@@ -350,6 +350,17 @@ target_include_directories(dsd-neo_test_core_csv_import PRIVATE ${PROJECT_SOURCE
 target_link_libraries(dsd-neo_test_core_csv_import PRIVATE dsd-neo_core dsd-neo_proto_dmr)
 add_test(NAME CORE_CSV_IMPORT COMMAND dsd-neo_test_core_csv_import)
 
+# TETRA RCPC mapping snapshot unit test
+add_executable(dsd-neo_test_tetra_rcpc_map protocol/tetra/test_rcpc_map.c ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_fec.c)
+target_include_directories(dsd-neo_test_tetra_rcpc_map PRIVATE ${PROJECT_SOURCE_DIR}/include)
+add_test(NAME TETRA_RCPC_MAP COMMAND dsd-neo_test_tetra_rcpc_map)
+
+# TETRA interleaver dims unit test — verify static table entries
+add_executable(dsd-neo_test_tetra_interleaver protocol/tetra/test_interleaver_dims.c ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_fec.c)
+target_include_directories(dsd-neo_test_tetra_interleaver PRIVATE ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(dsd-neo_test_tetra_interleaver PRIVATE dsd-neo_core)
+add_test(NAME TETRA_INTERLEAVER_DIMS COMMAND dsd-neo_test_tetra_interleaver)
+
 add_executable(dsd-neo_test_runtime_cli_compact runtime/test_runtime_cli_compact.c)
 target_include_directories(dsd-neo_test_runtime_cli_compact PRIVATE ${PROJECT_SOURCE_DIR}/include)
 target_link_libraries(dsd-neo_test_runtime_cli_compact PRIVATE dsd-neo_runtime dsd-neo_test_support)
