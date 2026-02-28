@@ -181,6 +181,15 @@ static void parse_mac_resource(const uint8_t *bits, int nbits, int cc,
         } else {
             state->tetra_ssi_valid  = 0;
         }
+
+        /* Phase 77: populate dropped MAC variables */
+        state->tetra_mac_fill_bits    = fill_bits;
+        state->tetra_mac_grant_pos    = grant_pos;
+        state->tetra_mac_rand_acc     = rand_acc;
+        state->tetra_mac_len_ind      = (uint8_t)(len_ind & 0x3Fu);
+        state->tetra_mac_addr_type    = addr_type;
+        state->tetra_mac_event_label  = (uint16_t)(event_label & 0x3FFu);
+        state->tetra_mac_usage_marker = (uint8_t)(usage_marker & 0x3Fu);
     }
 
     /* ---------------------------------------------------------------
@@ -292,6 +301,13 @@ static void parse_mac_sysinfo(const uint8_t *bits, int nbits, int cc,
         state->tetra_num_csch           = (uint8_t)(num_csch & 0x03u);
         state->tetra_ms_txpwr_max       = (uint8_t)(ms_txpwr & 0x07u);
         state->tetra_rxlev_access_min   = (uint8_t)(rxlev & 0x0Fu);
+        /* Phase 77: SYSINFO dropped vars */
+        state->tetra_sysinfo_main_carrier   = (uint16_t)(main_carrier & 0xFFFu);
+        state->tetra_sysinfo_rev_op         = (uint8_t)(rev_op & 1u);
+        state->tetra_sysinfo_acc_param      = (uint8_t)(acc_param & 0x0Fu);
+        state->tetra_sysinfo_radio_dl_tmo   = (uint8_t)(radio_dl_tmo & 0x0Fu);
+        state->tetra_sysinfo_opt_field_type = (uint8_t)(opt_field_type & 0x03u);
+        state->tetra_sysinfo_opt_field_data = (uint32_t)(opt_field_data & 0xFFFFFu);
     }
 
     /* MLE SYSINFO (§21.6.1): LA (14) + Subscr class (16) + BS service details (12) */
@@ -363,6 +379,8 @@ static void parse_mac_access_define(const uint8_t *bits, int nbits, int cc,
         state->tetra_access_frame_len_f   = (uint8_t)(frame_len_f & 1u);
         state->tetra_access_ts_ptr        = (uint8_t)(ts_ptr & 0x0Fu);
         state->tetra_access_min_pdu_pri   = (uint8_t)(min_pdu_pri & 0x07u);
+        /* Phase 77: store common_flag */
+        state->tetra_access_common_flag   = (uint8_t)(common_flag & 1u);
     }
 }
 

@@ -1408,6 +1408,47 @@ struct dsd_state {
     uint8_t  tetra_access_frame_len_f;
     uint8_t  tetra_access_ts_ptr;
     uint8_t  tetra_access_min_pdu_pri;
+
+    /* --- Phase 77: TETRA MAC dropped variables --- */
+    uint8_t  tetra_mac_fill_bits;
+    uint8_t  tetra_mac_grant_pos;
+    uint8_t  tetra_mac_rand_acc;
+    uint8_t  tetra_mac_len_ind;
+    uint8_t  tetra_mac_addr_type;
+    uint16_t tetra_mac_event_label;   // 10 bits
+    uint8_t  tetra_mac_usage_marker;  // 6 bits
+    
+    uint16_t tetra_sysinfo_main_carrier;
+    uint8_t  tetra_sysinfo_rev_op;
+    uint8_t  tetra_sysinfo_acc_param;
+    uint8_t  tetra_sysinfo_radio_dl_tmo;
+    uint8_t  tetra_sysinfo_opt_field_type;
+    uint32_t tetra_sysinfo_opt_field_data; // 20 bits
+    
+    uint8_t  tetra_access_common_flag;
+
+    /* --- Phase 78: TETRA CMCE/MLE dropped variables --- */
+    uint8_t  tetra_cmce_duplex;
+    uint8_t  tetra_cmce_notif;
+    uint8_t  tetra_cmce_com_type;
+    uint8_t  tetra_cmce_called_type;
+    
+    uint8_t  tetra_cmce_release_cause_type;
+    uint8_t  tetra_cmce_release_cause;
+    
+    uint8_t  tetra_cmce_tx_granted_perm;
+    uint8_t  tetra_cmce_tx_granted_reserv;
+    
+    uint8_t  tetra_cmce_sds_data_type;
+    uint8_t  tetra_cmce_sds_bpc;
+    uint8_t  tetra_cmce_sds_num_chars;
+    
+    uint8_t  tetra_mle_registration;
+
+    /* --- Phase 79: TETRA MM dropped variables --- */
+    uint8_t  tetra_mm_detach_flag;
+    uint8_t  tetra_mm_class_of_grp;
+    uint8_t  tetra_mm_addr_type;
 };
 
 // NOLINTEND(clang-analyzer-optin.performance.Padding)

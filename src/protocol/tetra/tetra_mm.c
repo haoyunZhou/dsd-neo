@@ -137,8 +137,15 @@ static void parse_mm_attach_detach_group(const uint8_t *bits, int nbits,
             cc, detach ? "DETACH" : "ATTACH",
             class_of_grp, addr_type, group_ssi);
 
-    if (state && group_ssi != 0)
-        state->tetra_mm_group_ssi = group_ssi;
+    if (state) {
+        if (group_ssi != 0)
+            state->tetra_mm_group_ssi = group_ssi;
+        
+        /* Phase 79: MM D-ATTACH-DETACH-GROUP dropped variables */
+        state->tetra_mm_detach_flag  = (uint8_t)(detach & 1u);
+        state->tetra_mm_class_of_grp = (uint8_t)(class_of_grp & 1u);
+        state->tetra_mm_addr_type    = (uint8_t)(addr_type & 0x03u);
+    }
 }
 
 /* -----------------------------------------------------------------------

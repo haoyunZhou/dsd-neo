@@ -111,13 +111,20 @@ static void parse_cmce_d_setup(const uint8_t *bits, int nbits,
     }
 
     fprintf(stderr, "\n");
-    (void)called_type; /* used in debug print above; suppress unused warning */
 
     /* Update state */
     if (state) {
         state->tetra_call_type    = (uint8_t)(call_type & 0x07u);
         state->tetra_call_active  = 1;
         state->tetra_call_id      = (uint8_t)(call_id & 1u);
+        state->tetra_call_timeout = (uint8_t)(call_timeout & 1u);
+        state->tetra_call_slots   = (uint8_t)(slots & 1u);
+        
+        /* Phase 78: CMCE D-SETUP dropped variables */
+        state->tetra_cmce_duplex      = (uint8_t)(duplex & 1u);
+        state->tetra_cmce_notif       = (uint8_t)(notif & 1u);
+        state->tetra_cmce_com_type    = (uint8_t)(com_type & 1u);
+        state->tetra_cmce_called_type = (uint8_t)(called_type & 0x03u);
         state->tetra_call_timeout = (uint8_t)(call_timeout & 1u);
         state->tetra_call_slots   = (uint8_t)(slots & 1u);
         if (calling_ssi != 0)
@@ -161,6 +168,8 @@ static void parse_cmce_d_release(const uint8_t *bits, int nbits,
 
     if (state) {
         state->tetra_call_active = 0;
+        state->tetra_cmce_release_cause_type = (uint8_t)(cause_type & 1u);
+        state->tetra_cmce_release_cause      = (uint8_t)(cause & 0x0Fu);
         tetra_sm_on_release(opts, state);
     }
 }
@@ -269,6 +278,11 @@ static void parse_cmce_d_tx_granted(const uint8_t *bits, int nbits,
     if (state) {
         state->tetra_tx_granted_valid = 1;
         state->tetra_enc_mode = (uint8_t)(enc_mode & 0x03u);
+        
+        /* Phase 78: CMCE D-TX-GRANTED dropped variables */
+        state->tetra_cmce_tx_granted_perm   = (uint8_t)(tx_perm & 1u);
+        state->tetra_cmce_tx_granted_reserv = (uint8_t)(reserv & 1u);
+
         if (got_ssi) {
             state->tetra_tx_granted_ssi = granted_ssi;
             /* Phase 45: propagate floor grant to shared UI fields so the
@@ -359,6 +373,8 @@ static void parse_mle_d_nwrk_broadcast(const uint8_t *bits, int nbits,
         state->tetra_la               = (uint16_t)la;
         state->tetra_subscr_class     = (uint16_t)subscr_cls;
         state->tetra_nwrk_bcast_known = 1;
+        /* Phase 78: dropped MLE D-NWRK-BROADCAST variable */
+        state->tetra_mle_registration = (uint8_t)(registration & 1u);
     }
 }
 
@@ -619,6 +635,7 @@ static void parse_cmce_d_sds_short_data(const uint8_t *bits, int nbits,
         state->tetra_sds_short_data  = short_data;
         state->tetra_sds_short_src   = src_ssi;
         state->tetra_sds_short_valid = 1;
+        state->tetra_cmce_sds_data_type = (uint8_t)(data_type & 0x03u);
     }
 }
 
@@ -751,6 +768,10 @@ static void parse_cmce_d_sds_data(const uint8_t *bits, int nbits,
             memcpy(state->tetra_sds_text, text, (size_t)(text_len + 1));
         else
             state->tetra_sds_text[0] = '\0';
+        
+        /* Phase 78: CMCE D-SDS-DATA dropped variables */
+        state->tetra_cmce_sds_bpc       = (uint8_t)(bpc & 0xFFu);
+        state->tetra_cmce_sds_num_chars = (uint8_t)(num_chars & 0xFFu);
     }
     return;
 
