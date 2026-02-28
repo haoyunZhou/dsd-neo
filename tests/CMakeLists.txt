@@ -249,6 +249,36 @@ dsd_neo_add_public_header_smoke_test(
   dsd-neo/protocol/p25/p25_trunk_sm_api.h
   C)
 
+dsd_neo_add_public_header_smoke_test(
+  dsd-neo_test_headers_public_protocol_tetra_mac
+  HEADERS_PUBLIC_PROTOCOL_TETRA_MAC
+  dsd-neo/protocol/tetra/tetra_mac.h
+  C)
+
+dsd_neo_add_public_header_smoke_test(
+  dsd-neo_test_headers_public_protocol_tetra_mle
+  HEADERS_PUBLIC_PROTOCOL_TETRA_MLE
+  dsd-neo/protocol/tetra/tetra_mle.h
+  C)
+
+dsd_neo_add_public_header_smoke_test(
+  dsd-neo_test_headers_public_protocol_tetra_mm
+  HEADERS_PUBLIC_PROTOCOL_TETRA_MM
+  dsd-neo/protocol/tetra/tetra_mm.h
+  C)
+
+dsd_neo_add_public_header_smoke_test(
+  dsd-neo_test_headers_public_protocol_tetra_trunk_sm
+  HEADERS_PUBLIC_PROTOCOL_TETRA_TRUNK_SM
+  dsd-neo/protocol/tetra/tetra_trunk_sm.h
+  C)
+
+dsd_neo_add_public_header_smoke_test(
+  dsd-neo_test_headers_public_protocol_tetra_acelp
+  HEADERS_PUBLIC_PROTOCOL_TETRA_ACELP
+  dsd-neo/protocol/tetra/tetra_acelp.h
+  C)
+
 add_executable(dsd-neo_test_aes_ofb crypto/test_aes_ofb.c)
 target_include_directories(dsd-neo_test_aes_ofb PRIVATE ${PROJECT_SOURCE_DIR}/include)
 target_link_libraries(dsd-neo_test_aes_ofb PRIVATE dsd-neo_crypto)
@@ -360,6 +390,188 @@ add_executable(dsd-neo_test_tetra_interleaver protocol/tetra/test_interleaver_di
 target_include_directories(dsd-neo_test_tetra_interleaver PRIVATE ${PROJECT_SOURCE_DIR}/include)
 target_link_libraries(dsd-neo_test_tetra_interleaver PRIVATE dsd-neo_core)
 add_test(NAME TETRA_INTERLEAVER_DIMS COMMAND dsd-neo_test_tetra_interleaver)
+
+# TETRA osmo shim soft-cost conversion unit test
+add_executable(dsd-neo_test_tetra_osmo_shim protocol/tetra/test_osmo_shim.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/osmo_sources/osmo_shim_map.c)
+target_include_directories(dsd-neo_test_tetra_osmo_shim PRIVATE ${PROJECT_SOURCE_DIR}/include
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/osmo_sources)
+add_test(NAME TETRA_OSMO_SHIM COMMAND dsd-neo_test_tetra_osmo_shim)
+
+# TETRA Viterbi backend availability smoke test
+add_executable(dsd-neo_test_tetra_osmo_viterbi protocol/tetra/test_osmo_viterbi_backend.c)
+target_include_directories(dsd-neo_test_tetra_osmo_viterbi PRIVATE ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(dsd-neo_test_tetra_osmo_viterbi PRIVATE dsd-neo_core)
+add_test(NAME TETRA_OSMO_VITERBI_BACKEND COMMAND dsd-neo_test_tetra_osmo_viterbi)
+
+# TETRA depuncture regression test (round-trip: conv encode -> puncture -> depuncture -> Viterbi)
+add_executable(dsd-neo_test_tetra_depuncture_regression
+  protocol/tetra/test_depuncture_regression.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_fec.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/osmo_sources/tetra_conv_enc.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/osmo_sources/osmo_viterbi_shim.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/osmo_sources/osmo_shim_map.c)
+target_include_directories(dsd-neo_test_tetra_depuncture_regression PRIVATE
+  ${PROJECT_SOURCE_DIR}/include
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/osmo_sources)
+target_link_libraries(dsd-neo_test_tetra_depuncture_regression PRIVATE dsd-neo_core)
+add_test(NAME TETRA_DEPUNCTURE_REGRESSION COMMAND dsd-neo_test_tetra_depuncture_regression)
+
+# TETRA MAC PDU parser – dsd_state integration test
+# Verifies that SYSINFO and MAC-RESOURCE PDUs correctly update tetra_* fields.
+add_executable(dsd-neo_test_tetra_mac_state
+  protocol/tetra/test_mac_state.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_mac.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_mle.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_mm.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_trunk_sm.c)
+target_include_directories(dsd-neo_test_tetra_mac_state PRIVATE ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(dsd-neo_test_tetra_mac_state PRIVATE dsd-neo_core dsd-neo_runtime)
+add_test(NAME TETRA_MAC_STATE COMMAND dsd-neo_test_tetra_mac_state)
+
+# TETRA MLE dispatch + CMCE D-SETUP / D-RELEASE call-state test
+add_executable(dsd-neo_test_tetra_mle_cmce
+  protocol/tetra/test_mle_cmce.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_mle.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_mm.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_trunk_sm.c)
+target_include_directories(dsd-neo_test_tetra_mle_cmce PRIVATE ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(dsd-neo_test_tetra_mle_cmce PRIVATE dsd-neo_core dsd-neo_runtime)
+add_test(NAME TETRA_MLE_CMCE COMMAND dsd-neo_test_tetra_mle_cmce)
+
+# TETRA MM dispatch + carrier frequency unit test
+add_executable(dsd-neo_test_tetra_mm_dispatch
+  protocol/tetra/test_mm_dispatch.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_mm.c)
+target_include_directories(dsd-neo_test_tetra_mm_dispatch PRIVATE ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(dsd-neo_test_tetra_mm_dispatch PRIVATE dsd-neo_core)
+add_test(NAME TETRA_MM_DISPATCH COMMAND dsd-neo_test_tetra_mm_dispatch)
+
+# TETRA D-TX-GRANTED Assigned Channel IE parsing + audio gate tests (Phase 12)
+add_executable(dsd-neo_test_tetra_d_tx_granted_chan
+  protocol/tetra/test_d_tx_granted_chan.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_mle.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_mm.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_trunk_sm.c)
+target_include_directories(dsd-neo_test_tetra_d_tx_granted_chan PRIVATE ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(dsd-neo_test_tetra_d_tx_granted_chan PRIVATE dsd-neo_core dsd-neo_runtime)
+add_test(NAME TETRA_D_TX_GRANTED_CHAN COMMAND dsd-neo_test_tetra_d_tx_granted_chan)
+
+# TETRA trunking state machine unit tests (Phase 13)
+add_executable(dsd-neo_test_tetra_trunk_sm
+  protocol/tetra/test_tetra_trunk_sm.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_trunk_sm.c)
+target_include_directories(dsd-neo_test_tetra_trunk_sm PRIVATE ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(dsd-neo_test_tetra_trunk_sm PRIVATE dsd-neo_core dsd-neo_runtime)
+add_test(NAME TETRA_TRUNK_SM COMMAND dsd-neo_test_tetra_trunk_sm)
+
+# TETRA TCH timeslot audio gate tests (Phase 14)
+add_executable(dsd-neo_test_tetra_tch_slot_gate
+  protocol/tetra/test_tetra_tch_slot_gate.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_tch_slot_gate.c)
+target_include_directories(dsd-neo_test_tetra_tch_slot_gate PRIVATE ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(dsd-neo_test_tetra_tch_slot_gate PRIVATE dsd-neo_core)
+add_test(NAME TETRA_TCH_SLOT_GATE COMMAND dsd-neo_test_tetra_tch_slot_gate)
+
+# TETRA format-helper tests (Phases 31-34): enc_mode_name, mm_status_name,
+# tetra_bsch_fmt_net, tetra_channel_info_fmt
+add_executable(dsd-neo_test_tetra_fmt_helpers
+  protocol/tetra/test_tetra_fmt_helpers.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_bsch_fmt.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_channel_info.c)
+target_include_directories(dsd-neo_test_tetra_fmt_helpers PRIVATE ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(dsd-neo_test_tetra_fmt_helpers PRIVATE dsd-neo_core)
+add_test(NAME TETRA_FMT_HELPERS COMMAND dsd-neo_test_tetra_fmt_helpers)
+
+# TETRA SM hangtime getter/setter tests (Phase 37)
+add_executable(dsd-neo_test_tetra_sm_hangtime
+  protocol/tetra/test_tetra_sm_hangtime.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_trunk_sm.c)
+target_include_directories(dsd-neo_test_tetra_sm_hangtime PRIVATE ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(dsd-neo_test_tetra_sm_hangtime PRIVATE dsd-neo_core dsd-neo_runtime)
+add_test(NAME TETRA_SM_HANGTIME COMMAND dsd-neo_test_tetra_sm_hangtime)
+
+# TETRA full-stack integration tests (Phase 38):
+# Chains SYSINFO→CMCE to verify Phases 19-37 state fields.
+add_executable(dsd-neo_test_tetra_integration
+  protocol/tetra/test_tetra_integration.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_mac.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_mle.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_mm.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_trunk_sm.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_bsch_fmt.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_channel_info.c)
+target_include_directories(dsd-neo_test_tetra_integration PRIVATE ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(dsd-neo_test_tetra_integration PRIVATE dsd-neo_core dsd-neo_runtime)
+add_test(NAME TETRA_INTEGRATION COMMAND dsd-neo_test_tetra_integration)
+
+# Phase 42: Tests for Phases 39–41 (FEC counters, D-SDS-DATA, SB sync types)
+add_executable(dsd-neo_test_tetra_phase42
+  protocol/tetra/test_tetra_phase42.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_mle.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_mm.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_trunk_sm.c)
+target_include_directories(dsd-neo_test_tetra_phase42 PRIVATE ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(dsd-neo_test_tetra_phase42 PRIVATE dsd-neo_core dsd-neo_runtime)
+add_test(NAME TETRA_PHASE42 COMMAND dsd-neo_test_tetra_phase42)
+
+# Phase 47: Tests for Phases 43–46 (TDMA timestamps, MM LU-REJECT/TEMP-ADDR, TX-GRANTED UI, SDS ref)
+add_executable(dsd-neo_test_tetra_phase47
+  protocol/tetra/test_tetra_phase47.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_bsch.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_fec.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_mle.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_mm.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_trunk_sm.c)
+target_include_directories(dsd-neo_test_tetra_phase47 PRIVATE ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(dsd-neo_test_tetra_phase47 PRIVATE dsd-neo_core dsd-neo_runtime)
+add_test(NAME TETRA_PHASE47 COMMAND dsd-neo_test_tetra_phase47)
+
+add_executable(dsd-neo_test_tetra_phase52
+  protocol/tetra/test_tetra_phase52.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_bsch.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_fec.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_mle.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_mm.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_trunk_sm.c)
+target_include_directories(dsd-neo_test_tetra_phase52 PRIVATE ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(dsd-neo_test_tetra_phase52 PRIVATE dsd-neo_core dsd-neo_runtime)
+add_test(NAME TETRA_PHASE52 COMMAND dsd-neo_test_tetra_phase52)
+
+add_executable(dsd-neo_test_tetra_phase61
+  protocol/tetra/test_tetra_phase61.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_bsch.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_fec.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_mle.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_mm.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_trunk_sm.c)
+target_include_directories(dsd-neo_test_tetra_phase61 PRIVATE ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(dsd-neo_test_tetra_phase61 PRIVATE dsd-neo_core dsd-neo_runtime)
+add_test(NAME TETRA_PHASE61 COMMAND dsd-neo_test_tetra_phase61)
+
+add_executable(dsd-neo_test_tetra_phase70
+  protocol/tetra/test_tetra_phase70.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_bsch.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_fec.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_mle.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_mm.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_trunk_sm.c)
+target_include_directories(dsd-neo_test_tetra_phase70 PRIVATE ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(dsd-neo_test_tetra_phase70 PRIVATE dsd-neo_core dsd-neo_runtime)
+add_test(NAME TETRA_PHASE70 COMMAND dsd-neo_test_tetra_phase70)
+
+# Phase 69: MAC Fragment Reassembly
+add_executable(dsd-neo_test_tetra_phase69
+  protocol/tetra/test_tetra_phase69.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_mac.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_mle.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_mm.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_trunk_sm.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_bsch.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_fec.c)
+target_include_directories(dsd-neo_test_tetra_phase69 PRIVATE ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(dsd-neo_test_tetra_phase69 PRIVATE dsd-neo_core dsd-neo_runtime)
+add_test(NAME TETRA_PHASE69 COMMAND dsd-neo_test_tetra_phase69)
 
 add_executable(dsd-neo_test_runtime_cli_compact runtime/test_runtime_cli_compact.c)
 target_include_directories(dsd-neo_test_runtime_cli_compact PRIVATE ${PROJECT_SOURCE_DIR}/include)

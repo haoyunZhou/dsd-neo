@@ -1117,6 +1117,111 @@ getFrameSync(dsd_opts* opts, dsd_state* state) {
             }
             //end YSF sync
 
+            // TETRA NDB sync (Normal Training Sequence, 11 dibits = 22 bits, pi/4-DQPSK)
+            // NOTE: sync pattern validity depends on pi/4-DQPSK demodulation; validate
+            //       against real captures before tightening the Hamming threshold.
+            if (opts->frame_tetra == 1) {
+                char synctest11[12];
+                strncpy(synctest11, (synctest_p - 10), 11);
+                synctest11[11] = 0;
+                int ham_tetra_ndb = dsd_sync_hamming_distance(synctest11, TETRA_NDB_NTS_SYNC, 11);
+                int ham_tetra_inv = dsd_sync_hamming_distance(synctest11, INV_TETRA_NDB_NTS_SYNC, 11);
+                const int TETRA_HAM_THRESH = 2;
+                if (ham_tetra_ndb <= TETRA_HAM_THRESH) {
+                    printFrameSync(opts, state, "+TETRA", synctest_pos + 1, modulation);
+                    state->carrier = 1;
+                    state->offset = synctest_pos;
+                    state->max = ((state->max) + lmax) / 2;
+                    state->min = ((state->min) + lmin) / 2;
+                    /* Capture Block 1 dibits from the scan window.
+                     * NDB layout before sync: [1d tail][108d Block1][11d NTS]
+                     * synctest_p currently points at NTS[10] (last NTS dibit).
+                     * Block1[0..107] live at synctest_p-118 .. synctest_p-11. */
+                    if ((synctest_p - synctest_buf) >= 118) {
+                        for (int _bi = 0; _bi < 108; _bi++)
+                            state->tetra_b1_dibuf[_bi] =
+                                (uint8_t)(*(synctest_p - 118 + _bi) - '0');
+                        state->tetra_b1_valid   = 1;
+                        state->tetra_polarity   = 0;
+                    } else {
+                        state->tetra_b1_valid = 0;
+                    }
+                    state->lastsynctype = DSD_SYNC_TETRA_NDB_POS;
+                    return DSD_SYNC_TETRA_NDB_POS;
+                } else if (ham_tetra_inv <= TETRA_HAM_THRESH) {
+                    printFrameSync(opts, state, "-TETRA", synctest_pos + 1, modulation);
+                    state->carrier = 1;
+                    state->offset = synctest_pos;
+                    state->max = ((state->max) + lmax) / 2;
+                    state->min = ((state->min) + lmin) / 2;
+                    /* Inverted TETRA: dibits in scan buffer are polarity-inverted.
+                     * Invert each dibit (0<->3, 1<->2) to restore correct values.
+                     * TODO: confirm π/4-DQPSK inversion direction against real captures. */
+                    if ((synctest_p - synctest_buf) >= 118) {
+                        for (int _bi = 0; _bi < 108; _bi++)
+                            state->tetra_b1_dibuf[_bi] =
+                                (uint8_t)(3 - (*(synctest_p - 118 + _bi) - '0'));
+                        state->tetra_b1_valid   = 1;
+                        state->tetra_polarity   = 1;
+                    } else {
+                        state->tetra_b1_valid = 0;
+                    }
+                    state->lastsynctype = DSD_SYNC_TETRA_NDB_NEG;
+                    return DSD_SYNC_TETRA_NDB_NEG;
+                }
+            }
+            //end TETRA NDB sync
+
+            // TETRA SB sync (Synchronisation Burst SSB, 19 dibits = 38 bits)
+            // NOTE: The SSB immediately follows the BSCH (SB1) block which carries
+            //       the BSCH PDU (MCC/MNC/colour) decoded by tetra_bsch_parse().
+            if (opts->frame_tetra == 1) {
+                char synctest19[20];
+                strncpy(synctest19, (synctest_p - 18), 19);
+                synctest19[19] = 0;
+                int ham_tetra_sb     = dsd_sync_hamming_distance(synctest19, TETRA_SB_SSB_SYNC, 19);
+                int ham_tetra_sb_inv = dsd_sync_hamming_distance(synctest19, INV_TETRA_SB_SSB_SYNC, 19);
+                const int TETRA_SB_HAM_THRESH = 3;
+                if (ham_tetra_sb <= TETRA_SB_HAM_THRESH) {
+                    printFrameSync(opts, state, "+TETRA-SB", synctest_pos + 1, modulation);
+                    state->carrier = 1;
+                    state->offset  = synctest_pos;
+                    state->max = ((state->max) + lmax) / 2;
+                    state->min = ((state->min) + lmin) / 2;
+                    /* Capture BSCH (SB1) dibits from the scan window.
+                     * SB layout before SSB: [... FC(40d) ...][60d BSCH][19d SSB]
+                     * BSCH[0..59] live at synctest_p-78 .. synctest_p-19. */
+                    if ((synctest_p - synctest_buf) >= 78) {
+                        for (int _bi = 0; _bi < 60; _bi++)
+                            state->tetra_sb1_dibuf[_bi] =
+                                (uint8_t)(*(synctest_p - 78 + _bi) - '0');
+                        state->tetra_sb1_valid = 1;
+                    } else {
+                        state->tetra_sb1_valid = 0;
+                    }
+                    state->lastsynctype = DSD_SYNC_TETRA_SB_POS;
+                    return DSD_SYNC_TETRA_SB_POS;
+                } else if (ham_tetra_sb_inv <= TETRA_SB_HAM_THRESH) {
+                    printFrameSync(opts, state, "-TETRA-SB", synctest_pos + 1, modulation);
+                    state->carrier = 1;
+                    state->offset  = synctest_pos;
+                    state->max = ((state->max) + lmax) / 2;
+                    state->min = ((state->min) + lmin) / 2;
+                    /* Inverted: invert each dibit (0<->3, 1<->2). */
+                    if ((synctest_p - synctest_buf) >= 78) {
+                        for (int _bi = 0; _bi < 60; _bi++)
+                            state->tetra_sb1_dibuf[_bi] =
+                                (uint8_t)(3 - (*(synctest_p - 78 + _bi) - '0'));
+                        state->tetra_sb1_valid = 1;
+                    } else {
+                        state->tetra_sb1_valid = 0;
+                    }
+                    state->lastsynctype = DSD_SYNC_TETRA_SB_NEG;
+                    return DSD_SYNC_TETRA_SB_NEG;
+                }
+            }
+            //end TETRA SB sync
+
             //M17 Sync -- Hamming distance based with auto-polarity detection
             strncpy(synctest16, (synctest_p - 15), 16);
             strncpy(synctest8, (synctest_p - 7), 8);

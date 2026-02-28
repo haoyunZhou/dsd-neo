@@ -213,6 +213,7 @@ struct dsd_opts {
     short int aggressive_framesync;
     int frame_m17;
     int inverted_m17;
+    int frame_tetra; /**< 1 = attempt TETRA NDB sync detection */
     int call_alert;
 
     // rigctl / sockets / streaming

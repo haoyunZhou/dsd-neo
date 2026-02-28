@@ -947,6 +947,467 @@ struct dsd_state {
     // Extension slots for module-owned per-state allocations (see core/state_ext.h).
     void* state_ext[DSD_STATE_EXT_MAX];
     dsd_state_ext_cleanup_fn state_ext_cleanup[DSD_STATE_EXT_MAX];
+
+    /* ─────────────────────────────────────────────────────────────────────────
+     * TETRA NDB Block 1 capture
+     *
+     * The NDB sync scan window consumes Block 1 before processTetraFrame() is
+     * called.  At TETRA sync detection the 108 hard dibits of Block 1 are saved
+     * here from the scan buffer so the frame processor can decode both blocks.
+     *
+     * tetra_b1_valid:   1 when tetra_b1_dibuf holds a fresh capture, cleared
+     *                   after processTetraFrame() consumes it.
+     * tetra_polarity:   0 = normal (+TETRA), 1 = inverted (-TETRA).
+     * ───────────────────────────────────────────────────────────────────────── */
+    uint8_t tetra_b1_dibuf[108];
+    uint8_t tetra_b1_valid;
+    uint8_t tetra_polarity;
+
+    /* tetra_sb1_dibuf: 60 hard dibits of the BSCH block captured from the
+     * synchronisation burst (SB) scan window at SSB detection.
+     * tetra_sb1_valid: 1 when tetra_sb1_dibuf holds a fresh capture. */
+    uint8_t tetra_sb1_dibuf[60];
+    uint8_t tetra_sb1_valid;
+
+    /* ───────────────────────────────────────────────────────────────────────
+     * TETRA network identity — populated when a BSCH (SB1 block) is decoded.
+     *
+     * tetra_net_known:  1 once MCC/MNC/colour have been parsed from BSCH.
+     * tetra_mcc:        10-bit Mobile Country Code (valid bits 9:0).
+     * tetra_mnc:        14-bit Mobile Network Code (valid bits 13:0).
+     * tetra_colour:     6-bit full colour code from BSCH (CB field carries the
+     *                   lower 2 bits of this value as the 2-bit CC).
+     * tetra_lfsr_seed:  Cached scrambling seed = tetra_compute_scramb_seed(mcc,mnc,colour).
+     *                   When tetra_net_known==0 this defaults to 3 (all-zero seed).
+     * ───────────────────────────────────────────────────────────────────────── */
+    uint8_t  tetra_net_known;
+    uint16_t tetra_mcc;
+    uint16_t tetra_mnc;
+    uint8_t  tetra_colour;
+    uint32_t tetra_lfsr_seed;
+
+    /* ───────────────────────────────────────────────────────────────────────
+     * TETRA network parameters — populated by MAC-BROADCAST/SYSINFO (MLE).
+     *
+     * tetra_sysinfo_known:    1 once a valid SYSINFO PDU has been decoded.
+     * tetra_nwrk_bcast_known: 1 once a D-NWRK-BROADCAST (MLE type 0) PDU
+     *                          has been received via MAC-BROADCAST bcast_type 3.
+     * tetra_la:               14-bit Location Area number (last received from
+     *                          either SYSINFO/MLE or D-NWRK-BROADCAST).
+     * tetra_bs_service_det:   12-bit BS service details bitmask.
+     * tetra_subscr_class:     16-bit subscriber class mask.
+     * ───────────────────────────────────────────────────────────────────────── */
+    uint8_t  tetra_sysinfo_known;
+    uint8_t  tetra_nwrk_bcast_known;
+    uint16_t tetra_la;
+    uint16_t tetra_bs_service_det;
+    uint16_t tetra_subscr_class;
+
+    /* ───────────────────────────────────────────────────────────────────────
+     * TETRA call tracking — updated by MAC-RESOURCE on each NDB block.
+     *
+     * tetra_ssi_valid:  1 when tetra_active_ssi holds a valid SSI.
+     * tetra_active_ssi: 24-bit Short Subscriber Identity of the current call.
+     * tetra_enc_mode:   2-bit encryption mode (TETRA_ENC_MODE_* constants).
+     * ───────────────────────────────────────────────────────────────────────── */
+    uint8_t  tetra_ssi_valid;
+    uint32_t tetra_active_ssi;
+    uint8_t  tetra_enc_mode;
+
+    /* ───────────────────────────────────────────────────────────────────────
+     * TETRA MLE / CMCE call-event state — updated by tetra_mle_dispatch().
+     *
+     * tetra_call_active:  1 while a call is in progress (set on D-SETUP or
+     *                     D-CONNECT, cleared on D-RELEASE / D-DISCONNECT).
+     * tetra_call_type:    3-bit call-type field from CMCE D-SETUP
+     *                     (0=group, 1=unaack-group, 2=ack, 3=SDS, …).
+     * tetra_calling_ssi:  24-bit SSI of the calling party extracted from the
+     *                     CMCE D-SETUP "Calling party" optional IE.
+     * tetra_gssi:         24-bit Group SSI (talkgroup ID) from the CMCE
+     *                     D-SETUP "Called party" optional IE.  Set for group
+     *                     and individual calls; 0 if the IE was absent.
+     * tetra_call_id:      1-bit Transaction Identifier from CMCE D-SETUP.
+     * ───────────────────────────────────────────────────────────────────────── */
+    uint8_t  tetra_call_active;
+    uint8_t  tetra_call_type;
+    uint32_t tetra_calling_ssi;
+    uint32_t tetra_gssi;
+    uint8_t  tetra_call_id;
+
+    /* ───────────────────────────────────────────────────────────────────────
+     * TETRA floor-control state — updated by CMCE D-TX-GRANTED / D-TX-CEASED.
+     *
+     * tetra_tx_granted_valid: 1 while a transmit grant is in force.
+     * tetra_tx_granted_ssi:   24-bit SSI of the currently-speaking party
+     *                          (from the D-TX-GRANTED optional IE).
+     * ───────────────────────────────────────────────────────────────────────── */
+    uint8_t  tetra_tx_granted_valid;
+    uint32_t tetra_tx_granted_ssi;
+
+    /* ───────────────────────────────────────────────────────────────────────
+     * TETRA MM (Mobility Management) state — updated by tetra_mm_dispatch().
+     *
+     * tetra_mm_la_valid:    1 when tetra_mm_la was received in a
+     *                        D-LOCATION-UPDATING-ACCEPT (may differ from the
+     *                        SYSINFO LA which is stored in tetra_la).
+     * tetra_mm_la:          14-bit Location Area from MM accept.
+     * tetra_mm_group_ssi:   Group SSI last seen in D-ATTACH-DETACH-GROUP.
+     * tetra_ms_enabled:     1 = MS is enabled, 0 = disabled by D-DISABLE.
+     *                        Initialised to 1 (enabled) by default; set to 0
+     *                        on D-DISABLE, back to 1 on D-ENABLE.
+     * tetra_mm_status_code: 8-bit status value from D-MM-STATUS (PDU type 15).
+     *                        0 means no D-MM-STATUS has been seen yet.
+     *
+     * TETRA carrier frequency (computed from SYSINFO main_carrier + freq_band):
+     *
+     * tetra_dl_carrier_hz:  Downlink carrier centre frequency in Hz (0 = unknown).
+     *                        Populated by parse_mac_sysinfo() once SYSINFO is
+     *                        decoded; used to feed the trunk CC-candidates scanner.
+     * ───────────────────────────────────────────────────────────────────────── */
+    uint8_t  tetra_mm_la_valid;
+    uint16_t tetra_mm_la;
+    uint32_t tetra_mm_group_ssi;
+    uint8_t  tetra_ms_enabled;
+    uint8_t  tetra_mm_status_code;
+    long     tetra_dl_carrier_hz;
+
+    /* ───────────────────────────────────────────────────────────────────────
+     * TETRA Phase 12: frequency band params cached from SYSINFO so that
+     * D-TX-GRANTED can resolve an assigned carrier to a DL frequency.
+     *
+     * tetra_freq_band:   4-bit band index from last SYSINFO.
+     * tetra_freq_offset: 2-bit freq_offset from last SYSINFO.
+     * ───────────────────────────────────────────────────────────────────────── */
+    uint8_t  tetra_freq_band;
+    uint8_t  tetra_freq_offset;
+
+    /* ───────────────────────────────────────────────────────────────────────
+     * TETRA VC channel assignment from D-TX-GRANTED Assigned Channel IE.
+     *
+     * tetra_vc_assignment_type: 0=not present, 1=new carrier, 2/3=same carrier.
+     * tetra_vc_carrier:         12-bit carrier number (assignment types 1 only).
+     * tetra_vc_slot:            2-bit timeslot (0=all, 1-3=specific).
+     * tetra_vc_freq_hz:         Resolved VC downlink frequency in Hz (0=unknown).
+     * ───────────────────────────────────────────────────────────────────────── */
+    uint8_t  tetra_vc_assignment_type;
+    uint16_t tetra_vc_carrier;
+    uint8_t  tetra_vc_slot;
+    long     tetra_vc_freq_hz;
+
+    /* ───────────────────────────────────────────────────────────────────────
+     * TETRA SDS (Short Data Service) state — updated by CMCE D-STATUS.
+     *
+     * tetra_sds_status: 16-bit pre-coded status value from CMCE D-STATUS.
+     *                   0 means no status has been received yet.
+     * tetra_sds_src:    24-bit SSI of the sending party (from the optional
+     *                   Calling Party IE in D-STATUS), or 0 if not present.
+     * tetra_sds_text:   NUL-terminated UTF-8 SDS message text (Phase 19).
+     * tetra_sds_text_len: byte length of tetra_sds_text (excluding NUL).
+     * tetra_sds_status_log: ring buffer of last 4 pre-coded status values.
+     * tetra_sds_status_log_head: next-write position in the ring buffer.
+     * ───────────────────────────────────────────────────────────────────────── */
+    uint16_t tetra_sds_status;
+    uint32_t tetra_sds_src;
+    char     tetra_sds_text[256];
+    uint16_t tetra_sds_text_len;
+    uint16_t tetra_sds_status_log[4];
+    uint8_t  tetra_sds_status_log_head;
+
+    /* ───────────────────────────────────────────────────────────────────────
+     * TETRA SYSINFO extended fields (Phase 20-22):
+     *
+     * tetra_cck_valid:         1 when tetra_cck_id contains a valid CCK-ID.
+     * tetra_cck_id:            16-bit CCK-ID from SYSINFO (or 0 if hyperframe).
+     * tetra_duplex_spacing:    3-bit duplex spacing index from SYSINFO.
+     * tetra_num_csch:          2-bit number of SCH channels from SYSINFO.
+     * tetra_ms_txpwr_max:      3-bit MS TX power max from SYSINFO.
+     * tetra_rxlev_access_min:  4-bit RXLEV access min from SYSINFO.
+     * ───────────────────────────────────────────────────────────────────────── */
+    uint8_t  tetra_cck_valid;
+    uint16_t tetra_cck_id;
+    uint8_t  tetra_duplex_spacing;
+    uint8_t  tetra_num_csch;
+    uint8_t  tetra_ms_txpwr_max;
+    uint8_t  tetra_rxlev_access_min;
+
+    /* ───────────────────────────────────────────────────────────────────────
+     * TETRA ACCESS-DEFINE cached params (Phase 23):
+     *
+     * tetra_access_imm:       4-bit immediate value from last ACCESS-DEFINE.
+     * tetra_access_wait_time: 4-bit waiting time from last ACCESS-DEFINE.
+     * ───────────────────────────────────────────────────────────────────────── */
+    uint8_t  tetra_access_imm;
+    uint8_t  tetra_access_wait_time;
+
+    /* ───────────────────────────────────────────────────────────────────────
+     * TETRA BSCH statistics (Phase 24):
+     *
+     * tetra_bsch_count:          number of BSCH frames parsed so far.
+     * tetra_bsch_colour_changed: 1 if colour code changed since last reset.
+     * ───────────────────────────────────────────────────────────────────────── */
+    uint32_t tetra_bsch_count;
+    uint8_t  tetra_bsch_colour_changed;
+
+    /* ───────────────────────────────────────────────────────────────────────
+     * TETRA MAC frame counters (Phase 25):
+     *
+     * tetra_frames_total:    total MAC PDUs processed.
+     * tetra_frames_sysinfo:  SYSINFO broadcast PDUs processed.
+     * tetra_frames_resource: MAC-RESOURCE PDUs processed.
+     * tetra_frames_frag:     MAC-FRAG/END PDUs processed.
+     * ───────────────────────────────────────────────────────────────────────── */
+    uint32_t tetra_frames_total;
+    uint32_t tetra_frames_sysinfo;
+    uint32_t tetra_frames_resource;
+    uint32_t tetra_frames_frag;
+
+    /* ───────────────────────────────────────────────────────────────────────
+     * TETRA MM D-LOCATION-UPDATING-COMMAND requested LA (Phase 27):
+     *
+     * tetra_mm_lu_req_la_valid: 1 when tetra_mm_lu_req_la is valid.
+     * tetra_mm_lu_req_la:       14-bit requested Location Area from D-LU-CMD.
+     * ───────────────────────────────────────────────────────────────────────── */
+    uint8_t  tetra_mm_lu_req_la_valid;
+    uint16_t tetra_mm_lu_req_la;
+
+    /* ───────────────────────────────────────────────────────────────────────
+     * TETRA MAC-FRAG/END reassembly tracking (Phase 28 + Phase 69):
+     *
+     * tetra_frag_active:  1 while a MAC-FRAG sequence is in progress.
+     * tetra_frag_seq:     running fragment sequence counter.
+     * tetra_frag_buf:     one-byte-per-bit reassembly buffer (1024 bits max).
+     * tetra_frag_nbits:   number of bits currently accumulated in the buffer.
+     * tetra_frag_cc:      CC that initiated the current fragment sequence.
+     * ───────────────────────────────────────────────────────────────────────── */
+    uint8_t  tetra_frag_active;
+    uint8_t  tetra_frag_seq;
+    uint8_t  tetra_frag_buf[1024]; /* one byte per bit */
+    uint16_t tetra_frag_nbits;
+    int8_t   tetra_frag_cc;
+
+    /* ───────────────────────────────────────────────────────────────────────
+     * TETRA CMCE D-SETUP supplementary fields (Phase 29):
+     *
+     * tetra_call_timeout: 1-bit call timeout flag from D-SETUP.
+     * tetra_call_slots:   1-bit slots field from D-SETUP.
+     * ───────────────────────────────────────────────────────────────────────── */
+    uint8_t  tetra_call_timeout;
+    uint8_t  tetra_call_slots;
+
+    /* ───────────────────────────────────────────────────────────────────────
+     * TETRA decode quality counters (Phase 35):
+     *
+     * tetra_decode_errors: cumulative count of frames that failed FEC.
+     * tetra_decode_ok:     cumulative count of frames successfully decoded.
+     * ───────────────────────────────────────────────────────────────────────── */
+    uint32_t tetra_decode_errors;
+    uint32_t tetra_decode_ok;
+
+    /* ───────────────────────────────────────────────────────────────────────
+     * TETRA TDMA timestamps extracted from BSCH (Phase 43):
+     *
+     * tetra_tdma_valid:  1 once the first SB1 has been decoded successfully.
+     * tetra_tn:          Timeslot Number 1-4 (BSCH bits[10..11] + 1).
+     * tetra_fn:          Frame Number 0-17  (BSCH bits[12..16]).
+     * tetra_mn:          Multiframe Number 0-59 (BSCH bits[17..22]).
+     * ───────────────────────────────────────────────────────────────────────── */
+    uint8_t  tetra_tdma_valid;
+    uint8_t  tetra_tn;
+    uint8_t  tetra_fn;
+    uint8_t  tetra_mn;
+
+    /* ───────────────────────────────────────────────────────────────────────
+     * TETRA MM D-LOCATION-UPDATING-REJECT fields (Phase 44):
+     *
+     * tetra_mm_lu_reject_cause:  3-bit rejection cause code.
+     * tetra_mm_lu_reject_valid:  1 when cause has been populated.
+     * ───────────────────────────────────────────────────────────────────────── */
+    uint8_t  tetra_mm_lu_reject_cause;
+    uint8_t  tetra_mm_lu_reject_valid;
+
+    /* ───────────────────────────────────────────────────────────────────────
+     * TETRA MM D-TEMPORARY-ADDRESS fields (Phase 44):
+     *
+     * tetra_mm_temp_ssi:       24-bit temporary SSI assigned by the network.
+     * tetra_mm_temp_ssi_valid: 1 when tetra_mm_temp_ssi is populated.
+     * ───────────────────────────────────────────────────────────────────────── */
+    uint32_t tetra_mm_temp_ssi;
+    uint8_t  tetra_mm_temp_ssi_valid;
+
+    /* ───────────────────────────────────────────────────────────────────────
+     * TETRA CMCE D-SDS-DATA tracking fields (Phase 46):
+     *
+     * tetra_sds_msg_ref:  4-bit message reference from the last SDS-TL header.
+     * tetra_sds_last_cc:  Control channel number of the last SDS PDU received
+     *                     (-1 = not yet received).
+     * ───────────────────────────────────────────────────────────────────────── */
+    uint8_t  tetra_sds_msg_ref;
+    int8_t   tetra_sds_last_cc;
+
+    /* ───────────────────────────────────────────────────────────────────────
+     * TETRA MM supplementary fields (Phase 48):
+     *
+     * tetra_mm_param_change_valid: 1 when a D-PARAMETER-CHANGE has been seen.
+     * tetra_mm_param_change_la:    14-bit LA from D-PARAMETER-CHANGE if present.
+     * tetra_mm_detach_ack:         1 when a D-ITSI-DETACH-ACK has been received.
+     * tetra_mm_lu_demand_cause:    3-bit cause from D-LU-DEMAND.
+     * tetra_mm_lu_demand_valid:    1 when D-LU-DEMAND has been received.
+     * ───────────────────────────────────────────────────────────────────────── */
+    uint8_t  tetra_mm_param_change_valid;
+    uint16_t tetra_mm_param_change_la;
+    uint8_t  tetra_mm_detach_ack;
+    uint8_t  tetra_mm_lu_demand_cause;
+    uint8_t  tetra_mm_lu_demand_valid;
+
+    /* ───────────────────────────────────────────────────────────────────────
+     * TETRA CMCE D-CONNECT parsed fields (Phase 49):
+     *
+     * tetra_connect_enc_mode:  2-bit encryption mode from D-CONNECT.
+     * tetra_connect_call_type: 3-bit call_type from D-CONNECT.
+     * tetra_connect_valid:     1 once a D-CONNECT has been fully parsed.
+     * ───────────────────────────────────────────────────────────────────────── */
+    uint8_t  tetra_connect_enc_mode;
+    uint8_t  tetra_connect_call_type;
+    uint8_t  tetra_connect_valid;
+
+    /* ───────────────────────────────────────────────────────────────────────
+     * TETRA CMCE D-SDS-SHORT-DATA fields (Phase 50):
+     *
+     * tetra_sds_short_data:   16-bit pre-defined short data status.
+     * tetra_sds_short_src:    24-bit calling party SSI.
+     * tetra_sds_short_valid:  1 when populated.
+     * ───────────────────────────────────────────────────────────────────────── */
+    uint16_t tetra_sds_short_data;
+    uint32_t tetra_sds_short_src;
+    uint8_t  tetra_sds_short_valid;
+
+    /* ───────────────────────────────────────────────────────────────────────
+     * TETRA CMCE floor-control event flags (Phase 54):
+     *
+     * Each flag is set to 1 when the corresponding PDU is received.
+     * tetra_tx_continue:   D-TX-CONTINUE  (type 9)  — speaker may continue.
+     * tetra_tx_interrupted: D-TX-INTERRUPT (type 11) — speaker interrupted.
+     * tetra_tx_wait:       D-TX-WAIT      (type 12) — MS must wait.
+     * tetra_tx_timed_out:  D-TX-TIMED-OUT (type 13) — grant expired.
+     * ───────────────────────────────────────────────────────────────────────── */
+    uint8_t  tetra_tx_continue;
+    uint8_t  tetra_tx_interrupted;
+    uint8_t  tetra_tx_wait;
+    uint8_t  tetra_tx_timed_out;
+
+    /* ───────────────────────────────────────────────────────────────────────
+     * TETRA MM D-CHECK-TSI / D-STATUS + MLE D-RESTORE fields (Phase 55):
+     *
+     * tetra_mm_check_tsi:       24-bit Individual TSI from D-CHECK-TSI.
+     * tetra_mm_check_tsi_valid: 1 when populated.
+     * tetra_mm_d_status_val:    Protocol status from MM D-STATUS (type 8).
+     * tetra_mm_d_status_valid:  1 when MM D-STATUS has been received.
+     * tetra_restore_ack:        1 when MLE D-RESTORE-ACK received.
+     * tetra_restore_response:   1 when MLE D-RESTORE-RESPONSE received.
+     * ───────────────────────────────────────────────────────────────────────── */
+    uint32_t tetra_mm_check_tsi;
+    uint8_t  tetra_mm_check_tsi_valid;
+    uint8_t  tetra_mm_d_status_val;
+    uint8_t  tetra_mm_d_status_valid;
+    uint8_t  tetra_restore_ack;
+    uint8_t  tetra_restore_response;
+
+    /* ───────────────────────────────────────────────────────────────────────
+     * TETRA CMCE D-INFO parsed fields (Phase 57):
+     *
+     * tetra_d_info_call_id: 1-bit call identification (TI).
+     * tetra_d_info_valid:   1 once a D-INFO has been decoded.
+     * ───────────────────────────────────────────────────────────────────────── */
+    uint8_t  tetra_d_info_call_id;
+    uint8_t  tetra_d_info_valid;
+
+    /* ───────────────────────────────────────────────────────────────────────
+     * TETRA SDS-DATA Unicode flag (Phase 58):
+     *
+     * tetra_sds_text_unicode: 1 when the last decoded SDS text used Unicode
+     *                          encoding (bpc=10 or bpc=16).
+     * ───────────────────────────────────────────────────────────────────────── */
+    uint8_t  tetra_sds_text_unicode;
+
+    /* ───────────────────────────────────────────────────────────────────────
+     * TETRA MLE D-NWRK-BROADCAST-EXTENSION fields (Phase 59):
+     *
+     * tetra_nwrk_bcast_ext_known: 1 after extension PDU received.
+     * tetra_nwrk_bcast_ext_la:    14-bit LA from the extension PDU.
+     * ───────────────────────────────────────────────────────────────────────── */
+    uint8_t  tetra_nwrk_bcast_ext_known;
+    uint16_t tetra_nwrk_bcast_ext_la;
+
+    /* ───────────────────────────────────────────────────────────────────────
+     * TETRA MM D-AUTHENTICATION fields (Phase 60):
+     *
+     * tetra_mm_auth_rand:  32-bit (truncated) random seed from D-AUTH.
+     * tetra_mm_auth_valid: 1 when populated.
+     * ───────────────────────────────────────────────────────────────────────── */
+    uint32_t tetra_mm_auth_rand;
+    uint8_t  tetra_mm_auth_valid;
+
+    /* ───────────────────────────────────────────────────────────────────────
+     * Phase 63: MM D-OTAR fields.
+     * tetra_otar_pdu_type: 5-bit OTAR sub-PDU type (ETSI EN 300 392-7).
+     * tetra_otar_valid:    1 when a D-OTAR PDU has been received.
+     * ───────────────────────────────────────────────────────────────────────── */
+    uint8_t  tetra_otar_pdu_type;
+    uint8_t  tetra_otar_valid;
+
+    /* ───────────────────────────────────────────────────────────────────────
+     * Phase 64: CMCE D-ALERT call_id.
+     * Phase 65: CMCE D-CALL-PROCEEDING call_id.
+     * Phase 66: CMCE D-CONNECT-ACK call_id.
+     * ───────────────────────────────────────────────────────────────────────── */
+    uint8_t  tetra_d_alert_call_id;
+    uint8_t  tetra_d_alert_valid;
+    uint8_t  tetra_d_call_proc_call_id;
+    uint8_t  tetra_d_call_proc_valid;
+    uint8_t  tetra_d_connect_ack_call_id;
+    uint8_t  tetra_d_connect_ack_valid;
+
+    /* ───────────────────────────────────────────────────────────────────────
+     * Phase 67: CMCE D-TX-CEASED parsed permission flags.
+     * tetra_tx_ceased_tx_perm:     Transmission permission bit.
+     * tetra_tx_ceased_cipher_info: Cipher information reservation bit.
+     * ───────────────────────────────────────────────────────────────────────── */
+    uint8_t  tetra_tx_ceased_tx_perm;
+    uint8_t  tetra_tx_ceased_cipher_info;
+
+    /* ───────────────────────────────────────────────────────────────────────
+     * Phase 68: MLE D-RESTORE-ACK / D-RESTORE-RESPONSE optional fields.
+     * tetra_restore_ack_la:                    14-bit LA from D-RESTORE-ACK.
+     * tetra_restore_ack_la_valid:              1 when LA field was present.
+     * tetra_restore_response_result:           1-bit result from D-RESTORE-RESPONSE.
+     * tetra_restore_response_result_valid:     1 when result field was present.
+     * ───────────────────────────────────────────────────────────────────────── */
+    uint16_t tetra_restore_ack_la;
+    uint8_t  tetra_restore_ack_la_valid;
+    uint8_t  tetra_restore_response_result;
+    uint8_t  tetra_restore_response_result_valid;
+
+    /* ───────────────────────────────────────────────────────────────────────
+     * Phase 73: CMCE D-SDS-REPORT fields (type=22).
+     * tetra_sds_report_valid:       1 after a D-SDS-REPORT is received.
+     * tetra_sds_report_delivery_ok: 1=delivered, 0=failure.
+     * tetra_sds_report_cause:       4-bit failure cause (if delivery_ok=0).
+     * ───────────────────────────────────────────────────────────────────────── */
+    uint8_t  tetra_sds_report_valid;
+    uint8_t  tetra_sds_report_delivery_ok;
+    uint8_t  tetra_sds_report_cause;
+
+    /* ───────────────────────────────────────────────────────────────────────
+     * Phase 74: MAC ACCESS-DEFINE extended fields.
+     * tetra_access_num_ra:      4-bit number of random access channels.
+     * tetra_access_frame_len_f: 1-bit frame length factor.
+     * tetra_access_ts_ptr:      4-bit timeslot pointer.
+     * tetra_access_min_pdu_pri: 3-bit minimum PDU priority.
+     * ───────────────────────────────────────────────────────────────────────── */
+    uint8_t  tetra_access_num_ra;
+    uint8_t  tetra_access_frame_len_f;
+    uint8_t  tetra_access_ts_ptr;
+    uint8_t  tetra_access_min_pdu_pri;
 };
 
 // NOLINTEND(clang-analyzer-optin.performance.Padding)

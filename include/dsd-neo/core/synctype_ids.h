@@ -182,6 +182,18 @@ extern "C" {
 /** Check if synctype is EDACS/ProVoice */
 #define DSD_SYNC_IS_EDACS(s)      (DSD_SYNC_IS_PROVOICE(s) || DSD_SYNC_IS_EDACS_ONLY(s))
 
+/* ============================================================================
+ * TETRA
+ * ============================================================================ */
+#define DSD_SYNC_TETRA_NDB_POS    41 /**< +TETRA Normal Downlink Burst (non-inverted) */
+#define DSD_SYNC_TETRA_NDB_NEG    42 /**< -TETRA Normal Downlink Burst (inverted) */
+#define DSD_SYNC_TETRA_SB_POS     43 /**< +TETRA Synchronisation Burst (non-inverted) */
+#define DSD_SYNC_TETRA_SB_NEG     44 /**< -TETRA Synchronisation Burst (inverted) */
+
+/** Check if synctype is TETRA */
+#define DSD_SYNC_IS_TETRA(s)      ((s) == DSD_SYNC_TETRA_NDB_POS || (s) == DSD_SYNC_TETRA_NDB_NEG || \
+                                   (s) == DSD_SYNC_TETRA_SB_POS  || (s) == DSD_SYNC_TETRA_SB_NEG)
+
 /** Check if synctype is inverted (negative polarity) */
 #define DSD_SYNC_IS_INVERTED(s)                                                                                        \
     ((s) == DSD_SYNC_P25P1_NEG || (s) == DSD_SYNC_X2TDMA_VOICE_NEG || (s) == DSD_SYNC_X2TDMA_DATA_NEG                  \

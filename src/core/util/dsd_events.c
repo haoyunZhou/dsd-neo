@@ -681,6 +681,47 @@ watchdog_event_current(dsd_opts* opts, dsd_state* state, uint8_t slot) {
                 }
             }
         }
+
+        if (DSD_SYNC_IS_TETRA(state->lastsynctype)) /* TETRA NDB */
+        {
+            /* target = the addressed group / SSI from MAC-RESOURCE.
+             * source = the party holding the floor (D-TX-GRANTED granted party
+             *          SSI), else the calling party (D-SETUP), else unset. */
+            if (state->tetra_ssi_valid) {
+                target_id = state->tetra_active_ssi;
+                snprintf(tgt_str, sizeof tgt_str, "SSI_%u",
+                         (unsigned)state->tetra_active_ssi);
+            }
+
+            if (state->tetra_tx_granted_valid && state->tetra_tx_granted_ssi != 0) {
+                source_id = state->tetra_tx_granted_ssi;
+                snprintf(src_str, sizeof src_str, "GRANT_%u",
+                         (unsigned)state->tetra_tx_granted_ssi);
+            } else if (state->tetra_calling_ssi != 0) {
+                source_id = state->tetra_calling_ssi;
+                snprintf(src_str, sizeof src_str, "CALL_%u",
+                         (unsigned)state->tetra_calling_ssi);
+            }
+
+            enc    = (state->tetra_enc_mode != 0) ? 1 : 0;
+            alg_id = state->tetra_enc_mode;
+
+            if (state->tetra_net_known) {
+                snprintf(sysid_string, sizeof sysid_string,
+                         "TETRA_MCC-%u_MNC-%u",
+                         (unsigned)state->tetra_mcc, (unsigned)state->tetra_mnc);
+            } else {
+                snprintf(sysid_string, sizeof sysid_string, "TETRA");
+            }
+
+            if (state->tetra_sysinfo_known) {
+                size_t used = strlen(sysid_string);
+                if (used < sizeof(sysid_string) - 1) {
+                    snprintf(sysid_string + used, sizeof(sysid_string) - used,
+                             "_LA-%u", (unsigned)state->tetra_la);
+                }
+            }
+        }
     }
 
     //if we have a group_array import, search and load it here

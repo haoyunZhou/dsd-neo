@@ -62,8 +62,8 @@ static const char* const SyncTypeStrings[] = {
     "EDACS/PV",     /* 38: -EDACS */
     "ANALOG",       /* 39: Generic analog */
     "DIGITAL",      /* 40: Generic digital */
-    NULL,           /* 41: unused */
-    NULL,           /* 42: unused */
+    "TETRA",        /* 41: +TETRA NDB (non-inverted) */
+    "TETRA",        /* 42: -TETRA NDB (inverted) */
     NULL,           /* 43: unused */
 };
 

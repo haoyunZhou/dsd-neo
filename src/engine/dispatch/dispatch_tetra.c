@@ -12,5 +12,10 @@ int dsd_dispatch_matches_tetra(int synctype) {
 }
 
 void dsd_dispatch_handle_tetra(dsd_opts* opts, dsd_state* state) {
-    processTetraFrame(opts, state);
+    if (state->lastsynctype == DSD_SYNC_TETRA_SB_POS ||
+        state->lastsynctype == DSD_SYNC_TETRA_SB_NEG) {
+        processTetraSBFrame(opts, state);
+    } else {
+        processTetraFrame(opts, state);
+    }
 }

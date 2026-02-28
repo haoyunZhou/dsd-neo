@@ -128,6 +128,7 @@ initOpts(dsd_opts* opts) {
     opts->frame_provoice = 0;
     opts->frame_ysf = 1;
     opts->frame_m17 = 0;
+    opts->frame_tetra = 0;
     opts->mod_c4fm = 1;
     opts->mod_qpsk = 0;
     opts->mod_gfsk = 0;

@@ -195,6 +195,7 @@ dsd_cli_usage(void) {
     printf("  -fe             Decode only EDACS EA/ProVoice\n");
     printf("  -fE             Decode only EDACS EA/ProVoice with ESK 0xA0\n");
     printf("  -fm             Decode only dPMR\n");
+    printf("  -fT           Decode only TETRA NDB (pi/4-DQPSK, 18 kHz channel)\n");
     printf("  -l            Disable DMR, dPMR, NXDN, M17 input filtering\n");
     printf("  -u <num>      Unvoiced speech quality (default=3)\n");
     printf("  -xx           Expect non-inverted X2-TDMA signal\n");

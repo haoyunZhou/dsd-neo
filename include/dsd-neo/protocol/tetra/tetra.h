@@ -12,6 +12,7 @@ extern "C" {
 int dsd_dispatch_matches_tetra(int synctype);
 void dsd_dispatch_handle_tetra(dsd_opts* opts, dsd_state* state);
 void processTetraFrame(dsd_opts* opts, dsd_state* state);
+void processTetraSBFrame(dsd_opts* opts, dsd_state* state);
 
 #ifdef __cplusplus
 }

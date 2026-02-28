@@ -431,6 +431,8 @@ user_config_load_no_reset(const char* path, dsdneoUserConfig* cfg) {
                     cfg->decode_mode = DSDCFG_MODE_TDMA;
                 } else if (dsd_strcasecmp(val, "analog") == 0 || dsd_strcasecmp(val, "analog_monitor") == 0) {
                     cfg->decode_mode = DSDCFG_MODE_ANALOG;
+                } else if (dsd_strcasecmp(val, "tetra") == 0) {
+                    cfg->decode_mode = DSDCFG_MODE_TETRA;
                 }
             } else if (strcmp(key_lc, "demod") == 0) {
                 cfg->has_demod = 1;
@@ -733,6 +735,7 @@ dsd_user_config_render_ini(const dsdneoUserConfig* cfg, FILE* out) {
             case DSDCFG_MODE_M17: fprintf(out, "decode = \"m17\"\n"); break;
             case DSDCFG_MODE_TDMA: fprintf(out, "decode = \"tdma\"\n"); break;
             case DSDCFG_MODE_ANALOG: fprintf(out, "decode = \"analog\"\n"); break;
+            case DSDCFG_MODE_TETRA: fprintf(out, "decode = \"tetra\"\n"); break;
             default: break;
         }
         if (cfg->has_demod) {
@@ -1193,6 +1196,7 @@ dsd_apply_user_config_to_opts(const dsdneoUserConfig* cfg, dsd_opts* opts, dsd_s
                 opts->frame_provoice = 0;
                 opts->frame_ysf = 0;
                 opts->frame_m17 = 0;
+                opts->frame_tetra = 0;
                 opts->pulse_digi_rate_out = 8000;
                 opts->pulse_digi_out_channels = 1;
                 opts->dmr_stereo = 0;
@@ -1202,6 +1206,30 @@ dsd_apply_user_config_to_opts(const dsdneoUserConfig* cfg, dsd_opts* opts, dsd_s
                 opts->monitor_input_audio = 1;
                 opts->analog_only = 1;
                 snprintf(opts->output_name, sizeof opts->output_name, "%s", "Analog Monitor");
+                break;
+            case DSDCFG_MODE_TETRA:
+                opts->frame_dstar = 0;
+                opts->frame_x2tdma = 0;
+                opts->frame_p25p1 = 0;
+                opts->frame_p25p2 = 0;
+                opts->frame_nxdn48 = 0;
+                opts->frame_nxdn96 = 0;
+                opts->frame_dmr = 0;
+                opts->frame_dpmr = 0;
+                opts->frame_provoice = 0;
+                opts->frame_ysf = 0;
+                opts->frame_m17 = 0;
+                opts->frame_tetra = 1;
+                opts->mod_c4fm = 0;
+                opts->mod_qpsk = 1;
+                opts->mod_gfsk = 0;
+                state->rf_mod = 1;
+                opts->pulse_digi_rate_out = 8000;
+                opts->pulse_digi_out_channels = 1;
+                opts->dmr_stereo = 0;
+                state->dmr_stereo = 0;
+                opts->dmr_mono = 0;
+                snprintf(opts->output_name, sizeof opts->output_name, "%s", "TETRA");
                 break;
             default: break;
         }
@@ -1517,6 +1545,10 @@ dsd_snapshot_opts_to_user_config(const dsd_opts* opts, const dsd_state* state, d
     } else if (opts->frame_m17 && !opts->frame_dstar && !opts->frame_ysf && !opts->frame_p25p1 && !opts->frame_p25p2
                && !opts->frame_dmr && !opts->frame_nxdn48 && !opts->frame_nxdn96 && !opts->frame_provoice) {
         cfg->decode_mode = DSDCFG_MODE_M17;
+    } else if (opts->frame_tetra && !opts->frame_dstar && !opts->frame_ysf && !opts->frame_p25p1 && !opts->frame_p25p2
+               && !opts->frame_dmr && !opts->frame_nxdn48 && !opts->frame_nxdn96 && !opts->frame_provoice
+               && !opts->frame_m17) {
+        cfg->decode_mode = DSDCFG_MODE_TETRA;
     } else {
         cfg->decode_mode = DSDCFG_MODE_AUTO;
     }
@@ -2103,6 +2135,8 @@ apply_profile_key(dsdneoUserConfig* cfg, const char* dotted_key, const char* val
                 cfg->decode_mode = DSDCFG_MODE_TDMA;
             } else if (dsd_strcasecmp(val, "analog") == 0) {
                 cfg->decode_mode = DSDCFG_MODE_ANALOG;
+            } else if (dsd_strcasecmp(val, "tetra") == 0) {
+                cfg->decode_mode = DSDCFG_MODE_TETRA;
             }
         } else if (strcmp(key, "demod") == 0) {
             cfg->has_demod = 1;

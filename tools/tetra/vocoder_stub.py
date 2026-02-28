@@ -1,31 +1,47 @@
 #!/usr/bin/env python3
 """
-Simple TETRA vocoder stub for testing TETRA_VOCODER_CMD integration.
-Reads one-byte-per-bit input from stdin and writes 16-bit little-endian PCM silence
-for each frame. This is only a functional stub for integration testing.
+TETRA TCH/FS vocoder stub — integration-test placeholder.
+
+Implements the synchronous, persistent-subprocess protocol used by dsd-neo:
+
+    dsd-neo  ──► stdin : FRAME_BITS bytes (one byte per coded bit, value 0 or 1)
+    dsd-neo  ◄── stdout: FRAME_SAMPLES × 2 bytes (PCM16LE @ 8 kHz, mono)
+    (repeat per frame until dsd-neo closes the pipe)
+
+This stub produces silence (all-zero PCM) for every frame, which lets you
+verify the full audio-routing path without a real TETRA ACELP codec.
+
+Usage (PowerShell):
+    $env:TETRA_VOCODER_CMD = "python $PWD\\tools\\tetra\\vocoder_stub.py"
+
+Usage (bash):
+    export TETRA_VOCODER_CMD="python3 $(pwd)/tools/tetra/vocoder_stub.py"
+
+Replace this stub with a real TETRA ACELP vocoder command to hear actual audio.
 """
+
 import sys
-import struct
 
-SAMPLE_RATE = 8000
-FRAME_SAMPLES = 160  # 20ms at 8kHz
+FRAME_BITS    = 137   # coded bits per TCH/FS ACELP sub-frame
+FRAME_SAMPLES = 160   # PCM samples per frame (20 ms @ 8 kHz)
+PCM_SILENCE   = bytes(FRAME_SAMPLES * 2)  # pre-built silence payload
 
-def main():
-    # Read all input bits (one byte per bit expected)
-    data = sys.stdin.buffer.read()
-    if not data:
-        # no input: write a short silence WAV to stdout
-        out = b"\x00" * (FRAME_SAMPLES * 2)
-        sys.stdout.buffer.write(out)
-        return
 
-    # For each incoming bit byte, produce one 20ms PCM frame of silence
-    # (This simulates a vocoder producing audio frames per codec frame.)
-    outbuf = bytearray()
-    for _b in data:
-        outbuf.extend(b"\x00" * (FRAME_SAMPLES * 2))
+def main() -> None:
+    stdin  = sys.stdin.buffer
+    stdout = sys.stdout.buffer
 
-    sys.stdout.buffer.write(outbuf)
+    while True:
+        data = stdin.read(FRAME_BITS)
+        if not data:
+            break                       # dsd-neo closed the pipe → exit cleanly
+        if len(data) < FRAME_BITS:
+            break                       # short read at EOF
 
-if __name__ == '__main__':
+        # Output one frame of PCM16LE silence
+        stdout.write(PCM_SILENCE)
+        stdout.flush()
+
+
+if __name__ == "__main__":
     main()

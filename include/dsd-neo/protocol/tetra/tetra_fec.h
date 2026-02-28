@@ -20,6 +20,13 @@ void tetra_descramble(uint8_t* in, int len, uint32_t lfsr_init);
  * `costs` length is number of bits; `lfsr_init` seeds the PN generator.
  */
 void tetra_descramble_soft(uint16_t* costs, int len, uint32_t lfsr_init);
+
+/* Compute TETRA scrambling seed from network identity (ETSI EN 300 392-2 §8.2.5.2).
+ * mcc: 10-bit Mobile Country Code, mnc: 14-bit Mobile Network Code,
+ * colour: 6-bit full colour code (from BSCH).
+ * Returns seed=3 when all inputs are zero (BSCH / all-zero network identity).
+ */
+uint32_t tetra_compute_scramb_seed(uint16_t mcc, uint16_t mnc, uint8_t colour);
 void tetra_viterbi_decode(uint8_t* in, uint8_t* out, int len);
 /* Soft-cost depuncture + Viterbi helper: depunc array length is depunc_len (coded symbols),
  * out_bits receives unpacked bits (caller must allocate sufficient space).

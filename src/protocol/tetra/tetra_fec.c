@@ -176,74 +176,78 @@ int tetra_rcpc_get_puncturer_params(int punct_id, const uint8_t **outP, int *out
 
 void tetra_block_deinterleave(uint8_t* in, uint8_t* out, int len, int a) {
     if (!in || !out || len <= 0 || a <= 0) return;
-    /* Implement a rectangular block deinterleaver parameterized by 'a'.
-     * Write input row-wise into a matrix with 'a' rows, then read out column-wise
-     * to produce the deinterleaved output. This matches the common block
-     * interleaver approach used in osmo-tetra where 'a' is a row count.
+    /* ETSI EN 300 392-2 §8.2.4.1 block deinterleave:
+     * π(i) = 1 + (a*i % K) ;  out[i-1] = in[π(i)-1]  for i = 1..K
+     * gcd(a, K) must equal 1 for a valid permutation.
      */
-    int rows = a;
-    int cols = (len + rows - 1) / rows;
-    /* Fill matrix by rows (pad with 0 if necessary) */
-    for (int r = 0; r < rows; r++) {
-        for (int c = 0; c < cols; c++) {
-            int src = r * cols + c;
-            int dst = c * rows + r;
-            if (src < len)
-                out[dst] = in[src];
-            else
-                out[dst] = 0;
-        }
+    const uint32_t K = (uint32_t)len;
+    const uint32_t A = (uint32_t)a;
+    for (uint32_t i = 1; i <= K; i++) {
+        uint32_t k = 1u + (A * i % K);
+        out[i - 1] = in[k - 1];
     }
-    fprintf(stderr, "[TETRA] block_deinterleave called (len=%d, a=%d)\n", len, a);
 }
 
-/* TETRA descrambler (PN sequence generator) - LFSR based.
- * Implement a 17-bit LFSR with taps at bit positions 17 and 3 (polynomial x^17 + x^3 + 1).
- * `lfsr_init` provides an initial non-zero seed; low bits are used as initial state.
+/* TETRA scrambling PN generator — 32-bit right-shifting Fibonacci LFSR.
+ * Polynomial: x^32+x^26+x^23+x^22+x^16+x^12+x^11+x^10+x^8+x^7+x^5+x^4+x^2+x+1
+ * (ETSI EN 300 392-2 §8.2.5 / osmo-tetra tetra_scramb.c)
+ *
+ * Tap macro: ST(x,y) = (x) >> (32-y), so ST(x,32) = x (bit 0 from LSB).
+ * The feedback bit (= output PN bit) is XOR of 14 tap positions, then
+ * injected at the MSB after a right-shift of the register.
+ *
+ * Seed formula (§8.2.5.2):
+ *   seed = ((colour & 0x3f) | ((mnc & 0x3fff) << 6) | ((mcc & 0x3ff) << 20)) << 2) | 3
+ * When MCC=MNC=colour=0: seed = 3.  This is the BSCH scrambling seed.
  */
+static uint8_t tetra_lfsr32_next(uint32_t *lfsr)
+{
+    uint32_t s = *lfsr;
+    /* taps at bit positions 0,6,9,10,16,20,21,22,24,25,27,28,30,31 (0=LSB) */
+    uint32_t bit = (
+        (s >>  0) ^ (s >>  6) ^ (s >>  9) ^ (s >> 10) ^
+        (s >> 16) ^ (s >> 20) ^ (s >> 21) ^ (s >> 22) ^
+        (s >> 24) ^ (s >> 25) ^ (s >> 27) ^ (s >> 28) ^
+        (s >> 30) ^ (s >> 31)
+    ) & 1u;
+    *lfsr = (s >> 1) | (bit << 31);
+    return (uint8_t)bit;
+}
+
 void tetra_descramble(uint8_t* in, int len, uint32_t lfsr_init) {
     if (!in || len <= 0) return;
-    uint32_t state = lfsr_init & 0x1FFFFu; /* 17-bit state */
-    if (state == 0) state = 0x1; /* avoid all-zero */
-    for (int i = 0; i < len; i++) {
-        /* generate next bit: xor of bit 16 and bit 2 (0-based) */
-        uint32_t bit16 = (state >> 16) & 1u;
-        uint32_t bit2 = (state >> 2) & 1u;
-        uint8_t pn = (uint8_t)(bit16 ^ bit2);
-        /* XOR descramble the input bit */
-        in[i] = in[i] ^ (pn & 1u);
-        /* advance LFSR: shift left and insert pn at lsb (feedback) */
-        state = ((state << 1) & 0x1FFFFu) | pn;
-    }
+    uint32_t state = lfsr_init ? lfsr_init : 3u; /* seed=0 is illegal; default to BSCH seed */
+    for (int i = 0; i < len; i++)
+        in[i] ^= tetra_lfsr32_next(&state);
 }
 
-/* Descramble soft-costs by inverting the soft cost polarity where scrambler bit == 1.
- * A soft cost is inverted by mapping 0x0000 <-> 0xFFFF; neutral cost 0x7FFF stays neutral if scrambler bit is 1.
+/* Descramble soft-costs: invert polarity where PN bit == 1.
+ * Neutral cost 0x7FFF stays neutral (completely uncertain ↔ no information).
+ * All other values are bitwise-complemented: v → (0xFFFF ^ v).
  */
 void tetra_descramble_soft(uint16_t* costs, int len, uint32_t lfsr_init) {
     if (!costs || len <= 0) return;
-    uint32_t state = lfsr_init & 0x1FFFFu; /* 17-bit state */
-    if (state == 0) state = 0x1;
+    uint32_t state = lfsr_init ? lfsr_init : 3u;
     for (int i = 0; i < len; i++) {
-        uint32_t bit16 = (state >> 16) & 1u;
-        uint32_t bit2 = (state >> 2) & 1u;
-        uint8_t pn = (uint8_t)(bit16 ^ bit2);
-        if (pn) {
-            uint16_t v = costs[i];
-            if (v == 0x7FFF) {
-                /* leave neutral as-is */
-            } else if (v == 0x0000) {
-                costs[i] = 0xFFFF;
-            } else if (v == 0xFFFF) {
-                costs[i] = 0x0000;
-            } else {
-                /* For intermediate soft values, invert around midpoint 0x7FFF */
-                uint32_t inv = (uint32_t)0xFFFFu - (uint32_t)v;
-                costs[i] = (uint16_t)inv;
-            }
-        }
-        state = ((state << 1) & 0x1FFFFu) | (pn & 1u);
+        uint8_t pn = tetra_lfsr32_next(&state);
+        if (pn && costs[i] != 0x7FFFu)
+            costs[i] = (uint16_t)(0xFFFFu ^ (uint32_t)costs[i]);
     }
+}
+
+/* Compute the TETRA scrambling seed from network identity parameters.
+ * Formula from ETSI EN 300 392-2 §8.2.5.2 and osmo-tetra tetra_scramb.c:
+ *   seed = ((colour & 0x3f) | ((mnc & 0x3fff) << 6) | ((mcc & 0x3ff) << 20)) << 2) | 3
+ * The constant 3 (SCRAMB_INIT) represents the pre-fill value p(-31)=1, p(-30)=1.
+ *
+ * Special case: mcc=0, mnc=0, colour=0 → seed = 3 (BSCH scrambling seed).
+ */
+uint32_t tetra_compute_scramb_seed(uint16_t mcc, uint16_t mnc, uint8_t colour)
+{
+    uint32_t s = (uint32_t)(colour  & 0x3fu)
+               | ((uint32_t)(mnc    & 0x3fffu) <<  6)
+               | ((uint32_t)(mcc    & 0x3ffu)  << 20);
+    return (s << 2) | 3u;   /* 3 = SCRAMB_INIT per §8.2.5.2 */
 }
 
 void tetra_viterbi_decode(uint8_t* in, uint8_t* out, int len) {
@@ -321,46 +325,43 @@ int tetra_rcpc_depuncture_soft(const uint16_t* in_costs, int info_bits_len, cons
 }
 
 void tetra_block_interleave(const uint8_t* in_bits, uint8_t* out_bits, int len, int rows, int cols) {
-    if (!in_bits || !out_bits || rows <= 0 || cols <= 0) return;
-    /* Simple row/column rectangular interleaver: write by rows, read by columns */
-    int idx = 0;
-    for (int r = 0; r < rows; r++) {
-        for (int c = 0; c < cols; c++) {
-            int pos = r * cols + c;
-            if (pos < len) {
-                out_bits[idx++] = in_bits[pos];
-            }
-        }
+    if (!in_bits || !out_bits || rows <= 0 || len <= 0) return;
+    /* ETSI EN 300 392-2 §8.2.4.1 block interleave:
+     * π(i) = 1 + (a*i % K) ;  out[π(i)-1] = in[i-1]  for i = 1..K
+     * `rows` is the interleaver parameter a; `cols` is unused (kept for ABI compat).
+     */
+    const uint32_t K = (uint32_t)len;
+    const uint32_t A = (uint32_t)rows;
+    (void)cols;
+    for (uint32_t i = 1; i <= K; i++) {
+        uint32_t k = 1u + (A * i % K);
+        out_bits[k - 1] = in_bits[i - 1];
     }
 }
 
 void tetra_block_deinterleave_bits(const uint8_t* in_bits, uint8_t* out_bits, int len, int rows, int cols) {
-    if (!in_bits || !out_bits || rows <= 0 || cols <= 0) return;
-    /* Inverse of the above rectangular interleaver */
-    int idx = 0;
-    for (int r = 0; r < rows; r++) {
-        for (int c = 0; c < cols; c++) {
-            int pos = r * cols + c;
-            if (pos < len) {
-                out_bits[pos] = in_bits[idx++];
-            }
-        }
+    if (!in_bits || !out_bits || rows <= 0 || len <= 0) return;
+    /* ETSI deinterleave: out[i-1] = in[π(i)-1] where π(i) = 1 + (a*i % K).
+     * `rows` is the interleaver parameter a; `cols` unused. */
+    const uint32_t K = (uint32_t)len;
+    const uint32_t A = (uint32_t)rows;
+    (void)cols;
+    for (uint32_t i = 1; i <= K; i++) {
+        uint32_t k = 1u + (A * i % K);
+        out_bits[i - 1] = in_bits[k - 1];
     }
 }
 
 void tetra_block_deinterleave_soft(const uint16_t* in_costs, uint16_t* out_costs, int len, int rows, int cols) {
-    if (!in_costs || !out_costs || rows <= 0 || cols <= 0) return;
-    /* Inverse of a rectangular interleaver for soft-costs: read column-wise from
-     * a rows x cols matrix filled row-wise by the transmitter. Reverse that here.
-     */
-    int idx = 0;
-    for (int r = 0; r < rows; r++) {
-        for (int c = 0; c < cols; c++) {
-            int pos = r * cols + c;
-            if (pos < len) {
-                out_costs[pos] = in_costs[idx++];
-            }
-        }
+    if (!in_costs || !out_costs || rows <= 0 || len <= 0) return;
+    /* ETSI deinterleave for soft costs: out[i-1] = in[π(i)-1] where π(i) = 1 + (a*i % K).
+     * `rows` is the interleaver parameter a; `cols` unused. */
+    const uint32_t K = (uint32_t)len;
+    const uint32_t A = (uint32_t)rows;
+    (void)cols;
+    for (uint32_t i = 1; i <= K; i++) {
+        uint32_t k = 1u + (A * i % K);
+        out_costs[i - 1] = in_costs[k - 1];
     }
 }
 

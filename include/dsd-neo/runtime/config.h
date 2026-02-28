@@ -611,7 +611,8 @@ typedef enum {
     DSDCFG_MODE_DPMR,
     DSDCFG_MODE_M17,
     DSDCFG_MODE_TDMA,
-    DSDCFG_MODE_ANALOG
+    DSDCFG_MODE_ANALOG,
+    DSDCFG_MODE_TETRA
 } dsdneoUserDecodeMode;
 
 typedef enum {

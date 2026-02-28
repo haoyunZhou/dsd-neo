@@ -234,8 +234,9 @@ dsd_bootstrap_interactive(dsd_opts* opts, dsd_state* state) {
     fprintf(stderr, " 11) dPMR\n");
     fprintf(stderr, " 12) M17\n");
     fprintf(stderr, " 13) P25 + DMR (TDMA)\n");
-    fprintf(stderr, " 14) Analog monitor (passive)\n");
-    int mode = prompt_int("Selection", 1, 1, 14);
+    fprintf(stderr, " 14) TETRA (pi/4-DQPSK, 18 kHz)\n");
+    fprintf(stderr, " 15) Analog monitor (passive)\n");
+    int mode = prompt_int("Selection", 1, 1, 15);
 
     // Apply decode mode selection
     switch (mode) {
@@ -523,7 +524,31 @@ dsd_bootstrap_interactive(dsd_opts* opts, dsd_state* state) {
             opts->pulse_digi_out_channels = 2;
             snprintf(opts->output_name, sizeof opts->output_name, "%s", "TDMA");
             break;
-        case 14: /* Analog monitor (-fA) */
+        case 14: /* TETRA (-fT) */
+            opts->frame_dstar = 0;
+            opts->frame_x2tdma = 0;
+            opts->frame_p25p1 = 0;
+            opts->frame_p25p2 = 0;
+            opts->frame_nxdn48 = 0;
+            opts->frame_nxdn96 = 0;
+            opts->frame_dmr = 0;
+            opts->frame_provoice = 0;
+            opts->frame_dpmr = 0;
+            opts->frame_ysf = 0;
+            opts->frame_m17 = 0;
+            opts->frame_tetra = 1;
+            opts->mod_c4fm = 0;
+            opts->mod_qpsk = 1;
+            opts->mod_gfsk = 0;
+            state->rf_mod = 1;
+            opts->pulse_digi_rate_out = 8000;
+            opts->pulse_digi_out_channels = 1;
+            opts->dmr_stereo = 0;
+            state->dmr_stereo = 0;
+            opts->dmr_mono = 0;
+            snprintf(opts->output_name, sizeof opts->output_name, "%s", "TETRA");
+            break;
+        case 15: /* Analog monitor (-fA) */
             opts->frame_dstar = 0;
             opts->frame_x2tdma = 0;
             opts->frame_p25p1 = 0;
@@ -535,6 +560,7 @@ dsd_bootstrap_interactive(dsd_opts* opts, dsd_state* state) {
             opts->frame_provoice = 0;
             opts->frame_ysf = 0;
             opts->frame_m17 = 0;
+            opts->frame_tetra = 0;
             opts->pulse_digi_rate_out = 8000;
             opts->pulse_digi_out_channels = 1;
             opts->dmr_stereo = 0;

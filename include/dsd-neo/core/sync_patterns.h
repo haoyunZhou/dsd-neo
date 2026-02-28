@@ -76,6 +76,21 @@
 #define INV_PROVOICE_EA_SYNC           "13313133113113333311313133133311"
 #define PROVOICE_EA_SYNC               "31131311331331111133131311311133"
 
+/* TETRA Normal Downlink Burst (NDB) Normal Training Sequence (NTS), 22 bits
+ * Reference: ETSI EN 300 392-2 Table 9.33
+ * NTS bits: 1,1,0,1,0,0,0,0,1,1,1,0,1,0,0,1,1,1,0,1,0,0 -> 11 dibits
+ * NOTE: pi/4-DQPSK differential decoding maps these to the patterns below;
+ *       validate against real TETRA signal captures before relying on them. */
+#define TETRA_NDB_NTS_SYNC         "31003221310" /* NTS dibits (non-inverted) */
+#define INV_TETRA_NDB_NTS_SYNC     "13330112230" /* NTS dibits (inverted/bit-flipped) */
+
+/* TETRA Synchronisation Burst SSB training sequence (ETSI EN 300 392-2 §9.4.4.3.4).
+ * y_bits[38] = { 1,1, 0,0, 0,0, 0,1, 1,0, 0,1, 1,1, 0,0, 1,1, 1,0, 1,0, 0,1,
+ *                1,1, 0,0, 0,0, 0,1, 1,0, 0,1, 1,1 }
+ * Mapped to 19 dibits: (b0<<1)|b1 per dibit pair. */
+#define TETRA_SB_SSB_SYNC          "3001213032213001213" /* all 19 SSB dibits (non-inverted) */
+#define INV_TETRA_SB_SSB_SYNC      "0332120301120332120" /* all 19 SSB dibits (inverted) */
+
 /* EDACS/PV EOT dotting sequence */
 #define DOTTING_SEQUENCE_A             "131313131313131313131313131313131313131313131313" /* 0xAAAA... */
 #define DOTTING_SEQUENCE_B             "313131313131313131313131313131313131313131313131" /* 0x5555... */

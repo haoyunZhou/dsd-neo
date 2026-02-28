@@ -12,6 +12,7 @@ target_sources(dsd-neo_dispatch PRIVATE
   dispatch/dispatch_p25p1.c
   dispatch/dispatch_p25p2.c
   dispatch/dispatch_provoice.c
+  dispatch/dispatch_tetra.c
   dispatch/dispatch_x2tdma.c
   dispatch/dispatch_ysf.c
 )
@@ -31,6 +32,7 @@ target_link_libraries(dsd-neo_dispatch PUBLIC
   dsd-neo_proto_nxdn
   dsd-neo_proto_p25
   dsd-neo_proto_provoice
+  dsd-neo_proto_tetra
   dsd-neo_proto_x2tdma
   dsd-neo_proto_ysf
 )

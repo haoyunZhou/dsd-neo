@@ -1343,6 +1343,31 @@ dsd_parse_short_opts(int argc, char** argv, dsd_opts* opts, dsd_state* state, in
                     snprintf(opts->output_name, sizeof opts->output_name, "%s", "M17");
                     LOG_NOTICE("Decoding only M17 frames (polarity auto-detected from preamble).\n");
                     opts->use_cosine_filter = 0;
+                } else if (optarg[0] == 'T') {
+                    /* -fT : TETRA-only mode (pi/4-DQPSK, 18 kHz channel) */
+                    opts->frame_dstar = 0;
+                    opts->frame_x2tdma = 0;
+                    opts->frame_p25p1 = 0;
+                    opts->frame_p25p2 = 0;
+                    opts->frame_nxdn48 = 0;
+                    opts->frame_nxdn96 = 0;
+                    opts->frame_dmr = 0;
+                    opts->frame_provoice = 0;
+                    opts->frame_dpmr = 0;
+                    opts->frame_ysf = 0;
+                    opts->frame_m17 = 0;
+                    opts->frame_tetra = 1;
+                    opts->mod_c4fm = 0;
+                    opts->mod_qpsk = 1;
+                    opts->mod_gfsk = 0;
+                    state->rf_mod = 1;
+                    opts->pulse_digi_rate_out = 8000;
+                    opts->pulse_digi_out_channels = 1;
+                    opts->dmr_stereo = 0;
+                    opts->dmr_mono = 0;
+                    state->dmr_stereo = 0;
+                    snprintf(opts->output_name, sizeof opts->output_name, "%s", "TETRA");
+                    LOG_NOTICE("Decoding only TETRA NDB frames (pi/4-DQPSK).\n");
                 } else if (optarg[0] == 'Z') {
                     opts->m17encoder = 1;
                     opts->pulse_digi_rate_out = 48000;
