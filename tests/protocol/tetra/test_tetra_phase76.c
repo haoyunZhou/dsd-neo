@@ -81,16 +81,16 @@ static void test_sds_data_truncation(void)
     st->tetra_sds_text_len = 5;
     strcpy(st->tetra_sds_text, "HELLO");
 
-    /* Truncated CMCE type=23 (D-SDS-DATA), missing SDS-TL bits */
-    uint8_t cmce[30];
+    /* Truncated CMCE type=23 (D-SDS-DATA), missing SDS-TL bits but enough to parse SSI */
+    uint8_t cmce[40];
     memset(cmce, 0, sizeof(cmce));
     pack_bits(cmce, 23, 0, 5); /* D-SDS-DATA */
     pack_bits(cmce,  0, 5, 1); /* external = 0 */
     pack_bits(cmce, 111, 6, 24); /* calling_ssi */
-    /* Cut it short: only 30 bits total, length < 36 so it gets aborted or jumps to log_only */
+    /* Cut it short: only 36 bits total, so it reaches log_only */
 
-    uint8_t pdu[30 + 9]; int n;
-    wrap_mle_cmce(cmce, 30, pdu, &n);
+    uint8_t pdu[40 + 9]; int n;
+    wrap_mle_cmce(cmce, 36, pdu, &n);
     tetra_mle_dispatch(pdu, n, 0, opt, st);
 
     /* Since parsing truncated at log_only, text_len should be cleared */

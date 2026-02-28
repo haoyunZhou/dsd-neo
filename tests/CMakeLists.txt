@@ -573,6 +573,20 @@ target_include_directories(dsd-neo_test_tetra_phase69 PRIVATE ${PROJECT_SOURCE_D
 target_link_libraries(dsd-neo_test_tetra_phase69 PRIVATE dsd-neo_core dsd-neo_runtime)
 add_test(NAME TETRA_PHASE69 COMMAND dsd-neo_test_tetra_phase69)
 
+# Phase 76: TETRA remaining log_only stubs (Phases 71-75)
+add_executable(dsd-neo_test_tetra_phase76
+  protocol/tetra/test_tetra_phase76.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_mac.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_mle.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_mm.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_trunk_sm.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_bsch.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_fec.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_channel_info.c)
+target_include_directories(dsd-neo_test_tetra_phase76 PRIVATE ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(dsd-neo_test_tetra_phase76 PRIVATE dsd-neo_core dsd-neo_runtime)
+add_test(NAME TETRA_PHASE76 COMMAND dsd-neo_test_tetra_phase76)
+
 add_executable(dsd-neo_test_runtime_cli_compact runtime/test_runtime_cli_compact.c)
 target_include_directories(dsd-neo_test_runtime_cli_compact PRIVATE ${PROJECT_SOURCE_DIR}/include)
 target_link_libraries(dsd-neo_test_runtime_cli_compact PRIVATE dsd-neo_runtime dsd-neo_test_support)

@@ -645,6 +645,10 @@ static void parse_cmce_d_sds_data(const uint8_t *bits, int nbits,
     if (nbits < 36) {
         fprintf(stderr, "[TETRA CMCE D-SDS-DATA] CC=%d (too short: %d bits)\n",
                 cc, nbits);
+        if (state) {
+            state->tetra_sds_text_len = 0;
+            state->tetra_sds_text[0]  = '\0';
+        }
         return;
     }
 
