@@ -210,6 +210,11 @@ dsd_neo_add_public_header_smoke_test(
   HEADERS_PUBLIC_CORE_STATE_EXT
   dsd-neo/core/state_ext.h
   C)
+dsd_neo_add_public_header_smoke_test(
+  dsd-neo_test_headers_public_core_vocoder
+  HEADERS_PUBLIC_CORE_VOCODER
+  dsd-neo/core/vocoder.h
+  C)
 
 dsd_neo_add_public_header_smoke_test(
   dsd-neo_test_headers_public_dsp_sync_hamming
@@ -374,6 +379,11 @@ add_executable(dsd-neo_test_core_dsd_time core/test_core_dsd_time.c)
 target_include_directories(dsd-neo_test_core_dsd_time PRIVATE ${PROJECT_SOURCE_DIR}/include)
 target_link_libraries(dsd-neo_test_core_dsd_time PRIVATE dsd-neo_core)
 add_test(NAME CORE_DSD_TIME COMMAND dsd-neo_test_core_dsd_time)
+
+add_executable(dsd-neo_test_core_vocoder_type core/test_vocoder_type.c)
+target_include_directories(dsd-neo_test_core_vocoder_type PRIVATE ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(dsd-neo_test_core_vocoder_type PRIVATE dsd-neo_core)
+add_test(NAME CORE_VOCODER_TYPE COMMAND dsd-neo_test_core_vocoder_type)
 
 add_executable(dsd-neo_test_core_csv_import core/test_core_csv_import.c)
 target_include_directories(dsd-neo_test_core_csv_import PRIVATE ${PROJECT_SOURCE_DIR}/include)

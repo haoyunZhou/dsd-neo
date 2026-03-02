@@ -152,6 +152,9 @@ extern "C" {
 /** Check if synctype is any DMR */
 #define DSD_SYNC_IS_DMR(s) (DSD_SYNC_IS_DMR_BS(s) || DSD_SYNC_IS_DMR_MS(s))
 
+/** Check if synctype is D-STAR voice (excludes header frames) */
+#define DSD_SYNC_IS_DSTAR_VOICE(s) ((s) == DSD_SYNC_DSTAR_VOICE_POS || (s) == DSD_SYNC_DSTAR_VOICE_NEG)
+
 /** Check if synctype is D-STAR (voice or header) */
 #define DSD_SYNC_IS_DSTAR(s)                                                                                           \
     ((s) == DSD_SYNC_DSTAR_VOICE_POS || (s) == DSD_SYNC_DSTAR_VOICE_NEG || (s) == DSD_SYNC_DSTAR_HD_POS                \
