@@ -10,6 +10,7 @@ target_sources(dsd-neo_core PRIVATE
   audio/dsd_upsample.c
   vocoder/dsd_mbe.c
   vocoder/dsd_mbe2.c
+  vocoder/dsd_vocoder_type.c
   frames/dsd_frame.c
   frames/dsd_dibit.c
   time/dsd_time.c

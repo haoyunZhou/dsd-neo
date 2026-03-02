@@ -139,7 +139,7 @@ soft_mbe(dsd_opts* opts, dsd_state* state, char imbe_fr[8][23], char ambe_fr[4][
     }
 
     //D-STAR AMBE
-    else if (state->synctype == DSD_SYNC_DSTAR_VOICE_POS || state->synctype == DSD_SYNC_DSTAR_VOICE_NEG) {
+    else if (DSD_SYNC_IS_DSTAR_VOICE(state->synctype)) {
         soft_demod_ambe_dstar(opts, state, ambe_fr, ambe_d);
         if (opts->payload == 1) {
             PrintAMBEData(opts, state, ambe_d);
