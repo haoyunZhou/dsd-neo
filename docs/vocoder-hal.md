@@ -1,6 +1,8 @@
 # Vocoder HAL Design in dsd-neo
 
 > **Scope:** This document summarises the Vocoder Hardware Abstraction Layer (HAL) in the `dsd-neo` project—covering abstract interfaces, supported vocoder types, encode/decode flow, state management, automatic codec selection, and inter-module collaboration.  Intended for PR discussion and code review.
+>
+> See also `docs/vocoder-libraries.md` for library details, protocol-to-codec mapping, and a full auto-matching walkthrough.
 
 ---
 
