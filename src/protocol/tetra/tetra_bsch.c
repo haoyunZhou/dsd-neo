@@ -21,15 +21,10 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <dsd-neo/protocol/tetra/tetra_bits.h>
 
-/* Extract an unsigned integer from a packed bit array (MSB first). */
-static uint32_t bits_to_uint(const uint8_t *bits, int offset, int len)
-{
-    uint32_t val = 0;
-    for (int i = 0; i < len; i++)
-        val = (val << 1) | (bits[offset + i] & 1u);
-    return val;
-}
+/* Phase 81: bits_to_uint unified — see tetra_bits.h */
+#define bits_to_uint  tetra_bits_to_uint
 
 int tetra_bsch_parse(const uint8_t *bits, int len,
                      dsd_opts *opts, dsd_state *state)

@@ -17,17 +17,10 @@
 #include <stdint.h>
 #include <string.h>
 #include <time.h>
+#include <dsd-neo/protocol/tetra/tetra_bits.h>
 
-/* -----------------------------------------------------------------------
- * Internal bit utility (local copy — avoids coupling to tetra_mac.c).
- * ----------------------------------------------------------------------- */
-static uint32_t mle_bits_to_uint(const uint8_t *bits, int off, int n)
-{
-    uint32_t v = 0;
-    for (int i = 0; i < n; i++)
-        v = (v << 1) | (bits[off + i] & 1u);
-    return v;
-}
+/* Phase 81: bits_to_uint unified — see tetra_bits.h */
+#define mle_bits_to_uint  tetra_bits_to_uint
 
 /* -----------------------------------------------------------------------
  * CMCE D-SETUP parser
@@ -508,7 +501,6 @@ static void parse_cmce_d_tx_event(const uint8_t *bits, int nbits,
                                    int cc, uint32_t pdu_type,
                                    dsd_state *state)
 {
-    (void)bits; (void)nbits;
     const char *name;
     switch (pdu_type) {
     case TETRA_CMCE_D_TX_CONTINUE:  name = "D-TX-CONTINUE";  break;
@@ -517,9 +509,28 @@ static void parse_cmce_d_tx_event(const uint8_t *bits, int nbits,
     case TETRA_CMCE_D_TX_TIMED_OUT: name = "D-TX-TIMED-OUT"; break;
     default:                         name = "D-TX-?";         break;
     }
-    fprintf(stderr, "[TETRA CMCE %s] CC=%d\n", name, cc);
+
+    /* ETSI EN 300 392-2 §14.7.1.23-27:
+     *   Bits 0-4 : pdu_type
+     *   Bit    5 : call_id (1 bit, Transaction Identifier)
+     *   Bit    6 : notification indicator (1 bit)
+     * D-TX-CONTINUE additionally has:
+     *   Bits 7-8 : tx_demand_priority (2 bits)         */
+    uint32_t call_id      = 0;
+    uint32_t notification = 0;
+
+    if (nbits >= 6)
+        call_id = mle_bits_to_uint(bits, 5, 1);
+    if (nbits >= 7)
+        notification = mle_bits_to_uint(bits, 6, 1);
+
+    fprintf(stderr, "[TETRA CMCE %s] CC=%d  call_id=%u  notif=%u  (%d bits)\n",
+            name, cc, call_id, notification, nbits);
 
     if (state) {
+        state->tetra_tx_event_call_id      = (uint8_t)call_id;
+        state->tetra_tx_event_notification = (uint8_t)notification;
+
         switch (pdu_type) {
         case TETRA_CMCE_D_TX_CONTINUE:  state->tetra_tx_continue    = 1; break;
         case TETRA_CMCE_D_TX_INTERRUPT: state->tetra_tx_interrupted = 1; break;
@@ -543,18 +554,32 @@ static void parse_cmce_d_info(const uint8_t *bits, int nbits, int cc,
      *   Bits 0-4 : pdu_type = 14
      *   Bit    5 : call_id  (1 bit, Transaction Identifier)
      *   Bit    6 : call_timeout (1 bit)
+     *   Bit    7 : notification indicator (1 bit, optional)
      *   further optional IEs follow */
-    if (nbits >= 6) {
-        uint32_t call_id = mle_bits_to_uint(bits, 5, 1);
-        fprintf(stderr, "[TETRA CMCE D-INFO] CC=%d  call_id=%u\n", cc, call_id);
-        if (state) {
-            state->tetra_d_info_call_id = (uint8_t)call_id;
-            state->tetra_d_info_valid   = 1;
-        }
-    } else {
+    if (nbits < 6) {
         fprintf(stderr, "[TETRA CMCE D-INFO] CC=%d  (%d bits, too short)\n",
                 cc, nbits);
         if (state) state->tetra_d_info_valid = 1;
+        return;
+    }
+
+    uint32_t call_id = mle_bits_to_uint(bits, 5, 1);
+    uint32_t call_timeout = 0;
+    uint32_t notification = 0;
+
+    if (nbits >= 7)
+        call_timeout = mle_bits_to_uint(bits, 6, 1);
+    if (nbits >= 8)
+        notification = mle_bits_to_uint(bits, 7, 1);
+
+    fprintf(stderr, "[TETRA CMCE D-INFO] CC=%d  call_id=%u  timeout=%u  notif=%u  (%d bits)\n",
+            cc, call_id, call_timeout, notification, nbits);
+
+    if (state) {
+        state->tetra_d_info_call_id      = (uint8_t)call_id;
+        state->tetra_d_info_call_timeout  = (uint8_t)call_timeout;
+        state->tetra_d_info_notification  = (uint8_t)notification;
+        state->tetra_d_info_valid         = 1;
     }
 }
 
@@ -787,6 +812,198 @@ log_only:
 }
 
 /* -----------------------------------------------------------------------
+ * Phase 83: CMCE D-FACILITY (PDU type 15) — supplementary service.
+ * ETSI EN 300 392-2 §14.7.1.18
+ *
+ * Layout:
+ *   Bits 0-4  : pdu_type = 15
+ *   Bits 5-8  : facility_ie (4-bit type indicator)
+ *   Remaining : supplementary-service-specific IEs (variable)
+ * ----------------------------------------------------------------------- */
+static void parse_cmce_d_facility(const uint8_t *bits, int nbits,
+                                   int cc, dsd_state *state)
+{
+    uint8_t fac_type = 0;
+    if (nbits >= 9)
+        fac_type = (uint8_t)mle_bits_to_uint(bits, 5, 4);
+
+    fprintf(stderr, "[TETRA CMCE D-FACILITY] CC=%d  fac_type=%u  (%d bits)\n",
+            cc, fac_type, nbits);
+    if (state) {
+        state->tetra_facility_type  = fac_type;
+        state->tetra_facility_valid = 1;
+    }
+}
+
+/* -----------------------------------------------------------------------
+ * Phase 83: CMCE D-SDS-ACK (PDU type 17) — SDS acknowledgement.
+ * ETSI EN 300 392-2 §14.7.1.16
+ *
+ * Layout:
+ *   Bits 0-4  : pdu_type = 17
+ *   Bits 5-8  : message_reference (4 bits)
+ * ----------------------------------------------------------------------- */
+static void parse_cmce_d_sds_ack(const uint8_t *bits, int nbits,
+                                  int cc, dsd_state *state)
+{
+    uint8_t msg_ref = 0;
+    if (nbits >= 9)
+        msg_ref = (uint8_t)mle_bits_to_uint(bits, 5, 4);
+
+    fprintf(stderr, "[TETRA CMCE D-SDS-ACK] CC=%d  msg_ref=%u\n", cc, msg_ref);
+    if (state) {
+        state->tetra_sds_ack_msg_ref = msg_ref;
+        state->tetra_sds_ack_valid   = 1;
+    }
+}
+
+/* -----------------------------------------------------------------------
+ * Phase 83: CMCE D-SDS-SHORT-REPORT (PDU type 18) — SDS short report.
+ * ETSI EN 300 392-2 §14.7.1.20a
+ *
+ * Layout:
+ *   Bits 0-4  : pdu_type = 18
+ *   Bits 5-6  : report_result (2 bits: 0=success, 1=fail, 2=pending, 3=reserved)
+ * ----------------------------------------------------------------------- */
+static void parse_cmce_d_sds_short_report(const uint8_t *bits, int nbits,
+                                           int cc, dsd_state *state)
+{
+    uint8_t result = 0;
+    if (nbits >= 7)
+        result = (uint8_t)mle_bits_to_uint(bits, 5, 2);
+
+    fprintf(stderr, "[TETRA CMCE D-SDS-SHORT-REPORT] CC=%d  result=%u\n",
+            cc, result);
+    if (state) {
+        state->tetra_sds_short_report_result = result;
+        state->tetra_sds_short_report_valid  = 1;
+    }
+}
+
+/* -----------------------------------------------------------------------
+ * Phase 82: CMCE D-SDS-LONG-DATA (PDU type 20) — long SDS data.
+ * ETSI EN 300 392-2 §14.7.1.19a
+ *
+ * Layout (similar to D-SDS-DATA with 10-bit length indicator):
+ *   Bits  0-4  : pdu_type = 20
+ *   Bit     5  : external_subscriber_number flag
+ *   Bits  6-29 : calling_ssi (24 bits, if flag == 0)
+ *   Bits 30-33 : message_reference (4 bits)
+ *   Bits 34-43 : length_indicator (10 bits, data length in bits)
+ *   Then SDS-TL PDU:
+ *     bits_per_character (8 bits)
+ *     number_of_characters (8 bits)
+ *     character data
+ * ----------------------------------------------------------------------- */
+static void parse_cmce_d_sds_long_data(const uint8_t *bits, int nbits,
+                                        int cc, dsd_state *state)
+{
+    if (nbits < 44) {
+        fprintf(stderr, "[TETRA CMCE D-SDS-LONG-DATA] CC=%d (too short: %d bits)\n",
+                cc, nbits);
+        if (state) {
+            state->tetra_sds_long_text_len = 0;
+            state->tetra_sds_long_text[0]  = '\0';
+        }
+        return;
+    }
+
+    int off = 5; /* skip pdu_type */
+
+    /* External subscriber flag */
+    uint32_t ext_flag = mle_bits_to_uint(bits, off, 1); off += 1;
+
+    uint32_t src_ssi = 0;
+    if (ext_flag == 0) {
+        if (off + 24 > nbits) goto long_log_only;
+        src_ssi = mle_bits_to_uint(bits, off, 24);
+        off += 24;
+    } else {
+        if (off + 8 > nbits) goto long_log_only;
+        int field_len = (int)mle_bits_to_uint(bits, off, 8); off += 8;
+        if (field_len > 0 && off + field_len <= nbits) {
+            int grab = field_len > 24 ? 24 : field_len;
+            src_ssi = mle_bits_to_uint(bits, off, grab);
+        }
+        off += field_len;
+    }
+
+    /* message_reference (4 bits) */
+    if (off + 4 > nbits) goto long_log_only;
+    off += 4; /* msg_ref consumed but not saved separately */
+
+    /* length_indicator (10 bits) */
+    if (off + 10 > nbits) goto long_log_only;
+    uint32_t data_len_bits = mle_bits_to_uint(bits, off, 10); off += 10;
+    (void)data_len_bits;
+
+    /* SDS-TL PDU: bpc (8 bits) + num_chars (8 bits) + data */
+    if (off + 16 > nbits) goto long_log_only;
+    uint32_t bpc       = mle_bits_to_uint(bits, off, 8); off += 8;
+    uint32_t num_chars = mle_bits_to_uint(bits, off, 8); off += 8;
+
+    fprintf(stderr, "[TETRA CMCE D-SDS-LONG-DATA] CC=%d  src_SSI=%u  bpc=%u  num_chars=%u",
+            cc, src_ssi, bpc, num_chars);
+
+    char text[256];
+    int  text_len = 0;
+    uint8_t is_unicode = 0;
+
+    if ((bpc == 7 || bpc == 8) && num_chars > 0 && off + (int)(num_chars * bpc) <= nbits) {
+        uint32_t max_chars = num_chars < 255u ? num_chars : 255u;
+        for (uint32_t ci = 0; ci < max_chars; ci++) {
+            uint8_t ch = (uint8_t)mle_bits_to_uint(bits, off + (int)(ci * bpc), (int)bpc);
+            text[text_len++] = (char)(ch & 0x7Fu);
+        }
+        text[text_len] = '\0';
+        fprintf(stderr, "  text=\"%s\"", text);
+    } else if ((bpc == 10 || bpc == 16) && num_chars > 0 && off + (int)(num_chars * bpc) <= nbits) {
+        is_unicode = 1;
+        uint32_t max_chars = num_chars < 127u ? num_chars : 127u;
+        for (uint32_t ci = 0; ci < max_chars; ci++) {
+            uint32_t cp = mle_bits_to_uint(bits, off + (int)(ci * bpc), (int)bpc);
+            if (cp < 0x80u && text_len + 1 < 255) {
+                text[text_len++] = (char)cp;
+            } else if (cp < 0x800u && text_len + 2 < 255) {
+                text[text_len++] = (char)(0xC0u | (cp >> 6));
+                text[text_len++] = (char)(0x80u | (cp & 0x3Fu));
+            } else if (text_len + 3 < 255) {
+                text[text_len++] = (char)(0xE0u | (cp >> 12));
+                text[text_len++] = (char)(0x80u | ((cp >> 6) & 0x3Fu));
+                text[text_len++] = (char)(0x80u | (cp & 0x3Fu));
+            }
+        }
+        text[text_len] = '\0';
+        fprintf(stderr, "  text(utf8)=\"%s\"", text);
+    } else {
+        text_len = 0;
+        text[0]  = '\0';
+    }
+    fprintf(stderr, "\n");
+
+    if (state) {
+        if (src_ssi) state->tetra_sds_src = src_ssi;
+        state->tetra_sds_long_text_len     = (uint16_t)(text_len & 0xFFFFu);
+        state->tetra_sds_long_text_unicode = is_unicode;
+        if (text_len > 0)
+            memcpy(state->tetra_sds_long_text, text, (size_t)(text_len + 1));
+        else
+            state->tetra_sds_long_text[0] = '\0';
+        state->tetra_sds_long_valid = 1;
+    }
+    return;
+
+long_log_only:
+    fprintf(stderr, "[TETRA CMCE D-SDS-LONG-DATA] CC=%d  src_SSI=%u  (truncated)\n",
+            cc, src_ssi);
+    if (state) {
+        if (src_ssi) state->tetra_sds_src = src_ssi;
+        state->tetra_sds_long_text_len = 0;
+        state->tetra_sds_long_text[0]  = '\0';
+    }
+}
+
+/* -----------------------------------------------------------------------
  * CMCE D-SDS-REPORT (PDU type 22)  — SDS delivery report.
  * ETSI EN 300 392-2 §14.7.1.20
  *
@@ -883,6 +1100,22 @@ static void tetra_cmce_parse(const uint8_t *bits, int nbits,
         parse_cmce_d_info(bits, nbits, cc, state);
         break;
 
+    case TETRA_CMCE_D_FACILITY:
+        parse_cmce_d_facility(bits, nbits, cc, state);
+        break;
+
+    case TETRA_CMCE_D_SDS_ACK:
+        parse_cmce_d_sds_ack(bits, nbits, cc, state);
+        break;
+
+    case TETRA_CMCE_D_SDS_SHORT_REPORT:
+        parse_cmce_d_sds_short_report(bits, nbits, cc, state);
+        break;
+
+    case TETRA_CMCE_D_SDS_LONG_DATA:
+        parse_cmce_d_sds_long_data(bits, nbits, cc, state);
+        break;
+
     case TETRA_CMCE_D_SDS_SHORT_DATA:
         parse_cmce_d_sds_short_data(bits, nbits, cc, state);
         break;
@@ -929,6 +1162,34 @@ void tetra_mle_dispatch(const uint8_t *bits, int nbits,
             tetra_cmce_parse(bits + 9, nbits - 9, cc, opts, state);
         } else if (pd == TETRA_MLE_PD_MM) {
             tetra_mm_dispatch(bits + 9, nbits - 9, cc, opts, state);
+        } else if (pd == TETRA_MLE_PD_SNDCP) {
+            /* ────────────────────────────────────────────────────────────
+             * SNDCP — Sub-Network Dependent Convergence Protocol (PD=8)
+             * ETSI EN 300 392-3 §11 / EN 300 392-2 Table 21.2
+             *
+             * Minimal parser: extract NSAPI (4 bits) and SNDCP PDU type
+             * (4 bits) from the first octet, log, and save to state.
+             * ──────────────────────────────────────────────────────────── */
+            const uint8_t *sn = bits + 9;
+            int sn_nbits = nbits - 9;
+            if (sn_nbits >= 8) {
+                uint32_t nsapi    = mle_bits_to_uint(sn, 0, 4);
+                uint32_t sn_type  = mle_bits_to_uint(sn, 4, 4);
+                fprintf(stderr,
+                        "[TETRA SNDCP] CC=%d  NSAPI=%u  pdu_type=%u  (%d bits)\n",
+                        cc, nsapi, sn_type, sn_nbits);
+                if (state) {
+                    state->tetra_sndcp_nsapi    = (uint8_t)nsapi;
+                    state->tetra_sndcp_pdu_type = (uint8_t)sn_type;
+                    state->tetra_sndcp_nbits    = (uint16_t)sn_nbits;
+                    state->tetra_sndcp_valid    = 1;
+                }
+            } else {
+                fprintf(stderr,
+                        "[TETRA SNDCP] CC=%d  (%d bits, too short)\n",
+                        cc, sn_nbits);
+                if (state) state->tetra_sndcp_valid = 1;
+            }
         } else {
             if (opts && opts->errorbars) {
                 fprintf(stderr, "[TETRA MLE C-PLANE] CC=%d  PD=%u  (%d bits)\n",

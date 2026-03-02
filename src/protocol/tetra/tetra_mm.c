@@ -13,17 +13,10 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
+#include <dsd-neo/protocol/tetra/tetra_bits.h>
 
-/* -----------------------------------------------------------------------
- * Internal bit utility
- * ----------------------------------------------------------------------- */
-static uint32_t mm_bits_to_uint(const uint8_t *bits, int off, int n)
-{
-    uint32_t v = 0;
-    for (int i = 0; i < n; i++)
-        v = (v << 1) | (bits[off + i] & 1u);
-    return v;
-}
+/* Phase 81: bits_to_uint unified — see tetra_bits.h */
+#define mm_bits_to_uint  tetra_bits_to_uint
 
 /* -----------------------------------------------------------------------
  * Carrier frequency table (ETSI EN 300 392-2 Annex A)

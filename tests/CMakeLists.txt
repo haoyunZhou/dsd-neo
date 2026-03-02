@@ -601,6 +601,43 @@ target_include_directories(dsd-neo_test_tetra_phase80 PRIVATE ${PROJECT_SOURCE_D
 target_link_libraries(dsd-neo_test_tetra_phase80 PRIVATE dsd-neo_core dsd-neo_runtime)
 add_test(NAME TETRA_PHASE80 COMMAND dsd-neo_test_tetra_phase80)
 
+# Phase 85: TETRA phases 81-84 (bits header, long SDS, facility/ack/report, channel_info)
+add_executable(dsd-neo_test_tetra_phase85
+  protocol/tetra/test_tetra_phase85.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_mac.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_mle.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_mm.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_trunk_sm.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_bsch.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_fec.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_channel_info.c)
+target_include_directories(dsd-neo_test_tetra_phase85 PRIVATE ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(dsd-neo_test_tetra_phase85 PRIVATE dsd-neo_core dsd-neo_runtime)
+add_test(NAME TETRA_PHASE85 COMMAND dsd-neo_test_tetra_phase85)
+
+# Phase 86: Expanded D-INFO, D-TX, SNDCP, channel info, D-SDS-LONG display
+add_executable(dsd-neo_test_tetra_phase86
+  protocol/tetra/test_tetra_phase86.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_mac.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_mle.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_mm.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_trunk_sm.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_bsch.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_fec.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_channel_info.c)
+target_include_directories(dsd-neo_test_tetra_phase86 PRIVATE ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(dsd-neo_test_tetra_phase86 PRIVATE dsd-neo_core dsd-neo_runtime)
+add_test(NAME TETRA_PHASE86 COMMAND dsd-neo_test_tetra_phase86)
+
+# Phase 87: TCH/FS pipeline reorder fix
+add_executable(dsd-neo_test_tetra_phase87
+  protocol/tetra/test_tetra_phase87.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_acelp.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/tetra/tetra_tch_slot_gate.c)
+target_include_directories(dsd-neo_test_tetra_phase87 PRIVATE ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(dsd-neo_test_tetra_phase87 PRIVATE dsd-neo_core dsd-neo_runtime)
+add_test(NAME TETRA_PHASE87 COMMAND dsd-neo_test_tetra_phase87)
+
 add_executable(dsd-neo_test_runtime_cli_compact runtime/test_runtime_cli_compact.c)
 target_include_directories(dsd-neo_test_runtime_cli_compact PRIVATE ${PROJECT_SOURCE_DIR}/include)
 target_link_libraries(dsd-neo_test_runtime_cli_compact PRIVATE dsd-neo_runtime dsd-neo_test_support)

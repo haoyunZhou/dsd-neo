@@ -1294,6 +1294,8 @@ struct dsd_state {
     uint8_t  tetra_tx_interrupted;
     uint8_t  tetra_tx_wait;
     uint8_t  tetra_tx_timed_out;
+    uint8_t  tetra_tx_event_call_id;
+    uint8_t  tetra_tx_event_notification;
 
     /* ───────────────────────────────────────────────────────────────────────
      * TETRA MM D-CHECK-TSI / D-STATUS + MLE D-RESTORE fields (Phase 55):
@@ -1315,10 +1317,14 @@ struct dsd_state {
     /* ───────────────────────────────────────────────────────────────────────
      * TETRA CMCE D-INFO parsed fields (Phase 57):
      *
-     * tetra_d_info_call_id: 1-bit call identification (TI).
-     * tetra_d_info_valid:   1 once a D-INFO has been decoded.
+     * tetra_d_info_call_id:      1-bit call identification (TI).
+     * tetra_d_info_call_timeout:  1-bit call timeout toggle.
+     * tetra_d_info_notification:  1-bit notification indicator (if present).
+     * tetra_d_info_valid:         1 once a D-INFO has been decoded.
      * ───────────────────────────────────────────────────────────────────────── */
     uint8_t  tetra_d_info_call_id;
+    uint8_t  tetra_d_info_call_timeout;
+    uint8_t  tetra_d_info_notification;
     uint8_t  tetra_d_info_valid;
 
     /* ───────────────────────────────────────────────────────────────────────
@@ -1449,6 +1455,27 @@ struct dsd_state {
     uint8_t  tetra_mm_detach_flag;
     uint8_t  tetra_mm_class_of_grp;
     uint8_t  tetra_mm_addr_type;
+
+    /* --- Phase 82-83: additional CMCE PDU fields --- */
+    uint8_t  tetra_facility_valid;
+    uint8_t  tetra_facility_type;
+
+    uint8_t  tetra_sds_ack_valid;
+    uint8_t  tetra_sds_ack_msg_ref;
+
+    uint8_t  tetra_sds_short_report_valid;
+    uint8_t  tetra_sds_short_report_result;
+
+    uint8_t  tetra_sds_long_valid;
+    uint16_t tetra_sds_long_text_len;
+    uint8_t  tetra_sds_long_text_unicode;
+    char     tetra_sds_long_text[256];
+
+    /* --- Phase 86: SNDCP (PD=8) parsed fields --- */
+    uint8_t  tetra_sndcp_valid;
+    uint8_t  tetra_sndcp_nsapi;
+    uint8_t  tetra_sndcp_pdu_type;
+    uint16_t tetra_sndcp_nbits;
 };
 
 // NOLINTEND(clang-analyzer-optin.performance.Padding)

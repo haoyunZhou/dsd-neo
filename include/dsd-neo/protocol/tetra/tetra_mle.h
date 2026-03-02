@@ -71,6 +71,10 @@ extern "C" {
 #define TETRA_CMCE_D_TX_WAIT         12
 #define TETRA_CMCE_D_TX_TIMED_OUT    13
 #define TETRA_CMCE_D_INFO            14
+#define TETRA_CMCE_D_FACILITY        15   /* Supplementary svc   §14.7.1.18 */
+#define TETRA_CMCE_D_SDS_ACK         17   /* SDS acknowledgement §14.7.1.16 */
+#define TETRA_CMCE_D_SDS_SHORT_REPORT 18  /* SDS short report    §14.7.1.20a*/
+#define TETRA_CMCE_D_SDS_LONG_DATA   20   /* Long SDS data       §14.7.1.19a*/
 #define TETRA_CMCE_D_SDS_SHORT_DATA  21  /* Short data service  §14.7.1.17 */
 #define TETRA_CMCE_D_SDS_REPORT      22  /* SDS delivery report §14.7.1.20 */
 #define TETRA_CMCE_D_SDS_DATA        23  /* Short data message  §14.7.1.19 */

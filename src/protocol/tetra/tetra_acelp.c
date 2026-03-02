@@ -22,7 +22,7 @@
 
 /* 50 Class-0 (most protected) bit positions, 1-indexed */
 static const uint8_t class0_positions[] = {
-    35, 36, 37, 38, 39, 40, 41, 42, 33, 47, 48,
+    35, 36, 37, 38, 39, 40, 41, 42, 43, 47, 48,
     56, 61, 62, 63, 65, 66, 67, 68, 69, 70, 74,
     75, 83, 88, 89, 90, 91, 92, 93, 94, 95, 96,
     97, 101, 102, 110, 115, 116, 117, 118, 119,
@@ -73,32 +73,39 @@ enum {
 #define TETRA_TCH_FRAME_BITS     137  /* encoded bits in one ACELP codec frame       */
 #define TETRA_TCH_FRAME_SAMPLES  160  /* decoded PCM16 samples (20ms @ 8 kHz)         */
 
-/* Convert decoded TYPE2 bits (432 bits) into two consecutive codec frames (2*216 bits)
- * This matches osmo-tetra's tetra_acelp_type2_to_codec behavior.
+/* Convert decoded TYPE2 bits (at least 272 bits) into two consecutive codec frames.
+ * Each frame occupies TETRA_TCH_FRAME_BITS (137) bytes in the output buffer.
+ * The output buffer must be at least 2 * TETRA_TCH_FRAME_BITS = 274 bytes.
+ *
+ * The class-reordered TYPE2 layout is (ETSI EN 300 395-2 Table 4):
+ *   [class0_frame0, class0_frame1, class0_frame0, class0_frame1, ...]  × 50 pairs
+ *   [class1 interleaved]  × 56 pairs
+ *   [class2 interleaved]  × 30 pairs
+ * Total: 2 × (50+56+30) = 272 input bits consumed.
  */
 void tetra_acelp_reorder(const uint8_t* in, uint8_t* out, int len) {
-    (void)len; /* we expect at least 2*NUM_ACELP_BITS but function uses provided arrays */
+    (void)len;
     const uint8_t *in_cur = in;
     int bit, frame;
 
     /* Class0 */
     for (bit = 0; bit < NUM_ACELP_CLASS0_BITS; bit++) {
         for (frame = 0; frame < 2; frame++)
-            out[frame*NUM_ACELP_BITS + class0_positions[bit] - 1] = in_cur[2*bit + frame];
+            out[frame * TETRA_TCH_FRAME_BITS + class0_positions[bit] - 1] = in_cur[2*bit + frame];
     }
     in_cur += 2*NUM_ACELP_CLASS0_BITS;
 
     /* Class1 */
     for (bit = 0; bit < NUM_ACELP_CLASS1_BITS; bit++) {
         for (frame = 0; frame < 2; frame++)
-            out[frame*NUM_ACELP_BITS + class1_positions[bit] - 1] = in_cur[2*bit + frame];
+            out[frame * TETRA_TCH_FRAME_BITS + class1_positions[bit] - 1] = in_cur[2*bit + frame];
     }
     in_cur += 2*NUM_ACELP_CLASS1_BITS;
 
     /* Class2 */
     for (bit = 0; bit < NUM_ACELP_CLASS2_BITS; bit++) {
         for (frame = 0; frame < 2; frame++)
-            out[frame*NUM_ACELP_BITS + class2_positions[bit] - 1] = in_cur[2*bit + frame];
+            out[frame * TETRA_TCH_FRAME_BITS + class2_positions[bit] - 1] = in_cur[2*bit + frame];
     }
 }
 
@@ -287,83 +294,89 @@ void tetra_acelp_decode(const uint8_t* bits, int len) {
 /* -------------------------------------------------------------------------
  * tetra_acelp_process_tch()
  *
- * Full TCH voice pipeline for one NDB block:
- *   decoded bits → bit-reorder (ETSI EN 300 395-2 Table 4)
- *               → external vocoder subprocess (TETRA_VOCODER_CMD)
- *               → PCM16 routing (PulseAudio / UDP / raw FD / WAV)
+ * Full TCH/FS voice pipeline for the combined 292 type-2 bits decoded
+ * from both NDB blocks:
  *
- * @decoded   : Viterbi-decoded type-1 bits (at least TETRA_TCH_FRAME_BITS)
- * @dec_len   : number of valid bits in decoded (clamped to TETRA_TCH_FRAME_BITS)
- * @block_idx : 1 or 2 (logging only)
- * @opts/state: standard dsd-neo context
+ *   type-2 bits → class reorder → 2 × ACELP codec frames
+ *               → external vocoder subprocess (TETRA_VOCODER_CMD)
+ *               → PCM16 routing (PA / UDP / raw FD / WAV)
+ *
+ * The reorder produces two 137-bit ACELP frames from the first 272
+ * type-2 bits (100 class-0 + 112 class-1 + 60 class-2, interleaved
+ * for two frames).  Each frame is sent to the vocoder independently.
+ *
+ * @type2_bits : Viterbi-decoded type-2 bits (at least 272 required)
+ * @type2_len  : number of valid bits
+ * @block_idx  : 0 for combined TCH/FS (informational)
+ * @opts/state : standard dsd-neo context
  * ------------------------------------------------------------------------- */
-void tetra_acelp_process_tch(const uint8_t *decoded, int dec_len,
+void tetra_acelp_process_tch(const uint8_t *type2_bits, int type2_len,
                               int block_idx,
                               dsd_opts *opts, dsd_state *state)
 {
-    /* Phase 12 + Phase 14: combined floor-grant and timeslot gate.
-     * tetra_acelp_slot_gate_passes() checks tetra_tx_granted_valid and
-     * tetra_vc_slot so that audio is produced only for the granted slot. */
-    if (!tetra_acelp_slot_gate_passes(block_idx, state))
+    /* Phase 12 floor-grant gate. */
+    if (!tetra_acelp_slot_gate_passes(block_idx ? block_idx : 1, state))
         return;
 
-    /* —— Step 1: bit reorder —— */
-    uint8_t acelp_frame[TETRA_TCH_FRAME_BITS];
-    memset(acelp_frame, 0, sizeof(acelp_frame));
-    tetra_acelp_reorder(decoded, acelp_frame, dec_len);
+    if (type2_len < 272) {
+        fprintf(stderr,
+            "[TETRA TCH] B%d: only %d type-2 bits (need 272), skipping\n",
+            block_idx, type2_len);
+        return;
+    }
 
-    /* —— Step 2: send to vocoder, receive PCM16 —— */
+    /* —— Step 1: class reorder → 2 codec frames —— */
+    uint8_t codec[2 * TETRA_TCH_FRAME_BITS];  /* 274 bytes */
+    memset(codec, 0, sizeof(codec));
+    tetra_acelp_reorder(type2_bits, codec, type2_len);
+
+    /* —— Step 2: vocoder + audio routing for each frame —— */
     if (!voc_ensure_open()) {
         static int warned = 0;
         if (!warned) {
             fprintf(stderr,
-                "[TETRA] TCH B%d: no vocoder. "
-                "Set TETRA_VOCODER_CMD to enable audio output.\n",
-                block_idx);
+                "[TETRA] TCH: no vocoder. "
+                "Set TETRA_VOCODER_CMD to enable audio output.\n");
             warned = 1;
         }
         return;
     }
 
-    int16_t pcm[TETRA_TCH_FRAME_SAMPLES];
-    memset(pcm, 0, sizeof(pcm));
-    int nsamples = voc_send_recv(acelp_frame, TETRA_TCH_FRAME_BITS,
-                                 pcm, TETRA_TCH_FRAME_SAMPLES);
-    if (nsamples <= 0) {
-        /* vocoder pipe died; reset state so it will be re-opened next time */
-        fprintf(stderr, "[TETRA] vocoder pipe error; resetting\n");
-        tetra_vocoder_close();
-        return;
-    }
+    for (int f = 0; f < 2; f++) {
+        const uint8_t *frame = codec + f * TETRA_TCH_FRAME_BITS;
 
-    /* —— Step 3: audio routing (same pattern as M17 / Codec2) —— */
-    if (opts->slot1_on == 1) {
-        /* PulseAudio / PortAudio */
-        if (opts->audio_out_type == 0 && opts->audio_out_stream)
-            dsd_audio_write(opts->audio_out_stream, pcm, (size_t)nsamples);
-
-        /* UDP */
-        if (opts->audio_out_type == 8)
-            dsd_udp_audio_hook_blast(opts, state,
-                                     (size_t)nsamples * sizeof(int16_t), pcm);
-
-        /* raw file descriptor */
-        if (opts->audio_out_type == 1 && opts->audio_out_fd >= 0)
-            dsd_write(opts->audio_out_fd, pcm,
-                      (size_t)nsamples * sizeof(int16_t));
-    }
-
-    /* per-call WAV */
-    if (opts->wav_out_f != NULL && opts->dmr_stereo_wav == 1)
-        sf_write_short(opts->wav_out_f, pcm, nsamples);
-
-    /* static WAV (interleaved stereo) */
-    if (opts->wav_out_f != NULL && opts->static_wav_file == 1) {
-        short ss[TETRA_TCH_FRAME_SAMPLES * 2];
-        for (int i = 0; i < nsamples && i < TETRA_TCH_FRAME_SAMPLES; i++) {
-            ss[i * 2 + 0] = pcm[i];
-            ss[i * 2 + 1] = pcm[i];
+        int16_t pcm[TETRA_TCH_FRAME_SAMPLES];
+        memset(pcm, 0, sizeof(pcm));
+        int nsamples = voc_send_recv(frame, TETRA_TCH_FRAME_BITS,
+                                     pcm, TETRA_TCH_FRAME_SAMPLES);
+        if (nsamples <= 0) {
+            fprintf(stderr, "[TETRA] vocoder pipe error; resetting\n");
+            tetra_vocoder_close();
+            return;
         }
-        sf_write_short(opts->wav_out_f, ss, nsamples * 2);
+
+        /* —— Step 3: audio routing (same pattern as M17 / Codec2) —— */
+        if (opts->slot1_on == 1) {
+            if (opts->audio_out_type == 0 && opts->audio_out_stream)
+                dsd_audio_write(opts->audio_out_stream, pcm, (size_t)nsamples);
+            if (opts->audio_out_type == 8)
+                dsd_udp_audio_hook_blast(opts, state,
+                                         (size_t)nsamples * sizeof(int16_t), pcm);
+            if (opts->audio_out_type == 1 && opts->audio_out_fd >= 0)
+                dsd_write(opts->audio_out_fd, pcm,
+                          (size_t)nsamples * sizeof(int16_t));
+        }
+
+        if (opts->wav_out_f != NULL && opts->dmr_stereo_wav == 1)
+            sf_write_short(opts->wav_out_f, pcm, nsamples);
+
+        if (opts->wav_out_f != NULL && opts->static_wav_file == 1) {
+            short ss[TETRA_TCH_FRAME_SAMPLES * 2];
+            for (int i = 0; i < nsamples && i < TETRA_TCH_FRAME_SAMPLES; i++) {
+                ss[i * 2 + 0] = pcm[i];
+                ss[i * 2 + 1] = pcm[i];
+            }
+            sf_write_short(opts->wav_out_f, ss, nsamples * 2);
+        }
     }
 }
