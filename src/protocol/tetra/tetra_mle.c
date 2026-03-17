@@ -739,9 +739,9 @@ static void parse_cmce_d_sds_data(const uint8_t *bits, int nbits,
     uint32_t dt_flag = mle_bits_to_uint(bits, off, 1); off += 1;
     if (dt_flag && off + 48 <= nbits) off += 48; /* datetime */
 
-    /* SDS-TL service PDU: bits_per_char(8) + num_chars(8) + data */
-    if (off + 16 > nbits) goto log_only;
-    uint32_t bpc       = mle_bits_to_uint(bits, off, 8); off += 8;
+    /* SDS-TL service PDU: bits_per_char(4) + num_chars(8) + data */
+    if (off + 12 > nbits) goto log_only;
+    uint32_t bpc       = mle_bits_to_uint(bits, off, 4); off += 4;
     uint32_t num_chars = mle_bits_to_uint(bits, off, 8); off += 8;
 
     fprintf(stderr, "[TETRA CMCE D-SDS-DATA] CC=%d  src_SSI=%u  bpc=%u  num_chars=%u",
