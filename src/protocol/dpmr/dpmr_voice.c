@@ -121,7 +121,7 @@ processdPMRvoice(dsd_opts* opts, dsd_state* state) {
     }
 
     /* First CC (Channel Code) - 24 bit */
-    // k initialized per block below
+    k = 0;
     for (i = 0; i < 12; i++) {
         dibit = getDibit(opts, state);
 
@@ -137,7 +137,7 @@ processdPMRvoice(dsd_opts* opts, dsd_state* state) {
     state->dPMRVoiceFS2Frame.ColorCode[0] = (unsigned int)GetdPmrColorCode(CC[0]);
 
     /* Second CCH (Control CHannel) - 72 bit */
-    // k initialized per inner loop
+    k = 0;
     for (i = 0; i < 36; i++) {
         dibit = getDibit(opts, state);
 
