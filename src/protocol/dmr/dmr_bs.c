@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: ISC
 /*
- * Copyright (C) 2025 by arancormonk <180709949+arancormonk@users.noreply.github.com>
+ * Copyright (C) 2026 by arancormonk <180709949+arancormonk@users.noreply.github.com>
  */
 /*-------------------------------------------------------------------------------
  * dmr_bs.c
@@ -31,11 +31,14 @@
 #include <dsd-neo/runtime/colors.h>
 #include <dsd-neo/runtime/exitflag.h>
 #include <dsd-neo/runtime/telemetry.h>
-
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+
+#include "dsd-neo/core/opts_fwd.h"
+#include "dsd-neo/core/state_fwd.h"
 
 // #define PRINT_AMBE72 //enable to view 72-bit AMBE codewords
 
@@ -543,6 +546,11 @@ dmrBS(dsd_opts* opts, dsd_state* state) {
                 tyt16_ambe2_codeword_keystream(state, ambe_fr2, 1);
                 tyt16_ambe2_codeword_keystream(state, ambe_fr3, 0);
             }
+            if (state->csi_ee == 1) {
+                csi72_ambe2_codeword_keystream(state, ambe_fr);
+                csi72_ambe2_codeword_keystream(state, ambe_fr2);
+                csi72_ambe2_codeword_keystream(state, ambe_fr3);
+            }
 
 #ifdef PRINT_AMBE72
             ambe2_codeword_print_i(opts, ambe_fr);
@@ -635,9 +643,15 @@ dmrBS(dsd_opts* opts, dsd_state* state) {
 
             if (internalslot == 0 && vc1 == 6) {
                 state->static_ks_counter[0] = 0;
+                state->vertex_ks_counter[0] = 0;
+                state->vertex_ks_active_idx[0] = -1;
+                state->vertex_ks_warned[0] = 0;
             }
             if (internalslot == 1 && vc2 == 6) {
                 state->static_ks_counter[1] = 0;
+                state->vertex_ks_counter[1] = 0;
+                state->vertex_ks_active_idx[1] = -1;
+                state->vertex_ks_warned[1] = 0;
             }
 
             if (opts->dmr_le != 2) { //if not Hytera Enhanced
@@ -748,22 +762,7 @@ END:
         fprintf(stderr, "%s", KNRM);
         fprintf(stderr, "\n");
         //run refresh if either slot had an active MI in it.
-        if (state->payload_algid >= 0x21) {
-            state->currentslot = 0;
-            dmr_alg_refresh(opts, state);
-        } else if (state->payload_algid == 0x02) {
-            hytera_enhanced_alg_refresh(state);
-            state->currentslot = 0;
-            dmr_alg_refresh(opts, state);
-        }
-        if (state->payload_algidR >= 0x21) {
-            state->currentslot = 1;
-            dmr_alg_refresh(opts, state);
-        } else if (state->payload_algidR == 0x02) {
-            hytera_enhanced_alg_refresh(state);
-            state->currentslot = 1;
-            dmr_alg_refresh(opts, state);
-        }
+        dmr_refresh_algids_on_error(opts, state);
 
         //failsafe to reset all data header and blocks when bad tact or emb
         dmr_reset_blocks(opts, state);
@@ -772,6 +771,12 @@ END:
     //reset static ks counter
     state->static_ks_counter[0] = 0;
     state->static_ks_counter[1] = 0;
+    state->vertex_ks_counter[0] = 0;
+    state->vertex_ks_counter[1] = 0;
+    state->vertex_ks_active_idx[0] = -1;
+    state->vertex_ks_active_idx[1] = -1;
+    state->vertex_ks_warned[0] = 0;
+    state->vertex_ks_warned[1] = 0;
     // reset EMB miss counters on exit
     state->dmr_emb_err[0] = 0;
     state->dmr_emb_err[1] = 0;
@@ -847,6 +852,9 @@ dmrBSBootstrap(dsd_opts* opts, dsd_state* state) {
 
     //reset static ks counter
     state->static_ks_counter[internalslot] = 0;
+    state->vertex_ks_counter[internalslot] = 0;
+    state->vertex_ks_active_idx[internalslot] = -1;
+    state->vertex_ks_warned[internalslot] = 0;
 
     //Setup for first AMBE Frame
 
@@ -999,6 +1007,11 @@ dmrBSBootstrap(dsd_opts* opts, dsd_state* state) {
         tyt16_ambe2_codeword_keystream(state, ambe_fr2, 1);
         tyt16_ambe2_codeword_keystream(state, ambe_fr3, 0);
     }
+    if (state->csi_ee == 1) {
+        csi72_ambe2_codeword_keystream(state, ambe_fr);
+        csi72_ambe2_codeword_keystream(state, ambe_fr2);
+        csi72_ambe2_codeword_keystream(state, ambe_fr3);
+    }
 
 #ifdef PRINT_AMBE72
     ambe2_codeword_print_i(opts, ambe_fr);
@@ -1086,22 +1099,7 @@ END:
         fprintf(stderr, "%s", KNRM);
         fprintf(stderr, "\n");
         //run refresh if either slot had an active MI in it.
-        if (state->payload_algid >= 0x21) {
-            state->currentslot = 0;
-            dmr_alg_refresh(opts, state);
-        } else if (state->payload_algid == 0x02) {
-            state->currentslot = 0;
-            hytera_enhanced_alg_refresh(state);
-            dmr_alg_refresh(opts, state);
-        }
-        if (state->payload_algidR >= 0x21) {
-            state->currentslot = 1;
-            dmr_alg_refresh(opts, state);
-        } else if (state->payload_algid == 0x02) {
-            hytera_enhanced_alg_refresh(state);
-            state->currentslot = 1;
-            dmr_alg_refresh(opts, state);
-        }
+        dmr_refresh_algids_on_error(opts, state);
 
         //failsafe to reset all data header and blocks when bad tact or emb
         dmr_reset_blocks(opts, state);

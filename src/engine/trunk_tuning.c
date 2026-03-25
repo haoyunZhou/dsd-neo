@@ -3,25 +3,29 @@
  * Copyright (C) 2026 by arancormonk <180709949+arancormonk@users.noreply.github.com>
  */
 
-#include <dsd-neo/engine/trunk_tuning.h>
-
 #include <dsd-neo/core/audio.h>
-#include <dsd-neo/core/constants.h>
 #include <dsd-neo/core/dsd_time.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/state.h>
 #include <dsd-neo/dsp/frame_sync.h>
+#include <dsd-neo/engine/trunk_tuning.h>
 #include <dsd-neo/io/rigctl_client.h>
+#ifdef USE_RADIO
 #include <dsd-neo/io/rtl_stream_c.h>
+#endif
 #include <dsd-neo/protocol/dmr/dmr_block.h>
 #include <dsd-neo/protocol/p25/p25_sm_watchdog.h>
 #include <dsd-neo/protocol/p25/p25p2_frame.h>
+#ifdef USE_RADIO
 #include <dsd-neo/runtime/config.h>
-
 #include <stdint.h>
 #include <stdio.h>
+#endif
 #include <string.h>
 #include <time.h>
+
+#include "dsd-neo/core/opts_fwd.h"
+#include "dsd-neo/core/state_fwd.h"
 
 /**
  * @brief Return to the P25 control channel, draining audio and resetting state.
@@ -34,6 +38,9 @@
  */
 void
 dsd_engine_return_to_cc(dsd_opts* opts, dsd_state* state) {
+    if (!opts || !state) {
+        return;
+    }
     // Audio drain is handled by dsd_engine_trunk_tune_to_cc() before the hardware retune.
 
     // Extra safeguards due to sync issues with NXDN
@@ -82,39 +89,46 @@ dsd_engine_return_to_cc(dsd_opts* opts, dsd_state* state) {
     // Avoid sending a zero/unknown frequency to the tuner which can wedge the
     // pipeline at DC and delay CC hunting.
     long int cc = (state->p25_cc_freq != 0) ? state->p25_cc_freq : state->trunk_cc_freq;
-    if (opts->p25_trunk == 1 && cc != 0) {
-        // Compute CC TED SPS dynamically based on actual demodulator output rate.
-        // P25P1 CC = 4800 sym/s, P25P2 TDMA CC = 6000 sym/s.
-        int sym_rate = (state->p25_cc_is_tdma == 1) ? 6000 : 4800;
-        int demod_rate = 0;
-#ifdef USE_RTLSDR
-        if (state->rtl_ctx) {
-            demod_rate = (int)rtl_stream_output_rate(state->rtl_ctx);
-        }
+    int trunk_enabled = (opts->trunk_enable == 1 || opts->p25_trunk == 1);
+    if (trunk_enabled && cc != 0) {
+        int cc_sps = 0;
+        /* Only apply P25-specific CC SPS override when we actually have a P25 CC.
+           For non-P25 (e.g., DMR Tier III), leave CC SPS selection to the normal
+           demod path to avoid forcing P25 assumptions on return-to-CC. */
+        if (state->p25_cc_freq != 0) {
+            int sym_rate = (state->p25_cc_is_tdma == 1) ? 6000 : 4800;
+            int demod_rate = 0;
+#ifdef USE_RADIO
+            if (state->rtl_ctx) {
+                demod_rate = (int)rtl_stream_output_rate(state->rtl_ctx);
+            }
 #endif
-        int cc_sps = dsd_opts_compute_sps_rate(opts, sym_rate, demod_rate);
+            cc_sps = dsd_opts_compute_sps_rate(opts, sym_rate, demod_rate);
+        }
         dsd_engine_trunk_tune_to_cc(opts, state, cc, cc_sps);
     }
 
     // Set symbol timing for CC based on CC type and actual demodulator rate.
     // samplesPerSymbol is used by the legacy symbol slicer code.
-    int demod_rate = 0;
-#ifdef USE_RTLSDR
-    if (state->rtl_ctx) {
-        demod_rate = (int)rtl_stream_output_rate(state->rtl_ctx);
-    }
+    if (state->p25_cc_freq != 0) {
+        int demod_rate = 0;
+#ifdef USE_RADIO
+        if (state->rtl_ctx) {
+            demod_rate = (int)rtl_stream_output_rate(state->rtl_ctx);
+        }
 #endif
-    if (state->p25_cc_is_tdma == 0) {
-        // P25P1 CC: 4800 sym/s
-        state->samplesPerSymbol = dsd_opts_compute_sps_rate(opts, 4800, demod_rate);
-        state->symbolCenter = dsd_opts_symbol_center(state->samplesPerSymbol);
-        /* Default CC is C4FM unless user requested CQPSK (-mq) */
-        state->rf_mod = (opts && opts->mod_qpsk == 1) ? 1 : 0;
-    } else {
-        // P25P2 TDMA CC: 6000 sym/s
-        state->samplesPerSymbol = dsd_opts_compute_sps_rate(opts, 6000, demod_rate);
-        state->symbolCenter = dsd_opts_symbol_center(state->samplesPerSymbol);
-        state->rf_mod = 1;
+        if (state->p25_cc_is_tdma == 0) {
+            // P25P1 CC: 4800 sym/s
+            state->samplesPerSymbol = dsd_opts_compute_sps_rate(opts, 4800, demod_rate);
+            state->symbolCenter = dsd_opts_symbol_center(state->samplesPerSymbol);
+            /* Default CC is C4FM unless user requested CQPSK (-mq) */
+            state->rf_mod = (opts && opts->mod_qpsk == 1) ? 1 : 0;
+        } else {
+            // P25P2 TDMA CC: 6000 sym/s
+            state->samplesPerSymbol = dsd_opts_compute_sps_rate(opts, 6000, demod_rate);
+            state->symbolCenter = dsd_opts_symbol_center(state->samplesPerSymbol);
+            state->rf_mod = 1;
+        }
     }
 }
 
@@ -142,7 +156,7 @@ dsd_engine_trunk_tune_to_freq(dsd_opts* opts, dsd_state* state, long int freq, i
      * which manifests as choppy/garbled P25P2 audio on non-simulcast systems.
      *
      * Respect explicit CQPSK forcing via runtime config/env (DSD_NEO_CQPSK). */
-#ifdef USE_RTLSDR
+#ifdef USE_RADIO
     if (opts->audio_in_type == AUDIO_IN_RTL && opts->p25_trunk == 1) {
         const dsdneoRuntimeConfig* cfg = dsd_neo_get_config();
         if (!cfg) {
@@ -180,7 +194,7 @@ dsd_engine_trunk_tune_to_freq(dsd_opts* opts, dsd_state* state, long int freq, i
     // but subsequent voice channel grants fail to lock with tanking EVM/SNR.
     // Only reset for P25P2 (ted_sps matching the TDMA symbol rate), not P25P1 or other modes.
     int p25p2_demod_rate = 0;
-#ifdef USE_RTLSDR
+#ifdef USE_RADIO
     if (state->rtl_ctx) {
         p25p2_demod_rate = (int)rtl_stream_output_rate(state->rtl_ctx);
     }
@@ -211,7 +225,7 @@ dsd_engine_trunk_tune_to_freq(dsd_opts* opts, dsd_state* state, long int freq, i
     // Set TED samples-per-symbol override if provided by caller.
     // The state machine determines the correct SPS for the current DSP rate and channel type
     // and passes it directly.
-#ifdef USE_RTLSDR
+#ifdef USE_RADIO
     if (opts->audio_in_type == AUDIO_IN_RTL && ted_sps > 0) {
         rtl_stream_set_ted_sps(ted_sps);
         // Optional debug: log VC tuning parameters when CQPSK debug is enabled.
@@ -240,7 +254,7 @@ dsd_engine_trunk_tune_to_freq(dsd_opts* opts, dsd_state* state, long int freq, i
         }
         SetFreq(opts->rigctl_sockfd, freq);
     } else if (opts->audio_in_type == AUDIO_IN_RTL) {
-#ifdef USE_RTLSDR
+#ifdef USE_RADIO
         if (state->rtl_ctx) {
             rtl_stream_tune(state->rtl_ctx, (uint32_t)freq);
         }
@@ -277,6 +291,9 @@ dsd_engine_trunk_tune_to_cc(dsd_opts* opts, dsd_state* state, long int freq, int
     if (!opts || !state || freq <= 0) {
         return;
     }
+#ifndef USE_RADIO
+    (void)ted_sps;
+#endif
     // Reset modulation auto-detect state for fresh acquisition.
     dsd_frame_sync_reset_mod_state();
 
@@ -294,7 +311,7 @@ dsd_engine_trunk_tune_to_cc(dsd_opts* opts, dsd_state* state, long int freq, int
         }
         SetFreq(opts->rigctl_sockfd, freq);
     } else if (opts->audio_in_type == AUDIO_IN_RTL) {
-#ifdef USE_RTLSDR
+#ifdef USE_RADIO
         /* Select DSP chain for control channel (C4FM vs QPSK family) unless user forced CQPSK. */
         if (opts->p25_trunk == 1) {
             const dsdneoRuntimeConfig* cfg = dsd_neo_get_config();

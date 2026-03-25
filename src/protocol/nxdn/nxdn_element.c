@@ -22,24 +22,29 @@
 #include <dsd-neo/core/state.h>
 #include <dsd-neo/core/synctype_ids.h>
 #include <dsd-neo/protocol/dmr/dmr_utils_api.h>
+#include <dsd-neo/protocol/nxdn/nxdn_alias_decode.h>
 #include <dsd-neo/protocol/nxdn/nxdn_lfsr.h>
 #include <dsd-neo/protocol/nxdn/nxdn_trunk_diag.h>
 #include <dsd-neo/protocol/p25/p25_frequency.h>
 #include <dsd-neo/runtime/colors.h>
 #include <dsd-neo/runtime/rigctl_query_hooks.h>
 #include <dsd-neo/runtime/trunk_tuning_hooks.h>
-
-#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
+
+#include "dsd-neo/core/opts_fwd.h"
+#include "dsd-neo/core/state_fwd.h"
 
 static inline void dsd_append(char* dst, size_t dstsz, const char* src);
+static uint8_t nxdn_alias_crc_ok(const dsd_state* state);
 
 void NXDN_Elements_Content_decode(dsd_opts* opts, dsd_state* state, uint8_t CrcCorrect, uint8_t* ElementsContent);
 void NXDN_decode_VCALL(dsd_opts* opts, dsd_state* state, uint8_t* Message);
 void NXDN_decode_VCALL_IV(dsd_opts* opts, dsd_state* state, uint8_t* Message);
 void NXDN_decode_Alias(dsd_opts* opts, dsd_state* state, uint8_t* Message);
+void NXDN_decode_ALIAS_ARIB(dsd_opts* opts, dsd_state* state, uint8_t* Message);
 void NXDN_decode_VCALL_ASSGN(dsd_opts* opts, dsd_state* state, uint8_t* Message);
 void NXDN_decode_cch_info(dsd_opts* opts, dsd_state* state, uint8_t* Message);
 void NXDN_decode_srv_info(dsd_opts* opts, dsd_state* state, uint8_t* Message);
@@ -100,6 +105,8 @@ NXDN_SACCH_Full_decode(dsd_opts* opts, dsd_state* state) {
 void
 NXDN_Elements_Content_decode(dsd_opts* opts, dsd_state* state, uint8_t CrcCorrect, uint8_t* ElementsContent) {
     uint8_t MessageType;
+    uint8_t MessageTypeExt;
+    uint8_t MessageTypeDispatch;
     /* Get the "Message Type" field */
     MessageType = (ElementsContent[2] & 1) << 5;
     MessageType |= (ElementsContent[3] & 1) << 4;
@@ -108,11 +115,15 @@ NXDN_Elements_Content_decode(dsd_opts* opts, dsd_state* state, uint8_t CrcCorrec
     MessageType |= (ElementsContent[6] & 1) << 1;
     MessageType |= (ElementsContent[7] & 1) << 0;
 
-    nxdn_message_type(opts, state, MessageType);
-
     /* Save the "F1" and "F2" flags */
     state->NxdnElementsContent.F1 = ElementsContent[0];
     state->NxdnElementsContent.F2 = ElementsContent[1];
+
+    MessageTypeExt = (uint8_t)(((state->NxdnElementsContent.F1 & 1U) << 7U)
+                               | ((state->NxdnElementsContent.F2 & 1U) << 6U) | MessageType);
+    MessageTypeDispatch = MessageType;
+
+    nxdn_message_type(opts, state, MessageTypeExt);
 
     /* Save the "Message Type" field */
     state->NxdnElementsContent.MessageType = MessageType;
@@ -120,8 +131,19 @@ NXDN_Elements_Content_decode(dsd_opts* opts, dsd_state* state, uint8_t CrcCorrec
     /* Set the CRC state */
     state->NxdnElementsContent.VCallCrcIsGood = CrcCorrect;
 
+    if (MessageTypeExt == 0xE7U) {
+        NXDN_decode_ALIAS_ARIB(opts, state, ElementsContent);
+        return;
+    }
+
+    // ARIB TX release uses extended type 0xE8 with a base type of 0x28.
+    // Dispatch it through TX_REL handling so release-time cleanup runs.
+    if (MessageTypeExt == 0xE8U) {
+        MessageTypeDispatch = 0x08U;
+    }
+
     /* Decode the right "Message Type" */
-    switch (MessageType) {
+    switch (MessageTypeDispatch) {
 
         /*
     //Note: CAC Message with same Message Type -- This is a private call request and rejection (TODO: Seperate handling depending on CAC, FACCH< Sacch, etc)
@@ -156,17 +178,19 @@ NXDN_Elements_Content_decode(dsd_opts* opts, dsd_state* state, uint8_t CrcCorrec
             state->last_cc_sync_time_m = dsd_time_now_monotonic_s();
             // Early CC anchor: if trunking and not voice-tuned and CC unknown,
             // set CC from current tuner so follower has a target.
-            if (opts->p25_trunk == 1 && opts->p25_is_tuned == 0 && state->p25_cc_freq == 0) {
+            if ((opts->trunk_enable == 1 || opts->p25_trunk == 1) && opts->trunk_is_tuned == 0
+                && state->p25_cc_freq == 0) {
                 long int ccfreq = 0;
                 if (opts->use_rigctl == 1) {
                     ccfreq = dsd_rigctl_query_hook_get_current_freq_hz(opts);
                 } else if (opts->audio_in_type == AUDIO_IN_RTL) {
-#ifdef USE_RTLSDR
+#ifdef USE_RADIO
                     ccfreq = (long int)opts->rtlsdr_center_freq;
 #endif
                 }
                 if (ccfreq != 0) {
                     state->p25_cc_freq = ccfreq;
+                    state->trunk_cc_freq = ccfreq;
                 }
             }
             break;
@@ -175,17 +199,19 @@ NXDN_Elements_Content_decode(dsd_opts* opts, dsd_state* state, uint8_t CrcCorrec
         case 0x1A:
             NXDN_decode_cch_info(opts, state, ElementsContent);
             state->last_cc_sync_time_m = dsd_time_now_monotonic_s();
-            if (opts->p25_trunk == 1 && opts->p25_is_tuned == 0 && state->p25_cc_freq == 0) {
+            if ((opts->trunk_enable == 1 || opts->p25_trunk == 1) && opts->trunk_is_tuned == 0
+                && state->p25_cc_freq == 0) {
                 long int ccfreq = 0;
                 if (opts->use_rigctl == 1) {
                     ccfreq = dsd_rigctl_query_hook_get_current_freq_hz(opts);
                 } else if (opts->audio_in_type == AUDIO_IN_RTL) {
-#ifdef USE_RTLSDR
+#ifdef USE_RADIO
                     ccfreq = (long int)opts->rtlsdr_center_freq;
 #endif
                 }
                 if (ccfreq != 0) {
                     state->p25_cc_freq = ccfreq;
+                    state->trunk_cc_freq = ccfreq;
                 }
             }
             break;
@@ -194,17 +220,19 @@ NXDN_Elements_Content_decode(dsd_opts* opts, dsd_state* state, uint8_t CrcCorrec
         case 0x18:
             NXDN_decode_site_info(opts, state, ElementsContent);
             state->last_cc_sync_time_m = dsd_time_now_monotonic_s();
-            if (opts->p25_trunk == 1 && opts->p25_is_tuned == 0 && state->p25_cc_freq == 0) {
+            if ((opts->trunk_enable == 1 || opts->p25_trunk == 1) && opts->trunk_is_tuned == 0
+                && state->p25_cc_freq == 0) {
                 long int ccfreq = 0;
                 if (opts->use_rigctl == 1) {
                     ccfreq = dsd_rigctl_query_hook_get_current_freq_hz(opts);
                 } else if (opts->audio_in_type == AUDIO_IN_RTL) {
-#ifdef USE_RTLSDR
+#ifdef USE_RADIO
                     ccfreq = (long int)opts->rtlsdr_center_freq;
 #endif
                 }
                 if (ccfreq != 0) {
                     state->p25_cc_freq = ccfreq;
+                    state->trunk_cc_freq = ccfreq;
                 }
             }
             break;
@@ -214,17 +242,19 @@ NXDN_Elements_Content_decode(dsd_opts* opts, dsd_state* state, uint8_t CrcCorrec
             NXDN_decode_adj_site(opts, state, ElementsContent);
             state->last_cc_sync_time_m = dsd_time_now_monotonic_s();
             // Adjacent site info often originates from CC. Apply the same anchor.
-            if (opts->p25_trunk == 1 && opts->p25_is_tuned == 0 && state->p25_cc_freq == 0) {
+            if ((opts->trunk_enable == 1 || opts->p25_trunk == 1) && opts->trunk_is_tuned == 0
+                && state->p25_cc_freq == 0) {
                 long int ccfreq = 0;
                 if (opts->use_rigctl == 1) {
                     ccfreq = dsd_rigctl_query_hook_get_current_freq_hz(opts);
                 } else if (opts->audio_in_type == AUDIO_IN_RTL) {
-#ifdef USE_RTLSDR
+#ifdef USE_RADIO
                     ccfreq = (long int)opts->rtlsdr_center_freq;
 #endif
                 }
                 if (ccfreq != 0) {
                     state->p25_cc_freq = ccfreq;
+                    state->trunk_cc_freq = ccfreq;
                 }
             }
             break;
@@ -242,7 +272,7 @@ NXDN_Elements_Content_decode(dsd_opts* opts, dsd_state* state, uint8_t CrcCorrec
         //DISC
         case 0x11:
             NXDN_decode_VCALL(opts, state, ElementsContent);
-            memset(state->nxdn_alias_block_segment, 0, sizeof(state->nxdn_alias_block_segment));
+            nxdn_alias_reset(state);
             sprintf(state->call_string[0], "%s", "");
             sprintf(state->nxdn_call_type, "%s", "");
 
@@ -251,10 +281,12 @@ NXDN_Elements_Content_decode(dsd_opts* opts, dsd_state* state, uint8_t CrcCorrec
             // #else
 
             //tune back to CC here - save about 1-2 seconds
-            if (opts->p25_trunk == 1 && state->p25_cc_freq != 0 && opts->p25_is_tuned == 1) {
+            if ((opts->trunk_enable == 1 || opts->p25_trunk == 1) && state->p25_cc_freq != 0
+                && (opts->trunk_is_tuned == 1 || opts->p25_is_tuned == 1)) {
                 // Use centralized io/control tuning API
                 dsd_trunk_tuning_hook_tune_to_cc(opts, state, state->p25_cc_freq, 0);
                 opts->p25_is_tuned = 0;
+                opts->trunk_is_tuned = 0;
 
                 // NXDN-specific state cleanup
                 memset(state->nxdn_sacch_frame_segment, 1, sizeof(state->nxdn_sacch_frame_segment));
@@ -281,7 +313,7 @@ NXDN_Elements_Content_decode(dsd_opts* opts, dsd_state* state, uint8_t CrcCorrec
         default: {
             break;
         }
-    } /* End switch(MessageType) */
+    } /* End switch(MessageTypeDispatch) */
 
 } /* End NXDN_Elements_Content_decode() */
 
@@ -695,7 +727,7 @@ NXDN_decode_VCALL_ASSGN(dsd_opts* opts, dsd_state* state, uint8_t* Message) {
     }
 
     //check for control channel frequency in the channel map if not available
-    if (opts->p25_trunk == 1 && state->p25_cc_freq == 0) {
+    if ((opts->trunk_enable == 1 || opts->p25_trunk == 1) && state->p25_cc_freq == 0 && opts->trunk_is_tuned == 0) {
         long int ccfreq = 0;
 
         //if not available, then poll rigctl if its available
@@ -703,6 +735,7 @@ NXDN_decode_VCALL_ASSGN(dsd_opts* opts, dsd_state* state, uint8_t* Message) {
             ccfreq = dsd_rigctl_query_hook_get_current_freq_hz(opts);
             if (ccfreq != 0) {
                 state->p25_cc_freq = ccfreq;
+                state->trunk_cc_freq = ccfreq;
             }
         }
         //if using rtl input, we can ask for the current frequency tuned
@@ -710,6 +743,7 @@ NXDN_decode_VCALL_ASSGN(dsd_opts* opts, dsd_state* state, uint8_t* Message) {
             ccfreq = (long int)opts->rtlsdr_center_freq;
             if (ccfreq != 0) {
                 state->p25_cc_freq = ccfreq;
+                state->trunk_cc_freq = ccfreq;
             }
         }
     }
@@ -816,108 +850,12 @@ END_ASSGN:; //do nothing
 
 void
 NXDN_decode_Alias(dsd_opts* opts, dsd_state* state, uint8_t* Message) {
-    UNUSED(opts);
+    nxdn_alias_decode_prop(opts, state, Message, nxdn_alias_crc_ok(state));
+}
 
-    uint8_t Alias1 = 0x20;
-    uint8_t Alias2 = 0x20;
-    uint8_t Alias3 = 0x20;
-    uint8_t Alias4 = 0x20;
-    uint8_t blocknumber = 0;
-    uint8_t total = 0;
-    uint8_t unk1 = 0;
-    uint8_t unk2 = 0;
-    uint8_t CrcCorrect = 0;
-
-    //alias can also hit on a facch1 -- do we still need this checkdown?
-    if (state->nxdn_sacch_non_superframe == FALSE) {
-        CrcCorrect = state->NxdnElementsContent.VCallCrcIsGood;
-    } else {
-        CrcCorrect = 1; //FACCH1 with bad CRC won't make it this far anyways, so set as 1
-    }
-
-    //FACCH Payload [3F][68][82][04][2 <- block number4] "[69][6F][6E][20]" <- 4 alias octets [00][7F][1C]
-    blocknumber = (uint8_t)ConvertBitIntoBytes(&Message[32], 4) & 0x7; // & 0x7, might just be three bits, unsure
-    total = (uint8_t)ConvertBitIntoBytes(&Message[36], 4)
-            & 0x7; //second value seems to be total number of blocks? or len of alias in this segment?
-    unk1 = (uint8_t)ConvertBitIntoBytes(&Message[8], 8);  //unknown values in first two bytes after the opcode
-    unk2 = (uint8_t)ConvertBitIntoBytes(&Message[16], 8); //could be related to the format of these (Iso8? etc)
-    UNUSED4(unk1, unk2, total, blocknumber);
-    Alias1 = (uint8_t)ConvertBitIntoBytes(&Message[40], 8);
-    Alias2 = (uint8_t)ConvertBitIntoBytes(&Message[48], 8);
-    Alias3 = (uint8_t)ConvertBitIntoBytes(&Message[56], 8);
-    Alias4 = (uint8_t)ConvertBitIntoBytes(&Message[64], 8);
-
-    char str_a[120];
-    char str_b[50];
-
-    //TODO: Revisit the debug here and see if anythign comes out of it,
-    //maybe go on the assumptiont his works very similar to DMR talker alias
-    //debug/test
-    // fprintf (stderr, " U1: %02X U2: %02X;", unk1, unk2); //these always appear to be the same two byte values, even across different systems and languages
-    // fprintf (stderr, " A:%d/%d; ", blocknumber, total); //this is accurate info here
-
-    //sanity check to prevent OOB array assignment
-    if (blocknumber > 0
-        && blocknumber
-               < 4) //last 'block' may have been assigning garbage name values -- I'm honestly not sure block'4' contains Alias data, but other data or something
-    {
-        //assign to index -1, since block number conveyed here is 1,2,3,4, and index values are 0,1,2,3
-        //only assign if within valid range of ascii characters (not including diacritical extended alphabet)
-        //else assign "space" ascii character
-
-        //since we are zeroing out the blocks on tx_rel and other conditions, better to just set nothing to bad Alias bytes
-        //tends to zero out otherwise already good blocks set in a previous repitition.
-        if (Alias1 > 0x19 && Alias1 < 0x7F) {
-            sprintf(state->nxdn_alias_block_segment[blocknumber - 1][0], "%c", Alias1);
-        }
-        // else sprintf (state->nxdn_alias_block_segment[blocknumber-1][0], "%c", 0x20); //space
-
-        if (Alias2 > 0x19 && Alias2 < 0x7F) {
-            sprintf(state->nxdn_alias_block_segment[blocknumber - 1][1], "%c", Alias2);
-        }
-        // else sprintf (state->nxdn_alias_block_segment[blocknumber-1][1], "%c", 0x20); //space
-
-        if (Alias3 > 0x19 && Alias3 < 0x7F) {
-            sprintf(state->nxdn_alias_block_segment[blocknumber - 1][2], "%c", Alias3);
-        }
-        // else sprintf (state->nxdn_alias_block_segment[blocknumber-1][2], "%c", 0x20); //space
-
-        if (Alias4 > 0x19 && Alias4 < 0x7F) {
-            sprintf(state->nxdn_alias_block_segment[blocknumber - 1][3], "%c", Alias4);
-        }
-        // else sprintf (state->nxdn_alias_block_segment[blocknumber-1][3], "%c", 0x20); //space
-
-        sprintf(str_a, "%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s", state->nxdn_alias_block_segment[0][0],
-                state->nxdn_alias_block_segment[0][1], state->nxdn_alias_block_segment[0][2],
-                state->nxdn_alias_block_segment[0][3], state->nxdn_alias_block_segment[1][0],
-                state->nxdn_alias_block_segment[1][1], state->nxdn_alias_block_segment[1][2],
-                state->nxdn_alias_block_segment[1][3], state->nxdn_alias_block_segment[2][0],
-                state->nxdn_alias_block_segment[2][1], state->nxdn_alias_block_segment[2][2],
-                state->nxdn_alias_block_segment[2][3], state->nxdn_alias_block_segment[3][0],
-                state->nxdn_alias_block_segment[3][1], state->nxdn_alias_block_segment[3][2],
-                state->nxdn_alias_block_segment[3][3]);
-
-        //juggle strings here so we don't get compiler warnings on assignment size
-        memcpy(str_b, str_a, 48);
-        str_b[49] = '\0';
-
-        sprintf(state->generic_talker_alias[0], "%s", str_b);
-        sprintf(state->event_history_s[0].Event_History_Items[0].alias, "%s; ", str_b);
-    }
-
-    //crc errs in one repitition may occlude an otherwise good alias, so test and change if needed
-    //completed alias should still appear in ncurses terminal regardless, so this may be okay
-    if (CrcCorrect) {
-        fprintf(stderr, " "); //spacer
-        for (int i = 0; i < 4; i++) {
-            for (int j = 0; j < 4; j++) {
-                fprintf(stderr, "%s", state->nxdn_alias_block_segment[i][j]);
-            }
-        }
-        fprintf(stderr, " ");
-    } else {
-        fprintf(stderr, " CRC ERR "); //redundant print? or okay?
-    }
+void
+NXDN_decode_ALIAS_ARIB(dsd_opts* opts, dsd_state* state, uint8_t* Message) {
+    nxdn_alias_decode_arib(opts, state, Message, nxdn_alias_crc_ok(state));
 }
 
 void
@@ -1023,6 +961,7 @@ NXDN_decode_cch_info(dsd_opts* opts, dsd_state* state, uint8_t* Message) {
         if (state->trunk_lcn_freq[0] == 0 && freq1 != 0) {
             state->trunk_lcn_freq[0] = freq1;
             state->p25_cc_freq = freq1;
+            state->trunk_cc_freq = freq1;
             state->lcn_freq_count = 1;
         }
     }
@@ -1058,8 +997,8 @@ NXDN_decode_srv_info(dsd_opts* opts, dsd_state* state, uint8_t* Message) {
 
     //poll for current frequency, will always be the control channel
     //this PDU is constantly pumped out on the CC CAC Message
-    if (opts->p25_trunk == 1
-        && opts->p25_is_tuned
+    if ((opts->trunk_enable == 1 || opts->p25_trunk == 1)
+        && opts->trunk_is_tuned
                == 0) //changed this so the rtl tuning lag doesn't set RTCH frequency after tuning but before landing
     {
         long int ccfreq = 0;
@@ -1068,6 +1007,7 @@ NXDN_decode_srv_info(dsd_opts* opts, dsd_state* state, uint8_t* Message) {
             ccfreq = dsd_rigctl_query_hook_get_current_freq_hz(opts);
             if (ccfreq != 0) {
                 state->p25_cc_freq = ccfreq;
+                state->trunk_cc_freq = ccfreq;
             }
         }
         //if using rtl input, we can ask for the current frequency tuned
@@ -1077,6 +1017,7 @@ NXDN_decode_srv_info(dsd_opts* opts, dsd_state* state, uint8_t* Message) {
             ccfreq = (long int)opts->rtlsdr_center_freq;
             if (ccfreq != 0) {
                 state->p25_cc_freq = ccfreq;
+                state->trunk_cc_freq = ccfreq;
             }
         }
     }
@@ -1527,7 +1468,7 @@ NXDN_decode_VCALL(dsd_opts* opts, dsd_state* state, uint8_t* Message) {
         state->nxdn_last_tg = 0;
         state->gi[0] = -1;
         sprintf(state->generic_talker_alias[0], "%s", "");
-        memset(state->nxdn_alias_block_segment, 0, sizeof(state->nxdn_alias_block_segment));
+        nxdn_alias_reset(state);
     }
 
     //set enc bit here so we can tell playSynthesizedVoice whether or not to play enc traffic
@@ -1846,8 +1787,10 @@ NXDN_decode_scch(dsd_opts* opts, dsd_state* state, uint8_t* Message, uint8_t dir
                 if (state->trunk_chan_map[31] != 0) {
                     state->p25_cc_freq =
                         state->trunk_chan_map[31]; //user provided channel to go to for '31' -- may change to 0 later?
+                    state->trunk_cc_freq = state->p25_cc_freq;
                 } else if (state->trunk_chan_map[rep2] != 0) {
                     state->p25_cc_freq = state->trunk_chan_map[rep2]; //rep2 is home repeater under this message
+                    state->trunk_cc_freq = state->p25_cc_freq;
                 }
 
                 //run group/tgt analysis and tune if available/desired
@@ -2058,6 +2001,21 @@ NXDN_Cipher_Type_To_Str(uint8_t CipherType) {
 
     return Ptr;
 } /* End NXDN_Cipher_Type_To_Str() */
+
+static uint8_t
+nxdn_alias_crc_ok(const dsd_state* state) {
+    if (state == NULL) {
+        return 0U;
+    }
+
+    /* FACCH1/SACCH superframe CRC drives alias acceptance when available. */
+    if (!state->nxdn_sacch_non_superframe) {
+        return (uint8_t)((state->NxdnElementsContent.VCallCrcIsGood != 0U) ? 1U : 0U);
+    }
+
+    /* Standalone SACCH frames do not carry the same assembled CRC context. */
+    return 1U;
+}
 
 static inline void
 dsd_append(char* dst, size_t dstsz, const char* src) {

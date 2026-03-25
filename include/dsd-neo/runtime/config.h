@@ -54,35 +54,33 @@ extern "C" {
  *
  * Rational resampler (polyphase upfirdn L/M)
  * - DSD_NEO_RESAMP
- *     Target output sample rate in Hz. Enables L/M resampler when set.
- *     Values: "off" or "0" to disable; integer Hz (e.g., 48000) to enable. Default: 48000 (enabled).
+ *     Target output sample rate in Hz (RTL/RTL-TCP). The RTL demod pipeline
+ *     enables resampling by default to keep the output rate at ~48 kHz.
+ *     Values: "off" or "0" to disable; integer Hz (e.g., 48000) to enable/override.
  *
  * Residual CFO frequency-locked loop (FLL)
  * - DSD_NEO_FLL
- *     Enable residual carrier frequency correction.
+ *     Enable residual carrier frequency correction (RTL demod path).
  *     Values: "1" to enable; "0"/unset/other to disable. Default: disabled.
  * - DSD_NEO_FLL_ALPHA, DSD_NEO_FLL_BETA
- *     Proportional and integral gains (Q15 fixed-point, ~value/32768). Typical small values.
- *     Defaults: ALPHA=100 (~0.003), BETA=10 (~0.0003). May be adjusted for digital modes if not set.
+ *     Native-float proportional/integral gains (typical: ALPHA 0.001..0.01, BETA 0.0001..0.001).
+ *     When unset, mode-specific defaults are selected by the RTL demod config.
  * - DSD_NEO_FLL_DEADBAND
  *     Ignore small phase errors in the FLL loop to avoid audible low-frequency sweeps in analog FM.
- *     Values: Q14 integer threshold (pi == 1<<14). Example: 60 (~0.36 degrees). Default: 45.
+ *     Values: native-float threshold (typical 0.001..0.01).
  * - DSD_NEO_FLL_SLEW
  *     Limit per-update NCO frequency change (slew-rate) to prevent rapid ramps.
- *     Values: Q15 integer (2*pi == 1<<15). Example: 32..128. Default: 64.
+ *     Values: native-float max freq delta per sample (rad/sample).
  *
  * Gardner timing error detector (TED)
  * - DSD_NEO_TED
- *     Enable lightweight fractional-delay timing correction. Generally off for analog FM.
- *     Values: 1 enable, else disabled. Default: 0 (disabled). For certain digital modes, defaults are adjusted
- *     only if envs are not provided (still off unless forced via DSD_NEO_TED=1).
- * - DSD_NEO_TED_SPS
- *     Nominal samples-per-symbol (integer). If unset and a digital mode is active, it is derived from output rate.
- *     Default: 10.
+ *     Enable lightweight fractional-delay timing correction (RTL demod path). Generally off for analog FM.
+ *     Values: 1 enable, else disabled. Default: 0 (disabled).
  * - DSD_NEO_TED_GAIN
- *     Small loop gain (Q20). Default: 64; for common digital modes may default to 96 when not provided.
+ *     Native-float loop gain (OP25-style; typical 0.01..0.1).
  * - DSD_NEO_TED_FORCE
- *     Force TED to run for FM/C4FM paths where it is normally skipped. Values: 1 enable, else disabled. Default: 0.
+ *     Force TED to run even when the pipeline would normally gate it off (e.g., non-integer SPS).
+ *     Values: 1 enable, else disabled. Default: 0.
  *
  * C4FM clock assist (symbol-domain)
  * - DSD_NEO_C4FM_CLK
@@ -172,7 +170,7 @@ extern "C" {
  * - DSD_NEO_TCP_* (autotune, waitall, stats, buffers, timeouts, prebuffer)
  * - DSD_NEO_RIGCTL_RCVTIMEO
  * - DSD_NEO_RTL_* and DSD_NEO_TUNER_* (direct/offset, xtal, testmode, autogain)
- * - DSD_NEO_AUTO_PPM* (spectrum-based PPM correction)
+ * - DSD_NEO_AUTO_PPM* (carrier/error-based PPM correction)
  *
  * Protocol timers/holds
  * - DSD_NEO_P25_* and DSD_NEO_DMR_* (hangtimes, grace windows, holds, watchdog)
@@ -530,6 +528,10 @@ void dsd_neo_config_init(const dsd_opts* opts);
  * @brief Get immutable pointer to the current runtime configuration, or NULL if
  * initialization has not been performed.
  *
+ * Thread-safety: returns a process-wide immutable snapshot pointer. The
+ * returned pointer remains valid for the process lifetime and may be shared
+ * across threads. Call again to observe newer published snapshots.
+ *
  * @return Pointer to config or NULL.
  */
 const dsdneoRuntimeConfig* dsd_neo_get_config(void);
@@ -589,6 +591,7 @@ typedef enum {
     DSDCFG_INPUT_PULSE,
     DSDCFG_INPUT_RTL,
     DSDCFG_INPUT_RTLTCP,
+    DSDCFG_INPUT_SOAPY,
     DSDCFG_INPUT_FILE,
     DSDCFG_INPUT_TCP,
     DSDCFG_INPUT_UDP
@@ -634,12 +637,14 @@ typedef struct dsdneoUserConfig {
     char rtl_freq[64];
     int rtl_gain;
     int rtl_ppm;
+    int rtl_ppm_is_set; /* distinguish explicit 0 from omitted */
     int rtl_bw_khz;
     int rtl_sql;
     int rtl_volume;
     int rtl_auto_ppm; /* bool */
     char rtltcp_host[128];
     int rtltcp_port;
+    char soapy_args[256];
     char file_path[1024];
     int file_sample_rate;
     char tcp_host[128];
@@ -673,6 +678,7 @@ typedef struct dsdneoUserConfig {
     /* [logging] */
     int has_logging;
     char event_log[1024];
+    char frame_log[1024];
 
     /* [recording] */
     int has_recording;
@@ -680,6 +686,12 @@ typedef struct dsdneoUserConfig {
     char per_call_wav_dir[512];
     char static_wav_path[1024];
     char raw_wav_path[1024];
+    int rdio_mode;
+    int rdio_system_id;
+    char rdio_api_url[1024];
+    char rdio_api_key[256];
+    int rdio_upload_timeout_ms;
+    int rdio_upload_retries;
 
     /* [dsp] */
     int has_dsp;

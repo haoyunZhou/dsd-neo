@@ -21,15 +21,16 @@
 #include <dsd-neo/platform/file_compat.h>
 #include <dsd-neo/runtime/p25_p2_audio_ring.h>
 #include <dsd-neo/runtime/udp_audio_hooks.h>
-
-#include <mbelib.h>
-
-#include <sndfile.h>
-
 #include <math.h>
-#include <stddef.h>
+#include <mbelib.h>
+#include <sndfile.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
+#include <sys/types.h>
+
+#include "dsd-neo/core/opts_fwd.h"
+#include "dsd-neo/core/state_fwd.h"
 
 /* Write int16 audio using the abstraction layer */
 static void
@@ -95,6 +96,11 @@ p25p2_s16_frames_have_audio(short frames[18][160]) {
         }
     }
     return 0;
+}
+
+static inline int
+dmr_forced_privacy_unmute_enabled(const dsd_state* state) {
+    return state && ((state->baofeng_ap == 1) || (state->csi_ee == 1));
 }
 
 void
@@ -199,12 +205,13 @@ playSynthesizedVoiceFS3(dsd_opts* opts, dsd_state* state) {
     encL = 1;
     encR = 1;
     {
+        const int forced_dmr_privacy = dmr_forced_privacy_unmute_enabled(state);
         int l_is_enc = state->dmr_encL != 0; // decoder flagged L as encrypted
         int r_is_enc = state->dmr_encR != 0; // decoder flagged R as encrypted
-        if (!l_is_enc || opts->dmr_mute_encL == 0) {
+        if (forced_dmr_privacy || !l_is_enc || opts->dmr_mute_encL == 0) {
             encL = 0;
         }
-        if (!r_is_enc || opts->dmr_mute_encR == 0) {
+        if (forced_dmr_privacy || !r_is_enc || opts->dmr_mute_encR == 0) {
             encR = 0;
         }
     }
@@ -774,7 +781,7 @@ playSynthesizedVoiceMS(dsd_opts* opts, dsd_state* state) {
     }
 
     if (opts->use_hpf_d == 1) {
-        hpf_dL(state, state->s_l, len);
+        hpf_dL(state, mono_samp, (int)len);
     }
 
     if (opts->audio_out == 1) {
@@ -1031,38 +1038,32 @@ playSynthesizedVoiceSS3(dsd_opts* opts, dsd_state* state) {
     encL = (state->dmr_so >> 6) & 0x1;
     encR = (state->dmr_soR >> 6) & 0x1;
 
+    // Forced vendor privacy modes decrypt AMBE with static keys even when ALG/KeyID
+    // metadata does not map to the normal RC4/AES key fields.
+    const int forced_dmr_privacy = dmr_forced_privacy_unmute_enabled(state);
+
     //checkdown to see if we can lift the 'mute' if a key is available
     if (encL) {
-        if (state->payload_algid == 0) {
-            if (state->K != 0 || state->K1 != 0) {
-                encL = 0;
-            }
-        } else if (state->payload_algid == 0x02 || state->payload_algid == 0x21 || state->payload_algid == 0x22) {
-            if (state->R != 0) {
-                encL = 0;
-            }
-        } else if (state->payload_algid == 0x24 || state->payload_algid == 0x25) {
-            //going to need a better check for this later on, or seperated keys or something
-            if (state->aes_key_loaded[0] == 1) {
-                encL = 0;
-            }
+        const int key_loaded = (state->K != 0 || state->K1 != 0);
+        const int can_decrypt =
+            forced_dmr_privacy
+            || ((state->payload_algid == 0)
+                    ? key_loaded
+                    : dsd_dmr_voice_alg_can_decrypt(state->payload_algid, state->R, state->aes_key_loaded[0]));
+        if (can_decrypt) {
+            encL = 0;
         }
     }
 
     if (encR) {
-        if (state->payload_algidR == 0) {
-            if (state->K != 0 || state->K1 != 0) {
-                encR = 0;
-            }
-        } else if (state->payload_algidR == 0x02 || state->payload_algidR == 0x21 || state->payload_algidR == 0x22) {
-            if (state->RR != 0) {
-                encR = 0;
-            }
-        } else if (state->payload_algidR == 0x24 || state->payload_algidR == 0x25) {
-            //going to need a better check for this later on, or seperated keys or something
-            if (state->aes_key_loaded[1] == 1) {
-                encR = 0;
-            }
+        const int key_loaded = (state->K != 0 || state->K1 != 0);
+        const int can_decrypt =
+            forced_dmr_privacy
+            || ((state->payload_algidR == 0)
+                    ? key_loaded
+                    : dsd_dmr_voice_alg_can_decrypt(state->payload_algidR, state->RR, state->aes_key_loaded[1]));
+        if (can_decrypt) {
+            encR = 0;
         }
     }
 
@@ -1742,38 +1743,27 @@ playSynthesizedVoiceSS18(dsd_opts* opts, dsd_state* state) {
         if (opts->audio_out_type == 0) //Pulse Audio
         {
             for (j = 0; j < 18; j++) {
-                if (memcmp(empty, stereo_sf[j], sizeof(empty))
-                    != 0) { //may not work as intended because its stereo and one will have something in it most likely
-                    write_s16_audio(opts, stereo_sf[j], 160);
-                }
+                write_s16_audio(opts, stereo_sf[j], 160);
             }
         }
 
         if (opts->audio_out_type == 8) //UDP Audio
         {
             for (j = 0; j < 18; j++) {
-                if (memcmp(empty, stereo_sf[j], sizeof(empty))
-                    != 0) { //may not work as intended because its stereo and one will have something in it most likely
-                    dsd_udp_audio_hook_blast(opts, state, (size_t)320u * sizeof(short), stereo_sf[j]);
-                }
+                dsd_udp_audio_hook_blast(opts, state, (size_t)320u * sizeof(short), stereo_sf[j]);
             }
         }
 
         if (opts->audio_out_type == 1) {
             for (j = 0; j < 18; j++) {
-                if (memcmp(empty, stereo_sf[j], sizeof(empty))
-                    != 0) { //may not work as intended because its stereo and one will have something in it most likely
-                    write_audio_out(opts->audio_out_fd, stereo_sf[j], (size_t)320u * sizeof(short));
-                }
+                write_audio_out(opts->audio_out_fd, stereo_sf[j], (size_t)320u * sizeof(short));
             }
         }
     }
 
     if (opts->wav_out_f != NULL && opts->static_wav_file == 1) {
         for (j = 0; j < 18; j++) {
-            if (memcmp(empty, stereo_sf[j], sizeof(empty)) != 0) {
-                sf_write_short(opts->wav_out_f, stereo_sf[j], 320);
-            }
+            sf_write_short(opts->wav_out_f, stereo_sf[j], 320);
         }
     }
 

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: ISC
 /*
- * Copyright (C) 2025 by arancormonk <180709949+arancormonk@users.noreply.github.com>
+ * Copyright (C) 2026 by arancormonk <180709949+arancormonk@users.noreply.github.com>
  */
 /*
  * Copyright (C) 2010 DSD Author
@@ -19,7 +19,6 @@
  * PERFORMANCE OF THIS SOFTWARE.
  */
 
-#include <dsd-neo/core/audio.h>
 #include <dsd-neo/core/constants.h>
 #include <dsd-neo/core/dibit.h>
 #include <dsd-neo/core/dsd_time.h>
@@ -31,14 +30,18 @@
 #include <dsd-neo/protocol/p25/p25_lsd.h>
 #include <dsd-neo/protocol/p25/p25_trunk_sm.h>
 #include <dsd-neo/protocol/p25/p25p1_check_ldu.h>
-#include <dsd-neo/protocol/p25/p25p1_const.h>
 #include <dsd-neo/protocol/p25/p25p1_hdu.h>
 #include <dsd-neo/protocol/p25/p25p1_ldu.h>
 #include <dsd-neo/runtime/colors.h>
-
+#include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
+
+#include "dsd-neo/core/opts_fwd.h"
+#include "dsd-neo/core/state_fwd.h"
+#include "dsd-neo/dsp/p25p1_heuristics.h"
 
 void
 processLDU1(dsd_opts* opts, dsd_state* state) {
@@ -107,36 +110,14 @@ processLDU1(dsd_opts* opts, dsd_state* state) {
     process_IMBE(opts, state, &status_count);
     // SM event: ACTIVE (P1 uses slot 0)
     p25_sm_emit_active(opts, state, 0);
-    if (opts->floating_point == 0 && opts->pulse_digi_out_channels == 1) {
-        playSynthesizedVoiceMS(opts, state);
-    }
-    if (opts->floating_point == 0 && opts->pulse_digi_out_channels == 2) {
-        playSynthesizedVoiceSS(opts, state);
-    }
-    if (opts->floating_point == 1 && opts->pulse_digi_out_channels == 1) {
-        playSynthesizedVoiceFM(opts, state);
-    }
-    if (opts->floating_point == 1 && opts->pulse_digi_out_channels == 2) {
-        playSynthesizedVoiceFS(opts, state);
-    }
+    p25p1_play_imbe_audio(opts, state);
 
     // IMBE 2
 #ifdef TRACE_DSD
     state->debug_prefix_2 = '1';
 #endif
     process_IMBE(opts, state, &status_count);
-    if (opts->floating_point == 0 && opts->pulse_digi_out_channels == 1) {
-        playSynthesizedVoiceMS(opts, state);
-    }
-    if (opts->floating_point == 0 && opts->pulse_digi_out_channels == 2) {
-        playSynthesizedVoiceSS(opts, state);
-    }
-    if (opts->floating_point == 1 && opts->pulse_digi_out_channels == 1) {
-        playSynthesizedVoiceFM(opts, state);
-    }
-    if (opts->floating_point == 1 && opts->pulse_digi_out_channels == 2) {
-        playSynthesizedVoiceFS(opts, state);
-    }
+    p25p1_play_imbe_audio(opts, state);
 
     // Read data after IMBE 2
     read_and_correct_hex_word(opts, state, &(hex_data[11][0]), &status_count, analog_signal_array,
@@ -155,18 +136,7 @@ processLDU1(dsd_opts* opts, dsd_state* state) {
     state->debug_prefix_2 = '2';
 #endif
     process_IMBE(opts, state, &status_count);
-    if (opts->floating_point == 0 && opts->pulse_digi_out_channels == 1) {
-        playSynthesizedVoiceMS(opts, state);
-    }
-    if (opts->floating_point == 0 && opts->pulse_digi_out_channels == 2) {
-        playSynthesizedVoiceSS(opts, state);
-    }
-    if (opts->floating_point == 1 && opts->pulse_digi_out_channels == 1) {
-        playSynthesizedVoiceFM(opts, state);
-    }
-    if (opts->floating_point == 1 && opts->pulse_digi_out_channels == 2) {
-        playSynthesizedVoiceFS(opts, state);
-    }
+    p25p1_play_imbe_audio(opts, state);
 
     // Read data after IMBE 3
     read_and_correct_hex_word(opts, state, &(hex_data[7][0]), &status_count, analog_signal_array, &analog_signal_index);
@@ -183,18 +153,7 @@ processLDU1(dsd_opts* opts, dsd_state* state) {
     state->debug_prefix_2 = '3';
 #endif
     process_IMBE(opts, state, &status_count);
-    if (opts->floating_point == 0 && opts->pulse_digi_out_channels == 1) {
-        playSynthesizedVoiceMS(opts, state);
-    }
-    if (opts->floating_point == 0 && opts->pulse_digi_out_channels == 2) {
-        playSynthesizedVoiceSS(opts, state);
-    }
-    if (opts->floating_point == 1 && opts->pulse_digi_out_channels == 1) {
-        playSynthesizedVoiceFM(opts, state);
-    }
-    if (opts->floating_point == 1 && opts->pulse_digi_out_channels == 2) {
-        playSynthesizedVoiceFS(opts, state);
-    }
+    p25p1_play_imbe_audio(opts, state);
 
     // Read data after IMBE 4
     read_and_correct_hex_word(opts, state, &(hex_data[3][0]), &status_count, analog_signal_array, &analog_signal_index);
@@ -211,18 +170,7 @@ processLDU1(dsd_opts* opts, dsd_state* state) {
     state->debug_prefix_2 = '4';
 #endif
     process_IMBE(opts, state, &status_count);
-    if (opts->floating_point == 0 && opts->pulse_digi_out_channels == 1) {
-        playSynthesizedVoiceMS(opts, state);
-    }
-    if (opts->floating_point == 0 && opts->pulse_digi_out_channels == 2) {
-        playSynthesizedVoiceSS(opts, state);
-    }
-    if (opts->floating_point == 1 && opts->pulse_digi_out_channels == 1) {
-        playSynthesizedVoiceFM(opts, state);
-    }
-    if (opts->floating_point == 1 && opts->pulse_digi_out_channels == 2) {
-        playSynthesizedVoiceFS(opts, state);
-    }
+    p25p1_play_imbe_audio(opts, state);
 
     // Read data after IMBE 5
     read_and_correct_hex_word(opts, state, &(hex_parity[11][0]), &status_count, analog_signal_array,
@@ -243,18 +191,7 @@ processLDU1(dsd_opts* opts, dsd_state* state) {
     state->debug_prefix_2 = '5';
 #endif
     process_IMBE(opts, state, &status_count);
-    if (opts->floating_point == 0 && opts->pulse_digi_out_channels == 1) {
-        playSynthesizedVoiceMS(opts, state);
-    }
-    if (opts->floating_point == 0 && opts->pulse_digi_out_channels == 2) {
-        playSynthesizedVoiceSS(opts, state);
-    }
-    if (opts->floating_point == 1 && opts->pulse_digi_out_channels == 1) {
-        playSynthesizedVoiceFM(opts, state);
-    }
-    if (opts->floating_point == 1 && opts->pulse_digi_out_channels == 2) {
-        playSynthesizedVoiceFS(opts, state);
-    }
+    p25p1_play_imbe_audio(opts, state);
 
     // Read data after IMBE 6
     read_and_correct_hex_word(opts, state, &(hex_parity[7][0]), &status_count, analog_signal_array,
@@ -275,18 +212,7 @@ processLDU1(dsd_opts* opts, dsd_state* state) {
     state->debug_prefix_2 = '6';
 #endif
     process_IMBE(opts, state, &status_count);
-    if (opts->floating_point == 0 && opts->pulse_digi_out_channels == 1) {
-        playSynthesizedVoiceMS(opts, state);
-    }
-    if (opts->floating_point == 0 && opts->pulse_digi_out_channels == 2) {
-        playSynthesizedVoiceSS(opts, state);
-    }
-    if (opts->floating_point == 1 && opts->pulse_digi_out_channels == 1) {
-        playSynthesizedVoiceFM(opts, state);
-    }
-    if (opts->floating_point == 1 && opts->pulse_digi_out_channels == 2) {
-        playSynthesizedVoiceFS(opts, state);
-    }
+    p25p1_play_imbe_audio(opts, state);
 
     // Read data after IMBE 7
     read_and_correct_hex_word(opts, state, &(hex_parity[3][0]), &status_count, analog_signal_array,
@@ -307,18 +233,7 @@ processLDU1(dsd_opts* opts, dsd_state* state) {
     state->debug_prefix_2 = '7';
 #endif
     process_IMBE(opts, state, &status_count);
-    if (opts->floating_point == 0 && opts->pulse_digi_out_channels == 1) {
-        playSynthesizedVoiceMS(opts, state);
-    }
-    if (opts->floating_point == 0 && opts->pulse_digi_out_channels == 2) {
-        playSynthesizedVoiceSS(opts, state);
-    }
-    if (opts->floating_point == 1 && opts->pulse_digi_out_channels == 1) {
-        playSynthesizedVoiceFM(opts, state);
-    }
-    if (opts->floating_point == 1 && opts->pulse_digi_out_channels == 2) {
-        playSynthesizedVoiceFS(opts, state);
-    }
+    p25p1_play_imbe_audio(opts, state);
 
     // Read data after IMBE 8: LSD (low speed data)
     {
@@ -368,18 +283,7 @@ processLDU1(dsd_opts* opts, dsd_state* state) {
     state->debug_prefix_2 = '8';
 #endif
     process_IMBE(opts, state, &status_count);
-    if (opts->floating_point == 0 && opts->pulse_digi_out_channels == 1) {
-        playSynthesizedVoiceMS(opts, state);
-    }
-    if (opts->floating_point == 0 && opts->pulse_digi_out_channels == 2) {
-        playSynthesizedVoiceSS(opts, state);
-    }
-    if (opts->floating_point == 1 && opts->pulse_digi_out_channels == 1) {
-        playSynthesizedVoiceFM(opts, state);
-    }
-    if (opts->floating_point == 1 && opts->pulse_digi_out_channels == 2) {
-        playSynthesizedVoiceFS(opts, state);
-    }
+    p25p1_play_imbe_audio(opts, state);
 
     if (opts->errorbars == 1) {
         fprintf(stderr, "\n");

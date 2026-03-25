@@ -70,6 +70,11 @@ dsd_neo_add_public_header_smoke_test(
   dsd-neo/runtime/config_schema.h
   C)
 dsd_neo_add_public_header_smoke_test(
+  dsd-neo_test_headers_public_runtime_decode_mode
+  HEADERS_PUBLIC_RUNTIME_DECODE_MODE
+  dsd-neo/runtime/decode_mode.h
+  C)
+dsd_neo_add_public_header_smoke_test(
   dsd-neo_test_headers_public_runtime_control_pump
   HEADERS_PUBLIC_RUNTIME_CONTROL_PUMP
   dsd-neo/runtime/control_pump.h
@@ -88,6 +93,11 @@ dsd_neo_add_public_header_smoke_test(
   dsd-neo_test_headers_public_runtime_freq_parse
   HEADERS_PUBLIC_RUNTIME_FREQ_PARSE
   dsd-neo/runtime/freq_parse.h
+  C)
+dsd_neo_add_public_header_smoke_test(
+  dsd-neo_test_headers_public_runtime_input_spec
+  HEADERS_PUBLIC_RUNTIME_INPUT_SPEC
+  dsd-neo/runtime/input_spec.h
   C)
 dsd_neo_add_public_header_smoke_test(
   dsd-neo_test_headers_public_runtime_p25_optional_hooks
@@ -160,6 +170,11 @@ dsd_neo_add_public_header_smoke_test(
   dsd-neo/runtime/mem.h
   C)
 dsd_neo_add_public_header_smoke_test(
+  dsd-neo_test_headers_public_runtime_rdio_export
+  HEADERS_PUBLIC_RUNTIME_RDIO_EXPORT
+  dsd-neo/runtime/rdio_export.h
+  C)
+dsd_neo_add_public_header_smoke_test(
   dsd-neo_test_headers_public_runtime_ring
   HEADERS_PUBLIC_RUNTIME_RING
   dsd-neo/runtime/ring.h
@@ -196,6 +211,12 @@ dsd_neo_add_public_header_smoke_test(
   C)
 
 dsd_neo_add_public_header_smoke_test(
+  dsd-neo_test_headers_public_ui_async
+  HEADERS_PUBLIC_UI_ASYNC
+  dsd-neo/ui/ui_async.h
+  C)
+
+dsd_neo_add_public_header_smoke_test(
   dsd-neo_test_headers_public_core_cleanup
   HEADERS_PUBLIC_CORE_CLEANUP
   dsd-neo/core/cleanup.h
@@ -204,6 +225,16 @@ dsd_neo_add_public_header_smoke_test(
   dsd-neo_test_headers_public_core_frame
   HEADERS_PUBLIC_CORE_FRAME
   dsd-neo/core/frame.h
+  C)
+dsd_neo_add_public_header_smoke_test(
+  dsd-neo_test_headers_public_core_file_io
+  HEADERS_PUBLIC_CORE_FILE_IO
+  dsd-neo/core/file_io.h
+  C)
+dsd_neo_add_public_header_smoke_test(
+  dsd-neo_test_headers_public_core_opts
+  HEADERS_PUBLIC_CORE_OPTS
+  dsd-neo/core/opts.h
   C)
 dsd_neo_add_public_header_smoke_test(
   dsd-neo_test_headers_public_core_state_ext
@@ -300,6 +331,16 @@ target_include_directories(dsd-neo_test_nxdn_trunk_diag PRIVATE ${PROJECT_SOURCE
 target_link_libraries(dsd-neo_test_nxdn_trunk_diag PRIVATE dsd-neo_proto_nxdn)
 add_test(NAME NXDN_TRUNK_DIAG COMMAND dsd-neo_test_nxdn_trunk_diag)
 
+add_executable(dsd-neo_test_nxdn_alias_decode protocol/nxdn/test_nxdn_alias_decode.c)
+target_include_directories(dsd-neo_test_nxdn_alias_decode PRIVATE ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(dsd-neo_test_nxdn_alias_decode PRIVATE dsd-neo_proto_nxdn)
+add_test(NAME NXDN_ALIAS_DECODE COMMAND dsd-neo_test_nxdn_alias_decode)
+
+add_executable(dsd-neo_test_nxdn_dcr_utils protocol/nxdn/test_nxdn_dcr_utils.c)
+target_include_directories(dsd-neo_test_nxdn_dcr_utils PRIVATE ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(dsd-neo_test_nxdn_dcr_utils PRIVATE dsd-neo_proto_nxdn)
+add_test(NAME NXDN_DCR_UTILS COMMAND dsd-neo_test_nxdn_dcr_utils)
+
 add_executable(dsd-neo_test_runtime_rings runtime/test_runtime_rings.cpp)
 target_include_directories(dsd-neo_test_runtime_rings PRIVATE ${PROJECT_SOURCE_DIR}/include)
 target_link_libraries(dsd-neo_test_runtime_rings PRIVATE dsd-neo_runtime)
@@ -310,10 +351,91 @@ target_include_directories(dsd-neo_test_runtime_control_pump PRIVATE ${PROJECT_S
 target_link_libraries(dsd-neo_test_runtime_control_pump PRIVATE dsd-neo_runtime)
 add_test(NAME RUNTIME_CONTROL_PUMP COMMAND dsd-neo_test_runtime_control_pump)
 
+add_executable(dsd-neo_test_runtime_p25_p2_audio_ring runtime/test_runtime_p25_p2_audio_ring.c)
+target_include_directories(dsd-neo_test_runtime_p25_p2_audio_ring PRIVATE ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(dsd-neo_test_runtime_p25_p2_audio_ring PRIVATE dsd-neo_runtime)
+add_test(NAME RUNTIME_P25_P2_AUDIO_RING COMMAND dsd-neo_test_runtime_p25_p2_audio_ring)
+
+add_executable(dsd-neo_test_ui_hotkeys_regression
+  ui/test_ui_hotkeys_regression.c
+  ${PROJECT_SOURCE_DIR}/src/ui/terminal/dsd_ncurses_handler.c)
+target_include_directories(dsd-neo_test_ui_hotkeys_regression PRIVATE ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(dsd-neo_test_ui_hotkeys_regression PRIVATE dsd-neo_platform)
+add_test(NAME UI_HOTKEYS_REGRESSION COMMAND dsd-neo_test_ui_hotkeys_regression)
+
+add_executable(dsd-neo_test_ui_menu_navigation
+  ui/test_ui_menu_navigation.c
+  ${PROJECT_SOURCE_DIR}/src/ui/terminal/menu_core.c)
+target_include_directories(dsd-neo_test_ui_menu_navigation PRIVATE
+  ${PROJECT_SOURCE_DIR}/include
+  ${PROJECT_SOURCE_DIR}/src/ui/terminal
+  ${CURSES_INCLUDE_DIRS})
+add_test(NAME UI_MENU_NAVIGATION COMMAND dsd-neo_test_ui_menu_navigation)
+
+add_executable(dsd-neo_test_ui_menu_paging_viewport
+  ui/test_ui_menu_paging_viewport.c
+  ${PROJECT_SOURCE_DIR}/src/ui/terminal/menu_core.c)
+target_include_directories(dsd-neo_test_ui_menu_paging_viewport PRIVATE
+  ${PROJECT_SOURCE_DIR}/include
+  ${PROJECT_SOURCE_DIR}/src/ui/terminal
+  ${CURSES_INCLUDE_DIRS})
+add_test(NAME UI_MENU_PAGING_VIEWPORT COMMAND dsd-neo_test_ui_menu_paging_viewport)
+
+add_executable(dsd-neo_test_ui_chooser_navigation
+  ui/test_ui_chooser_navigation.c
+  ${PROJECT_SOURCE_DIR}/src/ui/terminal/menu_prompts.c)
+target_include_directories(dsd-neo_test_ui_chooser_navigation PRIVATE
+  ${PROJECT_SOURCE_DIR}/include
+  ${PROJECT_SOURCE_DIR}/src/ui/terminal
+  ${CURSES_INCLUDE_DIRS})
+target_link_libraries(dsd-neo_test_ui_chooser_navigation PRIVATE dsd-neo_test_support ${CURSES_LIBRARIES})
+add_test(NAME UI_CHOOSER_NAVIGATION COMMAND dsd-neo_test_ui_chooser_navigation)
+
+add_executable(dsd-neo_test_ui_prompt_cursor
+  ui/test_ui_prompt_cursor.c
+  ${PROJECT_SOURCE_DIR}/src/ui/terminal/menu_prompts.c)
+target_include_directories(dsd-neo_test_ui_prompt_cursor PRIVATE
+  ${PROJECT_SOURCE_DIR}/include
+  ${PROJECT_SOURCE_DIR}/src/ui/terminal
+  ${CURSES_INCLUDE_DIRS})
+target_link_libraries(dsd-neo_test_ui_prompt_cursor PRIVATE dsd-neo_test_support ${CURSES_LIBRARIES})
+add_test(NAME UI_PROMPT_CURSOR COMMAND dsd-neo_test_ui_prompt_cursor)
+
+add_executable(dsd-neo_test_ui_history_state
+  ui/test_ui_history_state.c
+  ${PROJECT_SOURCE_DIR}/src/ui/terminal/ui_history.c)
+target_include_directories(dsd-neo_test_ui_history_state PRIVATE ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(dsd-neo_test_ui_history_state PRIVATE dsd-neo_platform)
+add_test(NAME UI_HISTORY_STATE COMMAND dsd-neo_test_ui_history_state)
+
+add_executable(dsd-neo_test_ui_history_compact
+  ui/test_ui_history_compact.c
+  ${PROJECT_SOURCE_DIR}/src/ui/terminal/ui_history.c)
+target_include_directories(dsd-neo_test_ui_history_compact PRIVATE ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(dsd-neo_test_ui_history_compact PRIVATE dsd-neo_platform)
+add_test(NAME UI_HISTORY_COMPACT COMMAND dsd-neo_test_ui_history_compact)
+
+add_executable(dsd-neo_test_ui_snapshot_event_history
+  ui/test_ui_snapshot_event_history.c
+  ${PROJECT_SOURCE_DIR}/src/ui/terminal/ui_snapshot.c)
+target_include_directories(dsd-neo_test_ui_snapshot_event_history PRIVATE ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(dsd-neo_test_ui_snapshot_event_history PRIVATE dsd-neo_platform)
+add_test(NAME UI_SNAPSHOT_EVENT_HISTORY COMMAND dsd-neo_test_ui_snapshot_event_history)
+
 add_executable(dsd-neo_test_runtime_freq_parse runtime/test_runtime_freq_parse.c)
 target_include_directories(dsd-neo_test_runtime_freq_parse PRIVATE ${PROJECT_SOURCE_DIR}/include)
 target_link_libraries(dsd-neo_test_runtime_freq_parse PRIVATE dsd-neo_runtime)
 add_test(NAME RUNTIME_FREQ_PARSE COMMAND dsd-neo_test_runtime_freq_parse)
+
+add_executable(dsd-neo_test_runtime_input_spec runtime/test_runtime_input_spec.c)
+target_include_directories(dsd-neo_test_runtime_input_spec PRIVATE ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(dsd-neo_test_runtime_input_spec PRIVATE dsd-neo_runtime)
+add_test(NAME RUNTIME_INPUT_SPEC COMMAND dsd-neo_test_runtime_input_spec)
+
+add_executable(dsd-neo_test_runtime_rdio_export runtime/test_runtime_rdio_export.c)
+target_include_directories(dsd-neo_test_runtime_rdio_export PRIVATE ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(dsd-neo_test_runtime_rdio_export PRIVATE dsd-neo_runtime dsd-neo_test_support)
+add_test(NAME RUNTIME_RDIO_EXPORT COMMAND dsd-neo_test_runtime_rdio_export)
 
 add_executable(dsd-neo_test_runtime_trunk_tuning_hooks runtime/test_runtime_trunk_tuning_hooks.c)
 target_include_directories(dsd-neo_test_runtime_trunk_tuning_hooks PRIVATE ${PROJECT_SOURCE_DIR}/include)
@@ -648,6 +770,26 @@ target_include_directories(dsd-neo_test_tetra_phase87 PRIVATE ${PROJECT_SOURCE_D
 target_link_libraries(dsd-neo_test_tetra_phase87 PRIVATE dsd-neo_core dsd-neo_runtime)
 add_test(NAME TETRA_PHASE87 COMMAND dsd-neo_test_tetra_phase87)
 
+add_executable(dsd-neo_test_core_audio_group_gate core/test_core_audio_group_gate.c)
+target_include_directories(dsd-neo_test_core_audio_group_gate PRIVATE ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(dsd-neo_test_core_audio_group_gate PRIVATE dsd-neo_core)
+add_test(NAME CORE_AUDIO_GROUP_GATE COMMAND dsd-neo_test_core_audio_group_gate)
+
+add_executable(dsd-neo_test_core_dmr_voice_alg_gate core/test_core_dmr_voice_alg_gate.c)
+target_include_directories(dsd-neo_test_core_dmr_voice_alg_gate PRIVATE ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(dsd-neo_test_core_dmr_voice_alg_gate PRIVATE dsd-neo_core)
+add_test(NAME CORE_DMR_VOICE_ALG_GATE COMMAND dsd-neo_test_core_dmr_voice_alg_gate)
+
+add_executable(dsd-neo_test_core_straight_keystream_validation core/test_core_straight_keystream_validation.c)
+target_include_directories(dsd-neo_test_core_straight_keystream_validation PRIVATE ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(dsd-neo_test_core_straight_keystream_validation PRIVATE dsd-neo_crypto)
+add_test(NAME CORE_STRAIGHT_KEYSTREAM_VALIDATION COMMAND dsd-neo_test_core_straight_keystream_validation)
+
+add_executable(dsd-neo_test_core_hytera_bp_silence core/test_core_hytera_bp_silence.c)
+target_include_directories(dsd-neo_test_core_hytera_bp_silence PRIVATE ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(dsd-neo_test_core_hytera_bp_silence PRIVATE dsd-neo_crypto)
+add_test(NAME CORE_HYTERA_BP_SILENCE COMMAND dsd-neo_test_core_hytera_bp_silence)
+
 add_executable(dsd-neo_test_runtime_cli_compact runtime/test_runtime_cli_compact.c)
 target_include_directories(dsd-neo_test_runtime_cli_compact PRIVATE ${PROJECT_SOURCE_DIR}/include)
 target_link_libraries(dsd-neo_test_runtime_cli_compact PRIVATE dsd-neo_runtime dsd-neo_test_support)
@@ -694,15 +836,102 @@ else()
 endif()
 add_test(NAME RUNTIME_CLI_PARSE COMMAND dsd-neo_test_runtime_cli_parse)
 
+add_executable(dsd-neo_test_core_frame_log core/test_core_frame_log.c)
+target_include_directories(dsd-neo_test_core_frame_log PRIVATE ${PROJECT_SOURCE_DIR}/include)
+if(NOT APPLE AND (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang"))
+  target_link_libraries(dsd-neo_test_core_frame_log PRIVATE
+    "-Wl,--start-group"
+    ${_DSD_RUNTIME_CLI_PARSE_LIBS}
+    "-Wl,--end-group"
+    ${LIBS}
+    dsd-neo_test_support
+  )
+else()
+  target_link_libraries(dsd-neo_test_core_frame_log PRIVATE
+    ${_DSD_RUNTIME_CLI_PARSE_LIBS}
+    ${LIBS}
+    dsd-neo_test_support
+  )
+endif()
+add_test(NAME CORE_FRAME_LOG COMMAND dsd-neo_test_core_frame_log)
+
+add_executable(dsd-neo_test_core_init_state core/test_core_init_state.c)
+target_include_directories(dsd-neo_test_core_init_state PRIVATE ${PROJECT_SOURCE_DIR}/include)
+if(NOT APPLE AND (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang"))
+  target_link_libraries(dsd-neo_test_core_init_state PRIVATE
+    "-Wl,--start-group"
+    ${_DSD_RUNTIME_CLI_PARSE_LIBS}
+    "-Wl,--end-group"
+    ${LIBS}
+    dsd-neo_test_support
+  )
+else()
+  target_link_libraries(dsd-neo_test_core_init_state PRIVATE
+    ${_DSD_RUNTIME_CLI_PARSE_LIBS}
+    ${LIBS}
+    dsd-neo_test_support
+  )
+endif()
+add_test(NAME CORE_INIT_STATE COMMAND dsd-neo_test_core_init_state)
+
+add_executable(dsd-neo_test_engine_no_carrier_reset engine/test_engine_no_carrier_reset.c)
+target_include_directories(dsd-neo_test_engine_no_carrier_reset PRIVATE ${PROJECT_SOURCE_DIR}/include)
+if(NOT APPLE AND (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang"))
+  target_link_libraries(dsd-neo_test_engine_no_carrier_reset PRIVATE
+    "-Wl,--start-group"
+    dsd-neo_engine
+    "-Wl,--end-group"
+    ${LIBS}
+    dsd-neo_test_support
+  )
+else()
+  target_link_libraries(dsd-neo_test_engine_no_carrier_reset PRIVATE
+    dsd-neo_engine
+    ${LIBS}
+    dsd-neo_test_support
+  )
+endif()
+add_test(NAME ENGINE_NO_CARRIER_RESET COMMAND dsd-neo_test_engine_no_carrier_reset)
+
 add_executable(dsd-neo_test_runtime_config_user runtime/test_runtime_config_user.cpp)
 target_include_directories(dsd-neo_test_runtime_config_user PRIVATE ${PROJECT_SOURCE_DIR}/include)
 target_link_libraries(dsd-neo_test_runtime_config_user PRIVATE dsd-neo_runtime dsd-neo_test_support)
 add_test(NAME RUNTIME_CONFIG_USER COMMAND dsd-neo_test_runtime_config_user)
 
+add_executable(dsd-neo_test_runtime_decode_mode runtime/test_runtime_decode_mode.c)
+target_include_directories(dsd-neo_test_runtime_decode_mode PRIVATE ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(dsd-neo_test_runtime_decode_mode PRIVATE dsd-neo_runtime)
+add_test(NAME RUNTIME_DECODE_MODE COMMAND dsd-neo_test_runtime_decode_mode)
+
 add_executable(dsd-neo_test_runtime_config_env runtime/test_runtime_config_env.cpp)
 target_include_directories(dsd-neo_test_runtime_config_env PRIVATE ${PROJECT_SOURCE_DIR}/include)
 target_link_libraries(dsd-neo_test_runtime_config_env PRIVATE dsd-neo_runtime dsd-neo_test_support)
 add_test(NAME RUNTIME_CONFIG_ENV COMMAND dsd-neo_test_runtime_config_env)
+
+add_executable(dsd-neo_test_runtime_config_apply runtime/test_runtime_config_apply.cpp)
+set_source_files_properties(runtime/test_runtime_config_apply.cpp PROPERTIES LANGUAGE C)
+target_include_directories(dsd-neo_test_runtime_config_apply PRIVATE ${PROJECT_SOURCE_DIR}/include)
+set(_DSD_RUNTIME_CONFIG_APPLY_LIBS
+  dsd-neo_ui_terminal
+  dsd-neo_engine
+  ${_DSD_RUNTIME_CLI_PARSE_LIBS}
+)
+if(NOT APPLE AND (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang"))
+  target_link_libraries(dsd-neo_test_runtime_config_apply PRIVATE
+    "-Wl,--start-group"
+    ${_DSD_RUNTIME_CONFIG_APPLY_LIBS}
+    "-Wl,--end-group"
+    ${LIBS}
+    dsd-neo_test_support
+  )
+else()
+  target_link_libraries(dsd-neo_test_runtime_config_apply PRIVATE
+    ${_DSD_RUNTIME_CONFIG_APPLY_LIBS}
+    ${LIBS}
+    dsd-neo_test_support
+  )
+endif()
+add_test(NAME RUNTIME_CONFIG_APPLY COMMAND dsd-neo_test_runtime_config_apply)
 
 set(_DSD_BOOTSTRAP_FIXTURE_DIR "${CMAKE_CURRENT_BINARY_DIR}/runtime_bootstrap_fixtures")
 file(MAKE_DIRECTORY "${_DSD_BOOTSTRAP_FIXTURE_DIR}")
@@ -983,6 +1212,14 @@ target_include_directories(dsd-neo_test_p25_p1_heuristics_ring PRIVATE ${PROJECT
 target_link_libraries(dsd-neo_test_p25_p1_heuristics_ring PRIVATE dsd-neo_proto_p25)
 add_test(NAME P25_P1_HEURISTICS_RING COMMAND dsd-neo_test_p25_p1_heuristics_ring)
 
+# P25 P1 IMBE audio playback dispatch matrix
+add_executable(dsd-neo_test_p25_p1_audio_dispatch
+  protocol/p25/test_p25_p1_audio_dispatch.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/p25/phase1/p25p1_audio_dispatch.c
+)
+target_include_directories(dsd-neo_test_p25_p1_audio_dispatch PRIVATE ${PROJECT_SOURCE_DIR}/include)
+add_test(NAME P25_P1_AUDIO_DISPATCH COMMAND dsd-neo_test_p25_p1_audio_dispatch)
+
 # (Optional) DMR Tier III MBC smoke test is disabled by default.
 # Enable locally if needed.
 # add_executable(dsd-neo_test_dmr_mbc protocol/dmr/test_mbc.c)
@@ -1205,6 +1442,13 @@ add_executable(dsd-neo_test_m17_lsf_parse
 target_include_directories(dsd-neo_test_m17_lsf_parse PRIVATE ${PROJECT_SOURCE_DIR}/include)
 add_test(NAME M17_LSF_PARSE COMMAND dsd-neo_test_m17_lsf_parse)
 
+add_executable(dsd-neo_test_m17_protocol_names
+  protocol/m17/test_m17_protocol_names.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/m17/m17_parse.c
+  ${PROJECT_SOURCE_DIR}/src/protocol/m17/m17_tables.c)
+target_include_directories(dsd-neo_test_m17_protocol_names PRIVATE ${PROJECT_SOURCE_DIR}/include)
+add_test(NAME M17_PROTOCOL_NAMES COMMAND dsd-neo_test_m17_protocol_names)
+
 add_executable(dsd-neo_test_dmr_t3_sm_clamp
   protocol/dmr/test_dmr_t3_sm_clamp.c
   ${PROJECT_SOURCE_DIR}/src/protocol/dmr/dmr_trunk_sm.c)
@@ -1263,6 +1507,13 @@ target_include_directories(dsd-neo_test_dmr_t3_move_release PRIVATE ${PROJECT_SO
 target_link_libraries(dsd-neo_test_dmr_t3_move_release PRIVATE dsd-neo_platform dsd-neo_runtime ${DSD_NEO_TEST_MATH_LIB})
 add_test(NAME DMR_T3_MOVE_RELEASE COMMAND dsd-neo_test_dmr_t3_move_release)
 
+# DMR Tier III regression: return-to-CC must work with trunk_enable only
+add_executable(dsd-neo_test_dmr_t3_return_to_cc_regression
+  protocol/dmr/test_dmr_t3_return_to_cc_regression.c
+  ${PROJECT_SOURCE_DIR}/src/engine/trunk_tuning.c)
+target_include_directories(dsd-neo_test_dmr_t3_return_to_cc_regression PRIVATE ${PROJECT_SOURCE_DIR}/include)
+add_test(NAME DMR_T3_RETURN_TO_CC_REGRESSION COMMAND dsd-neo_test_dmr_t3_return_to_cc_regression)
+
 # DSP block tests
 add_executable(dsd-neo_test_dsp_halfband dsp/test_dsp_halfband.cpp)
 target_include_directories(dsd-neo_test_dsp_halfband PRIVATE ${PROJECT_SOURCE_DIR}/include)
@@ -1290,7 +1541,7 @@ target_link_libraries(dsd-neo_test_dsp_ted PRIVATE dsd-neo_dsp)
 add_test(NAME DSP_TED COMMAND dsd-neo_test_dsp_ted)
 
 add_executable(dsd-neo_test_dsp_simd_widen dsp/test_dsp_simd_widen.cpp)
-target_include_directories(dsd-neo_test_dsp_simd_widen PRIVATE ${PROJECT_SOURCE_DIR}/include)
+target_include_directories(dsd-neo_test_dsp_simd_widen PRIVATE ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src)
 target_link_libraries(dsd-neo_test_dsp_simd_widen PRIVATE dsd-neo_dsp)
 add_test(NAME DSP_SIMD_WIDEN COMMAND dsd-neo_test_dsp_simd_widen)
 
@@ -1410,6 +1661,16 @@ add_executable(dsd-neo_test_dmr_le_infer_algid protocol/dmr/test_dmr_le_infer_al
 target_include_directories(dsd-neo_test_dmr_le_infer_algid PRIVATE ${PROJECT_SOURCE_DIR}/include)
 target_link_libraries(dsd-neo_test_dmr_le_infer_algid PRIVATE dsd-neo_proto_dmr)
 add_test(NAME DMR_LE_INFER_ALGID COMMAND dsd-neo_test_dmr_le_infer_algid)
+
+add_executable(dsd-neo_test_dmr_pi_kirisun protocol/dmr/test_dmr_pi_kirisun.c)
+target_include_directories(dsd-neo_test_dmr_pi_kirisun PRIVATE ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(dsd-neo_test_dmr_pi_kirisun PRIVATE dsd-neo_proto_dmr)
+add_test(NAME DMR_PI_KIRISUN COMMAND dsd-neo_test_dmr_pi_kirisun)
+
+add_executable(dsd-neo_test_dmr_bs_alg_refresh_error protocol/dmr/test_dmr_bs_alg_refresh_error.c)
+target_include_directories(dsd-neo_test_dmr_bs_alg_refresh_error PRIVATE ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(dsd-neo_test_dmr_bs_alg_refresh_error PRIVATE dsd-neo_proto_dmr)
+add_test(NAME DMR_BS_ALG_REFRESH_ERROR COMMAND dsd-neo_test_dmr_bs_alg_refresh_error)
 
 add_executable(dsd-neo_test_dmr_r34_stub protocol/dmr/test_dmr_r34_stub.c)
 target_include_directories(dsd-neo_test_dmr_r34_stub PRIVATE ${PROJECT_SOURCE_DIR}/include)
@@ -1724,3 +1985,68 @@ add_executable(dsd-neo_test_io_udp_input io/test_io_udp_input.c)
 target_include_directories(dsd-neo_test_io_udp_input PRIVATE ${PROJECT_SOURCE_DIR}/include)
 target_link_libraries(dsd-neo_test_io_udp_input PRIVATE dsd-neo_io_audio)
 add_test(NAME IO_UDP_INPUT COMMAND dsd-neo_test_io_udp_input)
+
+set(_sndfile_fwd_contract_src "${_DSD_PUBLIC_HEADER_TEST_DIR}/CORE_SNDFILE_FWD_CONTRACT.c")
+file(WRITE "${_sndfile_fwd_contract_src}"
+  "// SPDX-License-Identifier: GPL-3.0-or-later\n"
+  "/*\n"
+  " * Regression test: when libsndfile headers are available, sndfile_fwd.h must\n"
+  " * surface the real SF_INFO definition. This protects the conditional-include\n"
+  " * behavior that previously regressed across CI environments.\n"
+  " */\n"
+  "\n"
+  "#include <dsd-neo/platform/sndfile_fwd.h>\n"
+  "\n"
+  "static int\n"
+  "sf_info_is_complete(void) {\n"
+  "    SF_INFO info;\n"
+  "    info.frames = 0;\n"
+  "    info.samplerate = 48000;\n"
+  "    info.channels = 1;\n"
+  "    info.format = 0;\n"
+  "    info.sections = 0;\n"
+  "    info.seekable = 0;\n"
+  "    return info.channels;\n"
+  "}\n"
+  "\n"
+  "int\n"
+  "main(void) {\n"
+  "    return sf_info_is_complete() != 1;\n"
+  "}\n")
+add_executable(dsd-neo_test_core_sndfile_fwd_contract "${_sndfile_fwd_contract_src}")
+target_include_directories(dsd-neo_test_core_sndfile_fwd_contract PRIVATE
+  ${PROJECT_SOURCE_DIR}/include
+  ${LIBSNDFILE_INCLUDE_DIR}
+)
+add_test(NAME CORE_SNDFILE_FWD_CONTRACT COMMAND dsd-neo_test_core_sndfile_fwd_contract)
+
+add_executable(dsd-neo_test_io_rtl_capture_phase io/test_io_rtl_capture_phase.c)
+target_include_directories(dsd-neo_test_io_rtl_capture_phase PRIVATE ${PROJECT_SOURCE_DIR}/src/io/radio)
+add_test(NAME IO_RTL_CAPTURE_PHASE COMMAND dsd-neo_test_io_rtl_capture_phase)
+
+if(DSD_HAS_RADIO)
+  add_executable(dsd-neo_test_io_rtl_auto_ppm io/test_io_rtl_auto_ppm.cpp)
+  target_include_directories(dsd-neo_test_io_rtl_auto_ppm PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/src/io/radio
+  )
+  target_link_libraries(dsd-neo_test_io_rtl_auto_ppm PRIVATE dsd-neo_io_radio)
+  add_test(NAME IO_RTL_AUTO_PPM COMMAND dsd-neo_test_io_rtl_auto_ppm)
+
+  add_executable(dsd-neo_test_io_rtl_ppm_request io/test_io_rtl_ppm_request.cpp)
+  target_include_directories(dsd-neo_test_io_rtl_ppm_request PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/src/io/radio
+  )
+  add_test(NAME IO_RTL_PPM_REQUEST COMMAND dsd-neo_test_io_rtl_ppm_request)
+
+  add_executable(dsd-neo_test_io_rtl_stream_ppm_sync io/test_io_rtl_stream_ppm_sync.cpp)
+  target_include_directories(dsd-neo_test_io_rtl_stream_ppm_sync PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+  )
+  target_link_libraries(dsd-neo_test_io_rtl_stream_ppm_sync PRIVATE dsd-neo_io_radio dsd-neo_core)
+  if(DSD_HAS_RTLSDR)
+    target_link_libraries(dsd-neo_test_io_rtl_stream_ppm_sync PRIVATE ${RTLSDR_LIBRARIES} ${CMAKE_THREAD_LIBS_INIT})
+  endif()
+  add_test(NAME IO_RTL_STREAM_PPM_SYNC COMMAND dsd-neo_test_io_rtl_stream_ppm_sync)
+endif()

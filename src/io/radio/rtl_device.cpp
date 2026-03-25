@@ -13,6 +13,7 @@
  */
 
 #include <atomic>
+#include <dsd-neo/core/constants.h>
 #include <dsd-neo/dsp/simd_widen.h>
 #include <dsd-neo/io/rtl_device.h>
 #include <dsd-neo/platform/sockets.h>
@@ -22,19 +23,22 @@
 #include <dsd-neo/runtime/input_ring.h>
 #include <dsd-neo/runtime/rt_sched.h>
 #include <errno.h>
+#include <limits.h>
 #include <math.h>
-#include <rtl-sdr.h>
+#if !DSD_PLATFORM_WIN_NATIVE
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <sys/socket.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include "dsd-neo/platform/platform.h"
+#include "rtl_capture_phase.h"
+
 #if defined(_MSC_VER) && DSD_PLATFORM_WIN_NATIVE
 #include <excpt.h>
-#endif
-
-#if DSD_PLATFORM_POSIX
-#include <strings.h>
-#include <unistd.h>
 #endif
 /* Some platforms (e.g. non-glibc) may not define MSG_NOSIGNAL */
 #ifndef MSG_NOSIGNAL
@@ -43,8 +47,217 @@
 
 #include <stdint.h>
 
+#ifdef USE_SOAPYSDR
+#include <SoapySDR/Constants.h>
+#include <SoapySDR/Device.hpp>
+#include <SoapySDR/Errors.h>
+#include <SoapySDR/Errors.hpp>
+#include <SoapySDR/Formats.h>
+#include <SoapySDR/Types.hpp>
+#include <complex>
+#include <exception>
+#include <string>
+#include <vector>
+
+namespace SoapySDR {
+class Stream;
+} // namespace SoapySDR
+#else
+namespace SoapySDR {
+class Device;
+class Stream;
+} // namespace SoapySDR
+#endif
+
+#ifdef USE_RTLSDR
+#include <rtl-sdr.h>
+#else
+struct rtlsdr_dev;
+typedef struct rtlsdr_dev rtlsdr_dev_t;
+
+#ifndef RTLSDR_TUNER_E4000
+#define RTLSDR_TUNER_UNKNOWN 0
+#define RTLSDR_TUNER_E4000   1
+#define RTLSDR_TUNER_FC0012  2
+#define RTLSDR_TUNER_FC0013  3
+#define RTLSDR_TUNER_FC2580  4
+#define RTLSDR_TUNER_R820T   5
+#define RTLSDR_TUNER_R828D   6
+#endif
+
+static int
+rtlsdr_open(rtlsdr_dev_t** dev, uint32_t index) {
+    (void)dev;
+    (void)index;
+    return -1;
+}
+
+static int
+rtlsdr_close(rtlsdr_dev_t* dev) {
+    (void)dev;
+    return -1;
+}
+
+static int
+rtlsdr_read_async(rtlsdr_dev_t* dev, void (*cb)(unsigned char*, uint32_t, void*), void* ctx, uint32_t buf_num,
+                  uint32_t buf_len) {
+    (void)dev;
+    (void)cb;
+    (void)ctx;
+    (void)buf_num;
+    (void)buf_len;
+    return -1;
+}
+
+static int
+rtlsdr_cancel_async(rtlsdr_dev_t* dev) {
+    (void)dev;
+    return -1;
+}
+
+static int
+rtlsdr_set_tuner_gain_mode(rtlsdr_dev_t* dev, int manual) {
+    (void)dev;
+    (void)manual;
+    return -1;
+}
+
+static int
+rtlsdr_get_tuner_gains(rtlsdr_dev_t* dev, int* gains) {
+    (void)dev;
+    (void)gains;
+    return -1;
+}
+
+static int
+rtlsdr_set_center_freq(rtlsdr_dev_t* dev, uint32_t freq) {
+    (void)dev;
+    (void)freq;
+    return -1;
+}
+
+static int
+rtlsdr_set_sample_rate(rtlsdr_dev_t* dev, uint32_t rate) {
+    (void)dev;
+    (void)rate;
+    return -1;
+}
+
+static int
+rtlsdr_set_direct_sampling(rtlsdr_dev_t* dev, int on) {
+    (void)dev;
+    (void)on;
+    return -1;
+}
+
+static int
+rtlsdr_get_tuner_type(rtlsdr_dev_t* dev) {
+    (void)dev;
+    return RTLSDR_TUNER_UNKNOWN;
+}
+
+static int
+rtlsdr_set_tuner_bandwidth(rtlsdr_dev_t* dev, int bw_hz) {
+    (void)dev;
+    (void)bw_hz;
+    return -1;
+}
+
+static int
+rtlsdr_set_agc_mode(rtlsdr_dev_t* dev, int on) {
+    (void)dev;
+    (void)on;
+    return -1;
+}
+
+static int
+rtlsdr_set_tuner_gain(rtlsdr_dev_t* dev, int gain) {
+    (void)dev;
+    (void)gain;
+    return -1;
+}
+
+static int
+rtlsdr_set_freq_correction(rtlsdr_dev_t* dev, int ppm) {
+    (void)dev;
+    (void)ppm;
+    return -1;
+}
+
+static int
+rtlsdr_reset_buffer(rtlsdr_dev_t* dev) {
+    (void)dev;
+    return -1;
+}
+
+static uint32_t
+rtlsdr_get_sample_rate(rtlsdr_dev_t* dev) {
+    (void)dev;
+    return 0;
+}
+
+static int
+rtlsdr_get_tuner_gain(rtlsdr_dev_t* dev) {
+    (void)dev;
+    return -1;
+}
+
+static int
+rtlsdr_set_offset_tuning(rtlsdr_dev_t* dev, int on) {
+    (void)dev;
+    (void)on;
+    return -1;
+}
+
+static int
+rtlsdr_set_xtal_freq(rtlsdr_dev_t* dev, uint32_t rtl, uint32_t tuner) {
+    (void)dev;
+    (void)rtl;
+    (void)tuner;
+    return -1;
+}
+
+static int
+rtlsdr_set_testmode(rtlsdr_dev_t* dev, int on) {
+    (void)dev;
+    (void)on;
+    return -1;
+}
+
+static int
+rtlsdr_set_tuner_if_gain(rtlsdr_dev_t* dev, int stage, int gain) {
+    (void)dev;
+    (void)stage;
+    (void)gain;
+    return -1;
+}
+
+#ifdef USE_RTLSDR_BIAS_TEE
+static int
+rtlsdr_set_bias_tee(rtlsdr_dev_t* dev, int on) {
+    (void)dev;
+    (void)on;
+    return -1;
+}
+#endif
+#endif
+
 // Shutdown signaling (defined in src/runtime/exitflag.c)
 extern "C" volatile uint8_t exitflag;
+/* Capture-shift override (defined in rtl_demod_config.cpp). */
+extern int disable_fs4_shift;
+
+enum : int {
+    RTL_BACKEND_USB = 0,
+    RTL_BACKEND_TCP = 1,
+    RTL_BACKEND_SOAPY = 2,
+};
+
+enum : int {
+    SOAPY_FMT_NONE = 0,
+    SOAPY_FMT_CF32 = 1,
+    SOAPY_FMT_CS16 = 2,
+};
 
 // Internal RTL device structure
 struct rtl_device {
@@ -62,8 +275,22 @@ struct rtl_device {
     int thread_started;
     struct input_ring_state* input_ring;
     int combine_rotate_enabled;
-    /* Backend selector: 0 = USB (librtlsdr), 1 = rtl_tcp */
+    /* Backend selector: 0 = USB (librtlsdr), 1 = rtl_tcp, 2 = SoapySDR */
     int backend;
+    /* SoapySDR backend */
+    SoapySDR::Device* soapy_dev;
+    SoapySDR::Stream* soapy_stream;
+    dsd_mutex_t soapy_lock;
+    int soapy_lock_inited;
+    int soapy_format; /* SOAPY_FMT_* */
+    uint32_t soapy_mtu_elems;
+    int rot_phase;                                  /* persistent j^n phase in [0..3] for capture-side FS/4 rotation */
+    struct rtl_capture_u8_byte_carry iq_byte_carry; /* one buffered raw byte when a chunk ends mid-I/Q sample */
+    std::atomic<int> mute_byte_phase;               /* byte carry while an active mute span is discarded in fragments */
+    uint64_t soapy_overflow_count;
+    uint64_t soapy_timeout_count;
+    uint64_t soapy_read_errors;
+    uint64_t soapy_last_overflow_log_ns;
     /* rtl_tcp connection */
     dsd_socket_t sockfd;
     char host[1024];
@@ -126,45 +353,363 @@ struct rtl_device {
  *             per-role environment variables.
  */
 
-/**
- * @brief Rotate IQ data by 90 degrees in-place.
- *
- * @param buf Interleaved IQ byte buffer.
- * @param len Buffer length in bytes (processed in blocks of 8).
- */
-static void
-rotate_90(unsigned char* buf, uint32_t len) {
-    uint32_t i;
-    unsigned char tmp;
-    /* Process only full 8-byte blocks (4 IQ pairs) to avoid overrun */
-    uint32_t full = len - (len % 8);
-    for (i = 0; i < full; i += 8) {
-        /* uint8_t negation = 255 - x */
-        tmp = 255 - buf[i + 3];
-        buf[i + 3] = buf[i + 2];
-        buf[i + 2] = tmp;
+static inline int
+fs4_shift_capture_active(const struct rtl_device* s) {
+    return (s && !s->offset_tuning && !disable_fs4_shift) ? 1 : 0;
+}
 
-        tmp = 255 - buf[i + 2];
-        buf[i + 2] = buf[i + 3];
-        buf[i + 3] = tmp;
+static inline int
+rtl_process_u8_chunk(struct rtl_device* s, unsigned char* src, float* dst, size_t len, int fs4_shift_active,
+                     int use_two_pass, int* phase) {
+    if (!s || !src || !dst || len == 0) {
+        return phase ? *phase : 0;
+    }
+    int cur_phase = phase ? (*phase & 3) : 0;
+    if (fs4_shift_active && s->combine_rotate_enabled) {
+        cur_phase = (int)widen_rotate90_u8_to_f32_bias127_phase(src, dst, (uint32_t)len, (uint32_t)cur_phase);
+    } else if (use_two_pass) {
+        cur_phase = (int)rotate90_u8_inplace_phase(src, (uint32_t)len, (uint32_t)cur_phase);
+        widen_u8_to_f32_bias128_scalar(src, dst, (uint32_t)len);
+    } else {
+        widen_u8_to_f32_bias127(src, dst, (uint32_t)len);
+    }
+    if (phase) {
+        *phase = cur_phase;
+    }
+    return cur_phase;
+}
 
-        tmp = 255 - buf[i + 6];
-        buf[i + 6] = buf[i + 7];
-        buf[i + 7] = tmp;
+static inline size_t
+rtl_drop_u8_bytes_preserve_alignment(const unsigned char* src, size_t byte_count,
+                                     struct rtl_capture_u8_byte_carry* carry, int* phase, int fs4_shift_active) {
+    size_t dropped = rtl_capture_u8_byte_carry_drop_aligned(src, byte_count, carry);
+    if (fs4_shift_active && phase && dropped != 0) {
+        *phase = rtl_capture_phase_advance_pairs(*phase, dropped >> 1);
+    }
+    return dropped;
+}
 
-        tmp = 255 - buf[i + 7];
-        buf[i + 7] = buf[i + 6];
-        buf[i + 6] = tmp;
+static inline void
+rtl_prepare_fragmented_u8_mute(struct rtl_device* s) {
+    if (!s || s->mute.load(std::memory_order_relaxed) <= 0 || !s->iq_byte_carry.valid) {
+        return;
+    }
+
+    unsigned int carry = (unsigned int)(s->mute_byte_phase.load(std::memory_order_relaxed) & 1U);
+    int remaining = s->mute.load(std::memory_order_relaxed);
+    rtl_capture_u8_byte_carry_clear(&s->iq_byte_carry);
+    if (carry == 0U) {
+        carry = 1U;
+        if ((remaining & 1) == 0 && remaining < INT_MAX) {
+            s->mute.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    s->mute_byte_phase.store((int)carry, std::memory_order_relaxed);
+}
+
+static inline int
+rtl_account_fragmented_muted_u8_bytes(struct rtl_device* s, size_t discarded_bytes, int fs4_shift_active) {
+    if (!s || discarded_bytes == 0) {
+        return 0;
+    }
+    unsigned int carry = (unsigned int)(s->mute_byte_phase.load(std::memory_order_relaxed) & 1U);
+    if (fs4_shift_active) {
+        s->rot_phase = rtl_capture_phase_advance_u8_bytes_fragmented(s->rot_phase & 3, discarded_bytes, &carry);
+    } else {
+        (void)rtl_capture_phase_advance_u8_bytes_fragmented(0, discarded_bytes, &carry);
+    }
+    s->mute_byte_phase.store((int)carry, std::memory_order_relaxed);
+    return fs4_shift_active ? s->rot_phase : 0;
+}
+
+static inline void
+rtl_reset_capture_state_on_stream_boundary(struct rtl_device* s) {
+    if (!s) {
+        return;
+    }
+
+    unsigned int carry = (unsigned int)(s->mute_byte_phase.load(std::memory_order_relaxed) & 1U);
+    int remaining = s->mute.load(std::memory_order_relaxed);
+    for (;;) {
+        int realigned =
+            rtl_capture_restart_u8_stream_with_pending(&s->rot_phase, remaining, &carry, &s->tcp_pending_len);
+        if (realigned == remaining) {
+            break;
+        }
+        if (s->mute.compare_exchange_weak(remaining, realigned, std::memory_order_relaxed)) {
+            break;
+        }
+    }
+    rtl_capture_u8_byte_carry_clear(&s->iq_byte_carry);
+    s->mute_byte_phase.store((int)carry, std::memory_order_relaxed);
+}
+
+static int
+rtl_write_u8_to_ring(struct rtl_device* s, unsigned char* src, size_t len, int fs4_shift_active, int use_two_pass,
+                     int count_full_reserve) {
+    if (!s || !s->input_ring || !src || len == 0) {
+        return 0;
+    }
+
+    size_t done = 0;
+    size_t need = len;
+    int phase = s->rot_phase & 3;
+    struct rtl_capture_u8_byte_carry carry = s->iq_byte_carry;
+    int ring_exhausted = 0;
+
+    while (rtl_capture_u8_byte_carry_ready_bytes(need, &carry) >= 2U) {
+        float *p1 = NULL, *p2 = NULL;
+        size_t n1 = 0, n2 = 0;
+        size_t ready = rtl_capture_u8_byte_carry_ready_bytes(need, &carry);
+        input_ring_reserve(s->input_ring, ready, &p1, &n1, &p2, &n2);
+        if (n1 == 0 && n2 == 0) {
+            ring_exhausted = 1;
+            break;
+        }
+
+        if (n1 & 1U) {
+            n1--;
+        }
+        size_t w1 = (n1 < ready) ? n1 : ready;
+        size_t rem_after_w1 = ready - w1;
+        if (n2 & 1U) {
+            n2--;
+        }
+        size_t w2 = (n2 < rem_after_w1) ? n2 : rem_after_w1;
+        size_t produced = w1 + w2;
+
+        if (produced == 0) {
+            ring_exhausted = 1;
+            break;
+        }
+
+        size_t consumed = 0;
+        if (w1) {
+            unsigned char pair[2];
+            size_t prefix = rtl_capture_u8_byte_carry_consume_prefix(src + done, need, &carry, pair);
+            if (prefix != 0U) {
+                rtl_process_u8_chunk(s, pair, p1, 2U, fs4_shift_active, use_two_pass, &phase);
+                done += prefix;
+                need -= prefix;
+                consumed += 2U;
+            }
+            if (w1 > consumed) {
+                size_t body = w1 - consumed;
+                rtl_process_u8_chunk(s, src + done, p1 + consumed, body, fs4_shift_active, use_two_pass, &phase);
+                done += body;
+                need -= body;
+            }
+        }
+        if (w2) {
+            unsigned char pair[2];
+            size_t prefix = rtl_capture_u8_byte_carry_consume_prefix(src + done, need, &carry, pair);
+            size_t produced_w2 = 0;
+            if (prefix != 0U) {
+                rtl_process_u8_chunk(s, pair, p2, 2U, fs4_shift_active, use_two_pass, &phase);
+                done += prefix;
+                need -= prefix;
+                produced_w2 += 2U;
+            }
+            if (w2 > produced_w2) {
+                size_t body = w2 - produced_w2;
+                rtl_process_u8_chunk(s, src + done, p2 + produced_w2, body, fs4_shift_active, use_two_pass, &phase);
+                done += body;
+                need -= body;
+            }
+        }
+
+        input_ring_commit(s->input_ring, produced);
+    }
+
+    if (ring_exhausted) {
+        size_t dropped = rtl_drop_u8_bytes_preserve_alignment(src + done, need, &carry, &phase, fs4_shift_active);
+        if (dropped != 0U) {
+            s->input_ring->producer_drops.fetch_add((uint64_t)dropped);
+        }
+        if (count_full_reserve) {
+            s->reserve_full_events++;
+        }
+    } else if (need == 1U && !carry.valid) {
+        rtl_capture_u8_byte_carry_save(&carry, src[done]);
+    }
+
+    s->iq_byte_carry = carry;
+    if (fs4_shift_active) {
+        s->rot_phase = phase;
+    }
+    return ring_exhausted;
+}
+
+#ifdef USE_SOAPYSDR
+static inline void
+apply_j4_rotation(float in_i, float in_q, int phase, float* out_i, float* out_q) {
+    switch (phase & 3) {
+        case 0:
+            *out_i = in_i;
+            *out_q = in_q;
+            break;
+        case 1:
+            *out_i = -in_q;
+            *out_q = in_i;
+            break;
+        case 2:
+            *out_i = -in_i;
+            *out_q = -in_q;
+            break;
+        default:
+            *out_i = in_q;
+            *out_q = -in_i;
+            break;
     }
 }
+
+static size_t
+soapy_write_cf32_to_ring(struct rtl_device* s, const std::complex<float>* src, size_t num_elems, int apply_rot) {
+    if (!s || !s->input_ring || !src || num_elems == 0) {
+        return 0;
+    }
+    size_t need = num_elems * 2;
+    size_t done = 0;
+    int phase = s->rot_phase & 3;
+    while (need > 0) {
+        float *p1 = NULL, *p2 = NULL;
+        size_t n1 = 0, n2 = 0;
+        input_ring_reserve(s->input_ring, need, &p1, &n1, &p2, &n2);
+        if (n1 == 0 && n2 == 0) {
+            s->input_ring->producer_drops.fetch_add((uint64_t)need);
+            if (apply_rot) {
+                phase = rtl_capture_phase_advance_pairs(phase, need / 2);
+            }
+            break;
+        }
+        if (n1 & 1) {
+            n1--;
+        }
+        size_t w1 = (n1 < need) ? n1 : need;
+        size_t rem = need - w1;
+        if (n2 & 1) {
+            n2--;
+        }
+        size_t w2 = (n2 < rem) ? n2 : rem;
+        size_t w1_elems = w1 / 2;
+        size_t w2_elems = w2 / 2;
+        size_t src_idx = done / 2;
+        if (w1_elems > 0) {
+            for (size_t i = 0; i < w1_elems; i++) {
+                float i_in = src[src_idx + i].real();
+                float q_in = src[src_idx + i].imag();
+                if (apply_rot) {
+                    apply_j4_rotation(i_in, q_in, phase, &p1[(i * 2) + 0], &p1[(i * 2) + 1]);
+                    phase = (phase + 1) & 3;
+                } else {
+                    p1[(i * 2) + 0] = i_in;
+                    p1[(i * 2) + 1] = q_in;
+                }
+            }
+        }
+        src_idx += w1_elems;
+        if (w2_elems > 0) {
+            for (size_t i = 0; i < w2_elems; i++) {
+                float i_in = src[src_idx + i].real();
+                float q_in = src[src_idx + i].imag();
+                if (apply_rot) {
+                    apply_j4_rotation(i_in, q_in, phase, &p2[(i * 2) + 0], &p2[(i * 2) + 1]);
+                    phase = (phase + 1) & 3;
+                } else {
+                    p2[(i * 2) + 0] = i_in;
+                    p2[(i * 2) + 1] = q_in;
+                }
+            }
+        }
+        input_ring_commit(s->input_ring, w1 + w2);
+        done += w1 + w2;
+        need -= w1 + w2;
+    }
+    if (apply_rot) {
+        s->rot_phase = phase;
+    }
+    return done / 2;
+}
+
+static size_t
+soapy_write_cs16_to_ring(struct rtl_device* s, const int16_t* src, size_t num_elems, int apply_rot) {
+    if (!s || !s->input_ring || !src || num_elems == 0) {
+        return 0;
+    }
+    const float scale = 1.0f / 32768.0f;
+    size_t need = num_elems * 2;
+    size_t done = 0;
+    int phase = s->rot_phase & 3;
+    while (need > 0) {
+        float *p1 = NULL, *p2 = NULL;
+        size_t n1 = 0, n2 = 0;
+        input_ring_reserve(s->input_ring, need, &p1, &n1, &p2, &n2);
+        if (n1 == 0 && n2 == 0) {
+            s->input_ring->producer_drops.fetch_add((uint64_t)need);
+            if (apply_rot) {
+                phase = rtl_capture_phase_advance_pairs(phase, need / 2);
+            }
+            break;
+        }
+        if (n1 & 1) {
+            n1--;
+        }
+        size_t w1 = (n1 < need) ? n1 : need;
+        size_t rem = need - w1;
+        if (n2 & 1) {
+            n2--;
+        }
+        size_t w2 = (n2 < rem) ? n2 : rem;
+        size_t w1_elems = w1 / 2;
+        size_t w2_elems = w2 / 2;
+        size_t src_idx = done / 2;
+        if (w1_elems > 0) {
+            for (size_t i = 0; i < w1_elems; i++) {
+                size_t sample_idx = (src_idx + i) * 2;
+                float i_in = (float)src[sample_idx + 0] * scale;
+                float q_in = (float)src[sample_idx + 1] * scale;
+                if (apply_rot) {
+                    apply_j4_rotation(i_in, q_in, phase, &p1[(i * 2) + 0], &p1[(i * 2) + 1]);
+                    phase = (phase + 1) & 3;
+                } else {
+                    p1[(i * 2) + 0] = i_in;
+                    p1[(i * 2) + 1] = q_in;
+                }
+            }
+        }
+        src_idx += w1_elems;
+        if (w2_elems > 0) {
+            for (size_t i = 0; i < w2_elems; i++) {
+                size_t sample_idx = (src_idx + i) * 2;
+                float i_in = (float)src[sample_idx + 0] * scale;
+                float q_in = (float)src[sample_idx + 1] * scale;
+                if (apply_rot) {
+                    apply_j4_rotation(i_in, q_in, phase, &p2[(i * 2) + 0], &p2[(i * 2) + 1]);
+                    phase = (phase + 1) & 3;
+                } else {
+                    p2[(i * 2) + 0] = i_in;
+                    p2[(i * 2) + 1] = q_in;
+                }
+            }
+        }
+        input_ring_commit(s->input_ring, w1 + w2);
+        done += w1 + w2;
+        need -= w1 + w2;
+    }
+    if (apply_rot) {
+        s->rot_phase = phase;
+    }
+    return done / 2;
+}
+#endif
 
 /**
  * @brief RTL-SDR asynchronous USB callback.
  * Converts incoming u8 I/Q to normalized float and enqueues into the input ring. If
  * `offset_tuning` is off and `DSD_NEO_COMBINE_ROT` is enabled (default), a
  * combined rotate+widen implementation is used. Otherwise it falls back to
- * legacy two-pass (rotate_90 u8, then widen subtracting 128) or a simple
- * widen subtracting 127. On overflow, drops oldest ring data to avoid stalls.
+ * a legacy two-pass byte-rotation + bias128 widen path or a simple widen
+ * subtracting 127. On overflow, drops oldest ring data to avoid stalls.
  *
  * @param buf USB I/Q byte buffer.
  * @param len Buffer length in bytes (I/Q interleaved).
@@ -189,6 +734,8 @@ rtlsdr_callback(unsigned char* buf, uint32_t len, void* ctx) {
     if (!ctx) {
         return;
     }
+    int fs4_shift_active = fs4_shift_capture_active(s);
+    int use_two_pass = (fs4_shift_active && !s->combine_rotate_enabled);
     /* Handle muting: skip (discard) muted samples entirely instead of zero-filling.
      *
      * Previously we set muted samples to 127 (midpoint), which after bias subtraction
@@ -196,79 +743,35 @@ rtlsdr_callback(unsigned char* buf, uint32_t len, void* ctx) {
      * they're processed after the retune gate opens. By discarding them entirely,
      * the demod thread never sees transient samples.
      *
-     * Advance buf pointer and reduce len to skip the muted portion. */
+     * Advance buf pointer and reduce len to skip the muted portion.
+     *
+     * Note: the stored mute value counts raw stream bytes still to discard. On the
+     * rtl_tcp backend that remainder may legitimately be odd between callbacks because
+     * recv() can split an aligned mute span across arbitrary byte boundaries. */
     if (s->mute.load(std::memory_order_relaxed) > 0) {
+        rtl_prepare_fragmented_u8_mute(s);
         int old = s->mute.load(std::memory_order_relaxed);
         if (old > 0) {
             uint32_t m = (uint32_t)old;
             if (m >= len) {
                 /* Entire buffer is muted - discard all and update counter */
+                rtl_account_fragmented_muted_u8_bytes(s, len, fs4_shift_active);
                 s->mute.fetch_sub((int)len, std::memory_order_relaxed);
+                if (m == len) {
+                    s->mute_byte_phase.store(0, std::memory_order_relaxed);
+                }
                 return; /* Nothing to process */
             }
             /* Partial mute: skip first m bytes, process remainder */
+            rtl_account_fragmented_muted_u8_bytes(s, m, fs4_shift_active);
             buf += m;
             len -= m;
             s->mute.fetch_sub((int)m, std::memory_order_relaxed);
+            s->mute_byte_phase.store(0, std::memory_order_relaxed);
         }
     }
-    /* Convert incoming u8 I/Q and write directly into input ring without extra copy */
-    size_t need = len;
-    size_t done = 0;
-    /* For legacy two-pass path, rotate the incoming byte buffer once up front */
-    int use_two_pass = (!s->offset_tuning && !s->combine_rotate_enabled);
-    if (use_two_pass) {
-        rotate_90(buf, len);
-    }
-    while (need > 0) {
-        float *p1 = NULL, *p2 = NULL;
-        size_t n1 = 0, n2 = 0;
-        input_ring_reserve(s->input_ring, need, &p1, &n1, &p2, &n2);
-        if (n1 == 0 && n2 == 0) {
-            /* Ring full: record drop and give up remaining bytes from this callback */
-            if (s->input_ring) {
-                s->input_ring->producer_drops.fetch_add((uint64_t)need);
-            }
-            break;
-        }
-        /* Ensure even counts to keep I/Q pairs aligned */
-        if (n1 & 1) {
-            n1--;
-        }
-        size_t w1 = (n1 < need) ? n1 : need;
-        size_t rem_after_w1 = need - w1;
-        if (n2 & 1) {
-            n2--;
-        }
-        size_t w2 = (n2 < rem_after_w1) ? n2 : rem_after_w1;
-
-        if (!s->offset_tuning && s->combine_rotate_enabled) {
-            if (w1) {
-                widen_rotate90_u8_to_f32_bias127(buf + done, p1, (uint32_t)w1);
-            }
-            if (w2) {
-                widen_rotate90_u8_to_f32_bias127(buf + done + w1, p2, (uint32_t)w2);
-            }
-        } else if (use_two_pass) {
-            /* bytes already rotated in-place; widen with 128 subtraction to avoid bias */
-            if (w1) {
-                widen_u8_to_f32_bias128_scalar(buf + done, p1, (uint32_t)w1);
-            }
-            if (w2) {
-                widen_u8_to_f32_bias128_scalar(buf + done + w1, p2, (uint32_t)w2);
-            }
-        } else {
-            if (w1) {
-                widen_u8_to_f32_bias127(buf + done, p1, (uint32_t)w1);
-            }
-            if (w2) {
-                widen_u8_to_f32_bias127(buf + done + w1, p2, (uint32_t)w2);
-            }
-        }
-        input_ring_commit(s->input_ring, w1 + w2);
-        done += w1 + w2;
-        need -= w1 + w2;
-    }
+    /* Convert incoming u8 I/Q and write directly into input ring without extra copy. */
+    rtl_write_u8_to_ring(s, buf, len, fs4_shift_active, use_two_pass, 0);
 }
 
 /**
@@ -298,6 +801,239 @@ static DSD_THREAD_RETURN_TYPE
     rtlsdr_read_async(s->dev, rtlsdr_callback, s, 16, s->buf_len);
 #endif
     DSD_THREAD_RETURN;
+}
+
+#ifdef USE_SOAPYSDR
+template <typename Fn>
+static int
+soapy_call_locked(struct rtl_device* dev, const char* op, Fn&& fn) {
+    if (!dev || !dev->soapy_dev || !dev->soapy_lock_inited) {
+        return -1;
+    }
+    if (dsd_mutex_lock(&dev->soapy_lock) != 0) {
+        fprintf(stderr, "SoapySDR: failed to lock mutex for %s.\n", op);
+        return -1;
+    }
+    int ret = -1;
+    try {
+        ret = fn();
+    } catch (const std::exception& e) {
+        fprintf(stderr, "SoapySDR: exception in %s: %s\n", op, e.what());
+        ret = -1;
+    }
+    (void)dsd_mutex_unlock(&dev->soapy_lock);
+    return ret;
+}
+#endif
+
+static void
+soapy_stream_cleanup(struct rtl_device* dev, int unmake_device) {
+#ifdef USE_SOAPYSDR
+    if (!dev || !dev->soapy_lock_inited) {
+        return;
+    }
+    if (dsd_mutex_lock(&dev->soapy_lock) != 0) {
+        fprintf(stderr, "SoapySDR: failed to lock mutex for cleanup.\n");
+        return;
+    }
+    if (dev->soapy_dev && dev->soapy_stream) {
+        try {
+            int rc = dev->soapy_dev->deactivateStream(dev->soapy_stream, 0, 0);
+            if (rc < 0 && rc != SOAPY_SDR_NOT_SUPPORTED) {
+                fprintf(stderr, "SoapySDR: deactivateStream failed: %s (%d).\n", SoapySDR::errToStr(rc), rc);
+            }
+        } catch (const std::exception& e) {
+            fprintf(stderr, "SoapySDR: exception in deactivateStream: %s\n", e.what());
+        }
+        try {
+            dev->soapy_dev->closeStream(dev->soapy_stream);
+        } catch (const std::exception& e) {
+            fprintf(stderr, "SoapySDR: exception in closeStream: %s\n", e.what());
+        }
+        dev->soapy_stream = NULL;
+    }
+    if (unmake_device && dev->soapy_dev) {
+        try {
+            SoapySDR::Device::unmake(dev->soapy_dev);
+        } catch (const std::exception& e) {
+            fprintf(stderr, "SoapySDR: exception in Device::unmake: %s\n", e.what());
+        }
+        dev->soapy_dev = NULL;
+    }
+    (void)dsd_mutex_unlock(&dev->soapy_lock);
+#else
+    (void)dev;
+    (void)unmake_device;
+#endif
+}
+
+static DSD_THREAD_RETURN_TYPE
+#if DSD_PLATFORM_WIN_NATIVE
+    __stdcall
+#endif
+    soapy_thread_fn(void* arg) {
+#ifndef USE_SOAPYSDR
+    (void)arg;
+    DSD_THREAD_RETURN;
+#else
+    struct rtl_device* s = static_cast<rtl_device*>(arg);
+    if (!s || !s->soapy_dev) {
+        DSD_THREAD_RETURN;
+    }
+    maybe_set_thread_realtime_and_affinity("DONGLE");
+
+    int fatal = 0;
+    size_t mtu_elems = 16384;
+    std::string stream_format;
+
+    if (dsd_mutex_lock(&s->soapy_lock) != 0) {
+        fprintf(stderr, "SoapySDR: failed to lock mutex for stream setup.\n");
+        fatal = 1;
+    } else {
+        try {
+            std::vector<std::string> formats = s->soapy_dev->getStreamFormats(SOAPY_SDR_RX, 0);
+            bool have_cf32 = false;
+            bool have_cs16 = false;
+            for (size_t i = 0; i < formats.size(); i++) {
+                if (formats[i] == SOAPY_SDR_CF32) {
+                    have_cf32 = true;
+                } else if (formats[i] == SOAPY_SDR_CS16) {
+                    have_cs16 = true;
+                }
+            }
+            if (have_cf32) {
+                s->soapy_format = SOAPY_FMT_CF32;
+                stream_format = SOAPY_SDR_CF32;
+            } else if (have_cs16) {
+                s->soapy_format = SOAPY_FMT_CS16;
+                stream_format = SOAPY_SDR_CS16;
+            } else {
+                fprintf(stderr, "SoapySDR: RX stream formats do not include CF32 or CS16.\n");
+                fatal = 1;
+            }
+            if (!fatal) {
+                std::vector<size_t> channels(1, 0);
+                SoapySDR::Kwargs args;
+                s->soapy_stream = s->soapy_dev->setupStream(SOAPY_SDR_RX, stream_format, channels, args);
+                if (!s->soapy_stream) {
+                    fprintf(stderr, "SoapySDR: setupStream returned null.\n");
+                    fatal = 1;
+                }
+            }
+            if (!fatal && s->soapy_stream) {
+                size_t mtu = s->soapy_dev->getStreamMTU(s->soapy_stream);
+                if (mtu > 0) {
+                    mtu_elems = mtu;
+                }
+                s->soapy_mtu_elems = (uint32_t)mtu_elems;
+            }
+            if (!fatal && s->soapy_stream) {
+                int rc = s->soapy_dev->activateStream(s->soapy_stream, 0, 0, 0);
+                if (rc < 0) {
+                    fprintf(stderr, "SoapySDR: activateStream failed: %s (%d).\n", SoapySDR::errToStr(rc), rc);
+                    fatal = 1;
+                }
+            }
+        } catch (const std::exception& e) {
+            fprintf(stderr, "SoapySDR: exception during stream setup: %s\n", e.what());
+            fatal = 1;
+        }
+        (void)dsd_mutex_unlock(&s->soapy_lock);
+    }
+
+    if (fatal) {
+        soapy_stream_cleanup(s, 1);
+        s->run.store(0);
+        DSD_THREAD_RETURN;
+    }
+
+    std::vector<std::complex<float>> cf32_buf;
+    std::vector<int16_t> cs16_buf;
+    try {
+        if (s->soapy_format == SOAPY_FMT_CF32) {
+            cf32_buf.resize(mtu_elems);
+        } else if (s->soapy_format == SOAPY_FMT_CS16) {
+            cs16_buf.resize(mtu_elems * 2);
+        } else {
+            fatal = 1;
+        }
+    } catch (const std::exception& e) {
+        fprintf(stderr, "SoapySDR: buffer allocation exception: %s\n", e.what());
+        fatal = 1;
+    }
+    if (fatal) {
+        soapy_stream_cleanup(s, 1);
+        s->run.store(0);
+        DSD_THREAD_RETURN;
+    }
+
+    while (s->run.load() && exitflag == 0) {
+        int flags = 0;
+        long long time_ns = 0;
+        void* buffs[1] = {NULL};
+        if (s->soapy_format == SOAPY_FMT_CF32) {
+            buffs[0] = (void*)cf32_buf.data();
+        } else if (s->soapy_format == SOAPY_FMT_CS16) {
+            buffs[0] = (void*)cs16_buf.data();
+        } else {
+            fatal = 1;
+            break;
+        }
+
+        int ret = -1;
+        int read_exception = 0;
+        if (dsd_mutex_lock(&s->soapy_lock) != 0) {
+            fprintf(stderr, "SoapySDR: failed to lock mutex for readStream.\n");
+            fatal = 1;
+            break;
+        }
+        try {
+            ret = s->soapy_dev->readStream(s->soapy_stream, buffs, mtu_elems, flags, time_ns, 15000);
+        } catch (const std::exception& e) {
+            fprintf(stderr, "SoapySDR: exception in readStream: %s\n", e.what());
+            read_exception = 1;
+        }
+        (void)dsd_mutex_unlock(&s->soapy_lock);
+
+        if (read_exception) {
+            fatal = 1;
+            break;
+        }
+        if (ret == SOAPY_SDR_TIMEOUT) {
+            s->soapy_timeout_count++;
+            continue;
+        }
+        if (ret == SOAPY_SDR_OVERFLOW) {
+            s->soapy_overflow_count++;
+            uint64_t now_ns = dsd_time_monotonic_ns();
+            if ((now_ns - s->soapy_last_overflow_log_ns) > 1000000000ULL) {
+                fprintf(stderr, "SoapySDR: RX overflow count=%llu.\n", (unsigned long long)s->soapy_overflow_count);
+                s->soapy_last_overflow_log_ns = now_ns;
+            }
+            continue;
+        }
+        if (ret < 0) {
+            s->soapy_read_errors++;
+            fprintf(stderr, "SoapySDR: readStream failed: %s (%d).\n", SoapySDR::errToStr(ret), ret);
+            fatal = 1;
+            break;
+        }
+        if (ret == 0) {
+            continue;
+        }
+
+        const int apply_rot = fs4_shift_capture_active(s);
+        if (s->soapy_format == SOAPY_FMT_CF32) {
+            (void)soapy_write_cf32_to_ring(s, cf32_buf.data(), (size_t)ret, apply_rot);
+        } else {
+            (void)soapy_write_cs16_to_ring(s, cs16_buf.data(), (size_t)ret, apply_rot);
+        }
+    }
+
+    soapy_stream_cleanup(s, fatal ? 1 : 0);
+    s->run.store(0);
+    DSD_THREAD_RETURN;
+#endif
 }
 
 /* ---- rtl_tcp backend helpers ---- */
@@ -408,7 +1144,7 @@ static DSD_THREAD_RETURN_TYPE
     /* Default read size: for rtl_tcp prefer small (16 KiB) chunks for higher cadence.
        For USB, derive ~20 ms to reduce burstiness. */
     size_t BUFSZ = 0;
-    if (s->backend == 1) {
+    if (s->backend == RTL_BACKEND_TCP) {
         BUFSZ = 16384; /* ~5 ms @ 1.536 Msps */
     } else {
         if (s->rate > 0) {
@@ -435,7 +1171,7 @@ static DSD_THREAD_RETURN_TYPE
     }
     /* Discard server capability header so following bytes are pure IQ */
     rtl_tcp_skip_header(s->sockfd);
-    int waitall = (s->backend == 1) ? 0 : 1; /* rtl_tcp default off; USB default on */
+    int waitall = (s->backend == RTL_BACKEND_TCP) ? 0 : 1; /* rtl_tcp default off; USB default on */
     if (cfg && cfg->tcp_waitall_is_set) {
         waitall = cfg->tcp_waitall_enable ? 1 : 0;
     }
@@ -515,9 +1251,12 @@ static DSD_THREAD_RETURN_TYPE
                 if (newsfd != DSD_INVALID_SOCKET) {
                     s->sockfd = newsfd;
                     fprintf(stderr, "rtl_tcp: reconnected on attempt %d.\n", attempt);
-                    /* Reinitialize stream framing and pending state */
+                    /* Reinitialize stream framing. A reconnect starts a fresh IQ
+                     * stream after a new RTL0 header, so buffered bytes and
+                     * capture-side phase/carry state from the old socket must
+                     * not carry into the resumed stream. */
                     rtl_tcp_skip_header(s->sockfd);
-                    s->tcp_pending_len = 0;
+                    rtl_reset_capture_state_on_stream_boundary(s);
                     /* Reapply socket options: RCVBUF/NODELAY/RCVTIMEO */
                     {
                         const dsdneoRuntimeConfig* cfg2 = dsd_neo_get_config();
@@ -592,21 +1331,34 @@ static DSD_THREAD_RETURN_TYPE
         /* Successful read: reset timeout counter */
         consec_timeouts = 0;
         uint32_t len = (uint32_t)r;
+        int fs4_shift_active = fs4_shift_capture_active(s);
+        int use_two_pass = (fs4_shift_active && !s->combine_rotate_enabled);
         /* Handle muting: discard muted samples for rtl_tcp backend.
-         * Same logic as USB callback - skip samples entirely instead of processing. */
+         * Same logic as USB callback - skip samples entirely instead of processing.
+         *
+         * The remaining mute count tracks raw stream bytes, so it may be odd here
+         * after an odd-length recv() that was fully discarded. That is still aligned
+         * in the continuous transport stream and must not be rounded independently. */
         if (s->mute.load(std::memory_order_relaxed) > 0) {
+            rtl_prepare_fragmented_u8_mute(s);
             int old = s->mute.load(std::memory_order_relaxed);
             if (old > 0) {
                 uint32_t m = (uint32_t)old;
                 if (m >= len) {
                     /* Entire buffer is muted - discard all */
+                    rtl_account_fragmented_muted_u8_bytes(s, len, fs4_shift_active);
                     s->mute.fetch_sub((int)len, std::memory_order_relaxed);
+                    if (m == len) {
+                        s->mute_byte_phase.store(0, std::memory_order_relaxed);
+                    }
                     continue; /* Skip processing, get next recv */
                 }
                 /* Partial mute: skip first m bytes, process remainder */
+                rtl_account_fragmented_muted_u8_bytes(s, m, fs4_shift_active);
                 memmove(u8, u8 + m, len - m);
                 len -= m;
                 s->mute.fetch_sub((int)m, std::memory_order_relaxed);
+                s->mute_byte_phase.store(0, std::memory_order_relaxed);
             }
         }
         /* Stats: bytes in */
@@ -615,7 +1367,6 @@ static DSD_THREAD_RETURN_TYPE
             s->tcp_bytes_window += (uint64_t)len;
         }
         /* Reassemble into uniform slices matching device buf_len to stabilize cadence */
-        int use_two_pass = (!s->offset_tuning && !s->combine_rotate_enabled);
         const size_t SLICE = (s->buf_len > 0 ? (size_t)s->buf_len : 16384);
 
         /* Fill pending if it exists to complete one slice */
@@ -640,51 +1391,7 @@ static DSD_THREAD_RETURN_TYPE
             }
             if (s->tcp_pending_len == SLICE) {
                 unsigned char* src = s->tcp_pending;
-                if (use_two_pass) {
-                    rotate_90(src, (uint32_t)SLICE);
-                }
-                float *p1 = NULL, *p2 = NULL;
-                size_t n1 = 0, n2 = 0;
-                input_ring_reserve(s->input_ring, SLICE, &p1, &n1, &p2, &n2);
-                if (n1 == 0 && n2 == 0) {
-                    if (s->input_ring) {
-                        s->input_ring->producer_drops.fetch_add((uint64_t)SLICE);
-                    }
-                    s->reserve_full_events++;
-                } else {
-                    if (n1 & 1) {
-                        n1--;
-                    }
-                    size_t w1 = (n1 < SLICE) ? n1 : SLICE;
-                    size_t rem_after_w1 = SLICE - w1;
-                    if (n2 & 1) {
-                        n2--;
-                    }
-                    size_t w2 = (n2 < rem_after_w1) ? n2 : rem_after_w1;
-                    if (!s->offset_tuning && s->combine_rotate_enabled) {
-                        if (w1) {
-                            widen_rotate90_u8_to_f32_bias127(src, p1, (uint32_t)w1);
-                        }
-                        if (w2) {
-                            widen_rotate90_u8_to_f32_bias127(src + w1, p2, (uint32_t)w2);
-                        }
-                    } else if (use_two_pass) {
-                        if (w1) {
-                            widen_u8_to_f32_bias128_scalar(src, p1, (uint32_t)w1);
-                        }
-                        if (w2) {
-                            widen_u8_to_f32_bias128_scalar(src + w1, p2, (uint32_t)w2);
-                        }
-                    } else {
-                        if (w1) {
-                            widen_u8_to_f32_bias127(src, p1, (uint32_t)w1);
-                        }
-                        if (w2) {
-                            widen_u8_to_f32_bias127(src + w1, p2, (uint32_t)w2);
-                        }
-                    }
-                    input_ring_commit(s->input_ring, w1 + w2);
-                }
+                rtl_write_u8_to_ring(s, src, SLICE, fs4_shift_active, use_two_pass, 1);
                 s->tcp_pending_len = 0;
             }
         }
@@ -692,52 +1399,11 @@ static DSD_THREAD_RETURN_TYPE
         /* Process full slices directly from current buffer */
         while ((len - consumed) >= SLICE) {
             unsigned char* src = u8 + consumed;
-            if (use_two_pass) {
-                rotate_90(src, (uint32_t)SLICE);
-            }
-            float *p1 = NULL, *p2 = NULL;
-            size_t n1 = 0, n2 = 0;
-            input_ring_reserve(s->input_ring, SLICE, &p1, &n1, &p2, &n2);
-            if (n1 == 0 && n2 == 0) {
-                if (s->input_ring) {
-                    s->input_ring->producer_drops.fetch_add((uint64_t)SLICE);
-                }
-                s->reserve_full_events++;
+            int ring_exhausted = rtl_write_u8_to_ring(s, src, SLICE, fs4_shift_active, use_two_pass, 1);
+            consumed += SLICE;
+            if (ring_exhausted) {
                 break;
             }
-            if (n1 & 1) {
-                n1--;
-            }
-            size_t w1 = (n1 < SLICE) ? n1 : SLICE;
-            size_t rem_after_w1 = SLICE - w1;
-            if (n2 & 1) {
-                n2--;
-            }
-            size_t w2 = (n2 < rem_after_w1) ? n2 : rem_after_w1;
-            if (!s->offset_tuning && s->combine_rotate_enabled) {
-                if (w1) {
-                    widen_rotate90_u8_to_f32_bias127(src, p1, (uint32_t)w1);
-                }
-                if (w2) {
-                    widen_rotate90_u8_to_f32_bias127(src + w1, p2, (uint32_t)w2);
-                }
-            } else if (use_two_pass) {
-                if (w1) {
-                    widen_u8_to_f32_bias128_scalar(src, p1, (uint32_t)w1);
-                }
-                if (w2) {
-                    widen_u8_to_f32_bias128_scalar(src + w1, p2, (uint32_t)w2);
-                }
-            } else {
-                if (w1) {
-                    widen_u8_to_f32_bias127(src, p1, (uint32_t)w1);
-                }
-                if (w2) {
-                    widen_u8_to_f32_bias127(src + w1, p2, (uint32_t)w2);
-                }
-            }
-            input_ring_commit(s->input_ring, w1 + w2);
-            consumed += SLICE;
         }
 
         /* Save remainder (<SLICE) into pending */
@@ -750,6 +1416,9 @@ static DSD_THREAD_RETURN_TYPE
                     s->tcp_pending = nb;
                     s->tcp_pending_cap = cap;
                 } else {
+                    /* Retain one tail byte if needed so a dropped reassembly tail does not break I/Q alignment. */
+                    (void)rtl_drop_u8_bytes_preserve_alignment(u8 + consumed, rem, &s->iq_byte_carry, &s->rot_phase,
+                                                               fs4_shift_active);
                     rem = 0;
                 }
             }
@@ -948,10 +1617,14 @@ rtl_device_print_offset_capability(struct rtl_device* dev) {
     if (!dev) {
         return;
     }
-    if (dev->backend == 1) {
+    if (dev->backend == RTL_BACKEND_TCP) {
         fprintf(stderr,
                 "rtl_tcp: offset tuning capability is determined by the server; defaulting to disabled to match USB "
                 "fs/4/rotate path (override with DSD_NEO_RTL_OFFSET_TUNING=1).\n");
+        return;
+    }
+    if (dev->backend == RTL_BACKEND_SOAPY) {
+        fprintf(stderr, "SoapySDR: offset tuning not implemented in this backend; using fs/4 shift fallback path.\n");
         return;
     }
     if (!dev->dev) {
@@ -1108,8 +1781,16 @@ rtl_device_create(int dev_index, struct input_ring_state* input_ring, int combin
     dev->input_ring = input_ring;
     dev->thread_started = 0;
     dev->mute = 0;
+    dev->mute_byte_phase = 0;
     dev->combine_rotate_enabled = combine_rotate_enabled_param;
-    dev->backend = 0;
+    dev->backend = RTL_BACKEND_USB;
+    dev->soapy_dev = NULL;
+    dev->soapy_stream = NULL;
+    dev->soapy_lock_inited = 0;
+    dev->soapy_format = SOAPY_FMT_NONE;
+    dev->soapy_mtu_elems = 0;
+    dev->rot_phase = 0;
+    rtl_capture_u8_byte_carry_clear(&dev->iq_byte_carry);
     dev->sockfd = DSD_INVALID_SOCKET;
     dev->host[0] = '\0';
     dev->port = 0;
@@ -1157,8 +1838,16 @@ rtl_device_create_tcp(const char* host, int port, struct input_ring_state* input
     dev->input_ring = input_ring;
     dev->thread_started = 0;
     dev->mute = 0;
+    dev->mute_byte_phase = 0;
     dev->combine_rotate_enabled = combine_rotate_enabled_param;
-    dev->backend = 1;
+    dev->backend = RTL_BACKEND_TCP;
+    dev->soapy_dev = NULL;
+    dev->soapy_stream = NULL;
+    dev->soapy_lock_inited = 0;
+    dev->soapy_format = SOAPY_FMT_NONE;
+    dev->soapy_mtu_elems = 0;
+    dev->rot_phase = 0;
+    rtl_capture_u8_byte_carry_clear(&dev->iq_byte_carry);
     dev->sockfd = DSD_INVALID_SOCKET;
     snprintf(dev->host, sizeof(dev->host), "%s", host);
     dev->port = port;
@@ -1212,6 +1901,97 @@ rtl_device_create_tcp(const char* host, int port, struct input_ring_state* input
     return dev;
 }
 
+struct rtl_device*
+rtl_device_create_soapy(const char* soapy_args, struct input_ring_state* input_ring, int combine_rotate_enabled_param) {
+    if (!input_ring) {
+        return NULL;
+    }
+    struct rtl_device* dev = static_cast<rtl_device*>(calloc(1, sizeof(struct rtl_device)));
+    if (!dev) {
+        return NULL;
+    }
+    dev->dev = NULL;
+    dev->dev_index = -1;
+    dev->input_ring = input_ring;
+    dev->thread_started = 0;
+    dev->mute = 0;
+    dev->mute_byte_phase = 0;
+    dev->combine_rotate_enabled = combine_rotate_enabled_param;
+    dev->backend = RTL_BACKEND_SOAPY;
+    dev->soapy_dev = NULL;
+    dev->soapy_stream = NULL;
+    dev->soapy_format = SOAPY_FMT_NONE;
+    dev->soapy_mtu_elems = 0;
+    dev->rot_phase = 0;
+    rtl_capture_u8_byte_carry_clear(&dev->iq_byte_carry);
+    dev->sockfd = DSD_INVALID_SOCKET;
+    dev->host[0] = '\0';
+    dev->port = 0;
+    dev->run.store(0);
+    dev->agc_mode = 1;
+    dev->offset_tuning = 0;
+    dev->testmode_on = 0;
+    dev->rtl_xtal_hz = 0;
+    dev->tuner_xtal_hz = 0;
+    dev->if_gain_count = 0;
+
+#ifndef USE_SOAPYSDR
+    (void)soapy_args;
+    fprintf(stderr, "SoapySDR backend unavailable in this build.\n");
+    free(dev);
+    return NULL;
+#else
+    if (dsd_mutex_init(&dev->soapy_lock) != 0) {
+        fprintf(stderr, "SoapySDR: failed to initialize mutex.\n");
+        free(dev);
+        return NULL;
+    }
+    dev->soapy_lock_inited = 1;
+
+    const char* args_cstr = soapy_args ? soapy_args : "";
+    std::string args_string;
+    try {
+        args_string = args_cstr;
+        (void)SoapySDR::KwargsFromString(args_string);
+    } catch (const std::exception& e) {
+        fprintf(stderr, "SoapySDR: invalid args string '%s': %s\n", args_cstr, e.what());
+        (void)dsd_mutex_destroy(&dev->soapy_lock);
+        dev->soapy_lock_inited = 0;
+        free(dev);
+        return NULL;
+    }
+
+    if (dsd_mutex_lock(&dev->soapy_lock) != 0) {
+        fprintf(stderr, "SoapySDR: failed to lock mutex during creation.\n");
+        (void)dsd_mutex_destroy(&dev->soapy_lock);
+        dev->soapy_lock_inited = 0;
+        free(dev);
+        return NULL;
+    }
+    try {
+        SoapySDR::KwargsList found = SoapySDR::Device::enumerate(args_string);
+        if (found.empty()) {
+            fprintf(stderr, "SoapySDR: enumerate found no devices for args '%s'.\n", args_cstr);
+        }
+        dev->soapy_dev = SoapySDR::Device::make(args_string);
+    } catch (const std::exception& e) {
+        fprintf(stderr, "SoapySDR: exception in Device::make: %s\n", e.what());
+        dev->soapy_dev = NULL;
+    }
+    (void)dsd_mutex_unlock(&dev->soapy_lock);
+
+    if (!dev->soapy_dev) {
+        fprintf(stderr, "SoapySDR: failed to create device for args '%s'.\n", args_cstr);
+        (void)dsd_mutex_destroy(&dev->soapy_lock);
+        dev->soapy_lock_inited = 0;
+        free(dev);
+        return NULL;
+    }
+
+    return dev;
+#endif
+}
+
 /**
  * @brief Destroy an RTL-SDR device and free resources.
  *
@@ -1225,13 +2005,13 @@ rtl_device_destroy(struct rtl_device* dev) {
 
     if (dev->thread_started) {
         /* Ensure async read is cancelled before joining to avoid blocking */
-        if (dev->backend == 0) {
+        if (dev->backend == RTL_BACKEND_USB) {
             if (dev->dev) {
                 rtlsdr_cancel_async(dev->dev);
             }
-        } else if (dev->backend == 1) {
+        } else if (dev->backend == RTL_BACKEND_TCP || dev->backend == RTL_BACKEND_SOAPY) {
             dev->run.store(0);
-            if (dev->sockfd != DSD_INVALID_SOCKET) {
+            if (dev->backend == RTL_BACKEND_TCP && dev->sockfd != DSD_INVALID_SOCKET) {
                 dsd_socket_shutdown(dev->sockfd, SHUT_RDWR);
             }
         }
@@ -1240,7 +2020,7 @@ rtl_device_destroy(struct rtl_device* dev) {
     }
 
     /* Best-effort device state cleanup before closing the USB handle. */
-    if (dev->backend == 0 && dev->dev) {
+    if (dev->backend == RTL_BACKEND_USB && dev->dev) {
         /* Disable bias tee so subsequent runs don't inherit stale 5V state. */
 #ifdef USE_RTLSDR_BIAS_TEE
         (void)rtlsdr_set_bias_tee(dev->dev, 0);
@@ -1249,11 +2029,18 @@ rtl_device_destroy(struct rtl_device* dev) {
         (void)rtlsdr_reset_buffer(dev->dev);
     }
 
-    if (dev->backend == 0 && dev->dev) {
+    if (dev->backend == RTL_BACKEND_USB && dev->dev) {
         rtlsdr_close(dev->dev);
     }
-    if (dev->backend == 1 && dev->sockfd != DSD_INVALID_SOCKET) {
+    if (dev->backend == RTL_BACKEND_TCP && dev->sockfd != DSD_INVALID_SOCKET) {
         dsd_socket_close(dev->sockfd);
+    }
+    if (dev->backend == RTL_BACKEND_SOAPY) {
+        soapy_stream_cleanup(dev, 1);
+        if (dev->soapy_lock_inited) {
+            (void)dsd_mutex_destroy(&dev->soapy_lock);
+            dev->soapy_lock_inited = 0;
+        }
     }
     if (dev->tcp_pending) {
         free(dev->tcp_pending);
@@ -1278,14 +2065,24 @@ rtl_device_set_frequency(struct rtl_device* dev, uint32_t frequency) {
         return -1;
     }
     dev->freq = frequency;
-    if (dev->backend == 0) {
+    if (dev->backend == RTL_BACKEND_USB) {
         if (!dev->dev) {
             return -1;
         }
         return verbose_set_frequency(dev->dev, frequency);
-    } else {
+    }
+    if (dev->backend == RTL_BACKEND_TCP) {
         return rtl_tcp_send_cmd(dev->sockfd, 0x01, frequency);
     }
+#ifdef USE_SOAPYSDR
+    if (dev->backend == RTL_BACKEND_SOAPY) {
+        return soapy_call_locked(dev, "setFrequency", [&]() -> int {
+            dev->soapy_dev->setFrequency(SOAPY_SDR_RX, 0, (double)frequency);
+            return 0;
+        });
+    }
+#endif
+    return -1;
 }
 
 /**
@@ -1301,14 +2098,24 @@ rtl_device_set_sample_rate(struct rtl_device* dev, uint32_t samp_rate) {
         return -1;
     }
     dev->rate = samp_rate;
-    if (dev->backend == 0) {
+    if (dev->backend == RTL_BACKEND_USB) {
         if (!dev->dev) {
             return -1;
         }
         return verbose_set_sample_rate(dev->dev, samp_rate);
-    } else {
+    }
+    if (dev->backend == RTL_BACKEND_TCP) {
         return rtl_tcp_send_cmd(dev->sockfd, 0x02, samp_rate);
     }
+#ifdef USE_SOAPYSDR
+    if (dev->backend == RTL_BACKEND_SOAPY) {
+        return soapy_call_locked(dev, "setSampleRate", [&]() -> int {
+            dev->soapy_dev->setSampleRate(SOAPY_SDR_RX, 0, (double)samp_rate);
+            return 0;
+        });
+    }
+#endif
+    return -1;
 }
 
 /**
@@ -1322,11 +2129,26 @@ rtl_device_get_sample_rate(struct rtl_device* dev) {
     if (!dev) {
         return -1;
     }
-    if (dev->backend == 0) {
+    if (dev->backend == RTL_BACKEND_USB) {
         if (!dev->dev) {
             return -1;
         }
         return (int)rtlsdr_get_sample_rate(dev->dev);
+    }
+    if (dev->backend == RTL_BACKEND_SOAPY) {
+#ifdef USE_SOAPYSDR
+        double actual = 0.0;
+        int rc = soapy_call_locked(dev, "getSampleRate", [&]() -> int {
+            actual = dev->soapy_dev->getSampleRate(SOAPY_SDR_RX, 0);
+            return 0;
+        });
+        if (rc == 0 && actual > 0.0) {
+            uint32_t rounded = (uint32_t)(actual + 0.5);
+            dev->rate = rounded;
+            return (int)rounded;
+        }
+#endif
+        return (dev->rate > 0) ? (int)dev->rate : -1;
     }
     return (int)dev->rate;
 }
@@ -1346,7 +2168,7 @@ rtl_device_set_gain(struct rtl_device* dev, int gain) {
 
 #define AUTO_GAIN (-100)
     dev->gain = gain;
-    if (dev->backend == 0) {
+    if (dev->backend == RTL_BACKEND_USB) {
         if (!dev->dev) {
             return -1;
         }
@@ -1356,7 +2178,7 @@ rtl_device_set_gain(struct rtl_device* dev, int gain) {
             int nearest = nearest_gain(dev->dev, gain);
             return verbose_gain_set(dev->dev, nearest);
         }
-    } else {
+    } else if (dev->backend == RTL_BACKEND_TCP) {
         if (gain == AUTO_GAIN) {
             dev->agc_mode = 1;
             int r = rtl_tcp_send_cmd(dev->sockfd, 0x03, 0); /* tuner auto */
@@ -1375,6 +2197,36 @@ rtl_device_set_gain(struct rtl_device* dev, int gain) {
             return rtl_tcp_send_cmd(dev->sockfd, 0x04, (uint32_t)gain);
         }
     }
+#ifdef USE_SOAPYSDR
+    if (dev->backend == RTL_BACKEND_SOAPY) {
+        if (gain == AUTO_GAIN) {
+            int rc = soapy_call_locked(dev, "setGainMode(auto)", [&]() -> int {
+                if (!dev->soapy_dev->hasGainMode(SOAPY_SDR_RX, 0)) {
+                    return DSD_ERR_NOT_SUPPORTED;
+                }
+                dev->soapy_dev->setGainMode(SOAPY_SDR_RX, 0, true);
+                return 0;
+            });
+            if (rc == 0) {
+                dev->agc_mode = 1;
+            }
+            return rc;
+        }
+        const double gain_db = (double)gain / 10.0;
+        int rc = soapy_call_locked(dev, "setGain", [&]() -> int {
+            if (dev->soapy_dev->hasGainMode(SOAPY_SDR_RX, 0)) {
+                dev->soapy_dev->setGainMode(SOAPY_SDR_RX, 0, false);
+            }
+            dev->soapy_dev->setGain(SOAPY_SDR_RX, 0, gain_db);
+            return 0;
+        });
+        if (rc == 0) {
+            dev->agc_mode = 0;
+        }
+        return rc;
+    }
+#endif
+    return -1;
 }
 
 int
@@ -1382,7 +2234,7 @@ rtl_device_set_gain_nearest(struct rtl_device* dev, int target_tenth_db) {
     if (!dev) {
         return -1;
     }
-    if (dev->backend == 0) {
+    if (dev->backend == RTL_BACKEND_USB) {
         /* USB: find nearest supported and set manual gain */
         if (!dev->dev) {
             return -1;
@@ -1405,12 +2257,44 @@ rtl_device_set_gain_nearest(struct rtl_device* dev, int target_tenth_db) {
         fprintf(stderr, "Tuner manual gain (nearest): %0.1f dB.\n", (double)g / 10.0);
         return 0;
     }
-    /* rtl_tcp: request manual mode and set target directly */
-    int mode = 1;
-    (void)rtl_tcp_send_cmd(dev->sockfd, 0x03, (uint32_t)mode);
-    (void)rtl_tcp_send_cmd(dev->sockfd, 0x04, (uint32_t)target_tenth_db);
-    dev->gain = target_tenth_db;
-    return 0;
+    if (dev->backend == RTL_BACKEND_TCP) {
+        /* rtl_tcp: request manual mode and set target directly */
+        int mode = 1;
+        (void)rtl_tcp_send_cmd(dev->sockfd, 0x03, (uint32_t)mode);
+        (void)rtl_tcp_send_cmd(dev->sockfd, 0x04, (uint32_t)target_tenth_db);
+        dev->gain = target_tenth_db;
+        return 0;
+    }
+#ifdef USE_SOAPYSDR
+    if (dev->backend == RTL_BACKEND_SOAPY) {
+        const double target_db = (double)target_tenth_db / 10.0;
+        double applied_db = target_db;
+        int rc = soapy_call_locked(dev, "setGain(nearest)", [&]() -> int {
+            std::vector<std::string> names = dev->soapy_dev->listGains(SOAPY_SDR_RX, 0);
+            SoapySDR::Range range = dev->soapy_dev->getGainRange(SOAPY_SDR_RX, 0);
+            if (names.empty() && (range.minimum() == range.maximum())) {
+                return DSD_ERR_NOT_SUPPORTED;
+            }
+            if (applied_db < range.minimum()) {
+                applied_db = range.minimum();
+            }
+            if (applied_db > range.maximum()) {
+                applied_db = range.maximum();
+            }
+            if (dev->soapy_dev->hasGainMode(SOAPY_SDR_RX, 0)) {
+                dev->soapy_dev->setGainMode(SOAPY_SDR_RX, 0, false);
+            }
+            dev->soapy_dev->setGain(SOAPY_SDR_RX, 0, applied_db);
+            return 0;
+        });
+        if (rc == 0) {
+            dev->agc_mode = 0;
+            dev->gain = (int)(applied_db * 10.0 + (applied_db >= 0.0 ? 0.5 : -0.5));
+        }
+        return rc;
+    }
+#endif
+    return -1;
 }
 
 int
@@ -1418,16 +2302,37 @@ rtl_device_get_tuner_gain(struct rtl_device* dev) {
     if (!dev) {
         return -1;
     }
-    if (dev->backend == 0) {
+    if (dev->backend == RTL_BACKEND_USB) {
         if (!dev->dev) {
             return -1;
         }
         return rtlsdr_get_tuner_gain(dev->dev);
     }
-    if (dev->agc_mode) {
-        return 0;
+    if (dev->backend == RTL_BACKEND_TCP) {
+        if (dev->agc_mode) {
+            return 0;
+        }
+        return dev->gain;
     }
-    return dev->gain;
+#ifdef USE_SOAPYSDR
+    if (dev->backend == RTL_BACKEND_SOAPY) {
+        double gain_db = 0.0;
+        int rc = soapy_call_locked(dev, "getGain", [&]() -> int {
+            std::vector<std::string> names = dev->soapy_dev->listGains(SOAPY_SDR_RX, 0);
+            SoapySDR::Range range = dev->soapy_dev->getGainRange(SOAPY_SDR_RX, 0);
+            if (names.empty() && (range.minimum() == range.maximum())) {
+                return DSD_ERR_NOT_SUPPORTED;
+            }
+            gain_db = dev->soapy_dev->getGain(SOAPY_SDR_RX, 0);
+            return 0;
+        });
+        if (rc != 0) {
+            return rc;
+        }
+        return (int)(gain_db * 10.0 + (gain_db >= 0.0 ? 0.5 : -0.5));
+    }
+#endif
+    return -1;
 }
 
 int
@@ -1435,12 +2340,13 @@ rtl_device_is_auto_gain(struct rtl_device* dev) {
     if (!dev) {
         return -1;
     }
-    if (dev->backend == 0) {
+    if (dev->backend == RTL_BACKEND_USB) {
         /* We track AUTO vs manual in the requested field. */
         return (dev->gain == AUTO_GAIN) ? 1 : 0;
-    } else {
+    } else if (dev->backend == RTL_BACKEND_TCP || dev->backend == RTL_BACKEND_SOAPY) {
         return dev->agc_mode ? 1 : 0;
     }
+    return -1;
 }
 
 /**
@@ -1455,21 +2361,34 @@ rtl_device_set_ppm(struct rtl_device* dev, int ppm_error) {
     if (!dev) {
         return -1;
     }
-    /* Avoid redundant writes: if requested PPM equals current cached value,
-       skip making a driver call. This prevents a spurious warning on startup
-       when no PPM is provided (defaults to 0) or when re-applying zero. */
+    /* Cache only the last correction that the backend accepted. Retries for a
+     * previously failed value must still reach the driver/backend. */
     if (ppm_error == dev->ppm_error) {
         return 0;
     }
-    dev->ppm_error = ppm_error;
-    if (dev->backend == 0) {
+    int rc = -1;
+    if (dev->backend == RTL_BACKEND_USB) {
         if (!dev->dev) {
             return -1;
         }
-        return verbose_ppm_set(dev->dev, ppm_error);
-    } else {
-        return rtl_tcp_send_cmd(dev->sockfd, 0x05, (uint32_t)ppm_error);
+        rc = verbose_ppm_set(dev->dev, ppm_error);
+    } else if (dev->backend == RTL_BACKEND_TCP) {
+        rc = rtl_tcp_send_cmd(dev->sockfd, 0x05, (uint32_t)ppm_error);
+#ifdef USE_SOAPYSDR
+    } else if (dev->backend == RTL_BACKEND_SOAPY) {
+        rc = soapy_call_locked(dev, "setFrequencyCorrection", [&]() -> int {
+            if (!dev->soapy_dev->hasFrequencyCorrection(SOAPY_SDR_RX, 0)) {
+                return DSD_ERR_NOT_SUPPORTED;
+            }
+            dev->soapy_dev->setFrequencyCorrection(SOAPY_SDR_RX, 0, (double)ppm_error);
+            return 0;
+        });
+#endif
     }
+    if (rc == 0) {
+        dev->ppm_error = ppm_error;
+    }
+    return rc;
 }
 
 /**
@@ -1485,14 +2404,19 @@ rtl_device_set_direct_sampling(struct rtl_device* dev, int on) {
         return -1;
     }
     dev->direct_sampling = on;
-    if (dev->backend == 0) {
+    if (dev->backend == RTL_BACKEND_USB) {
         if (!dev->dev) {
             return -1;
         }
         return verbose_direct_sampling(dev->dev, on);
-    } else {
+    }
+    if (dev->backend == RTL_BACKEND_TCP) {
         return rtl_tcp_send_cmd(dev->sockfd, 0x09, (uint32_t)on);
     }
+    if (dev->backend == RTL_BACKEND_SOAPY) {
+        return DSD_ERR_NOT_SUPPORTED;
+    }
+    return -1;
 }
 
 /**
@@ -1504,7 +2428,7 @@ rtl_device_set_offset_tuning_enabled(struct rtl_device* dev, int on) {
         return -1;
     }
     int r = 0;
-    if (dev->backend == 0) {
+    if (dev->backend == RTL_BACKEND_USB) {
         if (!dev->dev) {
             return -1;
         }
@@ -1525,8 +2449,12 @@ rtl_device_set_offset_tuning_enabled(struct rtl_device* dev, int on) {
             }
             fprintf(stderr, "WARNING: Failed to set offset tuning (%d) for tuner %s.\n", r, tt);
         }
-    } else {
+    } else if (dev->backend == RTL_BACKEND_TCP) {
         r = rtl_tcp_send_cmd(dev->sockfd, 0x0A, (uint32_t)(on ? 1 : 0));
+    } else if (dev->backend == RTL_BACKEND_SOAPY) {
+        r = DSD_ERR_NOT_SUPPORTED;
+    } else {
+        r = -1;
     }
     if (r == 0) {
         dev->offset_tuning = on ? 1 : 0;
@@ -1539,16 +2467,30 @@ rtl_device_set_tuner_bandwidth(struct rtl_device* dev, uint32_t bw_hz) {
     if (!dev) {
         return -1;
     }
-    if (dev->backend == 0) {
+    if (dev->backend == RTL_BACKEND_USB) {
         if (!dev->dev) {
             return -1;
         }
         return verbose_set_tuner_bandwidth(dev->dev, bw_hz);
-    } else {
+    }
+    if (dev->backend == RTL_BACKEND_TCP) {
         /* Not universally supported by rtl_tcp; ignore */
         (void)bw_hz;
         return 0;
     }
+#ifdef USE_SOAPYSDR
+    if (dev->backend == RTL_BACKEND_SOAPY) {
+        return soapy_call_locked(dev, "setBandwidth", [&]() -> int {
+            SoapySDR::RangeList bw_range = dev->soapy_dev->getBandwidthRange(SOAPY_SDR_RX, 0);
+            if (bw_range.empty()) {
+                return DSD_ERR_NOT_SUPPORTED;
+            }
+            dev->soapy_dev->setBandwidth(SOAPY_SDR_RX, 0, (double)bw_hz);
+            return 0;
+        });
+    }
+#endif
+    return -1;
 }
 
 /**
@@ -1562,7 +2504,7 @@ rtl_device_reset_buffer(struct rtl_device* dev) {
     if (!dev) {
         return -1;
     }
-    if (dev->backend == 0) {
+    if (dev->backend == RTL_BACKEND_USB) {
         if (!dev->dev) {
             return -1;
         }
@@ -1586,20 +2528,32 @@ rtl_device_start_async(struct rtl_device* dev, uint32_t buf_len) {
         return -1;
     }
     dev->buf_len = buf_len;
+    rtl_reset_capture_state_on_stream_boundary(dev);
     dev->thread_started = 1;
     int r = 0;
-    if (dev->backend == 0) {
+    if (dev->backend == RTL_BACKEND_USB) {
         if (!dev->dev) {
             dev->thread_started = 0;
             return -1;
         }
         r = dsd_thread_create(&dev->thread, (dsd_thread_fn)dongle_thread_fn, dev);
-    } else {
+    } else if (dev->backend == RTL_BACKEND_TCP) {
         dev->run.store(1);
         r = dsd_thread_create(&dev->thread, (dsd_thread_fn)tcp_thread_fn, dev);
+    } else if (dev->backend == RTL_BACKEND_SOAPY) {
+        if (!dev->soapy_dev) {
+            dev->thread_started = 0;
+            return -1;
+        }
+        dev->run.store(1);
+        r = dsd_thread_create(&dev->thread, (dsd_thread_fn)soapy_thread_fn, dev);
+    } else {
+        dev->thread_started = 0;
+        return -1;
     }
     if (r != 0) {
         dev->thread_started = 0;
+        dev->run.store(0);
         return -1;
     }
     return 0;
@@ -1616,18 +2570,23 @@ rtl_device_stop_async(struct rtl_device* dev) {
     if (!dev || !dev->thread_started) {
         return -1;
     }
-    if (dev->backend == 0) {
+    if (dev->backend == RTL_BACKEND_USB) {
         if (dev->dev) {
             rtlsdr_cancel_async(dev->dev);
         }
-    } else {
+    } else if (dev->backend == RTL_BACKEND_TCP) {
         dev->run.store(0);
         if (dev->sockfd != DSD_INVALID_SOCKET) {
             dsd_socket_shutdown(dev->sockfd, SHUT_RDWR);
         }
+    } else if (dev->backend == RTL_BACKEND_SOAPY) {
+        dev->run.store(0);
+    } else {
+        return -1;
     }
     dsd_thread_join(dev->thread);
     dev->thread_started = 0;
+    rtl_reset_capture_state_on_stream_boundary(dev);
     return 0;
 }
 
@@ -1635,14 +2594,16 @@ rtl_device_stop_async(struct rtl_device* dev) {
  * @brief Mute the incoming raw input stream for a specified number of bytes.
  *
  * @param dev RTL-SDR device handle.
- * @param bytes Number of input bytes to replace with 0x7F.
+ * @param bytes Number of input bytes to discard while muting. Odd values are
+ *              rounded up so the muted span always covers whole I/Q pairs.
  */
 void
 rtl_device_mute(struct rtl_device* dev, int bytes) {
     if (!dev) {
         return;
     }
-    dev->mute.store(bytes);
+    dev->mute_byte_phase.store(0, std::memory_order_relaxed);
+    dev->mute.store(rtl_capture_align_u8_iq_bytes(bytes), std::memory_order_relaxed);
 }
 
 int
@@ -1651,9 +2612,12 @@ rtl_device_set_bias_tee(struct rtl_device* dev, int on) {
         return -1;
     }
     dev->bias_tee_on = on ? 1 : 0;
-    if (dev->backend == 1) {
+    if (dev->backend == RTL_BACKEND_TCP) {
         /* rtl_tcp protocol command 0x0E toggles bias tee */
         return rtl_tcp_send_cmd(dev->sockfd, 0x0E, (uint32_t)dev->bias_tee_on);
+    }
+    if (dev->backend == RTL_BACKEND_SOAPY) {
+        return DSD_ERR_NOT_SUPPORTED;
     }
 #ifdef USE_RTLSDR_BIAS_TEE
     if (!dev->dev) {
@@ -1669,7 +2633,7 @@ rtl_device_set_bias_tee(struct rtl_device* dev, int on) {
 #else
     (void)on;
     fprintf(stderr, "NOTE: librtlsdr built without bias tee API; ignoring bias setting on USB.\n");
-    return 0;
+    return DSD_ERR_NOT_SUPPORTED;
 #endif
 }
 
@@ -1678,8 +2642,8 @@ rtl_device_set_tcp_autotune(struct rtl_device* dev, int onoff) {
     if (!dev) {
         return -1;
     }
-    if (dev->backend != 1) {
-        return 0; /* not applicable for USB */
+    if (dev->backend != RTL_BACKEND_TCP) {
+        return DSD_ERR_NOT_SUPPORTED;
     }
     dev->tcp_autotune = onoff ? 1 : 0;
     return 0;
@@ -1690,7 +2654,7 @@ rtl_device_get_tcp_autotune(struct rtl_device* dev) {
     if (!dev) {
         return 0;
     }
-    if (dev->backend != 1) {
+    if (dev->backend != RTL_BACKEND_TCP) {
         return 0;
     }
     return dev->tcp_autotune ? 1 : 0;
@@ -1703,7 +2667,7 @@ rtl_device_set_xtal_freq(struct rtl_device* dev, uint32_t rtl_xtal_hz, uint32_t 
     }
     dev->rtl_xtal_hz = rtl_xtal_hz;
     dev->tuner_xtal_hz = tuner_xtal_hz;
-    if (dev->backend == 1) {
+    if (dev->backend == RTL_BACKEND_TCP) {
         if (dev->sockfd == DSD_INVALID_SOCKET) {
             return -1;
         }
@@ -1714,6 +2678,9 @@ rtl_device_set_xtal_freq(struct rtl_device* dev, uint32_t rtl_xtal_hz, uint32_t 
             (void)rtl_tcp_send_cmd(dev->sockfd, 0x0C, tuner_xtal_hz);
         }
         return 0;
+    }
+    if (dev->backend == RTL_BACKEND_SOAPY) {
+        return DSD_ERR_NOT_SUPPORTED;
     }
     if (!dev->dev) {
         return -1;
@@ -1734,11 +2701,14 @@ rtl_device_set_testmode(struct rtl_device* dev, int on) {
         return -1;
     }
     dev->testmode_on = on ? 1 : 0;
-    if (dev->backend == 1) {
+    if (dev->backend == RTL_BACKEND_TCP) {
         if (dev->sockfd == DSD_INVALID_SOCKET) {
             return -1;
         }
         return rtl_tcp_send_cmd(dev->sockfd, 0x07, (uint32_t)(on ? 1 : 0));
+    }
+    if (dev->backend == RTL_BACKEND_SOAPY) {
+        return DSD_ERR_NOT_SUPPORTED;
     }
     if (!dev->dev) {
         return -1;
@@ -1773,12 +2743,15 @@ rtl_device_set_if_gain(struct rtl_device* dev, int stage, int gain_tenth_db) {
         dev->if_gains[dev->if_gain_count].gain = gain_tenth_db;
         dev->if_gain_count++;
     }
-    if (dev->backend == 1) {
+    if (dev->backend == RTL_BACKEND_TCP) {
         if (dev->sockfd == DSD_INVALID_SOCKET) {
             return -1;
         }
         uint32_t packed = ((uint32_t)(stage & 0xFFFF) << 16) | ((uint16_t)(gain_tenth_db & 0xFFFF));
         return rtl_tcp_send_cmd(dev->sockfd, 0x06, packed);
+    }
+    if (dev->backend == RTL_BACKEND_SOAPY) {
+        return DSD_ERR_NOT_SUPPORTED;
     }
     if (!dev->dev) {
         return -1;

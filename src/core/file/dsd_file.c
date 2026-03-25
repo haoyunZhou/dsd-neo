@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: ISC
 /*
- * Copyright (C) 2025 by arancormonk <180709949+arancormonk@users.noreply.github.com>
+ * Copyright (C) 2026 by arancormonk <180709949+arancormonk@users.noreply.github.com>
  */
 /*
  * Copyright (C) 2010 DSD Author
@@ -29,20 +29,28 @@
 #include <dsd-neo/core/state.h>
 #include <dsd-neo/core/synctype_ids.h>
 #include <dsd-neo/core/time_format.h>
+#include <dsd-neo/crypto/aes.h>
+#include <dsd-neo/crypto/des.h>
 #include <dsd-neo/crypto/rc4.h>
+#include <dsd-neo/platform/posix_compat.h>
 #include <dsd-neo/protocol/dmr/dmr_const.h>   //for ambe+2 fr
 #include <dsd-neo/protocol/p25/p25p1_const.h> //for imbe fr (7200)
 #include <dsd-neo/runtime/exitflag.h>
 #include <dsd-neo/runtime/log.h>
-
+#include <dsd-neo/runtime/rdio_export.h>
+#include <fcntl.h> // IWYU pragma: keep
+#include <limits.h>
 #include <mbelib.h>
 #include <sndfile.h>
-
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+
+#include "dsd-neo/core/opts_fwd.h"
+#include "dsd-neo/core/state_fwd.h"
 
 void
 saveImbe4400Data(dsd_opts* opts, dsd_state* state, char* imbe_d) {
@@ -112,47 +120,186 @@ saveAmbe2450DataR(dsd_opts* opts, dsd_state* state, char* ambe_d) {
     fputc(b, opts->mbe_out_fR);
 }
 
+static int
+setvbuf_size_sanitize(size_t requested_size, size_t* out_size) {
+    if (!out_size) {
+        return 0;
+    }
+    size_t size = requested_size;
+    if (size < (size_t)2u) {
+        size = (size_t)2u;
+    }
+    if (size > (size_t)INT_MAX) {
+        size = (size_t)INT_MAX;
+    }
+    *out_size = size;
+    return 1;
+}
+
+static void
+configure_file_stream_buffer(FILE* stream, int mode, size_t requested_size) {
+    if (!stream) {
+        return;
+    }
+    size_t size = 0;
+    if (!setvbuf_size_sanitize(requested_size, &size)) {
+        return;
+    }
+    (void)setvbuf(stream, NULL, mode, size);
+}
+
+static int
+frame_log_ensure_open(dsd_opts* opts) {
+    if (!opts || opts->frame_log_file[0] == '\0') {
+        return 0;
+    }
+    if (opts->frame_log_f != NULL) {
+        return 1;
+    }
+    opts->frame_log_f = fopen(opts->frame_log_file, "a");
+    if (opts->frame_log_f == NULL) {
+        if (!opts->frame_log_open_error_reported) {
+            LOG_ERROR("Unable to open frame log file: %s\n", opts->frame_log_file);
+            opts->frame_log_open_error_reported = 1;
+        }
+        return 0;
+    }
+    opts->frame_log_open_error_reported = 0;
+    configure_file_stream_buffer(opts->frame_log_f, _IOLBF, (size_t)BUFSIZ);
+    return 1;
+}
+
+static void
+frame_log_sanitize_line(char* line) {
+    if (!line) {
+        return;
+    }
+    for (char* p = line; *p != '\0'; ++p) {
+        if (*p == '\r' || *p == '\n' || *p == '\t') {
+            *p = ' ';
+        }
+    }
+}
+
+int
+dsd_frame_log_enabled(const dsd_opts* opts) {
+    return (opts != NULL && opts->frame_log_file[0] != '\0') ? 1 : 0;
+}
+
+int
+dsd_frame_detail_enabled(const dsd_opts* opts) {
+    return (opts != NULL && (opts->payload == 1 || dsd_frame_log_enabled(opts))) ? 1 : 0;
+}
+
+void
+dsd_frame_log_close(dsd_opts* opts) {
+    if (!opts || opts->frame_log_f == NULL) {
+        return;
+    }
+    fflush(opts->frame_log_f);
+    fclose(opts->frame_log_f);
+    opts->frame_log_f = NULL;
+}
+
+void
+dsd_frame_logf(dsd_opts* opts, const char* format, ...) {
+    if (!format || !dsd_frame_log_enabled(opts)) {
+        return;
+    }
+    if (!frame_log_ensure_open(opts)) {
+        return;
+    }
+
+    char line[4096];
+    va_list args;
+    va_start(args, format);
+    // NOLINTNEXTLINE(clang-analyzer-valist.Uninitialized)
+    vsnprintf(line, sizeof(line), format, args);
+    va_end(args);
+    frame_log_sanitize_line(line);
+
+    time_t now = time(NULL);
+    char timestr[9];
+    char datestr[11];
+    getTimeN_buf(now, timestr);
+    getDateN_buf(now, datestr);
+
+    if (fprintf(opts->frame_log_f, "%s %s %s\n", datestr, timestr, line) < 0) {
+        if (!opts->frame_log_write_error_reported) {
+            LOG_ERROR("Failed writing frame log file: %s\n", opts->frame_log_file);
+            opts->frame_log_write_error_reported = 1;
+        }
+        dsd_frame_log_close(opts);
+        return;
+    }
+    opts->frame_log_write_error_reported = 0;
+}
+
 void
 PrintIMBEData(dsd_opts* opts, dsd_state* state, char* imbe_d) //for P25P1 and ProVoice
 {
-    fprintf(stderr, "\n IMBE ");
-    uint8_t imbe[88];
-    for (int i = 0; i < 11; i++) {
-        imbe[i] = convert_bits_into_output((uint8_t*)imbe_d + ((size_t)i * 8u), 8);
-        fprintf(stderr, "%02X", imbe[i]);
+    if (!opts || !state || !imbe_d) {
+        return;
     }
 
-    fprintf(stderr, " err = [%X] [%X] ", state->errs, state->errs2);
-    UNUSED(opts);
+    uint8_t imbe[11];
+    char imbe_hex[23];
+    size_t hex_off = 0;
+    imbe_hex[0] = '\0';
+    for (int i = 0; i < 11; i++) {
+        imbe[i] = convert_bits_into_output((uint8_t*)imbe_d + ((size_t)i * 8u), 8);
+        if (hex_off + 2 < sizeof(imbe_hex)) {
+            (void)snprintf(imbe_hex + hex_off, sizeof(imbe_hex) - hex_off, "%02X", imbe[i]);
+            hex_off += 2;
+        }
+    }
+    imbe_hex[sizeof(imbe_hex) - 1] = '\0';
+
+    if (opts->payload == 1) {
+        fprintf(stderr, "\n IMBE %s err = [%X] [%X] ", imbe_hex, state->errs, state->errs2);
+    }
+    dsd_frame_logf(opts, "FRAME IMBE slot=%d data=%s err=[%X] [%X]", state->currentslot + 1, imbe_hex, state->errs,
+                   state->errs2);
 }
 
 void
 PrintAMBEData(dsd_opts* opts, dsd_state* state, char* ambe_d) {
+    if (!opts || !state || !ambe_d) {
+        return;
+    }
 
     //cast as unsigned long long int and not uint64_t
     //to avoid the %lx vs %llx warning on 32 or 64 bit
     unsigned long long int ambe = 0;
-
-    //preceeding line break, if required
-    if (opts->dmr_stereo == 0 && opts->dmr_mono == 0) {
-        fprintf(stderr, "\n");
-    }
+    int errs = 0;
+    int errs2 = 0;
 
     ambe = convert_bits_into_output((uint8_t*)ambe_d, 49);
     ambe = ambe << 7; //shift to final position
 
-    fprintf(stderr, " AMBE %014llX", ambe);
-
     if (state->currentslot == 0) {
-        fprintf(stderr, " err = [%X] [%X] ", state->errs, state->errs2);
+        errs = state->errs;
+        errs2 = state->errs2;
     } else {
-        fprintf(stderr, " err = [%X] [%X] ", state->errsR, state->errs2R);
+        errs = state->errsR;
+        errs2 = state->errs2R;
     }
 
-    //trailing line break, if required
-    if (opts->dmr_stereo == 1 || opts->dmr_mono == 1) {
-        fprintf(stderr, "\n");
+    if (opts->payload == 1) {
+        //preceeding line break, if required
+        if (opts->dmr_stereo == 0 && opts->dmr_mono == 0) {
+            fprintf(stderr, "\n");
+        }
+
+        fprintf(stderr, " AMBE %014llX err = [%X] [%X] ", ambe, errs, errs2);
+
+        //trailing line break, if required
+        if (opts->dmr_stereo == 1 || opts->dmr_mono == 1) {
+            fprintf(stderr, "\n");
+        }
     }
+
+    dsd_frame_logf(opts, "FRAME AMBE slot=%d data=%014llX err=[%X] [%X]", state->currentslot + 1, ambe, errs, errs2);
 }
 
 int
@@ -160,8 +307,13 @@ readImbe4400Data(dsd_opts* opts, dsd_state* state, char* imbe_d) {
 
     int i, j, k;
     unsigned char b, x;
+    int c;
 
-    state->errs2 = fgetc(opts->mbe_in_f);
+    c = fgetc(opts->mbe_in_f);
+    if (c == EOF) {
+        return (1);
+    }
+    state->errs2 = c;
     state->errs = state->errs2;
 
     k = 0;
@@ -170,10 +322,11 @@ readImbe4400Data(dsd_opts* opts, dsd_state* state, char* imbe_d) {
     }
     x = 0;
     for (i = 0; i < 11; i++) {
-        b = fgetc(opts->mbe_in_f);
-        if (feof(opts->mbe_in_f)) {
+        c = fgetc(opts->mbe_in_f);
+        if (c == EOF) {
             return (1);
         }
+        b = (unsigned char)c;
         for (j = 0; j < 8; j++) {
             imbe_d[k] = (b & 128) >> 7;
 
@@ -192,6 +345,21 @@ readImbe4400Data(dsd_opts* opts, dsd_state* state, char* imbe_d) {
     if (opts->payload == 1) {
         fprintf(stderr, " err = [%X] [%X] ", state->errs, state->errs2); //not sure that errs here are legit values
     }
+    if (dsd_frame_log_enabled(opts)) {
+        char imbe_hex[23];
+        size_t hex_off = 0;
+        imbe_hex[0] = '\0';
+        for (i = 0; i < 11; i++) {
+            uint8_t oct = convert_bits_into_output((uint8_t*)imbe_d + ((size_t)i * 8u), 8);
+            if (hex_off + 2 < sizeof(imbe_hex)) {
+                (void)snprintf(imbe_hex + hex_off, sizeof(imbe_hex) - hex_off, "%02X", oct);
+                hex_off += 2;
+            }
+        }
+        imbe_hex[sizeof(imbe_hex) - 1] = '\0';
+        dsd_frame_logf(opts, "FRAME IMBE slot=%d data=%s err=[%X] [%X] source=mbe-file", state->currentslot + 1,
+                       imbe_hex, state->errs, state->errs2);
+    }
     return (0);
 }
 
@@ -200,8 +368,13 @@ readAmbe2450Data(dsd_opts* opts, dsd_state* state, char* ambe_d) {
 
     int i, j, k;
     unsigned char b, x;
+    int c;
 
-    state->errs2 = fgetc(opts->mbe_in_f);
+    c = fgetc(opts->mbe_in_f);
+    if (c == EOF) {
+        return (1);
+    }
+    state->errs2 = c;
     state->errs = state->errs2;
 
     k = 0;
@@ -212,10 +385,11 @@ readAmbe2450Data(dsd_opts* opts, dsd_state* state, char* ambe_d) {
     x = 0;
     for (i = 0; i < 6; i++) //breaks backwards compatablilty with 6 files
     {
-        b = fgetc(opts->mbe_in_f);
-        if (feof(opts->mbe_in_f)) {
+        c = fgetc(opts->mbe_in_f);
+        if (c == EOF) {
             return (1);
         }
+        b = (unsigned char)c;
         for (j = 0; j < 8; j++) {
             ambe_d[k] = (b & 128) >> 7;
 
@@ -236,8 +410,18 @@ readAmbe2450Data(dsd_opts* opts, dsd_state* state, char* ambe_d) {
     if (opts->payload == 1) {
         fprintf(stderr, " err = [%X] [%X] ", state->errs, state->errs2);
     }
-    b = fgetc(opts->mbe_in_f);
+    c = fgetc(opts->mbe_in_f);
+    if (c == EOF) {
+        return (1);
+    }
+    b = (unsigned char)c;
     ambe_d[48] = (b & 1);
+    if (dsd_frame_log_enabled(opts)) {
+        unsigned long long ambe = convert_bits_into_output((uint8_t*)ambe_d, 49);
+        ambe = ambe << 7;
+        dsd_frame_logf(opts, "FRAME AMBE slot=%d data=%014llX err=[%X] [%X] source=mbe-file", state->currentslot + 1,
+                       ambe, state->errs, state->errs2);
+    }
 
     return (0);
 }
@@ -246,18 +430,22 @@ void
 openMbeInFile(dsd_opts* opts, dsd_state* state) {
 
     char cookie[5];
+    state->mbe_file_type = -1;
 
-    opts->mbe_in_f = fopen(opts->mbe_in_file, "ro");
+    opts->mbe_in_f = fopen(opts->mbe_in_file, "rb");
     if (opts->mbe_in_f == NULL) {
         LOG_ERROR("Error: could not open %s\n", opts->mbe_in_file);
+        return;
     }
 
     //this will check the last 4 characters of the opts->mbe_in_file string
     char ext[5];
     memset(ext, 0, sizeof(ext));
-    uint16_t str_len = strlen((const char*)opts->mbe_in_file);
-    uint16_t ext_ptr = str_len - 4;
-    strncpy(ext, opts->mbe_in_file + ext_ptr, 4);
+    size_t str_len = strlen((const char*)opts->mbe_in_file);
+    if (str_len >= 4U) {
+        size_t ext_ptr = str_len - 4U;
+        strncpy(ext, opts->mbe_in_file + ext_ptr, 4);
+    }
 
     //debug
     // fprintf (stderr, "EXT: %s;", ext);
@@ -371,10 +559,10 @@ openMbeOutFile(dsd_opts* opts, dsd_state* state) {
     } else {
         opts->mbe_out = 1;
         /* Fully buffered output to reduce syscall overhead */
-        setvbuf(opts->mbe_out_f, NULL, _IOFBF, (size_t)64u * 1024u);
+        configure_file_stream_buffer(opts->mbe_out_f, _IOFBF, (size_t)64u * 1024u);
+        fprintf(opts->mbe_out_f, "%s", ext);
     }
 
-    fprintf(opts->mbe_out_f, "%s", ext);
     /* header write will be flushed later on close */
     /* stack buffers; no free */
 }
@@ -425,10 +613,10 @@ openMbeOutFileR(dsd_opts* opts, dsd_state* state) {
     } else {
         opts->mbe_outR = 1;
         /* Fully buffered output to reduce syscall overhead */
-        setvbuf(opts->mbe_out_fR, NULL, _IOFBF, (size_t)64u * 1024u);
+        configure_file_stream_buffer(opts->mbe_out_fR, _IOFBF, (size_t)64u * 1024u);
+        fprintf(opts->mbe_out_fR, "%s", ext);
     }
 
-    fprintf(opts->mbe_out_fR, "%s", ext);
     /* header write will be flushed later on close */
     /* stack buffers; no free */
 }
@@ -473,7 +661,8 @@ close_wav_file(SNDFILE* wav_file) {
 }
 
 SNDFILE*
-close_and_rename_wav_file(SNDFILE* wav_file, char* wav_out_filename, char* dir, Event_History_I* event_struct) {
+close_and_rename_wav_file(SNDFILE* wav_file, dsd_opts* opts, char* wav_out_filename, char* dir,
+                          Event_History_I* event_struct) {
     if (wav_file != NULL) {
         sf_close(wav_file);
     }
@@ -482,16 +671,24 @@ close_and_rename_wav_file(SNDFILE* wav_file, char* wav_out_filename, char* dir, 
         return NULL;
     }
 
-    time_t event_time = event_struct->Event_History_Items[0].event_time;
+    const Event_History* event_item = NULL;
+    if (event_struct) {
+        event_item = &event_struct->Event_History_Items[0];
+    }
+
+    time_t event_time = time(NULL);
+    if (event_item && event_item->event_time > 0) {
+        event_time = event_item->event_time;
+    }
     char datestr[9];
     char timestr[7];
     getDateF_buf(event_time, datestr);
     getTimeF_buf(event_time, timestr);
     uint16_t random_number = rand();
 
-    uint32_t source_id = event_struct->Event_History_Items[0].source_id;
-    uint32_t target_id = event_struct->Event_History_Items[0].target_id;
-    int8_t gi = event_struct->Event_History_Items[0].gi;
+    uint32_t source_id = event_item ? event_item->source_id : 0U;
+    uint32_t target_id = event_item ? event_item->target_id : 0U;
+    int8_t gi = event_item ? event_item->gi : 0;
 
     char sys_str[200];
     memset(sys_str, 0, sizeof(sys_str));
@@ -502,9 +699,11 @@ close_and_rename_wav_file(SNDFILE* wav_file, char* wav_out_filename, char* dir, 
     char gi_str[10];
     memset(gi_str, 0, sizeof(gi_str));
 
-    snprintf(sys_str, sizeof(sys_str), "%s", event_struct->Event_History_Items[0].sysid_string);
-    snprintf(src_str, sizeof(src_str), "%s", event_struct->Event_History_Items[0].src_str);
-    snprintf(tgt_str, sizeof(tgt_str), "%s", event_struct->Event_History_Items[0].tgt_str);
+    if (event_item) {
+        snprintf(sys_str, sizeof(sys_str), "%s", event_item->sysid_string);
+        snprintf(src_str, sizeof(src_str), "%s", event_item->src_str);
+        snprintf(tgt_str, sizeof(tgt_str), "%s", event_item->tgt_str);
+    }
 
     snprintf(gi_str, sizeof(gi_str), "%s", "");
     if (gi == 0) {
@@ -546,17 +745,29 @@ close_and_rename_wav_file(SNDFILE* wav_file, char* wav_out_filename, char* dir, 
     }
 
     // Safe to rename now
-    rename(wav_out_filename, new_filename);
+    if (rename(wav_out_filename, new_filename) != 0) {
+        LOG_ERROR("Error - could not rename wav file %s -> %s\n", wav_out_filename, new_filename);
+        return NULL;
+    }
 
     // Optional: recheck final file size and remove if header-only, though we already checked
     file = fopen(new_filename, "r");
+    long final_size = 0;
     if (file != NULL) {
         fseek(file, 0, SEEK_END);
-        long size = ftell(file);
+        final_size = ftell(file);
         fseek(file, 0, SEEK_SET);
         fclose(file);
-        if (size == 44) {
+        if (final_size == 44) {
             remove(new_filename);
+            wav_file = NULL;
+            return wav_file;
+        }
+    }
+
+    if (opts && final_size > 44) {
+        if (dsd_rdio_export_call(opts, event_struct, new_filename) != 0) {
+            LOG_WARN("Rdio export failed for %s\n", new_filename);
         }
     }
 
@@ -858,6 +1069,34 @@ reverse_lfsr_64_to_len(dsd_opts* opts, uint8_t* iv, int16_t len) {
     return bit2;
 }
 
+static void
+sdrtrunk_lfsr_64_to_128(uint8_t* iv) {
+    uint64_t lfsr = 0;
+    uint64_t bit = 0;
+
+    lfsr = ((uint64_t)iv[0] << 56ULL) + ((uint64_t)iv[1] << 48ULL) + ((uint64_t)iv[2] << 40ULL)
+           + ((uint64_t)iv[3] << 32ULL) + ((uint64_t)iv[4] << 24ULL) + ((uint64_t)iv[5] << 16ULL)
+           + ((uint64_t)iv[6] << 8ULL) + ((uint64_t)iv[7] << 0ULL);
+
+    uint8_t cnt = 0;
+    uint8_t x = 64;
+    for (cnt = 0; cnt < 64; cnt++) {
+        // Polynomial is C(x) = x^64 + x^62 + x^46 + x^38 + x^27 + x^15 + 1
+        bit = ((lfsr >> 63) ^ (lfsr >> 61) ^ (lfsr >> 45) ^ (lfsr >> 37) ^ (lfsr >> 26) ^ (lfsr >> 14)) & 0x1;
+        lfsr = (lfsr << 1) | bit;
+        iv[x / 8] = (uint8_t)((iv[x / 8] << 1) + bit);
+        x++;
+    }
+}
+
+static unsigned long long
+sdrtrunk_u64_from_be8(const uint8_t* v) {
+    return ((unsigned long long)v[0] << 56ULL) | ((unsigned long long)v[1] << 48ULL)
+           | ((unsigned long long)v[2] << 40ULL) | ((unsigned long long)v[3] << 32ULL)
+           | ((unsigned long long)v[4] << 24ULL) | ((unsigned long long)v[5] << 16ULL)
+           | ((unsigned long long)v[6] << 8ULL) | ((unsigned long long)v[7] << 0ULL);
+}
+
 //convert a user string into a uint8_t array
 uint16_t
 parse_raw_user_string(char* input, uint8_t* output, size_t out_cap) {
@@ -920,6 +1159,109 @@ parse_raw_user_string(char* input, uint8_t* output, size_t out_cap) {
     }
 
     return (uint16_t)want_octets;
+}
+
+static int
+sdrtrunk_build_voice_keystream_bits(dsd_state* state, uint8_t alg_id, uint16_t key_id, const uint8_t iv64[8],
+                                    int rc4_db, int rc4_mod, int protocol, uint8_t* out_bits, size_t out_bits_cap) {
+    if (!state || !iv64 || !out_bits || out_bits_cap < 8) {
+        return 0;
+    }
+
+    enum { SDRTRUNK_KS_BYTES = 384 };
+
+    uint8_t ks_bytes[SDRTRUNK_KS_BYTES];
+    memset(ks_bytes, 0, sizeof(ks_bytes));
+
+    size_t ks_valid_bytes = 0;
+    size_t skip_bytes = 0;
+
+    if (alg_id == 0xAA || alg_id == 0x21) {
+        unsigned long long int rc4_key = state->rkey_array[key_id];
+        if (rc4_key == 0ULL) {
+            rc4_key = state->R;
+        }
+        if (rc4_key == 0ULL) {
+            return 0;
+        }
+
+        uint8_t rc4_kiv[13];
+        memset(rc4_kiv, 0, sizeof(rc4_kiv));
+        rc4_kiv[0] = (uint8_t)((rc4_key >> 32ULL) & 0xFFULL);
+        rc4_kiv[1] = (uint8_t)((rc4_key >> 24ULL) & 0xFFULL);
+        rc4_kiv[2] = (uint8_t)((rc4_key >> 16ULL) & 0xFFULL);
+        rc4_kiv[3] = (uint8_t)((rc4_key >> 8ULL) & 0xFFULL);
+        rc4_kiv[4] = (uint8_t)((rc4_key >> 0ULL) & 0xFFULL);
+        memcpy(rc4_kiv + 5, iv64, 8);
+
+        rc4_block_output(rc4_db, rc4_mod, SDRTRUNK_KS_BYTES, rc4_kiv, ks_bytes);
+        ks_valid_bytes = SDRTRUNK_KS_BYTES;
+    } else if (alg_id == 0x81) {
+        unsigned long long int des_key = state->rkey_array[key_id];
+        if (des_key == 0ULL) {
+            des_key = state->R;
+        }
+        if (des_key == 0ULL) {
+            return 0;
+        }
+        unsigned long long int iv_u64 = sdrtrunk_u64_from_be8(iv64);
+        des_multi_keystream_output(iv_u64, des_key, ks_bytes, 1, SDRTRUNK_KS_BYTES / 8);
+        ks_valid_bytes = SDRTRUNK_KS_BYTES;
+        // SDRTrunk P25p1 playback requires LC/reserved offset in addition to OFB discard.
+        // P25p2 uses only the OFB discard offset.
+        skip_bytes = (protocol == 1) ? 19 : 8;
+    } else if (alg_id == 0x84 || alg_id == 0x89) {
+        uint8_t aes_key[32];
+        memset(aes_key, 0, sizeof(aes_key));
+        unsigned long long int a1 = state->rkey_array[key_id + 0x000];
+        unsigned long long int a2 = state->rkey_array[key_id + 0x101];
+        unsigned long long int a3 = state->rkey_array[key_id + 0x201];
+        unsigned long long int a4 = state->rkey_array[key_id + 0x301];
+        if (a1 == 0ULL && a2 == 0ULL && a3 == 0ULL && a4 == 0ULL) {
+            a1 = state->K1;
+            a2 = state->K2;
+            a3 = state->K3;
+            a4 = state->K4;
+        }
+        for (int i = 0; i < 8; i++) {
+            aes_key[i + 0] = (uint8_t)((a1 >> (56 - (i * 8))) & 0xFFULL);
+            aes_key[i + 8] = (uint8_t)((a2 >> (56 - (i * 8))) & 0xFFULL);
+            aes_key[i + 16] = (uint8_t)((a3 >> (56 - (i * 8))) & 0xFFULL);
+            aes_key[i + 24] = (uint8_t)((a4 >> (56 - (i * 8))) & 0xFFULL);
+        }
+        uint8_t zeros[32];
+        memset(zeros, 0, sizeof(zeros));
+        if (memcmp(aes_key, zeros, sizeof(aes_key)) == 0) {
+            return 0;
+        }
+
+        uint8_t aes_iv[16];
+        memset(aes_iv, 0, sizeof(aes_iv));
+        memcpy(aes_iv, iv64, 8);
+        sdrtrunk_lfsr_64_to_128(aes_iv);
+
+        const int aes_type = (alg_id == 0x84) ? 2 : 0; // 256/128
+        aes_ofb_keystream_output(aes_iv, aes_key, ks_bytes, aes_type, SDRTRUNK_KS_BYTES / 16);
+        ks_valid_bytes = SDRTRUNK_KS_BYTES;
+        // SDRTrunk P25p1 playback requires LC/reserved offset in addition to OFB discard.
+        // P25p2 uses only the OFB discard offset.
+        skip_bytes = (protocol == 1) ? 27 : 16;
+    } else {
+        return 0;
+    }
+
+    if (ks_valid_bytes <= skip_bytes) {
+        return 0;
+    }
+
+    memset(out_bits, 0, out_bits_cap);
+    size_t unpack_bytes = ks_valid_bytes - skip_bytes;
+    size_t max_unpack = out_bits_cap / 8;
+    if (unpack_bytes > max_unpack) {
+        unpack_bytes = max_unpack;
+    }
+    unpack_byte_array_into_bit_array(ks_bytes + skip_bytes, out_bits, (int)unpack_bytes);
+    return 1;
 }
 
 uint16_t
@@ -991,7 +1333,7 @@ ambe2_str_to_decode(dsd_opts* opts, dsd_state* state, char* ambe_str, uint8_t* k
     mbe_processAmbe2450Dataf(state->audio_out_temp_buf, &state->errs, &state->errs2, state->err_str, ambe_d,
                              state->cur_mp, state->prev_mp, state->prev_mp_enhanced, opts->uvquality);
 
-    if (opts->payload == 1) {
+    if (dsd_frame_detail_enabled(opts)) {
         PrintAMBEData(opts, state, ambe_d);
     }
 
@@ -1111,7 +1453,7 @@ imbe_str_to_decode(dsd_opts* opts, dsd_state* state, char* imbe_str, uint8_t* ks
     mbe_processImbe4400Dataf(state->audio_out_temp_buf, &state->errs, &state->errs2, state->err_str, imbe_d,
                              state->cur_mp, state->prev_mp, state->prev_mp_enhanced, opts->uvquality);
 
-    if (opts->payload == 1) {
+    if (dsd_frame_detail_enabled(opts)) {
         PrintIMBEData(opts, state, imbe_d);
     }
 
@@ -1224,7 +1566,8 @@ read_sdrtrunk_json_format(dsd_opts* opts, dsd_state* state) {
     // fprintf (stderr, " Source Size: %d.\n", source_size);
     // fprintf (stderr, "\n");
 
-    char* str_buffer = strtok(source_str, "{ \""); //value after initial { open bracket
+    char* str_saveptr = NULL;
+    char* str_buffer = dsd_strtok_r(source_str, "{ \"", &str_saveptr); //value after initial { open bracket
 
     //debug print current str_buffer
     // fprintf (stderr, "%s", str_buffer);
@@ -1235,7 +1578,7 @@ read_sdrtrunk_json_format(dsd_opts* opts, dsd_state* state) {
         // fprintf (stderr, "%s", str_buffer);
 
         if (strncmp("version", str_buffer, 7) == 0) {
-            str_buffer = strtok(NULL, " : \""); //next value after any : "" string
+            str_buffer = dsd_strtok_r(NULL, " : \"", &str_saveptr); //next value after any : "" string
 
             version = strtol(str_buffer, NULL, 10);
 
@@ -1250,7 +1593,7 @@ read_sdrtrunk_json_format(dsd_opts* opts, dsd_state* state) {
 
         //compare and set items accordingly
         if (strncmp("protocol", str_buffer, 8) == 0) {
-            str_buffer = strtok(NULL, " : \""); //next value after any : "" string
+            str_buffer = dsd_strtok_r(NULL, " : \"", &str_saveptr); //next value after any : "" string
 
             //debug print current str_buffer
             fprintf(stderr, "\n Protocol: %s", str_buffer);
@@ -1302,7 +1645,7 @@ read_sdrtrunk_json_format(dsd_opts* opts, dsd_state* state) {
         }
 
         if (strncmp("call_type", str_buffer, 9) == 0) {
-            str_buffer = strtok(NULL, " : \""); //next value after any : "" string
+            str_buffer = dsd_strtok_r(NULL, " : \"", &str_saveptr); //next value after any : "" string
 
             //set gi value based on this
             if (strncmp("GROUP", str_buffer, 5) == 0) {
@@ -1321,7 +1664,7 @@ read_sdrtrunk_json_format(dsd_opts* opts, dsd_state* state) {
         }
 
         if (strncmp("encrypted", str_buffer, 9) == 0) {
-            str_buffer = strtok(NULL, " : \""); //next value after any : "" string
+            str_buffer = dsd_strtok_r(NULL, " : \"", &str_saveptr); //next value after any : "" string
 
             //set enc value based on this
             if (strncmp("true", str_buffer, 4) == 0) {
@@ -1342,7 +1685,7 @@ read_sdrtrunk_json_format(dsd_opts* opts, dsd_state* state) {
         }
 
         if (strncmp("to", str_buffer, 2) == 0) {
-            str_buffer = strtok(NULL, " : \""); //next value after any : "" string
+            str_buffer = dsd_strtok_r(NULL, " : \"", &str_saveptr); //next value after any : "" string
 
             target = strtol(str_buffer, NULL, 10);
 
@@ -1356,7 +1699,7 @@ read_sdrtrunk_json_format(dsd_opts* opts, dsd_state* state) {
         }
 
         if (strncmp("from", str_buffer, 4) == 0) {
-            str_buffer = strtok(NULL, " : \""); //next value after any : "" string
+            str_buffer = dsd_strtok_r(NULL, " : \"", &str_saveptr); //next value after any : "" string
 
             source = strtol(str_buffer, NULL, 10);
 
@@ -1370,7 +1713,7 @@ read_sdrtrunk_json_format(dsd_opts* opts, dsd_state* state) {
         }
 
         if (strncmp("encryption_algorithm", str_buffer, 20) == 0) {
-            str_buffer = strtok(NULL, " : \""); //next value after any : "" string
+            str_buffer = dsd_strtok_r(NULL, " : \"", &str_saveptr); //next value after any : "" string
 
             alg_id = strtol(str_buffer, NULL, 10);
 
@@ -1387,7 +1730,7 @@ read_sdrtrunk_json_format(dsd_opts* opts, dsd_state* state) {
         }
 
         if (strncmp("encryption_key_id", str_buffer, 17) == 0) {
-            str_buffer = strtok(NULL, " : \""); //next value after any : "" string
+            str_buffer = dsd_strtok_r(NULL, " : \"", &str_saveptr); //next value after any : "" string
 
             key_id = strtol(str_buffer, NULL, 10);
 
@@ -1404,7 +1747,7 @@ read_sdrtrunk_json_format(dsd_opts* opts, dsd_state* state) {
         }
 
         if (strncmp("encryption_mi", str_buffer, 13) == 0) {
-            str_buffer = strtok(NULL, " : \""); //next value after any : "" string
+            str_buffer = dsd_strtok_r(NULL, " : \"", &str_saveptr); //next value after any : "" string
 
             uint16_t iv_len = strlen((const char*)str_buffer);
             char iv_str[20];
@@ -1437,45 +1780,38 @@ read_sdrtrunk_json_format(dsd_opts* opts, dsd_state* state) {
                 keyring(opts, state);
             }
 
-            //TODO: Handle multi keystream creation with a new function
-            uint8_t ks_bytes[375];
-            memset(ks_bytes, 0, sizeof(ks_bytes));
-            uint8_t kiv[15];
-            memset(kiv, 0, sizeof(kiv));
+            ks_available = 0;
+            uint8_t iv64[8];
+            memset(iv64, 0, sizeof(iv64));
+            (void)parse_raw_user_string(iv_str, iv64, sizeof(iv64));
 
-            //Test: Setup a simple RC4 for now (working)
-            if ((alg_id == 0xAA || alg_id == 0x21) && state->R != 0) {
+            if (is_enc == 1) {
+                ks_available = (uint8_t)sdrtrunk_build_voice_keystream_bits(state, alg_id, key_id, iv64, rc4_db,
+                                                                            rc4_mod, protocol, ks, sizeof(ks));
 
-                //load key into key portion of kiv
-                kiv[0] = ((state->R & 0xFF00000000) >> 32);
-                kiv[1] = ((state->R & 0xFF000000) >> 24);
-                kiv[2] = ((state->R & 0xFF0000) >> 16);
-                kiv[3] = ((state->R & 0xFF00) >> 8);
-                kiv[4] = ((state->R & 0xFF) >> 0);
-
-                //load the str_buffer into the IV portion of kiv
-                // KIV is 15 bytes; IV occupies bytes [5..14] → capacity 10
-                parse_raw_user_string(str_buffer, kiv + 5, sizeof(kiv) - 5);
-
-                rc4_block_output(rc4_db, rc4_mod, 200, kiv, ks_bytes);
-
-                unpack_byte_array_into_bit_array(ks_bytes, ks, 200);
-
-                //reverse lfsr on IV and create keystream with that as well
-                //due to out of order execution on P25p1 ESS sync.
-                if (protocol == 1 && version == 1) {
-                    reverse_lfsr_64_to_len(opts, kiv + 5, 64);
-
-                    memset(ks_bytes, 0, sizeof(ks_bytes));
-
-                    rc4_block_output(rc4_db, rc4_mod, 200, kiv, ks_bytes);
-
-                    unpack_byte_array_into_bit_array(ks_bytes, ks_i, 200);
+                // Reverse-LFSR path for v1 P25p1 SDRTrunk files where ESS appears before the
+                // superframe it should decrypt.
+                if (protocol == 1 && version == 1 && ks_available) {
+                    uint8_t iv_prev[8];
+                    memcpy(iv_prev, iv64, sizeof(iv_prev));
+                    reverse_lfsr_64_to_len(opts, iv_prev, 64);
+                    if (!sdrtrunk_build_voice_keystream_bits(state, alg_id, key_id, iv_prev, rc4_db, rc4_mod, protocol,
+                                                             ks_i, sizeof(ks_i))) {
+                        // Fallback: avoid a zero keystream if reverse derivation fails.
+                        memcpy(ks_i, ks, sizeof(ks_i));
+                    }
                 }
+            }
 
-                ks_available = 1;
-
-            } //end test
+            if (opts->payload == 1 && ks_available) {
+                if (alg_id == 0xAA || alg_id == 0x21) {
+                    fprintf(stderr, " RC4 keystream ready;");
+                } else if (alg_id == 0x81) {
+                    fprintf(stderr, " DES56 keystream ready;");
+                } else if (alg_id == 0x84 || alg_id == 0x89) {
+                    fprintf(stderr, " AES-%s keystream ready;", (alg_id == 0x84) ? "256" : "128");
+                }
+            }
 
             //NOTE: Regarding SDRTrunk .mbe format, the ESS Encryption Sync
             //is in the correct location on P25p2, but for P25p1, the ESS
@@ -1499,7 +1835,7 @@ read_sdrtrunk_json_format(dsd_opts* opts, dsd_state* state) {
         }
 
         if (strncmp("hex", str_buffer, 3) == 0) {
-            str_buffer = strtok(NULL, " : \""); //next value after any : "" string
+            str_buffer = dsd_strtok_r(NULL, " : \"", &str_saveptr); //next value after any : "" string
 
             if (protocol == 1) //P25p1 IMBE
             {
@@ -1562,7 +1898,7 @@ read_sdrtrunk_json_format(dsd_opts* opts, dsd_state* state) {
         }
 
         if (strncmp("time", str_buffer, 4) == 0) {
-            str_buffer = strtok(NULL, " : \""); //next value after any : "" string
+            str_buffer = dsd_strtok_r(NULL, " : \"", &str_saveptr); //next value after any : "" string
 
             char time_str[20];
             memset(time_str, 0, sizeof(time_str));
@@ -1603,7 +1939,7 @@ read_sdrtrunk_json_format(dsd_opts* opts, dsd_state* state) {
             ks_idx = 0;
         }
 
-        str_buffer = strtok(NULL, " : \""); //next value after any : "" string
+        str_buffer = dsd_strtok_r(NULL, " : \"", &str_saveptr); //next value after any : "" string
 
         if (str_buffer == NULL) {
             break;

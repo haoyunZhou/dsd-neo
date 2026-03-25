@@ -9,17 +9,24 @@
 #define _GNU_SOURCE
 #endif
 
-/* Include sched.h early on Linux for CPU_* macros (needs _GNU_SOURCE) */
-#if defined(__linux__)
-#include <sched.h>
+/* Include sched.h early:
+ * - Linux: CPU_* affinity macros (requires _GNU_SOURCE)
+ * - macOS: struct sched_param/SCHED_* constants for pthread scheduling */
+#if defined(__linux__) || (defined(__APPLE__) && defined(__MACH__))
+// IWYU can incorrectly suggest libc-internal bits headers for sched_param.
+// Keep the portable public header explicitly.
+// IWYU pragma: no_include <bits/types/struct_sched_param.h>
+#include <sched.h> // IWYU pragma: keep
 #endif
 
 #include <dsd-neo/platform/threading.h>
+#include <pthread.h>
+
+#include "dsd-neo/platform/platform.h"
 
 #if !DSD_PLATFORM_WIN_NATIVE
 
 #include <errno.h>
-#include <string.h>
 #include <time.h>
 
 /*============================================================================

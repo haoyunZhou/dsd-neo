@@ -10,22 +10,57 @@
 
 #include "menu_callbacks.h"
 
-#include "menu_env.h"
-#include "menu_internal.h"
-#include "menu_prompts.h"
-
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/state.h>
 #include <dsd-neo/platform/posix_compat.h>
 #include <dsd-neo/runtime/config.h>
-#include <dsd-neo/ui/menu_core.h>
 #include <dsd-neo/ui/ui_async.h>
 #include <dsd-neo/ui/ui_cmd.h>
-#include <dsd-neo/ui/ui_prims.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#include "dsd-neo/ui/menu_core.h"
+#include "menu_env.h"
+#include "menu_internal.h"
+#include "menu_prompts.h"
+
+static int
+clamp_int_with_notice(const char* label, int value, int min_v, int max_v, int* adjusted) {
+    int out = value;
+    if (out < min_v) {
+        out = min_v;
+    }
+    if (out > max_v) {
+        out = max_v;
+    }
+    if (adjusted) {
+        *adjusted = (out != value) ? 1 : 0;
+    }
+    if (out != value) {
+        ui_statusf("%s adjusted to %d (range %d..%d)", label ? label : "Value", out, min_v, max_v);
+    }
+    return out;
+}
+
+static double
+clamp_double_with_notice(const char* label, double value, double min_v, double max_v, int* adjusted) {
+    double out = value;
+    if (out < min_v) {
+        out = min_v;
+    }
+    if (out > max_v) {
+        out = max_v;
+    }
+    if (adjusted) {
+        *adjusted = (out != value) ? 1 : 0;
+    }
+    if (out != value) {
+        ui_statusf("%s adjusted to %.3f (range %.3f..%.3f)", label ? label : "Value", out, min_v, max_v);
+    }
+    return out;
+}
 
 // ---- Simple path callbacks ----
 
@@ -37,7 +72,7 @@ cb_event_log_set(void* v, const char* path) {
     }
     if (path && *path) {
         ui_post_cmd(UI_CMD_EVENT_LOG_SET, path, strlen(path) + 1);
-        ui_statusf("Event log set requested");
+        ui_statusf("Applying event log output...");
     }
 }
 
@@ -49,7 +84,7 @@ cb_static_wav(void* v, const char* path) {
     }
     if (path && *path) {
         ui_post_cmd(UI_CMD_WAV_STATIC_OPEN, path, strlen(path) + 1);
-        ui_statusf("Static WAV open requested");
+        ui_statusf("Applying static WAV output...");
     }
 }
 
@@ -61,7 +96,7 @@ cb_raw_wav(void* v, const char* path) {
     }
     if (path && *path) {
         ui_post_cmd(UI_CMD_WAV_RAW_OPEN, path, strlen(path) + 1);
-        ui_statusf("Raw WAV open requested");
+        ui_statusf("Applying raw WAV output...");
     }
 }
 
@@ -73,7 +108,7 @@ cb_dsp_out(void* v, const char* name) {
     }
     if (name && *name) {
         ui_post_cmd(UI_CMD_DSP_OUT_SET, name, strlen(name) + 1);
-        ui_statusf("DSP output set requested");
+        ui_statusf("Applying DSP output path...");
     }
 }
 
@@ -85,7 +120,7 @@ cb_import_chan(void* v, const char* p) {
     }
     if (p && *p) {
         ui_post_cmd(UI_CMD_IMPORT_CHANNEL_MAP, p, strlen(p) + 1);
-        ui_statusf("Import channel map requested");
+        ui_statusf("Importing channel map...");
     }
 }
 
@@ -97,7 +132,7 @@ cb_import_group(void* v, const char* p) {
     }
     if (p && *p) {
         ui_post_cmd(UI_CMD_IMPORT_GROUP_LIST, p, strlen(p) + 1);
-        ui_statusf("Import group list requested");
+        ui_statusf("Importing group list...");
     }
 }
 
@@ -109,7 +144,7 @@ cb_keys_dec(void* v, const char* p) {
     }
     if (p && *p) {
         ui_post_cmd(UI_CMD_IMPORT_KEYS_DEC, p, strlen(p) + 1);
-        ui_statusf("Import keys (DEC) requested");
+        ui_statusf("Importing keys (DEC)...");
     }
 }
 
@@ -121,7 +156,7 @@ cb_keys_hex(void* v, const char* p) {
     }
     if (p && *p) {
         ui_post_cmd(UI_CMD_IMPORT_KEYS_HEX, p, strlen(p) + 1);
-        ui_statusf("Import keys (HEX) requested");
+        ui_statusf("Importing keys (HEX)...");
     }
 }
 
@@ -184,8 +219,12 @@ cb_setmod_bw(void* v, int ok, int bw) {
         return;
     }
     if (ok) {
-        int32_t hz = bw;
+        int adjusted = 0;
+        int32_t hz = (int32_t)clamp_int_with_notice("Rigctl BW", bw, 0, 25000, &adjusted);
         ui_post_cmd(UI_CMD_RIGCTL_SET_MOD_BW, &hz, sizeof hz);
+        if (!adjusted) {
+            ui_statusf("Applying Rigctl BW: %d Hz", (int)hz);
+        }
     }
 }
 
@@ -196,8 +235,13 @@ cb_tg_hold(void* v, int ok, int tg) {
         return;
     }
     if (ok) {
-        uint32_t t = (unsigned)tg;
+        int adjusted = 0;
+        int tg_safe = clamp_int_with_notice("TG Hold", tg, 0, 2147483647, &adjusted);
+        uint32_t t = (uint32_t)tg_safe;
         ui_post_cmd(UI_CMD_TG_HOLD_SET, &t, sizeof t);
+        if (!adjusted) {
+            ui_statusf("Applying TG Hold: %u", t);
+        }
     }
 }
 
@@ -208,8 +252,17 @@ cb_hangtime(void* v, int ok, double s) {
         return;
     }
     if (ok) {
+        int adjusted = 0;
         double d = s;
+        if (d < 0.0) {
+            d = 0.0;
+            adjusted = 1;
+            ui_statusf("Hangtime adjusted to %.3f (range >= 0)", d);
+        }
         ui_post_cmd(UI_CMD_HANGTIME_SET, &d, sizeof d);
+        if (!adjusted) {
+            ui_statusf("Applying hangtime: %.3f s", d);
+        }
     }
 }
 
@@ -220,14 +273,13 @@ cb_slot_pref(void* v, int ok, int p) {
         return;
     }
     if (ok) {
-        if (p < 1) {
-            p = 1;
-        }
-        if (p > 2) {
-            p = 2;
-        }
+        int adjusted = 0;
+        p = clamp_int_with_notice("Slot preference", p, 1, 2, &adjusted);
         int32_t pref01 = p - 1;
         ui_post_cmd(UI_CMD_SLOT_PREF_SET, &pref01, sizeof pref01);
+        if (!adjusted) {
+            ui_statusf("Applying slot preference: %d", p);
+        }
     }
 }
 
@@ -238,8 +290,12 @@ cb_slots_on(void* v, int ok, int m) {
         return;
     }
     if (ok) {
-        int32_t mask = m;
+        int adjusted = 0;
+        int32_t mask = (int32_t)clamp_int_with_notice("Slot mask", m, 0, 3, &adjusted);
         ui_post_cmd(UI_CMD_SLOTS_ONOFF_SET, &mask, sizeof mask);
+        if (!adjusted) {
+            ui_statusf("Applying slot mask: %d", (int)mask);
+        }
     }
 }
 
@@ -368,6 +424,46 @@ cb_key_rc4des(void* v, const char* text) {
 
 // ---- Multi-step callbacks ----
 
+static int
+parse_required_hex(const char* text, unsigned long long* out) {
+    if (!text || !*text || !out) {
+        return 0;
+    }
+    return parse_hex_u64(text, out) ? 1 : 0;
+}
+
+static const char*
+hytera_step_title(int step) {
+    switch (step) {
+        case 0: return "Hytera Privacy Key 1 (HEX)";
+        case 1: return "Hytera Privacy Key 2 (HEX) or 0";
+        case 2: return "Hytera Privacy Key 3 (HEX) or 0";
+        case 3: return "Hytera Privacy Key 4 (HEX) or 0";
+        default: return "Hytera Privacy Key (HEX)";
+    }
+}
+
+static const char*
+aes_step_title(int step) {
+    switch (step) {
+        case 0: return "AES Segment 1 (HEX) or 0";
+        case 1: return "AES Segment 2 (HEX) or 0";
+        case 2: return "AES Segment 3 (HEX) or 0";
+        case 3: return "AES Segment 4 (HEX) or 0";
+        default: return "AES Segment (HEX)";
+    }
+}
+
+static const char*
+p2_step_title(int step) {
+    switch (step) {
+        case 0: return "Enter Phase 2 WACN (HEX)";
+        case 1: return "Enter Phase 2 SYSID (HEX)";
+        case 2: return "Enter Phase 2 NAC/CC (HEX)";
+        default: return "Enter Phase 2 value (HEX)";
+    }
+}
+
 void
 cb_hytera_step(void* u, const char* text) {
     HyCtx* hc = (HyCtx*)u;
@@ -375,29 +471,30 @@ cb_hytera_step(void* u, const char* text) {
         return;
     }
     unsigned long long t = 0ULL;
-    if (text && *text && parse_hex_u64(text, &t)) {
-        if (hc->step == 0) {
-            hc->H = t;
-            hc->K1 = t;
-        } else if (hc->step == 1) {
-            hc->K2 = t;
-        } else if (hc->step == 2) {
-            hc->K3 = t;
-        } else if (hc->step == 3) {
-            hc->K4 = t;
-        }
+    if (!text || !*text) {
+        ui_statusf("Hytera key entry canceled");
+        free(hc);
+        return;
+    }
+    if (!parse_required_hex(text, &t)) {
+        ui_statusf("Invalid HEX; expected %s", hytera_step_title(hc->step));
+        ui_prompt_open_string_async(hytera_step_title(hc->step), text, 128, cb_hytera_step, hc);
+        return;
+    }
+
+    if (hc->step == 0) {
+        hc->H = t;
+        hc->K1 = t;
+    } else if (hc->step == 1) {
+        hc->K2 = t;
+    } else if (hc->step == 2) {
+        hc->K3 = t;
+    } else if (hc->step == 3) {
+        hc->K4 = t;
     }
     hc->step++;
-    if (hc->step == 1) {
-        ui_prompt_open_string_async("Hytera Privacy Key 2 (HEX) or 0", NULL, 128, cb_hytera_step, hc);
-        return;
-    }
-    if (hc->step == 2) {
-        ui_prompt_open_string_async("Hytera Privacy Key 3 (HEX) or 0", NULL, 128, cb_hytera_step, hc);
-        return;
-    }
-    if (hc->step == 3) {
-        ui_prompt_open_string_async("Hytera Privacy Key 4 (HEX) or 0", NULL, 128, cb_hytera_step, hc);
+    if (hc->step <= 3) {
+        ui_prompt_open_string_async(hytera_step_title(hc->step), NULL, 128, cb_hytera_step, hc);
         return;
     }
 
@@ -417,28 +514,29 @@ cb_aes_step(void* u, const char* text) {
         return;
     }
     unsigned long long t = 0ULL;
-    if (text && *text && parse_hex_u64(text, &t)) {
-        if (ac->step == 0) {
-            ac->K1 = t;
-        } else if (ac->step == 1) {
-            ac->K2 = t;
-        } else if (ac->step == 2) {
-            ac->K3 = t;
-        } else if (ac->step == 3) {
-            ac->K4 = t;
-        }
+    if (!text || !*text) {
+        ui_statusf("AES key entry canceled");
+        free(ac);
+        return;
+    }
+    if (!parse_required_hex(text, &t)) {
+        ui_statusf("Invalid HEX; expected %s", aes_step_title(ac->step));
+        ui_prompt_open_string_async(aes_step_title(ac->step), text, 128, cb_aes_step, ac);
+        return;
+    }
+
+    if (ac->step == 0) {
+        ac->K1 = t;
+    } else if (ac->step == 1) {
+        ac->K2 = t;
+    } else if (ac->step == 2) {
+        ac->K3 = t;
+    } else if (ac->step == 3) {
+        ac->K4 = t;
     }
     ac->step++;
-    if (ac->step == 1) {
-        ui_prompt_open_string_async("AES Segment 2 (HEX) or 0", NULL, 128, cb_aes_step, ac);
-        return;
-    }
-    if (ac->step == 2) {
-        ui_prompt_open_string_async("AES Segment 3 (HEX) or 0", NULL, 128, cb_aes_step, ac);
-        return;
-    }
-    if (ac->step == 3) {
-        ui_prompt_open_string_async("AES Segment 4 (HEX) or 0", NULL, 128, cb_aes_step, ac);
+    if (ac->step <= 3) {
+        ui_prompt_open_string_async(aes_step_title(ac->step), NULL, 128, cb_aes_step, ac);
         return;
     }
 
@@ -457,8 +555,15 @@ cb_p2_step(void* u, const char* text) {
         return;
     }
     unsigned long long t = 0ULL;
-    if (text && *text) {
-        parse_hex_u64(text, &t);
+    if (!text || !*text) {
+        ui_statusf("Phase 2 parameter entry canceled");
+        free(pc);
+        return;
+    }
+    if (!parse_required_hex(text, &t)) {
+        ui_statusf("Invalid HEX; expected %s", p2_step_title(pc->step));
+        ui_prompt_open_string_async(p2_step_title(pc->step), text, 64, cb_p2_step, pc);
+        return;
     }
     if (pc->step == 0) {
         pc->w = t;
@@ -470,13 +575,14 @@ cb_p2_step(void* u, const char* text) {
     pc->step++;
     char pre[64];
     if (pc->step == 1) {
-        snprintf(pre, sizeof pre, "%llX", (unsigned long long)pc->c->state->p2_sysid);
-        ui_prompt_open_string_async("Enter Phase 2 SYSID (HEX)", pre, sizeof pre, cb_p2_step, pc);
+        snprintf(pre, sizeof pre, "%llX",
+                 (unsigned long long)((pc->c && pc->c->state) ? pc->c->state->p2_sysid : 0ULL));
+        ui_prompt_open_string_async(p2_step_title(pc->step), pre, sizeof pre, cb_p2_step, pc);
         return;
     }
     if (pc->step == 2) {
-        snprintf(pre, sizeof pre, "%llX", (unsigned long long)pc->c->state->p2_cc);
-        ui_prompt_open_string_async("Enter Phase 2 NAC/CC (HEX)", pre, sizeof pre, cb_p2_step, pc);
+        snprintf(pre, sizeof pre, "%llX", (unsigned long long)((pc->c && pc->c->state) ? pc->c->state->p2_cc : 0ULL));
+        ui_prompt_open_string_async(p2_step_title(pc->step), pre, sizeof pre, cb_p2_step, pc);
         return;
     }
 
@@ -711,15 +817,13 @@ cb_gain_dig(void* u, int ok, double g) {
         return;
     }
     if (ok) {
-        if (g < 0.0) {
-            g = 0.0;
-        }
-        if (g > 50.0) {
-            g = 50.0;
-        }
+        int adjusted = 0;
+        g = clamp_double_with_notice("Digital gain", g, 0.0, 50.0, &adjusted);
         int32_t v = (int32_t)g;
         ui_post_cmd(UI_CMD_GAIN_SET, &v, sizeof v);
-        ui_statusf("Digital gain set requested to %.1f", g);
+        if (!adjusted) {
+            ui_statusf("Applying digital gain: %.1f", g);
+        }
     }
 }
 
@@ -730,15 +834,13 @@ cb_gain_ana(void* u, int ok, double g) {
         return;
     }
     if (ok) {
-        if (g < 0.0) {
-            g = 0.0;
-        }
-        if (g > 100.0) {
-            g = 100.0;
-        }
+        int adjusted = 0;
+        g = clamp_double_with_notice("Analog gain", g, 0.0, 100.0, &adjusted);
         int32_t v = (int32_t)g;
         ui_post_cmd(UI_CMD_AGAIN_SET, &v, sizeof v);
-        ui_statusf("Analog gain set requested to %.1f", g);
+        if (!adjusted) {
+            ui_statusf("Applying analog gain: %.1f", g);
+        }
     }
 }
 
@@ -749,15 +851,13 @@ cb_input_vol(void* u, int ok, int m) {
         return;
     }
     if (ok) {
-        if (m < 1) {
-            m = 1;
-        }
-        if (m > 16) {
-            m = 16;
-        }
+        int adjusted = 0;
+        m = clamp_int_with_notice("Input volume", m, 1, 16, &adjusted);
         int32_t v = m;
         ui_post_cmd(UI_CMD_INPUT_VOL_SET, &v, sizeof v);
-        ui_statusf("Input Volume set requested to %dX", m);
+        if (!adjusted) {
+            ui_statusf("Applying input volume: %dX", m);
+        }
     }
 }
 
@@ -794,8 +894,13 @@ cb_rtl_gain(void* u, int ok, int g) {
         return;
     }
     if (ok) {
+        int adjusted = 0;
+        g = clamp_int_with_notice("RTL gain", g, 0, 49, &adjusted);
         int32_t v = g;
         ui_post_cmd(UI_CMD_RTL_SET_GAIN, &v, sizeof v);
+        if (!adjusted) {
+            ui_statusf("Applying RTL gain: %d", g);
+        }
     }
 }
 
@@ -806,8 +911,13 @@ cb_rtl_ppm(void* u, int ok, int p) {
         return;
     }
     if (ok) {
+        int adjusted = 0;
+        p = clamp_int_with_notice("RTL PPM", p, -200, 200, &adjusted);
         int32_t v = p;
         ui_post_cmd(UI_CMD_RTL_SET_PPM, &v, sizeof v);
+        if (!adjusted) {
+            ui_statusf("Applying RTL PPM: %d", p);
+        }
     }
 }
 
@@ -818,8 +928,27 @@ cb_rtl_bw(void* u, int ok, int bw) {
         return;
     }
     if (ok) {
+        int adjusted = 0;
+        const int allowed[] = {4, 6, 8, 12, 16, 24, 48};
+        int best = allowed[0];
+        int64_t best_dist = llabs((int64_t)bw - (int64_t)allowed[0]);
+        for (size_t i = 1; i < (sizeof allowed / sizeof allowed[0]); i++) {
+            int64_t d = llabs((int64_t)bw - (int64_t)allowed[i]);
+            if (d < best_dist) {
+                best_dist = d;
+                best = allowed[i];
+            }
+        }
+        if (best != bw) {
+            adjusted = 1;
+            ui_statusf("RTL BW adjusted to %d kHz (allowed: 4,6,8,12,16,24,48)", best);
+        }
+        bw = best;
         int32_t v = bw;
         ui_post_cmd(UI_CMD_RTL_SET_BW, &v, sizeof v);
+        if (!adjusted) {
+            ui_statusf("Applying RTL BW: %d kHz", bw);
+        }
     }
 }
 
@@ -842,8 +971,13 @@ cb_rtl_vol(void* u, int ok, int m) {
         return;
     }
     if (ok) {
+        int adjusted = 0;
+        m = clamp_int_with_notice("RTL volume", m, 0, 3, &adjusted);
         int32_t v = m;
         ui_post_cmd(UI_CMD_RTL_SET_VOL_MULT, &v, sizeof v);
+        if (!adjusted) {
+            ui_statusf("Applying RTL volume: %dX", m);
+        }
     }
 }
 
@@ -858,14 +992,13 @@ cb_input_warn(void* v, int ok, double thr) {
     if (!ok) {
         return;
     }
-    if (thr < -200.0) {
-        thr = -200.0;
-    }
-    if (thr > 0.0) {
-        thr = 0.0;
-    }
+    int adjusted = 0;
+    thr = clamp_double_with_notice("Input warning threshold", thr, -200.0, 0.0, &adjusted);
     ui_post_cmd(UI_CMD_INPUT_WARN_DB_SET, &thr, sizeof thr);
     env_set_double("DSD_NEO_INPUT_WARN_DB", thr);
+    if (!adjusted) {
+        ui_statusf("Applying input warning threshold: %.1f dBFS", thr);
+    }
 }
 
 void
@@ -993,11 +1126,19 @@ cb_env_edit_value(void* u, const char* val) {
     if (!ec) {
         return;
     }
-    if (val && *val) {
-        dsd_setenv(ec->name, val, 1);
-        // Apply to runtime config as appropriate
-        env_reparse_runtime_cfg(ec->c ? ec->c->opts : NULL);
+    if (!val) {
+        free(ec);
+        return;
     }
+    if (*val) {
+        dsd_setenv(ec->name, val, 1);
+        ui_statusf("Set %s", ec->name);
+    } else {
+        dsd_unsetenv(ec->name);
+        ui_statusf("Cleared %s", ec->name);
+    }
+    // Apply to runtime config as appropriate
+    env_reparse_runtime_cfg(ec->c ? ec->c->opts : NULL);
     free(ec);
 }
 
@@ -1013,6 +1154,7 @@ cb_env_edit_name(void* u, const char* name) {
     }
     // Require DSD_NEO_ prefix for safety
     if (dsd_strncasecmp(name, "DSD_NEO_", 8) != 0) {
+        ui_statusf("Variable name must start with DSD_NEO_");
         free(ec);
         return;
     }

@@ -3,23 +3,23 @@
  * Copyright (C) 2026 by arancormonk <180709949+arancormonk@users.noreply.github.com>
  */
 
-#include <dsd-neo/runtime/bootstrap.h>
-
-#include <dsd-neo/runtime/cli.h>
-#include <dsd-neo/runtime/config.h>
-#include <dsd-neo/runtime/git_ver.h>
-#include <dsd-neo/runtime/log.h>
-
+#include <ctype.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/state.h>
 #include <dsd-neo/platform/posix_compat.h>
-
+#include <dsd-neo/runtime/bootstrap.h>
+#include <dsd-neo/runtime/cli.h>
+#include <dsd-neo/runtime/config.h>
+#include <dsd-neo/runtime/git_ver.h>
+#include <dsd-neo/runtime/input_spec.h>
+#include <dsd-neo/runtime/log.h>
 #include <mbelib.h>
-
-#include <ctype.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
+
+#include "dsd-neo/core/opts_fwd.h"
+#include "dsd-neo/core/state_fwd.h"
+#include "dsd-neo/runtime/config_schema.h"
 
 static void
 bootstrap_set_exit_rc(int* out_exit_rc, int rc) {
@@ -115,6 +115,7 @@ dsd_runtime_bootstrap(int argc, char** argv, dsd_opts* opts, dsd_state* state, i
     const dsdneoRuntimeConfig* rcfg = dsd_neo_get_config();
     const char* config_env = (rcfg && rcfg->config_path_is_set) ? rcfg->config_path : NULL;
 
+    const int explicit_profile_selected = (profile_cli && *profile_cli) ? 1 : 0;
     int user_cfg_loaded = 0;
     dsdneoUserConfig user_cfg;
     memset(&user_cfg, 0, sizeof user_cfg);
@@ -137,7 +138,8 @@ dsd_runtime_bootstrap(int argc, char** argv, dsd_opts* opts, dsd_state* state, i
         }
 
         if (cfg_path && *cfg_path) {
-            // Remember the path so we can autosave the effective config later.
+            // Remember the path for config-aware frontends and, when safe,
+            // for autosaving the effective config later.
             state->config_autosave_enabled = 1;
             snprintf(state->config_autosave_path, sizeof state->config_autosave_path, "%s", cfg_path);
             state->config_autosave_path[sizeof state->config_autosave_path - 1] = '\0';
@@ -152,12 +154,19 @@ dsd_runtime_bootstrap(int argc, char** argv, dsd_opts* opts, dsd_state* state, i
             if (load_rc == 0) {
                 dsd_apply_user_config_to_opts(&user_cfg, opts, state);
                 user_cfg_loaded = 1;
-                if (profile_cli && *profile_cli) {
+                if (explicit_profile_selected) {
+                    /* Saving the effective config would flatten the profiled
+                       view back into the base INI and destroy profile sections.
+                       Keep the source path for explicit user actions, but
+                       disable automatic writes for this run. */
+                    state->config_autosave_enabled = 0;
+                    LOG_NOTICE("Autosave disabled for profiled config %s to avoid overwriting profile sections.\n",
+                               cfg_path);
                     LOG_NOTICE("Loaded user config from %s (profile: %s)\n", cfg_path, profile_cli);
                 } else {
                     LOG_NOTICE("Loaded user config from %s\n", cfg_path);
                 }
-            } else if (profile_cli && *profile_cli) {
+            } else if (explicit_profile_selected) {
                 // Missing profile is fatal when --profile is specified
                 LOG_ERROR("Profile '%s' not found in config file %s\n", profile_cli, cfg_path);
                 bootstrap_set_exit_rc(out_exit_rc, 1);
@@ -205,10 +214,10 @@ dsd_runtime_bootstrap(int argc, char** argv, dsd_opts* opts, dsd_state* state, i
     // If a user config enabled trunking but this process was started with
     // any effective CLI arguments and none of them explicitly enabled/disabled
     // trunk (via -T / -Y), fall back to the built-in default of trunking
-    // disabled for this run. This keeps CLI-driven sessions from inheriting
-    // trunk enable solely from the config file, while allowing config-driven
-    // runs like: dsd-neo --config <path>
-    if (argc_effective > 1 && user_cfg_loaded && !opts->trunk_cli_seen) {
+    // disabled for this run. Explicit profile selection counts as an
+    // intentional request to use that profiled config, so preserve its
+    // trunking state even when additional frontend/UI flags are present.
+    if (argc_effective > 1 && user_cfg_loaded && !opts->trunk_cli_seen && !explicit_profile_selected) {
         opts->p25_trunk = 0;
         opts->trunk_enable = 0;
     }
@@ -228,6 +237,9 @@ dsd_runtime_bootstrap(int argc, char** argv, dsd_opts* opts, dsd_state* state, i
     }
 
     if (print_config_cli) {
+        /* Ensure shorthand Soapy tuning is reflected in the exported effective config. */
+        int soapy_tuning_applied = 0;
+        (void)dsd_normalize_soapy_input_spec(opts, &soapy_tuning_applied);
         dsdneoUserConfig eff;
         dsd_snapshot_opts_to_user_config(opts, state, &eff);
         dsd_user_config_render_ini(&eff, stdout);

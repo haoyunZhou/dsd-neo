@@ -3,11 +3,11 @@
  * Copyright (C) 2026 by arancormonk <180709949+arancormonk@users.noreply.github.com>
  */
 
-#include <dsd-neo/runtime/p25_p2_audio_ring.h>
-
 #include <dsd-neo/core/state.h>
-
+#include <dsd-neo/runtime/p25_p2_audio_ring.h>
 #include <string.h>
+
+#include "dsd-neo/core/state_fwd.h"
 
 void
 p25_p2_audio_ring_reset(dsd_state* state, int slot) {
@@ -37,14 +37,14 @@ p25_p2_audio_ring_push(dsd_state* state, int slot, const float* frame160) {
         return 0;
     }
 
-    if (state->p25_p2_audio_ring_count[slot] >= 3) {
-        state->p25_p2_audio_ring_head[slot] = (state->p25_p2_audio_ring_head[slot] + 1) % 3;
+    if (state->p25_p2_audio_ring_count[slot] >= DSD_P25_P2_AUDIO_RING_DEPTH) {
+        state->p25_p2_audio_ring_head[slot] = (state->p25_p2_audio_ring_head[slot] + 1) % DSD_P25_P2_AUDIO_RING_DEPTH;
         state->p25_p2_audio_ring_count[slot]--;
     }
 
     int idx = state->p25_p2_audio_ring_tail[slot];
     memcpy(state->p25_p2_audio_ring[slot][idx], frame160, 160U * sizeof(*frame160));
-    state->p25_p2_audio_ring_tail[slot] = (state->p25_p2_audio_ring_tail[slot] + 1) % 3;
+    state->p25_p2_audio_ring_tail[slot] = (state->p25_p2_audio_ring_tail[slot] + 1) % DSD_P25_P2_AUDIO_RING_DEPTH;
     state->p25_p2_audio_ring_count[slot]++;
     return 1;
 }
@@ -62,7 +62,7 @@ p25_p2_audio_ring_pop(dsd_state* state, int slot, float* out160) {
 
     int idx = state->p25_p2_audio_ring_head[slot];
     memcpy(out160, state->p25_p2_audio_ring[slot][idx], 160U * sizeof(*out160));
-    state->p25_p2_audio_ring_head[slot] = (state->p25_p2_audio_ring_head[slot] + 1) % 3;
+    state->p25_p2_audio_ring_head[slot] = (state->p25_p2_audio_ring_head[slot] + 1) % DSD_P25_P2_AUDIO_RING_DEPTH;
     state->p25_p2_audio_ring_count[slot]--;
     return 1;
 }

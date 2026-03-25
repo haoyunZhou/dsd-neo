@@ -26,10 +26,8 @@
 #include <dsd-neo/runtime/colors.h>
 #include <dsd-neo/runtime/config.h>
 #include <dsd-neo/runtime/p25_p2_audio_ring.h>
-
-#include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
@@ -38,7 +36,9 @@ static inline void dsd_append(char* dst, size_t dstsz, const char* src);
 
 // Expose MAC helpers for tests and diagnostics.
 #include <dsd-neo/protocol/p25/p25p2_mac_parse.h>
-#include <dsd-neo/protocol/p25/p25p2_mac_tables.h>
+
+#include "dsd-neo/core/opts_fwd.h"
+#include "dsd-neo/core/state_fwd.h"
 
 /* Emit a compact JSON line for a P25 Phase 2 MAC PDU when enabled. */
 static void
@@ -85,6 +85,113 @@ p25p2_mac_handle(const struct p25p2_mac_result* res, dsd_opts* opts, dsd_state* 
         return;
     }
     p25_sm_on_group_grant(opts, state, channel, svc_bits, group, source);
+}
+
+/* Group-mode policy helpers used by grant handlers:
+ * mode ""/A allows tuning, "B" and "DE" block tuning. */
+static inline void
+p25_mode_set(char* mode, size_t mode_size, const char* value) {
+    if (!mode || mode_size == 0) {
+        return;
+    }
+    if (!value) {
+        value = "";
+    }
+    snprintf(mode, mode_size, "%s", value);
+}
+
+static inline void
+p25_mode_init(char* mode, size_t mode_size, const dsd_opts* opts) {
+    p25_mode_set(mode, mode_size, "");
+    if (opts && opts->trunk_use_allow_list == 1) {
+        p25_mode_set(mode, mode_size, "B");
+    }
+}
+
+static inline void
+p25_mode_apply_tg_hold(const dsd_state* state, int group, char* mode, size_t mode_size) {
+    if (!state) {
+        return;
+    }
+    if (state->tg_hold != 0 && state->tg_hold != (uint32_t)group) {
+        p25_mode_set(mode, mode_size, "B");
+    } else if (state->tg_hold != 0 && state->tg_hold == (uint32_t)group) {
+        p25_mode_set(mode, mode_size, "A");
+    }
+}
+
+static inline int
+p25_mode_allows_tune(const dsd_opts* opts, const char* mode) {
+    return opts && opts->p25_trunk == 1 && strcmp(mode, "DE") != 0 && strcmp(mode, "B") != 0;
+}
+
+static inline void
+p25_mode_apply_group_policy(const dsd_state* state, int group, char* mode, size_t mode_size) {
+    if (!state || !mode || mode_size == 0) {
+        return;
+    }
+
+    for (unsigned int gi = 0; gi < state->group_tally; gi++) {
+        if (state->group_array[gi].groupNumber == (unsigned long)group) {
+            fprintf(stderr, " [%s]", state->group_array[gi].groupName);
+            strncpy(mode, state->group_array[gi].groupMode, mode_size - 1);
+            mode[mode_size - 1] = '\0';
+            break;
+        }
+    }
+
+    p25_mode_apply_tg_hold(state, group, mode, mode_size);
+}
+
+static inline int
+p25_mfid90_enc_lockout_blocks(const dsd_opts* opts, const dsd_state* state, int group) {
+    return opts && state && opts->trunk_tune_enc_calls == 0 && !p25_patch_tg_key_is_clear(state, group)
+           && !p25_patch_sg_key_is_clear(state, group);
+}
+
+static inline void
+p25_set_playback_vc_freq(const dsd_opts* opts, dsd_state* state, long int freq) {
+    if (!opts || !state || opts->p25_trunk != 0) {
+        return;
+    }
+
+    if (DSD_SYNC_IS_P25P1(state->synctype)) {
+        state->p25_vc_freq[0] = freq;
+    } else {
+        state->p25_vc_freq[0] = state->p25_vc_freq[1] = freq;
+    }
+}
+
+static inline void
+p25_set_mfid90_active_channel_single(dsd_state* state, int channel, int group) {
+    if (!state) {
+        return;
+    }
+    char suffix[32];
+    p25_format_chan_suffix(state, (uint16_t)channel, -1, suffix, sizeof(suffix));
+    sprintf(state->active_channel[0], "MFID90 Active Ch: %04X%s SG: %d; ", channel, suffix, group);
+    state->last_active_time = time(NULL);
+}
+
+static inline void
+p25_set_mfid90_active_channel_update(dsd_state* state, int channel1, int group1, int channel2, int group2) {
+    if (!state) {
+        return;
+    }
+
+    if (channel2 != channel1 && channel2 != 0 && channel2 != 0xFFFF) {
+        char suffix1[32];
+        char suffix2[32];
+        p25_format_chan_suffix(state, (uint16_t)channel1, -1, suffix1, sizeof(suffix1));
+        p25_format_chan_suffix(state, (uint16_t)channel2, -1, suffix2, sizeof(suffix2));
+        sprintf(state->active_channel[0], "MFID90 Active Ch: %04X%s SG: %d; Ch: %04X%s SG: %d; ", channel1, suffix1,
+                group1, channel2, suffix2, group2);
+    } else {
+        p25_set_mfid90_active_channel_single(state, channel1, group1);
+        return;
+    }
+
+    state->last_active_time = time(NULL);
 }
 
 //MAC PDU 3-bit Opcodes BBAC (8.4.1) p 123:
@@ -193,13 +300,7 @@ process_MAC_VPDU(dsd_opts* opts, dsd_state* state, int type, unsigned long long 
 
     //group list mode so we can look and see if we need to block tuning any groups, etc
     char mode[8]; //allow, block, digital, enc, etc
-    sprintf(mode, "%s", "");
-
-    //if we are using allow/whitelist mode, then write 'B' to mode for block
-    //comparison below will look for an 'A' to write to mode if it is allowed
-    if (opts->trunk_use_allow_list == 1) {
-        sprintf(mode, "%s", "B");
-    }
+    p25_mode_init(mode, sizeof(mode), opts);
 
     for (int i = 0; i < 2; i++) {
 
@@ -216,27 +317,9 @@ process_MAC_VPDU(dsd_opts* opts, dsd_state* state, int type, unsigned long long 
             freq = process_channel_to_freq(opts, state, channel);
 
             //add active channel to string for ncurses display
-            char suf_m90a[32];
-            p25_format_chan_suffix(state, (uint16_t)channel, -1, suf_m90a, sizeof suf_m90a);
-            sprintf(state->active_channel[0], "MFID90 Active Ch: %04X%s SG: %d; ", channel, suf_m90a, sgroup);
-            state->last_active_time = time(NULL);
+            p25_set_mfid90_active_channel_single(state, channel, sgroup);
 
-            for (unsigned int gi = 0; gi < state->group_tally; gi++) {
-                if (state->group_array[gi].groupNumber == (unsigned long)sgroup) {
-                    fprintf(stderr, " [%s]", state->group_array[gi].groupName);
-                    strncpy(mode, state->group_array[gi].groupMode, sizeof(mode) - 1);
-                    mode[sizeof(mode) - 1] = '\0';
-                    break;
-                }
-            }
-
-            //TG hold on MFID90 GRG -- block non-matching super group, allow matching group
-            if (state->tg_hold != 0 && state->tg_hold != (uint32_t)sgroup) {
-                sprintf(mode, "%s", "B");
-            }
-            if (state->tg_hold != 0 && state->tg_hold == (uint32_t)sgroup) {
-                sprintf(mode, "%s", "A");
-            }
+            p25_mode_apply_group_policy(state, sgroup, mode, sizeof(mode));
 
             //Skip tuning group calls if group calls are disabled
             if (opts->trunk_tune_group_calls == 0) {
@@ -244,14 +327,13 @@ process_MAC_VPDU(dsd_opts* opts, dsd_state* state, int type, unsigned long long 
             }
 
             //tune if tuning available (centralized)
-            if (opts->p25_trunk == 1 && (strcmp(mode, "DE") != 0) && (strcmp(mode, "B") != 0)) {
+            if (p25_mode_allows_tune(opts, mode)) {
                 if (state->p25_cc_freq != 0 && opts->p25_is_tuned == 0 && freq != 0) {
                     // ENC lockout: these MFID90 GRG grants do not carry SVC bits. When
                     // ENC lockout is enabled, be conservative and avoid tuning unless a
                     // Harris regroup/patch policy explicitly indicates KEY=0000 (clear)
                     // for this TG/SG.
-                    if (opts->trunk_tune_enc_calls == 0 && !p25_patch_tg_key_is_clear(state, sgroup)
-                        && !p25_patch_sg_key_is_clear(state, sgroup)) {
+                    if (p25_mfid90_enc_lockout_blocks(opts, state, sgroup)) {
                         goto SKIPCALL;
                     }
                     p25p2_mac_handle(&mac_res, opts, state, channel, /*svc_bits*/ 0, sgroup, /*src*/ 0);
@@ -259,16 +341,7 @@ process_MAC_VPDU(dsd_opts* opts, dsd_state* state, int type, unsigned long long 
             }
             //if playing back files, and we still want to see what freqs are in use in the ncurses terminal
             //might only want to do these on a grant update, and not a grant by itself?
-            if (opts->p25_trunk == 0) {
-                //P1 FDMA
-                if (DSD_SYNC_IS_P25P1(state->synctype)) {
-                    state->p25_vc_freq[0] = freq;
-                }
-                //P2 TDMA
-                else {
-                    state->p25_vc_freq[0] = state->p25_vc_freq[1] = freq;
-                }
-            }
+            p25_set_playback_vc_freq(opts, state, freq);
         }
 
         //MFID90 Group Regroup Channel Grant - Explicit
@@ -284,27 +357,9 @@ process_MAC_VPDU(dsd_opts* opts, dsd_state* state, int type, unsigned long long 
             freq = process_channel_to_freq(opts, state, channel);
 
             //add active channel to string for ncurses display
-            char suf_m90b[32];
-            p25_format_chan_suffix(state, (uint16_t)channel, -1, suf_m90b, sizeof suf_m90b);
-            sprintf(state->active_channel[0], "MFID90 Active Ch: %04X%s SG: %d; ", channel, suf_m90b, sgroup);
-            state->last_active_time = time(NULL);
+            p25_set_mfid90_active_channel_single(state, channel, sgroup);
 
-            for (unsigned int gi = 0; gi < state->group_tally; gi++) {
-                if (state->group_array[gi].groupNumber == (unsigned long)sgroup) {
-                    fprintf(stderr, " [%s]", state->group_array[gi].groupName);
-                    strncpy(mode, state->group_array[gi].groupMode, sizeof(mode) - 1);
-                    mode[sizeof(mode) - 1] = '\0';
-                    break;
-                }
-            }
-
-            //TG hold on MFID90 GRG -- block non-matching super group, allow matching group
-            if (state->tg_hold != 0 && state->tg_hold != (uint32_t)sgroup) {
-                sprintf(mode, "%s", "B");
-            }
-            if (state->tg_hold != 0 && state->tg_hold == (uint32_t)sgroup) {
-                sprintf(mode, "%s", "A");
-            }
+            p25_mode_apply_group_policy(state, sgroup, mode, sizeof(mode));
 
             //Skip tuning group calls if group calls are disabled
             if (opts->trunk_tune_group_calls == 0) {
@@ -312,11 +367,10 @@ process_MAC_VPDU(dsd_opts* opts, dsd_state* state, int type, unsigned long long 
             }
 
             //tune if tuning available (centralized)
-            if (opts->p25_trunk == 1 && (strcmp(mode, "DE") != 0) && (strcmp(mode, "B") != 0)) {
+            if (p25_mode_allows_tune(opts, mode)) {
                 if (state->p25_cc_freq != 0 && opts->p25_is_tuned == 0 && freq != 0) {
                     // ENC lockout conservative gating for MFID90 GRG without SVC bits
-                    if (opts->trunk_tune_enc_calls == 0 && !p25_patch_tg_key_is_clear(state, sgroup)
-                        && !p25_patch_sg_key_is_clear(state, sgroup)) {
+                    if (p25_mfid90_enc_lockout_blocks(opts, state, sgroup)) {
                         goto SKIPCALL;
                     }
                     p25p2_mac_handle(&mac_res, opts, state, channel, /*svc_bits*/ 0, sgroup, /*src*/ 0);
@@ -326,14 +380,7 @@ process_MAC_VPDU(dsd_opts* opts, dsd_state* state, int type, unsigned long long 
             //might only want to do these on a grant update, and not a grant by itself?
             if (opts->p25_trunk == 0) {
                 if (sgroup == state->lasttg || sgroup == state->lasttgR) {
-                    //P1 FDMA
-                    if (DSD_SYNC_IS_P25P1(state->synctype)) {
-                        state->p25_vc_freq[0] = freq;
-                    }
-                    //P2 TDMA
-                    else {
-                        state->p25_vc_freq[0] = state->p25_vc_freq[1] = freq;
-                    }
+                    p25_set_playback_vc_freq(opts, state, freq);
                 }
             }
         }
@@ -356,19 +403,7 @@ process_MAC_VPDU(dsd_opts* opts, dsd_state* state, int type, unsigned long long 
             }
 
             //add active channel to string for ncurses display
-            if (channel2 != channel1 && channel2 != 0 && channel2 != 0xFFFF) {
-                char suf_m90c1[32];
-                char suf_m90c2[32];
-                p25_format_chan_suffix(state, (uint16_t)channel1, -1, suf_m90c1, sizeof suf_m90c1);
-                p25_format_chan_suffix(state, (uint16_t)channel2, -1, suf_m90c2, sizeof suf_m90c2);
-                sprintf(state->active_channel[0], "MFID90 Active Ch: %04X%s SG: %d; Ch: %04X%s SG: %d; ", channel1,
-                        suf_m90c1, group1, channel2, suf_m90c2, group2);
-            } else {
-                char suf_m90d[32];
-                p25_format_chan_suffix(state, (uint16_t)channel1, -1, suf_m90d, sizeof suf_m90d);
-                sprintf(state->active_channel[0], "MFID90 Active Ch: %04X%s SG: %d; ", channel1, suf_m90d, group1);
-            }
-            state->last_active_time = time(NULL);
+            p25_set_mfid90_active_channel_update(state, channel1, group1, channel2, group2);
 
             //Skip tuning group calls if group calls are disabled
             if (opts->trunk_tune_group_calls == 0) {
@@ -400,29 +435,13 @@ process_MAC_VPDU(dsd_opts* opts, dsd_state* state, int type, unsigned long long 
                     tunable_group = group2;
                 }
 
-                for (unsigned int gi = 0; gi < state->group_tally; gi++) {
-                    if (state->group_array[gi].groupNumber == (unsigned long)tunable_group) {
-                        fprintf(stderr, " [%s]", state->group_array[gi].groupName);
-                        strncpy(mode, state->group_array[gi].groupMode, sizeof(mode) - 1);
-                        mode[sizeof(mode) - 1] = '\0';
-                        break;
-                    }
-                }
-
-                //TG hold on MFID90 GRG -- block non-matching super group, allow matching group
-                if (state->tg_hold != 0 && state->tg_hold != (uint32_t)tunable_group) {
-                    sprintf(mode, "%s", "B");
-                }
-                if (state->tg_hold != 0 && state->tg_hold == (uint32_t)tunable_group) {
-                    sprintf(mode, "%s", "A");
-                }
+                p25_mode_apply_group_policy(state, tunable_group, mode, sizeof(mode));
 
                 //check to see if the group candidate is blocked first
-                if (opts->p25_trunk == 1 && (strcmp(mode, "DE") != 0) && (strcmp(mode, "B") != 0)) {
+                if (p25_mode_allows_tune(opts, mode)) {
                     if (state->p25_cc_freq != 0 && opts->p25_is_tuned == 0 && tunable_freq != 0) {
                         // ENC lockout conservative gating for MFID90 GRG Update without SVC bits
-                        if (opts->trunk_tune_enc_calls == 0 && !p25_patch_tg_key_is_clear(state, tunable_group)
-                            && !p25_patch_sg_key_is_clear(state, tunable_group)) {
+                        if (p25_mfid90_enc_lockout_blocks(opts, state, tunable_group)) {
                             goto SKIPCALL;
                         }
                         p25p2_mac_handle(&mac_res, opts, state, tunable_chan, /*svc_bits*/ 0, tunable_group, /*src*/ 0);
@@ -433,14 +452,7 @@ process_MAC_VPDU(dsd_opts* opts, dsd_state* state, int type, unsigned long long 
                 //might only want to do these on a grant update, and not a grant by itself?
                 if (opts->p25_trunk == 0) {
                     if (tunable_group == state->lasttg || tunable_group == state->lasttgR) {
-                        //P1 FDMA
-                        if (DSD_SYNC_IS_P25P1(state->synctype)) {
-                            state->p25_vc_freq[0] = tunable_freq;
-                        }
-                        //P2 TDMA
-                        else {
-                            state->p25_vc_freq[0] = state->p25_vc_freq[1] = tunable_freq;
-                        }
+                        p25_set_playback_vc_freq(opts, state, tunable_freq);
                     }
                 }
             }
@@ -514,12 +526,7 @@ process_MAC_VPDU(dsd_opts* opts, dsd_state* state, int type, unsigned long long 
             }
 
             //TG hold on GRP_V -- block non-matching group, allow matching group
-            if (state->tg_hold != 0 && state->tg_hold != (uint32_t)group) {
-                sprintf(mode, "%s", "B");
-            }
-            if (state->tg_hold != 0 && state->tg_hold == (uint32_t)group) {
-                sprintf(mode, "%s", "A");
-            }
+            p25_mode_apply_tg_hold(state, group, mode, sizeof(mode));
 
             //Skip tuning group calls if group calls are disabled
             if (opts->trunk_tune_group_calls == 0) {
@@ -535,7 +542,7 @@ process_MAC_VPDU(dsd_opts* opts, dsd_state* state, int type, unsigned long long 
             }
 
             //tune if tuning available (centralized)
-            if (opts->p25_trunk == 1 && (strcmp(mode, "DE") != 0) && (strcmp(mode, "B") != 0)) {
+            if (p25_mode_allows_tune(opts, mode)) {
                 if (state->p25_cc_freq != 0 && opts->p25_is_tuned == 0 && freq != 0) {
                     p25p2_mac_handle(&mac_res, opts, state, channel, svc, group, source);
                 }
@@ -656,7 +663,7 @@ process_MAC_VPDU(dsd_opts* opts, dsd_state* state, int type, unsigned long long 
 
             //TG hold on UU_V -- will want to disable UU_V grants while TG Hold enabled -- same for Telephone?
             if (state->tg_hold != 0 && state->tg_hold != (uint32_t)target) {
-                sprintf(mode, "%s", "B");
+                p25_mode_set(mode, sizeof(mode), "B");
             }
             // if (state->tg_hold != 0 && state->tg_hold == target)
             // {
@@ -665,7 +672,7 @@ process_MAC_VPDU(dsd_opts* opts, dsd_state* state, int type, unsigned long long 
             // }
 
             //tune if tuning available (centralized)
-            if (opts->p25_trunk == 1 && (strcmp(mode, "DE") != 0) && (strcmp(mode, "B") != 0)) {
+            if (p25_mode_allows_tune(opts, mode)) {
                 if (state->p25_cc_freq != 0 && opts->p25_is_tuned == 0 && freq != 0) {
                     p25_sm_on_indiv_grant(opts, state, channel, svc, (int)target, /*src*/ 0);
                 }
@@ -733,7 +740,7 @@ process_MAC_VPDU(dsd_opts* opts, dsd_state* state, int type, unsigned long long 
 
             //TG hold on UU_V -- will want to disable UU_V grants while TG Hold enabled
             if (state->tg_hold != 0 && state->tg_hold != (uint32_t)target) {
-                sprintf(mode, "%s", "B");
+                p25_mode_set(mode, sizeof(mode), "B");
             }
             // if (state->tg_hold != 0 && state->tg_hold == target)
             // {
@@ -742,7 +749,7 @@ process_MAC_VPDU(dsd_opts* opts, dsd_state* state, int type, unsigned long long 
             // }
 
             //tune if tuning available (centralized)
-            if (opts->p25_trunk == 1 && (strcmp(mode, "DE") != 0) && (strcmp(mode, "B") != 0)) {
+            if (p25_mode_allows_tune(opts, mode)) {
                 if (state->p25_cc_freq != 0 && opts->p25_is_tuned == 0 && freq != 0) {
                     // ENC lockout: these UU grants do not carry SVC bits; when enabled,
                     // skip tuning rather than risking an ENC follow.
@@ -919,15 +926,10 @@ process_MAC_VPDU(dsd_opts* opts, dsd_state* state, int type, unsigned long long 
                 }
 
                 //TG hold on GRP_V Multi -- block non-matching group, allow matching group
-                if (state->tg_hold != 0 && state->tg_hold != (uint32_t)tunable_group) {
-                    sprintf(mode, "%s", "B");
-                }
-                if (state->tg_hold != 0 && state->tg_hold == (uint32_t)tunable_group) {
-                    sprintf(mode, "%s", "A");
-                }
+                p25_mode_apply_tg_hold(state, tunable_group, mode, sizeof(mode));
 
                 //tune if tuning available (centralized)
-                if (opts->p25_trunk == 1 && (strcmp(mode, "DE") != 0) && (strcmp(mode, "B") != 0)) {
+                if (p25_mode_allows_tune(opts, mode)) {
                     if (state->p25_cc_freq != 0 && opts->p25_is_tuned == 0 && tunable_freq != 0) {
                         int svc_bits = (j == 0) ? svc1 : svc2;
                         p25p2_mac_handle(&mac_res, opts, state, tunable_chan, svc_bits, tunable_group, /*src*/ 0);
@@ -1122,15 +1124,10 @@ process_MAC_VPDU(dsd_opts* opts, dsd_state* state, int type, unsigned long long 
                 }
 
                 //TG hold on GRP_V Multi -- block non-matching group, allow matching group
-                if (state->tg_hold != 0 && state->tg_hold != (uint32_t)tunable_group) {
-                    sprintf(mode, "%s", "B");
-                }
-                if (state->tg_hold != 0 && state->tg_hold == (uint32_t)tunable_group) {
-                    sprintf(mode, "%s", "A");
-                }
+                p25_mode_apply_tg_hold(state, tunable_group, mode, sizeof(mode));
 
                 //tune if tuning available (centralized)
-                if (opts->p25_trunk == 1 && (strcmp(mode, "DE") != 0) && (strcmp(mode, "B") != 0)) {
+                if (p25_mode_allows_tune(opts, mode)) {
                     if (state->p25_cc_freq != 0 && opts->p25_is_tuned == 0 && tunable_freq != 0) {
                         int svc_bits = (j == 0) ? so1 : ((j == 1) ? so2 : so3);
                         p25p2_mac_handle(&mac_res, opts, state, tunable_chan, svc_bits, tunable_group, /*src*/ 0);
@@ -1225,15 +1222,10 @@ process_MAC_VPDU(dsd_opts* opts, dsd_state* state, int type, unsigned long long 
                 }
 
                 //TG hold on GRP_V Multi -- block non-matching group, allow matching group
-                if (state->tg_hold != 0 && state->tg_hold != (uint32_t)tunable_group) {
-                    sprintf(mode, "%s", "B");
-                }
-                if (state->tg_hold != 0 && state->tg_hold == (uint32_t)tunable_group) {
-                    sprintf(mode, "%s", "A");
-                }
+                p25_mode_apply_tg_hold(state, tunable_group, mode, sizeof(mode));
 
                 //tune if tuning available (centralized)
-                if (opts->p25_trunk == 1 && (strcmp(mode, "DE") != 0) && (strcmp(mode, "B") != 0)) {
+                if (p25_mode_allows_tune(opts, mode)) {
                     if (state->p25_cc_freq != 0 && opts->p25_is_tuned == 0 && tunable_freq != 0) {
                         p25p2_mac_handle(&mac_res, opts, state, tunable_chan, /*svc_bits*/ 0, tunable_group, /*src*/ 0);
                         j = 8; //break loop after first tune
@@ -1320,12 +1312,7 @@ process_MAC_VPDU(dsd_opts* opts, dsd_state* state, int type, unsigned long long 
             }
 
             //TG hold on GRP_V Exp -- block non-matching group, allow matching group
-            if (state->tg_hold != 0 && state->tg_hold != (uint32_t)group) {
-                sprintf(mode, "%s", "B");
-            }
-            if (state->tg_hold != 0 && state->tg_hold == (uint32_t)group) {
-                sprintf(mode, "%s", "A");
-            }
+            p25_mode_apply_tg_hold(state, group, mode, sizeof(mode));
 
             //Skip tuning group calls if group calls are disabled
             if (opts->trunk_tune_group_calls == 0) {
@@ -1341,7 +1328,7 @@ process_MAC_VPDU(dsd_opts* opts, dsd_state* state, int type, unsigned long long 
             }
 
             //tune if tuning available (centralized)
-            if (opts->p25_trunk == 1 && (strcmp(mode, "DE") != 0) && (strcmp(mode, "B") != 0)) {
+            if (p25_mode_allows_tune(opts, mode)) {
                 if (state->p25_cc_freq != 0 && opts->p25_is_tuned == 0 && freq1 != 0) {
                     p25p2_mac_handle(&mac_res, opts, state, channelt, svc, group, /*src*/ 0);
                 }
@@ -1421,11 +1408,11 @@ process_MAC_VPDU(dsd_opts* opts, dsd_state* state, int type, unsigned long long 
 
             //TG hold on UU_V -- will want to disable UU_V grants while TG Hold enabled
             if (state->tg_hold != 0 && state->tg_hold != (uint32_t)target) {
-                sprintf(mode, "%s", "B");
+                p25_mode_set(mode, sizeof(mode), "B");
             }
 
             //tune if tuning available (centralized)
-            if (opts->p25_trunk == 1 && (strcmp(mode, "DE") != 0) && (strcmp(mode, "B") != 0)) {
+            if (p25_mode_allows_tune(opts, mode)) {
                 if (state->p25_cc_freq != 0 && opts->p25_is_tuned == 0 && freq != 0) {
                     // ENC lockout: no SVC bits in this UU data form; be conservative
                     if (opts->trunk_tune_enc_calls == 0) {

@@ -1,14 +1,9 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+﻿// SPDX-License-Identifier: GPL-3.0-or-later
 /*
  * Copyright (C) 2026 by arancormonk <180709949+arancormonk@users.noreply.github.com>
  */
 
-#include <dsd-neo/runtime/cli.h>
-#include <dsd-neo/runtime/config.h>
-#include <dsd-neo/runtime/log.h>
-
-#include <dsd-neo/runtime/colors.h>
-
+#include <ctype.h>
 #include <dsd-neo/core/audio.h>
 #include <dsd-neo/core/csv_import.h>
 #include <dsd-neo/core/file_io.h>
@@ -16,13 +11,23 @@
 #include <dsd-neo/core/state.h>
 #include <dsd-neo/crypto/dmr_keystream.h>
 #include <dsd-neo/platform/posix_compat.h>
-
-#include <ctype.h>
+#include <dsd-neo/runtime/cli.h>
+#include <dsd-neo/runtime/colors.h>
+#include <dsd-neo/runtime/config.h>
+#include <dsd-neo/runtime/decode_mode.h>
+#include <dsd-neo/runtime/log.h>
+#include <dsd-neo/runtime/rdio_export.h>
+#include <errno.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
+
+#include "dsd-neo/core/opts_fwd.h"
+#include "dsd-neo/core/state_fwd.h"
+#include "dsd-neo/platform/platform.h"
 #if defined(__MINGW32__) || defined(__MINGW64__)
 #include <getopt.h>
 #include <unistd.h>
@@ -89,6 +94,26 @@ cli_parse_hex_u64_n(const char* hex, size_t n, unsigned long long* out) {
     return 1;
 }
 
+static int
+cli_parse_decimal_u32(const char* in, unsigned long* out) {
+    if (!in || !out || in[0] == '\0') {
+        return 0;
+    }
+    for (const char* p = in; *p; ++p) {
+        if (!isdigit((unsigned char)*p)) {
+            return 0;
+        }
+    }
+    errno = 0;
+    char* end = NULL;
+    unsigned long v = strtoul(in, &end, 10);
+    if (errno != 0 || !end || *end != '\0') {
+        return 0;
+    }
+    *out = v;
+    return 1;
+}
+
 // Parse long-style options and environment mapping; also supports the
 // one-shot LCN calculator. Short-option parsing has been migrated here
 // to centralize all CLI handling in runtime.
@@ -106,11 +131,53 @@ dsd_parse_args(int argc, char** argv, dsd_opts* opts, dsd_state* state, int* out
     const char* calc_start_cli = NULL;
     const char* input_vol_cli = NULL;
     const char* input_warn_db_cli = NULL;
+    const char* frame_log_cli = NULL;
+    const char* rdio_mode_cli = NULL;
+    const char* rdio_system_id_cli = NULL;
+    const char* rdio_api_url_cli = NULL;
+    const char* rdio_api_key_cli = NULL;
+    const char* rdio_upload_timeout_cli = NULL;
+    const char* rdio_upload_retries_cli = NULL;
+    const char* dmr_baofeng_pc5_cli = NULL;
+    const char* dmr_csi_ee72_cli = NULL;
+    const char* dmr_vertex_ks_csv_cli = NULL;
+    int rtl_udp_control_cli_seen = 0;
+    unsigned long rtl_udp_control_cli_port = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--rtltcp-autotune") == 0) {
             opts->rtltcp_autotune = 1;
             dsd_setenv("DSD_NEO_TCP_AUTOTUNE", "1", 1);
+            continue;
+        }
+        if (strcmp(argv[i], "--rtl-udp-control") == 0) {
+            if (i + 1 >= argc) {
+                LOG_ERROR("--rtl-udp-control requires a port value\n");
+                cli_set_exit_rc(out_exit_rc, 1);
+                return DSD_PARSE_ERROR;
+            }
+            const char* port_arg = argv[i + 1];
+            unsigned long parsed_port = 0;
+            if (!cli_parse_decimal_u32(port_arg, &parsed_port)) {
+                LOG_ERROR("Invalid --rtl-udp-control value \"%s\" (expected decimal port)\n", port_arg);
+                cli_set_exit_rc(out_exit_rc, 1);
+                return DSD_PARSE_ERROR;
+            }
+            rtl_udp_control_cli_seen = 1;
+            rtl_udp_control_cli_port = parsed_port;
+            i++;
+            continue;
+        }
+        if (strncmp(argv[i], "--rtl-udp-control=", 18) == 0) {
+            const char* port_arg = argv[i] + 18;
+            unsigned long parsed_port = 0;
+            if (!cli_parse_decimal_u32(port_arg, &parsed_port)) {
+                LOG_ERROR("Invalid --rtl-udp-control value \"%s\" (expected decimal port)\n", port_arg);
+                cli_set_exit_rc(out_exit_rc, 1);
+                return DSD_PARSE_ERROR;
+            }
+            rtl_udp_control_cli_seen = 1;
+            rtl_udp_control_cli_port = parsed_port;
             continue;
         }
         if (strcmp(argv[i], "--p25-vc-grace") == 0 && i + 1 < argc) {
@@ -240,6 +307,73 @@ dsd_parse_args(int argc, char** argv, dsd_opts* opts, dsd_state* state, int* out
             input_warn_db_cli = argv[++i];
             continue;
         }
+        if (strcmp(argv[i], "--frame-log") == 0 && i + 1 < argc) {
+            frame_log_cli = argv[++i];
+            continue;
+        }
+        if (strcmp(argv[i], "--rdio-mode") == 0 && i + 1 < argc) {
+            rdio_mode_cli = argv[++i];
+            continue;
+        }
+        if (strcmp(argv[i], "--rdio-system-id") == 0 && i + 1 < argc) {
+            rdio_system_id_cli = argv[++i];
+            continue;
+        }
+        if (strcmp(argv[i], "--rdio-api-url") == 0 && i + 1 < argc) {
+            rdio_api_url_cli = argv[++i];
+            continue;
+        }
+        if (strcmp(argv[i], "--rdio-api-key") == 0 && i + 1 < argc) {
+            rdio_api_key_cli = argv[++i];
+            continue;
+        }
+        if (strcmp(argv[i], "--rdio-upload-timeout-ms") == 0 && i + 1 < argc) {
+            rdio_upload_timeout_cli = argv[++i];
+            continue;
+        }
+        if (strcmp(argv[i], "--rdio-upload-retries") == 0 && i + 1 < argc) {
+            rdio_upload_retries_cli = argv[++i];
+            continue;
+        }
+        if (strcmp(argv[i], "--dmr-baofeng-pc5") == 0) {
+            if (i + 1 >= argc) {
+                LOG_ERROR("--dmr-baofeng-pc5 requires a hex key value\n");
+                cli_set_exit_rc(out_exit_rc, 1);
+                return DSD_PARSE_ERROR;
+            }
+            dmr_baofeng_pc5_cli = argv[++i];
+            continue;
+        }
+        if (strncmp(argv[i], "--dmr-baofeng-pc5=", 18) == 0) {
+            dmr_baofeng_pc5_cli = argv[i] + 18;
+            continue;
+        }
+        if (strcmp(argv[i], "--dmr-csi-ee72") == 0) {
+            if (i + 1 >= argc) {
+                LOG_ERROR("--dmr-csi-ee72 requires a hex key value\n");
+                cli_set_exit_rc(out_exit_rc, 1);
+                return DSD_PARSE_ERROR;
+            }
+            dmr_csi_ee72_cli = argv[++i];
+            continue;
+        }
+        if (strncmp(argv[i], "--dmr-csi-ee72=", 15) == 0) {
+            dmr_csi_ee72_cli = argv[i] + 15;
+            continue;
+        }
+        if (strcmp(argv[i], "--dmr-vertex-ks-csv") == 0) {
+            if (i + 1 >= argc) {
+                LOG_ERROR("--dmr-vertex-ks-csv requires a CSV path\n");
+                cli_set_exit_rc(out_exit_rc, 1);
+                return DSD_PARSE_ERROR;
+            }
+            dmr_vertex_ks_csv_cli = argv[++i];
+            continue;
+        }
+        if (strncmp(argv[i], "--dmr-vertex-ks-csv=", 20) == 0) {
+            dmr_vertex_ks_csv_cli = argv[i] + 20;
+            continue;
+        }
         if (strcmp(argv[i], "--auto-ppm-snr") == 0 && i + 1 < argc) {
             const char* sv = argv[++i];
             if (sv && *sv) {
@@ -301,6 +435,16 @@ dsd_parse_args(int argc, char** argv, dsd_opts* opts, dsd_state* state, int* out
         return DSD_PARSE_ONE_SHOT;
     }
 
+    if (rtl_udp_control_cli_seen) {
+        int p = rtl_udp_control_cli_port > 65535UL ? 65535 : (int)rtl_udp_control_cli_port;
+        opts->rtl_udp_port = p;
+        if (p > 0) {
+            LOG_NOTICE("RTL: external UDP retune control enabled on UDP/%d\n", p);
+        } else {
+            LOG_NOTICE("RTL: external UDP retune control disabled\n");
+        }
+    }
+
     // Apply input volume and warn threshold
     if (input_vol_cli) {
         int mv = atoi(input_vol_cli);
@@ -337,13 +481,97 @@ dsd_parse_args(int argc, char** argv, dsd_opts* opts, dsd_state* state, int* out
         LOG_NOTICE("Low input warning threshold (env): %.1f dBFS\n", opts->input_warn_db);
     }
 
+    if (frame_log_cli) {
+        snprintf(opts->frame_log_file, sizeof opts->frame_log_file, "%s", frame_log_cli);
+        opts->frame_log_file[sizeof opts->frame_log_file - 1] = '\0';
+        opts->frame_log_open_error_reported = 0;
+        opts->frame_log_write_error_reported = 0;
+        dsd_frame_log_close(opts);
+        LOG_NOTICE("Frame log file: %s\n", opts->frame_log_file);
+    }
+
+    if (rdio_mode_cli) {
+        int mode = DSD_RDIO_MODE_OFF;
+        if (dsd_rdio_mode_from_string(rdio_mode_cli, &mode) == 0) {
+            opts->rdio_mode = mode;
+            LOG_NOTICE("Rdio export mode: %s\n", dsd_rdio_mode_to_string(opts->rdio_mode));
+        } else {
+            LOG_WARN("Invalid --rdio-mode value \"%s\" (expected off|dirwatch|api|both)\n", rdio_mode_cli);
+        }
+    }
+    if (rdio_system_id_cli) {
+        int sid = atoi(rdio_system_id_cli);
+        if (sid < 0) {
+            sid = 0;
+        }
+        if (sid > 65535) {
+            sid = 65535;
+        }
+        opts->rdio_system_id = sid;
+        LOG_NOTICE("Rdio system ID: %d\n", opts->rdio_system_id);
+    }
+    if (rdio_api_url_cli) {
+        snprintf(opts->rdio_api_url, sizeof opts->rdio_api_url, "%s", rdio_api_url_cli);
+        opts->rdio_api_url[sizeof opts->rdio_api_url - 1] = '\0';
+        LOG_NOTICE("Rdio API URL: %s\n", opts->rdio_api_url);
+    }
+    if (rdio_api_key_cli) {
+        snprintf(opts->rdio_api_key, sizeof opts->rdio_api_key, "%s", rdio_api_key_cli);
+        opts->rdio_api_key[sizeof opts->rdio_api_key - 1] = '\0';
+        LOG_NOTICE("Rdio API key configured\n");
+    }
+    if (rdio_upload_timeout_cli) {
+        int timeout_ms = atoi(rdio_upload_timeout_cli);
+        if (timeout_ms < 100) {
+            timeout_ms = 100;
+        }
+        if (timeout_ms > 120000) {
+            timeout_ms = 120000;
+        }
+        opts->rdio_upload_timeout_ms = timeout_ms;
+        LOG_NOTICE("Rdio upload timeout: %d ms\n", opts->rdio_upload_timeout_ms);
+    }
+    if (rdio_upload_retries_cli) {
+        int retries = atoi(rdio_upload_retries_cli);
+        if (retries < 0) {
+            retries = 0;
+        }
+        if (retries > 10) {
+            retries = 10;
+        }
+        opts->rdio_upload_retries = retries;
+        LOG_NOTICE("Rdio upload retries: %d\n", opts->rdio_upload_retries);
+    }
+
+    if (dmr_baofeng_pc5_cli) {
+        if (baofeng_ap_pc5_keystream_creation(state, dmr_baofeng_pc5_cli) != 0) {
+            LOG_ERROR("Invalid --dmr-baofeng-pc5 value\n");
+            cli_set_exit_rc(out_exit_rc, 1);
+            return DSD_PARSE_ERROR;
+        }
+    }
+    if (dmr_csi_ee72_cli) {
+        if (connect_systems_ee72_key_creation(state, dmr_csi_ee72_cli) != 0) {
+            LOG_ERROR("Invalid --dmr-csi-ee72 value\n");
+            cli_set_exit_rc(out_exit_rc, 1);
+            return DSD_PARSE_ERROR;
+        }
+    }
+    if (dmr_vertex_ks_csv_cli) {
+        if (csvVertexKsImport(state, dmr_vertex_ks_csv_cli) != 0) {
+            LOG_ERROR("Invalid --dmr-vertex-ks-csv value\n");
+            cli_set_exit_rc(out_exit_rc, 1);
+            return DSD_PARSE_ERROR;
+        }
+    }
+
     int new_argc = dsd_cli_compact_args(argc, argv);
     // Reset getopt index and parse short options here (migrated)
     extern int optind;
     // NOTE: We invoke getopt() multiple times (unit tests, bootstrap flows).
-    // glibc requires optind=0 to fully reset internal state; BSD variants use optreset.
+    // Linux getopt supports optind=0 full reset; BSD variants use optreset.
     optind = 1;
-#if defined(__GLIBC__)
+#if defined(__linux__)
     optind = 0;
 #endif
 #if defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__)
@@ -399,7 +627,7 @@ dsd_parse_short_opts(int argc, char** argv, dsd_opts* opts, dsd_state* state, in
                 break;
             case 'j':
                 opts->p25_lcw_retune = 1;
-                LOG_NOTICE("P25: Enable LCW explicit retune (0x44).\n");
+                LOG_NOTICE("P25: LCW explicit retune (0x44) forced ON.\n");
                 break;
             case '^':
                 opts->p25_prefer_candidates = 1;
@@ -826,116 +1054,30 @@ dsd_parse_short_opts(int argc, char** argv, dsd_opts* opts, dsd_state* state, in
                            opts->use_hpf_d);
                 break;
             }
-            case 'f':
+            case 'f': {
                 // Any -f* preset should stop pure analog-monitor mode unless explicitly selecting it.
                 opts->analog_only = 0;
                 opts->monitor_input_audio = 0;
-                if (optarg[0] == 'a') {
-                    opts->frame_dstar = 1;
-                    opts->frame_x2tdma = 1;
-                    opts->frame_p25p1 = 1;
-                    opts->frame_p25p2 = 1;
-                    opts->inverted_p2 = 0;
-                    opts->frame_nxdn48 = 1;
-                    opts->frame_nxdn96 = 1;
-                    opts->frame_dmr = 1;
-                    opts->frame_dpmr = 1;
-                    opts->frame_provoice = 1;
-                    opts->frame_ysf = 1;
-                    opts->frame_m17 = 1;
-                    opts->mod_c4fm = 1;
-                    opts->mod_qpsk = 0;
-                    state->rf_mod = 0;
-                    opts->dmr_stereo = 1;
-                    opts->dmr_mono = 0;
-                    opts->pulse_digi_rate_out = 8000;
-                    opts->pulse_digi_out_channels = 2;
-                    snprintf(opts->output_name, sizeof opts->output_name, "%s", "AUTO");
-                    LOG_NOTICE("Decoding AUTO: all digital modes with multi-rate SPS hunting\n");
-                } else if (optarg[0] == 'A') {
-                    opts->frame_dstar = 0;
-                    opts->frame_x2tdma = 0;
-                    opts->frame_p25p1 = 0;
-                    opts->frame_p25p2 = 0;
-                    opts->frame_nxdn48 = 0;
-                    opts->frame_nxdn96 = 0;
-                    opts->frame_dmr = 0;
-                    opts->frame_dpmr = 0;
-                    opts->frame_provoice = 0;
-                    opts->frame_ysf = 0;
-                    opts->frame_m17 = 0;
-                    opts->pulse_digi_rate_out = 8000;
-                    opts->pulse_digi_out_channels = 1;
-                    opts->dmr_stereo = 0;
-                    state->dmr_stereo = 0;
-                    opts->dmr_mono = 0;
-                    state->rf_mod = 0;
-                    opts->monitor_input_audio = 1;
-                    opts->analog_only = 1;
-                    snprintf(opts->output_name, sizeof opts->output_name, "%s", "Analog Monitor");
-                    LOG_NOTICE("Only Monitoring Passive Analog Signal\n");
-                } else if (optarg[0] == 'd') {
-                    opts->frame_dstar = 1;
-                    opts->frame_x2tdma = 0;
-                    opts->frame_p25p1 = 0;
-                    opts->frame_p25p2 = 0;
-                    opts->frame_nxdn48 = 0;
-                    opts->frame_nxdn96 = 0;
-                    opts->frame_dmr = 0;
-                    opts->frame_dpmr = 0;
-                    opts->frame_provoice = 0;
-                    opts->frame_ysf = 0;
-                    opts->frame_m17 = 0;
-                    opts->pulse_digi_rate_out = 8000;
-                    opts->pulse_digi_out_channels = 1;
-                    opts->dmr_stereo = 0;
-                    state->dmr_stereo = 0;
-                    opts->dmr_mono = 0;
-                    state->rf_mod = 0;
-                    snprintf(opts->output_name, sizeof opts->output_name, "%s", "DSTAR");
-                    LOG_NOTICE("Decoding only DSTAR frames.\n");
-                } else if (optarg[0] == 'x') {
-                    opts->frame_dstar = 0;
-                    opts->frame_x2tdma = 1;
-                    opts->frame_p25p1 = 0;
-                    opts->frame_p25p2 = 0;
-                    opts->frame_nxdn48 = 0;
-                    opts->frame_nxdn96 = 0;
-                    opts->frame_dmr = 0;
-                    opts->frame_dpmr = 0;
-                    opts->frame_provoice = 0;
-                    opts->frame_ysf = 0;
-                    opts->frame_m17 = 0;
-                    opts->pulse_digi_rate_out = 8000;
-                    opts->pulse_digi_out_channels = 2;
-                    opts->dmr_stereo = 0;
-                    opts->dmr_mono = 0;
-                    state->dmr_stereo = 0;
-                    snprintf(opts->output_name, sizeof opts->output_name, "%s", "X2-TDMA");
-                    LOG_NOTICE("Decoding only X2-TDMA frames.\n");
-                } else if (optarg[0] == 't') {
-                    /* TDMA focus: P25 p1+p2 and DMR enabled; others off */
-                    opts->frame_dstar = 0;
-                    opts->frame_x2tdma = 0;
-                    opts->frame_p25p1 = 1;
-                    opts->frame_p25p2 = 1;
-                    opts->inverted_p2 = 0;
-                    opts->frame_nxdn48 = 0;
-                    opts->frame_nxdn96 = 0;
-                    opts->frame_dmr = 1;
-                    opts->frame_dpmr = 0;
-                    opts->frame_provoice = 0;
-                    opts->frame_ysf = 0;
-                    opts->frame_m17 = 0;
-                    opts->mod_c4fm = 1;
-                    opts->mod_qpsk = 0;
-                    opts->mod_gfsk = 0;
-                    state->rf_mod = 0;
-                    opts->dmr_stereo = 1;
-                    opts->dmr_mono = 0;
-                    opts->pulse_digi_rate_out = 8000;
-                    opts->pulse_digi_out_channels = 2;
-                    snprintf(opts->output_name, sizeof opts->output_name, "%s", "TDMA");
+
+                dsdneoUserDecodeMode core_mode = DSDCFG_MODE_UNSET;
+                if (dsd_decode_mode_from_cli_preset(optarg[0], &core_mode) == 0
+                    && dsd_apply_decode_mode_preset(core_mode, DSD_DECODE_PRESET_PROFILE_CLI, opts, state) == 0) {
+                    switch (optarg[0]) {
+                        case 'a': LOG_NOTICE("Decoding AUTO: all digital modes with multi-rate SPS hunting\n"); break;
+                        case 'A': LOG_NOTICE("Only Monitoring Passive Analog Signal\n"); break;
+                        case 'd': LOG_NOTICE("Decoding only DSTAR frames.\n"); break;
+                        case 'x': LOG_NOTICE("Decoding only X2-TDMA frames.\n"); break;
+                        case '1': LOG_NOTICE("Decoding only P25 Phase 1 frames.\n"); break;
+                        case '2': LOG_NOTICE("Decoding only P25 Phase 2 frames.\n"); break;
+                        case 's': LOG_NOTICE("Decoding only DMR frames.\n"); break;
+                        case 'i': LOG_NOTICE("Decoding only NXDN48 frames.\n"); break;
+                        case 'n': LOG_NOTICE("Decoding only NXDN96 frames.\n"); break;
+                        case 'y': LOG_NOTICE("Decoding only YSF frames.\n"); break;
+                        case 'm':
+                            LOG_NOTICE("Decoding only M17 frames (polarity auto-detected from preamble).\n");
+                            break;
+                        default: break;
+                    }
                 } else if (optarg[0] == 'p') {
                     opts->frame_dstar = 0;
                     opts->frame_x2tdma = 0;
@@ -1146,78 +1288,6 @@ dsd_parse_short_opts(int argc, char** argv, dsd_opts* opts, dsd_state* state, in
                                    state->edacs_s_bits);
                     }
                     opts->rtl_dsp_bw_khz = 24;
-                } else if (optarg[0] == '1') {
-                    opts->frame_dstar = 0;
-                    opts->frame_x2tdma = 0;
-                    opts->frame_p25p1 = 1;
-                    opts->frame_p25p2 = 0;
-                    opts->frame_nxdn48 = 0;
-                    opts->frame_nxdn96 = 0;
-                    opts->frame_dmr = 0;
-                    opts->frame_dpmr = 0;
-                    opts->frame_provoice = 0;
-                    opts->frame_ysf = 0;
-                    opts->frame_m17 = 0;
-                    opts->dmr_stereo = 0;
-                    state->dmr_stereo = 0;
-                    opts->mod_c4fm = 1;
-                    opts->mod_qpsk = 0;
-                    opts->mod_gfsk = 0;
-                    state->rf_mod = 0;
-                    opts->dmr_stereo = 0;
-                    opts->dmr_mono = 0;
-                    opts->pulse_digi_rate_out = 8000;
-                    opts->pulse_digi_out_channels = 1;
-                    opts->ssize = 36;
-                    opts->msize = 15;
-                    snprintf(opts->output_name, sizeof opts->output_name, "%s", "P25p1");
-                    LOG_NOTICE("Decoding only P25 Phase 1 frames.\n");
-                } else if (optarg[0] == '2') {
-                    opts->frame_dstar = 0;
-                    opts->frame_x2tdma = 0;
-                    opts->frame_p25p1 = 0;
-                    opts->frame_p25p2 = 1;
-                    opts->frame_nxdn48 = 0;
-                    opts->frame_nxdn96 = 0;
-                    opts->frame_dmr = 0;
-                    opts->frame_dpmr = 0;
-                    opts->frame_provoice = 0;
-                    opts->frame_ysf = 0;
-                    opts->frame_m17 = 0;
-                    state->samplesPerSymbol = 8;
-                    state->symbolCenter = 3;
-                    opts->mod_c4fm = 1;
-                    opts->mod_qpsk = 0;
-                    opts->mod_gfsk = 0;
-                    state->rf_mod = 0;
-                    opts->dmr_stereo = 1;
-                    state->dmr_stereo = 0;
-                    opts->dmr_mono = 0;
-                    snprintf(opts->output_name, sizeof opts->output_name, "%s", "P25p2");
-                    LOG_NOTICE("Decoding only P25 Phase 2 frames.\n");
-                } else if (optarg[0] == 's') {
-                    opts->frame_dstar = 0;
-                    opts->frame_x2tdma = 0;
-                    opts->frame_p25p1 = 0;
-                    opts->frame_p25p2 = 0;
-                    opts->inverted_p2 = 0;
-                    opts->frame_nxdn48 = 0;
-                    opts->frame_nxdn96 = 0;
-                    opts->frame_dmr = 1;
-                    opts->frame_dpmr = 0;
-                    opts->frame_provoice = 0;
-                    opts->frame_ysf = 0;
-                    opts->frame_m17 = 0;
-                    opts->mod_c4fm = 1;
-                    opts->mod_qpsk = 0;
-                    opts->mod_gfsk = 0;
-                    state->rf_mod = 0;
-                    opts->dmr_stereo = 1;
-                    opts->dmr_mono = 0;
-                    opts->pulse_digi_rate_out = 8000;
-                    opts->pulse_digi_out_channels = 2;
-                    snprintf(opts->output_name, sizeof opts->output_name, "%s", "DMR");
-                    LOG_NOTICE("Decoding only DMR frames.\n");
                 } else if (optarg[0] == 'r') {
                     /* Legacy -fr alias: DMR BS/MS simplex with mono audio.
                        Mirrors -fs but prefers mono content while keeping a
@@ -1248,126 +1318,6 @@ dsd_parse_short_opts(int argc, char** argv, dsd_opts* opts, dsd_state* state, in
                     opts->pulse_digi_out_channels = 2;
                     snprintf(opts->output_name, sizeof opts->output_name, "%s", "DMR-Mono");
                     LOG_NOTICE("Decoding DMR (legacy -fr mono mode).\n");
-                } else if (optarg[0] == 'i') {
-                    opts->frame_dstar = 0;
-                    opts->frame_x2tdma = 0;
-                    opts->frame_p25p1 = 0;
-                    opts->frame_p25p2 = 0;
-                    opts->frame_nxdn48 = 1;
-                    opts->frame_nxdn96 = 0;
-                    opts->frame_dmr = 0;
-                    opts->frame_dpmr = 0;
-                    opts->frame_provoice = 0;
-                    opts->frame_ysf = 0;
-                    opts->frame_m17 = 0;
-                    state->samplesPerSymbol = 20;
-                    state->symbolCenter = 9; /* (sps-1)/2 */
-                    opts->mod_c4fm = 1;
-                    opts->mod_qpsk = 0;
-                    opts->mod_gfsk = 0;
-                    state->rf_mod = 0;
-                    opts->pulse_digi_rate_out = 8000;
-                    opts->pulse_digi_out_channels = 1;
-                    opts->dmr_stereo = 0;
-                    state->dmr_stereo = 0;
-                    opts->dmr_mono = 0;
-                    snprintf(opts->output_name, sizeof opts->output_name, "%s", "NXDN48");
-                    LOG_NOTICE("Decoding only NXDN48 frames.\n");
-                } else if (optarg[0] == 'n') {
-                    opts->frame_dstar = 0;
-                    opts->frame_x2tdma = 0;
-                    opts->frame_p25p1 = 0;
-                    opts->frame_p25p2 = 0;
-                    opts->frame_nxdn48 = 0;
-                    opts->frame_nxdn96 = 1;
-                    opts->frame_dmr = 0;
-                    opts->frame_dpmr = 0;
-                    opts->frame_provoice = 0;
-                    opts->frame_ysf = 0;
-                    opts->frame_m17 = 0;
-                    opts->mod_c4fm = 1;
-                    opts->mod_qpsk = 0;
-                    opts->mod_gfsk = 0;
-                    state->rf_mod = 0;
-                    opts->pulse_digi_rate_out = 8000;
-                    opts->pulse_digi_out_channels = 1;
-                    opts->dmr_stereo = 0;
-                    opts->dmr_mono = 0;
-                    state->dmr_stereo = 0;
-                    snprintf(opts->output_name, sizeof opts->output_name, "%s", "NXDN96");
-                    LOG_NOTICE("Decoding only NXDN96 frames.\n");
-                } else if (optarg[0] == 'y') {
-                    opts->frame_dstar = 0;
-                    opts->frame_x2tdma = 0;
-                    opts->frame_p25p1 = 0;
-                    opts->frame_p25p2 = 0;
-                    opts->frame_nxdn48 = 0;
-                    opts->frame_nxdn96 = 0;
-                    opts->frame_dmr = 0;
-                    opts->frame_dpmr = 0;
-                    opts->frame_provoice = 0;
-                    opts->frame_ysf = 1;
-                    opts->frame_m17 = 0;
-                    opts->mod_c4fm = 1;
-                    opts->mod_qpsk = 0;
-                    opts->mod_gfsk = 0;
-                    state->rf_mod = 0;
-                    opts->pulse_digi_rate_out = 8000;
-                    opts->pulse_digi_out_channels = 1;
-                    opts->dmr_stereo = 0;
-                    state->dmr_stereo = 0;
-                    opts->dmr_mono = 0;
-                    snprintf(opts->output_name, sizeof opts->output_name, "%s", "YSF");
-                    LOG_NOTICE("Decoding only YSF frames.\n");
-                } else if (optarg[0] == 'm') {
-                    opts->frame_dstar = 0;
-                    opts->frame_x2tdma = 0;
-                    opts->frame_p25p1 = 0;
-                    opts->frame_p25p2 = 0;
-                    opts->frame_nxdn48 = 0;
-                    opts->frame_nxdn96 = 0;
-                    opts->frame_dmr = 0;
-                    opts->frame_provoice = 0;
-                    opts->frame_dpmr = 0;
-                    opts->frame_ysf = 0;
-                    opts->frame_m17 = 1;
-                    opts->mod_c4fm = 1;
-                    opts->mod_qpsk = 0;
-                    opts->mod_gfsk = 0;
-                    state->rf_mod = 0;
-                    opts->pulse_digi_rate_out = 8000;
-                    opts->pulse_digi_out_channels = 1;
-                    opts->dmr_stereo = 0;
-                    opts->dmr_mono = 0;
-                    state->dmr_stereo = 0;
-                    snprintf(opts->output_name, sizeof opts->output_name, "%s", "M17");
-                    LOG_NOTICE("Decoding only M17 frames (polarity auto-detected from preamble).\n");
-                    opts->use_cosine_filter = 0;
-                } else if (optarg[0] == 'T') {
-                    /* -fT : TETRA-only mode (pi/4-DQPSK, 18 kHz channel) */
-                    opts->frame_dstar = 0;
-                    opts->frame_x2tdma = 0;
-                    opts->frame_p25p1 = 0;
-                    opts->frame_p25p2 = 0;
-                    opts->frame_nxdn48 = 0;
-                    opts->frame_nxdn96 = 0;
-                    opts->frame_dmr = 0;
-                    opts->frame_provoice = 0;
-                    opts->frame_dpmr = 0;
-                    opts->frame_ysf = 0;
-                    opts->frame_m17 = 0;
-                    opts->frame_tetra = 1;
-                    opts->mod_c4fm = 0;
-                    opts->mod_qpsk = 1;
-                    opts->mod_gfsk = 0;
-                    state->rf_mod = 1;
-                    opts->pulse_digi_rate_out = 8000;
-                    opts->pulse_digi_out_channels = 1;
-                    opts->dmr_stereo = 0;
-                    opts->dmr_mono = 0;
-                    state->dmr_stereo = 0;
-                    snprintf(opts->output_name, sizeof opts->output_name, "%s", "TETRA");
-                    LOG_NOTICE("Decoding only TETRA NDB frames (pi/4-DQPSK).\n");
                 } else if (optarg[0] == 'Z') {
                     opts->m17encoder = 1;
                     opts->pulse_digi_rate_out = 48000;
@@ -1395,6 +1345,7 @@ dsd_parse_short_opts(int argc, char** argv, dsd_opts* opts, dsd_state* state, in
                     LOG_NOTICE("Decoding M17 UDP/IP Frames.\n");
                 }
                 break;
+            }
             case 'm':
                 if (optarg[0] == 'a') {
                     opts->mod_c4fm = 1;
@@ -1515,7 +1466,6 @@ dsd_parse_short_opts(int argc, char** argv, dsd_opts* opts, dsd_state* state, in
                 opts->dmr_stereo = 0;
                 state->dmr_stereo = 0;
                 snprintf(opts->output_name, sizeof opts->output_name, "%s", "MBE Playback");
-                state->optind = optind;
                 break;
             case 'l': opts->use_cosine_filter = 0; break;
             case 't':
@@ -1589,6 +1539,10 @@ dsd_parse_short_opts(int argc, char** argv, dsd_opts* opts, dsd_state* state, in
                 cli_set_exit_rc(out_exit_rc, 1);
                 return DSD_PARSE_ERROR;
         }
+    }
+    // Set after getopt completes so -r file ordering is independent of later options.
+    if (opts->playfiles == 1) {
+        state->optind = optind;
     }
     return DSD_PARSE_CONTINUE;
 }

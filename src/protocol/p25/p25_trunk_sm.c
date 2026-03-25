@@ -5,7 +5,6 @@
  * Unified P25 trunking state machine.
  */
 
-#include <dsd-neo/core/constants.h>
 #include <dsd-neo/core/dsd_time.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/state.h>
@@ -21,10 +20,13 @@
 #include <dsd-neo/runtime/rtl_stream_metrics_hooks.h>
 #include <dsd-neo/runtime/trunk_cc_candidates.h>
 #include <dsd-neo/runtime/trunk_tuning_hooks.h>
-
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
+
+#include "dsd-neo/core/opts_fwd.h"
+#include "dsd-neo/core/state_fwd.h"
 
 /* ============================================================================
  * Internal Helpers
@@ -804,7 +806,7 @@ p25_sm_event(p25_sm_ctx_t* ctx, dsd_opts* opts, dsd_state* state, const p25_sm_e
             // Voice sync - update activity timestamp
             if (ctx->state == P25_SM_TUNED) {
                 ctx->t_voice_m = now_monotonic();
-#ifdef USE_RTLSDR
+#ifdef USE_RADIO
                 /* Learn which RTL CQPSK demod chain mode successfully acquired this TDMA VC.
                  * Some P25p2 systems decode better with the legacy FM/QPSK slicer; others
                  * require the OP25-style CQPSK+TED chain. */
@@ -945,7 +947,7 @@ p25_sm_tick_ctx(p25_sm_ctx_t* ctx, dsd_opts* opts, dsd_state* state) {
                 // Never saw voice - check grant timeout
                 if (ctx->t_tune_m > 0.0) {
                     double dt_tune = now_m - ctx->t_tune_m;
-#ifdef USE_RTLSDR
+#ifdef USE_RADIO
                     /* CQPSK fallback for P25p2 TDMA VCs (RTL input only):
                      * If we don't see any voice activity soon after a TDMA grant,
                      * retry once with the opposite CQPSK DSP chain setting. */

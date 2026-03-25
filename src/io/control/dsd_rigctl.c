@@ -14,20 +14,33 @@
 
 #include <dsd-neo/core/constants.h>
 #include <dsd-neo/core/opts.h>
-#include <dsd-neo/core/state.h>
 #include <dsd-neo/io/control.h>
 #include <dsd-neo/io/rigctl_client.h>
+#ifdef USE_RADIO
+#include <dsd-neo/core/state.h>
 #include <dsd-neo/io/rtl_stream_c.h>
+#endif
+#include <dsd-neo/platform/platform.h>
+#include <dsd-neo/platform/posix_compat.h>
 #include <dsd-neo/platform/sockets.h>
 #include <dsd-neo/platform/timing.h>
 #include <dsd-neo/runtime/config.h>
 #include <dsd-neo/runtime/log.h>
-#include <errno.h>
+#if !DSD_PLATFORM_WIN_NATIVE
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <sys/socket.h>
+#endif
 #include <limits.h>
 #include <math.h>
+#include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#include "dsd-neo/core/opts_fwd.h"
+#include "dsd-neo/core/state_fwd.h"
 
 #define BUFSIZE        1024
 #define FREQ_MAX       4096
@@ -154,6 +167,7 @@ GetCurrentFreq(dsd_socket_t sockfd) {
     char buf[BUFSIZE];
     char* ptr;
     char* token;
+    char* saveptr = NULL;
 
     Send(sockfd, "f\n");
     Recv(sockfd, buf);
@@ -162,7 +176,7 @@ GetCurrentFreq(dsd_socket_t sockfd) {
         return freq;
     }
 
-    token = strtok(buf, "\n");
+    token = dsd_strtok_r(buf, "\n", &saveptr);
     freq = strtol(token, &ptr, 10);
     // fprintf (stderr, "\nRIGCTL VFO Freq: [%ld]\n", freq);
     return freq;
@@ -411,6 +425,9 @@ io_control_set_freq(dsd_opts* opts, dsd_state* state, long int freq) {
     if (!opts || freq <= 0) {
         return -1;
     }
+#ifndef USE_RADIO
+    (void)state;
+#endif
 
     LOG_INFO("io_control: tune to %ld Hz\n", freq);
 
@@ -423,7 +440,7 @@ io_control_set_freq(dsd_opts* opts, dsd_state* state, long int freq) {
         }
         SetFreq(opts->rigctl_sockfd, freq);
     } else if (opts->audio_in_type == AUDIO_IN_RTL) {
-#ifdef USE_RTLSDR
+#ifdef USE_RADIO
         if (state && state->rtl_ctx) {
             rtl_stream_tune(state->rtl_ctx, (uint32_t)freq);
         }

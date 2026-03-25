@@ -20,13 +20,14 @@
 #include <dsd-neo/protocol/dmr/dmr_utils_api.h>
 #include <dsd-neo/protocol/nxdn/nxdn_convolution.h>
 #include <dsd-neo/runtime/colors.h>
-
 #include <mbelib.h>
-
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+
+#include "dsd-neo/core/opts_fwd.h"
+#include "dsd-neo/core/state_fwd.h"
 
 /* thx gr-ysf fr_vch_decoder_bb_impl.cc * Copyright 2015 Mathias Weyland */
 // I hold Sylvain Munaut in high esteem for figuring this out.
@@ -994,7 +995,7 @@ processYSF(dsd_opts* opts, dsd_state* state) {
             mbe_processAmbe2450Dataf(state->audio_out_temp_buf, &state->errs, &state->errs2, state->err_str, ambe_d,
                                      state->cur_mp, state->prev_mp, state->prev_mp_enhanced, opts->uvquality);
 
-            if (opts->payload == 1) {
+            if (dsd_frame_detail_enabled(opts)) {
                 PrintAMBEData(opts, state, ambe_d);
             }
 

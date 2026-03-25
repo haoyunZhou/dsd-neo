@@ -8,18 +8,28 @@
 #include <dsd-neo/io/udp_input.h>
 #include <dsd-neo/platform/sockets.h>
 #include <dsd-neo/platform/threading.h>
-#include <dsd-neo/platform/timing.h>
 #include <dsd-neo/runtime/exitflag.h>
-
+#if !DSD_PLATFORM_WIN_NATIVE
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#endif
 #include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 
+#include "dsd-neo/core/opts_fwd.h"
+#include "dsd-neo/platform/platform.h"
+
 static int
 get_bound_port(dsd_socket_t sock) {
     struct sockaddr_in sa;
+#if DSD_PLATFORM_WIN_NATIVE
+    int slen = (int)sizeof(sa);
+#else
     socklen_t slen = (socklen_t)sizeof(sa);
+#endif
     memset(&sa, 0, sizeof(sa));
     if (getsockname(sock, (struct sockaddr*)&sa, &slen) != 0) {
         return -1;
@@ -106,7 +116,7 @@ main(void) {
     int th_started = 0;
     int rs_inited = 0;
 
-    dsd_opts opts;
+    static dsd_opts opts;
     memset(&opts, 0, sizeof(opts));
     opts.wav_sample_rate = 48000;
 

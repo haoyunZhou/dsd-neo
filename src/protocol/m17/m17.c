@@ -14,7 +14,6 @@
  *-----------------------------------------------------------------------------*/
 #include <dsd-neo/core/audio.h>
 #include <dsd-neo/core/audio_filters.h>
-#include <dsd-neo/core/cleanup.h>
 #include <dsd-neo/core/constants.h>
 #include <dsd-neo/core/dibit.h>
 #include <dsd-neo/core/events.h>
@@ -35,22 +34,29 @@
 #include <dsd-neo/runtime/log.h>
 #include <dsd-neo/runtime/m17_udp_hooks.h>
 #include <dsd-neo/runtime/net_audio_input_hooks.h>
-#include <dsd-neo/runtime/rtl_stream_io_hooks.h>
 #include <dsd-neo/runtime/telemetry.h>
 #include <dsd-neo/runtime/udp_audio_hooks.h>
+#ifdef USE_RADIO
+#include <dsd-neo/core/cleanup.h>
+#include <dsd-neo/runtime/rtl_stream_io_hooks.h>
+#endif
+#include <stdbool.h>
+#include <sys/types.h>
+#include <time.h>
 
 #ifdef USE_CODEC2
 #include <codec2/codec2.h>
 #endif
 
 #include <math.h>
-#include <stddef.h>
+#include <sndfile.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#include <sndfile.h>
+#include "dsd-neo/core/opts_fwd.h"
+#include "dsd-neo/core/state_fwd.h"
 
 void decodeM17PKT(dsd_opts* opts, dsd_state* state, uint8_t* input, int len);
 
@@ -2041,7 +2047,7 @@ encodeM17STR(dsd_opts* opts, dsd_state* state) {
 
         else if (opts->audio_in_type == AUDIO_IN_RTL) //RTL
         {
-#ifdef USE_RTLSDR
+#ifdef USE_RADIO
             for (i = 0; i < (int)nsam; i++) {
                 for (j = 0; j < dec; j++) {
                     if (!state->rtl_ctx) {
@@ -3469,29 +3475,10 @@ decodeM17PKT(dsd_opts* opts, dsd_state* state, uint8_t* input, int len) {
     int i;
 
     uint8_t protocol = input[0];
+    const char* protocol_name = m17_packet_protocol_name(protocol);
     fprintf(stderr, " Protocol:");
-    if (protocol == 0x00) {
-        fprintf(stderr, " Raw;");
-    } else if (protocol == 0x01) {
-        fprintf(stderr, " AX.25;");
-    } else if (protocol == 0x02) {
-        fprintf(stderr, " APRS;");
-    } else if (protocol == 0x03) {
-        fprintf(stderr, " 6LoWPAN;");
-    } else if (protocol == 0x04) {
-        fprintf(stderr, " IPv4;");
-    } else if (protocol == 0x05) {
-        fprintf(stderr, " SMS;");
-    } else if (protocol == 0x06) {
-        fprintf(stderr, " Winlink;");
-    } else if (protocol == 0x80) {
-        fprintf(stderr, " Meta Text Data;"); //internal format only from meta
-    } else if (protocol == 0x81) {
-        fprintf(stderr, " Meta GNSS Position Data;"); //internal format only from meta
-    } else if (protocol == 0x82) {
-        fprintf(stderr, " Meta Extended CSD;"); //internal format only from meta
-    } else if (protocol == 0x89) {
-        fprintf(stderr, " 1600 Arbitrary Data;"); //internal format only from 1600
+    if (protocol_name != NULL) {
+        fprintf(stderr, " %s;", protocol_name);
     } else {
         fprintf(stderr, " Res/Unk: %02X;", protocol);
     }

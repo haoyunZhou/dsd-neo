@@ -32,25 +32,27 @@
 #include <dsd-neo/dsp/symbol.h>
 #include <dsd-neo/dsp/sync_calibration.h>
 #include <dsd-neo/dsp/sync_hamming.h>
-#ifdef USE_RTLSDR
+#include <dsd-neo/platform/atomic_compat.h>
+#ifdef USE_RADIO
 #include <dsd-neo/runtime/rtl_stream_metrics_hooks.h>
 #endif
 #include <dsd-neo/core/dsd_time.h>
 #include <dsd-neo/core/synctype_ids.h>
-#include <dsd-neo/platform/atomic_compat.h>
 #include <dsd-neo/runtime/colors.h>
 #include <dsd-neo/runtime/comp.h>
 #include <dsd-neo/runtime/config.h>
 #include <dsd-neo/runtime/exitflag.h>
 #include <dsd-neo/runtime/frame_sync_hooks.h>
 #include <dsd-neo/runtime/telemetry.h>
-
-#include <locale.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+
+#include "dsd-neo/core/opts_fwd.h"
+#include "dsd-neo/core/state_fwd.h"
+#include "dsd-neo/platform/timing.h"
 
 static inline void
 dmr_set_symbol_timing(dsd_opts* opts, dsd_state* state) {
@@ -59,7 +61,7 @@ dmr_set_symbol_timing(dsd_opts* opts, dsd_state* state) {
     }
 
     int demod_rate = 0;
-#ifdef USE_RTLSDR
+#ifdef USE_RADIO
     if (opts->audio_in_type == AUDIO_IN_RTL && state->rtl_ctx) {
         demod_rate = (int)dsd_rtl_stream_metrics_hook_output_rate_hz();
     }
@@ -349,7 +351,7 @@ getFrameSync(dsd_opts* opts, dsd_state* state) {
                    Prefer QPSK when its normalized SNR clearly exceeds C4FM; conversely prefer
                    C4FM only when it exceeds QPSK by a larger margin. Also apply a small
                    stickiness when already in QPSK and SNRs are similar. */
-#ifdef USE_RTLSDR
+#ifdef USE_RADIO
                 do {
                     /* Pull smoothed SNR; fall back to lightweight estimators if needed */
                     double snr_c = dsd_rtl_stream_metrics_hook_snr_c4fm_db();
@@ -507,7 +509,7 @@ getFrameSync(dsd_opts* opts, dsd_state* state) {
         }
 
         //determine dibit state
-#ifdef USE_RTLSDR
+#ifdef USE_RADIO
         /* Debug: print symbol values when DSD_NEO_DEBUG_SYNC=1 */
         {
             static int sym_count = 0;
@@ -548,7 +550,7 @@ getFrameSync(dsd_opts* opts, dsd_state* state) {
          * The CQPSK demod outputs phase values scaled by 4/π, giving symbol levels at ±1, ±3.
          * Using fixed ±2.0 thresholds produces all 4 dibit values needed for P25 sync detection. */
         int cqpsk_4level = 0;
-#ifdef USE_RTLSDR
+#ifdef USE_RADIO
         if (state->rf_mod == 1 && opts->audio_in_type == AUDIO_IN_RTL
             && (opts->frame_p25p1 == 1 || opts->frame_p25p2 == 1)) {
             int dsp_cqpsk = 0, dsp_fll = 0, dsp_ted = 0;
@@ -739,7 +741,7 @@ getFrameSync(dsd_opts* opts, dsd_state* state) {
 
             // Optional SNR-based pre-decode squelch: skip expensive sync search when SNR is low.
             // Falls back to legacy power squelch gating for certain modes.
-#ifdef USE_RTLSDR
+#ifdef USE_RADIO
             {
                 const dsdneoRuntimeConfig* cfg = dsd_neo_get_config();
                 int snr_gate = 0;
@@ -775,7 +777,7 @@ getFrameSync(dsd_opts* opts, dsd_state* state) {
             /* OP25 compatibility: no dibit remapping based on sync pattern.
              * The Costas loop handles phase ambiguity; tuning errors need RF correction. */
             const char* p25_sync_window = synctest;
-#ifdef USE_RTLSDR
+#ifdef USE_RADIO
             /* Debug: print sync pattern when DSD_NEO_DEBUG_SYNC=1 */
             {
                 static int debug_count = 0;
@@ -1013,19 +1015,6 @@ getFrameSync(dsd_opts* opts, dsd_state* state) {
                     return DSD_SYNC_P25P1_NEG;
                 }
             }
-            /* When DMR/dPMR/NXDN are enabled targets, proactively disable FM AGC/limiter which can
-             * distort 2-level/FSK symbol envelopes and elevate early audio errors under marginal SNR.
-             * Also force FLL/TED off for FSK paths — but only when we are actually on the FSK/GFSK path. */
-#ifdef USE_RTLSDR
-            // Automatic DSP toggling disabled by user request.
-            // if ((opts->frame_dmr == 1 || opts->frame_dpmr == 1 || opts->frame_nxdn48 == 1 || opts->frame_nxdn96 == 1)
-            //     && state->rf_mod == 2) { /* 2 = GFSK/FSK family */
-            //     rtl_stream_set_fm_agc(0);
-            //     rtl_stream_set_fm_limiter(0);
-            //     rtl_stream_toggle_fll(0);
-            //     rtl_stream_toggle_ted(0);
-            // }
-#endif
             if (opts->frame_x2tdma == 1) {
                 if ((strcmp(synctest, X2TDMA_BS_DATA_SYNC) == 0) || (strcmp(synctest, X2TDMA_MS_DATA_SYNC) == 0)) {
                     state->carrier = 1;
@@ -2173,7 +2162,7 @@ getFrameSync(dsd_opts* opts, dsd_state* state) {
                             /* Compute SPS from actual demodulator output rate when available (RTL path),
                              * otherwise fall back to WAV interpolator scaling relative to 48 kHz. */
                             int demod_rate = 0;
-#ifdef USE_RTLSDR
+#ifdef USE_RADIO
                             if (opts->audio_in_type == AUDIO_IN_RTL && state->rtl_ctx) {
                                 demod_rate = (int)dsd_rtl_stream_metrics_hook_output_rate_hz();
                             }

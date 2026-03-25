@@ -27,14 +27,16 @@
 #include <dsd-neo/engine/engine.h>
 #include <dsd-neo/protocol/dmr/dmr_const.h>
 #include <dsd-neo/protocol/dstar/dstar_const.h>
-#include <dsd-neo/protocol/nxdn/nxdn_const.h>
 #include <dsd-neo/protocol/p25/p25p1_const.h>
 #include <dsd-neo/protocol/provoice/provoice_const.h>
 #include <dsd-neo/protocol/x2tdma/x2tdma_const.h>
 #include <dsd-neo/runtime/bootstrap.h>
-
+#include <dsd-neo/runtime/exitflag.h>
 #include <stdio.h>
 #include <stdlib.h>
+
+#include "dsd-neo/core/opts_fwd.h"
+#include "dsd-neo/core/state_fwd.h"
 
 int
 main(int argc, char** argv) {
@@ -49,6 +51,12 @@ main(int argc, char** argv) {
 
     initOpts(opts);
     initState(state);
+    if (exitflag != 0) {
+        freeState(state);
+        free(opts);
+        free(state);
+        return 1;
+    }
 
     int exit_rc = 1;
     int bootstrap_rc = dsd_runtime_bootstrap(argc, argv, opts, state, NULL, &exit_rc);

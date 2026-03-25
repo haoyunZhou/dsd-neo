@@ -38,23 +38,27 @@
 #include <dsd-neo/dsp/frame_sync.h>
 #include <dsd-neo/platform/audio.h>
 #include <dsd-neo/platform/file_compat.h>
-#include <dsd-neo/protocol/dmr/dmr_utils_api.h>
 #include <dsd-neo/runtime/colors.h>
 #include <dsd-neo/runtime/exitflag.h>
 #include <dsd-neo/runtime/log.h>
 #include <dsd-neo/runtime/net_audio_input_hooks.h>
 #include <dsd-neo/runtime/rigctl_query_hooks.h>
+#ifdef USE_RADIO
 #include <dsd-neo/runtime/rtl_stream_io_hooks.h>
+#endif
 #include <dsd-neo/runtime/telemetry.h>
 #include <dsd-neo/runtime/trunk_tuning_hooks.h>
 #include <dsd-neo/runtime/udp_audio_hooks.h>
 #include <math.h>
-
+#include <sndfile.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/types.h>
+#include <time.h>
 
-#include <sndfile.h>
+#include "dsd-neo/core/opts_fwd.h"
+#include "dsd-neo/core/state_fwd.h"
 
 unsigned long long int edacs_bch(unsigned long long int message);
 
@@ -241,7 +245,9 @@ edacs_analog(dsd_opts* opts, dsd_state* state, int afs, unsigned char lcn) {
     short analog2[960];
     short analog3[960];
     short sample = 0;
-    float rtl_sample = 0.0f; // For RTL-SDR input (float samples)
+#ifdef USE_RADIO
+    float rtl_sample = 0.0f;
+#endif
 
     // #define DEBUG_ANALOG //enable to digitize analog if 'data' bursts heard
 
@@ -440,10 +446,10 @@ edacs_analog(dsd_opts* opts, dsd_state* state, int afs, unsigned char lcn) {
         }
 
 //RTL Input
-#ifdef USE_RTLSDR
+#ifdef USE_RADIO
         if (opts->audio_in_type == AUDIO_IN_RTL) {
             for (i = 0; i < 960; i++) {
-#ifdef USE_RTLSDR
+#ifdef USE_RADIO
                 if (!state->rtl_ctx) {
                     cleanupAndExit(opts, state);
                     return;
@@ -464,7 +470,7 @@ edacs_analog(dsd_opts* opts, dsd_state* state, int afs, unsigned char lcn) {
             }
 
             for (i = 0; i < 960; i++) {
-#ifdef USE_RTLSDR
+#ifdef USE_RADIO
                 if (!state->rtl_ctx) {
                     cleanupAndExit(opts, state);
                     return;
@@ -485,7 +491,7 @@ edacs_analog(dsd_opts* opts, dsd_state* state, int afs, unsigned char lcn) {
             }
 
             for (i = 0; i < 960; i++) {
-#ifdef USE_RTLSDR
+#ifdef USE_RADIO
                 if (!state->rtl_ctx) {
                     cleanupAndExit(opts, state);
                     return;
@@ -759,7 +765,7 @@ edacs(dsd_opts* opts, dsd_state* state) {
 
     //if we have executed a tune to a channel, then we will forego decoding any more edacs until we return from the voice channel
     //this is a simple quick and dirty solution to fix setting the lastsrc value to something that we don't want in event history
-    if (opts->p25_is_tuned == 1) {
+    if (opts->trunk_is_tuned == 1 || opts->p25_is_tuned == 1) {
         goto EDACS_END;
     }
 
@@ -983,10 +989,12 @@ edacs(dsd_opts* opts, dsd_state* state) {
                         }
 
                         //set trunking cc here so we know where to come back to
-                        if (opts->p25_trunk == 1 && state->trunk_lcn_freq[state->edacs_cc_lcn - 1] != 0) {
+                        if ((opts->trunk_enable == 1 || opts->p25_trunk == 1)
+                            && state->trunk_lcn_freq[state->edacs_cc_lcn - 1] != 0) {
                             state->p25_cc_freq =
                                 state->trunk_lcn_freq[state->edacs_cc_lcn
                                                       - 1]; //index starts at zero, lcn's locally here start at 1
+                            state->trunk_cc_freq = state->p25_cc_freq;
                         }
                     }
                     fprintf(stderr, "%s", KNRM);
@@ -1320,8 +1328,9 @@ edacs(dsd_opts* opts, dsd_state* state) {
                             } //just write to already open temp file to be renamed later
                             else //close the temp 8k wav file and open as 48k
                             {
-                                opts->wav_out_f = close_and_rename_wav_file(
-                                    opts->wav_out_f, opts->wav_out_file, opts->wav_out_dir, &state->event_history_s[0]);
+                                opts->wav_out_f =
+                                    close_and_rename_wav_file(opts->wav_out_f, opts, opts->wav_out_file,
+                                                              opts->wav_out_dir, &state->event_history_s[0]);
                                 opts->wav_out_f = open_wav_file(opts->wav_out_dir, opts->wav_out_file, 48000, 0);
                             }
                         }
@@ -1444,8 +1453,9 @@ edacs(dsd_opts* opts, dsd_state* state) {
                             } //just write to already open temp file to be renamed later
                             else //close the temp 8k wav file and open as 48k
                             {
-                                opts->wav_out_f = close_and_rename_wav_file(
-                                    opts->wav_out_f, opts->wav_out_file, opts->wav_out_dir, &state->event_history_s[0]);
+                                opts->wav_out_f =
+                                    close_and_rename_wav_file(opts->wav_out_f, opts, opts->wav_out_file,
+                                                              opts->wav_out_dir, &state->event_history_s[0]);
                                 opts->wav_out_f = open_wav_file(opts->wav_out_dir, opts->wav_out_file, 48000, 0);
                             }
                         }
@@ -1554,8 +1564,9 @@ edacs(dsd_opts* opts, dsd_state* state) {
                             } //just write to already open temp file to be renamed later
                             else //close the temp 8k wav file and open as 48k
                             {
-                                opts->wav_out_f = close_and_rename_wav_file(
-                                    opts->wav_out_f, opts->wav_out_file, opts->wav_out_dir, &state->event_history_s[0]);
+                                opts->wav_out_f =
+                                    close_and_rename_wav_file(opts->wav_out_f, opts, opts->wav_out_file,
+                                                              opts->wav_out_dir, &state->event_history_s[0]);
                                 opts->wav_out_f = open_wav_file(opts->wav_out_dir, opts->wav_out_file, 48000, 0);
                             }
                         }
@@ -1729,8 +1740,9 @@ edacs(dsd_opts* opts, dsd_state* state) {
                             } //just write to already open temp file to be renamed later
                             else //close the temp 8k wav file and open as 48k
                             {
-                                opts->wav_out_f = close_and_rename_wav_file(
-                                    opts->wav_out_f, opts->wav_out_file, opts->wav_out_dir, &state->event_history_s[0]);
+                                opts->wav_out_f =
+                                    close_and_rename_wav_file(opts->wav_out_f, opts, opts->wav_out_file,
+                                                              opts->wav_out_dir, &state->event_history_s[0]);
                                 opts->wav_out_f = open_wav_file(opts->wav_out_dir, opts->wav_out_file, 48000, 0);
                             }
                         }
@@ -2010,7 +2022,7 @@ edacs(dsd_opts* opts, dsd_state* state) {
                                 else //close the temp 8k wav file and open as 48k
                                 {
                                     opts->wav_out_f =
-                                        close_and_rename_wav_file(opts->wav_out_f, opts->wav_out_file,
+                                        close_and_rename_wav_file(opts->wav_out_f, opts, opts->wav_out_file,
                                                                   opts->wav_out_dir, &state->event_history_s[0]);
                                     opts->wav_out_f = open_wav_file(opts->wav_out_dir, opts->wav_out_file, 48000, 0);
                                 }
@@ -2120,7 +2132,7 @@ edacs(dsd_opts* opts, dsd_state* state) {
                                 else //close the temp 8k wav file and open as 48k
                                 {
                                     opts->wav_out_f =
-                                        close_and_rename_wav_file(opts->wav_out_f, opts->wav_out_file,
+                                        close_and_rename_wav_file(opts->wav_out_f, opts, opts->wav_out_file,
                                                                   opts->wav_out_dir, &state->event_history_s[0]);
                                     opts->wav_out_f = open_wav_file(opts->wav_out_dir, opts->wav_out_file, 48000, 0);
                                 }
@@ -2337,9 +2349,11 @@ edacs(dsd_opts* opts, dsd_state* state) {
                             }
 
                             //Set trunking CC here so we know where to come back to
-                            if (opts->p25_trunk == 1 && state->trunk_lcn_freq[state->edacs_cc_lcn - 1] != 0) {
+                            if ((opts->trunk_enable == 1 || opts->p25_trunk == 1)
+                                && state->trunk_lcn_freq[state->edacs_cc_lcn - 1] != 0) {
                                 //Index starts at zero, LCNs locally here start at 1
                                 state->p25_cc_freq = state->trunk_lcn_freq[state->edacs_cc_lcn - 1];
+                                state->trunk_cc_freq = state->p25_cc_freq;
                             }
                         }
                     }
@@ -2416,7 +2430,7 @@ edacs(dsd_opts* opts, dsd_state* state) {
                                     else //close the temp 8k wav file and open as 48k
                                     {
                                         opts->wav_out_f =
-                                            close_and_rename_wav_file(opts->wav_out_f, opts->wav_out_file,
+                                            close_and_rename_wav_file(opts->wav_out_f, opts, opts->wav_out_file,
                                                                       opts->wav_out_dir, &state->event_history_s[0]);
                                         opts->wav_out_f =
                                             open_wav_file(opts->wav_out_dir, opts->wav_out_file, 48000, 0);
@@ -2533,7 +2547,7 @@ eot_cc(dsd_opts* opts, dsd_state* state) {
     //close and rename wav file here, then open a new one
     if (opts->dmr_stereo_wav == 1) {
         if (opts->wav_out_f != NULL) {
-            opts->wav_out_f = close_and_rename_wav_file(opts->wav_out_f, opts->wav_out_file, opts->wav_out_dir,
+            opts->wav_out_f = close_and_rename_wav_file(opts->wav_out_f, opts, opts->wav_out_file, opts->wav_out_dir,
                                                         &state->event_history_s[0]);
         }
         opts->wav_out_f = open_wav_file(opts->wav_out_dir, opts->wav_out_file, 8000, 0);
@@ -2544,10 +2558,13 @@ eot_cc(dsd_opts* opts, dsd_state* state) {
     state->last_vc_sync_time = now;
 
     //jump back to CC here
-    if (opts->p25_trunk == 1 && state->p25_cc_freq != 0 && opts->p25_is_tuned == 1) {
+    long int cc = (state->trunk_cc_freq != 0) ? state->trunk_cc_freq : state->p25_cc_freq;
+    if ((opts->trunk_enable == 1 || opts->p25_trunk == 1) && cc != 0
+        && (opts->trunk_is_tuned == 1 || opts->p25_is_tuned == 1)) {
         // Use centralized io/control tuning API
-        dsd_trunk_tuning_hook_tune_to_cc(opts, state, state->p25_cc_freq, 0);
+        dsd_trunk_tuning_hook_tune_to_cc(opts, state, cc, 0);
         opts->p25_is_tuned = 0;
+        opts->trunk_is_tuned = 0;
 
         // EDACS-specific state cleanup
         state->lasttg = 0;
@@ -2560,5 +2577,6 @@ eot_cc(dsd_opts* opts, dsd_state* state) {
         snprintf(state->active_channel[0], sizeof state->active_channel[0], "%s", "");
         snprintf(state->active_channel[1], sizeof state->active_channel[1], "%s", "");
         state->p25_vc_freq[0] = state->p25_vc_freq[1] = 0;
+        state->trunk_vc_freq[0] = state->trunk_vc_freq[1] = 0;
     }
 }

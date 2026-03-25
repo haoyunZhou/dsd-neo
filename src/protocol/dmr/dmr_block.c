@@ -26,9 +26,12 @@
 #include <dsd-neo/protocol/pdu.h>
 #include <dsd-neo/runtime/colors.h>
 #include <dsd-neo/runtime/unicode.h>
-
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+
+#include "dsd-neo/core/opts_fwd.h"
+#include "dsd-neo/core/state_fwd.h"
 
 #define DMR_PDU_DECRYPTION //disable to skip attempting to decrypt DMR PDUs
 
@@ -252,6 +255,8 @@ dmr_dheader(dsd_opts* opts, dsd_state* state, uint8_t dheader[], uint8_t dheader
             if (p_mfid == 0x10) {
                 snprintf(mfid_string, sizeof mfid_string, "%s",
                          "Moto"); //could just also be a generic catch all for DMRA
+            } else if (p_mfid == 0x77) {
+                snprintf(mfid_string, sizeof mfid_string, "%s", "Vertex");
             } else if (p_mfid == 0x58) {
                 snprintf(mfid_string, sizeof mfid_string, "%s", "Tait");
             } else if (p_mfid == 0x68 || p_mfid == 0x08) {
@@ -531,7 +536,35 @@ dmr_dheader(dsd_opts* opts, dsd_state* state, uint8_t dheader[], uint8_t dheader
             }
 
             //Start Setting DMR Data Packet Encryption Variables
-            if (p_sap != 1 && p_mfid == 0x10) {
+            if (p_sap != 1 && p_mfid == 0x77) {
+
+                uint8_t key_id = (uint8_t)ConvertBitIntoBytes(&dheader_bits[16], 8);
+                uint32_t mi32 = (uint32_t)ConvertBitIntoBytes(&dheader_bits[48], 32);
+
+                if (state->currentslot == 0) {
+                    state->dmr_so = 0x100;
+                    state->payload_keyid = key_id;
+                    state->payload_algid = 0x07;
+                    state->payload_mi = (unsigned long long int)mi32;
+                } else {
+                    state->dmr_soR = 0x100;
+                    state->payload_keyidR = key_id;
+                    state->payload_algidR = 0x07;
+                    state->payload_miR = (unsigned long long int)mi32;
+                }
+
+                fprintf(stderr, "\n Vertex PDU ENC Header:");
+                fprintf(stderr, " MFID: %02X;", p_mfid);
+                fprintf(stderr, " Key ID: %02X;", key_id);
+                fprintf(stderr, " ALG: 07; VTX STD;");
+                if (mi32 != 0U) {
+                    fprintf(stderr, " MI(32): %08X", mi32);
+                }
+
+                // Vertex data PDUs observed so far do not require MNIS keystream offsetting.
+                state->data_ks_start[slot] = 0;
+
+            } else if (p_sap != 1 && p_mfid == 0x10) {
 
                 //check ENC bit, assuming this is an ENC bit, or SVC OPT like thing (or could be an opcode for the rest of the extended header)
                 if ((uint8_t)ConvertBitIntoBytes(&dheader_bits[20], 4) == 1) {
@@ -1389,8 +1422,12 @@ dmr_block_assembler(dsd_opts* opts, dsd_state* state, uint8_t block_bytes[], uin
                     kid = state->payload_keyidR;
                 }
 
+                if (alg == 0x07) {
+                    fprintf(stderr, " Vertex Std data decrypt not implemented;");
+                }
+
                 char enc_str[200];
-                memset(enc_str, 200, sizeof(enc_str));
+                memset(enc_str, 0, sizeof(enc_str));
                 sprintf(enc_str, "DATA TGT: %lld; SRC: %lld; ENC PDU; ALG: %02X; KID: %02X;",
                         state->dmr_lrrp_source[slot], state->dmr_lrrp_target[slot], alg, kid);
                 sprintf(state->dmr_lrrp_gps[slot], "%s", enc_str);

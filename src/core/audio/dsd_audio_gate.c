@@ -14,10 +14,39 @@
 #include <dsd-neo/core/audio.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/state.h>
-
+#include <dsd-neo/core/synctype_ids.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+
+#include "dsd-neo/core/opts_fwd.h"
+#include "dsd-neo/core/state_fwd.h"
+
+int
+dsd_dmr_voice_alg_can_decrypt(int algid, unsigned long long r_key, int aes_loaded) {
+    switch (algid) {
+        // RC4/DES-style families keyed from 40/56-bit key material.
+        case 0x02: // Hytera Enhanced
+        case 0x21: // DMR RC4
+        case 0x22: // DMR DES
+        case 0x81: // P25 DES
+        case 0x9F: // P25 DES-XL
+        case 0xAA: // P25 RC4
+            return (r_key != 0ULL) ? 1 : 0;
+
+        // AES/TDEA-style families keyed from loaded AES key segments.
+        case 0x24: // DMR AES-128
+        case 0x25: // DMR AES-256
+        case 0x36: // Kirisun Advanced
+        case 0x37: // Kirisun Universal
+        case 0x83: // P25 TDEA
+        case 0x84: // P25 AES-256
+        case 0x89: // P25 AES-128
+            return (aes_loaded == 1) ? 1 : 0;
+
+        default: return 0;
+    }
+}
 
 int
 dsd_p25p2_mixer_gate(const dsd_state* state, int* encL, int* encR) {
@@ -54,8 +83,10 @@ dsd_audio_group_gate_mono(const dsd_opts* opts, const dsd_state* state, unsigned
         }
     }
 
-    // Block if this TG is explicitly on the block list.
-    if (strcmp(mode, "B") == 0) {
+    // Block if this TG is explicitly lockout-tagged in the group list.
+    // "DE" is treated as lockout in trunking policy and should match here
+    // so audio/playback/record gates stay consistent.
+    if (strcmp(mode, "B") == 0 || strcmp(mode, "DE") == 0) {
         enc = 1;
     }
 
@@ -82,4 +113,31 @@ dsd_audio_group_gate_dual(const dsd_opts* opts, const dsd_state* state, unsigned
     rc |= dsd_audio_group_gate_mono(opts, state, tgL, encL_in, encL_out);
     rc |= dsd_audio_group_gate_mono(opts, state, tgR, encR_in, encR_out);
     return rc;
+}
+
+int
+dsd_audio_record_gate_mono(const dsd_opts* opts, const dsd_state* state, int* allow_out) {
+    if (!opts || !state || !allow_out) {
+        return -1;
+    }
+
+    const int slot = (state->currentslot == 1) ? 1 : 0;
+    int allow = 0;
+    if (DSD_SYNC_IS_P25P2(state->synctype)) {
+        allow = (state->p25_p2_audio_allowed[slot] != 0) ? 1 : 0;
+    } else {
+        const int enc = (slot == 1) ? state->dmr_encR : state->dmr_encL;
+        allow = (opts->unmute_encrypted_p25 == 1 || enc == 0) ? 1 : 0;
+    }
+
+    if (allow) {
+        const unsigned long tg = (slot == 1) ? (unsigned long)state->lasttgR : (unsigned long)state->lasttg;
+        int rec_gate = 0;
+        if (dsd_audio_group_gate_mono(opts, state, tg, 0, &rec_gate) == 0 && rec_gate != 0) {
+            allow = 0;
+        }
+    }
+
+    *allow_out = allow;
+    return 0;
 }

@@ -7,8 +7,7 @@
  * P25 protocol display functions for ncurses UI
  */
 
-#include <dsd-neo/ui/ncurses_p25_display.h>
-
+#include <curses.h>
 #include <dsd-neo/core/constants.h>
 #include <dsd-neo/core/dsd_time.h>
 #include <dsd-neo/core/opts.h>
@@ -19,13 +18,16 @@
 #include <dsd-neo/runtime/config.h>
 #include <dsd-neo/runtime/trunk_cc_candidates.h>
 #include <dsd-neo/ui/ncurses_internal.h>
+#include <dsd-neo/ui/ncurses_p25_display.h>
 #include <dsd-neo/ui/ui_prims.h>
-
-#include <dsd-neo/platform/curses_compat.h>
-#include <math.h>
-#include <stdarg.h>
+#include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+
+#include "dsd-neo/core/opts_fwd.h"
+#include "dsd-neo/core/state_fwd.h"
 
 /* Alias for shared last synctype tracking (defined in ncurses_utils.c) */
 #define lls ncurses_last_synctype
@@ -409,16 +411,20 @@ ui_print_p25_metrics(const dsd_opts* opts, const dsd_state* state) {
         if (lfill < 0) {
             lfill = 0;
         }
-        if (lfill > 3) {
-            lfill = 3;
+        if (lfill > DSD_P25_P2_AUDIO_RING_DEPTH) {
+            lfill = DSD_P25_P2_AUDIO_RING_DEPTH;
         }
         if (rfill < 0) {
             rfill = 0;
         }
-        if (rfill > 3) {
-            rfill = 3;
+        if (rfill > DSD_P25_P2_AUDIO_RING_DEPTH) {
+            rfill = DSD_P25_P2_AUDIO_RING_DEPTH;
         }
-        printw("| P2 slot: %s; jitter S1:%d/3 S2:%d/3\n", (act == 0) ? "1" : (act == 1) ? "2" : "-", lfill, rfill);
+        printw("| P2 slot: %s; jitter S1:%d/%d S2:%d/%d\n",
+               (act == 0)   ? "1"
+               : (act == 1) ? "2"
+                            : "-",
+               lfill, DSD_P25_P2_AUDIO_RING_DEPTH, rfill, DSD_P25_P2_AUDIO_RING_DEPTH);
         lines++;
 
         // SM Gate introspection: show the conditions that can hold release

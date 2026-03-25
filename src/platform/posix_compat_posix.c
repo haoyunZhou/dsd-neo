@@ -3,14 +3,29 @@
  * Copyright (C) 2025 by arancormonk <180709949+arancormonk@users.noreply.github.com>
  */
 
+/* Ensure BSD/Darwin extensions (mkdtemp) are declared on macOS. */
+#if defined(__APPLE__) && defined(__MACH__) && !defined(_DARWIN_C_SOURCE)
+#define _DARWIN_C_SOURCE
+#endif
+
 #include <dsd-neo/platform/posix_compat.h>
+#include <sys/types.h>
+
+#include "dsd-neo/platform/platform.h"
 
 #if !DSD_PLATFORM_WIN_NATIVE
 
-#include <errno.h>
 #include <stdlib.h>
 #include <sys/stat.h>
-#include <unistd.h>
+
+#if defined(__APPLE__) && defined(__MACH__)
+/*
+ * Some Apple SDK feature-level combinations still hide mkdtemp from stdlib.h.
+ * Provide the prototype explicitly so strict C99+ builds do not fail with an
+ * implicit declaration.
+ */
+extern char* mkdtemp(char* tmpl);
+#endif
 
 int
 dsd_setenv(const char* name, const char* value, int overwrite) {

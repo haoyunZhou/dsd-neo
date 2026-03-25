@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: ISC
 /*
- * Copyright (C) 2025 by arancormonk <180709949+arancormonk@users.noreply.github.com>
+ * Copyright (C) 2026 by arancormonk <180709949+arancormonk@users.noreply.github.com>
  */
 /*
  * Copyright (C) 2010 DSD Author
@@ -31,20 +31,23 @@
 #include <dsd-neo/core/synctype_ids.h>
 #include <dsd-neo/crypto/aes.h>
 #include <dsd-neo/crypto/des.h>
+#include <dsd-neo/crypto/dmr_keystream.h>
 #include <dsd-neo/crypto/pc4.h>
+#include <dsd-neo/crypto/pc5.h>
 #include <dsd-neo/crypto/rc2.h>
 #include <dsd-neo/crypto/rc4.h>
 #include <dsd-neo/protocol/dmr/dmr_utils_api.h>
 #include <dsd-neo/protocol/nxdn/nxdn_lfsr.h>
 #include <dsd-neo/runtime/exitflag.h>
-
 #include <mbelib.h>
-
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+
+#include "dsd-neo/core/opts_fwd.h"
+#include "dsd-neo/core/state_fwd.h"
 
 //NOTE: This set of functions will be reorganized and simplified (hopefully) or at least
 //a more logical flow will be established to jive with the new audio handling
@@ -97,18 +100,30 @@ playMbeFiles(dsd_opts* opts, dsd_state* state, int argc, char** argv) {
     int i;
     char imbe_d[88];
     char ambe_d[49];
+    char file_err_str[260];
     srand(time(NULL)); //random seed for some file names using random numbers in file name
+
+    // Playback mode: keep static WAV writing functional even when audio output is disabled (-o null).
+    const int want_static_wav = (opts->wav_out_f != NULL && opts->static_wav_file == 1) ? 1 : 0;
 
     for (i = state->optind; i < argc; i++) {
         sprintf(opts->mbe_in_file, "%s", argv[i]);
         openMbeInFile(opts, state);
+        if (opts->mbe_in_f == NULL) {
+            continue;
+        }
         mbe_initMbeParms(state->cur_mp, state->prev_mp, state->prev_mp_enhanced);
         fprintf(stderr, "\n playing %s\n", opts->mbe_in_file);
-        while (feof(opts->mbe_in_f) == 0) {
+        while (opts->mbe_in_f != NULL && feof(opts->mbe_in_f) == 0) {
             if (state->mbe_file_type == 0) {
-                readImbe4400Data(opts, state, imbe_d);
-                mbe_processImbe4400Dataf(state->audio_out_temp_buf, &state->errs, &state->errs2, state->err_str, imbe_d,
+                if (readImbe4400Data(opts, state, imbe_d) != 0) {
+                    break;
+                }
+                file_err_str[0] = '\0';
+                mbe_processImbe4400Dataf(state->audio_out_temp_buf, &state->errs, &state->errs2, file_err_str, imbe_d,
                                          state->cur_mp, state->prev_mp, state->prev_mp_enhanced, opts->uvquality);
+                strncpy(state->err_str, file_err_str, sizeof(state->err_str) - 1);
+                state->err_str[sizeof(state->err_str) - 1] = '\0';
                 if (DSD_SYNC_IS_P25P1(state->synctype)) {
                     int len = state->p25_p1_voice_err_hist_len > 0 ? state->p25_p1_voice_err_hist_len : 50;
                     if (len > (int)sizeof(state->p25_p1_voice_err_hist)) {
@@ -123,18 +138,18 @@ playMbeFiles(dsd_opts* opts, dsd_state* state, int argc, char** argv) {
                     state->p25_p1_voice_err_hist_sum -= old;
                     state->p25_p1_voice_err_hist_pos = (pos + 1) % len;
                 }
-                if (opts->audio_out == 1 && opts->floating_point == 0) {
+                if ((opts->audio_out == 1 || want_static_wav) && opts->floating_point == 0) {
                     processAudio(opts, state);
                 }
 
                 //static wav file only, handled by playSynthesizedVoiceMS
-                //NOTE: if using -o null, playSynthesizedVoiceMS will not write to static wav file
+                //NOTE: Per-call (-P) still writes without event metadata for these legacy frame-only formats.
                 //Per call will work, but will end up with a single file with no meta info
                 if (opts->wav_out_f != NULL && opts->dmr_stereo_wav == 1) {
                     writeSynthesizedVoice(opts, state);
                 }
 
-                if (opts->audio_out == 1 && opts->floating_point == 0) {
+                if ((opts->audio_out == 1 || want_static_wav) && opts->floating_point == 0) {
                     playSynthesizedVoiceMS(opts, state);
                 }
                 if (opts->floating_point == 1) {
@@ -145,7 +160,9 @@ playMbeFiles(dsd_opts* opts, dsd_state* state, int argc, char** argv) {
                 read_sdrtrunk_json_format(opts, state);
             } else if (state->mbe_file_type > 0) //ambe files
             {
-                readAmbe2450Data(opts, state, ambe_d);
+                if (readAmbe2450Data(opts, state, ambe_d) != 0) {
+                    break;
+                }
                 int x;
                 unsigned long long int k;
                 if (state->K != 0) //apply Pr key
@@ -161,29 +178,35 @@ playMbeFiles(dsd_opts* opts, dsd_state* state, int argc, char** argv) {
 
                 //ambe+2
                 if (state->mbe_file_type == 1) {
-                    mbe_processAmbe2450Dataf(state->audio_out_temp_buf, &state->errs, &state->errs2, state->err_str,
+                    file_err_str[0] = '\0';
+                    mbe_processAmbe2450Dataf(state->audio_out_temp_buf, &state->errs, &state->errs2, file_err_str,
                                              ambe_d, state->cur_mp, state->prev_mp, state->prev_mp_enhanced,
                                              opts->uvquality);
+                    strncpy(state->err_str, file_err_str, sizeof(state->err_str) - 1);
+                    state->err_str[sizeof(state->err_str) - 1] = '\0';
                 }
                 //dstar ambe
                 if (state->mbe_file_type == 2) {
-                    mbe_processAmbe2400Dataf(state->audio_out_temp_buf, &state->errs, &state->errs2, state->err_str,
+                    file_err_str[0] = '\0';
+                    mbe_processAmbe2400Dataf(state->audio_out_temp_buf, &state->errs, &state->errs2, file_err_str,
                                              ambe_d, state->cur_mp, state->prev_mp, state->prev_mp_enhanced,
                                              opts->uvquality);
+                    strncpy(state->err_str, file_err_str, sizeof(state->err_str) - 1);
+                    state->err_str[sizeof(state->err_str) - 1] = '\0';
                 }
 
-                if (opts->audio_out == 1 && opts->floating_point == 0) {
+                if ((opts->audio_out == 1 || want_static_wav) && opts->floating_point == 0) {
                     processAudio(opts, state);
                 }
 
                 //static wav file only, handled by playSynthesizedVoiceMS
-                //NOTE: if using -o null, playSynthesizedVoiceMS will not write to static wav file
+                //NOTE: Per-call (-P) still writes without event metadata for these legacy frame-only formats.
                 //Per call will work, but will end up with a single file with no meta info
                 if (opts->wav_out_f != NULL && opts->dmr_stereo_wav == 1) {
                     writeSynthesizedVoice(opts, state);
                 }
 
-                if (opts->audio_out == 1 && opts->floating_point == 0) {
+                if ((opts->audio_out == 1 || want_static_wav) && opts->floating_point == 0) {
                     playSynthesizedVoiceMS(opts, state);
                 }
                 if (opts->floating_point == 1) {
@@ -196,7 +219,10 @@ playMbeFiles(dsd_opts* opts, dsd_state* state, int argc, char** argv) {
                 break;
             }
         }
-        fclose(opts->mbe_in_f); //close file after playing it
+        if (opts->mbe_in_f != NULL) {
+            fclose(opts->mbe_in_f); //close file after playing it
+            opts->mbe_in_f = NULL;
+        }
         if (exitflag == 1) {
             return;
         }
@@ -211,6 +237,8 @@ processMbeFrame(dsd_opts* opts, dsd_state* state, char imbe_fr[8][23], char ambe
     char ambe_d[49];
     unsigned long long int k;
     int x;
+    int vertex_ks_applied_l = 0;
+    int vertex_ks_applied_r = 0;
 
     //these conditions should ensure no clashing with the BP/HBP/Scrambler key loading machanisms already coded in
     if (state->currentslot == 0 && state->payload_algid != 0 && state->payload_algid != 0x80 && state->keyloader == 1) {
@@ -437,7 +465,7 @@ processMbeFrame(dsd_opts* opts, dsd_state* state, char imbe_fr[8][23], char ambe
         }
 
         //mbe_processImbe7200x4400Framef (state->audio_out_temp_buf, &state->errs, &state->errs2, state->err_str, imbe_fr, imbe_d, state->cur_mp, state->prev_mp, state->prev_mp_enhanced, opts->uvquality);
-        if (opts->payload == 1) {
+        if (dsd_frame_detail_enabled(opts)) {
             PrintIMBEData(opts, state, imbe_d);
         }
 
@@ -458,9 +486,11 @@ processMbeFrame(dsd_opts* opts, dsd_state* state, char imbe_fr[8][23], char ambe
         mbe_demodulateImbe7100x4400Data(imbe7100_fr);
         state->errs2 += mbe_eccImbe7100x4400Data(imbe7100_fr, imbe_d);
 
-        if (opts->payload == 1) {
+        if (dsd_frame_detail_enabled(opts)) {
             PrintIMBEData(opts, state, imbe_d);
-            fprintf(stderr, " 7100");
+            if (opts->payload == 1) {
+                fprintf(stderr, " 7100");
+            }
         }
 
         mbe_convertImbe7100to7200(imbe_d);
@@ -487,7 +517,7 @@ processMbeFrame(dsd_opts* opts, dsd_state* state, char imbe_fr[8][23], char ambe
     } else if ((state->synctype == DSD_SYNC_DSTAR_VOICE_POS) || (state->synctype == DSD_SYNC_DSTAR_VOICE_NEG)) {
         mbe_processAmbe3600x2400Framef(state->audio_out_temp_buf, &state->errs, &state->errs2, state->err_str, ambe_fr,
                                        ambe_d, state->cur_mp, state->prev_mp, state->prev_mp_enhanced, opts->uvquality);
-        if (opts->payload == 1) {
+        if (dsd_frame_detail_enabled(opts)) {
             PrintAMBEData(opts, state, ambe_d);
         }
         if (opts->mbe_out_f != NULL) {
@@ -593,7 +623,7 @@ processMbeFrame(dsd_opts* opts, dsd_state* state, char imbe_fr[8][23], char ambe
             state->p25_p2_voice_err_hist_pos[sidx] = (hpos + 1) % len2;
         }
 
-        if (opts->payload == 1) {
+        if (dsd_frame_detail_enabled(opts)) {
             PrintAMBEData(opts, state, ambe_d);
         }
 
@@ -649,57 +679,20 @@ processMbeFrame(dsd_opts* opts, dsd_state* state, char imbe_fr[8][23], char ambe
 
             if ((state->K1 > 0 && state->dmr_so & 0x40 && state->payload_keyid == 0 && state->dmr_fid == 0x68)
                 || (state->K1 > 0 && state->M == 1)) {
+                (void)hytera_bp_apply_frame49(state->K1, state->K2, state->K3, state->K4, &state->DMRvcL, ambe_d);
+            }
 
-                int pos = 0;
-
-                unsigned long long int k1 = state->K1;
-                unsigned long long int k2 = state->K2;
-                unsigned long long int k3 = state->K3;
-                unsigned long long int k4 = state->K4;
-
-                int T_Key[256] = {0};
-                int pN[882] = {0};
-
-                int len = 0;
-
-                if (k2 == 0) {
-                    len = 39;
-                    k1 = k1 << 24;
+            if (state->currentslot == 0 && state->payload_algid == 0x07 && state->straight_ks != 1) {
+                vertex_ks_applied_l = vertex_key_map_apply_frame49(state, 0, state->R, ambe_d);
+                if (vertex_ks_applied_l == 1) {
+                    // Mark this frame as decryptable for short-mix gating paths.
+                    state->dmr_so &= ~0x40U;
                 }
-                if (k2 != 0) {
-                    len = 127;
+                if (vertex_ks_applied_l == 0 && state->vertex_ks_warned[0] == 0) {
+                    fprintf(stderr, "\n DMR Vertex Std voice decrypt needs a mapped keystream (--dmr-vertex-ks-csv) or "
+                                    "manual -S bits:hex[:offset[:step]].");
+                    state->vertex_ks_warned[0] = 1;
                 }
-                if (k4 != 0) {
-                    len = 255;
-                }
-
-                for (i = 0; i < 64; i++) {
-                    T_Key[i] = (((k1 << i) & 0x8000000000000000) >> 63);
-                    T_Key[i + 64] = (((k2 << i) & 0x8000000000000000) >> 63);
-                    T_Key[i + 128] = (((k3 << i) & 0x8000000000000000) >> 63);
-                    T_Key[i + 192] = (((k4 << i) & 0x8000000000000000) >> 63);
-                }
-
-                for (i = 0; i < 882; i++) {
-                    pN[i] = T_Key[pos];
-                    pos++;
-                    if (pos > len) {
-                        pos = 0;
-                    }
-                }
-
-                //sanity check
-                if (state->DMRvcL > 17) //18
-                {
-                    state->DMRvcL = 17; //18
-                }
-
-                pos = state->DMRvcL * 49;
-                for (i = 0; i < 49; i++) {
-                    ambe_d[i] ^= pN[pos];
-                    pos++;
-                }
-                state->DMRvcL++;
             }
 
             //DMR and P25p2 DES-OFB 56 Handling, Slot 1, VCH 0 -- consider moving into the AES handler
@@ -762,7 +755,11 @@ processMbeFrame(dsd_opts* opts, dsd_state* state, char imbe_fr[8][23], char ambe
                 (state->currentslot == 0 && state->payload_algid == 0x89 && state->aes_key_loaded[0] == 1)
                 || //P25 AES128
                 (state->currentslot == 0 && state->payload_algid == 0x84 && state->aes_key_loaded[0] == 1)
-                ||                                                                          //P25 AES256
+                || //P25 AES256
+                (state->currentslot == 0 && state->payload_algid == 0x36 && state->aes_key_loaded[0] == 1)
+                || //Kirisun Advanced
+                (state->currentslot == 0 && state->payload_algid == 0x37 && state->aes_key_loaded[0] == 1)
+                ||                                                                          //Kirisun Universal
                 (state->currentslot == 0 && state->payload_algid == 0x02 && state->R != 0)) //HYT ENHANCED
             {
 
@@ -800,6 +797,14 @@ processMbeFrame(dsd_opts* opts, dsd_state* state, char imbe_fr[8][23], char ambe
                     if (state->payload_algid == 0x02) {
                         n = 0;
                         hytera_enhanced_rc4_setup(opts, state, state->R, state->payload_mi);
+                    }
+                    if (state->payload_algid == 0x36) {
+                        n = 0;
+                        kirisun_adv_keystream_creation(state);
+                    }
+                    if (state->payload_algid == 0x37) {
+                        n = 0;
+                        kirisun_uni_keystream_creation(state);
                     }
 
                     //Load Keystream Octet Bytes directly into keystream array //TODO: Convert to unpack function
@@ -943,6 +948,21 @@ processMbeFrame(dsd_opts* opts, dsd_state* state, char imbe_fr[8][23], char ambe
                 }
             }
 
+            //DMR Baofeng AP, Either Slot (static single key'd forced keystream)
+            if (state->baofeng_ap == 1) {
+
+                short frame1_cipher[49];
+                for (int i = 0; i < 49; i++) {
+                    frame1_cipher[i] = (short)(unsigned char)ambe_d[i];
+                }
+                decrypt_frame_49_pc5(frame1_cipher);
+
+                memset(ambe_d, 0, 49 * sizeof(char));
+                for (int i = 0; i < 49; i++) {
+                    ambe_d[i] = (char)ctxpc5.bits[i];
+                }
+            }
+
             //DMR TYT EP, Either Slot (static single key'd enforced KS)
             if (state->tyt_ep == 1) {
                 for (int i = 0; i < 49; i++) {
@@ -969,16 +989,11 @@ processMbeFrame(dsd_opts* opts, dsd_state* state, char imbe_fr[8][23], char ambe
             }
 
             //Generic Straight Static Keystream
-            if (state->straight_ks == 1) {
+            if (state->straight_ks == 1 && state->straight_mod > 0) {
                 //disable enc identifiers, if present
                 state->dmr_so = 0;
                 state->payload_algid = 0;
-                for (int i = 0; i < 49; i++) {
-                    ambe_d[i] ^= (uint8_t)(state->static_ks_bits[state->currentslot]
-                                                                [(state->static_ks_counter[state->currentslot]++)
-                                                                 % state->straight_mod]
-                                           & 1); //Yikes!
-                }
+                straight_mod_xor_apply_frame49(state, state->currentslot, ambe_d);
             }
 
             mbe_processAmbe2450Dataf(state->audio_out_temp_buf, &state->errs, &state->errs2, state->err_str, ambe_d,
@@ -1001,8 +1016,8 @@ processMbeFrame(dsd_opts* opts, dsd_state* state, char imbe_fr[8][23], char ambe
 
             //old method for this step below
             //mbe_processAmbe3600x2450Framef (state->audio_out_temp_buf, &state->errs, &state->errs2, state->err_str, ambe_fr, ambe_d, state->cur_mp, state->prev_mp, state->prev_mp_enhanced, opts->uvquality);
-            if (opts->payload
-                == 1) // && state->R == 0 this is why slot 1 didn't primt abme, probably had it set during testing
+            if (dsd_frame_detail_enabled(
+                    opts)) // && state->R == 0 this is why slot 1 didn't primt abme, probably had it set during testing
             {
                 PrintAMBEData(opts, state, ambe_d);
             }
@@ -1058,57 +1073,20 @@ processMbeFrame(dsd_opts* opts, dsd_state* state, char imbe_fr[8][23], char ambe
 
             if ((state->K1 > 0 && state->dmr_soR & 0x40 && state->payload_keyidR == 0 && state->dmr_fidR == 0x68)
                 || (state->K1 > 0 && state->M == 1)) {
+                (void)hytera_bp_apply_frame49(state->K1, state->K2, state->K3, state->K4, &state->DMRvcR, ambe_d);
+            }
 
-                int pos = 0;
-
-                unsigned long long int k1 = state->K1;
-                unsigned long long int k2 = state->K2;
-                unsigned long long int k3 = state->K3;
-                unsigned long long int k4 = state->K4;
-
-                int T_Key[256] = {0};
-                int pN[882] = {0};
-
-                int len = 0;
-
-                if (k2 == 0) {
-                    len = 39;
-                    k1 = k1 << 24;
+            if (state->currentslot == 1 && state->payload_algidR == 0x07 && state->straight_ks != 1) {
+                vertex_ks_applied_r = vertex_key_map_apply_frame49(state, 1, state->RR, ambe_d);
+                if (vertex_ks_applied_r == 1) {
+                    // Mark this frame as decryptable for short-mix gating paths.
+                    state->dmr_soR &= ~0x40U;
                 }
-                if (k2 != 0) {
-                    len = 127;
+                if (vertex_ks_applied_r == 0 && state->vertex_ks_warned[1] == 0) {
+                    fprintf(stderr, "\n DMR Vertex Std voice decrypt needs a mapped keystream (--dmr-vertex-ks-csv) or "
+                                    "manual -S bits:hex[:offset[:step]].");
+                    state->vertex_ks_warned[1] = 1;
                 }
-                if (k4 != 0) {
-                    len = 255;
-                }
-
-                for (i = 0; i < 64; i++) {
-                    T_Key[i] = (((k1 << i) & 0x8000000000000000) >> 63);
-                    T_Key[i + 64] = (((k2 << i) & 0x8000000000000000) >> 63);
-                    T_Key[i + 128] = (((k3 << i) & 0x8000000000000000) >> 63);
-                    T_Key[i + 192] = (((k4 << i) & 0x8000000000000000) >> 63);
-                }
-
-                for (i = 0; i < 882; i++) {
-                    pN[i] = T_Key[pos];
-                    pos++;
-                    if (pos > len) {
-                        pos = 0;
-                    }
-                }
-
-                //sanity check
-                if (state->DMRvcR > 17) //18
-                {
-                    state->DMRvcR = 17; //18
-                }
-
-                pos = state->DMRvcR * 49;
-                for (i = 0; i < 49; i++) {
-                    ambe_d[i] ^= pN[pos];
-                    pos++;
-                }
-                state->DMRvcR++;
             }
 
             //DMR and P25p2 DES-OFB 56 Handling, Slot 2, VCH 1 -- Consider moving into AES handler
@@ -1171,7 +1149,11 @@ processMbeFrame(dsd_opts* opts, dsd_state* state, char imbe_fr[8][23], char ambe
                 (state->currentslot == 1 && state->payload_algidR == 0x89 && state->aes_key_loaded[1] == 1)
                 || //P25 AES128
                 (state->currentslot == 1 && state->payload_algidR == 0x84 && state->aes_key_loaded[1] == 1)
-                ||                                                                            //P25 AES256
+                || //P25 AES256
+                (state->currentslot == 1 && state->payload_algidR == 0x36 && state->aes_key_loaded[1] == 1)
+                || //Kirisun Advanced
+                (state->currentslot == 1 && state->payload_algidR == 0x37 && state->aes_key_loaded[1] == 1)
+                ||                                                                            //Kirisun Universal
                 (state->currentslot == 1 && state->payload_algidR == 0x02 && state->RR != 0)) //HYT ENHANCED
             {
 
@@ -1211,6 +1193,14 @@ processMbeFrame(dsd_opts* opts, dsd_state* state, char imbe_fr[8][23], char ambe
                     if (state->payload_algidR == 0x02) {
                         n = 0;
                         hytera_enhanced_rc4_setup(opts, state, state->RR, state->payload_miR);
+                    }
+                    if (state->payload_algidR == 0x36) {
+                        n = 0;
+                        kirisun_adv_keystream_creation(state);
+                    }
+                    if (state->payload_algidR == 0x37) {
+                        n = 0;
+                        kirisun_uni_keystream_creation(state);
                     }
 
                     //Load Keystream Octet Bytes directly into keystream array
@@ -1353,6 +1343,21 @@ processMbeFrame(dsd_opts* opts, dsd_state* state, char imbe_fr[8][23], char ambe
                 }
             }
 
+            //DMR Baofeng AP, Either Slot (static single key'd forced keystream)
+            if (state->baofeng_ap == 1) {
+
+                short frame1_cipher[49];
+                for (int i = 0; i < 49; i++) {
+                    frame1_cipher[i] = (short)(unsigned char)ambe_d[i];
+                }
+                decrypt_frame_49_pc5(frame1_cipher);
+
+                memset(ambe_d, 0, 49 * sizeof(char));
+                for (int i = 0; i < 49; i++) {
+                    ambe_d[i] = (char)ctxpc5.bits[i];
+                }
+            }
+
             //DMR TYT EP, Either Slot (static single key'd enforced KS)
             if (state->tyt_ep == 1) {
                 for (int i = 0; i < 49; i++) {
@@ -1379,16 +1384,11 @@ processMbeFrame(dsd_opts* opts, dsd_state* state, char imbe_fr[8][23], char ambe
             }
 
             //Generic Straight Static Keystream
-            if (state->straight_ks == 1) {
+            if (state->straight_ks == 1 && state->straight_mod > 0) {
                 //disable enc identifiers, if present
                 state->dmr_soR = 0;
                 state->payload_algidR = 0;
-                for (int i = 0; i < 49; i++) {
-                    ambe_d[i] ^= (uint8_t)(state->static_ks_bits[state->currentslot]
-                                                                [(state->static_ks_counter[state->currentslot]++)
-                                                                 % state->straight_mod]
-                                           & 1); //Yikes!
-                }
+                straight_mod_xor_apply_frame49(state, state->currentslot, ambe_d);
             }
 
             mbe_processAmbe2450Dataf(state->audio_out_temp_bufR, &state->errsR, &state->errs2R, state->err_strR, ambe_d,
@@ -1411,7 +1411,7 @@ processMbeFrame(dsd_opts* opts, dsd_state* state, char imbe_fr[8][23], char ambe
 
             //old method for this step below
             //mbe_processAmbe3600x2450Framef (state->audio_out_temp_bufR, &state->errsR, &state->errs2R, state->err_strR, ambe_fr, ambe_d, state->cur_mp2, state->prev_mp2, state->prev_mp_enhanced2, opts->uvquality);
-            if (opts->payload == 1) {
+            if (dsd_frame_detail_enabled(opts)) {
                 PrintAMBEData(opts, state, ambe_d);
             }
 
@@ -1437,8 +1437,13 @@ processMbeFrame(dsd_opts* opts, dsd_state* state, char imbe_fr[8][23], char ambe
             state->dmr_encL = 0;
         }
 
-        //check for available R key
-        if (state->R != 0) {
+        // Unmute only when ALG/key state is known-decryptable.
+        if (state->payload_algid == 0) {
+            if (state->R != 0 || state->K != 0 || state->K1 != 0) {
+                state->dmr_encL = 0;
+            }
+        } else if (dsd_dmr_voice_alg_can_decrypt(state->payload_algid, state->R, state->aes_key_loaded[0])
+                   || (state->payload_algid == 0x07 && vertex_ks_applied_l == 1)) {
             state->dmr_encL = 0;
         }
 
@@ -1447,6 +1452,10 @@ processMbeFrame(dsd_opts* opts, dsd_state* state, char imbe_fr[8][23], char ambe
             if (state->p2_wacn == 0 || state->p2_sysid == 0 || state->p2_cc == 0) {
                 state->dmr_encL = 1;
             }
+        }
+
+        if (state->baofeng_ap == 1 || state->csi_ee == 1) {
+            state->dmr_encL = 0;
         }
 
         if (state->ken_sc == 1) {
@@ -1488,8 +1497,13 @@ processMbeFrame(dsd_opts* opts, dsd_state* state, char imbe_fr[8][23], char ambe
             state->dmr_encR = 0;
         }
 
-        //check for available RR key
-        if (state->RR != 0) {
+        // Unmute only when ALG/key state is known-decryptable.
+        if (state->payload_algidR == 0) {
+            if (state->RR != 0 || state->K != 0 || state->K1 != 0) {
+                state->dmr_encR = 0;
+            }
+        } else if (dsd_dmr_voice_alg_can_decrypt(state->payload_algidR, state->RR, state->aes_key_loaded[1])
+                   || (state->payload_algidR == 0x07 && vertex_ks_applied_r == 1)) {
             state->dmr_encR = 0;
         }
 
@@ -1498,6 +1512,10 @@ processMbeFrame(dsd_opts* opts, dsd_state* state, char imbe_fr[8][23], char ambe
             if (state->p2_wacn == 0 || state->p2_sysid == 0 || state->p2_cc == 0) {
                 state->dmr_encR = 1;
             }
+        }
+
+        if (state->baofeng_ap == 1 || state->csi_ee == 1) {
+            state->dmr_encR = 0;
         }
 
         if (state->ken_sc == 1) {
@@ -1543,7 +1561,8 @@ processMbeFrame(dsd_opts* opts, dsd_state* state, char imbe_fr[8][23], char ambe
         }
         if (allow_other) {
             state->debug_audio_errors += state->errs2;
-            if (opts->audio_out == 1 && opts->floating_point == 0) {
+            if ((opts->audio_out == 1 || (opts->wav_out_f != NULL && opts->static_wav_file == 1))
+                && opts->floating_point == 0) {
                 if (is_p25p2 && state->currentslot == 1) {
                     // Use right-channel processing when current slot is 2
                     processAudioR(opts, state);
@@ -1567,34 +1586,37 @@ processMbeFrame(dsd_opts* opts, dsd_state* state, char imbe_fr[8][23], char ambe
 
     //still need this for any switch that opens a 1 channel output config
     if (opts->static_wav_file == 0) {
-        //if using anything but DMR Stereo, borrowing state->dmr_encL to signal enc or clear for other types
         if (opts->wav_out_f != NULL && opts->dmr_stereo == 0) {
             int allow_wav = 0;
-            int is_p25p2 = DSD_SYNC_IS_P25P2(state->synctype);
-            if (is_p25p2) {
-                allow_wav = (state->p25_p2_audio_allowed[state->currentslot] != 0);
-            } else {
-                allow_wav = (opts->unmute_encrypted_p25 == 1 || state->dmr_encL == 0);
-            }
-            if (allow_wav) {
+            if (dsd_audio_record_gate_mono(opts, state, &allow_wav) == 0 && allow_wav) {
                 writeSynthesizedVoice(opts, state);
             }
         }
     }
 
-    //per call wav file writing for slot 1
+    // Per-call WAV writing for trunked dual-slot modes. Reuse group/TG-hold
+    // gate logic so blocked or non-held TGs are not persisted to disk.
     if (opts->dmr_stereo_wav == 1 && opts->dmr_stereo == 1 && state->currentslot == 0) {
-        if (state->dmr_encL == 0 || opts->dmr_mute_encL == 0) {
-            //write wav to per call on left channel Slot 1
-            writeSynthesizedVoice(opts, state);
+        int allow_rec = (state->dmr_encL == 0 || opts->dmr_mute_encL == 0) ? 1 : 0;
+        if (allow_rec) {
+            int rec_gate = 0;
+            unsigned long tg = (unsigned long)state->lasttg;
+            if (dsd_audio_group_gate_mono(opts, state, tg, 0, &rec_gate) == 0 && rec_gate == 0) {
+                //write wav to per call on left channel Slot 1
+                writeSynthesizedVoice(opts, state);
+            }
         }
     }
 
-    //per call wav file writing for slot 2
     if (opts->dmr_stereo_wav == 1 && opts->dmr_stereo == 1 && state->currentslot == 1) {
-        if (state->dmr_encR == 0 || opts->dmr_mute_encR == 0) {
-            //write wav to per call on right channel Slot 2
-            writeSynthesizedVoiceR(opts, state);
+        int allow_rec = (state->dmr_encR == 0 || opts->dmr_mute_encR == 0) ? 1 : 0;
+        if (allow_rec) {
+            int rec_gate = 0;
+            unsigned long tg = (unsigned long)state->lasttgR;
+            if (dsd_audio_group_gate_mono(opts, state, tg, 0, &rec_gate) == 0 && rec_gate == 0) {
+                //write wav to per call on right channel Slot 2
+                writeSynthesizedVoiceR(opts, state);
+            }
         }
     }
 

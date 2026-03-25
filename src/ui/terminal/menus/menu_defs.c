@@ -11,6 +11,7 @@
 #include <dsd-neo/ui/menu_defs.h>
 
 // All NcMenuItem arrays are declared in menu_items.h
+#include "dsd-neo/ui/menu_core.h"
 #include "menu_items.h"
 
 void
@@ -43,7 +44,7 @@ ui_menu_get_main_items(const NcMenuItem** out_items, size_t* out_n, UiCtx* ctx) 
                                 .label = "DSP Options",
                                 .help = "RTL-SDR DSP toggles and tuning.",
                                 .is_enabled = io_rtl_active,
-#ifdef USE_RTLSDR
+#ifdef USE_RADIO
                                 .submenu = DSP_MENU_ITEMS,
                                 .submenu_len = DSP_MENU_ITEMS_LEN};
 #else

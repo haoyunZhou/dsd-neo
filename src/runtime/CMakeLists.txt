@@ -5,16 +5,21 @@ target_sources(dsd-neo_runtime PRIVATE
   state_ext.c
   config.cpp
   config_user.cpp
+  config_user_loader.cpp
+  config_user_validation.cpp
   config_schema.c
+  decode_mode.c
   config_expand.c
   control_pump.c
   freq_parse.c
+  input_spec.c
   frame_sync_hooks.c
   trunk_tuning_hooks.c
   trunk_cc_candidates.c
   rtl_stream_io_hooks.c
   rtl_stream_metrics_hooks.c
   m17_udp_hooks.c
+  rdio_export.c
   p25_optional_hooks.c
   p25_p2_audio_ring.c
   rigctl_query_hooks.c
@@ -55,6 +60,13 @@ target_include_directories(dsd-neo_runtime
 )
 
 # Link platform abstraction library for threading primitives
-target_link_libraries(dsd-neo_runtime PUBLIC dsd-neo_platform dsd-neo_feature_rtlsdr dsd-neo_feature_colors_logs)
+target_link_libraries(dsd-neo_runtime PUBLIC dsd-neo_platform dsd-neo_feature_radio dsd-neo_feature_rtlsdr
+                                              dsd-neo_feature_colors_logs
+                                              dsd-neo_feature_curl)
 
 target_link_libraries(dsd-neo_runtime PRIVATE dsd-neo_warnings)
+
+install(TARGETS dsd-neo_runtime
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})

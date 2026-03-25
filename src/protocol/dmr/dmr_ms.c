@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: ISC
 /*
- * Copyright (C) 2025 by arancormonk <180709949+arancormonk@users.noreply.github.com>
+ * Copyright (C) 2026 by arancormonk <180709949+arancormonk@users.noreply.github.com>
  */
 
 /*-------------------------------------------------------------------------------
@@ -26,9 +26,12 @@
 #include <dsd-neo/protocol/dmr/dmr_const.h>
 #include <dsd-neo/protocol/dmr/dmr_trunk_sm.h>
 #include <dsd-neo/runtime/telemetry.h>
-
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+
+#include "dsd-neo/core/opts_fwd.h"
+#include "dsd-neo/core/state_fwd.h"
 
 // #define PRINT_AMBE72 //enable to view 72-bit AMBE codewords
 
@@ -279,6 +282,11 @@ dmrMS(dsd_opts* opts, dsd_state* state) {
             tyt16_ambe2_codeword_keystream(state, ambe_fr2, 1);
             tyt16_ambe2_codeword_keystream(state, ambe_fr3, 0);
         }
+        if (state->csi_ee == 1) {
+            csi72_ambe2_codeword_keystream(state, ambe_fr);
+            csi72_ambe2_codeword_keystream(state, ambe_fr2);
+            csi72_ambe2_codeword_keystream(state, ambe_fr3);
+        }
 
 #ifdef PRINT_AMBE72
         ambe2_codeword_print_i(opts, ambe_fr);
@@ -384,6 +392,9 @@ END:
 
     //reset static ks counter
     state->static_ks_counter[0] = 0;
+    state->vertex_ks_counter[0] = 0;
+    state->vertex_ks_active_idx[0] = -1;
+    state->vertex_ks_warned[0] = 0;
 }
 
 //collect buffered 1st half and get 2nd half voice payload and then jump to full MS Voice decoding.
@@ -395,6 +406,9 @@ dmrMSBootstrap(dsd_opts* opts, dsd_state* state) {
 
     //reset static ks counter
     state->static_ks_counter[0] = 0;
+    state->vertex_ks_counter[0] = 0;
+    state->vertex_ks_active_idx[0] = -1;
+    state->vertex_ks_warned[0] = 0;
 
     int i, dibit;
     int* dibit_p;
@@ -570,6 +584,11 @@ dmrMSBootstrap(dsd_opts* opts, dsd_state* state) {
         tyt16_ambe2_codeword_keystream(state, ambe_fr, 0);
         tyt16_ambe2_codeword_keystream(state, ambe_fr2, 1);
         tyt16_ambe2_codeword_keystream(state, ambe_fr3, 0);
+    }
+    if (state->csi_ee == 1) {
+        csi72_ambe2_codeword_keystream(state, ambe_fr);
+        csi72_ambe2_codeword_keystream(state, ambe_fr2);
+        csi72_ambe2_codeword_keystream(state, ambe_fr3);
     }
 
 #ifdef PRINT_AMBE72

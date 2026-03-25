@@ -17,10 +17,13 @@
 #include <dsd-neo/protocol/dmr/dmr_utils_api.h>
 #include <dsd-neo/protocol/p25/p25_lcw.h>
 #include <dsd-neo/runtime/unicode.h>
-
 #include <locale.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+
+#include "dsd-neo/core/opts_fwd.h"
+#include "dsd-neo/core/state_fwd.h"
 
 void apx_embedded_alias_decode(dsd_opts* opts, dsd_state* state, uint8_t slot, int16_t num_bits, uint8_t* input);
 void apx_embedded_alias_dump(dsd_opts* opts, dsd_state* state, uint8_t slot, uint16_t num_bytes, uint8_t* input,
@@ -28,6 +31,32 @@ void apx_embedded_alias_dump(dsd_opts* opts, dsd_state* state, uint8_t slot, uin
 void l3h_embedded_alias_decode(dsd_opts* opts, dsd_state* state, uint8_t slot, int16_t len, uint8_t* input);
 void dmr_talker_alias_lc_decode(dsd_opts* opts, dsd_state* state, uint8_t slot, uint8_t block_num, uint8_t char_size,
                                 uint16_t block_len);
+
+static int g_group_capacity_warned = 0;
+
+static int
+group_array_try_append(dsd_state* state, uint32_t id, const char* mode, const char* name) {
+    if (!state || id == 0 || !mode || !name) {
+        return 0;
+    }
+
+    const size_t group_cap = sizeof(state->group_array) / sizeof(state->group_array[0]);
+    if (state->group_tally >= group_cap) {
+        if (!g_group_capacity_warned) {
+            g_group_capacity_warned = 1;
+            fprintf(stderr, " WARNING: group_array capacity (%zu) reached; skipping additional alias/group inserts.\n",
+                    group_cap);
+        }
+        return 0;
+    }
+
+    const size_t idx = state->group_tally;
+    state->group_array[idx].groupNumber = id;
+    snprintf(state->group_array[idx].groupMode, sizeof(state->group_array[idx].groupMode), "%s", mode);
+    snprintf(state->group_array[idx].groupName, sizeof(state->group_array[idx].groupName), "%s", name);
+    state->group_tally++;
+    return 1;
+}
 
 //Motorola P25 OTA Alias Decoding ripped/demystified from Ilya Smirnov's SDRTrunk Voodoo Code
 uint8_t moto_alias_lut[256] = {
@@ -482,15 +511,8 @@ apx_embedded_alias_dump(dsd_opts* opts, dsd_state* state, uint8_t slot, uint16_t
         }
     }
 
-    if (wr == 0) //not already in there, so save it there now
+    if (wr == 0 && group_array_try_append(state, rid, "D", str)) //not already in there, so save it there now
     {
-        state->group_array[state->group_tally].groupNumber = rid;
-        snprintf(state->group_array[state->group_tally].groupMode,
-                 sizeof state->group_array[state->group_tally].groupMode, "%s", "D");
-        snprintf(state->group_array[state->group_tally].groupName,
-                 sizeof state->group_array[state->group_tally].groupName, "%s", str);
-        state->group_tally++;
-
         //if we have an opened group file, let's write what info we found into it
         if (opts->group_in_file[0] != 0) //file is available
         {
@@ -592,13 +614,8 @@ l3h_embedded_alias_decode(dsd_opts* opts, dsd_state* state, uint8_t slot, int16_
             }
         }
 
-        if (wr == 0) //not already in there, so save it there now
+        if (wr == 0 && group_array_try_append(state, tsrc, "D", str)) //not already in there, so save it there now
         {
-            state->group_array[state->group_tally].groupNumber = tsrc;
-            sprintf(state->group_array[state->group_tally].groupMode, "%s", "D");
-            sprintf(state->group_array[state->group_tally].groupName, "%s", str);
-            state->group_tally++;
-
             //if we have an opened group file, let's write what info we found into it
             if (opts->group_in_file[0] != 0) //file is available
             {
@@ -659,13 +676,9 @@ tait_iso7_embedded_alias_decode(dsd_opts* opts, dsd_state* state, uint8_t slot, 
             }
         }
 
-        if (wr == 0) //not already in there, so save it there now
+        if (wr == 0
+            && group_array_try_append(state, rid, "D", (const char*)alias)) //not already in there, so save it there now
         {
-            state->group_array[state->group_tally].groupNumber = rid;
-            sprintf(state->group_array[state->group_tally].groupMode, "%s", "D");
-            sprintf(state->group_array[state->group_tally].groupName, "%s", alias);
-            state->group_tally++;
-
             //if we have an opened group file, let's write what info we found into it
             if (opts->group_in_file[0] != 0) //file is available
             {

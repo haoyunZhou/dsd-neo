@@ -16,22 +16,7 @@
 #include <atomic>
 #include <cstring>
 
-/* Platform-specific CPU feature detection */
-#if defined(__x86_64__) || defined(_M_X64)
-#if defined(_MSC_VER)
-#include <intrin.h>
-#else
-#include <cpuid.h>
-
-/* Use inline assembly for _xgetbv to avoid target-specific option issues */
-static inline unsigned long long
-dsd_xgetbv(unsigned int xcr) {
-    unsigned int eax, edx;
-    __asm__ __volatile__("xgetbv" : "=a"(eax), "=d"(edx) : "c"(xcr));
-    return ((unsigned long long)edx << 32) | eax;
-}
-#endif
-#endif
+#include "simd_x86_cpu.h"
 
 /* Forward declarations for SIMD specializations (defined in arch-specific TUs) */
 #if defined(__x86_64__) || defined(_M_X64)
@@ -41,6 +26,7 @@ extern "C" int simd_hb_decim2_complex_sse2(const float* in, int in_len, float* o
                                            const float* taps, int taps_len);
 extern "C" int simd_hb_decim2_real_sse2(const float* in, int in_len, float* out, float* hist, const float* taps,
                                         int taps_len);
+#if defined(DSD_NEO_DSP_HAVE_AVX2_IMPL)
 extern "C" void simd_fir_complex_apply_avx2(const float* in, int in_len, float* out, float* hist_i, float* hist_q,
                                             const float* taps, int taps_len);
 extern "C" int simd_hb_decim2_complex_avx2(const float* in, int in_len, float* out, float* hist_i, float* hist_q,
@@ -48,8 +34,9 @@ extern "C" int simd_hb_decim2_complex_avx2(const float* in, int in_len, float* o
 extern "C" int simd_hb_decim2_real_avx2(const float* in, int in_len, float* out, float* hist, const float* taps,
                                         int taps_len);
 #endif
+#endif
 
-#if defined(__aarch64__)
+#if defined(__aarch64__) || defined(__arm64) || defined(_M_ARM64) || defined(_M_ARM64EC)
 extern "C" void simd_fir_complex_apply_neon(const float* in, int in_len, float* out, float* hist_i, float* hist_q,
                                             const float* taps, int taps_len);
 extern "C" int simd_hb_decim2_complex_neon(const float* in, int in_len, float* out, float* hist_i, float* hist_q,
@@ -159,16 +146,16 @@ simd_hb_decim2_complex_scalar(const float* in, int in_len, float* out, float* hi
         return 0;
     }
 
-    int ch_len = in_len >> 1;     /* per-channel samples */
-    int out_ch_len = ch_len >> 1; /* decimated per-channel */
-    if (out_ch_len <= 0) {
+    int ch_len = in_len >> 1; /* per-channel samples */
+    if (ch_len <= 0) {
         return 0;
     }
+    int out_ch_len = ch_len >> 1; /* decimated per-channel */
 
     const int center = (taps_len - 1) >> 1;
     const int left_len = taps_len - 1;
-    float lastI = (ch_len > 0) ? in[in_len - 2] : 0.0f;
-    float lastQ = (ch_len > 0) ? in[in_len - 1] : 0.0f;
+    float lastI = in[in_len - 2];
+    float lastQ = in[in_len - 1];
 
     auto get_iq = [&](int src_idx, float& xi, float& xq) {
         if (src_idx < left_len) {
@@ -225,14 +212,12 @@ simd_hb_decim2_complex_scalar(const float* in, int in_len, float* out, float* hi
             hist_q[k] = in[(rel << 1) + 1];
         }
     } else {
-        for (int k = 0; k < left_len; k++) {
-            if (k < ch_len) {
-                hist_i[k] = in[k << 1];
-                hist_q[k] = in[(k << 1) + 1];
-            } else {
-                hist_i[k] = 0.0f;
-                hist_q[k] = 0.0f;
-            }
+        int keep = left_len - ch_len;
+        std::memmove(hist_i, hist_i + ch_len, (size_t)keep * sizeof(float));
+        std::memmove(hist_q, hist_q + ch_len, (size_t)keep * sizeof(float));
+        for (int k = 0; k < ch_len; k++) {
+            hist_i[keep + k] = in[k << 1];
+            hist_q[keep + k] = in[(k << 1) + 1];
         }
     }
 
@@ -248,15 +233,15 @@ simd_hb_decim2_real_scalar(const float* in, int in_len, float* out, float* hist,
     if (taps_len < 3 || (taps_len & 1) == 0) {
         return 0;
     }
+    if (in_len <= 0) {
+        return 0;
+    }
 
     const int hist_len = taps_len - 1;
     const int center = (taps_len - 1) >> 1;
     int out_len = in_len >> 1;
-    if (out_len <= 0) {
-        return 0;
-    }
 
-    float last = (in_len > 0) ? in[in_len - 1] : 0.0f;
+    float last = in[in_len - 1];
 
     auto get_sample = [&](int src_idx) -> float {
         if (src_idx < hist_len) {
@@ -304,61 +289,6 @@ simd_hb_decim2_real_scalar(const float* in, int in_len, float* out, float* hist,
 }
 
 /* -------------------------------------------------------------------------- */
-/* CPU Feature Detection                                                      */
-/* -------------------------------------------------------------------------- */
-
-#if defined(__x86_64__) || defined(_M_X64)
-
-static bool
-cpu_has_avx2_with_os_support() {
-#if defined(__GNUC__) || defined(__clang__)
-    unsigned int eax, ebx, ecx, edx;
-    if (!__get_cpuid(1, &eax, &ebx, &ecx, &edx)) {
-        return false;
-    }
-    bool osxsave = (ecx & (1u << 27)) != 0;
-    bool avx = (ecx & (1u << 28)) != 0;
-    bool fma = (ecx & (1u << 12)) != 0;
-    if (!osxsave || !avx) {
-        return false;
-    }
-    /* Check OS has enabled YMM state saving via XGETBV */
-    unsigned long long xcr0 = dsd_xgetbv(0);
-    bool ymm_enabled = (xcr0 & 0x6) == 0x6; /* XMM + YMM state enabled */
-    if (!ymm_enabled) {
-        return false;
-    }
-    /* Check AVX2 support in extended features */
-    if (!__get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx)) {
-        return false;
-    }
-    bool has_avx2 = (ebx & (1u << 5)) != 0;
-    return has_avx2 && fma;
-#elif defined(_MSC_VER)
-    int cpuInfo[4];
-    __cpuid(cpuInfo, 1);
-    bool osxsave = (cpuInfo[2] & (1 << 27)) != 0;
-    bool avx = (cpuInfo[2] & (1 << 28)) != 0;
-    bool fma = (cpuInfo[2] & (1 << 12)) != 0;
-    if (!osxsave || !avx) {
-        return false;
-    }
-    unsigned long long xcr0 = _xgetbv(0);
-    bool ymm_enabled = (xcr0 & 0x6) == 0x6;
-    if (!ymm_enabled) {
-        return false;
-    }
-    __cpuidex(cpuInfo, 7, 0);
-    bool has_avx2 = (cpuInfo[1] & (1 << 5)) != 0;
-    return has_avx2 && fma;
-#else
-    return false;
-#endif
-}
-
-#endif /* x86_64 */
-
-/* -------------------------------------------------------------------------- */
 /* Function Pointer Dispatch                                                  */
 /* -------------------------------------------------------------------------- */
 
@@ -387,18 +317,21 @@ simd_fir_init_dispatch() {
 
     /* Perform one-time initialization */
 #if defined(__x86_64__) || defined(_M_X64)
-    if (cpu_has_avx2_with_os_support()) {
+#if defined(DSD_NEO_DSP_HAVE_AVX2_IMPL)
+    if (dsd_neo_cpu_has_avx2_with_os_support()) {
         g_fir_complex_impl = simd_fir_complex_apply_avx2;
         g_hb_decim2_complex_impl = simd_hb_decim2_complex_avx2;
         g_hb_decim2_real_impl = simd_hb_decim2_real_avx2;
         g_impl_name = "avx2";
-    } else {
+    } else
+#endif
+    {
         g_fir_complex_impl = simd_fir_complex_apply_sse2;
         g_hb_decim2_complex_impl = simd_hb_decim2_complex_sse2;
         g_hb_decim2_real_impl = simd_hb_decim2_real_sse2;
         g_impl_name = "sse2";
     }
-#elif defined(__aarch64__)
+#elif defined(__aarch64__) || defined(__arm64) || defined(_M_ARM64) || defined(_M_ARM64EC)
     g_fir_complex_impl = simd_fir_complex_apply_neon;
     g_hb_decim2_complex_impl = simd_hb_decim2_complex_neon;
     g_hb_decim2_real_impl = simd_hb_decim2_real_neon;

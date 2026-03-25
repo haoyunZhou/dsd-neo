@@ -38,20 +38,32 @@
 #include <dsd-neo/runtime/config.h>
 #include <dsd-neo/runtime/control_pump.h>
 #include <dsd-neo/runtime/exitflag.h>
+#include <dsd-neo/runtime/input_spec.h>
 #include <dsd-neo/runtime/log.h>
+#include <dsd-neo/runtime/rdio_export.h>
 #include <dsd-neo/runtime/trunk_cc_candidates.h>
 #include <dsd-neo/ui/ui_async.h>
-
-#include <mbelib.h>
-
 #include <limits.h>
+#include <mbelib.h>
 #include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
-#ifdef USE_RTLSDR
+#include <time.h>
+
+#include "dsd-neo/core/opts_fwd.h"
+#include "dsd-neo/core/state_ext.h"
+#include "dsd-neo/core/state_fwd.h"
+#include "dsd-neo/dsp/p25p1_heuristics.h"
+#include "dsd-neo/platform/sockets.h"
+
+struct CODEC2;
+#ifdef USE_RADIO
 #include <dsd-neo/io/rtl_stream_c.h>
+#endif
+#ifdef USE_RTLSDR
 #include <rtl-sdr.h>
 #endif
 
@@ -62,9 +74,18 @@ void codec2_destroy(struct CODEC2* codec2_state);
 // Local caches to avoid redundant device I/O in hot paths
 static long int s_last_rigctl_freq = -1;
 static int s_last_rigctl_bw = -12345;
-#ifdef USE_RTLSDR
+#ifdef USE_RADIO
 static uint32_t s_last_rtl_freq = 0;
 #endif
+
+static void
+reset_device_io_caches(void) {
+    s_last_rigctl_freq = -1;
+    s_last_rigctl_bw = -12345;
+#ifdef USE_RADIO
+    s_last_rtl_freq = 0;
+#endif
+}
 
 void dsd_engine_frame_sync_hooks_install(void);
 void dsd_engine_trunk_tuning_hooks_install(void);
@@ -176,10 +197,13 @@ open_recording_outputs_if_needed(dsd_opts* opts, dsd_state* state) {
 
 static int
 analog_filter_rate_hz(const dsd_opts* opts, const dsd_state* state) {
+#ifndef USE_RADIO
+    UNUSED(state);
+#endif
     if (!opts) {
         return 48000;
     }
-#ifdef USE_RTLSDR
+#ifdef USE_RADIO
     if (opts->audio_in_type == AUDIO_IN_RTL && state && state->rtl_ctx) {
         uint32_t Fs = rtl_stream_output_rate(state->rtl_ctx);
         if (Fs > 0) {
@@ -514,6 +538,28 @@ dsd_engine_setup_io(dsd_opts* opts, dsd_state* state) {
         opts->audio_in_type = AUDIO_IN_RTL; // use RTL pipeline
     }
 
+    if ((strcmp(opts->audio_in_dev, "soapy") == 0) || (strncmp(opts->audio_in_dev, "soapy:", 6) == 0)) {
+        int tuning_applied = 0;
+        (void)dsd_normalize_soapy_input_spec(opts, &tuning_applied);
+        const char* soapy_args = "";
+        if (strncmp(opts->audio_in_dev, "soapy:", 6) == 0) {
+            soapy_args = opts->audio_in_dev + 6;
+        }
+        LOG_NOTICE("SoapySDR Input");
+        if (soapy_args[0] != '\0') {
+            LOG_NOTICE(": %s\n", soapy_args);
+        } else {
+            LOG_NOTICE(": default device args\n");
+        }
+        if (tuning_applied) {
+            LOG_NOTICE("SoapySDR tuning: Freq=%u Gain=%d PPM=%d DSP-BW=%dkHz SQ=%.1fdB VOL=%d\n",
+                       opts->rtlsdr_center_freq, opts->rtl_gain_value, opts->rtlsdr_ppm_error, opts->rtl_dsp_bw_khz,
+                       pwr_to_dB(opts->rtl_squelch_level), opts->rtl_volume_multiplier);
+        }
+        opts->rtltcp_enabled = 0;
+        opts->audio_in_type = AUDIO_IN_RTL; // reuse radio pipeline
+    }
+
     // NOTE: Guard against matching "rtltcp" here; it shares the "rtl" prefix
     // and opts->audio_in_dev has been tokenized by strtok above. Without this
     // guard, selecting rtltcp would also fall through to the local RTL path
@@ -841,40 +887,41 @@ dsd_engine_parse_m17_userdata(dsd_opts* opts, dsd_state* state) {
 
         LOG_NOTICE("M17 User Data: ");
         char* curr;
+        char* saveptr = NULL;
 
         // if((strncmp(state->m17dat, "M17", 3) == 0))
         // goto M17END;
 
-        curr = strtok(state->m17dat, ":"); //should be 'M17'
+        curr = dsd_strtok_r(state->m17dat, ":", &saveptr); //should be 'M17'
         if (curr != NULL)
             ; //continue
         else {
             goto M17END; //end early with preset values
         }
 
-        curr = strtok(NULL, ":"); //m17 channel access number
+        curr = dsd_strtok_r(NULL, ":", &saveptr); //m17 channel access number
         if (curr != NULL) {
             state->m17_can_en = atoi(curr);
         }
 
-        curr = strtok(NULL, ":"); //m17 src address
+        curr = dsd_strtok_r(NULL, ":", &saveptr); //m17 src address
         if (curr != NULL) {
             strncpy(state->str50c, curr, 9); //only read first 9
             state->str50c[9] = '\0';
         }
 
-        curr = strtok(NULL, ":"); //m17 dst address
+        curr = dsd_strtok_r(NULL, ":", &saveptr); //m17 dst address
         if (curr != NULL) {
             strncpy(state->str50b, curr, 9); //only read first 9
             state->str50b[9] = '\0';
         }
 
-        curr = strtok(NULL, ":"); //m17 input audio rate
+        curr = dsd_strtok_r(NULL, ":", &saveptr); //m17 input audio rate
         if (curr != NULL) {
             state->m17_rate = atoi(curr);
         }
 
-        curr = strtok(NULL, ":"); //m17 vox enable
+        curr = dsd_strtok_r(NULL, ":", &saveptr); //m17 vox enable
         if (curr != NULL) {
             state->m17_vox = atoi(curr);
         }
@@ -956,7 +1003,7 @@ noCarrier(dsd_opts* opts, dsd_state* state) {
             }
             //rtl
             if (opts->audio_in_type == AUDIO_IN_RTL) {
-#ifdef USE_RTLSDR
+#ifdef USE_RADIO
                 if (state->rtl_ctx) {
                     uint32_t rf = (uint32_t)state->trunk_lcn_freq[state->lcn_freq_roll];
                     if (rf != s_last_rtl_freq) {
@@ -973,23 +1020,14 @@ noCarrier(dsd_opts* opts, dsd_state* state) {
     //end experimental conventional frequency scanner mode
 
     // Tune back to last known CC when using trunking after hangtime expires.
-    // Use VC activity when currently tuned to a VC; otherwise use CC timer.
-    if (opts->p25_trunk == 1 && (opts->trunk_is_tuned == 1 || opts->p25_is_tuned == 1)) {
+    // trunk_is_tuned/p25_is_tuned both represent a VC-follow state.
+    if ((opts->trunk_enable == 1 || opts->p25_trunk == 1) && (opts->trunk_is_tuned == 1 || opts->p25_is_tuned == 1)) {
         double dt;
-        if (opts->p25_is_tuned == 1) {
-            // On a voice channel: gate return by recent voice activity
-            if (state->last_vc_sync_time == 0) {
-                dt = 1e9; // no activity recorded; treat as expired
-            } else {
-                dt = (double)(now - state->last_vc_sync_time);
-            }
+        // On a voice channel: gate return by recent voice activity
+        if (state->last_vc_sync_time == 0) {
+            dt = 1e9; // no activity recorded; treat as expired
         } else {
-            // On control or idle: use CC timer
-            if (state->last_cc_sync_time == 0) {
-                dt = 1e9;
-            } else {
-                dt = (double)(now - state->last_cc_sync_time);
-            }
+            dt = (double)(now - state->last_vc_sync_time);
         }
 
         if (dt > opts->trunk_hangtime) {
@@ -1019,7 +1057,7 @@ noCarrier(dsd_opts* opts, dsd_state* state) {
                 }
                 //rtl
                 else if (opts->audio_in_type == AUDIO_IN_RTL) {
-#ifdef USE_RTLSDR
+#ifdef USE_RADIO
                     if (state->rtl_ctx) {
                         uint32_t rf = (uint32_t)cc;
                         if (rf != s_last_rtl_freq) {
@@ -1032,6 +1070,7 @@ noCarrier(dsd_opts* opts, dsd_state* state) {
                 }
 
                 opts->p25_is_tuned = 0;
+                opts->trunk_is_tuned = 0;
                 state->edacs_tuned_lcn = -1;
 
                 state->last_cc_sync_time = now;
@@ -1264,6 +1303,9 @@ noCarrier(dsd_opts* opts, dsd_state* state) {
     memset(state->nxdn_sacch_frame_segment, 1, sizeof(state->nxdn_sacch_frame_segment));
     state->nxdn_alias_block_number = 0;
     memset(state->nxdn_alias_block_segment, 0, sizeof(state->nxdn_alias_block_segment));
+    state->nxdn_alias_arib_total_segments = 0;
+    state->nxdn_alias_arib_seen_mask = 0;
+    memset(state->nxdn_alias_arib_segments, 0, sizeof(state->nxdn_alias_arib_segments));
     state->nxdn_call_type[0] = '\0';
 
     //unload keys when using keylaoder
@@ -1473,15 +1515,15 @@ liveScanner(dsd_opts* opts, dsd_state* state) {
         state->aout_gainR = 15.0f;
     }
 
-#ifdef USE_RTLSDR
+#ifdef USE_RADIO
     if (opts->audio_in_type == AUDIO_IN_RTL) {
         if (state->rtl_ctx == NULL) {
-            if (rtl_stream_create(opts, &state->rtl_ctx) < 0) {
-                LOG_ERROR("Failed to create RTL stream.\n");
+            if (rtl_stream_create_mirrored(opts, &state->rtl_ctx) < 0) {
+                LOG_ERROR("Failed to create radio stream.\n");
             }
         }
         if (state->rtl_ctx && rtl_stream_start(state->rtl_ctx) < 0) {
-            LOG_ERROR("Failed to open RTL-SDR stream.\n");
+            LOG_ERROR("Failed to open radio stream.\n");
         }
         opts->rtl_started = 1;
         opts->rtl_needs_restart = 0;
@@ -1525,6 +1567,9 @@ liveScanner(dsd_opts* opts, dsd_state* state) {
         snprintf(event_string, sizeof event_string, "%s %s Any decoded voice calls or data calls display here;",
                  datestr, timestr);
         write_event_to_log_file(opts, state, 0, 0, event_string);
+    }
+    if (dsd_frame_log_enabled(opts)) {
+        dsd_frame_logf(opts, "DSD-neo frame logging initialized");
     }
 
     //test P25 moto alias by loading in test vectors captured from a system and dumped on forum (see dsd_gps.c)
@@ -1632,12 +1677,12 @@ dsd_engine_cleanup(dsd_opts* opts, dsd_state* state) {
 
     if (opts->static_wav_file == 0) {
         if (opts->wav_out_f != NULL) {
-            opts->wav_out_f = close_and_rename_wav_file(opts->wav_out_f, opts->wav_out_file, opts->wav_out_dir,
+            opts->wav_out_f = close_and_rename_wav_file(opts->wav_out_f, opts, opts->wav_out_file, opts->wav_out_dir,
                                                         &state->event_history_s[0]);
         }
 
         if (opts->wav_out_fR != NULL) {
-            opts->wav_out_fR = close_and_rename_wav_file(opts->wav_out_fR, opts->wav_out_fileR, opts->wav_out_dir,
+            opts->wav_out_fR = close_and_rename_wav_file(opts->wav_out_fR, opts, opts->wav_out_fileR, opts->wav_out_dir,
                                                          &state->event_history_s[1]);
         }
     }
@@ -1654,14 +1699,18 @@ dsd_engine_cleanup(dsd_opts* opts, dsd_state* state) {
         }
     }
 
+    // Finalized WAV close/rename can enqueue API uploads; drain them before teardown.
+    dsd_rdio_upload_shutdown();
+
     if (opts->wav_out_raw != NULL) {
         opts->wav_out_raw = close_wav_file(opts->wav_out_raw);
     }
 
     //no if statement first?
     closeSymbolOutFile(opts, state);
+    dsd_frame_log_close(opts);
 
-#ifdef USE_RTLSDR
+#ifdef USE_RADIO
     if (opts->rtl_started == 1) {
         if (state->rtl_ctx) {
             rtl_stream_stop(state->rtl_ctx);
@@ -1722,6 +1771,10 @@ dsd_engine_run(dsd_opts* opts, dsd_state* state) {
     if (!opts || !state) {
         return -1;
     }
+
+    /* Keep tune/modulation caches run-scoped so repeated in-process runs do
+     * not inherit stale device state from a prior session. */
+    reset_device_io_caches();
 
     dsd_bootstrap_enable_ftz_daz_if_enabled();
     init_rrc_filter_memory(); //initialize input filtering
@@ -1819,15 +1872,15 @@ dsd_engine_run(dsd_opts* opts, dsd_state* state) {
             }
         }
 
-#ifdef USE_RTLSDR
+#ifdef USE_RADIO
         else if (opts->audio_in_type == AUDIO_IN_RTL) {
             if (state->rtl_ctx == NULL) {
-                if (rtl_stream_create(opts, &state->rtl_ctx) < 0) {
-                    LOG_ERROR("Failed to create RTL stream.\n");
+                if (rtl_stream_create_mirrored(opts, &state->rtl_ctx) < 0) {
+                    LOG_ERROR("Failed to create radio stream.\n");
                 }
             }
             if (state->rtl_ctx && rtl_stream_start(state->rtl_ctx) < 0) {
-                LOG_ERROR("Failed to open RTL-SDR stream.\n");
+                LOG_ERROR("Failed to open radio stream.\n");
             }
             opts->rtl_started = 1;
         }

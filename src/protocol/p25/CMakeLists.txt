@@ -16,6 +16,7 @@ target_sources(dsd-neo_proto_p25 PRIVATE
   p25_test_shim.c
   p25_test_lcw_shim.c
   phase1/p25p1_hdu.c
+  phase1/p25p1_audio_dispatch.c
   phase1/p25p1_ldu.c
   phase1/p25p1_ldu1.c
   phase1/p25p1_ldu2.c
@@ -45,6 +46,12 @@ target_include_directories(dsd-neo_proto_p25
   PRIVATE ${_PUBLIC_INCLUDES}
 )
 
-target_link_libraries(dsd-neo_proto_p25 PUBLIC dsd-neo_runtime dsd-neo_fec dsd-neo_crypto dsd-neo_dsp dsd-neo_feature_rtlsdr)
+target_link_libraries(dsd-neo_proto_p25 PUBLIC dsd-neo_runtime dsd-neo_fec dsd-neo_crypto dsd-neo_dsp dsd-neo_feature_radio
+                                               dsd-neo_feature_rtlsdr)
 
 target_link_libraries(dsd-neo_proto_p25 PRIVATE dsd-neo_warnings dsd-neo_feature_sid)
+
+install(TARGETS dsd-neo_proto_p25
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})

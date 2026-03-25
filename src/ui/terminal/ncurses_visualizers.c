@@ -7,25 +7,28 @@
  * RTL-SDR visualization panels: constellation, eye diagram, histogram, spectrum
  */
 
-#include <dsd-neo/ui/ncurses_internal.h>
-#include <dsd-neo/ui/ncurses_visualizers.h>
-
+#include <curses.h>
 #include <dsd-neo/core/constants.h>
-#include <dsd-neo/core/opts.h>
-#include <dsd-neo/core/state.h>
+#include <dsd-neo/ui/ncurses_visualizers.h>
 #include <dsd-neo/ui/ui_prims.h>
 
-#include <dsd-neo/platform/curses_compat.h>
-#include <math.h>
-#include <stdlib.h>
-#include <string.h>
+#include "dsd-neo/core/opts_fwd.h"
+#include "dsd-neo/core/state_fwd.h"
 
 #ifdef USE_RTLSDR
+#include <dsd-neo/core/opts.h>
+#include <dsd-neo/core/state.h>
 #include <dsd-neo/io/rtl_stream_c.h>
+#include <dsd-neo/ui/ncurses_internal.h>
+#include <math.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
 #endif
 
 void
 print_constellation_view(dsd_opts* opts, dsd_state* state) {
+    UNUSED(opts);
     UNUSED(state);
 #ifdef USE_RTLSDR
     /* Fetch a snapshot of recent I/Q points */
@@ -296,32 +299,22 @@ print_constellation_view(dsd_opts* opts, dsd_state* state) {
             int inside_sq = (x >= x0 && x <= x1 && y >= y0 && y <= y1);
             int is_haxis = inside_sq && (y == cy);
             int is_vaxis = inside_sq && (x == cx);
-            int is_diag = 0;
-            if (inside_sq && opts && (opts->mod_qpsk == 1)) {
-                /* Adjust diagonals to preserve ~45° visually under aspect correction */
-                int dx = x - cx;
-                int y_d1 = cy + (int)lrint((double)dx * y_aspect);
-                int y_d2 = cy - (int)lrint((double)dx * y_aspect);
-                is_diag = (y == y_d1) || (y == y_d2);
-            }
 
             unsigned short d = den[(size_t)y * (size_t)W + (size_t)x];
             char ch = ' ';
             int used_guide = 0;
 
-            if (is_haxis || is_vaxis || is_diag) {
+            if (is_haxis || is_vaxis) {
                 /* Choose overlay char */
-                if ((is_haxis && is_vaxis) || (is_vaxis && is_diag) || (is_haxis && is_diag)) {
+                if (is_haxis && is_vaxis) {
                     ch = '+';
                 } else if (is_haxis) {
                     ch = '-';
                 } else if (is_vaxis) {
                     ch = '|';
-                } else {
-                    ch = (x >= cx) ? '\\' : '/';
                 }
                 if (opts && opts->eye_color && has_colors()) {
-                    short gp = is_diag ? guide_x_pair : (is_haxis ? guide_h_pair : guide_v_pair);
+                    short gp = (is_haxis && is_vaxis) ? guide_x_pair : (is_haxis ? guide_h_pair : guide_v_pair);
                     if (last_pair >= 0) {
                         attroff(COLOR_PAIR(last_pair));
                         last_pair = -1;
@@ -390,45 +383,6 @@ print_constellation_view(dsd_opts* opts, dsd_state* state) {
                 }
             }
 
-            /* Reference cluster centers + quadrant labels (QPSK only) */
-            if (inside_sq && opts && (opts->mod_qpsk == 1)) {
-                /* Reference points near ~70% radius (independent of mode) */
-                double refR = 0.70 * (double)s_maxR;
-                int ref_ix[4] = {+1, -1, -1, +1};
-                int ref_qx[4] = {+1, +1, -1, -1};
-                for (int r = 0; r < 4; r++) {
-                    double rii = ref_ix[r] * refR;
-                    double rqq = ref_qx[r] * refR;
-                    double rx = (rii / (double)s_maxR);
-                    double ry = (rqq / (double)s_maxR);
-                    int xr = cx + (int)lrint(rx * (double)scale_eq * outer_margin);
-                    int yr = cy - (int)lrint(ry * (double)scale_eq * outer_margin * y_aspect);
-                    if (xr == x && yr == y) {
-                        ch = 'o';
-                        if (opts->eye_color && has_colors()) {
-                            if (last_pair >= 0) {
-                                attroff(COLOR_PAIR(last_pair));
-                                last_pair = -1;
-                            }
-                            attron(COLOR_PAIR(guide_x_pair));
-                            used_guide = guide_x_pair;
-                        }
-                    }
-                }
-                /* Quadrant labels */
-                int qdx = (W / 4);
-                int qdy = (H / 4);
-                if (y == cy - qdy && x == cx + qdx) {
-                    ch = '1';
-                } else if (y == cy - qdy && x == cx - qdx) {
-                    ch = '2';
-                } else if (y == cy + qdy && x == cx - qdx) {
-                    ch = '3';
-                } else if (y == cy + qdy && x == cx + qdx) {
-                    ch = '4';
-                }
-            }
-
             if (ch != 0) {
                 addch(ch);
             }
@@ -470,7 +424,7 @@ print_constellation_view(dsd_opts* opts, dsd_state* state) {
 
     /* Legend */
     ui_print_lborder();
-    printw(" Ref: axes '+', '/'\\'\\' slicer; 'o' cluster refs\n");
+    printw(" Ref: axes '+', '-', '|'\n");
     if (use_unicode) {
         if (use_dots) {
             ui_print_lborder();
@@ -543,6 +497,7 @@ print_constellation_view(dsd_opts* opts, dsd_state* state) {
 
 void
 print_eye_view(dsd_opts* opts, dsd_state* state) {
+    UNUSED2(opts, state);
 #ifdef USE_RTLSDR
     /* Fetch a snapshot of recent I-channel samples and SPS */
     enum { MAXS = 16384 };
@@ -1219,6 +1174,7 @@ print_fsk_hist_view(void) {
 
 void
 print_spectrum_view(dsd_opts* opts) {
+    UNUSED(opts);
 #ifdef USE_RTLSDR
     int nfft = rtl_stream_spectrum_get_size();
     if (nfft < 64) {

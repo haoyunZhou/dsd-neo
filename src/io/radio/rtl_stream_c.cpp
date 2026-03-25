@@ -13,13 +13,14 @@
  */
 
 #include <new>
+#include <stdint.h>
 #include <stdlib.h>
-#include <string.h>
 
-#include <dsd-neo/core/opts.h>
+#include "dsd-neo/core/opts_fwd.h"
 
 extern "C" {
 #include <dsd-neo/io/rtl_stream_c.h>
+
 // Local forward declarations for legacy helpers used under the hood
 void dsd_rtl_stream_clear_output(void);
 double dsd_rtl_stream_return_pwr(void);
@@ -51,6 +52,7 @@ int dsd_rtl_stream_get_auto_ppm(void);
 /* RTL-TCP autotune control */
 int dsd_rtl_stream_set_rtltcp_autotune(int onoff);
 int dsd_rtl_stream_get_rtltcp_autotune(void);
+int dsd_rtl_stream_get_last_applied_freq(uint32_t* out_freq_hz);
 /* Eye-based SNR fallback */
 double dsd_rtl_stream_estimate_snr_c4fm_eye(void);
 double dsd_rtl_stream_estimate_snr_qpsk_const(void);
@@ -69,15 +71,8 @@ struct RtlSdrContext {
     RtlSdrOrchestrator* stream;
 };
 
-/**
- * @brief Create a new RTL-SDR stream context from options.
- *
- * @param opts Decoder options snapshot used to configure the stream. Must not be NULL.
- * @param out_ctx [out] On success, receives an opaque context pointer.
- * @return 0 on success; otherwise <0 on error.
- */
-extern "C" int
-rtl_stream_create(const dsd_opts* opts, RtlSdrContext** out_ctx) {
+static int
+rtl_stream_create_impl(const dsd_opts* opts, dsd_opts* mirrored_opts, RtlSdrContext** out_ctx) {
     if (!out_ctx || !opts) {
         return -1;
     }
@@ -85,7 +80,7 @@ rtl_stream_create(const dsd_opts* opts, RtlSdrContext** out_ctx) {
     if (!*out_ctx) {
         return -1;
     }
-    (*out_ctx)->stream = new (std::nothrow) RtlSdrOrchestrator(*opts);
+    (*out_ctx)->stream = new (std::nothrow) RtlSdrOrchestrator(*opts, mirrored_opts);
     if (!(*out_ctx)->stream) {
         free(*out_ctx);
         *out_ctx = NULL;
@@ -95,9 +90,33 @@ rtl_stream_create(const dsd_opts* opts, RtlSdrContext** out_ctx) {
 }
 
 /**
+ * @brief Create a new RTL-SDR stream context from an immutable options snapshot.
+ *
+ * @param opts Decoder options snapshot used to configure the stream. Must not be NULL.
+ * @param out_ctx [out] On success, receives an opaque context pointer.
+ * @return 0 on success; otherwise <0 on error.
+ */
+extern "C" int
+rtl_stream_create(const dsd_opts* opts, RtlSdrContext** out_ctx) {
+    return rtl_stream_create_impl(opts, NULL, out_ctx);
+}
+
+/**
+ * @brief Create a new RTL-SDR stream context mirrored to caller-owned options.
+ *
+ * @param opts Mutable caller-owned decoder options to mirror. Must not be NULL.
+ * @param out_ctx [out] On success, receives an opaque context pointer.
+ * @return 0 on success; otherwise <0 on error.
+ */
+extern "C" int
+rtl_stream_create_mirrored(dsd_opts* opts, RtlSdrContext** out_ctx) {
+    return rtl_stream_create_impl(opts, opts, out_ctx);
+}
+
+/**
  * @brief Start the stream threads and device I/O.
  *
- * @param ctx Stream context created by rtl_stream_create().
+ * @param ctx Stream context created by rtl_stream_create() or rtl_stream_create_mirrored().
  * @return 0 on success; otherwise <0 on error.
  */
 extern "C" int
@@ -113,7 +132,7 @@ rtl_stream_start(RtlSdrContext* ctx) {
  *
  * Safe to call multiple times; subsequent calls are no-ops.
  *
- * @param ctx Stream context created by rtl_stream_create().
+ * @param ctx Stream context created by rtl_stream_create() or rtl_stream_create_mirrored().
  * @return 0 on success; otherwise <0 on error.
  */
 extern "C" int
@@ -166,16 +185,7 @@ rtl_stream_tune(RtlSdrContext* ctx, uint32_t center_freq_hz) {
     if (!ctx || !ctx->stream) {
         return -1;
     }
-    // simple process-level cache; safe since single tuner is typical
-    static uint32_t s_last_freq = 0U;
-    if (center_freq_hz == s_last_freq) {
-        return 0; // no-op
-    }
-    int rc = ctx->stream->tune(center_freq_hz);
-    if (rc == 0) {
-        s_last_freq = center_freq_hz;
-    }
-    return rc;
+    return ctx->stream->tune(center_freq_hz);
 }
 
 /**
@@ -560,4 +570,9 @@ rtl_stream_get_rtltcp_autotune(void) {
 extern "C" void
 rtl_stream_set_rtltcp_autotune(int onoff) {
     (void)dsd_rtl_stream_set_rtltcp_autotune(onoff);
+}
+
+extern "C" int
+rtl_stream_get_last_applied_freq(uint32_t* out_freq_hz) {
+    return dsd_rtl_stream_get_last_applied_freq(out_freq_hz);
 }

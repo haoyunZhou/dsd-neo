@@ -52,6 +52,7 @@ struct dsd_opts {
     FILE* mbe_out_f;
     FILE* mbe_out_fR; //second slot on a TDMA system
     FILE* symbol_out_f;
+    FILE* frame_log_f;                    // optional frame-trace sink
     time_t symbol_out_file_creation_time; //time the symbol out file was created
     SNDFILE* wav_out_f;
     SNDFILE* wav_out_fR;
@@ -97,6 +98,10 @@ struct dsd_opts {
     int audio_out;
     int dmr_stereo_wav;  //per-call wav file use (rename later)
     int static_wav_file; //single static wav file for decoding duration
+    int rdio_mode;       //0=off, 1=dirwatch, 2=api, 3=both
+    int rdio_system_id;  //rdio-scanner system id used for API upload
+    int rdio_upload_timeout_ms;
+    int rdio_upload_retries;
     int serial_baud;
     int serial_fd;
     int resume;
@@ -194,6 +199,8 @@ struct dsd_opts {
     double p25_p1_err_hold_s;          // additional seconds to hold when threshold exceeded
     int reset_state;
     int payload;
+    int frame_log_open_error_reported;  // guard repeated open error spam
+    int frame_log_write_error_reported; // guard repeated write error spam
     unsigned int dPMR_curr_frame_is_encrypted;
     int dPMR_next_part_of_superframe;
     int inverted_dpmr;
@@ -277,6 +284,7 @@ struct dsd_opts {
     char pa_input_idx[100];
     char pa_output_idx[100];
     char wav_out_dir[512];
+    char rdio_api_key[256];
     char mbe_in_file[1024];
     char audio_out_dev[1024];
     char mbe_out_dir[1024];
@@ -288,10 +296,12 @@ struct dsd_opts {
     char symbol_out_file[1024];
     char lrrp_out_file[1024];
     char event_out_file[1024];
+    char frame_log_file[1024];
     char szNumbers[1024]; //**tera 10/32/64 char str
     char serial_dev[1024];
     char output_name[1024];
     char rigctlhostname[1024];
+    char rdio_api_url[1024];
     char udp_hostname[1024];
     char udp_in_bindaddr[1024];
     char m17_hostname[1024];

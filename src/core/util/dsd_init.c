@@ -14,13 +14,18 @@
 #include <dsd-neo/dsp/dmr_sync.h>
 #include <dsd-neo/platform/posix_compat.h>
 #include <dsd-neo/runtime/log.h>
-
+#include <dsd-neo/runtime/shutdown.h>
+#include <mbelib.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
-#include <mbelib.h>
+#include "dsd-neo/core/opts_fwd.h"
+#include "dsd-neo/core/state_fwd.h"
+#include "dsd-neo/dsp/p25p1_heuristics.h"
+#include "dsd-neo/platform/sockets.h"
 
 #ifdef USE_CODEC2
 #include <codec2/codec2.h>
@@ -94,6 +99,7 @@ initOpts(dsd_opts* opts) {
     opts->symbol_out_file[0] = 0;
     opts->lrrp_out_file[0] = 0;
     opts->event_out_file[0] = 0;
+    opts->frame_log_file[0] = 0;
     //csv import filenames
     opts->group_in_file[0] = 0;
     opts->lcn_in_file[0] = 0;
@@ -102,6 +108,9 @@ initOpts(dsd_opts* opts) {
     //end import filenames
     opts->szNumbers[0] = 0;
     opts->symbol_out_f = NULL;
+    opts->frame_log_f = NULL;
+    opts->frame_log_open_error_reported = 0;
+    opts->frame_log_write_error_reported = 0;
     opts->symbol_out_file_creation_time = time(NULL);
     opts->symbol_out_file_is_auto = 0;
     opts->mbe_out = 0;
@@ -112,6 +121,12 @@ initOpts(dsd_opts* opts) {
 
     opts->dmr_stereo_wav = 0;  //flag for per call dmr stereo wav recordings
     opts->static_wav_file = 0; //single static wav file for decoding duration
+    opts->rdio_mode = 0;
+    opts->rdio_system_id = 0;
+    opts->rdio_upload_timeout_ms = 5000;
+    opts->rdio_upload_retries = 1;
+    opts->rdio_api_key[0] = 0;
+    snprintf(opts->rdio_api_url, sizeof opts->rdio_api_url, "%s", "http://127.0.0.1:3000");
     //opts->wav_out_fd = -1;
     opts->serial_baud = 115200;
     opts->serial_fd = -1;
@@ -165,7 +180,7 @@ initOpts(dsd_opts* opts) {
     opts->rtl_needs_restart = 0;
     opts->rtl_pwr = 0;                // mean power approximation level on rtl input signal
     opts->rtl_bias_tee = 0;           // bias tee disabled by default
-    opts->rtl_auto_ppm = 0;           // spectrum-based auto PPM disabled by default
+    opts->rtl_auto_ppm = 0;           // auto PPM disabled by default
     opts->rtl_auto_ppm_snr_db = 0.0f; // use default SNR threshold unless overridden
     //end RTL user options
     opts->pulse_raw_rate_in = 48000;
@@ -291,7 +306,8 @@ initOpts(dsd_opts* opts) {
     opts->trunk_tune_enc_calls = 1; //enabled by default
 
     //P25 LCW explicit retune (format 0x44)
-    opts->p25_lcw_retune = 0; //disabled by default
+    //Enabled by default so explicit-only P25 systems follow voice grants out-of-the-box.
+    opts->p25_lcw_retune = 1;
 
     opts->dPMR_next_part_of_superframe = 0;
 
@@ -380,6 +396,8 @@ initState(dsd_state* state) {
 
     // RTL-SDR stream context (initialized to NULL; lifecycle managed by caller)
     state->rtl_ctx = NULL;
+    // Optional RC2 crypto context (allocated on demand by key setup path)
+    state->rc2_context = NULL;
 
     //Bitmap Filtering Options
     state->audio_smoothing = 0;
@@ -482,6 +500,7 @@ initState(dsd_state* state) {
     state->optind = 0;
     state->numtdulc = 0;
     state->firstframe = 0;
+    state->p25_lcw_retune_disabled_warned = 0;
     state->slot1light[0] = '\0';
     state->slot2light[0] = '\0';
     state->aout_gain = 25.0f;
@@ -507,6 +526,25 @@ initState(dsd_state* state) {
     state->cur_mp2 = malloc(sizeof(mbe_parms));
     state->prev_mp2 = malloc(sizeof(mbe_parms));
     state->prev_mp_enhanced2 = malloc(sizeof(mbe_parms));
+
+    if (state->cur_mp == NULL || state->prev_mp == NULL || state->prev_mp_enhanced == NULL || state->cur_mp2 == NULL
+        || state->prev_mp2 == NULL || state->prev_mp_enhanced2 == NULL) {
+        LOG_ERROR("memory allocation failure for mbelib vocoder state\n");
+        free(state->cur_mp);
+        state->cur_mp = NULL;
+        free(state->prev_mp);
+        state->prev_mp = NULL;
+        free(state->prev_mp_enhanced);
+        state->prev_mp_enhanced = NULL;
+        free(state->cur_mp2);
+        state->cur_mp2 = NULL;
+        free(state->prev_mp2);
+        state->prev_mp2 = NULL;
+        free(state->prev_mp_enhanced2);
+        state->prev_mp_enhanced2 = NULL;
+        dsd_request_shutdown(NULL, NULL);
+        return;
+    }
 
     mbe_initMbeParms(state->cur_mp, state->prev_mp, state->prev_mp_enhanced);
     mbe_initMbeParms(state->cur_mp2, state->prev_mp2, state->prev_mp_enhanced2);
@@ -594,12 +632,18 @@ initState(dsd_state* state) {
     state->tyt_ap = 0;
     state->tyt_bp = 0;
     state->tyt_ep = 0;
+    state->baofeng_ap = 0;
+    state->csi_ee = 0;
+    memset(state->csi_ee_key, 0, sizeof(state->csi_ee_key));
     state->retevis_ap = 0;
 
     state->ken_sc = 0;
     state->any_bp = 0;
     state->straight_ks = 0;
     state->straight_mod = 0;
+    state->straight_frame_mode = 0;
+    state->straight_frame_off = 0;
+    state->straight_frame_step = 0;
 
     //ks array storage and counters
     memset(state->ks_octetL, 0, sizeof(state->ks_octetL));
@@ -612,6 +656,19 @@ initState(dsd_state* state) {
 
     memset(state->static_ks_bits, 0, sizeof(state->static_ks_bits));
     memset(state->static_ks_counter, 0, sizeof(state->static_ks_counter));
+    memset(state->vertex_ks_key, 0, sizeof(state->vertex_ks_key));
+    memset(state->vertex_ks_bits, 0, sizeof(state->vertex_ks_bits));
+    memset(state->vertex_ks_mod, 0, sizeof(state->vertex_ks_mod));
+    memset(state->vertex_ks_frame_mode, 0, sizeof(state->vertex_ks_frame_mode));
+    memset(state->vertex_ks_frame_off, 0, sizeof(state->vertex_ks_frame_off));
+    memset(state->vertex_ks_frame_step, 0, sizeof(state->vertex_ks_frame_step));
+    state->vertex_ks_count = 0;
+    state->vertex_ks_active_idx[0] = -1;
+    state->vertex_ks_active_idx[1] = -1;
+    state->vertex_ks_counter[0] = 0;
+    state->vertex_ks_counter[1] = 0;
+    state->vertex_ks_warned[0] = 0;
+    state->vertex_ks_warned[1] = 0;
 
     //AES Specific Variables
     memset(state->aes_key, 0, sizeof(state->aes_key));
@@ -779,6 +836,10 @@ initState(dsd_state* state) {
     memset(state->nxdn_sacch_frame_segment, 1, sizeof(state->nxdn_sacch_frame_segment));
     state->nxdn_alias_block_number = 0;
     memset(state->nxdn_alias_block_segment, 0, sizeof(state->nxdn_alias_block_segment));
+    state->nxdn_alias_arib_total_segments = 0;
+    state->nxdn_alias_arib_seen_mask = 0;
+    memset(state->nxdn_alias_arib_segments, 0, sizeof(state->nxdn_alias_arib_segments));
+    state->nxdn_dcr_sf_message_type = 0xFFU;
 
     //site/srv/cch info
     state->nxdn_location_site_code = 0;
@@ -1004,4 +1065,7 @@ freeState(dsd_state* state) {
     free(state->dmr_reliab_buf);
     state->dmr_reliab_buf = NULL;
     state->dmr_reliab_p = NULL;
+
+    free(state->rc2_context);
+    state->rc2_context = NULL;
 }

@@ -16,46 +16,41 @@
  * 2024-03 EDACS-FME display improvements
  *-----------------------------------------------------------------------------*/
 
-#include <dsd-neo/core/dsd_time.h>
+#include <curses.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/power.h>
 #include <dsd-neo/core/state.h>
 #include <dsd-neo/core/sync_patterns.h>
 #include <dsd-neo/core/synctype_ids.h>
-#include <dsd-neo/platform/curses_compat.h>
 #include <dsd-neo/protocol/edacs/edacs_afs.h>
 #include <dsd-neo/protocol/p25/p25_callsign.h>
-#include <dsd-neo/protocol/p25/p25_sm_watchdog.h>
 #include <dsd-neo/protocol/p25/p25_trunk_sm.h>
-#include <dsd-neo/runtime/config.h>
-#include <dsd-neo/runtime/git_ver.h>
 #include <dsd-neo/runtime/telemetry.h>
-#include <dsd-neo/ui/keymap.h>
 #include <dsd-neo/ui/menu_core.h>
 #include <dsd-neo/ui/ncurses.h>
 #include <dsd-neo/ui/ncurses_dsp_display.h>
 #include <dsd-neo/ui/ncurses_internal.h>
 #include <dsd-neo/ui/ncurses_p25_display.h>
-#include <dsd-neo/ui/ncurses_snr.h>
 #include <dsd-neo/ui/ncurses_trunk_display.h>
-#include <dsd-neo/ui/ncurses_visualizers.h>
 #include <dsd-neo/ui/panels.h>
 #include <dsd-neo/ui/ui_async.h>
-#include <dsd-neo/ui/ui_cmd.h>
+#include <dsd-neo/ui/ui_history.h>
 #include <dsd-neo/ui/ui_prims.h>
 #include <math.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <wchar.h>
-#ifdef USE_RTLSDR
-#include <dsd-neo/io/rtl_stream_c.h>
-#endif
 
-/* file_compat.h provides portable file descriptor operations */
-#include <dsd-neo/platform/file_compat.h>
+#include "dsd-neo/core/opts_fwd.h"
+#include "dsd-neo/core/state_fwd.h"
+#ifdef USE_RADIO
+#include <dsd-neo/io/rtl_stream_c.h>
+#include <dsd-neo/ui/keymap.h>
+#include <dsd-neo/ui/ncurses_snr.h>
+#include <dsd-neo/ui/ncurses_visualizers.h>
+#endif
 
 extern unsigned long long int edacs_channel_tree[33][6];
 
@@ -98,6 +93,15 @@ ui_eh_item_has_content(const Event_History* item) {
     }
     return item->event_string[0] != '\0' || item->text_message[0] != '\0' || item->alias[0] != '\0'
            || item->gps_s[0] != '\0' || item->internal_str[0] != '\0';
+}
+
+static int
+ui_audio_in_is_soapy(const dsd_opts* opts) {
+    const char* dev = opts ? opts->audio_in_dev : NULL;
+    if (!dev) {
+        return 0;
+    }
+    return (strcmp(dev, "soapy") == 0) || (strncmp(dev, "soapy:", 6) == 0);
 }
 
 char* DMRBusrtTypes[32] = {
@@ -146,22 +150,7 @@ ncursesPrinter(dsd_opts* opts, dsd_state* state) {
     }
     uint8_t idas = 0;
     int level = 0;
-    int c = 0;
     int i = 0;
-
-    if (opts->audio_in_type != AUDIO_IN_STDIN) //can't run getch/menu when using STDIN -
-    {
-        c = getch(); // non-blocking (set once in ncursesOpen)
-        if (c == KEY_RESIZE) {
-#if DSD_CURSES_NEEDS_EXPLICIT_RESIZE
-            // PDCurses doesn't auto-update dimensions on resize.
-            resize_term(0, 0);
-#endif
-            // Force a full redraw on next refresh to avoid artifacts
-            clearok(stdscr, TRUE);
-            c = -1; // ignore as input
-        }
-    }
 
     // Defer overlay drawing to the end so it stays on top.
 
@@ -265,13 +254,22 @@ ncursesPrinter(dsd_opts* opts, dsd_state* state) {
     }
 
     if (opts->audio_in_type == AUDIO_IN_RTL) {
-        printw("| RTL: %d;", opts->rtl_dev_index);
+        int soapy_input = ui_audio_in_is_soapy(opts);
+        if (soapy_input) {
+            if (strncmp(opts->audio_in_dev, "soapy:", 6) == 0 && opts->audio_in_dev[6] != '\0') {
+                printw("| SoapySDR: %s;", opts->audio_in_dev + 6);
+            } else {
+                printw("| SoapySDR;");
+            }
+        } else {
+            printw("| RTL: %d;", opts->rtl_dev_index);
+        }
         /* Show applied tuner gain when available (actual driver value),
            otherwise fall back to requested value. */
         {
             int g10 = 0, is_auto = 1;
             int have = 0;
-#ifdef USE_RTLSDR
+#ifdef USE_RADIO
             /* Header is already included indirectly via other UI modules. */
             extern int rtl_stream_get_gain(int* out_tenth_db, int* out_is_auto);
             if (rtl_stream_get_gain(&g10, &is_auto) == 0) {
@@ -294,25 +292,33 @@ ncursesPrinter(dsd_opts* opts, dsd_state* state) {
             }
         }
         printw(" V: %iX;", opts->rtl_volume_multiplier);
-        printw(" PPM: %i;", opts->rtlsdr_ppm_error); //Adjust manually now with { and }
+        {
+            int requested_ppm = 0;
+#ifdef USE_RADIO
+            requested_ppm = rtl_stream_get_requested_ppm(opts);
+#else
+            requested_ppm = opts->rtlsdr_ppm_error;
+#endif
+            printw(" PPM: %i;", requested_ppm); //Adjust manually now with { and }
+        }
         printw(" SQL: %.1f dB;", pwr_to_dB(opts->rtl_squelch_level));
         printw(" PWR: %.1f dB;", pwr_to_dB(opts->rtl_pwr));
         printw(" DSP-BW: %i kHz;", opts->rtl_dsp_bw_khz);
         printw(" FRQ: %i;", opts->rtlsdr_center_freq);
-        /* Show spectrum-based auto PPM status snapshot */
+        /* Show carrier/error-based auto PPM status snapshot */
         {
-            int ap_en = 0, ap_dir = 0, ap_cd = 0, ap_locked = 0;
-            double ap_snr = -100.0, ap_df = 0.0, ap_estppm = 0.0;
-#ifdef USE_RTLSDR
+            int ap_en = 0, ap_dir = 0, ap_locked = 0;
+            double ap_snr = -100.0, ap_df = 0.0;
+#ifdef USE_RADIO
             extern int rtl_stream_auto_ppm_get_status(int*, double*, double*, double*, int*, int*, int*);
-            (void)rtl_stream_auto_ppm_get_status(&ap_en, &ap_snr, &ap_df, &ap_estppm, &ap_dir, &ap_cd, &ap_locked);
+            (void)rtl_stream_auto_ppm_get_status(&ap_en, &ap_snr, &ap_df, NULL, &ap_dir, NULL, &ap_locked);
 #endif
             if (!ap_en) {
                 printw("\n| Auto PPM: Off");
             } else if (ap_locked) {
                 int lppm = 0;
                 double lsnr = -100.0, ldf = 0.0;
-#ifdef USE_RTLSDR
+#ifdef USE_RADIO
                 extern int rtl_stream_auto_ppm_get_lock(int*, double*, double*);
                 (void)rtl_stream_auto_ppm_get_lock(&lppm, &lsnr, &ldf);
 #endif
@@ -326,7 +332,7 @@ ncursesPrinter(dsd_opts* opts, dsd_state* state) {
                                       : "hold");
             }
         }
-        if (opts->rtl_udp_port != 0) {
+        if (!soapy_input && opts->rtl_udp_port != 0) {
             printw("\n| External RTL Tuning on UDP Port: %i", opts->rtl_udp_port);
         }
         printw("\n");
@@ -708,10 +714,10 @@ ncursesPrinter(dsd_opts* opts, dsd_state* state) {
     // if (opts->call_alert == 1)   printw ("| Call Alert Tone Enabled\n");
 
     ui_print_hr();
-#ifdef USE_RTLSDR
+#ifdef USE_RADIO
     /* Only show RTL-SDR section and render visualizers when RTL input is active */
     if (opts->audio_in_type == AUDIO_IN_RTL) {
-        ui_print_header("RTL-SDR Visual Aids");
+        ui_print_header(ui_audio_in_is_soapy(opts) ? "SoapySDR Visual Aids" : "RTL-SDR Visual Aids");
         int nfft = rtl_stream_spectrum_get_size();
         /* Controls/status line: only show controls relevant to active views */
         printw("| Const View:  %s (%c)", opts->constellation ? "On" : "Off", DSD_KEY_CONST_VIEW_UPPER);
@@ -802,7 +808,7 @@ ncursesPrinter(dsd_opts* opts, dsd_state* state) {
         printw("CRC/(RAS) ");
     }
     /* Demod SNR (per modulation) */
-#ifdef USE_RTLSDR
+#ifdef USE_RADIO
     {
         double snr = -100.0;
         const char* m = "";
@@ -910,7 +916,7 @@ ncursesPrinter(dsd_opts* opts, dsd_state* state) {
         }
     }
 #endif
-#ifndef USE_RTLSDR
+#ifndef USE_RADIO
     /* If built without RTL support, still show a placeholder */
     printw(" SNR: n/a []");
 #endif
@@ -1783,6 +1789,23 @@ ncursesPrinter(dsd_opts* opts, dsd_state* state) {
             }
             attron(COLOR_PAIR(3));
         }
+        if (state->payload_algid == 0x07) {
+            attron(COLOR_PAIR(1));
+            printw("Vertex Std");
+            attron(COLOR_PAIR(3));
+        }
+        if (state->payload_algid == 0x36 || state->payload_algid == 0x37) {
+            attron(COLOR_PAIR(1));
+            if (state->payload_algid == 0x36) {
+                printw("Kirisun Adv");
+            } else {
+                printw("Kirisun Uni");
+            }
+            if (state->aes_key_loaded[0] != 0) {
+                printw(" KS: %016llX", state->A4[0]);
+            }
+            attron(COLOR_PAIR(3));
+        }
 
         printw("\n");
 
@@ -1983,6 +2006,23 @@ ncursesPrinter(dsd_opts* opts, dsd_state* state) {
                 }
                 attron(COLOR_PAIR(3));
             }
+            if (state->payload_algidR == 0x07) {
+                attron(COLOR_PAIR(1));
+                printw("Vertex Std");
+                attron(COLOR_PAIR(3));
+            }
+            if (state->payload_algidR == 0x36 || state->payload_algidR == 0x37) {
+                attron(COLOR_PAIR(1));
+                if (state->payload_algidR == 0x36) {
+                    printw("Kirisun Adv");
+                } else {
+                    printw("Kirisun Uni");
+                }
+                if (state->aes_key_loaded[1] != 0) {
+                    printw(" KS: %016llX", state->A4[1]);
+                }
+                attron(COLOR_PAIR(3));
+            }
 
             printw("\n");
 
@@ -2164,7 +2204,7 @@ ncursesPrinter(dsd_opts* opts, dsd_state* state) {
             int a = (edacs_channel_tree[i][2] >> state->edacs_a_shift) & state->edacs_a_mask;
             int f = (edacs_channel_tree[i][2] >> state->edacs_f_shift) & state->edacs_f_mask;
             int s = edacs_channel_tree[i][2] & state->edacs_s_mask;
-            printw("| - LCN [%02d][%010.06lf] MHz", i, (double)state->trunk_lcn_freq[i - 1] / 1000000);
+            printw("| - LCN [%02d][%.06lf] MHz", i, (double)state->trunk_lcn_freq[i - 1] / 1000000);
 
             //print Control Channel on LCN line with the current Control Channel
             if ((i) == state->edacs_cc_lcn) {
@@ -2419,9 +2459,11 @@ ncursesPrinter(dsd_opts* opts, dsd_state* state) {
         attroff(COLOR_PAIR(3));
     }
     //only print event history if enabled
+    const int history_mode = ui_history_get_mode();
+    int history_draw_footer = 1;
     attron(COLOR_PAIR(4)); //cyan for history
     {
-        /* Custom header to underline active Cycle (h) mode */
+        /* Custom header to emphasize active Cycle (h) mode */
         int rows = 0, cols = 80;
         getmaxyx(stdscr, rows, cols);
         if (cols < 4) {
@@ -2439,36 +2481,44 @@ ncursesPrinter(dsd_opts* opts, dsd_state* state) {
             printw("Latest Event History ([|])  Slots 1+2 (\\)  Cycle (h): ");
         }
 
-        /* Underline the active cycle indicator based on opts->ncurses_history
+        /* Bold the active cycle indicator based on UI history mode
            0 = Off, 1 = Short, 2 = Long */
-        const int hist = opts->ncurses_history % 3;
+        const int hist = history_mode;
 
         if (hist == 1) {
-            attron(A_UNDERLINE);
+            attron(A_BOLD);
         }
         addstr("Short");
         if (hist == 1) {
-            attroff(A_UNDERLINE);
+            attroff(A_BOLD);
         }
 
         addch('/');
 
         if (hist == 2) {
-            attron(A_UNDERLINE);
+            attron(A_BOLD);
         }
         addstr("Long");
         if (hist == 2) {
-            attroff(A_UNDERLINE);
+            attroff(A_BOLD);
         }
 
         addch('/');
 
         if (hist == 0) {
-            attron(A_UNDERLINE);
+            attron(A_BOLD);
         }
         addstr("Off");
         if (hist == 0) {
-            attroff(A_UNDERLINE);
+            attroff(A_BOLD);
+        }
+
+        // If there's no room for at least one event row, surface it in-header.
+        if (history_mode != 0) {
+            int room_hint = rows - (y + 1) - 2;
+            if (room_hint < 1) {
+                addstr(" [No room]");
+            }
         }
 
         /* Fill remainder of line with '-' and advance to next line */
@@ -2484,7 +2534,7 @@ ncursesPrinter(dsd_opts* opts, dsd_state* state) {
             addch('\n');
         }
     }
-    if (opts->ncurses_history != 0) {
+    if (history_mode != 0) {
         int rows = 0, cols = 0;
         getmaxyx(stdscr, rows, cols);
 
@@ -2493,7 +2543,13 @@ ncursesPrinter(dsd_opts* opts, dsd_state* state) {
         (void)start_x;
 
         // Leave room for the bottom HR line and avoid scrolling on ui_print_hr().
+        // If that leaves no room, reclaim the footer line instead of truncating
+        // higher sections.
         int avail_lines = rows - start_y - 2;
+        if (avail_lines < 1) {
+            avail_lines = rows - start_y - 1;
+            history_draw_footer = 0;
+        }
         if (avail_lines < 0) {
             avail_lines = 0;
         }
@@ -2505,9 +2561,14 @@ ncursesPrinter(dsd_opts* opts, dsd_state* state) {
             events_to_show = max_events;
         }
 
+        int history_stop_y = rows - (history_draw_footer ? 2 : 1);
+        if (history_stop_y < 0) {
+            history_stop_y = 0;
+        }
+
         // In short mode, bound the displayed event string to the current width to avoid wrapping.
         uint16_t string_size = 71;
-        if (opts->ncurses_history == 2) {
+        if (history_mode == 2) {
             string_size = 1999;
         } else if (cols > 0) {
             int max_text = cols - 4; // "| " (2) + 2 cols of slack
@@ -2537,7 +2598,7 @@ ncursesPrinter(dsd_opts* opts, dsd_state* state) {
                     int y = 0, x = 0;
                     getyx(stdscr, y, x);
                     (void)x;
-                    if (y >= rows - 2) {
+                    if (y >= history_stop_y) {
                         break;
                     }
 
@@ -2551,10 +2612,28 @@ ncursesPrinter(dsd_opts* opts, dsd_state* state) {
                     attron(COLOR_PAIR(4));
 
                     if (item->event_string[0] != '\0') {
+                        char compact_string[2000];
                         char text_string[2000];
-                        memcpy(text_string, item->event_string, (size_t)string_size * sizeof(char));
-                        text_string[string_size] = 0; //terminate string
-                        printw("| ");
+                        ui_history_compact_event_text(compact_string, sizeof compact_string, item->event_string,
+                                                      history_mode);
+
+                        const int show_enc_tag = (history_mode == 1 && item->enc != 0);
+                        const char* line_prefix = show_enc_tag ? "| [ENC] " : "| ";
+                        const int line_prefix_len = show_enc_tag ? 8 : 2;
+                        uint16_t line_size = string_size;
+                        if (history_mode != 2 && cols > 0) {
+                            int max_text = cols - (line_prefix_len + 2);
+                            if (max_text < 0) {
+                                max_text = 0;
+                            }
+                            if (max_text < (int)line_size) {
+                                line_size = (uint16_t)max_text;
+                            }
+                        }
+
+                        memcpy(text_string, compact_string, (size_t)line_size * sizeof(char));
+                        text_string[line_size] = 0; //terminate string
+                        printw("%s", line_prefix);
                         attron(COLOR_PAIR(color_pair)); //this is where the custom color switch occurs for the
                                                         //event_string
                         printw("%s\n", text_string);
@@ -2565,56 +2644,56 @@ ncursesPrinter(dsd_opts* opts, dsd_state* state) {
 
                     if (item->text_message[0] != '\0') {
                         getyx(stdscr, y, x);
-                        if (y >= rows - 2) {
+                        if (y >= history_stop_y) {
                             break;
                         }
                         printw("|");
-                        attron(COLOR_PAIR(4)); //feel free to change this to any value you want
-                        printw("      %s\n", item->text_message);
+                        attron(COLOR_PAIR(4));
+                        printw("  \\-- %s\n", item->text_message);
                         attron(COLOR_PAIR(4));
                     }
 
                     if (item->alias[0] != '\0') {
                         getyx(stdscr, y, x);
-                        if (y >= rows - 2) {
+                        if (y >= history_stop_y) {
                             break;
                         }
                         printw("|");
-                        attron(COLOR_PAIR(4)); //feel free to change this to any value you want
-                        printw("      Alias: %s \n", item->alias);
+                        attron(COLOR_PAIR(4));
+                        printw("  \\-- Alias: %s \n", item->alias);
                         attron(COLOR_PAIR(4));
                     }
 
                     if (item->gps_s[0] != '\0') {
                         getyx(stdscr, y, x);
-                        if (y >= rows - 2) {
+                        if (y >= history_stop_y) {
                             break;
                         }
                         printw("|");
-                        attron(COLOR_PAIR(4)); //feel free to change this to any value you want
-                        printw("      GPS: %s \n", item->gps_s);
+                        attron(COLOR_PAIR(4));
+                        printw("  \\-- GPS: %s \n", item->gps_s);
                         attron(COLOR_PAIR(4));
                     }
 
                     if (item->internal_str[0] != '\0') {
                         getyx(stdscr, y, x);
-                        if (y >= rows - 2) {
+                        if (y >= history_stop_y) {
                             break;
                         }
                         printw("|");
-                        attron(COLOR_PAIR(4)); //feel free to change this to any value you want
-                        printw("      DSD-neo: %s \n", item->internal_str);
+                        attron(COLOR_PAIR(4));
+                        printw("  \\-- DSD-neo: %s \n", item->internal_str);
                         attron(COLOR_PAIR(4));
                     }
                 }
             } else {
-                const int prefix_len = 5; // "| S# " (5)
+                const int base_prefix_len = 5; // "|[1] " (5)
                 uint16_t idx0 = 1;
                 uint16_t idx1 = 1;
                 uint16_t skip = state->eh_index;
 
-                if (opts->ncurses_history != 2 && cols > 0) {
-                    int max_text = cols - (prefix_len + 2);
+                if (history_mode != 2 && cols > 0) {
+                    int max_text = cols - (base_prefix_len + 2);
                     if (max_text < 0) {
                         max_text = 0;
                     }
@@ -2650,7 +2729,7 @@ ncursesPrinter(dsd_opts* opts, dsd_state* state) {
                     int y = 0, x = 0;
                     getyx(stdscr, y, x);
                     (void)x;
-                    if (y >= rows - 2) {
+                    if (y >= history_stop_y) {
                         break;
                     }
 
@@ -2684,51 +2763,74 @@ ncursesPrinter(dsd_opts* opts, dsd_state* state) {
                     uint8_t color_pair = item->color_pair;
                     attron(COLOR_PAIR(4));
 
+                    char compact_string[2000];
                     char text_string[2000];
-                    memcpy(text_string, item->event_string, (size_t)string_size * sizeof(char));
-                    text_string[string_size] = 0; //terminate string
-                    printw("| S%d ", slot + 1);
+                    char line_prefix[16];
+                    const int show_enc_tag = (history_mode == 1 && item->enc != 0);
+                    if (show_enc_tag) {
+                        snprintf(line_prefix, sizeof line_prefix, "|[%d] [ENC] ", slot + 1);
+                    } else {
+                        snprintf(line_prefix, sizeof line_prefix, "|[%d] ", slot + 1);
+                    }
+
+                    ui_history_compact_event_text(compact_string, sizeof compact_string, item->event_string,
+                                                  history_mode);
+
+                    uint16_t line_size = string_size;
+                    if (history_mode != 2 && cols > 0) {
+                        int max_text = cols - ((int)strlen(line_prefix) + 2);
+                        if (max_text < 0) {
+                            max_text = 0;
+                        }
+                        if (max_text < (int)line_size) {
+                            line_size = (uint16_t)max_text;
+                        }
+                    }
+
+                    memcpy(text_string, compact_string, (size_t)line_size * sizeof(char));
+                    text_string[line_size] = 0; //terminate string
+                    printw("%s", line_prefix);
                     attron(COLOR_PAIR(color_pair)); //this is where the custom color switch occurs for the event_string
                     printw("%s\n", text_string);
                     attron(COLOR_PAIR(4));
 
                     if (item->text_message[0] != '\0') {
                         getyx(stdscr, y, x);
-                        if (y >= rows - 2) {
+                        if (y >= history_stop_y) {
                             break;
                         }
                         attron(COLOR_PAIR(4)); //feel free to change this to any value you want
-                        printw("| S%d      %s\n", slot + 1, item->text_message);
+                        printw("|[%d] \\-- %s\n", slot + 1, item->text_message);
                         attron(COLOR_PAIR(4));
                     }
 
                     if (item->alias[0] != '\0') {
                         getyx(stdscr, y, x);
-                        if (y >= rows - 2) {
+                        if (y >= history_stop_y) {
                             break;
                         }
-                        attron(COLOR_PAIR(4)); //feel free to change this to any value you want
-                        printw("| S%d      Alias: %s \n", slot + 1, item->alias);
+                        attron(COLOR_PAIR(4));
+                        printw("|[%d] \\-- Alias: %s \n", slot + 1, item->alias);
                         attron(COLOR_PAIR(4));
                     }
 
                     if (item->gps_s[0] != '\0') {
                         getyx(stdscr, y, x);
-                        if (y >= rows - 2) {
+                        if (y >= history_stop_y) {
                             break;
                         }
-                        attron(COLOR_PAIR(4)); //feel free to change this to any value you want
-                        printw("| S%d      GPS: %s \n", slot + 1, item->gps_s);
+                        attron(COLOR_PAIR(4));
+                        printw("|[%d] \\-- GPS: %s \n", slot + 1, item->gps_s);
                         attron(COLOR_PAIR(4));
                     }
 
                     if (item->internal_str[0] != '\0') {
                         getyx(stdscr, y, x);
-                        if (y >= rows - 2) {
+                        if (y >= history_stop_y) {
                             break;
                         }
-                        attron(COLOR_PAIR(4)); //feel free to change this to any value you want
-                        printw("| S%d      DSD-neo: %s \n", slot + 1, item->internal_str);
+                        attron(COLOR_PAIR(4));
+                        printw("|[%d] \\-- DSD-neo: %s \n", slot + 1, item->internal_str);
                         attron(COLOR_PAIR(4));
                     }
                 }
@@ -2736,7 +2838,9 @@ ncursesPrinter(dsd_opts* opts, dsd_state* state) {
         }
     }
 
-    ui_print_hr();
+    if (history_draw_footer || history_mode == 0) {
+        ui_print_hr();
+    }
     attroff(COLOR_PAIR(4)); //cyan for history
 
     wnoutrefresh(stdscr);
@@ -2745,7 +2849,4 @@ ncursesPrinter(dsd_opts* opts, dsd_state* state) {
     if (ui_menu_is_open()) {
         ui_menu_tick(opts, state);
     }
-
-    //handle input
-    ncurses_input_handler(opts, state, c);
 }

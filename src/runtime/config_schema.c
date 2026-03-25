@@ -12,14 +12,13 @@
 
 #include <dsd-neo/platform/posix_compat.h>
 #include <dsd-neo/runtime/config_schema.h>
-
+#include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 
 /* Schema data for all configuration keys */
 static const dsdcfg_schema_entry_t s_schema[] = {
     /* [input] section */
-    {"input", "source", "Input source type", "pulse", "pulse|rtl|rtltcp|file|tcp|udp", DSDCFG_TYPE_ENUM, 0, 0, 0},
+    {"input", "source", "Input source type", "pulse", "pulse|rtl|rtltcp|soapy|file|tcp|udp", DSDCFG_TYPE_ENUM, 0, 0, 0},
     {"input", "pulse_source", "PulseAudio source device name", "", NULL, DSDCFG_TYPE_STRING, 0, 0, 0},
     {"input", "pulse_input", "PulseAudio input device (alias for pulse_source)", "", NULL, DSDCFG_TYPE_STRING, 0, 0,
      1}, /* deprecated alias */
@@ -30,11 +29,13 @@ static const dsdcfg_schema_entry_t s_schema[] = {
     {"input", "rtl_bw_khz", "RTL-SDR DSP bandwidth in kHz", "48", NULL, DSDCFG_TYPE_INT, 4, 48, 0},
     {"input", "rtl_sql", "RTL-SDR squelch level in dB (0 to disable)", "0", NULL, DSDCFG_TYPE_INT, -100, 0, 0},
     {"input", "rtl_volume", "RTL-SDR volume multiplier", "2", NULL, DSDCFG_TYPE_INT, 1, 3, 0},
-    {"input", "auto_ppm", "Enable spectrum-based RTL auto-PPM correction", "false", NULL, DSDCFG_TYPE_BOOL, 0, 0, 0},
-    {"input", "rtl_auto_ppm", "Enable spectrum-based RTL auto-PPM correction (alias for auto_ppm)", "false", NULL,
+    {"input", "auto_ppm", "Enable carrier/error-based RTL auto-PPM correction", "false", NULL, DSDCFG_TYPE_BOOL, 0, 0,
+     0},
+    {"input", "rtl_auto_ppm", "Enable carrier/error-based RTL auto-PPM correction (alias for auto_ppm)", "false", NULL,
      DSDCFG_TYPE_BOOL, 0, 0, 1}, /* deprecated alias */
     {"input", "rtltcp_host", "RTL-TCP server hostname or IP", "127.0.0.1", NULL, DSDCFG_TYPE_STRING, 0, 0, 0},
     {"input", "rtltcp_port", "RTL-TCP server port", "1234", NULL, DSDCFG_TYPE_INT, 1, 65535, 0},
+    {"input", "soapy_args", "SoapySDR device selection args string", "", NULL, DSDCFG_TYPE_STRING, 0, 0, 0},
     {"input", "file_path", "Input audio file path", "", NULL, DSDCFG_TYPE_PATH, 0, 0, 0},
     {"input", "file_sample_rate", "Input file sample rate in Hz", "48000", NULL, DSDCFG_TYPE_INT, 8000, 192000, 0},
     {"input", "tcp_host", "TCP direct input hostname", "127.0.0.1", NULL, DSDCFG_TYPE_STRING, 0, 0, 0},
@@ -67,12 +68,21 @@ static const dsdcfg_schema_entry_t s_schema[] = {
 
     /* [logging] section */
     {"logging", "event_log", "Event history log file path", "", NULL, DSDCFG_TYPE_PATH, 0, 0, 0},
+    {"logging", "frame_log", "Frame trace log file path", "", NULL, DSDCFG_TYPE_PATH, 0, 0, 0},
 
     /* [recording] section */
     {"recording", "per_call_wav", "Enable per-call WAV output", "false", NULL, DSDCFG_TYPE_BOOL, 0, 0, 0},
     {"recording", "per_call_wav_dir", "Per-call WAV output directory", "./WAV", NULL, DSDCFG_TYPE_PATH, 0, 0, 0},
     {"recording", "static_wav", "Static decoded voice WAV output file", "", NULL, DSDCFG_TYPE_PATH, 0, 0, 0},
     {"recording", "raw_wav", "Raw (48 kHz) audio WAV output file", "", NULL, DSDCFG_TYPE_PATH, 0, 0, 0},
+    {"recording", "rdio_mode", "rdio-scanner export mode", "off", "off|dirwatch|api|both", DSDCFG_TYPE_ENUM, 0, 0, 0},
+    {"recording", "rdio_system_id", "rdio-scanner numeric system ID", "0", NULL, DSDCFG_TYPE_INT, 0, 65535, 0},
+    {"recording", "rdio_api_url", "rdio-scanner API base URL", "http://127.0.0.1:3000", NULL, DSDCFG_TYPE_STRING, 0, 0,
+     0},
+    {"recording", "rdio_api_key", "rdio-scanner API key", "", NULL, DSDCFG_TYPE_STRING, 0, 0, 0},
+    {"recording", "rdio_upload_timeout_ms", "rdio API upload timeout in milliseconds", "5000", NULL, DSDCFG_TYPE_INT,
+     100, 120000, 0},
+    {"recording", "rdio_upload_retries", "rdio API upload attempts per call", "1", NULL, DSDCFG_TYPE_INT, 0, 10, 0},
 
     /* [dsp] section */
     {"dsp", "iq_balance", "Enable RTL IQ balance (image suppression)", "false", NULL, DSDCFG_TYPE_BOOL, 0, 0, 0},

@@ -24,6 +24,11 @@
 
 #include <dsd-neo/dsp/p25p1_heuristics.h>
 
+enum {
+    DSD_P25_P2_AUDIO_RING_DEPTH = 4,
+    DSD_VERTEX_KS_MAP_MAX = 64,
+};
+
 /* Forward declaration for mbelib decoder state (opaque in public API). */
 struct mbe_parameters;
 typedef struct mbe_parameters mbe_parms;
@@ -568,8 +573,8 @@ struct dsd_state {
     // P25p2 per-slot audio gating (set on MAC_PTT/ACTIVE, cleared on MAC_END/IDLE/SIGNAL)
     int p25_p2_audio_allowed[2];
     // P25p2 small output jitter buffers (per-slot ring of decoded 20 ms frames)
-    // Depth 3 per checklist to bound latency (~60 ms max)
-    float p25_p2_audio_ring[2][3][160];
+    // Depth DSD_P25_P2_AUDIO_RING_DEPTH to match drain behavior (~80 ms max at depth=4)
+    float p25_p2_audio_ring[2][DSD_P25_P2_AUDIO_RING_DEPTH][160];
     int p25_p2_audio_ring_head[2]; // pop index
     int p25_p2_audio_ring_tail[2]; // push index
     int p25_p2_audio_ring_count[2];
@@ -607,8 +612,9 @@ struct dsd_state {
     uint32_t p25_p2_enc_pending_ttg[2];
 
     //iden freq storage for frequency calculations
-    int p25_chan_tdma[16];              // set from iden_up vs iden_up_tdma (bit0 = TDMA flag)
-    uint8_t p25_chan_tdma_explicit[16]; // 0=unknown, 1=explicit FDMA, 2=explicit TDMA
+    int p25_chan_tdma[16];                  // set from iden_up vs iden_up_tdma (bit0 = TDMA flag)
+    uint8_t p25_chan_tdma_explicit[16];     // 0=unknown, 1=explicit FDMA, 2=explicit TDMA
+    uint8_t p25_lcw_retune_disabled_warned; // 1 once "LCW retune disabled" warning emitted
     int p25_chan_iden;
     int p25_chan_type[16];
     int p25_trans_off[16];
@@ -814,6 +820,10 @@ struct dsd_state {
     uint8_t nxdn_sacch_frame_segcrc[4];
     uint8_t nxdn_alias_block_number;
     char nxdn_alias_block_segment[4][4][8];
+    uint8_t nxdn_alias_arib_total_segments;
+    uint8_t nxdn_alias_arib_seen_mask;
+    uint8_t nxdn_alias_arib_segments[4][6];
+    uint8_t nxdn_dcr_sf_message_type; // DCR SACCH2 SF message type; 0xFF means unknown.
 
     //site/srv/cch info
 
@@ -908,6 +918,9 @@ struct dsd_state {
     int tyt_ap;
     int tyt_bp;
     int tyt_ep;
+    int baofeng_ap;
+    int csi_ee;
+    uint8_t csi_ee_key[9];
     // retrevis rc2
     int retevis_ap;
 
@@ -920,9 +933,24 @@ struct dsd_state {
     //generic ks
     int straight_ks;
     int straight_mod;
+    int straight_frame_mode; //0=legacy continuous bitstream, 1=frame-aligned (offset/step)
+    int straight_frame_off;  //frame-aligned start offset (bits)
+    int straight_frame_step; //frame-aligned per-frame step (bits)
 
     uint8_t static_ks_bits[2][882];
     int static_ks_counter[2];
+
+    // Vertex ALG 0x07 interim key->keystream mapping table.
+    unsigned long long vertex_ks_key[DSD_VERTEX_KS_MAP_MAX];
+    uint8_t vertex_ks_bits[DSD_VERTEX_KS_MAP_MAX][882];
+    int vertex_ks_mod[DSD_VERTEX_KS_MAP_MAX];
+    int vertex_ks_frame_mode[DSD_VERTEX_KS_MAP_MAX];
+    int vertex_ks_frame_off[DSD_VERTEX_KS_MAP_MAX];
+    int vertex_ks_frame_step[DSD_VERTEX_KS_MAP_MAX];
+    int vertex_ks_count;
+    int vertex_ks_active_idx[2];
+    int vertex_ks_counter[2];
+    uint8_t vertex_ks_warned[2];
 
     // DMR: consecutive EMB decode failures per slot (hysteresis for robustness)
     uint8_t dmr_emb_err[2];

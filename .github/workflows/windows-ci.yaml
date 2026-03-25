@@ -22,13 +22,11 @@ jobs:
       VCPKG_DEFAULT_TRIPLET: x64-windows-dynamic-release
       VCPKG_TARGET_TRIPLET: x64-windows-dynamic-release
       VCPKG_OVERLAY_TRIPLETS: ${{ github.workspace }}\vcpkg-triplets
-      # Enable vcpkg binary caching on GitHub Actions cache.
-      VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
       # Enable sccache GitHub Actions backend.
       SCCACHE_GHA_ENABLED: "true"
     steps:
       - name: Checkout
-        uses: actions/checkout@v6.0.1
+        uses: actions/checkout@v6.0.2
 
       - name: Run sccache-cache
         uses: mozilla-actions/sccache-action@v0.0.9
@@ -45,8 +43,9 @@ jobs:
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@v11.5
         with:
-          # run-vcpkg v11.5 requires a full 40-char SHA1; update as needed.
-          vcpkgGitCommitId: "b5b449f0bb37fbad60171245eb323e08e892e8d7"
+          # run-vcpkg v11.5 requires a full 40-char SHA1.
+          # Keep this in sync with vcpkg.json's builtin-baseline.
+          vcpkgGitCommitId: "c3867e714dd3a51c272826eea77267876517ed99"
 
       - name: Install vcpkg dependencies (MSVC)
         shell: pwsh
@@ -55,7 +54,12 @@ jobs:
       - name: Configure (MSVC Release)
         shell: pwsh
         # Use Ninja generator (override preset) so CMAKE_*_COMPILER_LAUNCHER works with sccache
-        run: cmake --preset win-msvc-release -G Ninja -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
+        run: |
+          cmake --preset win-msvc-release -G Ninja `
+            -DCMAKE_C_COMPILER_LAUNCHER=sccache `
+            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache `
+            -DDSD_REQUIRE_RTLSDR=ON `
+            -DDSD_REQUIRE_SOAPYSDR=ON
 
       - name: Build (MSVC Release)
         shell: pwsh
@@ -152,7 +156,7 @@ jobs:
           & $exe -h
 
       - name: Upload native MSVC artifact
-        uses: actions/upload-artifact@v6.0.0
+        uses: actions/upload-artifact@v7.0.0
         with:
           name: ${{ steps.zip.outputs.ART_NAME }}
           path: ${{ steps.zip.outputs.ZIP_PATH }}
@@ -160,7 +164,7 @@ jobs:
 
       - name: Upload native MSVC release asset
         if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2.5.0
+        uses: softprops/action-gh-release@v2.6.1
         with:
           files: ${{ steps.zip.outputs.ZIP_PATH }}
 
@@ -183,14 +187,12 @@ jobs:
       # Use a release-only triplet to avoid building debug variants of vcpkg deps.
       VCPKG_DEFAULT_TRIPLET: x64-mingw-dynamic-release
       VCPKG_TARGET_TRIPLET: x64-mingw-dynamic-release
-      # Enable vcpkg binary caching on GitHub Actions cache.
-      VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
       # Enable sccache GitHub Actions backend.
       SCCACHE_GHA_ENABLED: "true"
       VCPKG_OVERLAY_TRIPLETS: ${{ github.workspace }}\vcpkg-triplets
     steps:
       - name: Checkout
-        uses: actions/checkout@v6.0.1
+        uses: actions/checkout@v6.0.2
 
       - name: Run sccache-cache
         uses: mozilla-actions/sccache-action@v0.0.9
@@ -220,8 +222,9 @@ jobs:
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@v11.5
         with:
-          # run-vcpkg v11.5 requires a full 40-char SHA1; update as needed.
-          vcpkgGitCommitId: "b5b449f0bb37fbad60171245eb323e08e892e8d7"
+          # run-vcpkg v11.5 requires a full 40-char SHA1.
+          # Keep this in sync with vcpkg.json's builtin-baseline.
+          vcpkgGitCommitId: "c3867e714dd3a51c272826eea77267876517ed99"
 
       - name: Install vcpkg dependencies (MinGW)
         shell: msys2 {0}
@@ -241,7 +244,9 @@ jobs:
           SCCACHE_EXE="$(cygpath -u "$SCCACHE_PATH")"
           cmake --preset win-mingw-release -G Ninja \
             -DCMAKE_C_COMPILER_LAUNCHER="$SCCACHE_EXE" \
-            -DCMAKE_CXX_COMPILER_LAUNCHER="$SCCACHE_EXE"
+            -DCMAKE_CXX_COMPILER_LAUNCHER="$SCCACHE_EXE" \
+            -DDSD_REQUIRE_RTLSDR=ON \
+            -DDSD_REQUIRE_SOAPYSDR=ON
 
       - name: Build (MinGW Release)
         shell: msys2 {0}
@@ -348,7 +353,7 @@ jobs:
           & $exe -h
 
       - name: Upload native MinGW artifact
-        uses: actions/upload-artifact@v6.0.0
+        uses: actions/upload-artifact@v7.0.0
         with:
           name: ${{ steps.zip.outputs.ART_NAME }}
           path: ${{ steps.zip.outputs.ZIP_PATH }}
@@ -356,7 +361,7 @@ jobs:
 
       - name: Upload native MinGW release asset
         if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2.5.0
+        uses: softprops/action-gh-release@v2.6.1
         with:
           files: ${{ steps.zip.outputs.ZIP_PATH }}
 

@@ -14,12 +14,11 @@
 
 #include <algorithm>
 #include <atomic>
-#include <chrono>
-#include <dsd-neo/core/audio.h>
+// IWYU pragma: no_include <bits/chrono.h>
+#include <chrono> // IWYU pragma: keep
 #include <dsd-neo/core/constants.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/power.h>
-#include <dsd-neo/core/state.h>
 #include <dsd-neo/dsp/costas.h>
 #include <dsd-neo/dsp/demod_pipeline.h>
 #include <dsd-neo/dsp/demod_state.h>
@@ -30,7 +29,6 @@
 #include <dsd-neo/dsp/ted.h>
 #include <dsd-neo/io/rtl_demod_config.h>
 #include <dsd-neo/io/rtl_device.h>
-#include <dsd-neo/io/rtl_metrics.h>
 #include <dsd-neo/io/rtl_stream_c.h>
 #include <dsd-neo/io/udp_control.h>
 #include <dsd-neo/platform/posix_compat.h>
@@ -45,18 +43,19 @@
 #include <dsd-neo/runtime/rt_sched.h>
 #include <dsd-neo/runtime/threading.h>
 #include <dsd-neo/runtime/unicode.h>
-#include <dsd-neo/runtime/worker_pool.h>
-#include <errno.h>
 #include <limits.h>
 #include <math.h>
+#include <mutex>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#if DSD_PLATFORM_POSIX
-#include <unistd.h>
-#endif
-#include <vector>
+
+#include "dsd-neo/core/opts_fwd.h"
+#include "dsd-neo/core/state_fwd.h"
+#include "dsd-neo/platform/platform.h"
+#include "rtl_auto_ppm.h"
+#include "rtl_ppm_request.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -171,7 +170,8 @@ struct dongle_state {
     uint32_t rate;
     int gain;
     uint32_t buf_len;
-    int ppm_error;
+    /* Last PPM value successfully applied to hardware. */
+    std::atomic<int> ppm_error;
     int offset_tuning;
     int direct_sampling;
     std::atomic<int> mute;
@@ -196,6 +196,20 @@ struct controller_state {
     /* Marshalled retune request from external threads (UDP/API). */
     std::atomic<int> manual_retune_pending;
     uint32_t manual_retune_freq;
+    /* Marshalled PPM correction updates stay on the controller thread so
+     * device controls remain serialized with retunes/hops. */
+    std::atomic<int> ppm_change_pending;
+    std::atomic<int> pending_ppm_error;
+    std::atomic<uint32_t> ppm_request_publish_seq;
+    std::atomic<uint32_t> pending_ppm_request_seq;
+    std::atomic<int> ppm_apply_in_progress;
+    std::atomic<int> active_ppm_error;
+    std::atomic<uint32_t> active_ppm_request_seq;
+    /* Reconcile rejected PPM requests back on the read thread without
+     * overwriting a newer request that arrived after the failure. */
+    std::atomic<int> ppm_apply_failure_pending;
+    std::atomic<int> failed_ppm_error;
+    std::atomic<uint32_t> failed_ppm_request_seq;
     /* Cold start gate: demod thread skips CQPSK until controller signals ready.
      * This prevents the race where demod processes samples with uninitialized
      * TED/Costas state before the controller finishes cold start configuration. */
@@ -215,6 +229,12 @@ struct controller_state {
     /* Request ID for matching completion signals to requests (prevents stale wakeups) */
     std::atomic<uint32_t> retune_request_id;
     std::atomic<uint32_t> retune_complete_id;
+    /* Last center frequency successfully applied by the controller thread. */
+    std::atomic<uint32_t> last_applied_freq_hz;
+    /* Completed capture reconfigure generation. This lets consumer-side
+     * holdoffs reset even when the tuned center frequency remains unchanged
+     * (for example, live PPM correction on the active stream). */
+    std::atomic<uint32_t> reconfigure_seq;
 };
 
 struct rtl_device* rtl_device_handle = NULL;
@@ -225,6 +245,7 @@ struct controller_state controller;
 static struct input_ring_state input_ring;
 /* Controller can request a ring purge; consumer/demod performs the discard safely. */
 static std::atomic<int> g_ring_purge_pending{0};
+static dsd::io::radio::RtlAutoPpmController g_auto_ppm_controller;
 
 struct RtlSdrInternals {
     struct rtl_device* device;
@@ -235,12 +256,253 @@ struct RtlSdrInternals {
     struct input_ring_state* input_ring;
     struct udp_control** udp_ctrl_ptr;
     const dsd_opts* opts; /* snapshot for mode hints (P25p1/2, etc.) */
-    const dsdneoRuntimeConfig* cfg;
     /* Cooperative shutdown flag for threads launched by this stream */
     std::atomic<int> should_exit;
 };
 
 static struct RtlSdrInternals* g_stream = NULL;
+/* Keep the requested PPM value and its logical request generation paired so
+ * UI and read-thread activity cannot observe mixed snapshots. */
+static std::mutex g_requested_ppm_state_mutex;
+
+struct RtlRequestedPpmMirrors {
+    dsd_opts* active_opts = NULL;
+    dsd_opts* caller_opts = NULL;
+};
+
+static RtlRequestedPpmMirrors g_requested_ppm_mirrors = {};
+
+enum RadioSourceKind {
+    RADIO_SOURCE_RTL_USB = 0,
+    RADIO_SOURCE_RTL_TCP = 1,
+    RADIO_SOURCE_SOAPY = 2,
+};
+
+static RadioSourceKind
+detect_radio_source(const dsd_opts* opts) {
+    const char* dev = (opts) ? opts->audio_in_dev : NULL;
+    if (!dev) {
+        return RADIO_SOURCE_RTL_USB;
+    }
+    if ((strcmp(dev, "rtltcp") == 0) || (strncmp(dev, "rtltcp:", 7) == 0)) {
+        return RADIO_SOURCE_RTL_TCP;
+    }
+    if ((strcmp(dev, "soapy") == 0) || (strncmp(dev, "soapy:", 6) == 0)) {
+        return RADIO_SOURCE_SOAPY;
+    }
+    return RADIO_SOURCE_RTL_USB;
+}
+
+static int
+radio_source_is_rtltcp(const dsd_opts* opts) {
+    return detect_radio_source(opts) == RADIO_SOURCE_RTL_TCP;
+}
+
+static int
+radio_source_is_soapy(const dsd_opts* opts) {
+    return detect_radio_source(opts) == RADIO_SOURCE_SOAPY;
+}
+
+static const char*
+radio_source_soapy_args(const dsd_opts* opts) {
+    if (!radio_source_is_soapy(opts) || !opts) {
+        return "";
+    }
+    const char* colon = strchr(opts->audio_in_dev, ':');
+    if (!colon || colon[1] == '\0') {
+        return "";
+    }
+    return colon + 1;
+}
+
+static void
+log_unsupported_control_if_needed(const char* control_name, int rc) {
+    if (rc == DSD_ERR_NOT_SUPPORTED) {
+        LOG_NOTICE("%s unsupported by active radio backend.\n", control_name);
+    }
+}
+
+static int
+apply_ppm_setting(int ppm_error) {
+    int rc = rtl_device_set_ppm(rtl_device_handle, ppm_error);
+    log_unsupported_control_if_needed("PPM correction control", rc);
+    return rc;
+}
+
+static inline int
+load_dongle_ppm_error(void) {
+    return dongle.ppm_error.load(std::memory_order_acquire);
+}
+
+static inline void
+store_dongle_ppm_error(int ppm_error) {
+    dongle.ppm_error.store(ppm_error, std::memory_order_release);
+}
+
+static inline int
+clamp_requested_ppm(int ppm_error) {
+    if (ppm_error < -200) {
+        return -200;
+    }
+    if (ppm_error > 200) {
+        return 200;
+    }
+    return ppm_error;
+}
+
+static const dsd_opts*
+requested_ppm_source_opts_locked(const dsd_opts* fallback_opts) {
+    if (g_requested_ppm_mirrors.active_opts) {
+        return g_requested_ppm_mirrors.active_opts;
+    }
+    if (g_requested_ppm_mirrors.caller_opts) {
+        return g_requested_ppm_mirrors.caller_opts;
+    }
+    return fallback_opts;
+}
+
+static void
+sync_requested_ppm_snapshots_locked(dsd_opts* touched_opts, int ppm_error) {
+    int clamped_ppm = clamp_requested_ppm(ppm_error);
+    if (g_requested_ppm_mirrors.active_opts) {
+        g_requested_ppm_mirrors.active_opts->rtlsdr_ppm_error = clamped_ppm;
+    }
+    if (g_requested_ppm_mirrors.caller_opts
+        && g_requested_ppm_mirrors.caller_opts != g_requested_ppm_mirrors.active_opts) {
+        g_requested_ppm_mirrors.caller_opts->rtlsdr_ppm_error = clamped_ppm;
+    }
+    if (touched_opts && touched_opts != g_requested_ppm_mirrors.active_opts
+        && touched_opts != g_requested_ppm_mirrors.caller_opts) {
+        touched_opts->rtlsdr_ppm_error = clamped_ppm;
+    }
+}
+
+extern "C" void
+dsd_rtl_stream_register_requested_ppm_opts(dsd_opts* active_opts, dsd_opts* caller_opts) {
+    if (!active_opts) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_requested_ppm_state_mutex);
+    g_requested_ppm_mirrors.active_opts = active_opts;
+    g_requested_ppm_mirrors.caller_opts = caller_opts ? caller_opts : active_opts;
+    int initial_ppm = caller_opts ? caller_opts->rtlsdr_ppm_error : active_opts->rtlsdr_ppm_error;
+    sync_requested_ppm_snapshots_locked(active_opts, initial_ppm);
+}
+
+extern "C" void
+dsd_rtl_stream_unregister_requested_ppm_opts(dsd_opts* active_opts, dsd_opts* caller_opts) {
+    if (!active_opts) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_requested_ppm_state_mutex);
+    dsd_opts* expected_caller_opts = caller_opts ? caller_opts : active_opts;
+    if (g_requested_ppm_mirrors.active_opts == active_opts
+        && g_requested_ppm_mirrors.caller_opts == expected_caller_opts) {
+        g_requested_ppm_mirrors.active_opts = NULL;
+        g_requested_ppm_mirrors.caller_opts = NULL;
+    }
+}
+
+struct RtlRequestedPpmState {
+    int ppm = 0;
+    uint32_t request_id = 0;
+};
+
+static RtlRequestedPpmState
+snapshot_requested_ppm_state(const dsd_opts* opts) {
+    RtlRequestedPpmState snapshot = {};
+    std::lock_guard<std::mutex> lock(g_requested_ppm_state_mutex);
+    const dsd_opts* source_opts = requested_ppm_source_opts_locked(opts);
+    if (!source_opts) {
+        return snapshot;
+    }
+    snapshot.ppm = source_opts->rtlsdr_ppm_error;
+    snapshot.request_id = controller.ppm_request_publish_seq.load(std::memory_order_relaxed);
+    return snapshot;
+}
+
+static uint32_t
+publish_requested_ppm(dsd_opts* opts, int ppm_error) {
+    if (!opts) {
+        return 0;
+    }
+    std::lock_guard<std::mutex> lock(g_requested_ppm_state_mutex);
+    sync_requested_ppm_snapshots_locked(opts, ppm_error);
+    uint32_t request_id = controller.ppm_request_publish_seq.fetch_add(1U, std::memory_order_relaxed) + 1U;
+    return request_id;
+}
+
+static uint32_t
+publish_requested_ppm_delta(dsd_opts* opts, int delta) {
+    if (!opts) {
+        return 0;
+    }
+    std::lock_guard<std::mutex> lock(g_requested_ppm_state_mutex);
+    const dsd_opts* source_opts = requested_ppm_source_opts_locked(opts);
+    int requested_ppm = source_opts ? source_opts->rtlsdr_ppm_error : 0;
+    sync_requested_ppm_snapshots_locked(opts, requested_ppm + delta);
+    uint32_t request_id = controller.ppm_request_publish_seq.fetch_add(1U, std::memory_order_relaxed) + 1U;
+    return request_id;
+}
+
+static int
+rollback_requested_ppm_if_latest(dsd_opts* opts, int applied_ppm, uint32_t failed_request_id) {
+    if (!opts) {
+        return 0;
+    }
+    std::lock_guard<std::mutex> lock(g_requested_ppm_state_mutex);
+    if (controller.ppm_request_publish_seq.load(std::memory_order_relaxed) != failed_request_id) {
+        return 0;
+    }
+    sync_requested_ppm_snapshots_locked(opts, applied_ppm);
+    controller.ppm_request_publish_seq.store(failed_request_id + 1U, std::memory_order_relaxed);
+    return 1;
+}
+
+static void
+note_failed_ppm_request(int requested_ppm, uint32_t request_id, int applied_ppm, int rc) {
+    controller.failed_ppm_error.store(requested_ppm, std::memory_order_release);
+    controller.failed_ppm_request_seq.store(request_id, std::memory_order_release);
+    controller.ppm_apply_failure_pending.store(1, std::memory_order_release);
+    LOG_NOTICE("PPM correction request %d failed (rc=%d); keeping applied value %d.\n", requested_ppm, rc, applied_ppm);
+}
+
+static void
+sync_requested_ppm_after_failed_apply(dsd_opts* opts) {
+    if (!opts) {
+        return;
+    }
+    if (!controller.ppm_apply_failure_pending.exchange(0, std::memory_order_acq_rel)) {
+        return;
+    }
+
+    int applied_ppm = load_dongle_ppm_error();
+    RtlRequestedPpmState requested = snapshot_requested_ppm_state(opts);
+    uint32_t failed_request_id = controller.failed_ppm_request_seq.load(std::memory_order_acquire);
+    dsd::io::radio::RtlPpmRejectedRequestResolution resolution = dsd::io::radio::rtl_ppm_resolve_rejected_request(
+        applied_ppm, requested.ppm, requested.request_id, failed_request_id);
+    if (resolution.rolled_back) {
+        (void)rollback_requested_ppm_if_latest(opts, resolution.requested_ppm, failed_request_id);
+    }
+}
+
+static dsd::io::radio::RtlPpmControllerRequestsSnapshot
+snapshot_controller_ppm_request_state(void) {
+    dsd::io::radio::RtlPpmControllerRequestsSnapshot snapshot = {};
+    dsd_mutex_lock(&controller.hop_m);
+    snapshot.active_request.pending = controller.ppm_apply_in_progress.load(std::memory_order_acquire);
+    if (snapshot.active_request.pending) {
+        snapshot.active_request.ppm = controller.active_ppm_error.load(std::memory_order_acquire);
+        snapshot.active_request.request_id = controller.active_ppm_request_seq.load(std::memory_order_acquire);
+    }
+    snapshot.queued_request.pending = controller.ppm_change_pending.load(std::memory_order_acquire);
+    if (snapshot.queued_request.pending) {
+        snapshot.queued_request.ppm = controller.pending_ppm_error.load(std::memory_order_acquire);
+        snapshot.queued_request.request_id = controller.pending_ppm_request_seq.load(std::memory_order_acquire);
+    }
+    dsd_mutex_unlock(&controller.hop_m);
+    return snapshot;
+}
 
 static inline int
 debug_cqpsk_enabled(void) {
@@ -481,7 +743,7 @@ demod_reset_on_retune(struct demod_state* s) {
             s->resamp_phase = 0;
             s->resamp_hist_head = 0;
             if (s->resamp_hist && s->resamp_taps_per_phase > 0) {
-                memset(s->resamp_hist, 0, (size_t)s->resamp_taps_per_phase * sizeof(float));
+                memset(s->resamp_hist, 0, (size_t)s->resamp_taps_per_phase * 2U * sizeof(float));
             }
             /* Reset timing/carrier loops for the new symbol rate. */
             ted_init_state(&s->ted_state);
@@ -660,7 +922,7 @@ demod_reset_on_retune(struct demod_state* s) {
         s->resamp_phase = 0;
         s->resamp_hist_head = 0;
         if (s->resamp_hist && s->resamp_taps_per_phase > 0) {
-            memset(s->resamp_hist, 0, (size_t)s->resamp_taps_per_phase * sizeof(float));
+            memset(s->resamp_hist, 0, (size_t)s->resamp_taps_per_phase * 2U * sizeof(float));
         }
     }
 
@@ -683,21 +945,6 @@ demod_reset_on_retune(struct demod_state* s) {
     }
 }
 
-/**
- * @brief Demodulation worker: consume input ring, run pipeline, and produce audio.
- *
- * Reads baseband I/Q blocks from the input ring, invokes the full demodulation
- * pipeline, and writes audio samples to the output ring with optional
- * resampling or legacy upsampling. Runs until global exit flag is set.
- *
- * @param arg Pointer to `demod_state`.
- * @return NULL on exit.
- */
-/* SNR buffers for different modulations
- * NOTE: These are updated from the demod thread and read from the UI thread.
- * Use atomics to avoid data races and stale reads. Relaxed ordering is
- * sufficient because we only need value coherence, not synchronization. */
-#include <atomic>
 std::atomic<double> g_snr_c4fm_db{-100.0};
 std::atomic<double> g_snr_qpsk_db{-100.0};
 std::atomic<double> g_snr_gfsk_db{-100.0};
@@ -777,6 +1024,9 @@ dsd_rtl_stream_get_snr_bias_evm(void) {
 
 /* Fwd decl: spectrum snapshot getter used for spectral SNR gating */
 extern "C" int dsd_rtl_stream_spectrum_get(float* out_db, int max_bins, int* out_rate);
+extern "C" double dsd_rtl_stream_get_cfo_hz(void);
+extern "C" double dsd_rtl_stream_get_residual_cfo_hz(void);
+extern "C" int dsd_rtl_stream_get_carrier_lock(void);
 /* Tuner autogain runtime get/set (implemented in rtl_sdr_fm.cpp) */
 extern "C" int dsd_rtl_stream_get_tuner_autogain(void);
 extern "C" void dsd_rtl_stream_set_tuner_autogain(int onoff);
@@ -809,6 +1059,7 @@ static DSD_THREAD_RETURN_TYPE
     static auto ag_hold_until = std::chrono::steady_clock::time_point{};
     static auto ag_probe_until = std::chrono::steady_clock::time_point{};
     static uint32_t ag_last_freq = 0;
+    static uint32_t ag_last_reconfigure_seq = 0;
     const int ag_throttle_ms = 1500; /* min interval between changes */
     const int ag_hold_ms = 1200;     /* pause after retune/scanning before adjusting */
     /* Up-step gating: now uses spectral SNR + in-band power ratio (see below). */
@@ -822,7 +1073,19 @@ static DSD_THREAD_RETURN_TYPE
     static int s_ag_up_step_db10 = 30;      /* up-step size in tenth-dB (default +3.0 dB) */
     static int s_ag_up_persist = 2;         /* require consecutive passes before stepping up */
     static int ag_spec_pass = 0;            /* persistence counter for spectral gate */
-    const int is_rtltcp_input = (g_stream && g_stream->opts && g_stream->opts->rtltcp_enabled) ? 1 : 0;
+    const int is_rtltcp_input = (g_stream && radio_source_is_rtltcp(g_stream->opts)) ? 1 : 0;
+    auto reset_autogain_window = [&](uint32_t current_freq_hz, uint32_t current_reconfigure_seq) {
+        ag_last_freq = current_freq_hz;
+        ag_last_reconfigure_seq = current_reconfigure_seq;
+        ag_blocks = ag_high = ag_low = 0;
+        ag_hold_until = std::chrono::steady_clock::now() + std::chrono::milliseconds(ag_hold_ms);
+        if (s_probe_ms > 0) {
+            ag_probe_until = std::chrono::steady_clock::now() + std::chrono::milliseconds(s_probe_ms);
+        } else {
+            ag_probe_until = std::chrono::steady_clock::time_point{};
+        }
+        ag_spec_pass = 0;
+    };
     while (!exitflag && !(g_stream && g_stream->should_exit.load())) {
         /* Preserve rtltcp prebuffer: hold the consumer until cold start finishes. */
         if (is_rtltcp_input && !controller.cold_start_ready.load(std::memory_order_acquire)) {
@@ -834,13 +1097,26 @@ static DSD_THREAD_RETURN_TYPE
             input_ring_discard_all_consumer(&input_ring);
             continue;
         }
+        /* Freeze the consumer while the controller is reconfiguring the
+         * capture path. Successful reconfigures request a purge before this
+         * gate is released; rejected live PPM updates simply resume. */
+        if (controller.retune_in_progress.load(std::memory_order_acquire)) {
+            dsd_sleep_ms(1);
+            continue;
+        }
         /* Read a block from input ring */
         int got = input_ring_read_block(&input_ring, d->input_cb_buf, static_cast<size_t>(MAXIMUM_BUF_LENGTH));
         if (got <= 0) {
             continue;
         }
+        /* Recheck after the blocking read in case the controller armed a
+         * reconfigure or queued a purge while we were waiting for input. */
+        if (controller.retune_in_progress.load(std::memory_order_acquire)
+            || g_ring_purge_pending.load(std::memory_order_acquire)) {
+            continue;
+        }
         if (!ag_initialized) {
-            const dsdneoRuntimeConfig* cfg = (g_stream && g_stream->cfg) ? g_stream->cfg : dsd_neo_get_config();
+            const dsdneoRuntimeConfig* cfg = dsd_neo_get_config();
             if (cfg) {
                 g_tuner_autogain_on.store(cfg->tuner_autogain_enable ? 1 : 0, std::memory_order_relaxed);
                 s_probe_ms = cfg->tuner_autogain_probe_ms;
@@ -854,18 +1130,12 @@ static DSD_THREAD_RETURN_TYPE
         }
         /* Update simple occupancy metrics on pre-DSP input for autogain */
         if (g_tuner_autogain_on.load(std::memory_order_relaxed)) {
-            /* Detect retune and apply short holdoff to avoid reacting on noise */
-            if (ag_last_freq != dongle.freq) {
-                ag_last_freq = dongle.freq;
-                ag_blocks = ag_high = ag_low = 0;
-                ag_hold_until = std::chrono::steady_clock::now() + std::chrono::milliseconds(ag_hold_ms);
-                /* On retune, defer any takeover to allow device auto to settle */
-                if (s_probe_ms > 0) {
-                    ag_probe_until = std::chrono::steady_clock::now() + std::chrono::milliseconds(s_probe_ms);
-                } else {
-                    ag_probe_until = std::chrono::steady_clock::time_point{};
-                }
-                ag_spec_pass = 0; /* reset spectral gate persistence on retune */
+            uint32_t current_freq_hz = dongle.freq;
+            uint32_t current_reconfigure_seq = controller.reconfigure_seq.load(std::memory_order_acquire);
+            /* Detect retunes, including same-frequency reconfigures such as a
+             * live PPM correction, and apply the normal post-retune holdoff. */
+            if (ag_last_freq != current_freq_hz || ag_last_reconfigure_seq != current_reconfigure_seq) {
+                reset_autogain_window(current_freq_hz, current_reconfigure_seq);
             }
             float max_abs = 0.0f;
             double sum_abs = 0.0;
@@ -1082,10 +1352,9 @@ static DSD_THREAD_RETURN_TYPE
         if (!controller.cold_start_ready.load(std::memory_order_acquire)) {
             continue;
         }
-        /* Gate: skip demod processing while a retune is in progress.
-         * This prevents the race where we process transient/stale samples during
-         * hardware retune before TED/AGC/filters are reset for the new frequency.
-         * Applies to all modulations (C4FM, GFSK, QPSK, etc). */
+        /* Recheck at the last possible point before demodulation so a
+         * controller-side retune or same-frequency live PPM reconfigure
+         * cannot race with demod_reset_on_retune() mutating shared state. */
         if (controller.retune_in_progress.load(std::memory_order_acquire)) {
             continue;
         }
@@ -1549,7 +1818,7 @@ optimal_settings(int freq, int rate) {
  * @param center_freq_hz Desired RF center frequency in Hz.
  */
 static void
-apply_capture_settings(uint32_t center_freq_hz) {
+program_capture_frequency_and_rate(uint32_t center_freq_hz) {
     optimal_settings((int)center_freq_hz, demod.rate_in);
     rtl_device_set_frequency(rtl_device_handle, dongle.freq);
     rtl_device_set_sample_rate(rtl_device_handle, dongle.rate);
@@ -1575,8 +1844,72 @@ apply_capture_settings(uint32_t center_freq_hz) {
         LOG_INFO("Adjusted to actual device rate: requested=%u, actual=%u, demod_out=%d Hz.\n", prev, dongle.rate,
                  demod.rate_out);
     }
-    /* Ensure TED SPS reflects the current effective sampling rate unless explicitly overridden. */
+}
+
+/**
+ * @brief Program capture settings and apply hardware PPM correction when requested.
+ *
+ * @param ppm_error PPM correction to apply alongside the reconfigure.
+ * @return Result from the PPM control apply attempt.
+ */
+static int
+apply_capture_settings(uint32_t center_freq_hz, int ppm_error) {
+    int ppm_rc = apply_ppm_setting(ppm_error);
+    program_capture_frequency_and_rate(center_freq_hz);
+    return ppm_rc;
+}
+
+static void
+controller_finalize_reconfigure(struct controller_state* s, uint32_t center_freq_hz) {
+    if (!s || center_freq_hz == 0) {
+        return;
+    }
+    s->last_applied_freq_hz.store(center_freq_hz, std::memory_order_release);
+    rtl_demod_maybe_update_resampler_after_rate_change(&demod, &output, rtl_dsp_bw_hz);
     rtl_demod_maybe_refresh_ted_sps_after_rate_change(&demod, g_stream ? g_stream->opts : NULL, &output);
+    demod_reset_on_retune(&demod);
+    s->reconfigure_seq.fetch_add(1, std::memory_order_acq_rel);
+    g_ring_purge_pending.store(1, std::memory_order_release);
+}
+
+static inline void
+controller_begin_reconfigure(struct controller_state* s) {
+    if (!s) {
+        return;
+    }
+    s->retune_in_progress.store(1, std::memory_order_release);
+}
+
+static inline void
+controller_end_reconfigure(struct controller_state* s) {
+    if (!s) {
+        return;
+    }
+    s->retune_in_progress.store(0, std::memory_order_release);
+}
+
+static void
+controller_reconfigure_active_stream_locked(struct controller_state* s, uint32_t center_freq_hz) {
+    if (!s || center_freq_hz == 0) {
+        return;
+    }
+    program_capture_frequency_and_rate(center_freq_hz);
+    controller_finalize_reconfigure(s, center_freq_hz);
+}
+
+static int
+controller_apply_reconfigure(struct controller_state* s, uint32_t center_freq_hz, int ppm_error) {
+    if (!s || center_freq_hz == 0) {
+        return -1;
+    }
+    controller_begin_reconfigure(s);
+    int ppm_rc = apply_capture_settings(center_freq_hz, ppm_error);
+    if (ppm_rc == 0) {
+        store_dongle_ppm_error(ppm_error);
+    }
+    controller_finalize_reconfigure(s, center_freq_hz);
+    controller_end_reconfigure(s);
+    return ppm_rc;
 }
 
 /* Resampler and TED SPS helpers are implemented in rtl_demod_config.cpp. */
@@ -1614,11 +1947,11 @@ static DSD_THREAD_RETURN_TYPE
        Respect explicit env override when provided. */
     {
         int want = 1;
-        if (g_stream && g_stream->opts && g_stream->opts->rtltcp_enabled) {
+        if (g_stream && radio_source_is_rtltcp(g_stream->opts)) {
             /* rtl_tcp: keep fs/4 + combine-rotate path consistent with USB defaults */
             want = 0;
         }
-        const dsdneoRuntimeConfig* cfg = (g_stream && g_stream->cfg) ? g_stream->cfg : dsd_neo_get_config();
+        const dsdneoRuntimeConfig* cfg = dsd_neo_get_config();
         if (cfg && cfg->rtl_offset_tuning_is_set) {
             want = cfg->rtl_offset_tuning_enable ? 1 : 0;
         }
@@ -1635,6 +1968,7 @@ static DSD_THREAD_RETURN_TYPE
 
     /* Set the frequency then sample rate (rtl_fm order). */
     rtl_device_set_frequency(rtl_device_handle, dongle.freq);
+    s->last_applied_freq_hz.store((uint32_t)s->freqs[0], std::memory_order_release);
     LOG_INFO("Oversampling input by: %ix.\n", (demod.downsample_passes > 0) ? (1 << demod.downsample_passes) : 1);
     LOG_INFO("Oversampling output by: %ix.\n", demod.post_downsample);
     LOG_INFO("Buffer size: %0.2fms\n", 1000 * 0.5 * (float)ACTUAL_BUF_LENGTH / (float)dongle.rate);
@@ -1688,27 +2022,43 @@ static DSD_THREAD_RETURN_TYPE
     while (!exitflag && !(g_stream && g_stream->should_exit.load())) {
         /* Wait for a hop signal or a pending retune, with proper predicate guard */
         dsd_mutex_lock(&s->hop_m);
-        while (!s->manual_retune_pending.load() && !exitflag && !(g_stream && g_stream->should_exit.load())) {
+        while (!s->manual_retune_pending.load(std::memory_order_acquire)
+               && !s->ppm_change_pending.load(std::memory_order_acquire) && !exitflag
+               && !(g_stream && g_stream->should_exit.load())) {
             dsd_cond_wait(&s->hop, &s->hop_m);
         }
-        dsd_mutex_unlock(&s->hop_m);
         if (exitflag || (g_stream && g_stream->should_exit.load())) {
+            dsd_mutex_unlock(&s->hop_m);
             break;
         }
+        int requested_ppm = s->pending_ppm_error.load(std::memory_order_acquire);
+        uint32_t requested_ppm_request_id = s->pending_ppm_request_seq.load(std::memory_order_acquire);
+        int ppm_pending = s->ppm_change_pending.exchange(0, std::memory_order_acq_rel);
+        if (ppm_pending) {
+            s->active_ppm_error.store(requested_ppm, std::memory_order_release);
+            s->active_ppm_request_seq.store(requested_ppm_request_id, std::memory_order_release);
+            s->ppm_apply_in_progress.store(1, std::memory_order_release);
+        }
+        dsd_mutex_unlock(&s->hop_m);
+        int current_ppm = load_dongle_ppm_error();
+        int ppm_changed = ppm_pending && (requested_ppm != current_ppm);
+        auto clear_active_ppm_request = [&]() {
+            if (!ppm_pending) {
+                return;
+            }
+            s->active_ppm_error.store(0, std::memory_order_release);
+            s->active_ppm_request_seq.store(0, std::memory_order_release);
+            s->ppm_apply_in_progress.store(0, std::memory_order_release);
+        };
         /* Process marshalled manual retunes first */
-        if (s->manual_retune_pending.load()) {
+        if (s->manual_retune_pending.load(std::memory_order_acquire)) {
             uint32_t tgt = s->manual_retune_freq;
-            s->manual_retune_pending.store(0);
-            /* Gate demod thread: prevent processing transient samples during retune */
-            s->retune_in_progress.store(1, std::memory_order_release);
-            /* Ask consumer to purge ring safely (keeps SPSC producer/consumer contract). */
-            g_ring_purge_pending.store(1, std::memory_order_release);
-            apply_capture_settings((uint32_t)tgt);
-            rtl_demod_maybe_update_resampler_after_rate_change(&demod, &output, rtl_dsp_bw_hz);
-            rtl_demod_maybe_refresh_ted_sps_after_rate_change(&demod, g_stream ? g_stream->opts : NULL, &output);
-            demod_reset_on_retune(&demod);
-            /* Retune complete: allow demod thread to resume processing */
-            s->retune_in_progress.store(0, std::memory_order_release);
+            s->manual_retune_pending.store(0, std::memory_order_release);
+            int target_ppm = ppm_changed ? requested_ppm : current_ppm;
+            int ppm_rc = controller_apply_reconfigure(s, (uint32_t)tgt, target_ppm);
+            if (ppm_changed && ppm_rc != 0) {
+                note_failed_ppm_request(requested_ppm, requested_ppm_request_id, current_ppm, ppm_rc);
+            }
             /* Signal completion to any waiting callers (e.g., dsd_rtl_stream_tune).
              * Increment the complete_id to match the request_id that was generated
              * when the tune was requested. This ensures waiters wake up only for
@@ -1718,23 +2068,57 @@ static DSD_THREAD_RETURN_TYPE
             dsd_cond_broadcast(&s->retune_done_cond);
             dsd_mutex_unlock(&s->retune_done_m);
             drain_output_on_retune();
-            LOG_INFO("Retune applied: %u Hz.\n", tgt);
+            clear_active_ppm_request();
+            if (ppm_changed && ppm_rc == 0) {
+                LOG_INFO("Retune applied: %u Hz (PPM=%d).\n", tgt, requested_ppm);
+            } else {
+                LOG_INFO("Retune applied: %u Hz.\n", tgt);
+            }
+            continue;
+        }
+        if (ppm_pending) {
+            if (ppm_changed) {
+                uint32_t fallback_freq_hz = 0;
+                if (s->freq_len > 0) {
+                    fallback_freq_hz = (uint32_t)s->freqs[s->freq_now];
+                }
+                dsd::io::radio::RtlPpmApplyPlan ppm_plan = dsd::io::radio::rtl_ppm_plan_apply_to_active_stream(
+                    s->last_applied_freq_hz.load(std::memory_order_acquire), fallback_freq_hz, current_ppm,
+                    requested_ppm);
+                if (ppm_plan.reconfigure) {
+                    controller_begin_reconfigure(s);
+                }
+                /* Only disrupt the live stream after the backend accepts the new
+                 * PPM value. Rejected requests must not reset the current demod
+                 * chain. */
+                int ppm_rc = apply_ppm_setting(requested_ppm);
+                if (dsd::io::radio::rtl_ppm_should_reconfigure_after_apply(ppm_plan, ppm_rc)) {
+                    store_dongle_ppm_error(requested_ppm);
+                    controller_reconfigure_active_stream_locked(s, ppm_plan.freq_hz);
+                    controller_end_reconfigure(s);
+                    drain_output_on_retune();
+                    LOG_INFO("PPM correction applied: %d (reconfigured %u Hz).\n", requested_ppm, ppm_plan.freq_hz);
+                } else if (ppm_rc == 0) {
+                    if (ppm_plan.reconfigure) {
+                        controller_end_reconfigure(s);
+                    }
+                    store_dongle_ppm_error(requested_ppm);
+                    LOG_INFO("PPM correction applied: %d.\n", requested_ppm);
+                } else {
+                    if (ppm_plan.reconfigure) {
+                        controller_end_reconfigure(s);
+                    }
+                    note_failed_ppm_request(requested_ppm, requested_ppm_request_id, current_ppm, ppm_rc);
+                }
+            }
+            clear_active_ppm_request();
             continue;
         }
         if (s->freq_len <= 1) {
             continue;
         }
         s->freq_now = (s->freq_now + 1) % s->freq_len;
-        /* Gate demod thread: prevent processing transient samples during hop */
-        s->retune_in_progress.store(1, std::memory_order_release);
-        /* Flush any leftover IQ from the previous frequency before applying the new center. */
-        g_ring_purge_pending.store(1, std::memory_order_release);
-        apply_capture_settings((uint32_t)s->freqs[s->freq_now]);
-        rtl_demod_maybe_update_resampler_after_rate_change(&demod, &output, rtl_dsp_bw_hz);
-        rtl_demod_maybe_refresh_ted_sps_after_rate_change(&demod, g_stream ? g_stream->opts : NULL, &output);
-        demod_reset_on_retune(&demod);
-        /* Hop complete: allow demod thread to resume processing */
-        s->retune_in_progress.store(0, std::memory_order_release);
+        controller_apply_reconfigure(s, (uint32_t)s->freqs[s->freq_now], load_dongle_ppm_error());
         drain_output_on_retune();
     }
     DSD_THREAD_RETURN;
@@ -2105,7 +2489,7 @@ dsd_rtl_stream_estimate_snr_gfsk_eye(void) {
     return 10.0 * log10(sig_var / noise_var) - bias;
 }
 
-/* Auto-PPM status (spectrum-based) is implemented in rtl_metrics.cpp. */
+/* Auto-PPM status is implemented in rtl_metrics.cpp. */
 extern std::atomic<int> g_auto_ppm_enabled;
 extern std::atomic<int> g_auto_ppm_user_en;
 extern std::atomic<int> g_auto_ppm_locked;
@@ -2118,6 +2502,9 @@ extern std::atomic<double> g_auto_ppm_df_hz;
 extern std::atomic<double> g_auto_ppm_est_ppm;
 extern std::atomic<int> g_auto_ppm_last_dir;
 extern std::atomic<int> g_auto_ppm_cooldown;
+extern std::atomic<double> g_spec_peak_db;
+extern std::atomic<double> g_spec_snr_db;
+extern std::atomic<double> g_resid_cfo_phase_hz;
 
 /* Spectrum, carrier diagnostics, tuner autogain, and auto-PPM metrics
  * exports are implemented in rtl_metrics.cpp. */
@@ -2131,6 +2518,7 @@ void
 dongle_init(struct dongle_state* s) {
     s->rate = rtl_dsp_bw_hz;
     s->gain = AUTO_GAIN; // tenths of a dB
+    s->ppm_error.store(0, std::memory_order_relaxed);
     s->mute = 0;
     s->direct_sampling = 0;
     s->offset_tuning = 0; //E4000 tuners only
@@ -2198,6 +2586,16 @@ controller_init(struct controller_state* s) {
     dsd_mutex_init(&s->hop_m);
     s->manual_retune_pending.store(0);
     s->manual_retune_freq = 0;
+    s->ppm_change_pending.store(0);
+    s->pending_ppm_error.store(0);
+    s->ppm_request_publish_seq.store(0);
+    s->pending_ppm_request_seq.store(0);
+    s->ppm_apply_in_progress.store(0);
+    s->active_ppm_error.store(0);
+    s->active_ppm_request_seq.store(0);
+    s->ppm_apply_failure_pending.store(0);
+    s->failed_ppm_error.store(0);
+    s->failed_ppm_request_seq.store(0);
     s->cold_start_ready.store(0); /* Demod will wait for controller to signal ready */
     s->retune_in_progress.store(0);
     /* Initialize retune completion synchronization */
@@ -2206,6 +2604,8 @@ controller_init(struct controller_state* s) {
     s->retune_done_flag.store(0);
     s->retune_request_id.store(0);
     s->retune_complete_id.store(0);
+    s->last_applied_freq_hz.store(0, std::memory_order_release);
+    s->reconfigure_seq.store(0, std::memory_order_release);
 }
 
 /**
@@ -2254,8 +2654,7 @@ setup_initial_freq_and_rate(dsd_opts* opts) {
         controller.freq_len++;
     }
     if (opts->rtlsdr_ppm_error != 0) {
-        dongle.ppm_error = opts->rtlsdr_ppm_error;
-        LOG_INFO("Setting RTL PPM Error Set to %d\n", opts->rtlsdr_ppm_error);
+        LOG_INFO("Requested RTL PPM Error Set to %d\n", opts->rtlsdr_ppm_error);
     }
     dongle.dev_index = opts->rtl_dev_index;
     LOG_INFO("Setting DSP baseband to %d Hz\n", rtl_dsp_bw_hz);
@@ -2301,6 +2700,39 @@ schedule_manual_retune(uint32_t target_freq_hz) {
     dsd_cond_signal(&controller.hop);
     dsd_mutex_unlock(&controller.hop_m);
     return request_id;
+}
+
+static void
+sync_requested_ppm_to_controller(const dsd_opts* opts) {
+    if (!opts) {
+        return;
+    }
+    int applied_ppm = load_dongle_ppm_error();
+    dsd_mutex_lock(&controller.hop_m);
+    std::lock_guard<std::mutex> request_lock(g_requested_ppm_state_mutex);
+    int requested_ppm = opts->rtlsdr_ppm_error;
+    uint32_t requested_ppm_request_id = controller.ppm_request_publish_seq.load(std::memory_order_relaxed);
+    dsd::io::radio::RtlPpmControllerRequestState queued_request = {};
+    queued_request.pending = controller.ppm_change_pending.load(std::memory_order_acquire);
+    if (queued_request.pending) {
+        queued_request.ppm = controller.pending_ppm_error.load(std::memory_order_acquire);
+        queued_request.request_id = controller.pending_ppm_request_seq.load(std::memory_order_acquire);
+    }
+    dsd::io::radio::RtlPpmControllerRequestState active_request = {};
+    active_request.pending = controller.ppm_apply_in_progress.load(std::memory_order_acquire);
+    if (active_request.pending) {
+        active_request.ppm = controller.active_ppm_error.load(std::memory_order_acquire);
+        active_request.request_id = controller.active_ppm_request_seq.load(std::memory_order_acquire);
+    }
+    bool needs_schedule = dsd::io::radio::rtl_ppm_should_schedule_request(
+        applied_ppm, requested_ppm, requested_ppm_request_id, queued_request, active_request);
+    if (needs_schedule) {
+        controller.pending_ppm_error.store(requested_ppm, std::memory_order_release);
+        controller.pending_ppm_request_seq.store(requested_ppm_request_id, std::memory_order_release);
+        controller.ppm_change_pending.store(1, std::memory_order_release);
+        dsd_cond_signal(&controller.hop);
+    }
+    dsd_mutex_unlock(&controller.hop_m);
 }
 
 /**
@@ -2354,6 +2786,19 @@ dsd_rtl_stream_open(dsd_opts* opts) {
         LOG_ERROR("RTL stream open: missing opts\n");
         return -1;
     }
+
+    g_auto_ppm_controller.reset(load_dongle_ppm_error(), opts->rtlsdr_center_freq);
+    g_auto_ppm_enabled.store(0, std::memory_order_relaxed);
+    g_auto_ppm_locked.store(0, std::memory_order_relaxed);
+    g_auto_ppm_training.store(0, std::memory_order_relaxed);
+    g_auto_ppm_lock_ppm.store(0, std::memory_order_relaxed);
+    g_auto_ppm_lock_snr_db.store(-100.0, std::memory_order_relaxed);
+    g_auto_ppm_lock_df_hz.store(0.0, std::memory_order_relaxed);
+    g_auto_ppm_snr_db.store(-100.0, std::memory_order_relaxed);
+    g_auto_ppm_df_hz.store(0.0, std::memory_order_relaxed);
+    g_auto_ppm_est_ppm.store(0.0, std::memory_order_relaxed);
+    g_auto_ppm_last_dir.store(0, std::memory_order_relaxed);
+    g_auto_ppm_cooldown.store(0, std::memory_order_relaxed);
 
     struct {
         int use;
@@ -2470,7 +2915,8 @@ dsd_rtl_stream_open(dsd_opts* opts) {
     /* Ensure async read uses a valid, explicit buffer length */
     dongle.buf_len = (uint32_t)ACTUAL_BUF_LENGTH;
 
-    if (opts && opts->rtltcp_enabled) {
+    RadioSourceKind source_kind = detect_radio_source(opts);
+    if (source_kind == RADIO_SOURCE_RTL_TCP) {
         int autotune = opts->rtltcp_autotune;
         if (!autotune) {
             const dsdneoRuntimeConfig* cfg = dsd_neo_get_config();
@@ -2487,6 +2933,24 @@ dsd_rtl_stream_open(dsd_opts* opts) {
             LOG_INFO("Using rtl_tcp source %s:%d.\n", opts->rtltcp_hostname, opts->rtltcp_portno);
             rtl_device_print_offset_capability(rtl_device_handle);
         }
+    } else if (source_kind == RADIO_SOURCE_SOAPY) {
+        const char* soapy_args = radio_source_soapy_args(opts);
+        rtl_device_handle = rtl_device_create_soapy(soapy_args, &input_ring, combine_rotate_enabled);
+        if (!rtl_device_handle) {
+            if (soapy_args[0] != '\0') {
+                LOG_ERROR("Failed to open SoapySDR device with args: %s.\n", soapy_args);
+            } else {
+                LOG_ERROR("Failed to open SoapySDR device.\n");
+            }
+            return -1;
+        } else {
+            if (soapy_args[0] != '\0') {
+                LOG_INFO("Using SoapySDR source: %s.\n", soapy_args);
+            } else {
+                LOG_INFO("Using SoapySDR default source.\n");
+            }
+            rtl_device_print_offset_capability(rtl_device_handle);
+        }
     } else {
         rtl_device_handle = rtl_device_create(dongle.dev_index, &input_ring, combine_rotate_enabled);
         if (!rtl_device_handle) {
@@ -2501,7 +2965,8 @@ dsd_rtl_stream_open(dsd_opts* opts) {
 
     /* Apply bias tee setting before other tuner config (USB via librtlsdr; rtl_tcp via protocol cmd 0x0E) */
     if (opts && opts->rtl_bias_tee) {
-        rtl_device_set_bias_tee(rtl_device_handle, 1);
+        int rc = rtl_device_set_bias_tee(rtl_device_handle, 1);
+        log_unsupported_control_if_needed("Bias tee control", rc);
     }
 
     /* Advanced RTL-SDR driver options via environment */
@@ -2510,25 +2975,37 @@ dsd_rtl_stream_open(dsd_opts* opts) {
 
         if (cfg && cfg->rtl_direct_is_set) {
             int mode = cfg->rtl_direct_mode;
-            rtl_device_set_direct_sampling(rtl_device_handle, mode);
-            dongle.direct_sampling = mode;
+            int rc = rtl_device_set_direct_sampling(rtl_device_handle, mode);
+            if (rc == 0) {
+                dongle.direct_sampling = mode;
+            } else {
+                dongle.direct_sampling = 0;
+                log_unsupported_control_if_needed("Direct sampling control", rc);
+            }
         }
 
         if (cfg && cfg->rtl_offset_tuning_is_set) {
             int on = cfg->rtl_offset_tuning_enable ? 1 : 0;
-            rtl_device_set_offset_tuning_enabled(rtl_device_handle, on);
-            dongle.offset_tuning = on ? 1 : 0;
+            int rc = rtl_device_set_offset_tuning_enabled(rtl_device_handle, on);
+            if (rc == 0) {
+                dongle.offset_tuning = on ? 1 : 0;
+            } else {
+                dongle.offset_tuning = 0;
+                log_unsupported_control_if_needed("Offset tuning control", rc);
+            }
         }
 
         if (cfg && (cfg->rtl_xtal_hz_is_set || cfg->tuner_xtal_hz_is_set)) {
             uint32_t rtl_xtal_hz = cfg->rtl_xtal_hz_is_set ? (uint32_t)cfg->rtl_xtal_hz : 0U;
             uint32_t tuner_xtal_hz = cfg->tuner_xtal_hz_is_set ? (uint32_t)cfg->tuner_xtal_hz : 0U;
-            rtl_device_set_xtal_freq(rtl_device_handle, rtl_xtal_hz, tuner_xtal_hz);
+            int rc = rtl_device_set_xtal_freq(rtl_device_handle, rtl_xtal_hz, tuner_xtal_hz);
+            log_unsupported_control_if_needed("Xtal frequency control", rc);
         }
 
         if (cfg && cfg->rtl_testmode_is_set) {
             int on = cfg->rtl_testmode_enable ? 1 : 0;
-            rtl_device_set_testmode(rtl_device_handle, on);
+            int rc = rtl_device_set_testmode(rtl_device_handle, on);
+            log_unsupported_control_if_needed("Test mode control", rc);
         }
 
         if (cfg && cfg->rtl_if_gains_is_set && cfg->rtl_if_gains[0] != '\0') {
@@ -2567,7 +3044,8 @@ dsd_rtl_stream_open(dsd_opts* opts) {
                     gain_tenth = (abs(gi) > 90) ? gi : (gi * 10);
                 }
                 if (stage >= 0) {
-                    rtl_device_set_if_gain(rtl_device_handle, stage, gain_tenth);
+                    int rc = rtl_device_set_if_gain(rtl_device_handle, stage, gain_tenth);
+                    log_unsupported_control_if_needed("IF gain control", rc);
                 }
             }
         }
@@ -2639,12 +3117,27 @@ dsd_rtl_stream_open(dsd_opts* opts) {
     }
 
     /* Set the tuner gain */
-    rtl_device_set_gain(rtl_device_handle, dongle.gain);
+    {
+        int rc = rtl_device_set_gain(rtl_device_handle, dongle.gain);
+        log_unsupported_control_if_needed("Gain control", rc);
+    }
     if (dongle.gain == AUTO_GAIN) {
         LOG_INFO("Setting RTL Autogain. \n");
     }
 
-    rtl_device_set_ppm(rtl_device_handle, dongle.ppm_error);
+    {
+        /* Keep the requested PPM and request generation paired so a startup
+         * failure cannot roll back a newer live request that arrived later. */
+        RtlRequestedPpmState initial_ppm_request = snapshot_requested_ppm_state(opts);
+        int ppm_rc = apply_ppm_setting(initial_ppm_request.ppm);
+        if (ppm_rc == 0) {
+            store_dongle_ppm_error(initial_ppm_request.ppm);
+        } else {
+            note_failed_ppm_request(initial_ppm_request.ppm, initial_ppm_request.request_id, load_dongle_ppm_error(),
+                                    ppm_rc);
+        }
+        g_auto_ppm_controller.reset(load_dongle_ppm_error(), opts->rtlsdr_center_freq);
+    }
 
     /* Prepare initial settings; controller thread will program the device. */
     if (controller.freq_len == 0) {
@@ -2653,7 +3146,11 @@ dsd_rtl_stream_open(dsd_opts* opts) {
     }
     optimal_settings(controller.freqs[0], demod.rate_in);
     if (dongle.direct_sampling) {
-        rtl_device_set_direct_sampling(rtl_device_handle, 1);
+        int rc = rtl_device_set_direct_sampling(rtl_device_handle, 1);
+        if (rc != 0) {
+            dongle.direct_sampling = 0;
+            log_unsupported_control_if_needed("Direct sampling control", rc);
+        }
     }
     LOG_INFO("Oversampling input by: %ix.\n", (demod.downsample_passes > 0) ? (1 << demod.downsample_passes) : 1);
     LOG_INFO("Oversampling output by: %ix.\n", demod.post_downsample);
@@ -2715,13 +3212,12 @@ dsd_rtl_stream_open(dsd_opts* opts) {
         g_stream->input_ring = &input_ring;
         g_stream->udp_ctrl_ptr = &g_udp_ctrl;
         g_stream->opts = opts;
-        g_stream->cfg = dsd_neo_get_config();
         g_stream->should_exit.store(0);
     }
 
     /* For rtl_tcp sources, optionally prebuffer before starting demod/controller
        to reduce initial under-runs and jitter on the consumer side. */
-    if (opts && opts->rtltcp_enabled) {
+    if (radio_source_is_rtltcp(opts)) {
         int pre_ms = 1000; /* default deeper prebuffer for rtltcp */
         {
             const dsdneoRuntimeConfig* cfg = dsd_neo_get_config();
@@ -2937,6 +3433,150 @@ dsd_rtl_stream_soft_stop(void) {
     return 0;
 }
 
+static uint64_t
+auto_ppm_now_ms(void) {
+    auto now = std::chrono::steady_clock::now();
+    return (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
+}
+
+static double
+auto_ppm_pick_demod_snr_db(uint64_t now_ms) {
+    const long long fresh_ms = 800;
+    double gate_snr_db = -100.0;
+
+    long long c4_ms = g_snr_c4fm_last_ms.load(std::memory_order_relaxed);
+    int c4_src = g_snr_c4fm_src.load(std::memory_order_relaxed);
+    if (c4_src == 1 && (long long)now_ms - c4_ms <= fresh_ms) {
+        gate_snr_db = g_snr_c4fm_db.load(std::memory_order_relaxed);
+    }
+
+    long long qp_ms = g_snr_qpsk_last_ms.load(std::memory_order_relaxed);
+    int qp_src = g_snr_qpsk_src.load(std::memory_order_relaxed);
+    if (qp_src == 1 && (long long)now_ms - qp_ms <= fresh_ms) {
+        double snr = g_snr_qpsk_db.load(std::memory_order_relaxed);
+        if (snr > gate_snr_db) {
+            gate_snr_db = snr;
+        }
+    }
+
+    long long gf_ms = g_snr_gfsk_last_ms.load(std::memory_order_relaxed);
+    int gf_src = g_snr_gfsk_src.load(std::memory_order_relaxed);
+    if (gf_src == 1 && (long long)now_ms - gf_ms <= fresh_ms) {
+        double snr = g_snr_gfsk_db.load(std::memory_order_relaxed);
+        if (snr > gate_snr_db) {
+            gate_snr_db = snr;
+        }
+    }
+
+    return gate_snr_db;
+}
+
+static int
+auto_ppm_effective_enabled(const dsd_opts* opts) {
+    const dsdneoRuntimeConfig* cfg = dsd_neo_get_config();
+    int enabled = (cfg && cfg->auto_ppm_enable) ? 1 : 0;
+    int user = g_auto_ppm_user_en.load(std::memory_order_relaxed);
+    if (user == 0) {
+        return 0;
+    }
+    if (user == 1) {
+        return 1;
+    }
+    if (opts && opts->rtl_auto_ppm) {
+        return 1;
+    }
+    return enabled;
+}
+
+static dsd::io::radio::RtlAutoPpmConfig
+auto_ppm_make_config(const dsd_opts* opts) {
+    dsd::io::radio::RtlAutoPpmConfig config = {};
+    const dsdneoRuntimeConfig* cfg = dsd_neo_get_config();
+    if (cfg) {
+        config.min_snr_db = cfg->auto_ppm_snr_db;
+        config.min_power_db = cfg->auto_ppm_pwr_db;
+        config.zero_lock_ppm = cfg->auto_ppm_zerolock_ppm;
+        config.zero_lock_hz = static_cast<double>(cfg->auto_ppm_zerolock_hz);
+    }
+    if (opts && opts->rtl_auto_ppm_snr_db > 0.0f && opts->rtl_auto_ppm_snr_db <= 60.0f) {
+        config.min_snr_db = static_cast<double>(opts->rtl_auto_ppm_snr_db);
+    }
+    return config;
+}
+
+static int
+auto_ppm_should_freeze_retunes(void) {
+    const dsdneoRuntimeConfig* cfg = dsd_neo_get_config();
+    if (!cfg) {
+        return 1;
+    }
+    return cfg->auto_ppm_freeze_enable ? 1 : 0;
+}
+
+static void
+auto_ppm_publish_status(int enabled, const dsd::io::radio::RtlAutoPpmUpdate& update) {
+    g_auto_ppm_enabled.store(enabled, std::memory_order_relaxed);
+    g_auto_ppm_snr_db.store(update.snr_db, std::memory_order_relaxed);
+    g_auto_ppm_df_hz.store(update.df_hz, std::memory_order_relaxed);
+    g_auto_ppm_est_ppm.store(update.est_ppm, std::memory_order_relaxed);
+    g_auto_ppm_last_dir.store(update.last_dir, std::memory_order_relaxed);
+    g_auto_ppm_cooldown.store(update.cooldown_ticks, std::memory_order_relaxed);
+    g_auto_ppm_training.store(update.training, std::memory_order_relaxed);
+    g_auto_ppm_locked.store(update.locked, std::memory_order_relaxed);
+    g_auto_ppm_lock_ppm.store(update.lock_ppm, std::memory_order_relaxed);
+    g_auto_ppm_lock_snr_db.store(update.lock_snr_db, std::memory_order_relaxed);
+    g_auto_ppm_lock_df_hz.store(update.lock_df_hz, std::memory_order_relaxed);
+}
+
+static void
+auto_ppm_maybe_adjust(dsd_opts* opts) {
+    if (!opts) {
+        return;
+    }
+
+    int enabled = auto_ppm_effective_enabled(opts);
+    int applied_ppm = load_dongle_ppm_error();
+    uint64_t now_ms = auto_ppm_now_ms();
+    uint32_t applied_freq_hz = controller.last_applied_freq_hz.load(std::memory_order_acquire);
+    double spec_snr_db = g_spec_snr_db.load(std::memory_order_relaxed);
+    dsd::io::radio::RtlAutoPpmConfig config = auto_ppm_make_config(opts);
+
+    dsd::io::radio::RtlAutoPpmSignalMetrics metrics = {};
+    metrics.cqpsk_enable = demod.cqpsk_enable ? 1 : 0;
+    metrics.tracking_enable = (demod.cqpsk_enable || demod.fll_enabled) ? 1 : 0;
+    metrics.carrier_lock = dsd_rtl_stream_get_carrier_lock();
+    metrics.spectrum_valid = (spec_snr_db > -99.0) ? 1 : 0;
+    metrics.nco_cfo_hz = dsd_rtl_stream_get_cfo_hz();
+    metrics.phase_cfo_hz = g_resid_cfo_phase_hz.load(std::memory_order_relaxed);
+    metrics.spectrum_cfo_hz = dsd_rtl_stream_get_residual_cfo_hz();
+
+    dsd::io::radio::RtlAutoPpmInputs inputs = {};
+    inputs.now_ms = now_ms;
+    inputs.enabled = enabled;
+    /* Auto-PPM must train against the correction the tuner has actually
+     * applied, not a queued request that may still be waiting on the
+     * controller thread. */
+    inputs.current_ppm = applied_ppm;
+    inputs.requested_ppm = snapshot_requested_ppm_state(opts).ppm;
+    dsd::io::radio::RtlPpmControllerRequestsSnapshot controller_requests = snapshot_controller_ppm_request_state();
+    inputs.controller_queued_request = controller_requests.queued_request;
+    inputs.controller_active_request = controller_requests.active_request;
+    inputs.tuned_freq_hz = applied_freq_hz;
+    inputs.signal_power_db = g_spec_peak_db.load(std::memory_order_relaxed);
+    inputs.gate_snr_db = auto_ppm_pick_demod_snr_db(now_ms);
+    inputs.spec_snr_db = spec_snr_db;
+    inputs.estimate = dsd::io::radio::rtl_auto_ppm_select_estimate(metrics);
+
+    dsd::io::radio::RtlAutoPpmUpdate update = g_auto_ppm_controller.update(config, inputs);
+    auto_ppm_publish_status(enabled, update);
+    if (update.apply_ppm) {
+        LOG_INFO("AUTO-PPM: src=%d pwr=%.1f dB snr=%.1f dB df=%.1f Hz ppm %d->%d\n",
+                 static_cast<int>(inputs.estimate.source), inputs.signal_power_db, update.snr_db, update.df_hz,
+                 applied_ppm, update.new_ppm);
+        (void)publish_requested_ppm(opts, update.new_ppm);
+    }
+}
+
 /**
  * @brief Batched consumer API: read up to count samples with fewer wakeups/locks.
  * Applies volume scaling.
@@ -2961,421 +3601,11 @@ dsd_rtl_stream_read(float* out, size_t count, dsd_opts* opts, dsd_state* state) 
         return -1;
     }
 
-    /* Optional: spectrum-based auto PPM correction (opt-in via DSD_NEO_AUTO_PPM).
-       Uses quadratic interpolation of the spectrum peak (industry practice)
-        and a simple SNR gate. When SNR >= 6 dB, nudge PPM by +/-1 toward center. */
-    do {
-        static int init = 0;
-        static int enabled = 0;
-        /* minimum SNR to trigger (kept for env/opt parsing below) */
-        static double snr_thr_db = 6.0;
-        static int cooldown = 0; /* simple rate limiter (loops) */
-        if (!init) {
-            init = 1;
-            const dsdneoRuntimeConfig* cfg = dsd_neo_get_config();
-            enabled = (cfg && cfg->auto_ppm_enable) ? 1 : 0;
-            if (cfg) {
-                snr_thr_db = cfg->auto_ppm_snr_db;
-            }
-            if (opts && opts->rtl_auto_ppm_snr_db > 0.0f && opts->rtl_auto_ppm_snr_db <= 60.0f) {
-                snr_thr_db = (double)opts->rtl_auto_ppm_snr_db;
-            }
-        }
-        /* Allow CLI/opts to enable even if env unset */
-        /* Runtime user override takes precedence; otherwise follow opts */
-        {
-            int u = g_auto_ppm_user_en.load(std::memory_order_relaxed);
-            if (u == 0) {
-                enabled = 0;
-            } else if (u == 1) {
-                enabled = 1;
-            } else {
-                if (opts) {
-                    enabled = (opts->rtl_auto_ppm != 0) ? 1 : 0;
-                }
-            }
-        }
-        g_auto_ppm_enabled.store(enabled, std::memory_order_relaxed);
-        if (!g_auto_ppm_locked.load(std::memory_order_relaxed) && enabled) {
-            /* Initialize training window once on first entry */
-            static int train_init = 0;
-            static std::chrono::steady_clock::time_point t0;
-            if (!train_init) {
-                t0 = std::chrono::steady_clock::now();
-                train_init = 1;
-            }
-        }
-        if (!enabled) {
-            g_auto_ppm_training.store(0, std::memory_order_relaxed);
-            break;
-        }
-        if (g_auto_ppm_locked.load(std::memory_order_relaxed)) {
-            g_auto_ppm_training.store(0, std::memory_order_relaxed);
-            /* Locked: do not adjust further */
-            break;
-        }
-        if (cooldown > 0) {
-            cooldown--;
-            g_auto_ppm_cooldown.store(cooldown, std::memory_order_relaxed);
-            break;
-        }
-        /* Snapshot current spectrum via helper */
-        static float spec_copy[1024];
-        int rate = 0;
-        int N = dsd_rtl_stream_spectrum_get(spec_copy, (int)(sizeof(spec_copy) / sizeof(spec_copy[0])), &rate);
-        if (N <= 0 || rate <= 0) {
-            g_auto_ppm_last_dir.store(0, std::memory_order_relaxed);
-            break;
-        }
-        /* Find strongest bin near DC primarily: widen search to +/- N/4 of center
-           to tolerate larger initial frequency errors. */
-        int k_center_i = N >> 1;
-        int W = N >> 2; /* N/4 */
-        if (W < 8) {
-            W = 8;
-        }
-        int i_lo = k_center_i - W;
-        int i_hi = k_center_i + W;
-        if (i_lo < 2) {
-            i_lo = 2;
-        }
-        if (i_hi > N - 3) {
-            i_hi = N - 3;
-        }
-        int i_max = i_lo;
-        float p_max = spec_copy[i_lo];
-        for (int i = i_lo + 1; i <= i_hi; i++) {
-            if (spec_copy[i] > p_max) {
-                p_max = spec_copy[i];
-                i_max = i;
-            }
-        }
-        /* Estimate noise floor via median of bins excluding +-2 around peak */
-        static float tmp[1024];
-        int m = 0;
-        for (int i = i_lo; i < i_hi; i++) {
-            if (i >= i_max - 2 && i <= i_max + 2) {
-                continue;
-            }
-            tmp[m++] = spec_copy[i];
-        }
-        if (m < 16) {
-            g_auto_ppm_last_dir.store(0, std::memory_order_relaxed);
-            break;
-        }
-        /* Require recent direct demod SNR for gating; also compute spectral SNR */
-        int mid = m / 2; /* still compute median to keep spectrum path consistent */
-        std::nth_element(tmp, tmp + mid, tmp + m);
-        float noise_med_db = tmp[mid];
-        float spec_snr_db = p_max - noise_med_db;
-        auto nowtp = std::chrono::steady_clock::now();
-        long long nowms = std::chrono::duration_cast<std::chrono::milliseconds>(nowtp.time_since_epoch()).count();
-        const long long fresh_ms = 800; /* direct SNR must be updated within 0.8 s */
-        long long c4_ms = g_snr_c4fm_last_ms.load(std::memory_order_relaxed);
-        int c4_src = g_snr_c4fm_src.load(std::memory_order_relaxed);
-        long long qp_ms = g_snr_qpsk_last_ms.load(std::memory_order_relaxed);
-        int qp_src = g_snr_qpsk_src.load(std::memory_order_relaxed);
-        long long gf_ms = g_snr_gfsk_last_ms.load(std::memory_order_relaxed);
-        int gf_src = g_snr_gfsk_src.load(std::memory_order_relaxed);
-        double d_c4 = g_snr_c4fm_db.load(std::memory_order_relaxed);
-        double d_qp = g_snr_qpsk_db.load(std::memory_order_relaxed);
-        double d_gf = g_snr_gfsk_db.load(std::memory_order_relaxed);
-        bool c4_ok = (c4_src == 1) && (nowms - c4_ms <= fresh_ms);
-        bool qp_ok = (qp_src == 1) && (nowms - qp_ms <= fresh_ms);
-        bool gf_ok = (gf_src == 1) && (nowms - gf_ms <= fresh_ms);
-        bool have_demod = c4_ok || qp_ok || gf_ok; /* currently unused for gating */
-        (void)have_demod;
-        double gate_snr_db = -100.0;
-        if (c4_ok) {
-            gate_snr_db = d_c4;
-        }
-        if (qp_ok && d_qp > gate_snr_db) {
-            gate_snr_db = d_qp;
-        }
-        if (gf_ok && d_gf > gate_snr_db) {
-            gate_snr_db = d_gf;
-        }
-        /* Store spectral SNR for UI */
-        g_auto_ppm_snr_db.store(spec_snr_db, std::memory_order_relaxed);
-        /* Debounce absolute power (peak dB) to avoid brief spikes */
-        static double pwr_thr_db = -80.0;
-        static int pwr_thr_inited = 0;
-        if (!pwr_thr_inited) {
-            const dsdneoRuntimeConfig* cfg = dsd_neo_get_config();
-            if (cfg) {
-                pwr_thr_db = cfg->auto_ppm_pwr_db;
-            }
-            pwr_thr_inited = 1;
-        }
-        static int pwr_gate_active = 0;
-        static auto pwr_gate_since = std::chrono::steady_clock::now();
-        const int pwr_gate_debounce_ms = 2000; /* require 2s continuously above threshold */
-        auto now_gate = std::chrono::steady_clock::now();
-        bool pwr_over = (p_max >= (float)pwr_thr_db);
-        if (pwr_over) {
-            if (!pwr_gate_active) {
-                pwr_gate_active = 1;
-                pwr_gate_since = now_gate;
-            }
-        } else {
-            pwr_gate_active = 0;
-        }
-        bool pwr_debounced =
-            pwr_gate_active
-            && (std::chrono::duration_cast<std::chrono::milliseconds>(now_gate - pwr_gate_since).count()
-                >= pwr_gate_debounce_ms);
-        /* Also require spectral SNR above threshold; reuse parsed env/opt value */
-        double spec_thr_db = snr_thr_db;
-        if (!pwr_debounced || spec_snr_db < spec_thr_db) {
-            g_auto_ppm_training.store(0, std::memory_order_relaxed);
-            g_auto_ppm_last_dir.store(0, std::memory_order_relaxed);
-            break; /* below thresholds */
-        }
-        /* DC spur guard: if max is exactly the center bin and looks spur-like, ignore */
-        if (i_max == k_center_i) {
-            float l = spec_copy[i_max - 1];
-            float r = spec_copy[i_max + 1];
-            float side_max = (l > r) ? l : r;
-            if ((p_max - side_max) > 12.0f) {
-                /* sharp isolated spike at DC: likely residual DC spur */
-                g_auto_ppm_last_dir.store(0, std::memory_order_relaxed);
-                break;
-            }
-        }
-        /* Parabolic interpolation around peak using log-power (dB) */
-        int k = i_max;
-        if (k <= 1 || k >= N - 2) {
-            g_auto_ppm_last_dir.store(0, std::memory_order_relaxed);
-            break;
-        }
-        double p1 = spec_copy[k - 1];
-        double p2 = spec_copy[k + 0];
-        double p3 = spec_copy[k + 1];
-        double denom = (p1 - 2.0 * p2 + p3);
-        double delta = 0.0; /* fractional bin offset in [-1,1] */
-        if (fabs(denom) > 1e-6) {
-            delta = 0.5 * (p1 - p3) / denom;
-            if (delta > 1.0) {
-                delta = 1.0;
-            }
-            if (delta < -1.0) {
-                delta = -1.0;
-            }
-        }
-        double k_hat = (double)k + delta;
-        double k_center = 0.5 * (double)N; /* DC after shift */
-        double k_err = k_hat - k_center;
-        double bin_hz = (double)rate / (double)N;
-        double df_hz = k_err * bin_hz; /* positive: signal to + side */
-        g_auto_ppm_df_hz.store(df_hz, std::memory_order_relaxed);
-        /* Convert to ppm relative to current tuned hardware center */
-        double f0 = (double)dongle.freq;
-        if (f0 <= 0.0) {
-            g_auto_ppm_last_dir.store(0, std::memory_order_relaxed);
-            break;
-        }
-        double est_ppm = (df_hz * 1e6) / f0;
-        g_auto_ppm_est_ppm.store(est_ppm, std::memory_order_relaxed);
-        /* Nudge by 1 ppm toward center with persistence, throttle, and direction self-calibration */
-        static int dir_run = 0; /* -1,0,+1 (consensus of successive decisions) */
-        static int run_len = 0; /* consecutive consistent decisions */
-        static auto next_allowed = std::chrono::steady_clock::now();
-        static int dir_calibrated = 0;          /* 0=unknown; +/-1 = mapping sign */
-        static int awaiting_eval = 0;           /* 1 if last step pending evaluation */
-        static int last_dir_applied = 0;        /* +/-1 for last applied change */
-        static int last_ppm_after = 0;          /* ppm value after last applied change */
-        static int last_step_size = 1;          /* ppm step size used for last change */
-        static double prev_abs_df = 1e12;       /* |df| before last applied change */
-        static double prev_demod_snr_db = -1e9; /* demod SNR at last step */
-        /* Training + lock policy */
-        static auto train_start = std::chrono::steady_clock::now();
-        static int train_started = 0;
-        static int train_steps = 0;
-        const int train_max_ms = 15000;             /* train for up to 15 seconds */
-        const int train_max_steps = 8;              /* or up to 8 steps */
-        const int lock_hold_ms = 3000;              /* lock if stable for 3 seconds */
-        static double lock_deadband_hz = 120.0;     /* and within 120 Hz window */
-        static double zero_lock_deadband_hz = 60.0; /* tighter window for zero-step lock */
-        /* Only allow zero-step lock when estimated offset is very small. This
-           prevents premature lock at 0 when a meaningful offset remains. */
-        static double zero_lock_max_est_ppm = 0.6; /* require |est_ppm| <= 0.6 */
-        /* One-time config overrides for lock thresholds */
-        static int zero_thr_inited = 0;
-        if (!zero_thr_inited) {
-            const dsdneoRuntimeConfig* cfg = dsd_neo_get_config();
-            if (cfg) {
-                zero_lock_max_est_ppm = cfg->auto_ppm_zerolock_ppm;
-                zero_lock_deadband_hz = (double)cfg->auto_ppm_zerolock_hz;
-            }
-            zero_thr_inited = 1;
-        }
-
-        const int hold_needed = 4;             /* require 4 consistent decisions */
-        const int throttle_ms = 1000;          /* at most 1 adjustment per 1s */
-        const double deadband_ppm = 0.8;       /* ignore tiny offsets */
-        const int ppm_limit = 200;             /* clamp absolute ppm range */
-        const double eval_margin_hz = 120;     /* require ~>1/4-bin improvement to accept direction */
-        const double eval_snr_margin_db = 0.5; /* prefer direction that improves demod SNR by >=0.5 dB */
-
-        /* If evaluating last step, prefer demod SNR change; fallback to |df| change */
-        if (awaiting_eval) {
-            double cur_abs_df = fabs(df_hz);
-            auto now = std::chrono::steady_clock::now();
-            bool time_ok = (now >= next_allowed); /* wait full throttle interval for stable measurement */
-            if (time_ok) {
-                bool snr_improved = (gate_snr_db > (prev_demod_snr_db + eval_snr_margin_db));
-                bool snr_worsened = (gate_snr_db + eval_snr_margin_db < prev_demod_snr_db);
-                bool accept = snr_improved || (!snr_worsened && (cur_abs_df + eval_margin_hz < prev_abs_df));
-                bool flip = snr_worsened || (cur_abs_df > prev_abs_df + eval_margin_hz);
-                if (accept) {
-                    dir_calibrated = last_dir_applied;
-                    awaiting_eval = 0;
-                } else if (flip) {
-                    int target_ppm = last_ppm_after - 2 * last_dir_applied * last_step_size;
-                    if (target_ppm > ppm_limit) {
-                        target_ppm = ppm_limit;
-                    }
-                    if (target_ppm < -ppm_limit) {
-                        target_ppm = -ppm_limit;
-                    }
-                    if (target_ppm != opts->rtlsdr_ppm_error) {
-                        opts->rtlsdr_ppm_error = target_ppm;
-                        if (snr_worsened) {
-                            LOG_INFO("AUTO-PPM(spectrum): flip dir (SNR %.1f->%.1f dB). ppm->%d\n", prev_demod_snr_db,
-                                     gate_snr_db, target_ppm);
-                        } else {
-                            LOG_INFO("AUTO-PPM(spectrum): flip dir (|df| %.1f->%.1f Hz). ppm->%d\n", prev_abs_df,
-                                     cur_abs_df, target_ppm);
-                        }
-                    }
-                    dir_calibrated = -last_dir_applied;
-                    awaiting_eval = 0;
-                    next_allowed = now + std::chrono::milliseconds(throttle_ms);
-                    g_auto_ppm_cooldown.store(throttle_ms / 10, std::memory_order_relaxed);
-                } else {
-                    /* Inconclusive: extend wait window a bit */
-                    next_allowed = now + std::chrono::milliseconds(250);
-                }
-            }
-        }
-
-        int dir_base = 0;
-        if (est_ppm > deadband_ppm) {
-            dir_base = +1;
-        } else if (est_ppm < -deadband_ppm) {
-            dir_base = -1;
-        }
-        /* Apply mapping sign when calibrated */
-        int dir = (dir_calibrated == 0) ? dir_base : (dir_base * dir_calibrated);
-        /* Fast catch-up: choose step size based on estimated absolute ppm */
-        int step_size = 1;
-        double abs_est_ppm = fabs(est_ppm);
-        if (abs_est_ppm >= 50.0) {
-            step_size = 8;
-        } else if (abs_est_ppm >= 25.0) {
-            step_size = 4;
-        } else if (abs_est_ppm >= 12.0) {
-            step_size = 2;
-        }
-        if (dir == 0) {
-            dir_run = 0;
-            run_len = 0;
-        } else {
-            if (dir == dir_run) {
-                run_len++;
-            } else {
-                dir_run = dir;
-                run_len = 1;
-            }
-        }
-
-        g_auto_ppm_last_dir.store(dir, std::memory_order_relaxed);
-
-        auto now = std::chrono::steady_clock::now();
-        bool time_ok = (now >= next_allowed);
-        int effective_hold = (step_size > 1) ? (hold_needed / 2) : hold_needed;
-        if (effective_hold < 1) {
-            effective_hold = 1;
-        }
-        if (!awaiting_eval && dir != 0 && run_len >= effective_hold && time_ok) {
-            int new_ppm = opts->rtlsdr_ppm_error + dir * step_size; /* variable step size */
-            if (new_ppm > ppm_limit) {
-                new_ppm = ppm_limit;
-            }
-            if (new_ppm < -ppm_limit) {
-                new_ppm = -ppm_limit;
-            }
-            if (new_ppm != opts->rtlsdr_ppm_error) {
-                prev_abs_df = fabs(df_hz);
-                prev_demod_snr_db = gate_snr_db;
-                opts->rtlsdr_ppm_error = new_ppm;
-                last_dir_applied = dir;
-                last_ppm_after = new_ppm;
-                last_step_size = step_size;
-                awaiting_eval = 1; /* evaluate on next allowed window */
-                next_allowed = now + std::chrono::milliseconds(throttle_ms);
-                g_auto_ppm_cooldown.store(throttle_ms / 10, std::memory_order_relaxed);
-                LOG_INFO("AUTO-PPM(spectrum): PWR=%.1f dB, SNR=%.1f dB, df=%.1f Hz, dir=%+d, step=%d, ppm->%d\n", p_max,
-                         gate_snr_db, df_hz, dir, step_size, new_ppm);
-                if (!train_started) {
-                    train_started = 1;
-                    train_start = now;
-                }
-                train_steps++;
-            }
-            run_len = 0; /* require persistence again */
-        }
-
-        /* Evaluate lock conditions: duration, step count, or stability window */
-        auto now2 = std::chrono::steady_clock::now();
-        if (!train_started) {
-            /* Start the training window only after gate debounce is satisfied */
-            if (pwr_debounced) {
-                train_started = 1;
-                train_start = now2;
-            }
-        } else {
-            int elapsed_ms = (int)std::chrono::duration_cast<std::chrono::milliseconds>(now2 - train_start).count();
-            bool time_over = (elapsed_ms >= train_max_ms);
-            bool steps_over = (train_steps >= train_max_steps);
-            static auto last_change = std::chrono::steady_clock::now();
-            if (awaiting_eval == 0 && run_len == 0 && dir == 0) {
-                /* if not changing, update stability timer */
-                /* we keep last_change unless a step occurs (handled above) */
-            } else if (awaiting_eval == 0 && last_dir_applied != 0) {
-                last_change = now2;
-            }
-            int since_change_ms =
-                (int)std::chrono::duration_cast<std::chrono::milliseconds>(now2 - last_change).count();
-            bool stable_ok = (since_change_ms >= lock_hold_ms && fabs(df_hz) <= lock_deadband_hz);
-            /* Allow lock without steps only when df is stably near zero and
-               the estimated offset is tiny (avoid false zero locks). */
-            bool significant_offset = (fabs(est_ppm) > deadband_ppm);
-            bool stable_zero_ok = (train_steps == 0) && stable_ok && (fabs(df_hz) <= zero_lock_deadband_hz)
-                                  && (!significant_offset) && (fabs(est_ppm) <= zero_lock_max_est_ppm);
-            /* Lock if: lots of steps, or (>=1 step and time/stability satisfied), or (permissible zero-step lock) */
-            bool can_lock = steps_over || ((train_steps >= 1) && (time_over || stable_ok)) || stable_zero_ok;
-            if (can_lock) {
-                g_auto_ppm_locked.store(1, std::memory_order_relaxed);
-                g_auto_ppm_training.store(0, std::memory_order_relaxed);
-                g_auto_ppm_lock_ppm.store(opts->rtlsdr_ppm_error, std::memory_order_relaxed);
-                /* Store peak power at lock for UI */
-                g_auto_ppm_lock_snr_db.store(p_max, std::memory_order_relaxed);
-                g_auto_ppm_lock_df_hz.store(df_hz, std::memory_order_relaxed);
-                LOG_INFO("AUTO-PPM(spectrum): training complete, locked (elapsed=%d ms, steps=%d, |df|=%.1f Hz)\n",
-                         elapsed_ms, train_steps, fabs(df_hz));
-            }
-        }
-        if (!g_auto_ppm_locked.load(std::memory_order_relaxed)) {
-            g_auto_ppm_training.store(1, std::memory_order_relaxed);
-        }
-    } while (0);
+    sync_requested_ppm_after_failed_apply(opts);
+    auto_ppm_maybe_adjust(opts);
 
     /* If PPM Error is Manually Changed, change it here once per batch */
-    if (opts->rtlsdr_ppm_error != dongle.ppm_error) {
-        dongle.ppm_error = opts->rtlsdr_ppm_error;
-        rtl_device_set_ppm(rtl_device_handle, dongle.ppm_error);
-    }
+    sync_requested_ppm_to_controller(opts);
 
     int got = ring_read_batch(&output, out, count);
     if (got <= 0) {
@@ -3383,6 +3613,32 @@ dsd_rtl_stream_read(float* out, size_t count, dsd_opts* opts, dsd_state* state) 
     }
     /* No internal scaling here; callers may apply their own multiplier. */
     return got;
+}
+
+extern "C" int
+rtl_stream_request_ppm(dsd_opts* opts, int ppm) {
+    if (!opts) {
+        return -1;
+    }
+    (void)publish_requested_ppm(opts, ppm);
+    return 0;
+}
+
+extern "C" int
+rtl_stream_adjust_ppm(dsd_opts* opts, int delta) {
+    if (!opts) {
+        return -1;
+    }
+    (void)publish_requested_ppm_delta(opts, delta);
+    return 0;
+}
+
+extern "C" int
+rtl_stream_get_requested_ppm(const dsd_opts* opts) {
+    if (!opts) {
+        return 0;
+    }
+    return snapshot_requested_ppm_state(opts).ppm;
 }
 
 /**
@@ -3807,24 +4063,14 @@ rtl_stream_dsp_get(int* cqpsk_enable, int* fll_enable, int* ted_enable) {
  */
 extern "C" int
 dsd_rtl_stream_tune(dsd_opts* opts, long int frequency) {
-    /* Freeze retunes during auto-PPM training (to allow lock) unless disabled */
-    static int freeze_checked = 0;
-    static int freeze_on_train = 1; /* default on */
-    if (!freeze_checked) {
-        freeze_checked = 1;
-        const dsdneoRuntimeConfig* cfg = dsd_neo_get_config();
-        if (cfg) {
-            freeze_on_train = cfg->auto_ppm_freeze_enable ? 1 : 0;
-        }
-    }
-    extern int dsd_rtl_stream_auto_ppm_training_active(void);
-    if (freeze_on_train && dsd_rtl_stream_auto_ppm_training_active()) {
+    if (auto_ppm_should_freeze_retunes() && dsd_rtl_stream_auto_ppm_training_active()) {
         LOG_NOTICE("Retune deferred: auto-PPM training active.\n");
-        return 0; /* no retune while training */
+        return 0;
     }
     if (opts->payload == 1) {
         LOG_INFO("\nTuning to %ld Hz.", frequency);
     }
+    uint32_t requested_freq = (uint32_t)frequency;
     dongle.freq = opts->rtlsdr_center_freq = frequency;
 
     /* Enqueue retune, coalescing with any already-pending request so completion IDs
@@ -3865,9 +4111,36 @@ dsd_rtl_stream_tune(dsd_opts* opts, long int frequency) {
     }
     dsd_mutex_unlock(&controller.retune_done_m);
 
+    if (rc == 0) {
+        /* If our request was coalesced/overridden by a newer pending tune,
+         * sync caller-visible frequency state to what was actually applied.
+         *
+         * Only reconcile after successful wait completion. On timeout, the
+         * controller may still be retuning, so forcing state here can stale
+         * caller-visible frequency and emit false supersede logs. */
+        uint32_t applied_freq = controller.last_applied_freq_hz.load(std::memory_order_acquire);
+        if (applied_freq != 0 && applied_freq != requested_freq) {
+            LOG_NOTICE("Retune request %u Hz superseded by %u Hz (coalesced pending tune).\n", requested_freq,
+                       applied_freq);
+            dongle.freq = applied_freq;
+            if (opts) {
+                opts->rtlsdr_center_freq = (long int)applied_freq;
+            }
+        }
+    }
+
     /* Honor drain/clear policy for API-triggered tunes as well */
     drain_output_on_retune();
     return rc;
+}
+
+extern "C" int
+dsd_rtl_stream_get_last_applied_freq(uint32_t* out_freq_hz) {
+    if (!out_freq_hz) {
+        return -1;
+    }
+    *out_freq_hz = controller.last_applied_freq_hz.load(std::memory_order_acquire);
+    return 0;
 }
 
 /**

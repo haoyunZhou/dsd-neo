@@ -10,12 +10,6 @@
 
 #include "menu_actions.h"
 
-#include "menu_callbacks.h"
-#include "menu_env.h"
-#include "menu_internal.h"
-#include "menu_prompts.h"
-
-#include <dsd-neo/core/audio.h>
 #include <dsd-neo/core/constants.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/power.h>
@@ -24,15 +18,20 @@
 #include <dsd-neo/platform/posix_compat.h>
 #include <dsd-neo/runtime/config.h>
 #include <dsd-neo/runtime/exitflag.h>
-#include <dsd-neo/ui/menu_core.h>
 #include <dsd-neo/ui/ui_async.h>
 #include <dsd-neo/ui/ui_cmd.h>
-#include <dsd-neo/ui/ui_prims.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#ifdef USE_RTLSDR
+#include "dsd-neo/ui/menu_core.h"
+#include "menu_callbacks.h"
+#include "menu_env.h"
+#include "menu_internal.h"
+#include "menu_prompts.h"
+
+#ifdef USE_RADIO
 #include <dsd-neo/io/rtl_stream_c.h>
 #include <dsd-neo/ui/ui_dsp_cmd.h>
 #endif
@@ -636,19 +635,34 @@ io_stop_symbol_saving(void* vctx) {
     ui_statusf("Stop symbol capture requested");
 }
 
-void
-io_set_pulse_out(void* vctx) {
+static void
+free_pulse_choice_lists(const char** labels, const char** names, char** bufs, int n) {
+    for (int i = 0; i < n; i++) {
+        free((void*)names[i]);
+        free(bufs[i]);
+    }
+    free((void*)labels);
+    free((void*)names);
+    free((void*)bufs);
+}
+
+static void
+io_set_pulse_device_common(void* vctx, int is_input, const char* chooser_title, const char* empty_msg,
+                           void (*on_done)(void*, int)) {
+    enum { kMaxPulseDevices = 16 };
+
     UiCtx* c = (UiCtx*)vctx;
-    dsd_audio_device outs[16];
-    dsd_audio_device ins[16];
-    if (dsd_audio_enumerate_devices(ins, outs, 16) < 0) {
+    dsd_audio_device outs[kMaxPulseDevices];
+    dsd_audio_device ins[kMaxPulseDevices];
+    if (dsd_audio_enumerate_devices(ins, outs, kMaxPulseDevices) < 0) {
         ui_statusf("Failed to get audio device list");
         return;
     }
+
     int n = 0;
-    const char** labels = (const char**)calloc(16, sizeof(char*));
-    const char** names = (const char**)calloc(16, sizeof(char*));
-    char** bufs = (char**)calloc(16, sizeof(char*));
+    const char** labels = (const char**)calloc(kMaxPulseDevices, sizeof(char*));
+    const char** names = (const char**)calloc(kMaxPulseDevices, sizeof(char*));
+    char** bufs = (char**)calloc(kMaxPulseDevices, sizeof(char*));
     if (!labels || !names || !bufs) {
         free((void*)labels);
         free((void*)names);
@@ -656,39 +670,35 @@ io_set_pulse_out(void* vctx) {
         ui_statusf("Out of memory");
         return;
     }
-    for (int i = 0; i < 16; i++) {
-        if (!outs[i].initialized) {
+
+    for (int i = 0; i < kMaxPulseDevices; i++) {
+        const dsd_audio_device* dev = is_input ? &ins[i] : &outs[i];
+        if (!dev->initialized) {
             break;
         }
         bufs[n] = (char*)calloc(768, sizeof(char));
         if (!bufs[n]) {
             continue;
         }
-        int name_len = (int)strnlen(outs[i].name, 511);
-        int desc_len = (int)strnlen(outs[i].description, 255);
-        snprintf(bufs[n], 768, "[%d] %.*s - %.*s", outs[i].index, name_len, outs[i].name, desc_len,
-                 outs[i].description);
+        int name_len = (int)strnlen(dev->name, 511);
+        int desc_len = (int)strnlen(dev->description, 255);
+        snprintf(bufs[n], 768, "[%d] %.*s - %.*s", dev->index, name_len, dev->name, desc_len, dev->description);
         labels[n] = bufs[n];
-        names[n] = dsd_strdup(outs[i].name);
+        names[n] = dsd_strdup(dev->name);
         n++;
     }
+
     if (n == 0) {
         free((void*)labels);
         free((void*)names);
         free((void*)bufs);
-        ui_statusf("No Pulse outputs found");
+        ui_statusf("%s", empty_msg);
         return;
     }
 
     PulseSelCtx* pctx = (PulseSelCtx*)calloc(1, sizeof(PulseSelCtx));
     if (!pctx) {
-        for (int i = 0; i < n; i++) {
-            free((void*)names[i]);
-            free(bufs[i]);
-        }
-        free((void*)labels);
-        free((void*)names);
-        free((void*)bufs);
+        free_pulse_choice_lists(labels, names, bufs, n);
         ui_statusf("Out of memory");
         return;
     }
@@ -697,70 +707,17 @@ io_set_pulse_out(void* vctx) {
     pctx->names = names;
     pctx->bufs = bufs;
     pctx->n = n;
-    ui_chooser_start("Select Pulse Output", labels, n, chooser_done_pulse_out, pctx);
+    ui_chooser_start(chooser_title, labels, n, on_done, pctx);
+}
+
+void
+io_set_pulse_out(void* vctx) {
+    io_set_pulse_device_common(vctx, 0, "Select Pulse Output", "No Pulse outputs found", chooser_done_pulse_out);
 }
 
 void
 io_set_pulse_in(void* vctx) {
-    UiCtx* c = (UiCtx*)vctx;
-    dsd_audio_device outs[16];
-    dsd_audio_device ins[16];
-    if (dsd_audio_enumerate_devices(ins, outs, 16) < 0) {
-        ui_statusf("Failed to get audio device list");
-        return;
-    }
-    int n = 0;
-    const char** labels = (const char**)calloc(16, sizeof(char*));
-    const char** names = (const char**)calloc(16, sizeof(char*));
-    char** bufs = (char**)calloc(16, sizeof(char*));
-    if (!labels || !names || !bufs) {
-        free((void*)labels);
-        free((void*)names);
-        free((void*)bufs);
-        ui_statusf("Out of memory");
-        return;
-    }
-    for (int i = 0; i < 16; i++) {
-        if (!ins[i].initialized) {
-            break;
-        }
-        bufs[n] = (char*)calloc(768, sizeof(char));
-        if (!bufs[n]) {
-            continue;
-        }
-        int name_len2 = (int)strnlen(ins[i].name, 511);
-        int desc_len2 = (int)strnlen(ins[i].description, 255);
-        snprintf(bufs[n], 768, "[%d] %.*s - %.*s", ins[i].index, name_len2, ins[i].name, desc_len2, ins[i].description);
-        labels[n] = bufs[n];
-        names[n] = dsd_strdup(ins[i].name);
-        n++;
-    }
-    if (n == 0) {
-        free((void*)labels);
-        free((void*)names);
-        free((void*)bufs);
-        ui_statusf("No Pulse inputs found");
-        return;
-    }
-
-    PulseSelCtx* pctx = (PulseSelCtx*)calloc(1, sizeof(PulseSelCtx));
-    if (!pctx) {
-        for (int i = 0; i < n; i++) {
-            free((void*)names[i]);
-            free(bufs[i]);
-        }
-        free((void*)labels);
-        free((void*)names);
-        free((void*)bufs);
-        ui_statusf("Out of memory");
-        return;
-    }
-    pctx->c = c;
-    pctx->labels = labels;
-    pctx->names = names;
-    pctx->bufs = bufs;
-    pctx->n = n;
-    ui_chooser_start("Select Pulse Input", labels, n, chooser_done_pulse_in, pctx);
+    io_set_pulse_device_common(vctx, 1, "Select Pulse Input", "No Pulse inputs found", chooser_done_pulse_in);
 }
 
 void
@@ -1092,7 +1049,7 @@ act_toggle_ui_p25_callsign(void* v) {
 
 // ---- RTL-SDR actions ----
 
-#ifdef USE_RTLSDR
+#ifdef USE_RADIO
 
 void
 rtl_enable(void* v) {
@@ -1127,7 +1084,7 @@ rtl_set_gain(void* v) {
 void
 rtl_set_ppm(void* v) {
     UiCtx* c = (UiCtx*)v;
-    ui_prompt_open_int_async("PPM error (-200..200)", c->opts->rtlsdr_ppm_error, cb_rtl_ppm, c);
+    ui_prompt_open_int_async("PPM error (-200..200)", rtl_stream_get_requested_ppm(c->opts), cb_rtl_ppm, c);
 }
 
 void
@@ -1380,4 +1337,4 @@ act_toggle_dsp_panel(void* v) {
     ui_post_cmd(UI_CMD_UI_SHOW_DSP_PANEL_TOGGLE, NULL, 0);
 }
 
-#endif /* USE_RTLSDR */
+#endif /* USE_RADIO */

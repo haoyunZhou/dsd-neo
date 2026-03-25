@@ -29,25 +29,27 @@
 #include <dsd-neo/dsp/dmr_sync.h>
 #include <dsd-neo/dsp/sps_filters.h>
 #include <dsd-neo/dsp/symbol_levels.h>
-#ifdef USE_RTLSDR
+#include <time.h>
+#ifdef USE_RADIO
 #include <dsd-neo/runtime/rtl_stream_io_hooks.h>
 #include <dsd-neo/runtime/rtl_stream_metrics_hooks.h>
 #endif
 #include <dsd-neo/platform/audio.h>
-#include <dsd-neo/platform/posix_compat.h>
 #include <dsd-neo/platform/timing.h>
 #include <dsd-neo/runtime/config.h>
 #include <dsd-neo/runtime/exitflag.h>
 #include <dsd-neo/runtime/log.h>
 #include <dsd-neo/runtime/net_audio_input_hooks.h>
 #include <dsd-neo/runtime/udp_audio_hooks.h>
-
 #include <math.h>
 #include <sndfile.h>
 #include <stdint.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
+
+#include "dsd-neo/core/opts_fwd.h"
+#include "dsd-neo/core/state_fwd.h"
+#include "dsd-neo/platform/sockets.h"
 
 extern dsd_socket_t Connect(char* hostname, int portno);
 extern void cleanupAndExit(dsd_opts* opts, dsd_state* state);
@@ -99,7 +101,7 @@ select_window_gfsk(int* l_edge, int* r_edge, int freeze_window) {
     *r_edge = 1;         // pick i == center+1
 }
 
-#ifdef USE_RTLSDR
+#ifdef USE_RADIO
 /* --- C4FM clock assist (EL / M&M) --- */
 static inline int
 slice_c4fm_level(int x, const dsd_state* s) {
@@ -207,7 +209,7 @@ maybe_c4fm_clock(dsd_opts* opts, dsd_state* state, int have_sync, int mode, int 
 }
 #endif
 
-#ifdef USE_RTLSDR
+#ifdef USE_RADIO
 /*
  * Nudge symbolCenter by ±1 based on a smoothed TED residual when available.
  * Guards against oscillation using a small deadband and a cooldown period.
@@ -293,7 +295,7 @@ maybe_auto_center(dsd_opts* opts, dsd_state* state, int have_sync) {
 }
 #endif
 
-#ifdef USE_RTLSDR
+#ifdef USE_RADIO
 /*
  * When using the RTL pipeline without resampling to 48 kHz, adjust
  * samplesPerSymbol and symbolCenter proportional to the current output rate
@@ -367,7 +369,7 @@ getSymbol(dsd_opts* opts, dsd_state* state, int have_sync) {
     count = 0;
     sample = 0.0f; //init sample with a value of 0...see if this was causing issues with raw audio monitoring
 
-#ifdef USE_RTLSDR
+#ifdef USE_RADIO
     /* C4FM clock assist capture around symbol center */
     int clk_mode = 0;
     int clk_early = 0, clk_mid = 0, clk_late = 0;
@@ -384,7 +386,7 @@ getSymbol(dsd_opts* opts, dsd_state* state, int have_sync) {
 #endif
 
     /* Optional auto-centering based on TED residual (RTL path only, C4FM, when not synced) */
-#ifdef USE_RTLSDR
+#ifdef USE_RADIO
     maybe_auto_center(opts, state, have_sync);
     /* Align SPS to current RTL output rate if not 48 kHz */
     maybe_adjust_sps_for_output_rate(opts, state);
@@ -410,7 +412,7 @@ getSymbol(dsd_opts* opts, dsd_state* state, int have_sync) {
     if (symbol_span < 1) {
         symbol_span = 1;
     }
-#ifdef USE_RTLSDR
+#ifdef USE_RADIO
     int cqpsk_symbol_rate = 0;
     if (opts->audio_in_type == AUDIO_IN_RTL && state->rf_mod == 1) {
         int dsp_cqpsk = 0, dsp_fll = 0, dsp_ted = 0;
@@ -533,7 +535,7 @@ getSymbol(dsd_opts* opts, dsd_state* state, int have_sync) {
                 }
             }
         } else if (opts->audio_in_type == AUDIO_IN_RTL) {
-#ifdef USE_RTLSDR
+#ifdef USE_RADIO
             // Read demodulated stream here
             if (!state->rtl_ctx) {
                 cleanupAndExit(opts, state);
@@ -586,7 +588,6 @@ getSymbol(dsd_opts* opts, dsd_state* state, int have_sync) {
                     backoff_ms = cfg_retry->tcpin_backoff_ms;
                 }
                 fprintf(stderr, "\nConnection to TCP Server Interrupted. Trying again in %d ms.\n", backoff_ms);
-                sample = 0;
                 dsd_net_audio_input_hook_tcp_close(opts->tcp_in_ctx); //close current connection on this end
                 opts->tcp_in_ctx = NULL;
                 dsd_socket_close(opts->tcp_sockfd);
@@ -666,7 +667,7 @@ getSymbol(dsd_opts* opts, dsd_state* state, int have_sync) {
             /* Collect ~20 ms of audio based on current output Fs (defaults to 48 kHz; ~960 samples). */
             unsigned int analog_block = analog_out_cap;
             if (opts->audio_in_type == AUDIO_IN_RTL) {
-#ifdef USE_RTLSDR
+#ifdef USE_RADIO
                 unsigned int Fs = 0;
                 if (state->rtl_ctx) {
                     Fs = dsd_rtl_stream_metrics_hook_output_rate_hz();
@@ -968,7 +969,7 @@ getSymbol(dsd_opts* opts, dsd_state* state, int have_sync) {
 
         state->lastsample = sample;
 
-#ifdef USE_RTLSDR
+#ifdef USE_RADIO
         if (clk_mode && state->rf_mod == 0) {
             int c = state->symbolCenter;
             if (i == c - 1) {
@@ -1004,15 +1005,17 @@ getSymbol(dsd_opts* opts, dsd_state* state, int have_sync) {
         }
         left = state->debug_sample_left_edge / SAMPLE_RATE_IN;
         right = state->debug_sample_right_edge / SAMPLE_RATE_IN;
-        if (state->debug_prefix != '\0') {
-            if (state->debug_prefix == 'I') {
-                fprintf(state->debug_label_file, "%f\t%f\t%c%c %.3f\n", left, right, state->debug_prefix,
-                        state->debug_prefix_2, symbol);
+        if (state->debug_label_file != NULL) {
+            if (state->debug_prefix != '\0') {
+                if (state->debug_prefix == 'I') {
+                    fprintf(state->debug_label_file, "%f\t%f\t%c%c %.3f\n", left, right, state->debug_prefix,
+                            state->debug_prefix_2, symbol);
+                } else {
+                    fprintf(state->debug_label_file, "%f\t%f\t%c %.3f\n", left, right, state->debug_prefix, symbol);
+                }
             } else {
-                fprintf(state->debug_label_file, "%f\t%f\t%c %.3f\n", left, right, state->debug_prefix, symbol);
+                fprintf(state->debug_label_file, "%f\t%f\t%.3f\n", left, right, symbol);
             }
-        } else {
-            fprintf(state->debug_label_file, "%f\t%f\t%.3f\n", left, right, symbol);
         }
     }
 #endif
@@ -1076,7 +1079,7 @@ getSymbol(dsd_opts* opts, dsd_state* state, int have_sync) {
     }
 
     /* Apply C4FM clock assist after symbol decision (unsynced only) */
-#ifdef USE_RTLSDR
+#ifdef USE_RADIO
     if (clk_mode && state->rf_mod == 0) {
         maybe_c4fm_clock(opts, state, have_sync, clk_mode, clk_early, clk_mid, clk_late);
     }

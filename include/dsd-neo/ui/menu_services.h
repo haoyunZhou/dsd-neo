@@ -170,7 +170,7 @@ void svc_toggle_inv_dpmr(dsd_opts* opts);
 /** @brief Toggle M17 symbol inversion. */
 void svc_toggle_inv_m17(dsd_opts* opts);
 
-#ifdef USE_RTLSDR
+#ifdef USE_RADIO
 // RTL-SDR configuration and lifecycle helpers
 /** @brief Switch active input to RTL-SDR and restart the stream. */
 int svc_rtl_enable_input(dsd_opts* opts, dsd_state* state);
@@ -194,7 +194,7 @@ int svc_rtl_set_volume_mult(dsd_opts* opts, int mult);
 int svc_rtl_set_bias_tee(dsd_opts* opts, dsd_state* state, int on);
 /** @brief Toggle RTL-TCP adaptive networking and propagate to env/stream. */
 int svc_rtltcp_set_autotune(dsd_opts* opts, dsd_state* state, int on);
-/** @brief Toggle spectrum-based auto PPM and propagate to env/stream. */
+/** @brief Toggle carrier/error-based auto PPM and propagate to env/stream. */
 int svc_rtl_set_auto_ppm(dsd_opts* opts, dsd_state* state, int on);
 #endif
 

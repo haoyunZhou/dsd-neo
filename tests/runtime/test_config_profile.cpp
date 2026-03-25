@@ -7,13 +7,13 @@
  * Unit tests for config profile support.
  */
 
+#include <dsd-neo/runtime/config.h>
 #include <errno.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
+#include <sys/types.h>
 
-#include <dsd-neo/runtime/config.h>
-
+#include "dsd-neo/platform/file_compat.h"
 #include "test_support.h"
 
 static int
@@ -191,6 +191,137 @@ test_profile_multiple_overrides(void) {
 }
 
 static int
+test_profile_bool_aliases(void) {
+    static const char* ini = "version = 1\n"
+                             "\n"
+                             "[output]\n"
+                             "backend = \"pulse\"\n"
+                             "ncurses_ui = false\n"
+                             "\n"
+                             "[trunking]\n"
+                             "enabled = true\n"
+                             "allow_list = false\n"
+                             "tune_group_calls = true\n"
+                             "tune_private_calls = true\n"
+                             "tune_data_calls = false\n"
+                             "tune_enc_calls = true\n"
+                             "\n"
+                             "[profile.bool_aliases]\n"
+                             "output.ncurses_ui = on\n"
+                             "trunking.enabled = off\n"
+                             "trunking.allow_list = on\n"
+                             "trunking.tune_group_calls = off\n"
+                             "trunking.tune_private_calls = no\n"
+                             "trunking.tune_data_calls = yes\n"
+                             "trunking.tune_enc_calls = 0\n";
+
+    char path[DSD_TEST_PATH_MAX];
+    if (write_temp_config(ini, path, sizeof path) != 0) {
+        return 1;
+    }
+
+    dsdneoUserConfig cfg;
+    memset(&cfg, 0, sizeof(cfg));
+
+    int rc = dsd_user_config_load_profile(path, "bool_aliases", &cfg);
+
+    int result = 0;
+    if (rc != 0) {
+        fprintf(stderr, "FAIL: load with bool_aliases profile failed (rc=%d)\n", rc);
+        result = 1;
+    }
+    if (!cfg.ncurses_ui) {
+        fprintf(stderr, "FAIL: expected ncurses_ui on from profile alias\n");
+        result = 1;
+    }
+    if (cfg.trunk_enabled) {
+        fprintf(stderr, "FAIL: expected trunking disabled by profile alias\n");
+        result = 1;
+    }
+    if (!cfg.trunk_use_allow_list) {
+        fprintf(stderr, "FAIL: expected allow_list enabled by profile alias\n");
+        result = 1;
+    }
+    if (cfg.trunk_tune_group_calls != 0) {
+        fprintf(stderr, "FAIL: expected tune_group_calls disabled by profile alias\n");
+        result = 1;
+    }
+    if (cfg.trunk_tune_private_calls != 0) {
+        fprintf(stderr, "FAIL: expected tune_private_calls disabled by profile alias\n");
+        result = 1;
+    }
+    if (cfg.trunk_tune_data_calls != 1) {
+        fprintf(stderr, "FAIL: expected tune_data_calls enabled by profile alias\n");
+        result = 1;
+    }
+    if (cfg.trunk_tune_enc_calls != 0) {
+        fprintf(stderr, "FAIL: expected tune_enc_calls disabled by profile alias\n");
+        result = 1;
+    }
+
+    (void)remove(path);
+    return result;
+}
+
+static int
+test_profile_decode_mode_aliases(void) {
+    static const char* ini = "version = 1\n"
+                             "\n"
+                             "[mode]\n"
+                             "decode = \"auto\"\n"
+                             "\n"
+                             "[profile.alias_p25p1]\n"
+                             "mode.decode = \"p25p1_only\"\n"
+                             "\n"
+                             "[profile.alias_p25p2]\n"
+                             "mode.decode = \"p25p2_only\"\n"
+                             "\n"
+                             "[profile.alias_analog]\n"
+                             "mode.decode = \"analog_monitor\"\n"
+                             "\n"
+                             "[profile.alias_edacs]\n"
+                             "mode.decode = \"edacs\"\n"
+                             "\n"
+                             "[profile.alias_provoice]\n"
+                             "mode.decode = \"provoice\"\n";
+
+    char path[DSD_TEST_PATH_MAX];
+    if (write_temp_config(ini, path, sizeof path) != 0) {
+        return 1;
+    }
+
+    struct {
+        const char* profile_name;
+        dsdneoUserDecodeMode expected_mode;
+    } cases[] = {
+        {"alias_p25p1", DSDCFG_MODE_P25P1},       {"alias_p25p2", DSDCFG_MODE_P25P2},
+        {"alias_analog", DSDCFG_MODE_ANALOG},     {"alias_edacs", DSDCFG_MODE_EDACS_PV},
+        {"alias_provoice", DSDCFG_MODE_EDACS_PV},
+    };
+
+    int result = 0;
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        dsdneoUserConfig cfg;
+        memset(&cfg, 0, sizeof(cfg));
+
+        int rc = dsd_user_config_load_profile(path, cases[i].profile_name, &cfg);
+        if (rc != 0) {
+            fprintf(stderr, "FAIL: load with profile %s failed (rc=%d)\n", cases[i].profile_name, rc);
+            result = 1;
+            continue;
+        }
+        if (cfg.decode_mode != cases[i].expected_mode) {
+            fprintf(stderr, "FAIL: profile %s expected decode_mode %d, got %d\n", cases[i].profile_name,
+                    (int)cases[i].expected_mode, (int)cfg.decode_mode);
+            result = 1;
+        }
+    }
+
+    (void)remove(path);
+    return result;
+}
+
+static int
 test_unknown_profile(void) {
     static const char* ini = "version = 1\n"
                              "\n"
@@ -353,6 +484,94 @@ test_profile_rtl_settings(void) {
 }
 
 static int
+test_profile_invalid_int_uses_legacy_zero_fallback(void) {
+    static const char* ini = "version = 1\n"
+                             "\n"
+                             "[input]\n"
+                             "source = \"rtl\"\n"
+                             "rtl_gain = 30\n"
+                             "\n"
+                             "[profile.invalid_gain]\n"
+                             "input.rtl_gain = \"invalid\"\n";
+
+    char path[DSD_TEST_PATH_MAX];
+    if (write_temp_config(ini, path, sizeof path) != 0) {
+        return 1;
+    }
+
+    dsdneoUserConfig cfg;
+    memset(&cfg, 0, sizeof(cfg));
+
+    int rc = dsd_user_config_load_profile(path, "invalid_gain", &cfg);
+
+    int result = 0;
+    if (rc != 0) {
+        fprintf(stderr, "FAIL: load with invalid_gain profile failed (rc=%d)\n", rc);
+        result = 1;
+    }
+    if (cfg.input_source != DSDCFG_INPUT_RTL) {
+        fprintf(stderr, "FAIL: expected rtl source, got %d\n", cfg.input_source);
+        result = 1;
+    }
+    if (cfg.rtl_gain != 0) {
+        fprintf(stderr, "FAIL: expected invalid profile rtl_gain to fall back to 0, got %d\n", cfg.rtl_gain);
+        result = 1;
+    }
+
+    (void)remove(path);
+    return result;
+}
+
+static int
+test_profile_soapy_settings(void) {
+    static const char* ini = "version = 1\n"
+                             "\n"
+                             "[input]\n"
+                             "source = \"pulse\"\n"
+                             "\n"
+                             "[profile.soapy_scan]\n"
+                             "input.source = \"soapy\"\n"
+                             "input.soapy_args = \"driver=airspy,serial=ABC123\"\n"
+                             "input.rtl_freq = \"162.550M\"\n"
+                             "input.rtl_gain = 27\n";
+
+    char path[DSD_TEST_PATH_MAX];
+    if (write_temp_config(ini, path, sizeof path) != 0) {
+        return 1;
+    }
+
+    dsdneoUserConfig cfg;
+    memset(&cfg, 0, sizeof(cfg));
+
+    int rc = dsd_user_config_load_profile(path, "soapy_scan", &cfg);
+
+    int result = 0;
+    if (rc != 0) {
+        fprintf(stderr, "FAIL: load with soapy_scan profile failed (rc=%d)\n", rc);
+        result = 1;
+    }
+    if (cfg.input_source != DSDCFG_INPUT_SOAPY) {
+        fprintf(stderr, "FAIL: expected soapy source, got %d\n", cfg.input_source);
+        result = 1;
+    }
+    if (strcmp(cfg.soapy_args, "driver=airspy,serial=ABC123") != 0) {
+        fprintf(stderr, "FAIL: expected soapy_args driver=airspy,serial=ABC123, got %s\n", cfg.soapy_args);
+        result = 1;
+    }
+    if (strcmp(cfg.rtl_freq, "162.550M") != 0) {
+        fprintf(stderr, "FAIL: expected rtl_freq 162.550M, got %s\n", cfg.rtl_freq);
+        result = 1;
+    }
+    if (cfg.rtl_gain != 27) {
+        fprintf(stderr, "FAIL: expected rtl_gain 27, got %d\n", cfg.rtl_gain);
+        result = 1;
+    }
+
+    (void)remove(path);
+    return result;
+}
+
+static int
 test_include_directive(void) {
     /* Create included file first */
     static const char* included_ini = "version = 1\n"
@@ -503,10 +722,14 @@ main(void) {
     rc |= test_load_without_profile();
     rc |= test_load_with_profile_override();
     rc |= test_profile_multiple_overrides();
+    rc |= test_profile_bool_aliases();
+    rc |= test_profile_decode_mode_aliases();
     rc |= test_unknown_profile();
     rc |= test_list_profiles();
     rc |= test_list_profiles_empty();
     rc |= test_profile_rtl_settings();
+    rc |= test_profile_invalid_int_uses_legacy_zero_fallback();
+    rc |= test_profile_soapy_settings();
     rc |= test_include_directive();
     rc |= test_include_override();
 

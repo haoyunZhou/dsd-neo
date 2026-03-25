@@ -7,17 +7,17 @@
  * Trunk system display functions for ncurses UI
  */
 
-#include <dsd-neo/ui/ncurses_trunk_display.h>
-
+#include <curses.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/state.h>
 #include <dsd-neo/core/synctype_ids.h>
 #include <dsd-neo/ui/ncurses_p25_display.h>
+#include <dsd-neo/ui/ncurses_trunk_display.h>
 #include <dsd-neo/ui/ui_prims.h>
-
-#include <dsd-neo/platform/curses_compat.h>
 #include <string.h>
-#include <time.h>
+
+#include "dsd-neo/core/opts_fwd.h"
+#include "dsd-neo/core/state_fwd.h"
 
 // Print learned trunking LCNs and their mapped frequencies
 void
@@ -97,10 +97,10 @@ ui_print_learned_lcns(const dsd_opts* opts, const dsd_state* state) {
                 int is_iden = ui_match_iden_channel(state, i, f, &iden);
                 if (is_iden) {
                     attron(COLOR_PAIR(ui_iden_color_pair(iden)));
-                    printw("CH %04X[I%d]: %010.06lf MHz", i & 0xFFFF, iden & 0xF, (double)f / 1000000.0);
+                    printw("CH %04X[I%d]: %.06lf MHz", i & 0xFFFF, iden & 0xF, (double)f / 1000000.0);
                     attr_set(saved_attrs, saved_pair, NULL);
                 } else {
-                    printw("CH %04X: %010.06lf MHz", i & 0xFFFF, (double)f / 1000000.0);
+                    printw("CH %04X: %.06lf MHz", i & 0xFFFF, (double)f / 1000000.0);
                 }
                 col_in_row++;
                 printed++;
@@ -165,17 +165,17 @@ ui_print_learned_lcns(const dsd_opts* opts, const dsd_state* state) {
                 int is_iden = ui_match_iden_channel(state, found_ch, f, &iden);
                 if (is_iden) {
                     attron(COLOR_PAIR(ui_iden_color_pair(iden)));
-                    printw("CH %04X[I%d]: %010.06lf MHz", found_ch & 0xFFFF, iden & 0xF, (double)f / 1000000.0);
+                    printw("CH %04X[I%d]: %.06lf MHz", found_ch & 0xFFFF, iden & 0xF, (double)f / 1000000.0);
                     attr_set(saved_attrs, saved_pair, NULL);
                 } else {
-                    printw("CH %04X: %010.06lf MHz", found_ch & 0xFFFF, (double)f / 1000000.0);
+                    printw("CH %04X: %.06lf MHz", found_ch & 0xFFFF, (double)f / 1000000.0);
                 }
             } else {
                 if (col_in_row == 0) {
                     ui_print_lborder_green();
                     addch(' ');
                 }
-                printw("CH ----: %010.06lf MHz", (double)f / 1000000.0);
+                printw("CH ----: %.06lf MHz", (double)f / 1000000.0);
             }
             col_in_row++;
             if (col_in_row >= cols_per_line) {

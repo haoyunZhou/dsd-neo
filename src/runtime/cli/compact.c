@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 /*
- * Copyright (C) 2025 by arancormonk <180709949+arancormonk@users.noreply.github.com>
+ * Copyright (C) 2026 by arancormonk <180709949+arancormonk@users.noreply.github.com>
  */
 
 #include <dsd-neo/runtime/cli.h>
@@ -27,6 +27,15 @@ dsd_cli_compact_args(int argc, char** argv) {
         if (strcmp(arg, "--rtltcp-autotune") == 0) {
             continue;
         }
+        if (strcmp(arg, "--rtl-udp-control") == 0) {
+            if (i + 1 < argc && argv[i + 1] != NULL && argv[i + 1][0] != '-') {
+                i++;
+            }
+            continue;
+        }
+        if (strncmp(arg, "--rtl-udp-control=", 18) == 0) {
+            continue;
+        }
         if (strcmp(arg, "--input-volume") == 0) {
             if (i + 1 < argc) {
                 i++;
@@ -37,6 +46,75 @@ dsd_cli_compact_args(int argc, char** argv) {
             if (i + 1 < argc) {
                 i++;
             }
+            continue;
+        }
+        if (strcmp(arg, "--frame-log") == 0) {
+            if (i + 1 < argc) {
+                i++;
+            }
+            continue;
+        }
+        if (strcmp(arg, "--rdio-mode") == 0) {
+            if (i + 1 < argc) {
+                i++;
+            }
+            continue;
+        }
+        if (strcmp(arg, "--rdio-system-id") == 0) {
+            if (i + 1 < argc) {
+                i++;
+            }
+            continue;
+        }
+        if (strcmp(arg, "--rdio-api-url") == 0) {
+            if (i + 1 < argc) {
+                i++;
+            }
+            continue;
+        }
+        if (strcmp(arg, "--rdio-api-key") == 0) {
+            if (i + 1 < argc) {
+                i++;
+            }
+            continue;
+        }
+        if (strcmp(arg, "--rdio-upload-timeout-ms") == 0) {
+            if (i + 1 < argc) {
+                i++;
+            }
+            continue;
+        }
+        if (strcmp(arg, "--rdio-upload-retries") == 0) {
+            if (i + 1 < argc) {
+                i++;
+            }
+            continue;
+        }
+        if (strcmp(arg, "--dmr-baofeng-pc5") == 0) {
+            if (i + 1 < argc) {
+                i++;
+            }
+            continue;
+        }
+        if (strncmp(arg, "--dmr-baofeng-pc5=", 18) == 0) {
+            continue;
+        }
+        if (strcmp(arg, "--dmr-csi-ee72") == 0) {
+            if (i + 1 < argc) {
+                i++;
+            }
+            continue;
+        }
+        if (strncmp(arg, "--dmr-csi-ee72=", 15) == 0) {
+            continue;
+        }
+        if (strcmp(arg, "--dmr-vertex-ks-csv") == 0) {
+            if (i + 1 < argc) {
+                i++;
+            }
+            continue;
+        }
+        if (strncmp(arg, "--dmr-vertex-ks-csv=", 20) == 0) {
             continue;
         }
         if (strcmp(arg, "--auto-ppm-snr") == 0) {

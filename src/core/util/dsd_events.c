@@ -20,11 +20,13 @@
 #include <dsd-neo/core/synctype_ids.h>
 #include <dsd-neo/core/time_format.h>
 #include <dsd-neo/protocol/edacs/edacs_afs.h>
-#include <dsd-neo/runtime/git_ver.h>
-
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
+
+#include "dsd-neo/core/opts_fwd.h"
+#include "dsd-neo/core/state_fwd.h"
 
 // Safe bounded copy helper that tolerates potential overlap
 static inline void
@@ -273,14 +275,14 @@ watchdog_event_history(dsd_opts* opts, dsd_state* state, uint8_t slot) {
         if (opts->static_wav_file == 0) {
 
             if (slot == 0 && opts->wav_out_f != NULL) {
-                opts->wav_out_f =
-                    close_and_rename_wav_file(opts->wav_out_f, opts->wav_out_file, opts->wav_out_dir, event_struct);
+                opts->wav_out_f = close_and_rename_wav_file(opts->wav_out_f, opts, opts->wav_out_file,
+                                                            opts->wav_out_dir, event_struct);
                 opts->wav_out_f = open_wav_file(opts->wav_out_dir, opts->wav_out_file, 8000, 0);
             }
 
             else if (slot == 1 && opts->wav_out_fR != NULL) {
-                opts->wav_out_fR =
-                    close_and_rename_wav_file(opts->wav_out_fR, opts->wav_out_fileR, opts->wav_out_dir, event_struct);
+                opts->wav_out_fR = close_and_rename_wav_file(opts->wav_out_fR, opts, opts->wav_out_fileR,
+                                                             opts->wav_out_dir, event_struct);
                 opts->wav_out_fR = open_wav_file(opts->wav_out_dir, opts->wav_out_fileR, 8000, 0);
             }
         }
@@ -1198,6 +1200,8 @@ watchdog_event_datacall(dsd_opts* opts, dsd_state* state, uint32_t src, uint32_t
     snprintf(state->event_history_s[slot].Event_History_Items[0].event_string,
              sizeof state->event_history_s[slot].Event_History_Items[0].event_string, "%s",
              event_string); // could change this to a strncpy to prevent potential overflow
+
+    dsd_frame_logf(opts, "FRAME DATA slot=%d src=%u dst=%u %s", slot + 1, src, dst, data_string ? data_string : "");
 
     /* stack buffers; no free */
 

@@ -15,9 +15,23 @@
 #include <dsd-neo/protocol/dmr/dmr.h>
 #include <dsd-neo/protocol/dmr/dmr_utils_api.h>
 #include <dsd-neo/runtime/colors.h>
-
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+
+#include "dsd-neo/core/opts_fwd.h"
+#include "dsd-neo/core/state_fwd.h"
+
+static int
+dmr_slot_is_kirisun_call(const dsd_state* state, uint8_t slot_idx) {
+    // Gate Kirisun handling using current-call slot metadata only.
+    // payload_algid* can persist across call boundaries and must not steer SB/RC parsing.
+    if (slot_idx == 0U) {
+        return state->dmr_fid == 0x0A;
+    }
+
+    return state->dmr_fidR == 0x0A;
+}
 
 //gather ambe_fr mi fragments for processing
 void
@@ -237,6 +251,22 @@ dmr_late_entry_mi(dsd_opts* opts, dsd_state* state) {
 }
 
 void
+dmr_refresh_algids_on_error(dsd_opts* opts, dsd_state* state) {
+    for (uint8_t slot = 0; slot < 2; slot++) {
+        int algid = (slot == 0) ? state->payload_algid : state->payload_algidR;
+        if (algid >= 0x21) {
+            state->currentslot = slot;
+            dmr_alg_refresh(opts, state);
+        } else if (algid == 0x02) {
+            // hytera_enhanced_alg_refresh reads state->currentslot to pick the slot MI.
+            state->currentslot = slot;
+            hytera_enhanced_alg_refresh(state);
+            dmr_alg_refresh(opts, state);
+        }
+    }
+}
+
+void
 dmr_alg_refresh(dsd_opts* opts, dsd_state* state) {
     UNUSED(opts);
 
@@ -264,6 +294,24 @@ dmr_alg_refresh(dsd_opts* opts, dsd_state* state) {
             fprintf(stderr, " Hytera Enhanced;");
             fprintf(stderr, "%s\n", KNRM);
         }
+
+        if (state->payload_algid == 0x35 || state->payload_algid == 0x36 || state->payload_algid == 0x37) {
+            state->DMRvcL = 0;
+            state->payload_mi = kirisun_lfsr(state->payload_mi);
+            fprintf(stderr, "%s", KYEL);
+            fprintf(stderr, " Slot 1");
+            fprintf(stderr, " DMR PI C- ALG ID: %02X; KEY ID: %02X;", state->payload_algid, state->payload_keyid);
+            fprintf(stderr, " MI(32): %08llX;", state->payload_mi);
+            fprintf(stderr, " Kirisun");
+            if (state->payload_algid == 0x36) {
+                fprintf(stderr, " Advanced;");
+            } else if (state->payload_algid == 0x37) {
+                fprintf(stderr, " Universal;");
+            } else {
+                fprintf(stderr, " Encryption;");
+            }
+            fprintf(stderr, "%s\n", KNRM);
+        }
     }
     if (state->currentslot == 1) {
         state->dropR = 256;
@@ -287,6 +335,24 @@ dmr_alg_refresh(dsd_opts* opts, dsd_state* state) {
             fprintf(stderr, " DMR PI C- ALG ID: %02X; KEY ID: %02X;", state->payload_algidR, state->payload_keyidR);
             fprintf(stderr, " MI(40): %010llX;", state->payload_miR);
             fprintf(stderr, " Hytera Enhanced;");
+            fprintf(stderr, "%s\n", KNRM);
+        }
+
+        if (state->payload_algidR == 0x35 || state->payload_algidR == 0x36 || state->payload_algidR == 0x37) {
+            state->DMRvcR = 0;
+            state->payload_miR = kirisun_lfsr(state->payload_miR);
+            fprintf(stderr, "%s", KYEL);
+            fprintf(stderr, " Slot 2");
+            fprintf(stderr, " DMR PI C- ALG ID: %02X; KEY ID: %02X;", state->payload_algidR, state->payload_keyidR);
+            fprintf(stderr, " MI(32): %08llX;", state->payload_miR);
+            fprintf(stderr, " Kirisun");
+            if (state->payload_algidR == 0x36) {
+                fprintf(stderr, " Advanced;");
+            } else if (state->payload_algidR == 0x37) {
+                fprintf(stderr, " Universal;");
+            } else {
+                fprintf(stderr, " Encryption;");
+            }
             fprintf(stderr, "%s\n", KNRM);
         }
     }
@@ -427,6 +493,7 @@ dmr_sbrc(dsd_opts* opts, dsd_state* state, uint8_t power) {
     uint8_t alg = sbrc_hex & 0x7; //SEE: https://patents.google.com/patent/EP2347540B1/en
     uint8_t key = (sbrc_hex >> 3) & 0xFF;
     uint8_t txi_delay = (sbrc_hex >> 3) & 0x1F; //middle five are the 'delay' value on a TXI system
+    const int kirisun_call = dmr_slot_is_kirisun_call(state, slot_idx);
 
     //Note: AES-256 Key 1 will pass a CRC3 due to its bit arrangement vs the CRC poly 1101
     // if (irr_err == 0 && sbrc_hex = 0xD) crc3_okay = 0; //SB: 00000001101
@@ -434,7 +501,41 @@ dmr_sbrc(dsd_opts* opts, dsd_state* state, uint8_t power) {
     //NOTE: on above, I belive that we need to check by opcode as well, as a CRC3 can have multiple collisions
     //so we need to exclude op/alg 0 and 3 from the check (does algID 0x03/0x23 even exist?)
 
-    if (opts->dmr_le == 1) {
+    if (opts->dmr_le == 3 && kirisun_call) {
+        if (irr_err != 0) {
+            uint32_t sbrcpl = 0;
+            for (i = 0; i < 32; i++) {
+                sbrcpl = sbrcpl << 1;
+                sbrcpl |= sbrc_interleaved[i] & 1;
+            }
+            if (opts->payload == 0) {
+                fprintf(stderr, "\n");
+            }
+            fprintf(stderr, "%s SLOT %d SB/RC (FEC ERR) E:%d; I:%08X D:%03X; %s ", KRED, slot + 1, irr_err, sbrcpl,
+                    sbrc_hex, KNRM);
+            if (opts->payload == 1) {
+                fprintf(stderr, "\n");
+            }
+        } else if (power == 0 && sbrc_hex != 0) {
+            fprintf(stderr, "\n");
+            fprintf(stderr, "%s", KCYN);
+            fprintf(stderr, " Slot %d", state->currentslot + 1);
+            fprintf(stderr, " DMR LE SB Kirisun Encryption Identifier;");
+            fprintf(stderr, "%s ", KNRM);
+            if (slot_idx == 0U) {
+                if (state->payload_algid == 0 && (state->dmr_so & 0x40U)) {
+                    state->payload_algid = 0x35;
+                }
+            } else {
+                if (state->payload_algidR == 0 && (state->dmr_soR & 0x40U)) {
+                    state->payload_algidR = 0x35;
+                }
+            }
+        }
+    }
+
+    // opts->dmr_le is global; fall back to standard SB/RC parsing for non-Kirisun calls.
+    if (opts->dmr_le == 1 || (opts->dmr_le == 3 && !kirisun_call)) {
         if (irr_err != 0) {
             uint32_t sbrcpl = 0;
             for (i = 0; i < 32; i++) {

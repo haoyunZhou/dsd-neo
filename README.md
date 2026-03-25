@@ -12,12 +12,12 @@ Project homepage: https://github.com/arancormonk/dsd-neo
 
 ## Downloads
 
-- Stable releases (**TBD**):
-  - Linux AppImage (x86_64): dsd-neo-linux-x86_64-portable-<version>.AppImage
-  - Linux AppImage (aarch64): dsd-neo-linux-aarch64-portable-<version>.AppImage
-  - macOS DMG (arm64): dsd-neo-macos-arm64-portable-<version>.dmg
-  - Windows native ZIP (MSVC x86_64, **recommended**): dsd-neo-msvc-x86_64-native-<version>.zip
-  - Windows native ZIP (MinGW x86_64, alternative): dsd-neo-mingw-x86_64-native-<version>.zip
+- Stable releases: see [GitHub Releases](https://github.com/arancormonk/dsd-neo/releases)
+  - Linux AppImage (x86_64): `dsd-neo-linux-x86_64-portable-<version>.AppImage`
+  - Linux AppImage (aarch64): `dsd-neo-linux-aarch64-portable-<version>.AppImage`
+  - macOS DMG (arm64): `dsd-neo-macos-arm64-portable-<version>.dmg`
+  - Windows native ZIP (MSVC x86_64, **recommended**): `dsd-neo-msvc-x86_64-native-<version>.zip`
+  - Windows native ZIP (MinGW x86_64, alternative): `dsd-neo-mingw-x86_64-native-<version>.zip`
 - Nightly builds:
   - Linux AppImage (x86_64): [dsd-neo-linux-x86_64-portable-nightly.AppImage](https://github.com/arancormonk/dsd-neo/releases/download/nightly/dsd-neo-linux-x86_64-portable-nightly.AppImage)
   - Linux AppImage (aarch64): [dsd-neo-linux-aarch64-portable-nightly.AppImage](https://github.com/arancormonk/dsd-neo/releases/download/nightly/dsd-neo-linux-aarch64-portable-nightly.AppImage)
@@ -44,14 +44,15 @@ This project is an active work in progress as we decouple from the upstream fork
 
 - More input and streaming options
 
-  - Direct RTL‑SDR USB, plus RTL‑TCP (`-i rtltcp[:host:port]`) and generic IQ TCP (`-i tcp[:host:port]`, SDR++/GRC 7355).
-  - UDP audio in/out: receive PCM16 over UDP as an input, and send decoded audio to UDP sinks for easy piping to other apps or hosts.
+  - Direct RTL‑SDR USB, plus RTL‑TCP (`-i rtltcp[:host:port]`) and SoapySDR (`-i soapy[:args]`) for non-RTL radios (for example Airspy/SDRplay/HackRF/LimeSDR).
+  - Generic TCP PCM16LE input (`-i tcp[:host:port]`, SDR++/GRC 7355 audio streams).
+  - UDP audio in/out: receive PCM16LE over UDP as an input, and send decoded audio to UDP sinks for easy piping to other apps or hosts (decoded voice is typically 8 kHz; see `docs/network-audio.md`).
   - M17 UDP/IP in/out: dedicated M17 frame input/output over UDP (`-i m17udp[:bind:17000]`, `-o m17udp[:host:17000]`).
 
 - Built‑in trunking workflow
 
   - Follow P25 and DMR trunked voice automatically using channel maps and group lists (`-C ...csv`, `-G group.csv`, `-T`, `-N`).
-  - On‑the‑fly control via UDP retune or rigctl; pairs well with TCP/RTL‑TCP inputs.
+  - On‑the‑fly retune control via rigctl (`-U`) for external SDR front-ends (e.g., SDR++). For RTL/RTL‑TCP input, DSD-neo retunes directly (optional external UDP retune control can be enabled with `--rtl-udp-control <port>`; see `docs/udp-control.md`).
 
 - RTL‑SDR quality‑of‑life features
 
@@ -97,18 +98,35 @@ Requirements
 - CMake ≥ 3.20.
 - Dependencies:
   - Required: libsndfile; a curses backend (ncursesw/PDCurses); and an audio backend (PulseAudio by default, PortAudio on Windows).
-  - Optional: librtlsdr (RTL‑SDR support), Codec2 (additional vocoder paths), help2man (man page generation).
+  - Optional: librtlsdr (RTL‑SDR support), SoapySDR (non‑RTL SDR backends), Codec2 (additional vocoder paths), libcurl (rdio API uploads), help2man (man page generation).
   - Vocoder: mbelib-neo (`mbe-neo` CMake package) is required.
 
 OS package hints
 
 - Ubuntu/Debian (apt):
-  - `sudo apt-get update && sudo apt-get install -y build-essential cmake ninja-build libsndfile1-dev libpulse-dev libncurses-dev librtlsdr-dev`
+  - `sudo apt-get update && sudo apt-get install -y build-essential cmake ninja-build libsndfile1-dev libpulse-dev libncurses-dev librtlsdr-dev libsoapysdr-dev`
 - macOS (Homebrew):
-  - `brew install cmake ninja libsndfile ncurses pulseaudio librtlsdr codec2`
+  - `brew install cmake ninja libsndfile ncurses pulseaudio librtlsdr soapysdr codec2`
 - Windows:
   - Preferred binary: the native MSVC ZIP. The MinGW ZIP is an alternative native build.
   - Source builds use CMake presets with vcpkg; set `VCPKG_ROOT` and use `win-msvc-*` or `win-mingw-*` presets in `CMakePresets.json`.
+
+MBE vocoder dependency (mbelib-neo)
+
+DSD‑neo requires the `mbe-neo` CMake package (from `mbelib-neo`). If CMake fails with “could not find mbe-neo”, install it and re-run configure.
+
+Example (Linux/macOS):
+
+```bash
+# Build and install mbelib-neo (once)
+git clone https://github.com/arancormonk/mbelib-neo
+cmake -S mbelib-neo -B mbelib-neo/build -DCMAKE_BUILD_TYPE=Release
+cmake --build mbelib-neo/build -j
+cmake --install mbelib-neo/build --prefix "$HOME/.local"
+
+# Then configure dsd-neo (point CMake to the install prefix)
+cmake --preset dev-release -DCMAKE_PREFIX_PATH="$HOME/.local"
+```
 
 Build recipes (copy/paste)
 
@@ -118,8 +136,8 @@ Build recipes (copy/paste)
 # From the repository root.
 #
 # OS deps (examples):
-# - Ubuntu/Debian: sudo apt-get update && sudo apt-get install -y build-essential cmake ninja-build libsndfile1-dev libpulse-dev libncurses-dev librtlsdr-dev
-# - macOS:         brew install cmake ninja libsndfile ncurses pulseaudio librtlsdr codec2
+# - Ubuntu/Debian: sudo apt-get update && sudo apt-get install -y build-essential cmake ninja-build libsndfile1-dev libpulse-dev libncurses-dev librtlsdr-dev libsoapysdr-dev
+# - macOS:         brew install cmake ninja libsndfile ncurses pulseaudio librtlsdr soapysdr codec2
 #
 # Install is optional; you can run directly from the build tree.
 
@@ -138,8 +156,8 @@ cmake --install build/dev-release --prefix "$HOME/.local"
 
 ```bash
 # OS deps (examples):
-# - Ubuntu/Debian: sudo apt-get update && sudo apt-get install -y build-essential cmake ninja-build libsndfile1-dev libpulse-dev libncurses-dev librtlsdr-dev
-# - macOS:         brew install cmake ninja libsndfile ncurses pulseaudio librtlsdr codec2
+# - Ubuntu/Debian: sudo apt-get update && sudo apt-get install -y build-essential cmake ninja-build libsndfile1-dev libpulse-dev libncurses-dev librtlsdr-dev libsoapysdr-dev
+# - macOS:         brew install cmake ninja libsndfile ncurses pulseaudio librtlsdr soapysdr codec2
 
 cmake --preset dev-debug
 cmake --build --preset dev-debug -j
@@ -212,6 +230,11 @@ These are CMake cache options (set at configure time via `-D...`).
   - `-DDSD_ENABLE_UBSAN=ON` — UndefinedBehaviorSanitizer in Debug builds.
 - Audio backend selection:
   - `-DDSD_USE_PORTAUDIO=ON` — Use PortAudio instead of PulseAudio (default on Windows).
+- Radio backend selection:
+  - `-DDSD_ENABLE_RTLSDR=ON|OFF` — Enable/disable RTL-SDR backend discovery.
+  - `-DDSD_ENABLE_SOAPYSDR=ON|OFF` — Enable/disable SoapySDR backend discovery.
+  - `-DDSD_REQUIRE_RTLSDR=ON|OFF` — Fail configure when RTL-SDR is enabled but unavailable.
+  - `-DDSD_REQUIRE_SOAPYSDR=ON|OFF` — Fail configure when SoapySDR is enabled but unavailable.
 - UI and behavior toggles:
   - `-DCOLORS=OFF` — Disable ncurses color output.
   - `-DCOLORSLOGS=OFF` — Disable colored terminal/log output.
@@ -221,7 +244,55 @@ These are CMake cache options (set at configure time via `-D...`).
   - `-DSID=ON` — Enable experimental P25p1 Soft ID decoding.
 - Optional features (auto‑detected):
   - RTL‑SDR support is enabled when `librtlsdr` is found.
+  - SoapySDR support is enabled when SoapySDR is found.
   - Codec2 support is enabled when `codec2` is found.
+
+## CI Backend Policy
+
+- CI treats backend availability as a build contract, not a best-effort option.
+- Linux CI runs a backend matrix for `both`, `soapy_only`, `rtl_only`, and `neither`.
+- Release/packaging/static-analysis jobs that are expected to exercise radio backends configure with:
+  - `-DDSD_REQUIRE_RTLSDR=ON`
+  - `-DDSD_REQUIRE_SOAPYSDR=ON`
+- If either required backend is missing, configure fails fast.
+
+## Backend Matrix Reproduction (Local)
+
+Run from repo root after installing deps (`librtlsdr` and SoapySDR when required):
+
+```bash
+# both backends required
+cmake --preset dev-debug \
+  -DDSD_ENABLE_RTLSDR=ON -DDSD_REQUIRE_RTLSDR=ON \
+  -DDSD_ENABLE_SOAPYSDR=ON -DDSD_REQUIRE_SOAPYSDR=ON
+cmake --build --preset dev-debug -j
+
+# soapy_only
+cmake --preset dev-debug \
+  -DDSD_ENABLE_RTLSDR=OFF \
+  -DDSD_ENABLE_SOAPYSDR=ON -DDSD_REQUIRE_SOAPYSDR=ON
+cmake --build --preset dev-debug -j
+
+# rtl_only
+cmake --preset dev-debug \
+  -DDSD_ENABLE_RTLSDR=ON -DDSD_REQUIRE_RTLSDR=ON \
+  -DDSD_ENABLE_SOAPYSDR=OFF
+cmake --build --preset dev-debug -j
+
+# neither
+cmake --preset dev-debug \
+  -DDSD_ENABLE_RTLSDR=OFF \
+  -DDSD_ENABLE_SOAPYSDR=OFF
+cmake --build --preset dev-debug -j
+```
+
+CI-like strict scan-build run:
+
+```bash
+tools/scan_build.sh --strict \
+  --cmake-arg -DDSD_REQUIRE_RTLSDR=ON \
+  --cmake-arg -DDSD_REQUIRE_SOAPYSDR=ON
+```
 
 ## Runtime Tuning
 
@@ -233,6 +304,16 @@ Common options:
 - RTL‑TCP adaptive buffering: `--rtltcp-autotune`
 - Rig control (SDR++): `-U 4532` (default port), `-B <Hz>` (bandwidth)
 
+## SoapySDR Quickstart
+
+- Use SoapySDR when your hardware is not accessed through `librtlsdr` directly.
+- Build with Soapy enabled (`-DDSD_ENABLE_SOAPYSDR=ON`) and optionally require it (`-DDSD_REQUIRE_SOAPYSDR=ON`).
+- Install SoapySDR tools and the Soapy module for your radio; verify with `SoapySDRUtil --info` and discover args with
+  `SoapySDRUtil --find`.
+- Run with `-i soapy[:args]`. The `soapy:` string selects backend/device only; set tuning via `rtl_*` keys (at minimum
+  `rtl_freq`; easiest via config). See the guide for a minimal config snippet.
+- Full guide: `docs/soapysdr.md`.
+
 ## Using The CLI
 
 - See the friendly CLI guide: [docs/cli.md](docs/cli.md)
@@ -241,11 +322,12 @@ Common options:
   - DMR mono helpers:
     - Modern form: `-fs -nm` (DMR BS/MS simplex + mono audio).
     - Legacy alias: `-fr` (kept as a shorthand for the same DMR‑mono profile).
+  - CSV formats (channel maps, group lists, key lists): `docs/csv-formats.md` (examples in `examples/`)
 
 Quick examples
 
 - UDP in → Pulse out with UI: `dsd-neo -i udp -o pulse -N`
-- DMR trunking from TCP IQ (with rigctl): `dsd-neo -fs -i tcp -U 4532 -T -C dmr_t3_chan.csv -G group.csv -N`
+- DMR trunking from TCP PCM input (with rigctl): `dsd-neo -fs -i tcp -U 4532 -T -C dmr_t3_chan.csv -G group.csv -N`
 
 ## Configuration
 
@@ -262,7 +344,14 @@ Quick examples
 
 ## Documentation
 
-- Module overview and targets are documented in `docs/code_map.md`.
+- CLI usage and options: `docs/cli.md`
+- SoapySDR non-RTL setup and usage: `docs/soapysdr.md`
+- User config system (INI): `docs/config-system.md`
+- Trunking CSV formats: `docs/csv-formats.md` (examples in `examples/`)
+- Network audio I/O details (TCP/UDP/stdin/stdout): `docs/network-audio.md`
+- Terminal UI hotkeys and menus: `docs/ui-terminal.md`
+- RTL UDP retune control protocol: `docs/udp-control.md`
+- Module overview and build targets: `docs/code_map.md`
 
 ## Project Layout
 
@@ -272,7 +361,7 @@ Quick examples
 - Platform: `src/platform`, headers `<dsd-neo/platform/...>` — cross-platform primitives (audio backend, sockets, threading, timing, curses).
 - Runtime: `src/runtime`, headers `<dsd-neo/runtime/...>` — config, logging, aligned memory, rings, worker pool, RT scheduling, git version.
 - DSP: `src/dsp`, headers `<dsd-neo/dsp/...>` — demod pipeline, resampler, filters, FLL/TED, SIMD helpers.
-- IO: `src/io`, headers `<dsd-neo/io/...>` — radio (RTL‑SDR), audio (PulseAudio/PortAudio + UDP PCM input/output), control (UDP/rigctl/serial).
+- IO: `src/io`, headers `<dsd-neo/io/...>` — radio (RTL‑SDR, RTL‑TCP, SoapySDR), audio (PulseAudio/PortAudio + UDP PCM input/output), control (UDP/rigctl/serial).
 - FEC: `src/fec`, headers `<dsd-neo/fec/...>` — BCH, Golay, Hamming, RS, BPTC, CRC/FCS.
 - Crypto: `src/crypto`, headers `<dsd-neo/crypto/...>` — RC2/RC4/DES/AES and helpers.
 - Protocols: `src/protocol/<name>`, headers `<dsd-neo/protocol/<name>/...>` — DMR, dPMR, D‑STAR, NXDN, P25, X2‑TDMA, EDACS, ProVoice, M17, YSF.
@@ -281,8 +370,16 @@ Quick examples
 ## Tooling
 
 - Format: `tools/format.sh` (requires `clang-format`; see `.clang-format`).
-- Static analysis: `tools/clang_tidy.sh` (use `--strict` for extra checks) or `clang-tidy -p build/dev-debug <files>`.
-- Git hooks: `tools/install-git-hooks.sh` enables auto‑format on commit and clang‑tidy/cppcheck on push.
+- Static analysis:
+  - `tools/clang_tidy.sh` (use `--strict` for extra checks).
+  - `tools/cppcheck.sh` (use `--strict` for broader checks).
+  - `tools/iwyu.sh` (include hygiene via include-what-you-use; excludes `src/third_party`).
+  - `tools/gcc_fanalyzer.sh` (GCC `-fanalyzer` path-sensitive diagnostics; excludes `src/third_party`).
+  - `tools/scan_build.sh` (Clang Static Analyzer via `scan-build`, heavier full-build pass; excludes `src/third_party`; supports repeatable `--cmake-arg` passthrough).
+  - `tools/semgrep.sh` (additional SAST rules; use `--strict` to fail on findings; excludes `src/third_party`).
+- Git hooks: `tools/install-git-hooks.sh` enables auto‑format on commit and a CI-aligned pre-push analysis pass (clang-format, clang-tidy, cppcheck, IWYU, GCC fanalyzer, Semgrep) on changed paths.
+- Optional full scan-build pre-push/preflight pass: set `DSD_HOOK_RUN_SCAN_BUILD=1`.
+- Manual preflight runner: `tools/preflight_ci.sh` runs the same CI-aligned checks as `pre-push` without pushing.
 
 ## Contributing
 
@@ -296,4 +393,4 @@ Quick examples
 - Project license: GPL‑3.0‑or‑later (see `LICENSE`).
 - Portions remain under ISC per the original DSD author (see `COPYRIGHT`).
 - Third-party notices live in `THIRD_PARTY.md` (installed license texts: `share/doc/dsd-neo/licenses/`).
-- Source files carry SPDX identifiers reflecting their license.
+- Project-authored source files carry SPDX identifiers reflecting their license; vendored third-party files retain upstream license headers.

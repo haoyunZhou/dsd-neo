@@ -15,12 +15,18 @@
 #include <dsd-neo/io/udp_control.h>
 #include <dsd-neo/platform/sockets.h>
 #include <dsd-neo/platform/threading.h>
-
+#include <dsd-neo/runtime/log.h>
+#if !DSD_PLATFORM_WIN_NATIVE
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#endif
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#include <dsd-neo/runtime/log.h>
+#include "dsd-neo/platform/platform.h"
 
 struct udp_control {
     int port;
@@ -65,7 +71,7 @@ static DSD_THREAD_RETURN_TYPE
 #endif
     udp_thread_fn(void* arg) {
     udp_control* ctrl = (udp_control*)arg;
-    int n;
+    int n = 0;
     unsigned char buffer[5];
     struct sockaddr_in serv_addr;
 

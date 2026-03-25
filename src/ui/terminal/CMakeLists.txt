@@ -20,6 +20,7 @@ target_sources(dsd-neo_ui_terminal PRIVATE
   ui_opts_snapshot.c
   ui_cmd_queue.c
   ui_async.c
+  ui_history.c
   telemetry_hooks_install.c
   menu_core.c
   menu_env.c
@@ -41,9 +42,14 @@ target_include_directories(dsd-neo_ui_terminal
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
-target_link_libraries(dsd-neo_ui_terminal PUBLIC dsd-neo_core dsd-neo_runtime dsd-neo_feature_rtlsdr)
+target_link_libraries(dsd-neo_ui_terminal PUBLIC dsd-neo_core dsd-neo_runtime dsd-neo_feature_radio dsd-neo_feature_rtlsdr)
 
 target_link_libraries(dsd-neo_ui_terminal PRIVATE dsd-neo_warnings dsd-neo_feature_colors)
+
+install(TARGETS dsd-neo_ui_terminal
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
 
 # Many menu actions are conditionally referenced; suppress unused-function just for these sources.
 # MSVC/clang-cl do not understand GCC/Clang-style `-Wno-*` options.

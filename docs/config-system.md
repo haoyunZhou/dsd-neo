@@ -57,7 +57,7 @@ Example:
 version = 1
 
 [input]
-source = "rtl"              # pulse / rtl / rtltcp / file / tcp / udp
+source = "rtl"              # pulse / rtl / rtltcp / soapy / file / tcp / udp
 rtl_device = 0
 rtl_freq = "851.375M"       # supports K/M/G suffix or raw Hz
 
@@ -92,6 +92,7 @@ Path expansion is applied to:
 - `[trunking] chan_csv`
 - `[trunking] group_csv`
 - `[logging] event_log`
+- `[logging] frame_log`
 - `[recording] per_call_wav_dir`
 - `[recording] static_wav`
 - `[recording] raw_wav`
@@ -251,7 +252,7 @@ small subset is exposed as config keys for convenience (for example
 **[input] section:**
 | Key | Type | Description | Default |
 |-----|------|-------------|---------|
-| `source` | ENUM | Input source type | `pulse` |
+| `source` | ENUM | Input source type (`pulse|rtl|rtltcp|soapy|file|tcp|udp`) | `pulse` |
 | `pulse_source` | STRING | PulseAudio source device | (empty) |
 | `rtl_device` | INT (0-255) | RTL-SDR device index | `0` |
 | `rtl_freq` | FREQ | RTL-SDR frequency | `851.375M` |
@@ -264,6 +265,7 @@ small subset is exposed as config keys for convenience (for example
 | `rtl_auto_ppm` | BOOL | Enable spectrum-based RTL auto-PPM correction (alias for `auto_ppm`) | `false` |
 | `rtltcp_host` | STRING | RTL-TCP hostname | `127.0.0.1` |
 | `rtltcp_port` | INT (1-65535) | RTL-TCP port | `1234` |
+| `soapy_args` | STRING | SoapySDR device selection args (from SoapySDRUtil `--find`/`--probe`) | (empty) |
 | `file_path` | PATH | Input file path (WAV/BIN/RAW/SYM) | (empty) |
 | `file_sample_rate` | INT (8000-192000) | File sample rate (WAV/RAW) | `48000` |
 | `tcp_host` | STRING | TCP PCM input host | `127.0.0.1` |
@@ -300,6 +302,7 @@ small subset is exposed as config keys for convenience (for example
 | Key | Type | Description | Default |
 |-----|------|-------------|---------|
 | `event_log` | PATH | Event history log file path | (empty) |
+| `frame_log` | PATH | Frame trace log file path | (empty) |
 
 **[recording] section:**
 | Key | Type | Description | Default |
@@ -308,6 +311,12 @@ small subset is exposed as config keys for convenience (for example
 | `per_call_wav_dir` | PATH | Per-call WAV output directory | `./WAV` |
 | `static_wav` | PATH | Static decoded voice WAV output file | (empty) |
 | `raw_wav` | PATH | Raw (48 kHz) audio WAV output file | (empty) |
+| `rdio_mode` | ENUM | rdio export mode: off/dirwatch/api/both | `off` |
+| `rdio_system_id` | INT | rdio-scanner numeric system ID | `0` |
+| `rdio_api_url` | STRING | rdio API base URL | `http://127.0.0.1:3000` |
+| `rdio_api_key` | STRING | rdio API key | (empty) |
+| `rdio_upload_timeout_ms` | INT | rdio API timeout per call in ms | `5000` |
+| `rdio_upload_retries` | INT | rdio API upload attempts per call | `1` |
 
 Note: `per_call_wav` and `static_wav` are mutually exclusive (same as `-P` vs `-w` on the CLI).
 
@@ -374,7 +383,7 @@ version = 1
 
 [input]
 # Input source type
-# Allowed: pulse|rtl|rtltcp|file|tcp|udp
+# Allowed: pulse|rtl|rtltcp|soapy|file|tcp|udp
 # source = "pulse"
 
 # RTL-SDR device index (0-based)
@@ -400,6 +409,18 @@ version = 1
   for the network endpoint, plus the same `rtl_*` tuning keys. To switch
   the input to RTL-TCP at startup, set at least `rtltcp_host`.
 
+- **SoapySDR (`source = "soapy"`)**:
+  - Uses `soapy_args` for device selection only (same semantics as CLI `-i soapy[:args]`).
+  - CLI also supports optional shorthand tuning:
+    `-i soapy[:args]:freq[:gain[:ppm[:bw[:sql[:vol]]]]]`.
+  - Reuses existing `rtl_*` tuning keys (`rtl_freq`, `rtl_gain`, `rtl_ppm`, `rtl_bw_khz`, `rtl_sql`, `rtl_volume`)
+    so trunking and retune behavior remains unchanged.
+  - `rtl_device` and `rtltcp_*` endpoint keys are not used in Soapy mode.
+  - Set `rtl_freq` explicitly for predictable startup frequency with non-RTL radios.
+  - If frequency resolves to `0`, radio startup fails with `Please specify a frequency.`
+  - Verify Soapy install and plugin discovery with `SoapySDRUtil --info`.
+  - Use `SoapySDRUtil --find` / `SoapySDRUtil --probe="<args>"` to discover valid `soapy_args`.
+
 - **PulseAudio (`source = "pulse"`)**: Use `pulse_source` to specify
   a particular input device. The older `pulse_input` key is accepted
   as an alias.
@@ -421,15 +442,46 @@ version = 1
 The `decode` key in `[mode]` configures the frame types and modulation.
 Supported values: `auto`, `p25p1`, `p25p2`, `dmr`, `nxdn48`, `nxdn96`,
 `x2tdma`, `ysf`, `dstar`, `edacs_pv`, `dpmr`, `m17`, `tdma`, `analog`.
+Compatibility aliases are also accepted: `p25p1_only`, `p25p2_only`,
+`edacs`, `provoice`, and `analog_monitor`.
 
 The optional `demod` key selects a demodulator path (`auto`, `c4fm`, `gfsk`,
 `qpsk`). When set, it locks demodulator selection similarly to the `-m*`
 CLI modulation options.
 
-If you choose RTL/RTLTCP input and omit specific tuning fields, DSD-neo falls
-back to its built-in RTL defaults: center frequency 850 MHz, DSP bandwidth
-48 kHz, and volume multiplier 2. The template still shows 851.375M as the
-example frequency.
+If you choose RTL/RTLTCP/Soapy input and omit specific tuning fields, DSD-neo
+falls back to its built-in radio defaults: center frequency 850 MHz, DSP
+bandwidth 48 kHz, and volume multiplier 2. The template still shows 851.375M
+as the example frequency.
+
+### Soapy Config Usage
+
+```ini
+[input]
+source = "soapy"
+soapy_args = "driver=sdrplay,serial=123456"
+
+# Soapy tuning reuses rtl_* keys
+rtl_freq = "851.375M"
+rtl_gain = 22
+rtl_ppm = -2
+rtl_bw_khz = 24
+rtl_sql = 0
+rtl_volume = 2
+```
+
+If you omit `soapy_args`, DSD-neo uses the default Soapy device args (equivalent to `-i soapy`).
+For multiple identical devices, prefer including a stable selector like `serial=...`.
+
+### Soapy Troubleshooting
+
+- If device discovery is empty, run `SoapySDRUtil --find` first and verify your hardware module is installed.
+- If Soapy devices/modules are not discovered, confirm plugin discovery path via `SOAPY_SDR_PLUGIN_PATH`.
+- Driver capabilities differ by hardware: some devices may not support PPM correction, bandwidth selection, or manual
+  gain range controls.
+- Expected sample-rate and gain behavior can vary by driver; requested values may be quantized/clamped to supported
+  ranges.
+- See `docs/soapysdr.md` for a full non-RTL setup flow.
 
 ### Trunking
 
@@ -439,6 +491,7 @@ When `[trunking] enabled = true`:
 - CSV paths (`chan_csv`, `group_csv`) are passed to the decoder.
 - CSV paths in the config are applied the same as passing `-C`/`-G` and are
   loaded when trunking is enabled.
+- CSV formats and examples are documented in `docs/csv-formats.md` and `examples/`.
 - If you start DSD-neo with any CLI args and you do not explicitly set trunking
   or scan mode (`-T`/`-Y`), trunking inherited from the config is disabled for
   that run.
@@ -451,6 +504,8 @@ When `[trunking] enabled = true`:
 2. Config values are applied, then CLI arguments override them.
 3. One-shot commands (`--dump-config-template`, `--validate-config`,
    `--list-profiles`, `--print-config`) execute and exit immediately.
+   Before `--print-config` renders, Soapy shorthand input specs are normalized
+   into `soapy_args` plus shared `rtl_*` tuning keys.
 4. If no CLI args and no config is loaded, the interactive bootstrap wizard runs.
 5. When a config is loaded: interactive bootstrap is skipped unless
    `--interactive-setup` is specified.
@@ -547,7 +602,7 @@ When running with the ncurses UI (`ncurses_ui = true` or `-N`), the
 The following can be changed without restarting:
 
 - PulseAudio input/output device
-- RTL-SDR and RTLTCP tuning parameters (frequency, gain, PPM, etc.)
+- RTL-SDR, RTL-TCP, and Soapy tuning parameters (frequency, gain, PPM, etc.)
 - TCP/UDP connection parameters
 - File input path
 

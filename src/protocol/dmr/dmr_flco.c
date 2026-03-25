@@ -24,12 +24,38 @@
 #include <dsd-neo/runtime/colors.h>
 #include <dsd-neo/runtime/rigctl_query_hooks.h>
 #include <dsd-neo/runtime/trunk_tuning_hooks.h>
-
+#include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
+
+#include "dsd-neo/core/opts_fwd.h"
+#include "dsd-neo/core/state_fwd.h"
 
 static inline void dsd_append(char* dst, size_t dstsz, const char* src);
 void dmr_slco(dsd_opts* opts, dsd_state* state, uint8_t slco_bits[]);
+static inline int dmr_slot_is_known(const dsd_state* state);
+static inline void dmr_print_slot_tag(const dsd_state* state);
+
+static inline int
+dmr_slot_is_known(const dsd_state* state) {
+    if (!state) {
+        return 0;
+    }
+    /* In simplex/MS mode there is no CACH-derived slot signaling, so avoid
+     * presenting a hard slot number that can be misread as authoritative. */
+    return state->dmr_ms_mode == 0;
+}
+
+static inline void
+dmr_print_slot_tag(const dsd_state* state) {
+    if (dmr_slot_is_known(state)) {
+        fprintf(stderr, " SLOT %d", ((state->currentslot & 1) + 1));
+    } else {
+        fprintf(stderr, " SLOT ?");
+    }
+}
 
 //combined flco handler (vlc, tlc, emb), minus the superfluous structs and strings
 void
@@ -130,7 +156,7 @@ dmr_flco(dsd_opts* opts, dsd_state* state, uint8_t lc_bits[], uint32_t CRCCorrec
         if (type == 3) {
             fprintf(stderr, "%s", KRED);
         }
-        fprintf(stderr, " SLOT %d", state->currentslot + 1);
+        dmr_print_slot_tag(state);
         fprintf(stderr, " Protected LC ");
         // Do not bail early; update metadata first, then exit below.
     }
@@ -199,7 +225,7 @@ dmr_flco(dsd_opts* opts, dsd_state* state, uint8_t lc_bits[], uint32_t CRCCorrec
             if (type == 3) {
                 fprintf(stderr, "%s", KCYN);
             }
-            fprintf(stderr, " SLOT %d", state->currentslot + 1);
+            dmr_print_slot_tag(state);
             fprintf(stderr, " Motorola");
             unk = 1;
             goto END_FLCO;
@@ -208,7 +234,7 @@ dmr_flco(dsd_opts* opts, dsd_state* state, uint8_t lc_bits[], uint32_t CRCCorrec
         //7.1.1.1 Terminator Data Link Control PDU - ETSI TS 102 361-3 V1.2.1 (2013-07)
         if (type == 2 && flco == 0x30) {
             fprintf(stderr, "%s \n", KRED);
-            fprintf(stderr, " SLOT %d", state->currentslot + 1);
+            dmr_print_slot_tag(state);
             fprintf(stderr, " Data Terminator (TD_LC) ");
             fprintf(stderr, "%s", KNRM);
 
@@ -243,7 +269,7 @@ dmr_flco(dsd_opts* opts, dsd_state* state, uint8_t lc_bits[], uint32_t CRCCorrec
             if (type == 3) {
                 fprintf(stderr, "%s", KCYN);
             }
-            fprintf(stderr, " SLOT %d", state->currentslot + 1);
+            dmr_print_slot_tag(state);
             fprintf(stderr, " Tait");
             unk = 1;
             goto END_FLCO;
@@ -292,7 +318,8 @@ dmr_flco(dsd_opts* opts, dsd_state* state, uint8_t lc_bits[], uint32_t CRCCorrec
             tg_hash = crc8(target_hash, 16);
 
             fprintf(stderr, "%s \n", KGRN);
-            fprintf(stderr, " SLOT %d ", state->currentslot + 1);
+            dmr_print_slot_tag(state);
+            fprintf(stderr, " ");
             if (opts->payload == 1) {
                 fprintf(stderr, "FLCO=0x%02X FID=0x%02X ", flco, fid);
             }
@@ -378,7 +405,7 @@ dmr_flco(dsd_opts* opts, dsd_state* state, uint8_t lc_bits[], uint32_t CRCCorrec
             if (type == 3) {
                 fprintf(stderr, "%s", KCYN);
             }
-            fprintf(stderr, " SLOT %d", state->currentslot + 1);
+            dmr_print_slot_tag(state);
             fprintf(stderr, " Hytera ");
             unk = 1;
             goto END_FLCO;
@@ -395,7 +422,7 @@ dmr_flco(dsd_opts* opts, dsd_state* state, uint8_t lc_bits[], uint32_t CRCCorrec
             if (type == 3) {
                 fprintf(stderr, "%s", KYEL);
             }
-            fprintf(stderr, " SLOT %d", state->currentslot + 1);
+            dmr_print_slot_tag(state);
             fprintf(stderr, " Unknown LC ");
             unk = 1;
             goto END_FLCO;
@@ -409,7 +436,11 @@ dmr_flco(dsd_opts* opts, dsd_state* state, uint8_t lc_bits[], uint32_t CRCCorrec
             uint8_t key = (uint8_t)ConvertBitIntoBytes(&lc_bits[16], 8);
             unsigned long long int mi = (unsigned long long int)ConvertBitIntoBytes(&lc_bits[24], 40);
             fprintf(stderr, "%s", KYEL);
-            fprintf(stderr, " Slot %d Alg: %02X; KEY ID: %02X; MI(40): %010llX;", slot + 1, alg, key, mi);
+            if (dmr_slot_is_known(state)) {
+                fprintf(stderr, " Slot %d Alg: %02X; KEY ID: %02X; MI(40): %010llX;", slot + 1, alg, key, mi);
+            } else {
+                fprintf(stderr, " Slot ? Alg: %02X; KEY ID: %02X; MI(40): %010llX;", alg, key, mi);
+            }
             fprintf(stderr, " Hytera Enhanced; ");
 
             if (slot == 0 && state->R != 0) {
@@ -491,7 +522,7 @@ dmr_flco(dsd_opts* opts, dsd_state* state, uint8_t lc_bits[], uint32_t CRCCorrec
             }
 
             //update cc amd vc sync time for trunking purposes (particularly Con+)
-            if (opts->p25_is_tuned == 1) {
+            if (opts->trunk_is_tuned == 1 || opts->p25_is_tuned == 1) {
                 dsd_mark_vc_sync(state);
                 dsd_mark_cc_sync(state);
             }
@@ -567,7 +598,8 @@ dmr_flco(dsd_opts* opts, dsd_state* state, uint8_t lc_bits[], uint32_t CRCCorrec
             fprintf(stderr, "%s", KGRN);
         }
 
-        fprintf(stderr, " SLOT %d ", state->currentslot + 1);
+        dmr_print_slot_tag(state);
+        fprintf(stderr, " ");
         fprintf(stderr, "TGT=%u SRC=%u ", target, source);
         if (opts->payload == 1 && is_xpt == 1 && flco == 0x3) {
             fprintf(stderr, "HASH=%d ", tg_hash);
@@ -884,6 +916,24 @@ dmr_flco(dsd_opts* opts, dsd_state* state, uint8_t lc_bits[], uint32_t CRCCorrec
             }
             fprintf(stderr, "%s ", KNRM);
         }
+
+        if (slot == 0 && (state->payload_algid == 0x36 || state->payload_algid == 0x37)
+            && state->aes_key_loaded[0] == 1) {
+            fprintf(stderr, "\n ");
+            fprintf(stderr, "%s", KYEL);
+            fprintf(stderr, "Key: %016llX %016llX %016llX %016llX", state->A1[0], state->A2[0], state->A3[0],
+                    state->A4[0]);
+            fprintf(stderr, "%s ", KNRM);
+        }
+
+        if (slot == 1 && (state->payload_algidR == 0x36 || state->payload_algidR == 0x37)
+            && state->aes_key_loaded[1] == 1) {
+            fprintf(stderr, "\n ");
+            fprintf(stderr, "%s", KYEL);
+            fprintf(stderr, "Key: %016llX %016llX %016llX %016llX", state->A1[1], state->A2[1], state->A3[1],
+                    state->A4[1]);
+            fprintf(stderr, "%s ", KNRM);
+        }
     }
 
 END_FLCO:
@@ -903,7 +953,7 @@ END_FLCO:
             fprintf(stderr, "\n");
         }
         fprintf(stderr, "%s", KRED);
-        fprintf(stderr, " SLOT %d", state->currentslot + 1);
+        dmr_print_slot_tag(state);
         fprintf(stderr, " FLCO FEC ERR ");
         fprintf(stderr, "%s", KNRM);
     }
@@ -981,7 +1031,11 @@ dmr_cach(dsd_opts* opts, dsd_state* state, uint8_t cach_bits[25]) {
 
         // Minimal, safe reporting — avoid invoking full dmr_slco() with partial payload
         fprintf(stderr, "\n%s", KYEL);
-        fprintf(stderr, " SLOT %d", slot + 1);
+        if (dmr_slot_is_known(state)) {
+            fprintf(stderr, " SLOT %d", slot + 1);
+        } else {
+            fprintf(stderr, " SLOT ?");
+        }
         if (slco == 0x0) {
             fprintf(stderr, " SLCO NULL (single) ");
         } else if (slco == 0x1) {
@@ -1356,7 +1410,7 @@ dmr_slco(dsd_opts* opts, dsd_state* state, uint8_t slco_bits[]) {
         sprintf(state->dmr_site_parms, "%d-%d ", con_netid, con_siteid);
 
         //if using rigctl we can set an unknown cc frequency by polling rigctl for the current frequency
-        if (opts->use_rigctl == 1 && opts->p25_is_tuned == 0) {
+        if (opts->use_rigctl == 1 && opts->trunk_is_tuned == 0) {
             ccfreq = dsd_rigctl_query_hook_get_current_freq_hz(opts);
             if (ccfreq != 0) {
                 state->trunk_cc_freq = ccfreq;
@@ -1364,7 +1418,7 @@ dmr_slco(dsd_opts* opts, dsd_state* state, uint8_t slco_bits[]) {
         }
 
         //if using rtl input, we can ask for the current frequency tuned
-        if (opts->audio_in_type == AUDIO_IN_RTL && opts->p25_is_tuned == 0) {
+        if (opts->audio_in_type == AUDIO_IN_RTL && opts->trunk_is_tuned == 0) {
             ccfreq = (long int)opts->rtlsdr_center_freq;
             if (ccfreq != 0) {
                 state->trunk_cc_freq = ccfreq;
@@ -1415,7 +1469,9 @@ dmr_slco(dsd_opts* opts, dsd_state* state, uint8_t slco_bits[]) {
                         // Use centralized io/control tuning API
                         dsd_trunk_tuning_hook_tune_to_cc(opts, state, state->trunk_cc_freq, 0);
                         opts->p25_is_tuned = 0;
+                        opts->trunk_is_tuned = 0;
                         state->p25_vc_freq[0] = state->p25_vc_freq[1] = 0;
+                        state->trunk_vc_freq[0] = state->trunk_vc_freq[1] = 0;
                         dmr_reset_blocks(opts, state); //reset all block gathering since we are tuning away
                     }
                 }
@@ -1465,7 +1521,9 @@ dmr_slco(dsd_opts* opts, dsd_state* state, uint8_t slco_bits[]) {
                         // Use centralized io/control tuning API
                         dsd_trunk_tuning_hook_tune_to_cc(opts, state, state->trunk_cc_freq, 0);
                         opts->p25_is_tuned = 0;
+                        opts->trunk_is_tuned = 0;
                         state->p25_vc_freq[0] = state->p25_vc_freq[1] = 0;
+                        state->trunk_vc_freq[0] = state->trunk_vc_freq[1] = 0;
                         dmr_reset_blocks(opts, state); //reset all block gathering since we are tuning away
                     }
                 }
