@@ -11,11 +11,11 @@
  */
 
 #include <assert.h>
-#include <curses.h>
 #include <locale.h>
 #include <stdio.h>
 #include <string.h>
 
+#include <dsd-neo/platform/curses_compat.h>
 #include "menu_prompts.h"
 #include "test_support.h"
 
@@ -76,7 +76,7 @@ init_screen(void) {
     noecho();
     cbreak();
     keypad(stdscr, TRUE);
-    resizeterm(17, 80);
+    assert(dsd_curses_resize_term(17, 80) != ERR);
     clear();
     refresh();
 }

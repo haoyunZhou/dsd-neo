@@ -76,3 +76,12 @@ dsd_curses_set_escdelay(int delay_ms) {
     set_escdelay(delay_ms);
 #endif
 }
+
+static inline int
+dsd_curses_resize_term(int lines, int columns) {
+#if defined(DSD_USE_PDCURSES)
+    return resize_term(lines, columns);
+#else
+    return resizeterm(lines, columns);
+#endif
+}
