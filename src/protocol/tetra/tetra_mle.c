@@ -677,7 +677,7 @@ static void parse_cmce_d_sds_short_data(const uint8_t *bits, int nbits,
  *   Bit    35  : validity_period_flag  → if 1, 16-bit period follows
  *   Bit    36+ : datetime_ind → if 1, 48-bit timestamp follows
  *   Then SDS-TL service PDU:
- *     bits_per_character (4 bits) — 7=7-bit ASCII, 8=8-bit ISO, 10=Unicode
+ *     bits_per_character (8 bits) — 7=7-bit ASCII, 8=8-bit ISO, 10=Unicode, 16=UCS-2
  *     number_of_characters (8 bits)
  *     character data (num_chars * bits_per_char bits)
  * ----------------------------------------------------------------------- */
@@ -739,9 +739,9 @@ static void parse_cmce_d_sds_data(const uint8_t *bits, int nbits,
     uint32_t dt_flag = mle_bits_to_uint(bits, off, 1); off += 1;
     if (dt_flag && off + 48 <= nbits) off += 48; /* datetime */
 
-    /* SDS-TL service PDU: bits_per_char(4) + num_chars(8) + data */
-    if (off + 12 > nbits) goto log_only;
-    uint32_t bpc       = mle_bits_to_uint(bits, off, 4); off += 4;
+    /* SDS-TL service PDU: bits_per_char(8) + num_chars(8) + data */
+    if (off + 16 > nbits) goto log_only;
+    uint32_t bpc       = mle_bits_to_uint(bits, off, 8); off += 8;
     uint32_t num_chars = mle_bits_to_uint(bits, off, 8); off += 8;
 
     fprintf(stderr, "[TETRA CMCE D-SDS-DATA] CC=%d  src_SSI=%u  bpc=%u  num_chars=%u",

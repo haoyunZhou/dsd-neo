@@ -106,14 +106,14 @@ static void test_d_sds_data_8bit_text(void)
      *   [34]    store_fwd = 0
      *   [35]    vp_flag = 0
      *   [36]    dt_flag = 0
-     *   [37-40] bpc = 8
-     *   [41-48] num_chars = 2
-     *   [49-56] 'O' = 79
-     *   [57-64] 'K' = 75
-     * Total CMCE PDU: 65 bits
+     *   [37-44] bpc = 8
+     *   [45-52] num_chars = 2
+     *   [53-60] 'O' = 79
+     *   [61-68] 'K' = 75
+     * Total CMCE PDU: 69 bits
      */
-    const int CMCE_NBITS = 65;
-    uint8_t cmce[65];
+    const int CMCE_NBITS = 69;
+    uint8_t cmce[69];
     memset(cmce, 0, sizeof(cmce));
 
     pack_bits(cmce, 23u,    0,  5);   /* pdu_type = D-SDS-DATA */
@@ -123,12 +123,12 @@ static void test_d_sds_data_8bit_text(void)
     pack_bits(cmce,  0u,   34,  1);   /* store_fwd              */
     pack_bits(cmce,  0u,   35,  1);   /* vp_flag = 0            */
     pack_bits(cmce,  0u,   36,  1);   /* dt_flag = 0            */
-    pack_bits(cmce,  8u,   37,  4);   /* bits_per_char = 8      */
-    pack_bits(cmce,  2u,   41,  8);   /* num_chars = 2          */
-    pack_bits(cmce, (uint32_t)'O', 49, 8);  /* 'O' = 79        */
-    pack_bits(cmce, (uint32_t)'K', 57, 8);  /* 'K' = 75        */
+    pack_bits(cmce,  8u,   37,  8);   /* bits_per_char = 8      */
+    pack_bits(cmce,  2u,   45,  8);   /* num_chars = 2          */
+    pack_bits(cmce, (uint32_t)'O', 53, 8);  /* 'O' = 79        */
+    pack_bits(cmce, (uint32_t)'K', 61, 8);  /* 'K' = 75        */
 
-    uint8_t mle[9 + 65];
+    uint8_t mle[9 + 69];
     int mle_nbits;
     wrap_mle_cmce(cmce, CMCE_NBITS, mle, &mle_nbits);
 
@@ -212,15 +212,15 @@ static void test_d_sds_data_7bit_text(void)
      *   [34]    store_fwd = 0
      *   [35]    vp_flag = 0
      *   [36]    dt_flag = 0
-     *   [37-40] bpc = 7
-     *   [41-48] num_chars = 3
-     *   [49-55] 'H' = 72 (7 bits MSB first: 1001000)
-     *   [56-62] 'i' = 105 (7 bits: 1101001)
-     *   [63-69] '!' = 33  (7 bits: 0100001)
-     * Total: 70 bits
+     *   [37-44] bpc = 7
+     *   [45-52] num_chars = 3
+     *   [53-59] 'H' = 72 (7 bits MSB first: 1001000)
+     *   [60-66] 'i' = 105 (7 bits: 1101001)
+     *   [67-73] '!' = 33  (7 bits: 0100001)
+     * Total: 74 bits
      */
-    const int CMCE_NBITS = 70;
-    uint8_t cmce[70];
+    const int CMCE_NBITS = 74;
+    uint8_t cmce[74];
     memset(cmce, 0, sizeof(cmce));
 
     pack_bits(cmce, 23u,    0,  5);
@@ -230,13 +230,13 @@ static void test_d_sds_data_7bit_text(void)
     pack_bits(cmce,  0u,   34,  1);
     pack_bits(cmce,  0u,   35,  1);
     pack_bits(cmce,  0u,   36,  1);
-    pack_bits(cmce,  7u,   37,  4);   /* bpc = 7 */
-    pack_bits(cmce,  3u,   41,  8);   /* num_chars = 3 */
-    pack_bits(cmce, (uint32_t)'H', 49, 7);
-    pack_bits(cmce, (uint32_t)'i', 56, 7);
-    pack_bits(cmce, (uint32_t)'!', 63, 7);
+    pack_bits(cmce,  7u,   37,  8);   /* bpc = 7 */
+    pack_bits(cmce,  3u,   45,  8);   /* num_chars = 3 */
+    pack_bits(cmce, (uint32_t)'H', 53, 7);
+    pack_bits(cmce, (uint32_t)'i', 60, 7);
+    pack_bits(cmce, (uint32_t)'!', 67, 7);
 
-    uint8_t mle[9 + 70];
+    uint8_t mle[9 + 74];
     int mle_nbits;
     wrap_mle_cmce(cmce, CMCE_NBITS, mle, &mle_nbits);
 

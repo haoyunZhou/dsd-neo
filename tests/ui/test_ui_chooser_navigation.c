@@ -15,6 +15,10 @@
 #include <stdio.h>
 #include <string.h>
 
+#if defined(DSD_USE_PDCURSES) && defined(_WIN32)
+#include <windows.h>
+#endif
+
 #include <dsd-neo/platform/curses_compat.h>
 #include "menu_prompts.h"
 #include "test_support.h"
@@ -66,6 +70,30 @@ static void
 init_screen(void) {
     setlocale(LC_ALL, "");
     assert(dsd_test_setenv("TERM", "xterm-256color", 0) == 0);
+#if defined(DSD_USE_PDCURSES) && defined(_WIN32)
+    /* PDCurses WinCon uses GetStdHandle() directly and requires an attached
+     * console with valid dimensions. In headless CTest/CI environments
+     * stdout/stdin are pipes, so allocate a console and redirect the Win32
+     * standard handles to it so GetConsoleScreenBufferInfo() succeeds. */
+    AllocConsole();
+    {
+        HANDLE hOut = CreateFileA("CONOUT$", GENERIC_READ | GENERIC_WRITE,
+                                  FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+        HANDLE hIn  = CreateFileA("CONIN$",  GENERIC_READ | GENERIC_WRITE,
+                                  FILE_SHARE_READ,  NULL, OPEN_EXISTING, 0, NULL);
+        if (hOut != INVALID_HANDLE_VALUE) {
+            /* Shrink window first, then buffer — order matters on Windows */
+            SMALL_RECT win = {0, 0, 79, 16};
+            COORD      buf = {80, 17};
+            SetConsoleWindowInfo(hOut, TRUE, &win);
+            SetConsoleScreenBufferSize(hOut, buf);
+            SetStdHandle(STD_OUTPUT_HANDLE, hOut);
+            SetStdHandle(STD_ERROR_HANDLE,  hOut);
+        }
+        if (hIn != INVALID_HANDLE_VALUE)
+            SetStdHandle(STD_INPUT_HANDLE, hIn);
+    }
+#endif
     g_in = tmpfile();
     g_out = tmpfile();
     assert(g_in != NULL);

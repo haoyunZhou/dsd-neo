@@ -35,6 +35,21 @@
 #include "dsd-neo/core/opts_fwd.h"
 #include "dsd-neo/core/state_fwd.h"
 
+/* dPMR AMBE interleave schedule — definitions (shared via extern in dpmr_const.h) */
+/* bit 1 */
+const int dPmrW[36] = {0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1,
+                       0, 1, 0, 1, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2};
+
+const int dPmrX[36] = {23, 10, 22, 9, 21, 8,  20, 7, 19, 6, 18, 5, 17, 4, 16, 3, 15, 2,
+                       14, 1,  13, 0, 12, 10, 11, 9, 10, 8, 9,  7, 8,  6, 7,  5, 6,  4};
+
+/* bit 0 */
+const int dPmrY[36] = {0, 2, 0, 2, 0, 2, 0, 2, 0, 3, 0, 3, 1, 3, 1, 3, 1, 3,
+                       1, 3, 1, 3, 1, 3, 1, 3, 1, 3, 1, 3, 1, 3, 1, 3, 1, 3};
+
+const int dPmrZ[36] = {5,  3, 4,  2, 3,  1, 2,  0, 1,  13, 0,  12, 22, 11, 21, 10, 20, 9,
+                       19, 8, 18, 7, 17, 6, 16, 5, 15, 4,  14, 3,  13, 2,  12, 1,  11, 0};
+
 int32_t GetdPmrColorCode(uint8_t ChannelCodeBit[24]);
 void ScrambledPMRBit(uint32_t* LfsrValue, uint8_t* BufferIn, uint8_t* BufferOut, uint32_t NbOfBitToScramble);
 void DeInterleave6x12DPmrBit(uint8_t* BufferIn, uint8_t* BufferOut);
@@ -71,11 +86,11 @@ processdPMRvoice(dsd_opts* opts, dsd_state* state) {
     uint32_t CCH_CalledID = 0;
     uint32_t CCH_CallingID = 0;
     uint32_t CCH_CommunicationMode[NB_OF_DPMR_VOICE_FRAME_TO_DECODE] = {0};
-    uint32_t CCH_Version[NB_OF_DPMR_VOICE_FRAME_TO_DECODE];
-    uint32_t CCH_CommsFormat[NB_OF_DPMR_VOICE_FRAME_TO_DECODE];
-    uint32_t CCH_EmergencyPriority[NB_OF_DPMR_VOICE_FRAME_TO_DECODE];
-    uint32_t CCH_Reserved[NB_OF_DPMR_VOICE_FRAME_TO_DECODE];
-    uint32_t CCH_SlowData[NB_OF_DPMR_VOICE_FRAME_TO_DECODE];
+    uint32_t CCH_Version[NB_OF_DPMR_VOICE_FRAME_TO_DECODE] = {0};
+    uint32_t CCH_CommsFormat[NB_OF_DPMR_VOICE_FRAME_TO_DECODE] = {0};
+    uint32_t CCH_EmergencyPriority[NB_OF_DPMR_VOICE_FRAME_TO_DECODE] = {0};
+    uint32_t CCH_Reserved[NB_OF_DPMR_VOICE_FRAME_TO_DECODE] = {0};
+    uint32_t CCH_SlowData[NB_OF_DPMR_VOICE_FRAME_TO_DECODE] = {0};
     uint32_t PartOfSuperFrame = 0;
     uint8_t CalledID[8] = {0};
     uint8_t CallingID[8] = {0};
@@ -390,7 +405,7 @@ processdPMRvoice(dsd_opts* opts, dsd_state* state) {
         fprintf(stderr, "%s", KNRM);
 
         //check other as well before assigning
-        if (state->dPMRVoiceFS2Frame.CalledIDOk) {
+        if (state->dPMRVoiceFS2Frame.CallingIDOk) {
             snprintf(state->dpmr_caller_id, sizeof state->dpmr_caller_id, "%s", CallingID);
         }
 

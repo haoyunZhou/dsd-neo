@@ -473,14 +473,14 @@ static void test_tx_granted_last_active_time(void)
  *   [34]    store_fwd = 0
  *   [35]    vp_flag = 0
  *   [36]    dt_flag = 0
- *   [37-40] bpc = 8
- *   [41-48] num_chars = 1
- *   [49-56] 'A' = 65
- * Total: 57 bits
+ *   [37-44] bpc = 8
+ *   [45-52] num_chars = 1
+ *   [53-60] 'A' = 65
+ * Total: 61 bits
  */
 static void build_d_sds_data(uint8_t *cmce, uint32_t src_ssi, uint8_t msg_ref)
 {
-    memset(cmce, 0, 57);
+    memset(cmce, 0, 61);
     pack_bits(cmce, 23u,     0,  5);    /* pdu_type = D-SDS-DATA */
     pack_bits(cmce,  0u,     5,  1);    /* ext_flag = 0          */
     pack_bits(cmce, src_ssi, 6, 24);    /* calling_ssi           */
@@ -488,21 +488,21 @@ static void build_d_sds_data(uint8_t *cmce, uint32_t src_ssi, uint8_t msg_ref)
     pack_bits(cmce,  0u,    34,  1);    /* store_fwd             */
     pack_bits(cmce,  0u,    35,  1);    /* vp_flag               */
     pack_bits(cmce,  0u,    36,  1);    /* dt_flag               */
-    pack_bits(cmce,  8u,    37,  4);    /* bpc = 8               */
-    pack_bits(cmce,  1u,    41,  8);    /* num_chars = 1         */
-    pack_bits(cmce, (uint32_t)'A', 49, 8);  /* 'A'              */
+    pack_bits(cmce,  8u,    37,  8);    /* bpc = 8               */
+    pack_bits(cmce,  1u,    45,  8);    /* num_chars = 1         */
+    pack_bits(cmce, (uint32_t)'A', 53, 8);  /* 'A'              */
 }
 
 static void test_sds_msg_ref_stored(void)
 {
     printf("[test_sds_msg_ref_stored]\n");
 
-    uint8_t cmce[57];
+    uint8_t cmce[61];
     build_d_sds_data(cmce, 22222u, 7u);
 
-    uint8_t mle[9 + 57];
+    uint8_t mle[9 + 61];
     int mle_nbits;
-    wrap_mle_cmce(cmce, 57, mle, &mle_nbits);
+    wrap_mle_cmce(cmce, 61, mle, &mle_nbits);
 
     dsd_state *st  = alloc_state();
     dsd_opts  *opt = alloc_opts();
@@ -519,12 +519,12 @@ static void test_sds_last_cc_stored(void)
 {
     printf("[test_sds_last_cc_stored]\n");
 
-    uint8_t cmce[57];
+    uint8_t cmce[61];
     build_d_sds_data(cmce, 33333u, 2u);
 
-    uint8_t mle[9 + 57];
+    uint8_t mle[9 + 61];
     int mle_nbits;
-    wrap_mle_cmce(cmce, 57, mle, &mle_nbits);
+    wrap_mle_cmce(cmce, 61, mle, &mle_nbits);
 
     dsd_state *st  = alloc_state();
     dsd_opts  *opt = alloc_opts();
@@ -544,18 +544,18 @@ static void test_sds_msg_ref_overwrite(void)
     dsd_opts  *opt = alloc_opts();
 
     /* First SDS with msg_ref=5 */
-    uint8_t cmce1[57];
+    uint8_t cmce1[61];
     build_d_sds_data(cmce1, 10001u, 5u);
-    uint8_t mle1[9 + 57]; int n1;
-    wrap_mle_cmce(cmce1, 57, mle1, &n1);
+    uint8_t mle1[9 + 61]; int n1;
+    wrap_mle_cmce(cmce1, 61, mle1, &n1);
     tetra_mle_dispatch(mle1, n1, 0, opt, st);
     CHECK(st->tetra_sds_msg_ref == 5, "first SDS: msg_ref=5");
 
     /* Second SDS with msg_ref=12 */
-    uint8_t cmce2[57];
+    uint8_t cmce2[61];
     build_d_sds_data(cmce2, 10002u, 12u);
-    uint8_t mle2[9 + 57]; int n2;
-    wrap_mle_cmce(cmce2, 57, mle2, &n2);
+    uint8_t mle2[9 + 61]; int n2;
+    wrap_mle_cmce(cmce2, 61, mle2, &n2);
     tetra_mle_dispatch(mle2, n2, 0, opt, st);
     /* msg_ref is 4-bit so 12 stores as 12 */
     CHECK(st->tetra_sds_msg_ref == 12, "second SDS: msg_ref overwritten to 12");

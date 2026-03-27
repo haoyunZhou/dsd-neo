@@ -187,7 +187,7 @@ typedef struct {
     unsigned int CommsFormat[NB_OF_DPMR_VOICE_FRAME_TO_DECODE];
     unsigned int EmergencyPriority[NB_OF_DPMR_VOICE_FRAME_TO_DECODE];
     unsigned int Reserved[NB_OF_DPMR_VOICE_FRAME_TO_DECODE];
-    unsigned char SlowData[NB_OF_DPMR_VOICE_FRAME_TO_DECODE];
+    unsigned int SlowData[NB_OF_DPMR_VOICE_FRAME_TO_DECODE]; /* 18-bit slow data field */
     unsigned int ColorCode[NB_OF_DPMR_VOICE_FRAME_TO_DECODE / 2];
 } dPMRVoiceFS2Frame_t;
 

@@ -910,10 +910,12 @@ initState(dsd_state* state) {
     state->dPMRVoiceFS2Frame.CallingIDOk = 0;
     memset(state->dPMRVoiceFS2Frame.CalledID, 0, 8);
     memset(state->dPMRVoiceFS2Frame.CallingID, 0, 8);
-    memset(state->dPMRVoiceFS2Frame.Version, 0, 8);
+    memset(state->dPMRVoiceFS2Frame.Version, 0, sizeof(state->dPMRVoiceFS2Frame.Version));
 
-    set_spaces(state->dpmr_caller_id, 6);
-    set_spaces(state->dpmr_target_id, 6);
+    memset(state->dpmr_caller_id, ' ', sizeof(state->dpmr_caller_id) - 1);
+    state->dpmr_caller_id[sizeof(state->dpmr_caller_id) - 1] = '\0';
+    memset(state->dpmr_target_id, ' ', sizeof(state->dpmr_target_id) - 1);
+    state->dpmr_target_id[sizeof(state->dpmr_target_id) - 1] = '\0';
 
     //YSF Fusion Call Strings
     set_spaces(state->ysf_tgt, 10); //10 spaces
