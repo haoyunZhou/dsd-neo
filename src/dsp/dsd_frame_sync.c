@@ -619,6 +619,24 @@ getFrameSync(dsd_opts* opts, dsd_state* state) {
             *state->dibit_buf_p = d;
             state->dibit_buf_p++;
             dibit = '0' + d;
+        } else if (opts->frame_tetra == 1 && state->rf_mod == 1) {
+            /* TETRA pi/4-DQPSK: use a 4-level slicer so the sync window contains
+             * all four dibit values (0-3).  The TETRA NTS/SSB sync patterns are
+             * defined with full 4-level dibits; the binary slicer used by C4FM
+             * protocols only produces '1' and '3', making the Hamming-distance
+             * comparison always fail for TETRA. */
+            float c  = state->center;
+            float hi = c + (state->max - c) * (5.0f / 8.0f);
+            float lo = c + (state->min - c) * (5.0f / 8.0f);
+            int d;
+            if (symbol > c) {
+                d = (symbol > hi) ? 1 : 0;
+            } else {
+                d = (symbol < lo) ? 3 : 2;
+            }
+            *state->dibit_buf_p = d;
+            state->dibit_buf_p++;
+            dibit = '0' + d;
         } else if (symbol > 0) {
             *state->dibit_buf_p = 1;
             state->dibit_buf_p++;
@@ -631,8 +649,8 @@ getFrameSync(dsd_opts* opts, dsd_state* state) {
 
         if (opts->symbol_out_f && dibit != 0) {
             int csymbol;
-            if (cqpsk_4level) {
-                /* For CQPSK 4-level, dibit is already '0'..'3' */
+            if (cqpsk_4level || (opts->frame_tetra == 1 && state->rf_mod == 1)) {
+                /* 4-level path: dibit is already '0'..'3' */
                 csymbol = dibit - '0';
             } else {
                 csymbol = 0;
@@ -2122,7 +2140,7 @@ getFrameSync(dsd_opts* opts, dsd_state* state) {
                 }
 
                 /* Multi-rate SPS hunting: cycle through common symbol rates when no sync found.
-                 * Tries 4800/2400/9600/6000 symbols/s (example SPS @48 kHz: 10/20/5/8).
+                 * Tries 4800/2400/9600/6000/18000 symbols/s (example SPS @48 kHz: 10/20/5/8/3).
                  * Only cycle if in auto mode and no carrier detected. */
                 if (state->carrier == 0 && !opts->mod_cli_lock) {
                     state->sps_hunt_counter++;
@@ -2130,16 +2148,17 @@ getFrameSync(dsd_opts* opts, dsd_state* state) {
                     if (state->sps_hunt_counter >= 3) {
                         state->sps_hunt_counter = 0;
                         /* Determine which protocols are enabled to decide SPS options */
-                        int has_2400 = (opts->frame_nxdn48 == 1 || opts->frame_dpmr == 1);
-                        int has_9600 = (opts->frame_provoice == 1);
-                        int has_6000 = (opts->frame_p25p2 == 1 || opts->frame_x2tdma == 1);
+                        int has_2400  = (opts->frame_nxdn48 == 1 || opts->frame_dpmr == 1);
+                        int has_9600  = (opts->frame_provoice == 1);
+                        int has_6000  = (opts->frame_p25p2 == 1 || opts->frame_x2tdma == 1);
+                        int has_18000 = (opts->frame_tetra == 1);
 
                         /* Cycle through symbol rates based on enabled protocols */
-                        static const int sym_rate_cycle[] = {4800, 2400, 9600, 6000};
-                        int next_idx = (state->sps_hunt_idx + 1) % 4;
+                        static const int sym_rate_cycle[] = {4800, 2400, 9600, 6000, 18000};
+                        int next_idx = (state->sps_hunt_idx + 1) % 5;
 
                         /* Skip rates for protocols not enabled */
-                        for (int tries = 0; tries < 4; tries++) {
+                        for (int tries = 0; tries < 5; tries++) {
                             int sym_rate = sym_rate_cycle[next_idx];
                             int skip = 0;
                             if (sym_rate == 2400 && !has_2400) {
@@ -2151,10 +2170,13 @@ getFrameSync(dsd_opts* opts, dsd_state* state) {
                             if (sym_rate == 6000 && !has_6000) {
                                 skip = 1;
                             }
+                            if (sym_rate == 18000 && !has_18000) {
+                                skip = 1;
+                            }
                             if (!skip) {
                                 break;
                             }
-                            next_idx = (next_idx + 1) % 4;
+                            next_idx = (next_idx + 1) % 5;
                         }
 
                         if (next_idx != state->sps_hunt_idx) {

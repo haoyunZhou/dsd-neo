@@ -31,6 +31,7 @@ dsd_decode_mode_from_cli_preset(char preset, dsdneoUserDecodeMode* out_mode) {
         case 'n': *out_mode = DSDCFG_MODE_NXDN96; return 0;
         case 'y': *out_mode = DSDCFG_MODE_YSF; return 0;
         case 'm': *out_mode = DSDCFG_MODE_M17; return 0;
+        case 'T': *out_mode = DSDCFG_MODE_TETRA; return 0;
         default: return -1;
     }
 }
@@ -57,8 +58,9 @@ dsd_apply_decode_mode_preset(dsdneoUserDecodeMode mode, dsdDecodePresetProfile p
                 opts->frame_provoice = 1;
                 opts->frame_ysf = 1;
                 opts->frame_m17 = 1;
+                opts->frame_tetra = 1;
                 opts->mod_c4fm = 1;
-                opts->mod_qpsk = 0;
+                opts->mod_qpsk = 1;
                 state->rf_mod = 0;
                 opts->dmr_stereo = 1;
                 opts->dmr_mono = 0;
@@ -210,6 +212,7 @@ dsd_apply_decode_mode_preset(dsdneoUserDecodeMode mode, dsdDecodePresetProfile p
             opts->frame_provoice = 0;
             opts->frame_ysf = 0;
             opts->frame_m17 = 0;
+            opts->frame_tetra = 0;
             opts->mod_c4fm = 1;
             opts->mod_qpsk = 0;
             opts->mod_gfsk = 0;
@@ -364,6 +367,7 @@ dsd_apply_decode_mode_preset(dsdneoUserDecodeMode mode, dsdDecodePresetProfile p
             opts->frame_provoice = 0;
             opts->frame_ysf = 0;
             opts->frame_m17 = 0;
+            opts->frame_tetra = 0;
             opts->mod_c4fm = 1;
             opts->mod_qpsk = 0;
             opts->mod_gfsk = 0;
@@ -398,6 +402,38 @@ dsd_apply_decode_mode_preset(dsdneoUserDecodeMode mode, dsdDecodePresetProfile p
             snprintf(opts->output_name, sizeof opts->output_name, "%s", "Analog Monitor");
             return 0;
 
+        case DSDCFG_MODE_TETRA:
+            opts->frame_dstar    = 0;
+            opts->frame_x2tdma   = 0;
+            opts->frame_p25p1    = 0;
+            opts->frame_p25p2    = 0;
+            opts->frame_nxdn48   = 0;
+            opts->frame_nxdn96   = 0;
+            opts->frame_dmr      = 0;
+            opts->frame_dpmr     = 0;
+            opts->frame_provoice = 0;
+            opts->frame_ysf      = 0;
+            opts->frame_m17      = 0;
+            opts->frame_tetra    = 1;
+            /* TETRA uses pi/4-DQPSK at 18000 symbols/s (18 kHz channel spacing).
+             * Lock symbol timing so the SPS hunt does not drag us off 18000. */
+            opts->mod_c4fm     = 0;
+            opts->mod_qpsk     = 1;
+            opts->mod_gfsk     = 0;
+            opts->mod_cli_lock = 1;
+            state->rf_mod      = 1; /* QPSK demodulation path */
+            state->samplesPerSymbol = dsd_opts_compute_sps(opts, 18000);
+            state->symbolCenter     = dsd_opts_symbol_center(state->samplesPerSymbol);
+            opts->pulse_digi_rate_out  = 8000;
+            opts->pulse_digi_out_channels = 1;
+            opts->dmr_stereo = 0;
+            opts->dmr_mono   = 0;
+            if (profile != DSD_DECODE_PRESET_PROFILE_CONFIG) {
+                state->dmr_stereo = 0;
+            }
+            snprintf(opts->output_name, sizeof opts->output_name, "%s", "TETRA");
+            return 0;
+
         default: return -1;
     }
 }
@@ -428,38 +464,43 @@ dsd_infer_decode_mode_preset(const dsd_opts* opts) {
         return DSDCFG_MODE_P25P2;
     }
     if (opts->frame_nxdn48 && !opts->frame_nxdn96 && !opts->frame_p25p1 && !opts->frame_p25p2 && !opts->frame_dmr
-        && !opts->frame_dstar && !opts->frame_ysf && !opts->frame_provoice && !opts->frame_m17) {
+        && !opts->frame_dstar && !opts->frame_ysf && !opts->frame_provoice && !opts->frame_m17 && !opts->frame_tetra) {
         return DSDCFG_MODE_NXDN48;
     }
     if (!opts->frame_nxdn48 && opts->frame_nxdn96 && !opts->frame_p25p1 && !opts->frame_p25p2 && !opts->frame_dmr
-        && !opts->frame_dstar && !opts->frame_ysf && !opts->frame_provoice && !opts->frame_m17) {
+        && !opts->frame_dstar && !opts->frame_ysf && !opts->frame_provoice && !opts->frame_m17 && !opts->frame_tetra) {
         return DSDCFG_MODE_NXDN96;
     }
     if (opts->frame_x2tdma && !opts->frame_p25p1 && !opts->frame_p25p2 && !opts->frame_dmr && !opts->frame_dstar
         && !opts->frame_ysf && !opts->frame_nxdn48 && !opts->frame_nxdn96 && !opts->frame_provoice
-        && !opts->frame_m17) {
+        && !opts->frame_m17 && !opts->frame_tetra) {
         return DSDCFG_MODE_X2TDMA;
     }
     if (opts->frame_ysf && !opts->frame_dstar && !opts->frame_p25p1 && !opts->frame_p25p2 && !opts->frame_dmr
-        && !opts->frame_nxdn48 && !opts->frame_nxdn96 && !opts->frame_provoice && !opts->frame_m17) {
+        && !opts->frame_nxdn48 && !opts->frame_nxdn96 && !opts->frame_provoice && !opts->frame_m17 && !opts->frame_tetra) {
         return DSDCFG_MODE_YSF;
     }
     if (opts->frame_dstar && !opts->frame_ysf && !opts->frame_p25p1 && !opts->frame_p25p2 && !opts->frame_dmr
-        && !opts->frame_nxdn48 && !opts->frame_nxdn96 && !opts->frame_provoice && !opts->frame_m17) {
+        && !opts->frame_nxdn48 && !opts->frame_nxdn96 && !opts->frame_provoice && !opts->frame_m17 && !opts->frame_tetra) {
         return DSDCFG_MODE_DSTAR;
     }
     if (opts->frame_provoice && !opts->frame_dstar && !opts->frame_ysf && !opts->frame_p25p1 && !opts->frame_p25p2
-        && !opts->frame_dmr && !opts->frame_nxdn48 && !opts->frame_nxdn96 && !opts->frame_m17) {
+        && !opts->frame_dmr && !opts->frame_nxdn48 && !opts->frame_nxdn96 && !opts->frame_m17 && !opts->frame_tetra) {
         return DSDCFG_MODE_EDACS_PV;
     }
     if (opts->frame_dpmr && !opts->frame_dstar && !opts->frame_ysf && !opts->frame_p25p1 && !opts->frame_p25p2
         && !opts->frame_dmr && !opts->frame_nxdn48 && !opts->frame_nxdn96 && !opts->frame_provoice
-        && !opts->frame_m17) {
+        && !opts->frame_m17 && !opts->frame_tetra) {
         return DSDCFG_MODE_DPMR;
     }
     if (opts->frame_m17 && !opts->frame_dstar && !opts->frame_ysf && !opts->frame_p25p1 && !opts->frame_p25p2
-        && !opts->frame_dmr && !opts->frame_nxdn48 && !opts->frame_nxdn96 && !opts->frame_provoice) {
+        && !opts->frame_dmr && !opts->frame_nxdn48 && !opts->frame_nxdn96 && !opts->frame_provoice && !opts->frame_tetra) {
         return DSDCFG_MODE_M17;
+    }
+    if (opts->frame_tetra && !opts->frame_dstar && !opts->frame_ysf && !opts->frame_p25p1 && !opts->frame_p25p2
+        && !opts->frame_dmr && !opts->frame_nxdn48 && !opts->frame_nxdn96 && !opts->frame_provoice
+        && !opts->frame_dpmr && !opts->frame_m17 && !opts->frame_x2tdma) {
+        return DSDCFG_MODE_TETRA;
     }
     return DSDCFG_MODE_AUTO;
 }

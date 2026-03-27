@@ -4,8 +4,8 @@
  *
  * Tests tetra_acelp_slot_gate_passes(block_idx, state) which implements:
  *   1. NULL-state permissive pass-through
- *   2. Phase 12 floor-grant gate (tetra_tx_granted_valid)
- *   3. Phase 14 slot filter (tetra_vc_slot vs block_idx)
+ *   2. No-grant permissive pass-through for direct-tuned voice
+ *   3. Phase 14 slot filter (tetra_vc_slot vs block_idx) once grant exists
  *
  * This test only compiles tetra_tch_slot_gate.c — it does NOT need the
  * full ACELP pipeline or any audio/platform libraries.
@@ -53,20 +53,24 @@ test_null_state_passes(void)
 }
 
 /* -----------------------------------------------------------------------
- * Test 2: tx_granted_valid == 0 → suppress regardless of slot
+ * Test 2: tx_granted_valid == 0 → pass regardless of slot
+ *
+ * Direct-tuned TETRA VC reception may have valid TCH/FS voice without a
+ * decoded D-TX-GRANTED on the current channel. Audio must not be muted in
+ * that case.
  * ----------------------------------------------------------------------- */
 static void
-test_no_grant_suppresses_all(void)
+test_no_grant_passes_all(void)
 {
     dsd_state *s = (dsd_state *)calloc(1, sizeof(dsd_state));
     s->tetra_tx_granted_valid = 0;
     s->tetra_vc_slot = 0; /* no filter */
 
-    CHECK(tetra_acelp_slot_gate_passes(1, s) == 0, "no grant: block 1 must be suppressed");
-    CHECK(tetra_acelp_slot_gate_passes(2, s) == 0, "no grant: block 2 must be suppressed");
+    CHECK(tetra_acelp_slot_gate_passes(1, s) == 1, "no grant: block 1 must pass");
+    CHECK(tetra_acelp_slot_gate_passes(2, s) == 1, "no grant: block 2 must pass");
 
     free(s);
-    fprintf(stderr, "  PASS test_no_grant_suppresses_all\n");
+    fprintf(stderr, "  PASS test_no_grant_passes_all\n");
 }
 
 /* -----------------------------------------------------------------------
@@ -130,19 +134,21 @@ test_slot3_passes_both(void)
 }
 
 /* -----------------------------------------------------------------------
- * Test 7: no grant overrides slot filter (slot 1 assigned, no grant)
+ * Test 7: no grant overrides slot filter in the permissive direction
  * ----------------------------------------------------------------------- */
 static void
-test_no_grant_overrides_slot(void)
+test_no_grant_overrides_slot_permissive(void)
 {
     dsd_state *s = alloc_granted_state(1);
     s->tetra_tx_granted_valid = 0; /* revoke grant after alloc */
 
-    CHECK(tetra_acelp_slot_gate_passes(1, s) == 0,
-          "no grant overrides slot: block 1 must be suppressed even with slot=1");
+    CHECK(tetra_acelp_slot_gate_passes(1, s) == 1,
+        "no grant overrides slot: block 1 must pass even with slot=1");
+    CHECK(tetra_acelp_slot_gate_passes(2, s) == 1,
+        "no grant overrides slot: block 2 must pass even with slot=1");
 
     free(s);
-    fprintf(stderr, "  PASS test_no_grant_overrides_slot\n");
+    fprintf(stderr, "  PASS test_no_grant_overrides_slot_permissive\n");
 }
 
 /* -----------------------------------------------------------------------
@@ -171,12 +177,12 @@ int main(void)
     fprintf(stderr, "=== TETRA TCH slot gate tests ===\n");
 
     test_null_state_passes();
-    test_no_grant_suppresses_all();
+    test_no_grant_passes_all();
     test_slot0_passes_both();
     test_slot1_filter();
     test_slot2_filter();
     test_slot3_passes_both();
-    test_no_grant_overrides_slot();
+    test_no_grant_overrides_slot_permissive();
     test_slot_change_updates_filter();
 
     fprintf(stderr, "=== %d failure(s) ===\n", g_failures);

@@ -73,6 +73,13 @@ enum {
 #define TETRA_TCH_FRAME_BITS     137  /* encoded bits in one ACELP codec frame       */
 #define TETRA_TCH_FRAME_SAMPLES  160  /* decoded PCM16 samples (20ms @ 8 kHz)         */
 
+typedef enum {
+    TETRA_VOC_STATUS_UNKNOWN = 0,
+    TETRA_VOC_STATUS_OPEN,
+    TETRA_VOC_STATUS_MISSING_CMD,
+    TETRA_VOC_STATUS_OPEN_FAILED
+} tetra_voc_status_t;
+
 /* Convert decoded TYPE2 bits (at least 272 bits) into two consecutive codec frames.
  * Each frame occupies TETRA_TCH_FRAME_BITS (137) bytes in the output buffer.
  * The output buffer must be at least 2 * TETRA_TCH_FRAME_BITS = 274 bytes.
@@ -138,6 +145,27 @@ static struct {
     int    open;
 } s_voc;
 
+static tetra_voc_status_t s_voc_status = TETRA_VOC_STATUS_UNKNOWN;
+
+static int
+build_windows_shell_command(const char *cmd, char *out, size_t out_sz) {
+    const char *comspec;
+
+    if (!cmd || !cmd[0] || !out || out_sz < 16)
+        return 0;
+
+    comspec = getenv("ComSpec");
+    if (!comspec || !comspec[0])
+        comspec = "C:\\Windows\\System32\\cmd.exe";
+
+    /*
+     * Run through cmd.exe so TETRA_VOCODER_CMD can be a normal Windows
+     * command line: .exe with args, .cmd/.bat wrappers, or interpreter-based
+     * commands such as "py -3 path\\to\\vocoder.py".
+     */
+    return snprintf(out, out_sz, "\"%s\" /D /S /C \"%s\"", comspec, cmd) < (int)out_sz;
+}
+
 static int voc_open(const char *cmd) {
     SECURITY_ATTRIBUTES sa;
     memset(&sa, 0, sizeof(sa));
@@ -165,9 +193,20 @@ static int voc_open(const char *cmd) {
 
     PROCESS_INFORMATION pi;
     ZeroMemory(&pi, sizeof(pi));
-    char cmd_buf[1024];
-    snprintf(cmd_buf, sizeof(cmd_buf), "%s", cmd);
+    char cmd_buf[2048];
+    DWORD last_error;
+
+    if (!build_windows_shell_command(cmd, cmd_buf, sizeof(cmd_buf))) {
+        fprintf(stderr, "[TETRA] vocoder command too long or invalid\n");
+        CloseHandle(pipe_stdin_r);  CloseHandle(pipe_stdin_w);
+        CloseHandle(pipe_stdout_r); CloseHandle(pipe_stdout_w);
+        return 0;
+    }
+
     if (!CreateProcessA(NULL, cmd_buf, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi)) {
+        last_error = GetLastError();
+        fprintf(stderr, "[TETRA] failed to start vocoder command '%s' (CreateProcess=%lu)\n",
+                cmd, (unsigned long)last_error);
         CloseHandle(pipe_stdin_r);  CloseHandle(pipe_stdin_w);
         CloseHandle(pipe_stdout_r); CloseHandle(pipe_stdout_w);
         return 0;
@@ -181,6 +220,7 @@ static int voc_open(const char *cmd) {
     s_voc.h_proc   = pi.hProcess;
     s_voc.h_thread = pi.hThread;
     s_voc.open     = 1;
+    s_voc_status   = TETRA_VOC_STATUS_OPEN;
     fprintf(stderr, "[TETRA] vocoder subprocess started\n");
     return 1;
 }
@@ -221,6 +261,8 @@ static struct {
     int    open;
 } s_voc;
 
+static tetra_voc_status_t s_voc_status = TETRA_VOC_STATUS_UNKNOWN;
+
 static int voc_open(const char *cmd) {
     int to_child[2], from_child[2];
     if (pipe(to_child) != 0) return 0;
@@ -250,6 +292,7 @@ static int voc_open(const char *cmd) {
     s_voc.fd_read  = from_child[0];
     s_voc.pid      = pid;
     s_voc.open     = 1;
+    s_voc_status   = TETRA_VOC_STATUS_OPEN;
     fprintf(stderr, "[TETRA] vocoder subprocess started\n");
     return 1;
 }
@@ -280,8 +323,55 @@ void tetra_vocoder_close(void) {
 static int voc_ensure_open(void) {
     if (s_voc.open) return 1;
     const char *cmd = getenv("TETRA_VOCODER_CMD");
-    if (!cmd || !cmd[0]) return 0;
-    return voc_open(cmd);
+    if (!cmd || !cmd[0]) {
+        s_voc_status = TETRA_VOC_STATUS_MISSING_CMD;
+        return 0;
+    }
+    if (!voc_open(cmd)) {
+        s_voc_status = TETRA_VOC_STATUS_OPEN_FAILED;
+        return 0;
+    }
+    return 1;
+}
+
+static const char *
+tetra_audio_backend_name(const dsd_opts *opts) {
+    if (!opts)
+        return "unknown";
+
+    switch (opts->audio_out_type) {
+        case 0: return "pulse";
+        case 1: return "file/stdout";
+        case 8: return "udp";
+        default: return "other";
+    }
+}
+
+static int
+tetra_has_live_audio_route(const dsd_opts *opts) {
+    if (!opts)
+        return 0;
+    if (opts->slot1_on != 1)
+        return 0;
+
+    if (opts->audio_out_type == 0)
+        return opts->audio_out_stream != NULL;
+    if (opts->audio_out_type == 1)
+        return opts->audio_out_fd >= 0;
+    if (opts->audio_out_type == 8)
+        return 1;
+    return 0;
+}
+
+static int
+tetra_has_any_audio_sink(const dsd_opts *opts) {
+    if (!opts)
+        return 0;
+    if (tetra_has_live_audio_route(opts))
+        return 1;
+    if (opts->wav_out_f != NULL && (opts->dmr_stereo_wav == 1 || opts->static_wav_file == 1))
+        return 1;
+    return 0;
 }
 
 /* tetra_acelp_decode() kept for backward ABI compat; no longer does anything.
@@ -314,9 +404,23 @@ void tetra_acelp_process_tch(const uint8_t *type2_bits, int type2_len,
                               int block_idx,
                               dsd_opts *opts, dsd_state *state)
 {
+    static int warned_gate = 0;
+    static int warned_missing_cmd = 0;
+    static int warned_open_failed = 0;
+    static int warned_no_sink = 0;
+
     /* Phase 12 floor-grant gate. */
-    if (!tetra_acelp_slot_gate_passes(block_idx ? block_idx : 1, state))
+    if (!tetra_acelp_slot_gate_passes(block_idx ? block_idx : 1, state)) {
+        if (!warned_gate) {
+            fprintf(stderr,
+                "[TETRA] audio suppressed by slot gate: grant_valid=%u vc_slot=%u block=%d\n",
+                state ? (unsigned)state->tetra_tx_granted_valid : 0u,
+                state ? (unsigned)state->tetra_vc_slot : 0u,
+                block_idx ? block_idx : 1);
+            warned_gate = 1;
+        }
         return;
+    }
 
     if (type2_len < 272) {
         fprintf(stderr,
@@ -332,14 +436,39 @@ void tetra_acelp_process_tch(const uint8_t *type2_bits, int type2_len,
 
     /* —— Step 2: vocoder + audio routing for each frame —— */
     if (!voc_ensure_open()) {
-        static int warned = 0;
-        if (!warned) {
-            fprintf(stderr,
-                "[TETRA] TCH: no vocoder. "
-                "Set TETRA_VOCODER_CMD to enable audio output.\n");
-            warned = 1;
+        if (s_voc_status == TETRA_VOC_STATUS_MISSING_CMD) {
+            if (!warned_missing_cmd) {
+                fprintf(stderr,
+                    "[TETRA] audio disabled: TETRA_VOCODER_CMD is not set. "
+                    "Example: TETRA_VOCODER_CMD=\"python tools/tetra/vocoder_stub.py --tone\"\n");
+                warned_missing_cmd = 1;
+            }
+        } else if (s_voc_status == TETRA_VOC_STATUS_OPEN_FAILED) {
+            if (!warned_open_failed) {
+                const char *cmd = getenv("TETRA_VOCODER_CMD");
+                fprintf(stderr,
+                    "[TETRA] audio disabled: failed to start vocoder command: %s\n",
+                    (cmd && cmd[0]) ? cmd : "(unset)");
+                warned_open_failed = 1;
+            }
         }
         return;
+    }
+
+    if (!tetra_has_any_audio_sink(opts)) {
+        if (!warned_no_sink) {
+            fprintf(stderr,
+                "[TETRA] vocoder is producing PCM but no audio sink is active: "
+                "audio_out=%d backend=%s slot1_on=%d stream=%s fd=%d wav=%s static_wav=%d\n",
+                opts ? opts->audio_out : -1,
+                tetra_audio_backend_name(opts),
+                opts ? opts->slot1_on : -1,
+                (opts && opts->audio_out_stream) ? "yes" : "no",
+                opts ? opts->audio_out_fd : -1,
+                (opts && opts->wav_out_f) ? "yes" : "no",
+                opts ? opts->static_wav_file : 0);
+            warned_no_sink = 1;
+        }
     }
 
     for (int f = 0; f < 2; f++) {

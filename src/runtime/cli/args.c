@@ -1073,6 +1073,7 @@ dsd_parse_short_opts(int argc, char** argv, dsd_opts* opts, dsd_state* state, in
                         case 'i': LOG_NOTICE("Decoding only NXDN48 frames.\n"); break;
                         case 'n': LOG_NOTICE("Decoding only NXDN96 frames.\n"); break;
                         case 'y': LOG_NOTICE("Decoding only YSF frames.\n"); break;
+                        case 'T': LOG_NOTICE("Decoding only TETRA frames.\n"); break;
                         case 'm':
                             LOG_NOTICE("Decoding only M17 frames (polarity auto-detected from preamble).\n");
                             break;
