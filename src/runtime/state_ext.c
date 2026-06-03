@@ -11,11 +11,19 @@
 
 static int
 dsd_state_ext_id_is_valid(dsd_state_ext_id id) {
-    return (int)id >= 0 && (int)id < DSD_STATE_EXT_MAX;
+    return (unsigned int)id < (unsigned int)DSD_STATE_EXT_MAX;
 }
 
 void*
 dsd_state_ext_get(dsd_state* state, dsd_state_ext_id id) {
+    if (!state || !dsd_state_ext_id_is_valid(id)) {
+        return NULL;
+    }
+    return state->state_ext[(int)id];
+}
+
+const void*
+dsd_state_ext_get_const(const dsd_state* state, dsd_state_ext_id id) {
     if (!state || !dsd_state_ext_id_is_valid(id)) {
         return NULL;
     }

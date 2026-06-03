@@ -11,19 +11,42 @@
  * of the C++ `RtlSdrOrchestrator`, for consumption by C translation units.
  */
 
-#pragma once
+#ifndef DSD_NEO_INCLUDE_DSD_NEO_IO_RTL_STREAM_C_H_H
+#define DSD_NEO_INCLUDE_DSD_NEO_IO_RTL_STREAM_C_H_H
+
+#include <dsd-neo/platform/platform.h>
 
 #include <stddef.h>
 #include <stdint.h>
 
 #include <dsd-neo/core/opts_fwd.h>
+#include <dsd-neo/io/rtl_stream_fwd.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-/* Opaque stream context */
-typedef struct RtlSdrContext RtlSdrContext;
+typedef enum DSD_ATTR_PACKED rtl_stream_output_kind {
+    RTL_STREAM_OUTPUT_AUDIO_MONITOR = 0,
+    RTL_STREAM_OUTPUT_SYMBOL_FSK = 1,
+    RTL_STREAM_OUTPUT_SYMBOL_CQPSK = 2,
+} rtl_stream_output_kind;
+
+typedef enum DSD_ATTR_PACKED rtl_stream_channel_profile {
+    RTL_STREAM_CHANNEL_PROFILE_WIDE = 0,
+    RTL_STREAM_CHANNEL_PROFILE_6K25 = 1,
+    RTL_STREAM_CHANNEL_PROFILE_12K5 = 2,
+    RTL_STREAM_CHANNEL_PROFILE_PROVOICE = 3,
+    RTL_STREAM_CHANNEL_PROFILE_P25_C4FM = 4,
+    RTL_STREAM_CHANNEL_PROFILE_P25_CQPSK = 5,
+} rtl_stream_channel_profile;
+
+typedef enum DSD_ATTR_PACKED rtl_stream_tune_result {
+    RTL_STREAM_TUNE_OK = 0,
+    RTL_STREAM_TUNE_DEFERRED = 1,
+    RTL_STREAM_TUNE_FAILED = -1,
+    RTL_STREAM_TUNE_TIMEOUT = -2,
+} rtl_stream_tune_result;
 
 /* Lifecycle */
 /**
@@ -86,7 +109,7 @@ int rtl_stream_destroy(RtlSdrContext* ctx);
  * @brief Tune to a new center frequency.
  * @param ctx Stream context.
  * @param center_freq_hz New center frequency in Hz.
- * @return 0 on success; otherwise <0 on error.
+ * @return rtl_stream_tune_result: 0 on success, 1 when deferred, negative on error/timeout.
  */
 int rtl_stream_tune(RtlSdrContext* ctx, uint32_t center_freq_hz);
 /**
@@ -133,12 +156,118 @@ int rtl_stream_get_requested_ppm(const dsd_opts* opts);
  * @return 0 on success; otherwise <0 on error (e.g., shutdown).
  */
 int rtl_stream_read(RtlSdrContext* ctx, float* out, size_t count, int* out_got);
+int rtl_stream_read_monitor(const RtlSdrContext* ctx, float* out, size_t count, int* out_got);
 /**
  * @brief Get the current output sample rate in Hz.
  * @param ctx Stream context.
  * @return Output sample rate in Hz; returns 0 if `ctx` is invalid.
  */
 uint32_t rtl_stream_output_rate(const RtlSdrContext* ctx);
+uint32_t rtl_stream_monitor_rate(const RtlSdrContext* ctx);
+/**
+ * @brief Return the RTL output stream generation.
+ *
+ * Increments whenever the RTL output stream can contain a different logical
+ * sample/symbol sequence, such as fresh stream setup, retune, restart, or
+ * explicit output clear.
+ */
+uint32_t rtl_stream_output_generation(void);
+/**
+ * @brief Return 1 when an RTL-family stream context is currently running.
+ *
+ * The predicate is false before startup, after soft/hard stop, and during
+ * cooperative shutdown. Use it before consuming stream-local metadata that may
+ * retain its last configured value after cleanup.
+ */
+int rtl_stream_is_active(void);
+/**
+ * @brief Return the active RTL stream output kind.
+ *
+ * Digital RTL-family paths, including SoapySDR, return symbol kinds. Analog
+ * monitor paths return AUDIO_MONITOR.
+ */
+int rtl_stream_get_output_kind(void);
+int rtl_stream_get_symbol_profile(int* out_symbol_rate_hz, int* out_levels);
+int rtl_stream_get_symbol_profile_full(int* out_symbol_rate_hz, int* out_levels, int* out_channel_profile);
+
+/**
+ * @brief Update symbol modem profile for RTL-family digital modes.
+ *
+ * @param symbol_rate_hz Symbol rate in Hz, e.g. 4800, 6000, 2400.
+ * @param levels Number of FSK levels (2 or 4). CQPSK remains selected by modulation.
+ * @param channel_profile rtl_stream_channel_profile profile id.
+ * @return 0 on success, negative on invalid input.
+ */
+int rtl_stream_set_symbol_profile(int symbol_rate_hz, int levels, int channel_profile);
+
+/**
+ * @brief Queue a symbol/CQPSK/TED profile to apply at the next RTL retune boundary.
+ *
+ * Trunking code may know the destination channel profile before the controller
+ * thread has actually programmed the tuner. This helper records that profile
+ * without mutating the active demodulator; the controller applies it after the
+ * hardware frequency change and before retune DSP state reset.
+ *
+ * @param cqpsk_enable 0/1 to force CQPSK off/on, negative to leave unchanged.
+ * @param symbol_rate_hz Symbol rate in Hz, e.g. 4800 or 6000.
+ * @param levels Number of symbol levels, 2 or 4.
+ * @param channel_profile rtl_stream_channel_profile profile id.
+ * @param ted_sps TED samples-per-symbol to apply; <=0 leaves TED SPS unchanged.
+ * @param persist_ted_override Non-zero keeps ted_sps as an override after retune.
+ */
+void rtl_stream_prepare_retune_profile(int cqpsk_enable, int symbol_rate_hz, int levels, int channel_profile,
+                                       int ted_sps, int persist_ted_override);
+
+/**
+ * @brief Queue a symbol/CQPSK/TED profile for a specific RTL retune target.
+ *
+ * This is the preferred trunking helper when the destination frequency is
+ * already known. The native RTL controller consumes the profile only for a
+ * matching target frequency, so unrelated retunes cannot steal the queued
+ * demodulator settings before the intended tune request is scheduled.
+ *
+ * @param target_freq_hz Intended center frequency in Hz; zero leaves the profile unbound.
+ * @param cqpsk_enable 0/1 to force CQPSK off/on, negative to leave unchanged.
+ * @param symbol_rate_hz Symbol rate in Hz, e.g. 4800 or 6000.
+ * @param levels Number of symbol levels, 2 or 4.
+ * @param channel_profile rtl_stream_channel_profile profile id.
+ * @param ted_sps TED samples-per-symbol to apply; <=0 leaves TED SPS unchanged.
+ * @param persist_ted_override Non-zero keeps ted_sps as an override after retune.
+ */
+void rtl_stream_prepare_retune_profile_for_target(uint32_t target_freq_hz, int cqpsk_enable, int symbol_rate_hz,
+                                                  int levels, int channel_profile, int ted_sps,
+                                                  int persist_ted_override);
+
+/**
+ * @brief Apply and clear the queued retune profile immediately.
+ *
+ * Use this when RTL audio is retuned by an external backend rather than the
+ * native RTL controller, so there is no controller retune boundary to consume
+ * the queued profile.
+ */
+void rtl_stream_apply_pending_retune_profile(void);
+
+/**
+ * @brief Apply and clear a queued retune profile for a specific external retune target.
+ *
+ * Use this when an external backend, such as rigctl, has completed a frequency
+ * change and the queued profile was bound to that target.
+ */
+void rtl_stream_apply_pending_retune_profile_for_target(uint32_t target_freq_hz);
+
+/**
+ * @brief Clear any queued retune profile that has not yet been consumed.
+ */
+void rtl_stream_clear_pending_retune_profile(void);
+
+/**
+ * @brief Request fresh acquisition for the active RTL FSK symbol modem.
+ *
+ * The request is consumed by the demod thread before the next FSK block so the
+ * modem state is not mutated from decoder/control threads. Returns 1 when a
+ * request was queued, 0 when FSK symbol output is inactive.
+ */
+int rtl_stream_request_fsk_reacquire(void);
 
 /* Optional helpers to mirror legacy API behavior */
 /**
@@ -207,13 +336,116 @@ void rtl_stream_set_rtltcp_autotune(int onoff);
  */
 int rtl_stream_get_last_applied_freq(uint32_t* out_freq_hz);
 
+#if defined(DSD_NEO_ENABLE_INTERNAL_TEST_HOOKS)
 /**
- * @brief Get smoothed TED residual (EMA of Gardner error) from demod pipeline.
- * Positive: persistent early (nudge center right). Negative: late (nudge left).
+ * @brief Test-only helper to request a retune on an active stream context.
+ *
+ * Returns 0 on success, -1 when the request is rejected (for example replay),
+ * and -2 on timeout.
+ */
+int rtl_stream_test_request_retune(const RtlSdrContext* ctx, uint32_t freq_hz, int timeout_ms);
+
+/**
+ * @brief Seed queued output, run reconfigure input preparation, and report the result.
+ *
+ * This verifies retune preparation preserves queued samples that the later
+ * drain/clear policy is responsible for handling.
+ */
+int rtl_stream_test_prepare_reconfigure_input(size_t queued_samples, size_t* out_used_after,
+                                              uint32_t* out_generation_before, uint32_t* out_generation_after);
+
+/**
+ * @brief Seed output/cache counts and report whether retune drain sees them.
+ *
+ * Decoder-owned cached symbols are reported for diagnostics but do not block
+ * the retune drain predicate.
+ */
+int rtl_stream_test_retune_output_pending(size_t queued_samples, int cached_symbols, size_t* out_ring_pending,
+                                          int* out_cache_pending, int* out_drained);
+
+/**
+ * @brief Seed output/cache counts, apply tune-result drain policy, and report the result.
+ */
+int rtl_stream_test_tune_result_output_drain(int tune_result, size_t queued_samples, int cached_symbols,
+                                             size_t* out_used_after, int* out_cache_pending_after,
+                                             uint32_t* out_generation_before, uint32_t* out_generation_after);
+
+/**
+ * @brief Seed output/cache counts, clear output, and report the resulting state.
+ */
+int rtl_stream_test_clear_output(size_t queued_samples, int cached_symbols, size_t* out_used_after,
+                                 int* out_cache_pending_after, uint32_t* out_generation_before,
+                                 uint32_t* out_generation_after);
+
+/**
+ * @brief Seed output/cache state, request FSK reacquire, and consume pending reset.
+ */
+int rtl_stream_test_fsk_reacquire(int output_kind, size_t queued_samples, int cached_symbols, size_t* out_used_after,
+                                  int* out_cache_pending_after, uint32_t* out_generation_before,
+                                  uint32_t* out_generation_after, int* out_request_rc, int* out_consumed);
+
+/**
+ * @brief Verify queued retune profiles are copied onto their scheduled requests.
+ */
+int rtl_stream_test_retune_profile_request_binding(int* out_first_profile, int* out_second_profile,
+                                                   uint32_t* out_first_freq_hz, uint32_t* out_second_freq_hz,
+                                                   uint32_t* out_first_request_id, uint32_t* out_second_request_id);
+
+/**
+ * @brief Verify a coalesced no-profile retune preserves an already-bound profile.
+ */
+int rtl_stream_test_retune_profile_coalesced_no_profile(int* out_profile, uint32_t* out_profile_freq_hz,
+                                                        uint32_t* out_manual_freq_hz, uint32_t* out_request_id,
+                                                        uint32_t* out_coalesced_request_id);
+
+typedef struct rtl_stream_test_replay_state {
+    int replay_input_eof;
+    int replay_input_drained;
+    int replay_demod_drained;
+    int replay_output_drained;
+    int replay_forced_stop;
+    int should_exit;
+    uint64_t replay_last_submit_gen;
+    uint64_t replay_last_submit_gen_at_eof;
+    uint64_t replay_last_consume_gen;
+    size_t input_ring_used;
+    size_t output_ring_used;
+    uint32_t replay_event_retune_count;
+    uint32_t replay_event_mute_count;
+    uint32_t replay_event_reset_count;
+    uint32_t replay_event_last_frequency_hz;
+    uint64_t replay_event_last_mute_bytes;
+    int replay_event_last_reset_reason;
+    uint32_t replay_loop_restart_count;
+    uint32_t replay_loop_restart_last_frequency_hz;
+} rtl_stream_test_replay_state;
+
+/**
+ * @brief Snapshot replay EOF state-machine fields for integration tests.
+ *
+ * Returns 0 on success and fills @p out_state, or a negative value if the
+ * stream/context is unavailable.
+ */
+int rtl_stream_test_get_replay_state(const RtlSdrContext* ctx, rtl_stream_test_replay_state* out_state);
+
+/**
+ * @brief Return whether steady-state demod watermarks are enabled for a source.
+ *
+ * This protects live rtl_tcp from reintroducing demod-side refill pauses after
+ * the startup prebuffer.
+ */
+int rtl_stream_test_steady_state_watermark_enabled(const char* audio_in_dev);
+#endif
+
+/**
+ * @brief Get smoothed TED residual from demod pipeline in Q14 units.
+ *
+ * Positive values indicate persistent "sample early" bias (nudge center right),
+ * negative values indicate "sample late" bias (nudge center left).
  * Returns 0 when unavailable.
  *
  * @param ctx Stream context (unused).
- * @return Residual value (coarse units, signed integer).
+ * @return Signed Q14 residual (approximately float residual * 16384).
  */
 int rtl_stream_ted_bias(const RtlSdrContext* ctx);
 
@@ -223,6 +455,13 @@ int rtl_stream_ted_bias(const RtlSdrContext* ctx);
  * @return Nominal SPS (>=2); 0 when unavailable.
  */
 int rtl_stream_get_ted_sps(void);
+
+/**
+ * @brief Get the pending Gardner TED samples-per-symbol override.
+ *
+ * @return Override SPS when set; 0 when normal rate-derived SPS is active.
+ */
+int rtl_stream_get_ted_sps_override(void);
 
 /**
  * @brief Set the Gardner TED samples-per-symbol.
@@ -270,7 +509,7 @@ void rtl_stream_set_ted_gain(float gain);
 float rtl_stream_get_ted_gain(void);
 
 /**
- * @brief Force-enable the TED even for FM/C4FM paths (0/1).
+ * @brief Force-enable TED for non-symbol FM/C4FM paths (0/1).
  *
  * @param onoff Non-zero to force enable; zero to follow mode defaults.
  */
@@ -459,6 +698,62 @@ int rtl_stream_get_iq_balance(void);
 void rtl_stream_p25p1_ber_update(int fec_ok_delta, int fec_err_delta);
 
 /* Coarse DSP feature toggles and snapshot */
+typedef struct rtl_stream_cqpsk_eq_status {
+    int enabled;
+    int initialized;
+    int taps;
+    unsigned int symbols;
+    float mu;
+    float modulus;
+    float err_ema;
+    float mag2_ema;
+    float tap_energy;
+    float center_tap_mag;
+    float max_side_tap_mag;
+} rtl_stream_cqpsk_eq_status;
+
+typedef struct rtl_stream_costas_metrics {
+    int err_smooth_avg_q14;
+    int err_raw_avg_q14;
+    int confidence_avg_q14;
+    int zero_conf_pct;
+} rtl_stream_costas_metrics;
+
+typedef struct rtl_stream_fsk_metrics {
+    int valid;
+    int levels;
+    int symbol_rate_hz;
+    uint64_t symbols_total;
+    unsigned int window_symbols;
+    unsigned int mean_reliability;
+    unsigned int min_reliability;
+    float rms_error;
+    float evm_snr_db;
+    float low_reliability_pct;
+    float clip_pct;
+    int timing_acquired;
+    float track_last_error;
+    float track_last_score;
+    uint64_t track_updates;
+    uint64_t track_skips;
+    float abs_est;
+    float dc_est;
+    float last_symbol;
+    uint32_t generation;
+} rtl_stream_fsk_metrics;
+
+typedef struct rtl_stream_decode_health {
+    int valid;
+    uint32_t generation;
+    unsigned int p25p1_fec_ok;
+    unsigned int p25p1_fec_err;
+    unsigned int p25p2_facch_ok;
+    unsigned int p25p2_facch_err;
+    unsigned int p25p2_sacch_ok;
+    unsigned int p25p2_sacch_err;
+    unsigned int p25p2_voice_err;
+} rtl_stream_decode_health;
+
 /**
  * @brief Toggle CQPSK path pre-processing on/off (0=off, nonzero=on).
  *
@@ -466,13 +761,13 @@ void rtl_stream_p25p1_ber_update(int fec_ok_delta, int fec_err_delta);
  */
 void rtl_stream_toggle_cqpsk(int onoff);
 /**
- * @brief Toggle FLL on/off (0=off, nonzero=on).
+ * @brief Toggle non-symbol residual FLL on/off (0=off, nonzero=on).
  *
  * @param onoff Non-zero to enable; zero to disable.
  */
 void rtl_stream_toggle_fll(int onoff);
 /**
- * @brief Toggle TED on/off (0=off, nonzero=on).
+ * @brief Toggle non-symbol TED on/off (0=off, nonzero=on).
  *
  * @param onoff Non-zero to enable; zero to disable.
  */
@@ -486,6 +781,59 @@ void rtl_stream_toggle_ted(int onoff);
  * @return 0 on success; negative on error.
  */
 int rtl_stream_dsp_get(int* cqpsk_enable, int* fll_enable, int* ted_enable);
+
+/**
+ * @brief Get CQPSK CMA equalizer status and adaptation metrics.
+ *
+ * `err_ema` is the smoothed absolute constant-modulus error, `mag2_ema` is the
+ * smoothed output magnitude squared, and `max_side_tap_mag` indicates how much
+ * non-center tap correction the equalizer has learned.
+ *
+ * @param out [out] Equalizer status snapshot. Must not be NULL.
+ * @return 0 on success; negative on invalid input.
+ */
+int rtl_stream_get_cqpsk_eq_status(rtl_stream_cqpsk_eq_status* out);
+
+/**
+ * @brief Get recent soft-symbol quality metrics from the RTL FSK symbol modem.
+ *
+ * These metrics observe the current FSK symbol stream and do not affect slicer
+ * decisions. The snapshot is invalidated on retune, output clear, or squelch
+ * zero-symbol generation.
+ *
+ * @param out [out] FSK metrics snapshot. Must not be NULL.
+ * @return 0 on success; negative on invalid input.
+ */
+int rtl_stream_get_fsk_metrics(rtl_stream_fsk_metrics* out);
+
+/**
+ * @brief Get RTL-path decode-health counters for the current output generation.
+ *
+ * Counters are reset on output generation changes and accumulate protocol
+ * health callbacks such as P25 Phase 1 FEC and Phase 2 RS/voice deltas.
+ *
+ * @param out [out] Decode-health snapshot. Must not be NULL.
+ * @return 0 on success; negative on invalid input.
+ */
+int rtl_stream_get_decode_health(rtl_stream_decode_health* out);
+
+/**
+ * @brief Set live CQPSK CMA equalizer controls; pass negative values to keep a field unchanged.
+ *
+ * The tap count is clamped to odd values in [3, 15]. Step size (`mu`) is
+ * clamped to [0.000001, 0.01], and target modulus to [0.05, 4.0].
+ *
+ * @param enable Non-negative to set enable (0/1); negative to keep existing.
+ * @param taps Positive tap count to set; non-positive to keep existing.
+ * @param mu Positive CMA adaptation step; negative to keep existing.
+ * @param modulus Positive target output magnitude squared; negative to keep existing.
+ */
+void rtl_stream_set_cqpsk_eq(int enable, int taps, float mu, float modulus);
+
+/**
+ * @brief Reset the live CQPSK CMA equalizer taps and adaptation metrics.
+ */
+void rtl_stream_reset_cqpsk_eq(void);
 
 /**
  * @brief Set or disable the resampler target rate (applied on controller thread).
@@ -565,8 +913,10 @@ double rtl_stream_get_cfo_hz(void);
 double rtl_stream_get_residual_cfo_hz(void);
 /** Return 1 when carrier loop appears locked (CQPSK active, CFO/residual small, SNR ok), else 0. */
 int rtl_stream_get_carrier_lock(void);
-/** Return last average absolute Costas error magnitude (Q14, pi==1<<14). */
+/** Return last average absolute smoothed Costas error magnitude (Q14, pi==1<<14). */
 int rtl_stream_get_costas_err_q14(void);
+/** Return Costas discriminator health metrics for the latest DSP block. */
+int rtl_stream_get_costas_metrics(rtl_stream_costas_metrics* out);
 /** Return raw NCO frequency control (Q15 cycles per sample). */
 int rtl_stream_get_nco_q15(void);
 /** Return current demod output sample rate (Hz). */
@@ -576,9 +926,9 @@ int rtl_stream_get_demod_rate_hz(void);
 double rtl_stream_get_fll_band_edge_freq_hz(void);
 
 /* -------- FM/C4FM amplitude stabilization + DC blocker (runtime) -------- */
-/** Get FM AGC enable state (1 on, 0 off). */
+/** Get non-symbol FM AGC enable state (1 on, 0 off). */
 int rtl_stream_get_fm_agc(void);
-/** Enable/disable FM AGC (0 off, nonzero on). */
+/** Enable/disable non-symbol FM AGC (0 off, nonzero on). */
 void rtl_stream_set_fm_agc(int onoff);
 /**
  * @brief Get FM AGC parameters (any pointer may be NULL).
@@ -600,9 +950,9 @@ void rtl_stream_get_fm_agc_params(float* target_rms, float* min_rms, float* alph
  */
 void rtl_stream_set_fm_agc_params(float target_rms, float min_rms, float alpha_up, float alpha_down);
 
-/** Get FM constant-envelope limiter state (1 on, 0 off). */
+/** Get non-symbol FM constant-envelope limiter state (1 on, 0 off). */
 int rtl_stream_get_fm_limiter(void);
-/** Enable/disable FM constant-envelope limiter (0 off, nonzero on). */
+/** Enable/disable non-symbol FM constant-envelope limiter (0 off, nonzero on). */
 void rtl_stream_set_fm_limiter(int onoff);
 
 /**
@@ -625,3 +975,4 @@ void rtl_stream_set_iq_dc(int enable, int shift_k);
 #ifdef __cplusplus
 }
 #endif
+#endif /* DSD_NEO_INCLUDE_DSD_NEO_IO_RTL_STREAM_C_H_H */

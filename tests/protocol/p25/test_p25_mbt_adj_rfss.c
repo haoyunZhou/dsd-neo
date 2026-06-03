@@ -9,14 +9,21 @@
  * using pre-seeded IDEN tables.
  */
 
+#include <dsd-neo/protocol/p25/p25_cc_candidates.h>
 #include <dsd-neo/protocol/p25/p25_trunk_sm_api.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
-#include <string.h>
-
 #include "dsd-neo/core/opts_fwd.h"
+#include "dsd-neo/core/safe_api.h"
 #include "dsd-neo/core/state_fwd.h"
+
+#if defined(__GNUC__) && !defined(__cplusplus)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmissing-prototypes"
+#endif
+
+#include "p25_test_shim.h"
 
 // Shim: decode an MBT with pre-seeded iden tables
 int p25_test_decode_mbt_with_iden(const unsigned char* mbt, int mbt_len, int iden, int type, int tdma, long base,
@@ -98,6 +105,7 @@ sm_test_api(void) {
 }
 
 bool
+// NOLINTNEXTLINE(misc-use-internal-linkage)
 SetFreq(int sockfd, long int freq) {
     (void)sockfd;
     (void)freq;
@@ -105,6 +113,7 @@ SetFreq(int sockfd, long int freq) {
 }
 
 bool
+// NOLINTNEXTLINE(misc-use-internal-linkage)
 SetModulation(int sockfd, int bw) {
     (void)sockfd;
     (void)bw;
@@ -112,13 +121,16 @@ SetModulation(int sockfd, int bw) {
 }
 
 void
+// NOLINTNEXTLINE(misc-use-internal-linkage)
 return_to_cc(dsd_opts* opts, dsd_state* state) {
     (void)opts;
     (void)state;
 }
+// NOLINTNEXTLINE(misc-use-internal-linkage)
 struct RtlSdrContext* g_rtl_ctx = 0;
 
 int
+// NOLINTNEXTLINE(misc-use-internal-linkage)
 rtl_stream_tune(struct RtlSdrContext* ctx, uint32_t center_freq_hz) {
     (void)ctx;
     (void)center_freq_hz;
@@ -126,13 +138,15 @@ rtl_stream_tune(struct RtlSdrContext* ctx, uint32_t center_freq_hz) {
 }
 
 void
-unpack_byte_array_into_bit_array(uint8_t* input, uint8_t* output, int len) {
+// NOLINTNEXTLINE(misc-use-internal-linkage)
+unpack_byte_array_into_bit_array(const uint8_t* input, uint8_t* output, int len) {
     (void)input;
     (void)output;
     (void)len;
 }
 
 void
+// NOLINTNEXTLINE(misc-use-internal-linkage)
 apx_embedded_alias_header_phase2(dsd_opts* opts, dsd_state* state, uint8_t slot, uint8_t* lc_bits) {
     (void)opts;
     (void)state;
@@ -141,6 +155,7 @@ apx_embedded_alias_header_phase2(dsd_opts* opts, dsd_state* state, uint8_t slot,
 }
 
 void
+// NOLINTNEXTLINE(misc-use-internal-linkage)
 apx_embedded_alias_blocks_phase2(dsd_opts* opts, dsd_state* state, uint8_t slot, uint8_t* lc_bits) {
     (void)opts;
     (void)state;
@@ -149,6 +164,7 @@ apx_embedded_alias_blocks_phase2(dsd_opts* opts, dsd_state* state, uint8_t slot,
 }
 
 void
+// NOLINTNEXTLINE(misc-use-internal-linkage)
 l3h_embedded_alias_decode(dsd_opts* opts, dsd_state* state, uint8_t slot, int16_t len, uint8_t* input) {
     (void)opts;
     (void)state;
@@ -158,6 +174,7 @@ l3h_embedded_alias_decode(dsd_opts* opts, dsd_state* state, uint8_t slot, int16_
 }
 
 void
+// NOLINTNEXTLINE(misc-use-internal-linkage)
 nmea_harris(dsd_opts* opts, dsd_state* state, uint8_t* input, uint32_t src, int slot) {
     (void)opts;
     (void)state;
@@ -169,7 +186,7 @@ nmea_harris(dsd_opts* opts, dsd_state* state, uint8_t* input, uint32_t src, int 
 static int
 expect_eq_long(const char* tag, long got, long want) {
     if (got != want) {
-        fprintf(stderr, "%s: got %ld want %ld\n", tag, got, want);
+        DSD_FPRINTF(stderr, "%s: got %ld want %ld\n", tag, got, want);
         return 1;
     }
     return 0;
@@ -179,7 +196,10 @@ int
 main(void) {
     int rc = 0;
 
-    p25_sm_set_api(sm_test_api());
+    {
+        p25_sm_api api = sm_test_api();
+        p25_sm_set_api(&api);
+    }
 
     // Common iden config: iden=1 FDMA, base=851.000 MHz, spacing=12.5 kHz
     const int iden = 1, type = 1, tdma = 0;
@@ -187,9 +207,11 @@ main(void) {
     const int spac125 = 100;          // 100*125 = 12.5 kHz
 
     // Case A: RFSS Status Broadcast (0x3A)
+    // CHAN-R is the uplink side of the explicit channel and must not become
+    // a separate downlink CC candidate.
     {
         uint8_t mbt[48];
-        memset(mbt, 0, sizeof(mbt));
+        DSD_MEMSET(mbt, 0, sizeof(mbt));
         mbt[0] = 0x17;  // ALT format
         mbt[2] = 0x00;  // MFID standard
         mbt[3] = 0x01;  // LRA
@@ -219,15 +241,19 @@ main(void) {
 
         long want1 = 851000000 + 1 * 100 * 125; // 851.0125 MHz
         long want2 = 851000000 + 2 * 100 * 125; // 851.0250 MHz
-        rc |= expect_eq_long("neigh count", g_neigh_count, 2);
+        rc |= expect_eq_long("neigh count", g_neigh_count, 1);
         rc |= expect_eq_long("neigh f1", g_neigh[0], want1);
-        rc |= expect_eq_long("neigh f2", g_neigh[1], want2);
+        (void)want2;
     }
 
     // Case B: Adjacent Status Broadcast (0x3C)
+    // After Layer 2 enrichment, 0x3C calls p25_nb_add_ex() + p25_cc_add_candidate()
+    // directly instead of p25_sm_on_neighbor_update(). Verify via neighbor table.
+    // CHAN-R is the uplink side of the explicit channel and must not become
+    // a separate downlink CC candidate.
     {
         uint8_t mbt[48];
-        memset(mbt, 0, sizeof(mbt));
+        DSD_MEMSET(mbt, 0, sizeof(mbt));
         mbt[0] = 0x17;  // ALT format
         mbt[2] = 0x00;  // MFID standard
         mbt[3] = 0x02;  // LRA
@@ -244,24 +270,62 @@ main(void) {
         mbt[16] = 0x00; // SSC
         // WACN fields at [17..19] ignored here
 
-        g_neigh_count = 0;
-        g_neigh[0] = g_neigh[1] = 0;
         long cc = 0, w = 0;
         int sid = 0;
+        int nb_count = 0;
+        long nb_freqs[P25_NB_MAX];
+        DSD_MEMSET(nb_freqs, 0, sizeof(nb_freqs));
         (void)cc;
         (void)w;
         (void)sid;
-        int sh = p25_test_decode_mbt_with_iden(mbt, (int)sizeof(mbt), iden, type, tdma, base5, spac125, &cc, &w, &sid);
+        p25_test_iden_config cfg = {iden, type, tdma, base5, spac125};
+        p25_test_mbt_outputs outputs = {&cc, &w, &sid, &nb_count, nb_freqs};
+        int sh = p25_test_decode_mbt_with_iden_nb(mbt, (int)sizeof(mbt), &cfg, &outputs);
         if (sh != 0) {
             return 30;
         }
 
         long want1 = 851000000 + 10 * 100 * 125; // 851.1250 MHz
         long want2 = 851000000 + 5 * 100 * 125;  // 851.0625 MHz
-        rc |= expect_eq_long("adj count", g_neigh_count, 2);
-        rc |= expect_eq_long("adj f1", g_neigh[0], want1);
-        rc |= expect_eq_long("adj f2", g_neigh[1], want2);
+        rc |= expect_eq_long("adj nb_count", (long)nb_count, 1L);
+        rc |= expect_eq_long("adj nb f1", nb_freqs[0], want1);
+        (void)want2;
+    }
+
+    // Case C: AMBTC opcode 0x3E is Protection Parameter Broadcast in sdrtrunk,
+    // not RFSS Status. It must not update trunking identity or current CC.
+    {
+        uint8_t mbt[48];
+        DSD_MEMSET(mbt, 0, sizeof(mbt));
+        mbt[0] = 0x17; // ALT format
+        mbt[2] = 0x00; // MFID standard
+        mbt[3] = 0x03; // LRA-like byte if misdecoded
+        mbt[4] = 0x01; // would make SYSID 0x123 if misdecoded as RFSS status
+        mbt[5] = 0x23;
+        mbt[6] = 0x02;  // blks
+        mbt[7] = 0x3E;  // Protection Parameter Broadcast
+        mbt[12] = 0x04; // data block bytes that used to be misread as RFSS/site/channel
+        mbt[13] = 0x05;
+        mbt[14] = 0x10;
+        mbt[15] = 0x0A;
+        mbt[16] = 0x10;
+        mbt[17] = 0x05;
+
+        long cc = -1, w = -1;
+        int sid = -1;
+        int sh = p25_test_decode_mbt_with_iden(mbt, (int)sizeof(mbt), iden, type, tdma, base5, spac125, &cc, &w, &sid);
+        if (sh != 0) {
+            return 40;
+        }
+
+        rc |= expect_eq_long("ambtc_0x3e_cc_unchanged", cc, 0);
+        rc |= expect_eq_long("ambtc_0x3e_wacn_unchanged", w, 0);
+        rc |= expect_eq_long("ambtc_0x3e_sysid_unchanged", sid, 0);
     }
 
     return rc;
 }
+
+#if defined(__GNUC__) && !defined(__cplusplus)
+#pragma GCC diagnostic pop
+#endif

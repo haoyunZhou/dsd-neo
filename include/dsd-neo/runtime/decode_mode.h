@@ -8,7 +8,10 @@
  * @brief Shared decode preset helpers for CLI/config/snapshot paths.
  */
 
-#pragma once
+#ifndef DSD_NEO_INCLUDE_DSD_NEO_RUNTIME_DECODE_MODE_H_
+#define DSD_NEO_INCLUDE_DSD_NEO_RUNTIME_DECODE_MODE_H_
+
+#include <dsd-neo/platform/platform.h>
 
 #include <dsd-neo/core/opts_fwd.h>
 #include <dsd-neo/core/state_fwd.h>
@@ -24,7 +27,7 @@ extern "C" {
  * Some presets intentionally differ between config and CLI paths to preserve
  * existing behavior.
  */
-typedef enum {
+typedef enum DSD_ATTR_PACKED {
     DSD_DECODE_PRESET_PROFILE_CONFIG = 0,
     DSD_DECODE_PRESET_PROFILE_CLI,
     DSD_DECODE_PRESET_PROFILE_INTERACTIVE
@@ -54,6 +57,19 @@ int dsd_apply_decode_mode_preset(dsdneoUserDecodeMode mode, dsdDecodePresetProfi
                                  dsd_state* state);
 
 /**
+ * @brief Rebuild preset symbol timing for a decode mode at a target PCM rate.
+ *
+ * Starts from the preset's canonical 48 kHz timing and rescales it to the
+ * provided effective PCM rate. This is used when a mode preset is combined
+ * with non-48 kHz file/socket input so the slicer starts with the correct SPS.
+ *
+ * @param mode Decode mode preset.
+ * @param effective_input_rate_hz Effective PCM rate after any staged upsample.
+ * @param state Decoder state receiving `samplesPerSymbol` and `symbolCenter`.
+ */
+void dsd_apply_decode_mode_symbol_timing(dsdneoUserDecodeMode mode, int effective_input_rate_hz, dsd_state* state);
+
+/**
  * @brief Infer a user decode mode from active opts flags.
  *
  * Mirrors config snapshot classification behavior.
@@ -66,3 +82,5 @@ dsdneoUserDecodeMode dsd_infer_decode_mode_preset(const dsd_opts* opts);
 #ifdef __cplusplus
 }
 #endif
+
+#endif /* DSD_NEO_INCLUDE_DSD_NEO_RUNTIME_DECODE_MODE_H_ */

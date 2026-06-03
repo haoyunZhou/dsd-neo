@@ -9,7 +9,8 @@
  *
  * This header is internal to src/ui/terminal/ and should NOT be installed.
  */
-#pragma once
+#ifndef DSD_NEO_SRC_UI_TERMINAL_MENU_PROMPTS_H_
+#define DSD_NEO_SRC_UI_TERMINAL_MENU_PROMPTS_H_
 
 #include <stddef.h>
 
@@ -141,3 +142,18 @@ int ui_chooser_handle_key(int ch);
  * @brief Render the chooser overlay.
  */
 void ui_chooser_render(void);
+
+#ifdef DSD_NEO_TEST_HOOKS
+typedef struct {
+    int active;
+    int count;
+    int sel;
+    int top;
+    int page_rows;
+} UiChooserTestSnapshot;
+
+void ui_chooser_test_set_page_rows(int page_rows);
+UiChooserTestSnapshot ui_chooser_test_snapshot(void);
+#endif
+
+#endif /* DSD_NEO_SRC_UI_TERMINAL_MENU_PROMPTS_H_ */

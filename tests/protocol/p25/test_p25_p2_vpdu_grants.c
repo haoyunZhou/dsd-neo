@@ -11,24 +11,27 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
-#include <string.h>
+#include "dsd-neo/core/opts_fwd.h"
+#include "dsd-neo/core/safe_api.h"
+#include "dsd-neo/core/state_fwd.h"
 
-// Test shim wrapper
-void p25_test_invoke_mac_vpdu_capture(const unsigned char* mac_bytes, int mac_len, int p25_trunk, long p25_cc_freq,
-                                      int iden, int type, int tdma, long base, int spac, long* out_vc0, int* out_tuned);
+#if defined(__GNUC__) && !defined(__cplusplus)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmissing-prototypes"
+#endif
 
-// Stubs for alias helpers and rigctl referenced along the path
-typedef struct dsd_opts dsd_opts;
-typedef struct dsd_state dsd_state;
+#include "p25_test_shim.h"
 
 void
-unpack_byte_array_into_bit_array(uint8_t* input, uint8_t* output, int len) {
+// NOLINTNEXTLINE(misc-use-internal-linkage)
+unpack_byte_array_into_bit_array(const uint8_t* input, uint8_t* output, int len) {
     (void)input;
     (void)output;
     (void)len;
 }
 
 void
+// NOLINTNEXTLINE(misc-use-internal-linkage)
 apx_embedded_alias_header_phase2(dsd_opts* opts, dsd_state* state, uint8_t slot, uint8_t* lc_bits) {
     (void)opts;
     (void)state;
@@ -37,6 +40,7 @@ apx_embedded_alias_header_phase2(dsd_opts* opts, dsd_state* state, uint8_t slot,
 }
 
 void
+// NOLINTNEXTLINE(misc-use-internal-linkage)
 apx_embedded_alias_blocks_phase2(dsd_opts* opts, dsd_state* state, uint8_t slot, uint8_t* lc_bits) {
     (void)opts;
     (void)state;
@@ -45,6 +49,7 @@ apx_embedded_alias_blocks_phase2(dsd_opts* opts, dsd_state* state, uint8_t slot,
 }
 
 void
+// NOLINTNEXTLINE(misc-use-internal-linkage)
 l3h_embedded_alias_decode(dsd_opts* opts, dsd_state* state, uint8_t slot, int16_t len, uint8_t* input) {
     (void)opts;
     (void)state;
@@ -54,6 +59,7 @@ l3h_embedded_alias_decode(dsd_opts* opts, dsd_state* state, uint8_t slot, int16_
 }
 
 void
+// NOLINTNEXTLINE(misc-use-internal-linkage)
 nmea_harris(dsd_opts* opts, dsd_state* state, uint8_t* input, uint32_t src, int slot) {
     (void)opts;
     (void)state;
@@ -63,6 +69,7 @@ nmea_harris(dsd_opts* opts, dsd_state* state, uint8_t* input, uint32_t src, int 
 }
 
 bool
+// NOLINTNEXTLINE(misc-use-internal-linkage)
 SetFreq(int sockfd, long int freq) {
     (void)sockfd;
     (void)freq;
@@ -70,6 +77,7 @@ SetFreq(int sockfd, long int freq) {
 }
 
 bool
+// NOLINTNEXTLINE(misc-use-internal-linkage)
 SetModulation(int sockfd, int bandwidth) {
     (void)sockfd;
     (void)bandwidth;
@@ -77,13 +85,16 @@ SetModulation(int sockfd, int bandwidth) {
 }
 
 void
+// NOLINTNEXTLINE(misc-use-internal-linkage)
 return_to_cc(dsd_opts* opts, dsd_state* state) {
     (void)opts;
     (void)state;
 }
+// NOLINTNEXTLINE(misc-use-internal-linkage)
 struct RtlSdrContext* g_rtl_ctx = 0;
 
 int
+// NOLINTNEXTLINE(misc-use-internal-linkage)
 rtl_stream_tune(struct RtlSdrContext* ctx, uint32_t center_freq_hz) {
     (void)ctx;
     (void)center_freq_hz;
@@ -93,7 +104,7 @@ rtl_stream_tune(struct RtlSdrContext* ctx, uint32_t center_freq_hz) {
 static int
 expect_eq_long(const char* tag, long got, long want) {
     if (got != want) {
-        fprintf(stderr, "%s: got %ld want %ld\n", tag, got, want);
+        DSD_FPRINTF(stderr, "%s: got %ld want %ld\n", tag, got, want);
         return 1;
     }
     return 0;
@@ -102,7 +113,7 @@ expect_eq_long(const char* tag, long got, long want) {
 static int
 expect_true(const char* tag, int cond) {
     if (!cond) {
-        fprintf(stderr, "%s: expected true\n", tag);
+        DSD_FPRINTF(stderr, "%s: expected true\n", tag);
         return 1;
     }
     return 0;
@@ -122,7 +133,7 @@ main(void) {
     // Case A: MFID 0x90, opcode A3 (Group Regroup Channel Grant - Implicit)
     {
         unsigned char mac[24];
-        memset(mac, 0, sizeof mac);
+        DSD_MEMSET(mac, 0, sizeof mac);
         mac[1] = 0xA3;
         mac[2] = 0x90;
         mac[5] = 0x10;
@@ -131,7 +142,8 @@ main(void) {
         mac[8] = 0x67; // group id (arbitrary)
         long vc = 0;
         int tuned = 0;
-        p25_test_invoke_mac_vpdu_capture(mac, 24, 1, cc, iden, type, tdma, base, spac, &vc, &tuned);
+        p25_test_iden_config cfg = {iden, type, tdma, base, spac};
+        p25_test_invoke_mac_vpdu_capture(mac, 24, 1, cc, &cfg, &vc, &tuned);
         rc |= expect_true("A3 tuned", tuned == 1);
         rc |= expect_eq_long("A3 vc", vc, 851125000);
     }
@@ -139,7 +151,7 @@ main(void) {
     // Case B: UU Voice Service Channel Grant (opcode 0x44)
     {
         unsigned char mac[24];
-        memset(mac, 0, sizeof mac);
+        DSD_MEMSET(mac, 0, sizeof mac);
         mac[1] = 0x44;
         mac[2] = 0x00; // std MFID
         mac[2] = 0x10;
@@ -152,10 +164,59 @@ main(void) {
         mac[9] = 0x02; // source
         long vc = 0;
         int tuned = 0;
-        p25_test_invoke_mac_vpdu_capture(mac, 24, 1, cc, iden, type, tdma, base, spac, &vc, &tuned);
+        p25_test_iden_config cfg = {iden, type, tdma, base, spac};
+        p25_test_invoke_mac_vpdu_capture(mac, 24, 1, cc, &cfg, &vc, &tuned);
         rc |= expect_true("UU tuned", tuned == 1);
         rc |= expect_eq_long("UU vc", vc, 851125000);
     }
 
+    // Case C: Group Voice Channel Grant Update Multiple - Explicit (opcode 0x25)
+    {
+        unsigned char mac[24];
+        DSD_MEMSET(mac, 0, sizeof mac);
+        mac[1] = 0x25;
+        mac[2] = 0x00; // svc1
+        mac[3] = 0x10;
+        mac[4] = 0x0A; // channel T1 0x100A
+        mac[5] = 0x00;
+        mac[6] = 0x00; // channel R1 unused
+        mac[7] = 0x12;
+        mac[8] = 0x34; // group1
+        mac[9] = 0x00; // svc2
+        mac[10] = 0x10;
+        mac[11] = 0x0B; // channel T2 0x100B
+        mac[12] = 0x00;
+        mac[13] = 0x00; // channel R2 unused
+        mac[14] = 0x56;
+        mac[15] = 0x78; // group2
+        long vc = 0;
+        int tuned = 0;
+        p25_test_iden_config cfg = {iden, type, tdma, base, spac};
+        p25_test_invoke_mac_vpdu_capture(mac, 24, 1, cc, &cfg, &vc, &tuned);
+        rc |= expect_true("0x25 tuned", tuned == 1);
+        rc |= expect_eq_long("0x25 vc", vc, 851125000);
+    }
+
+    // Case D: SNDCP Data Channel Announcement resolves both T and R channels (opcode 0xD6)
+    {
+        unsigned char mac[24];
+        DSD_MEMSET(mac, 0, sizeof mac);
+        mac[1] = 0xD6;
+        mac[4] = 0x10;
+        mac[5] = 0x0A; // CHAN-T 0x100A
+        mac[6] = 0x10;
+        mac[7] = 0x0B; // CHAN-R 0x100B
+        long freq_t = 0;
+        long freq_r = 0;
+        p25_test_iden_config cfg = {iden, type, tdma, base, spac};
+        p25_test_invoke_mac_vpdu_channel_cache(mac, 24, &cfg, 0x100A, 0x100B, &freq_t, &freq_r);
+        rc |= expect_eq_long("0xD6 CHAN-T cache", freq_t, 851125000);
+        rc |= expect_eq_long("0xD6 CHAN-R cache", freq_r, 851137500);
+    }
+
     return rc;
 }
+
+#if defined(__GNUC__) && !defined(__cplusplus)
+#pragma GCC diagnostic pop
+#endif

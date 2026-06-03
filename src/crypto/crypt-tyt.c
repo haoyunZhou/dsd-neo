@@ -10,23 +10,30 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
-
 #include "dsd-neo/core/opts_fwd.h"
+#include "dsd-neo/core/safe_api.h"
+#include "dsd-neo/core/secret_redaction.h"
 #include "dsd-neo/core/state_fwd.h"
+#include "vendor_ap_key_parse.h"
+
+#if defined(__GNUC__) || defined(__clang__)
+#define DSD_ATTR_UNUSED_FN __attribute__((unused))
+#else
+#define DSD_ATTR_UNUSED_FN
+#endif
 
 //interleaved code words for AMBE+2 (as it arrives over the air)
-void
-ambe2_codeword_print_i(dsd_opts* opts, char ambe_fr[4][24]) {
+static void DSD_ATTR_UNUSED_FN
+ambe2_codeword_print_i(const dsd_opts* opts, char ambe_fr[4][24]) {
     uint8_t interleaved[72];
-    memset(interleaved, 0, sizeof(interleaved));
+    DSD_MEMSET(interleaved, 0, sizeof(interleaved));
 
     //reinterleave the frame
     const int *w, *x, *y, *z;
-    w = rW;
-    x = rX;
-    y = rY;
-    z = rZ;
+    w = dmr_ambe_interleave_w;
+    x = dmr_ambe_interleave_x;
+    y = dmr_ambe_interleave_y;
+    z = dmr_ambe_interleave_z;
 
     for (int8_t i = 0; i < 36; i++) {
         interleaved[(i * 2) + 0] = (uint8_t)ambe_fr[*w][*x];
@@ -39,25 +46,25 @@ ambe2_codeword_print_i(dsd_opts* opts, char ambe_fr[4][24]) {
     }
 
     uint8_t bytes[9];
-    memset(bytes, 0, sizeof(bytes));
+    DSD_MEMSET(bytes, 0, sizeof(bytes));
 
     //pack
     pack_bit_array_into_byte_array(interleaved, bytes, 9);
 
     if (opts->payload == 1) {
-        fprintf(stderr, " AMBE HEX(72) INT: ");
+        DSD_FPRINTF(stderr, " AMBE HEX(72) INT: ");
         for (int8_t i = 0; i < 9; i++) {
-            fprintf(stderr, "%02X", bytes[i]);
+            DSD_FPRINTF(stderr, "%02X", bytes[i]);
         }
-        fprintf(stderr, "\n");
+        DSD_FPRINTF(stderr, "\n");
     }
 }
 
 //de-interleaved code words for AMBE+2
-void
-ambe2_codeword_print_b(dsd_opts* opts, char ambe_fr[4][24]) {
+static void DSD_ATTR_UNUSED_FN
+ambe2_codeword_print_b(const dsd_opts* opts, char ambe_fr[4][24]) {
     uint8_t fr_reverse[4][24];
-    memset(fr_reverse, 0, sizeof(fr_reverse));
+    DSD_MEMSET(fr_reverse, 0, sizeof(fr_reverse));
     for (int i = 0; i < 24; i++) {
         fr_reverse[0][i] = ambe_fr[0][23 - i];
     }
@@ -91,45 +98,45 @@ ambe2_codeword_print_b(dsd_opts* opts, char ambe_fr[4][24]) {
     UNUSED(opts);
 
     if (opts->payload == 1) {
-        fprintf(stderr, " AMBE HEX(72): %016llX%02llX \n", hex1, hex2);
-        fprintf(stderr, " AMBE HEX(49): %014llX\n", hex49 << 7);
+        DSD_FPRINTF(stderr, " AMBE HEX(72): %016llX%02llX \n", hex1, hex2);
+        DSD_FPRINTF(stderr, " AMBE HEX(49): %014llX\n", hex49 << 7);
     }
 }
 
 //de-interleaved code words for AMBE+2
-void
-ambe2_codeword_print_f(dsd_opts* opts, char ambe_fr[4][24]) {
+static void DSD_ATTR_UNUSED_FN
+ambe2_codeword_print_f(const dsd_opts* opts, char ambe_fr[4][24]) {
     uint32_t v0 = (uint32_t)convert_bits_into_output((uint8_t*)ambe_fr[0], 24); //24
     uint32_t v1 = (uint32_t)convert_bits_into_output((uint8_t*)ambe_fr[1], 23); //23
     uint32_t v2 = (uint32_t)convert_bits_into_output((uint8_t*)ambe_fr[2], 11); //11
     uint32_t v3 = (uint32_t)convert_bits_into_output((uint8_t*)ambe_fr[3], 14); //14
 
     // if (opts->payload == 1)
-    //   fprintf (stderr, " AMBE V0: %06X; V1: %06X; V2: %03X; V3: %04X; \n", v0, v1, v2, v3);
+    //   DSD_FPRINTF(stderr, " AMBE V0: %06X; V1: %06X; V2: %03X; V3: %04X; \n", v0, v1, v2, v3);
 
     unsigned long long int hex1 = ((unsigned long long int)v0 << 40ULL) + ((unsigned long long int)v1 << 17ULL)
                                   + ((unsigned long long int)v2 << 6ULL) + (v3 >> 8);
     unsigned long long int hex2 = v3 & 0xFF;
 
     if (opts->payload == 1) {
-        fprintf(stderr, " AMBE HEX(72): %016llX%02llX \n", hex1, hex2);
+        DSD_FPRINTF(stderr, " AMBE HEX(72): %016llX%02llX \n", hex1, hex2);
     }
 }
 
 //NOTE: This mode DOES NOT work over a repeater, simplex only
 //repeaters may or will attempt to correct the frame errors
 void
-tyt16_ambe2_codeword_keystream(dsd_state* state, char ambe_fr[4][24], int fnum) {
+tyt16_ambe2_codeword_keystream(const dsd_state* state, char ambe_fr[4][24], int fnum) {
 
     char interleaved[72];
-    memset(interleaved, 0, sizeof(interleaved));
+    DSD_MEMSET(interleaved, 0, sizeof(interleaved));
 
     //interleave the frame
     const int *w, *x, *y, *z;
-    w = rW;
-    x = rX;
-    y = rY;
-    z = rZ;
+    w = dmr_ambe_interleave_w;
+    x = dmr_ambe_interleave_x;
+    y = dmr_ambe_interleave_y;
+    z = dmr_ambe_interleave_z;
 
     for (int8_t i = 0; i < 36; i++) {
         interleaved[(i * 2) + 0] = ambe_fr[*w][*x];
@@ -142,9 +149,9 @@ tyt16_ambe2_codeword_keystream(dsd_state* state, char ambe_fr[4][24], int fnum) 
     }
 
     uint8_t ks_bytes[10];
-    memset(ks_bytes, 0, sizeof(ks_bytes));
+    DSD_MEMSET(ks_bytes, 0, sizeof(ks_bytes));
     uint8_t ks[80];
-    memset(ks, 0, sizeof(ks));
+    DSD_MEMSET(ks, 0, sizeof(ks));
 
     ks_bytes[0] = (state->H >> 8) & 0xFF;
     ks_bytes[1] = (state->H >> 0) & 0xFF;
@@ -171,10 +178,10 @@ tyt16_ambe2_codeword_keystream(dsd_state* state, char ambe_fr[4][24], int fnum) 
     }
 
     //deinterleave back into ambe_fr frame
-    w = rW;
-    x = rX;
-    y = rY;
-    z = rZ;
+    w = dmr_ambe_interleave_w;
+    x = dmr_ambe_interleave_x;
+    y = dmr_ambe_interleave_y;
+    z = dmr_ambe_interleave_z;
     int k = 0;
     for (int8_t i = 0; i < 36; i++) {
         ambe_fr[*w][*x] = interleaved[k++];
@@ -188,37 +195,51 @@ tyt16_ambe2_codeword_keystream(dsd_state* state, char ambe_fr[4][24], int fnum) 
 }
 
 void
-tyt_ap_pc4_keystream_creation(dsd_state* state, char* input) {
-    unsigned char key1[16] = {0};
-    unsigned char key2[16] = {0};
-
-    char buf[1024];
-    snprintf(buf, sizeof(buf), "%s", input);
-
-    char* pEnd;
-    uint64_t K1 = strtoull(buf, &pEnd, 16);
-    uint64_t K2 = strtoull(pEnd, &pEnd, 16);
-
-    u64_to_bytes_be(K1, &key1[0]);
-    u64_to_bytes_be(K2, &key1[8]);
-
-    for (int i = 0; i < 16; i++) {
-        key2[i] = key1[15 - i];
+tyt_ap_pc4_keystream_creation(dsd_state* state, const char* input) {
+    if (state == NULL || input == NULL) {
+        return;
     }
 
-    /* Create key schedule */
-    create_keys(&ctx, key2, sizeof(key2));
-    ctx.rounds = nbround;
+    dsd_vendor_ap_key parsed;
+    const int parse_rc = dsd_vendor_ap_key_parse(input, &parsed);
+    if (parse_rc != DSD_VENDOR_AP_KEY_OK) {
+        DSD_FPRINTF(stderr, "DMR TYT AP (PC4) key parse failed: expected 32 or 64 hex characters\n");
+        state->tyt_ap = 0;
+        return;
+    }
 
-    fprintf(stderr, "DMR TYT AP (PC4) 128-bit Key %016llX%016llX with Forced Application\n", (unsigned long long int)K1,
-            (unsigned long long int)K2);
+    if (parsed.nhex == 64U) {
+        create_keys(&g_pc4_context, parsed.hex, parsed.nhex);
+        g_pc4_context.rounds = nbround;
+
+        DSD_FPRINTF(stderr, "DMR TYT AP (PC4) 256-bit key loaded with forced application: %s\n", DSD_SECRET_REDACTED);
+    } else {
+        unsigned char key1[16];
+        DSD_MEMSET(key1, 0, sizeof(key1));
+        unsigned char key2[16];
+        DSD_MEMSET(key2, 0, sizeof(key2));
+
+        if (dsd_vendor_ap_key_hex_to_bytes(parsed.hex, parsed.nhex, key1, sizeof(key1)) != 0) {
+            DSD_FPRINTF(stderr, "DMR TYT AP (PC4) key parse failed: invalid 128-bit key\n");
+            state->tyt_ap = 0;
+            return;
+        }
+        for (int i = 0; i < 16; i++) {
+            key2[i] = key1[15 - i];
+        }
+
+        create_keys(&g_pc4_context, key2, 16);
+        g_pc4_context.rounds = nbround;
+
+        DSD_FPRINTF(stderr, "DMR TYT AP (PC4) 128-bit key loaded with forced application: %s\n", DSD_SECRET_REDACTED);
+    }
     state->tyt_ap = 1;
 }
 
 void
 tyt_ep_aes_keystream_creation(dsd_state* state, char* input) {
     char buf[1024];
-    snprintf(buf, sizeof(buf), "%s", input);
+    DSD_SNPRINTF(buf, sizeof(buf), "%s", input);
 
     char* pEnd;
     unsigned long long int K1 = strtoull(buf, &pEnd, 16);
@@ -226,7 +247,7 @@ tyt_ep_aes_keystream_creation(dsd_state* state, char* input) {
 
     //
     uint8_t static_key[32];
-    memset(static_key, 0, sizeof(static_key));
+    DSD_MEMSET(static_key, 0, sizeof(static_key));
 
     //static key value
     static_key[0] = 0x6e;
@@ -248,7 +269,7 @@ tyt_ep_aes_keystream_creation(dsd_state* state, char* input) {
 
     //the key value provided by user
     uint8_t user_key[16];
-    memset(user_key, 0, sizeof(user_key));
+    DSD_MEMSET(user_key, 0, sizeof(user_key));
 
     //Load user key into array to manipulate
     for (int i = 0; i < 8; i++) {
@@ -257,7 +278,7 @@ tyt_ep_aes_keystream_creation(dsd_state* state, char* input) {
     }
 
     uint8_t input_register[16];
-    memset(input_register, 0, sizeof(input_register));
+    DSD_MEMSET(input_register, 0, sizeof(input_register));
 
     //manipulate user provided key by loading bytes in reverse order into the input_register
     for (int i = 0; i < 16; i++) {
@@ -265,19 +286,56 @@ tyt_ep_aes_keystream_creation(dsd_state* state, char* input) {
     }
 
     uint8_t ks_bytes[16];
-    memset(ks_bytes, 0, sizeof(ks_bytes));
+    DSD_MEMSET(ks_bytes, 0, sizeof(ks_bytes));
 
     //create keystream
     aes_ofb_keystream_output(input_register, static_key, ks_bytes, 0, 1);
     uint8_t ks_bits[128];
-    memset(ks_bits, 0, sizeof(ks_bits));
+    DSD_MEMSET(ks_bits, 0, sizeof(ks_bits));
     unpack_byte_array_into_bit_array(ks_bytes, ks_bits, 16);
 
-    //load static keystream into ctx.bits since that isn't ever zeroed out
+    //load static keystream into g_pc4_context.bits since that isn't ever zeroed out
     for (int i = 0; i < 49; i++) {
-        ctx.bits[i] = ks_bits[i];
+        g_pc4_context.bits[i] = ks_bits[i];
     }
 
-    fprintf(stderr, "DMR TYT EP (AES-128) Key %016llX%016llX with Forced Application\n", K1, K2);
+    DSD_FPRINTF(stderr, "DMR TYT EP (AES-128) key loaded with forced application: %s\n", DSD_SECRET_REDACTED);
     state->tyt_ep = 1;
+}
+
+int
+tyt_ap_pc4_apply_frame49(const dsd_state* state, char ambe_d[49]) {
+    if (state == NULL || ambe_d == NULL || state->tyt_ap != 1) {
+        return 0;
+    }
+    if (dmr_ambe49_is_default_silence(ambe_d) == 1 || dmr_ambe49_has_zero_tail(ambe_d) == 1) {
+        return 0;
+    }
+
+    short frame1_cipher[49];
+    for (int i = 0; i < 49; i++) {
+        frame1_cipher[i] = (short)(unsigned char)ambe_d[i];
+    }
+    decrypt_frame_49(frame1_cipher);
+
+    DSD_MEMSET(ambe_d, 0, 49 * sizeof(char));
+    for (int i = 0; i < 49; i++) {
+        ambe_d[i] = (char)(g_pc4_context.bits[i] & 1);
+    }
+    return 1;
+}
+
+int
+tyt_ep_aes_apply_frame49(const dsd_state* state, char ambe_d[49]) {
+    if (state == NULL || ambe_d == NULL || state->tyt_ep != 1) {
+        return 0;
+    }
+    if (dmr_ambe49_is_default_silence(ambe_d) == 1 || dmr_ambe49_has_zero_tail(ambe_d) == 1) {
+        return 0;
+    }
+
+    for (int i = 0; i < 49; i++) {
+        ambe_d[i] ^= (char)(g_pc4_context.bits[i] & 1);
+    }
+    return 1;
 }

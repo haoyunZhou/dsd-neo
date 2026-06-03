@@ -3,7 +3,8 @@
  * Copyright (C) 2025 by arancormonk <180709949+arancormonk@users.noreply.github.com>
  */
 
-#pragma once
+#ifndef DSD_NEO_INCLUDE_DSD_NEO_PLATFORM_THREADING_H_
+#define DSD_NEO_INCLUDE_DSD_NEO_PLATFORM_THREADING_H_
 
 /**
  * @file
@@ -21,7 +22,8 @@
 #include <pthread.h>
 #endif
 
-#include <stdbool.h>
+#include <errno.h> // IWYU pragma: keep
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -63,12 +65,32 @@ typedef void* (*dsd_thread_fn)(void*);
 /**
  * @brief Create and start a new thread.
  *
+ * On POSIX C/C++ builds this expands to pthread_create at the call site so
+ * static analysis can preserve the concrete thread entry/argument pairing.
+ * The C++ form uses a lambda to keep the null checks without triggering
+ * -Waddress when passing named thread entry functions.
+ *
  * @param thread    Pointer to thread handle (output).
  * @param func      Thread entry function.
  * @param arg       Argument passed to thread function.
  * @return 0 on success, non-zero error code on failure.
  */
+#if !DSD_PLATFORM_WIN_NATIVE && !defined(DSD_NEO_THREADING_NO_INLINE_CREATE) && defined(__cplusplus)
+#define dsd_thread_create(thread, func, arg)                                                                           \
+    ([&]() -> int {                                                                                                    \
+        dsd_thread_t* const dsd_thread_handle__ = (thread);                                                            \
+        dsd_thread_fn const dsd_thread_func__ = (func);                                                                \
+        void* const dsd_thread_arg__ = (arg);                                                                          \
+        return (!dsd_thread_handle__ || !dsd_thread_func__)                                                            \
+                   ? EINVAL                                                                                            \
+                   : pthread_create(dsd_thread_handle__, NULL, dsd_thread_func__, dsd_thread_arg__);                   \
+    }())
+#elif !DSD_PLATFORM_WIN_NATIVE && !defined(DSD_NEO_THREADING_NO_INLINE_CREATE)
+#define dsd_thread_create(thread, func, arg)                                                                           \
+    (((thread) == NULL || (func) == NULL) ? EINVAL : pthread_create((thread), NULL, (func), (arg)))
+#else
 int dsd_thread_create(dsd_thread_t* thread, dsd_thread_fn func, void* arg);
+#endif
 
 /**
  * @brief Wait for a thread to terminate.
@@ -164,6 +186,28 @@ int dsd_cond_wait(dsd_cond_t* cond, dsd_mutex_t* mutex);
 int dsd_cond_timedwait(dsd_cond_t* cond, dsd_mutex_t* mutex, unsigned int timeout_ms);
 
 /**
+ * @brief Initialize a condition variable for monotonic-clock waits.
+ *
+ * On POSIX platforms with clock-selectable condition variables this binds
+ * timed waits to CLOCK_MONOTONIC. Platforms without that support may use a
+ * relative-time fallback that is still driven by monotonic deadlines.
+ *
+ * @param cond Pointer to condition variable (output).
+ * @return 0 on success, non-zero error code on failure.
+ */
+int dsd_cond_init_monotonic(dsd_cond_t* cond);
+
+/**
+ * @brief Timed wait using an absolute monotonic deadline.
+ *
+ * @param cond Pointer to condition variable.
+ * @param mutex Pointer to associated mutex (must be locked).
+ * @param deadline_ns Absolute monotonic deadline from dsd_time_monotonic_ns().
+ * @return 0 on signal, ETIMEDOUT on deadline expiry, other non-zero on error.
+ */
+int dsd_cond_timedwait_monotonic(dsd_cond_t* cond, dsd_mutex_t* mutex, uint64_t deadline_ns);
+
+/**
  * @brief Signal one thread waiting on a condition variable.
  *
  * @param cond      Pointer to condition variable.
@@ -202,3 +246,5 @@ int dsd_thread_set_affinity(int cpu_index);
 #ifdef __cplusplus
 }
 #endif
+
+#endif /* DSD_NEO_INCLUDE_DSD_NEO_PLATFORM_THREADING_H_ */

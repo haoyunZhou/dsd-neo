@@ -11,13 +11,14 @@
  * and a gamma LUT for density visualizations.
  */
 
-#pragma once
+#ifndef DSD_NEO_INCLUDE_DSD_NEO_UI_UI_PRIMS_H_
+#define DSD_NEO_INCLUDE_DSD_NEO_UI_UI_PRIMS_H_
 
-#include <dsd-neo/platform/curses_compat.h>
+#include <dsd-neo/platform/platform.h>
+
+#include <curses.h>
 #include <stddef.h>
 #include <time.h>
-
-// `curses_compat.h` provides the `WINDOW` type.
 
 #ifdef __cplusplus
 extern "C" {
@@ -32,7 +33,7 @@ void ui_destroy_window(WINDOW** win);
 void ui_commit_frame(void);
 
 /** @brief Set a transient status/footer message (printf-style). */
-void ui_statusf(const char* fmt, ...);
+void ui_statusf(const char* fmt, ...) DSD_ATTR_FORMAT(printf, 1, 2);
 /** @brief Copy active status into buf when not expired at `now`; returns 1 if copied. */
 int ui_status_peek(char* buf, size_t n, time_t now);
 /** @brief Clear status when expired at `now` (no-op if still active). */
@@ -55,3 +56,5 @@ double ui_gamma_map01(double f);
 #ifdef __cplusplus
 }
 #endif
+
+#endif /* DSD_NEO_INCLUDE_DSD_NEO_UI_UI_PRIMS_H_ */

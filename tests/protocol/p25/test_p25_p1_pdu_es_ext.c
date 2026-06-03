@@ -9,20 +9,30 @@
  * This drives p25_decode_extended_address and p25_decode_es_header paths.
  */
 
+#include <dsd-neo/core/opts.h>
+#include <dsd-neo/core/state.h>
+#include <dsd-neo/protocol/p25/p25_pdu.h>
 #include <errno.h>
+#include <limits.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-// Forward minimal types and hooks
+#include "dsd-neo/core/opts_fwd.h"
+#include "dsd-neo/core/safe_api.h"
+#include "dsd-neo/core/state_fwd.h"
 #include "test_support.h"
+
+struct RtlSdrContext;
+
+#if defined(__GNUC__) && !defined(__cplusplus)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmissing-prototypes"
+#endif
 
 #define setenv dsd_test_setenv
 
-typedef struct dsd_opts dsd_opts;
-typedef struct dsd_state dsd_state;
 typedef struct dsdneoRuntimeConfig dsdneoRuntimeConfig;
 void dsd_neo_config_init(const dsd_opts* opts);
 const dsdneoRuntimeConfig* dsd_neo_get_config(void);
@@ -32,6 +42,7 @@ void p25_test_p1_pdu_data_decode(const unsigned char* input, int len);
 
 // Stubs required by linked decoder units
 void
+// NOLINTNEXTLINE(misc-use-internal-linkage)
 watchdog_event_datacall(dsd_opts* opts, dsd_state* state, uint32_t src, uint32_t dst, char* str, uint8_t slot) {
     (void)opts;
     (void)state;
@@ -42,6 +53,7 @@ watchdog_event_datacall(dsd_opts* opts, dsd_state* state, uint32_t src, uint32_t
 }
 
 void
+// NOLINTNEXTLINE(misc-use-internal-linkage)
 watchdog_event_history(dsd_opts* opts, dsd_state* state, uint8_t slot) {
     (void)opts;
     (void)state;
@@ -49,6 +61,7 @@ watchdog_event_history(dsd_opts* opts, dsd_state* state, uint8_t slot) {
 }
 
 void
+// NOLINTNEXTLINE(misc-use-internal-linkage)
 watchdog_event_current(dsd_opts* opts, dsd_state* state, uint8_t slot) {
     (void)opts;
     (void)state;
@@ -56,6 +69,7 @@ watchdog_event_current(dsd_opts* opts, dsd_state* state, uint8_t slot) {
 }
 
 void
+// NOLINTNEXTLINE(misc-use-internal-linkage)
 utf8_to_text(dsd_state* state, uint8_t wr, uint16_t len, uint8_t* input) {
     (void)state;
     (void)wr;
@@ -65,7 +79,8 @@ utf8_to_text(dsd_state* state, uint8_t wr, uint16_t len, uint8_t* input) {
 
 // Bit helpers expected by p25p1_pdu_data.c implementation
 void
-unpack_byte_array_into_bit_array(uint8_t* input, uint8_t* output, int len) {
+// NOLINTNEXTLINE(misc-use-internal-linkage)
+unpack_byte_array_into_bit_array(const uint8_t* input, uint8_t* output, int len) {
     // MSB-first bit unpack
     for (int i = 0; i < len * 8; i++) {
         int byte = i / 8;
@@ -75,7 +90,8 @@ unpack_byte_array_into_bit_array(uint8_t* input, uint8_t* output, int len) {
 }
 
 uint64_t
-ConvertBitIntoBytes(uint8_t* BufferIn, uint32_t BitLength) {
+// NOLINTNEXTLINE(misc-use-internal-linkage)
+ConvertBitIntoBytes(const uint8_t* BufferIn, uint32_t BitLength) {
     uint64_t v = 0;
     for (uint32_t i = 0; i < BitLength; i++) {
         v = (v << 1) | (BufferIn[i] & 1);
@@ -83,7 +99,19 @@ ConvertBitIntoBytes(uint8_t* BufferIn, uint32_t BitLength) {
     return v;
 }
 
+uint8_t
+// NOLINTNEXTLINE(misc-use-internal-linkage)
+nmea_sentence_checker(const dsd_opts* opts, dsd_state* state, const uint8_t* input, uint8_t slot, int len_bytes) {
+    (void)opts;
+    (void)state;
+    (void)input;
+    (void)slot;
+    (void)len_bytes;
+    return 0;
+}
+
 void
+// NOLINTNEXTLINE(misc-use-internal-linkage)
 decode_ip_pdu(dsd_opts* opts, dsd_state* state, uint16_t len, uint8_t* input) {
     (void)opts;
     (void)state;
@@ -93,6 +121,7 @@ decode_ip_pdu(dsd_opts* opts, dsd_state* state, uint16_t len, uint8_t* input) {
 
 // Additional stubs for rigctl path
 bool
+// NOLINTNEXTLINE(misc-use-internal-linkage)
 SetFreq(int sockfd, long int freq) {
     (void)sockfd;
     (void)freq;
@@ -100,6 +129,7 @@ SetFreq(int sockfd, long int freq) {
 }
 
 bool
+// NOLINTNEXTLINE(misc-use-internal-linkage)
 SetModulation(int sockfd, int bandwidth) {
     (void)sockfd;
     (void)bandwidth;
@@ -107,17 +137,40 @@ SetModulation(int sockfd, int bandwidth) {
 }
 
 void
+// NOLINTNEXTLINE(misc-use-internal-linkage)
 return_to_cc(dsd_opts* opts, dsd_state* state) {
     (void)opts;
     (void)state;
 }
+// NOLINTNEXTLINE(misc-use-internal-linkage)
 struct RtlSdrContext* g_rtl_ctx = 0;
 
 int
+// NOLINTNEXTLINE(misc-use-internal-linkage)
 rtl_stream_tune(struct RtlSdrContext* ctx, uint32_t center_freq_hz) {
     (void)ctx;
     (void)center_freq_hz;
     return 0;
+}
+
+static int
+parse_json_int_field(const char* line, const char* key, int* out) {
+    if (!line || !key || !out) {
+        return 0;
+    }
+    const char* p = strstr(line, key);
+    if (!p) {
+        return 0;
+    }
+    p += strlen(key);
+    errno = 0;
+    char* end = NULL;
+    long v = strtol(p, &end, 10);
+    if (end == p || errno == ERANGE || v < INT_MIN || v > INT_MAX) {
+        return 0;
+    }
+    *out = (int)v;
+    return 1;
 }
 
 static void
@@ -144,8 +197,7 @@ parse_last_json(const char* buf, int len, int* out_sap) {
     const char* last_nl = strrchr(buf, '\n');
     const char* line = last_nl ? (last_nl + 1) : buf;
     int sap = -1;
-    const char* q = strstr(line, "\"sap\":");
-    if (!q || sscanf(q, "\"sap\":%d", &sap) != 1) {
+    if (!parse_json_int_field(line, "\"sap\":", &sap)) {
         return -1;
     }
     if (out_sap) {
@@ -154,22 +206,133 @@ parse_last_json(const char* buf, int len, int* out_sap) {
     return 0;
 }
 
+static int
+expect_bytes(const char* label, const uint8_t* got, const uint8_t* want, size_t len) {
+    if (memcmp(got, want, len) != 0) {
+        DSD_FPRINTF(stderr, "%s: byte mismatch\n", label);
+        return 1;
+    }
+    return 0;
+}
+
+static int
+expect_u8(const char* label, uint8_t got, uint8_t want) {
+    if (got != want) {
+        DSD_FPRINTF(stderr, "%s: got 0x%02X want 0x%02X\n", label, got, want);
+        return 1;
+    }
+    return 0;
+}
+
+static int
+test_p25_pdu_des_decrypt_vector(void) {
+    static const uint8_t expect[] = {0x67, 0xAE, 0x7A, 0x29, 0x61, 0xDF, 0xA3, 0x45};
+    static dsd_opts opts;
+    static dsd_state st;
+    uint8_t input[sizeof expect];
+    DSD_MEMSET(&opts, 0, sizeof opts);
+    DSD_MEMSET(&st, 0, sizeof st);
+    DSD_MEMSET(input, 0, sizeof input);
+    st.R = 0x133457799BBCDFF1ULL;
+
+    uint8_t encrypted = p25_decrypt_pdu(&opts, &st, input, 0x81, 0x4321, 0x0123456789ABCDEFULL, (int)sizeof input);
+
+    int rc = 0;
+    rc |= expect_u8("P25 PDU DES decrypt flag", encrypted, 0);
+    rc |= expect_bytes("P25 PDU DES OFB discard vector", input, expect, sizeof expect);
+    return rc;
+}
+
+static int
+test_p25_pdu_rc4_decrypt_vector(void) {
+    static const uint8_t expect[] = {0xFD, 0x03, 0xAB, 0x28, 0x7B, 0x5C, 0x1D, 0x19,
+                                     0x5A, 0x3F, 0xE2, 0x45, 0xFE, 0x54, 0xDB, 0x10};
+    static dsd_opts opts;
+    static dsd_state st;
+    uint8_t input[sizeof expect];
+    DSD_MEMSET(&opts, 0, sizeof opts);
+    DSD_MEMSET(&st, 0, sizeof st);
+    DSD_MEMSET(input, 0, sizeof input);
+    st.R = 0x0102030405ULL;
+
+    uint8_t encrypted = p25_decrypt_pdu(&opts, &st, input, 0xAA, 0x4321, 0x0123456789ABCDEFULL, (int)sizeof input);
+
+    int rc = 0;
+    rc |= expect_u8("P25 PDU RC4 decrypt flag", encrypted, 0);
+    rc |= expect_bytes("P25 PDU RC4 drop-256 vector", input, expect, sizeof expect);
+    return rc;
+}
+
+static int
+test_p25_pdu_aes128_decrypt_vector(void) {
+    static const uint8_t expect[] = {0xEC, 0xAB, 0x6A, 0x30, 0x3A, 0x05, 0x65, 0x68,
+                                     0xE0, 0x29, 0x0F, 0x56, 0x58, 0xA3, 0x07, 0xF3};
+    static dsd_opts opts;
+    static dsd_state st;
+    uint8_t input[sizeof expect];
+    DSD_MEMSET(&opts, 0, sizeof opts);
+    DSD_MEMSET(&st, 0, sizeof st);
+    DSD_MEMSET(input, 0, sizeof input);
+    st.K1 = 0x0011223344556677ULL;
+    st.K2 = 0x8899AABBCCDDEEFFULL;
+
+    uint8_t encrypted = p25_decrypt_pdu(&opts, &st, input, 0x89, 0x4321, 0x0123456789ABCDEFULL, (int)sizeof input);
+
+    int rc = 0;
+    rc |= expect_u8("P25 PDU AES-128 decrypt flag", encrypted, 0);
+    rc |= expect_bytes("P25 PDU AES-128 OFB discard vector", input, expect, sizeof expect);
+    return rc;
+}
+
+static int
+test_p25_pdu_missing_keys_stay_encrypted(void) {
+    static const uint8_t expect[] = {0xC0, 0xDE, 0x12, 0x34};
+    static dsd_opts opts;
+    static dsd_state st;
+    uint8_t des_input[sizeof expect];
+    uint8_t rc4_input[sizeof expect];
+    uint8_t aes_input[sizeof expect];
+    DSD_MEMSET(&opts, 0, sizeof opts);
+    DSD_MEMSET(&st, 0, sizeof st);
+    DSD_MEMCPY(des_input, expect, sizeof expect);
+    DSD_MEMCPY(rc4_input, expect, sizeof expect);
+    DSD_MEMCPY(aes_input, expect, sizeof expect);
+
+    uint8_t des_encrypted =
+        p25_decrypt_pdu(&opts, &st, des_input, 0x81, 0x4321, 0x0123456789ABCDEFULL, (int)sizeof des_input);
+    uint8_t rc4_encrypted =
+        p25_decrypt_pdu(&opts, &st, rc4_input, 0xAA, 0x4321, 0x0123456789ABCDEFULL, (int)sizeof rc4_input);
+    uint8_t aes_encrypted =
+        p25_decrypt_pdu(&opts, &st, aes_input, 0x89, 0x4321, 0x0123456789ABCDEFULL, (int)sizeof aes_input);
+
+    int rc = 0;
+    rc |= expect_u8("P25 PDU DES missing-key encrypted flag", des_encrypted, 1);
+    rc |= expect_u8("P25 PDU RC4 missing-key encrypted flag", rc4_encrypted, 1);
+    rc |= expect_u8("P25 PDU AES missing-key encrypted flag", aes_encrypted, 1);
+    rc |= expect_bytes("P25 PDU DES missing-key unchanged", des_input, expect, sizeof expect);
+    rc |= expect_bytes("P25 PDU RC4 missing-key unchanged", rc4_input, expect, sizeof expect);
+    rc |= expect_bytes("P25 PDU AES missing-key unchanged", aes_input, expect, sizeof expect);
+    return rc;
+}
+
 int
 main(void) {
+    int rc = 0;
+
     // Enable JSON emission
     setenv("DSD_NEO_PDU_JSON", "1", 1);
     dsd_neo_config_init(NULL);
 
     dsd_test_capture_stderr cap;
     if (dsd_test_capture_stderr_begin(&cap, "p25_p1_pdu_es_ext") != 0) {
-        fprintf(stderr, "Failed to capture stderr: %s\n", strerror(errno));
+        DSD_FPRINTF(stderr, "Failed to capture stderr: %s\n", strerror(errno));
         return 101;
     }
 
     // Build PDU with initial SAP=31 (extended address), which sets aux SAP=1,
     // then ES header sets aux_sap=32 (RegAuth). Follow with small payload.
     uint8_t pdu[96];
-    memset(pdu, 0, sizeof(pdu));
+    DSD_MEMSET(pdu, 0, sizeof(pdu));
 
     pdu[0] = 0x10; // fmt=16, io=0
     pdu[1] = 31;   // SAP 31 triggers extended addressing
@@ -181,14 +344,14 @@ main(void) {
     // Extended Address header (12 bytes) at offset 12
     // Layout: ea_sap @ bit 10 (6b) → 1; ea_mfid @16 (6b) → 0x15; ea_llid @24 (24b) → 0x000102
     uint8_t* ext = pdu + 12;
-    memset(ext, 0, 12);
+    DSD_MEMSET(ext, 0, 12);
     pack_bits(ext, 12, 10, 6, 1);         // ea_sap = 1 (encryption header follows)
     pack_bits(ext, 12, 16, 6, 0x15);      // ea_mfid
     pack_bits(ext, 12, 24, 24, 0x000102); // ea_llid
 
     // ES header (13 bytes) immediately after ext
     uint8_t* es = pdu + 12 + 12;
-    memset(es, 0, 13);
+    DSD_MEMSET(es, 0, 13);
     // MI 64-bit: 0x0102030405060708
     es[0] = 0x01;
     es[1] = 0x02;
@@ -221,7 +384,7 @@ main(void) {
 
     FILE* rf = fopen(cap.path, "rb");
     if (!rf) {
-        fprintf(stderr, "fopen read failed\n");
+        DSD_FPRINTF(stderr, "fopen read failed\n");
         return 102;
     }
     fseek(rf, 0, SEEK_END);
@@ -247,9 +410,17 @@ main(void) {
     free(buf);
     // Expect aux_sap=32 (RegAuth) after ES header
     if (sap != 32) {
-        fprintf(stderr, "expected SAP 32 after ES header, got %d\n", sap);
-        return 1;
+        DSD_FPRINTF(stderr, "expected SAP 32 after ES header, got %d\n", sap);
+        rc = 1;
     }
     (void)remove(cap.path);
-    return 0;
+    rc |= test_p25_pdu_des_decrypt_vector();
+    rc |= test_p25_pdu_rc4_decrypt_vector();
+    rc |= test_p25_pdu_aes128_decrypt_vector();
+    rc |= test_p25_pdu_missing_keys_stay_encrypted();
+    return rc;
 }
+
+#if defined(__GNUC__) && !defined(__cplusplus)
+#pragma GCC diagnostic pop
+#endif

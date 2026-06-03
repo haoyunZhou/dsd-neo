@@ -8,15 +8,19 @@
  */
 
 #include <errno.h>
+#include <limits.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-// Call into shim to keep dependencies narrow.
-
+#include "dsd-neo/core/safe_api.h"
 #include "test_support.h"
+
+#if defined(__GNUC__) && !defined(__cplusplus)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmissing-prototypes"
+#endif
 
 #define setenv dsd_test_setenv
 
@@ -29,8 +33,11 @@ const dsdneoRuntimeConfig* dsd_neo_get_config(void);
 // Use a local shim that sets up real opts/state in a separate TU.
 void p25_test_p1_pdu_data_decode(const unsigned char* input, int len);
 
+static int g_utf8_calls = 0;
+
 // Stubs referenced by PDU data path
 void
+// NOLINTNEXTLINE(misc-use-internal-linkage)
 watchdog_event_datacall(dsd_opts* opts, dsd_state* state, uint32_t src, uint32_t dst, char* str, uint8_t slot) {
     (void)opts;
     (void)state;
@@ -41,6 +48,7 @@ watchdog_event_datacall(dsd_opts* opts, dsd_state* state, uint32_t src, uint32_t
 }
 
 void
+// NOLINTNEXTLINE(misc-use-internal-linkage)
 watchdog_event_history(dsd_opts* opts, dsd_state* state, uint8_t slot) {
     (void)opts;
     (void)state;
@@ -48,6 +56,7 @@ watchdog_event_history(dsd_opts* opts, dsd_state* state, uint8_t slot) {
 }
 
 void
+// NOLINTNEXTLINE(misc-use-internal-linkage)
 watchdog_event_current(dsd_opts* opts, dsd_state* state, uint8_t slot) {
     (void)opts;
     (void)state;
@@ -55,15 +64,18 @@ watchdog_event_current(dsd_opts* opts, dsd_state* state, uint8_t slot) {
 }
 
 void
+// NOLINTNEXTLINE(misc-use-internal-linkage)
 utf8_to_text(dsd_state* state, uint8_t wr, uint16_t len, uint8_t* input) {
     (void)state;
     (void)wr;
     (void)len;
     (void)input;
+    g_utf8_calls++;
 }
 
 void
-unpack_byte_array_into_bit_array(uint8_t* input, uint8_t* output, int len) {
+// NOLINTNEXTLINE(misc-use-internal-linkage)
+unpack_byte_array_into_bit_array(const uint8_t* input, uint8_t* output, int len) {
     if (!input || !output || len <= 0) {
         return;
     }
@@ -81,7 +93,8 @@ unpack_byte_array_into_bit_array(uint8_t* input, uint8_t* output, int len) {
 }
 
 uint64_t
-ConvertBitIntoBytes(uint8_t* BufferIn, uint32_t BitLength) {
+// NOLINTNEXTLINE(misc-use-internal-linkage)
+ConvertBitIntoBytes(const uint8_t* BufferIn, uint32_t BitLength) {
     // Simple MSB-first packer
     uint64_t v = 0;
     for (uint32_t i = 0; i < BitLength; i++) {
@@ -90,7 +103,31 @@ ConvertBitIntoBytes(uint8_t* BufferIn, uint32_t BitLength) {
     return v;
 }
 
+uint8_t
+// NOLINTNEXTLINE(misc-use-internal-linkage)
+nmea_sentence_checker(const dsd_opts* opts, dsd_state* state, const uint8_t* input, uint8_t slot, int len_bytes) {
+    (void)opts;
+    (void)state;
+    (void)slot;
+    if (input == NULL || len_bytes < 6) {
+        return 0;
+    }
+
+    char prefix[7];
+    for (int i = 0; i < 6; i++) {
+        prefix[i] = (char)ConvertBitIntoBytes(input + ((size_t)i * 8U), 8);
+    }
+    prefix[6] = '\0';
+    if (strcmp(prefix, "$GPRMC") != 0) {
+        return 0;
+    }
+
+    DSD_FPRINTF(stderr, "$GPRMC,123519");
+    return 1;
+}
+
 void
+// NOLINTNEXTLINE(misc-use-internal-linkage)
 decode_ip_pdu(dsd_opts* opts, dsd_state* state, uint16_t len, uint8_t* input) {
     (void)opts;
     (void)state;
@@ -100,6 +137,7 @@ decode_ip_pdu(dsd_opts* opts, dsd_state* state, uint16_t len, uint8_t* input) {
 
 // Additional stubs referenced by linked objects (rigctl/rtl streaming)
 bool
+// NOLINTNEXTLINE(misc-use-internal-linkage)
 SetFreq(int sockfd, long int freq) {
     (void)sockfd;
     (void)freq;
@@ -107,6 +145,7 @@ SetFreq(int sockfd, long int freq) {
 }
 
 bool
+// NOLINTNEXTLINE(misc-use-internal-linkage)
 SetModulation(int sockfd, int bandwidth) {
     (void)sockfd;
     (void)bandwidth;
@@ -114,13 +153,16 @@ SetModulation(int sockfd, int bandwidth) {
 }
 
 void
+// NOLINTNEXTLINE(misc-use-internal-linkage)
 return_to_cc(dsd_opts* opts, dsd_state* state) {
     (void)opts;
     (void)state;
 }
+// NOLINTNEXTLINE(misc-use-internal-linkage)
 struct RtlSdrContext* g_rtl_ctx = 0;
 
 int
+// NOLINTNEXTLINE(misc-use-internal-linkage)
 rtl_stream_tune(struct RtlSdrContext* ctx, uint32_t center_freq_hz) {
     (void)ctx;
     (void)center_freq_hz;
@@ -128,9 +170,29 @@ rtl_stream_tune(struct RtlSdrContext* ctx, uint32_t center_freq_hz) {
 }
 
 static int
+parse_json_int_field(const char* line, const char* key, int* out) {
+    if (!line || !key || !out) {
+        return 0;
+    }
+    const char* p = strstr(line, key);
+    if (!p) {
+        return 0;
+    }
+    p += strlen(key);
+    errno = 0;
+    char* end = NULL;
+    long v = strtol(p, &end, 10);
+    if (end == p || errno == ERANGE || v < INT_MIN || v > INT_MAX) {
+        return 0;
+    }
+    *out = (int)v;
+    return 1;
+}
+
+static int
 expect_eq_int(const char* tag, int got, int want) {
     if (got != want) {
-        fprintf(stderr, "%s: got %d want %d\n", tag, got, want);
+        DSD_FPRINTF(stderr, "%s: got %d want %d\n", tag, got, want);
         return 1;
     }
     return 0;
@@ -139,7 +201,7 @@ expect_eq_int(const char* tag, int got, int want) {
 static int
 expect_str_contains(const char* tag, const char* hay, const char* needle) {
     if (!strstr(hay, needle)) {
-        fprintf(stderr, "%s: missing '%s' in '%s'\n", tag, needle, hay);
+        DSD_FPRINTF(stderr, "%s: missing '%s' in '%s'\n", tag, needle, hay);
         return 1;
     }
     return 0;
@@ -156,20 +218,16 @@ parse_last_json(const char* buf, int len, int* out_sap, int* out_mfid, int* out_
     const char* line = last_nl ? (last_nl + 1) : buf;
 
     int sap = -1, mfid = -1, io = -1, jlen = -1;
-    const char* q = strstr(line, "\"sap\":");
-    if (!q || sscanf(q, "\"sap\":%d", &sap) != 1) {
+    if (!parse_json_int_field(line, "\"sap\":", &sap)) {
         return -1;
     }
-    q = strstr(line, "\"mfid\":");
-    if (!q || sscanf(q, "\"mfid\":%d", &mfid) != 1) {
+    if (!parse_json_int_field(line, "\"mfid\":", &mfid)) {
         return -2;
     }
-    q = strstr(line, "\"io\":");
-    if (!q || sscanf(q, "\"io\":%d", &io) != 1) {
+    if (!parse_json_int_field(line, "\"io\":", &io)) {
         return -3;
     }
-    q = strstr(line, "\"len\":");
-    if (!q || sscanf(q, "\"len\":%d", &jlen) != 1) {
+    if (!parse_json_int_field(line, "\"len\":", &jlen)) {
         return -4;
     }
 
@@ -210,14 +268,14 @@ main(void) {
 
     dsd_test_capture_stderr cap;
     if (dsd_test_capture_stderr_begin(&cap, "p25_p1_pdu_json") != 0) {
-        fprintf(stderr, "Failed to capture stderr: %s\n", strerror(errno));
+        DSD_FPRINTF(stderr, "Failed to capture stderr: %s\n", strerror(errno));
         return 101;
     }
 
     // Case 1: SAP 32 RegAuth
     {
         uint8_t pdu[64];
-        memset(pdu, 0, sizeof(pdu));
+        DSD_MEMSET(pdu, 0, sizeof(pdu));
         // fmt/io (bit1), sap, mfid, llid
         pdu[0] = 0x10; // fmt=16, io=0
         pdu[1] = 32;   // SAP 32
@@ -238,11 +296,27 @@ main(void) {
         p25_test_p1_pdu_data_decode(pdu, total_len);
     }
 
-    // Case 2: SAP 34 SysCfg
+    // Case 2: SAP 48 Location Service with a valid NMEA sentence.
+    {
+        uint8_t pdu[128];
+        DSD_MEMSET(pdu, 0, sizeof(pdu));
+        pdu[0] = 0x10; // fmt=16, io=0
+        pdu[1] = 48;   // SAP 48
+        pdu[2] = 0x01; // MFID
+        pdu[6] = 0x02; // blks
+        pdu[7] = 0x00; // pad
+        pdu[9] = 0x00; // offset
+        static const char nmea[] = "$GPRMC,123519,A,4807.038,N,01131.000,E,022.4,084.4,230394,003.1,W*6A\r\n";
+        DSD_MEMCPY(pdu + 12, nmea, sizeof(nmea) - 1);
+        int total_len = 12 + (int)(sizeof(nmea) - 1) + 4;
+        p25_test_p1_pdu_data_decode(pdu, total_len);
+    }
+
+    // Case 3: SAP 34 SysCfg
     {
         uint8_t pdu[64];
-        memset(pdu, 0, sizeof(pdu));
-        pdu[0] = 0x12; // fmt=18, io=1
+        DSD_MEMSET(pdu, 0, sizeof(pdu));
+        pdu[0] = 0x30; // fmt=16, io=1, low bit 1 clear to catch IO-bit regressions
         pdu[1] = 34;   // SAP 34
         pdu[2] = 0x55; // MFID
         pdu[3] = 0x00;
@@ -262,7 +336,7 @@ main(void) {
 
     FILE* rf = fopen(cap.path, "rb");
     if (!rf) {
-        fprintf(stderr, "fopen read failed\n");
+        DSD_FPRINTF(stderr, "fopen read failed\n");
         return 102;
     }
     fseek(rf, 0, SEEK_END);
@@ -284,9 +358,9 @@ main(void) {
     int sap = -1, mfid = -1, io = -1, jlen = -1;
     char summary[128];
     int er = parse_last_json(buf, (int)nread, &sap, &mfid, &io, &jlen, summary, sizeof(summary));
-    free(buf);
     if (er != 0) {
-        fprintf(stderr, "parse_last_json er=%d\n", er);
+        free(buf);
+        DSD_FPRINTF(stderr, "parse_last_json er=%d\n", er);
         return 103;
     }
     rc |= expect_eq_int("SysCfg sap", sap, 34);
@@ -294,7 +368,14 @@ main(void) {
     rc |= expect_eq_int("SysCfg io", io, 1);
     rc |= expect_eq_int("SysCfg len", jlen, 3);
     rc |= expect_str_contains("SysCfg summary", summary, "SysCfg");
+    rc |= expect_str_contains("SAP48 NMEA output", buf, "$GPRMC,123519");
+    rc |= expect_eq_int("SAP48 NMEA avoids UTF8 fallback", g_utf8_calls, 0);
+    free(buf);
 
     (void)remove(cap.path);
     return rc;
 }
+
+#if defined(__GNUC__) && !defined(__cplusplus)
+#pragma GCC diagnostic pop
+#endif

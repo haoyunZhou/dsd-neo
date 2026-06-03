@@ -11,7 +11,8 @@
  * detection and some protocol handlers.
  */
 
-#pragma once
+#ifndef DSD_NEO_INCLUDE_DSD_NEO_CORE_SYNC_PATTERNS_H_H
+#define DSD_NEO_INCLUDE_DSD_NEO_CORE_SYNC_PATTERNS_H_H
 
 /* M17 Sync Patterns */
 #define M17_LSF                        "11113313"
@@ -23,6 +24,8 @@
 #define M17_PIV_LSF                    "1313131311113313" /* Preamble + LSF */
 #define M17_BRT                        "31331111"
 #define M17_PKT                        "13113333"
+#define M17_EOT                        "11111131"
+#define M17_EOT_INV                    "33333313"
 
 #define FUSION_SYNC                    "31111311313113131131"
 #define INV_FUSION_SYNC                "13333133131331313313"
@@ -137,3 +140,4 @@
 #define INV_DPMR_FRAME_SYNC_2   "331111313113"
 #define INV_DPMR_FRAME_SYNC_3   "311313111133"
 #define INV_DPMR_FRAME_SYNC_4   "111333331133131131111313"
+#endif /* DSD_NEO_INCLUDE_DSD_NEO_CORE_SYNC_PATTERNS_H_H */

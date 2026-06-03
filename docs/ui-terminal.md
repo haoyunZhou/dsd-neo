@@ -22,8 +22,34 @@ Common controls:
 
 - Move selection: arrow keys (`Up`/`Down`), `PageUp`/`PageDown`, `Home`/`End`
 - Select / open submenu: `Enter`, `Right`
-- Back / close: `Esc`, `q`, `Left`
+- Back / close: `Esc`, `q`/`Q`, `Left`
 - Item help: `h`
+
+Group policy reload:
+
+- In the Trunking/Import menu path, importing a group list (`-G` CSV) performs a full policy reload. On parse failure,
+  the currently loaded list remains active.
+
+Config profiles:
+
+- In the Config menu, `Load Profile...` lists `[profile.NAME]` sections from the active config path, or the default
+  config path when no config has been loaded yet. Loading a profile applies it to the running session and disables
+  autosave, matching CLI `--profile NAME` behavior.
+
+## DSP Status
+
+The DSP status panel shows RTL DSP loop state when RTL input support is available. In CQPSK mode, the CMA equalizer
+lines report:
+
+- `CMA EQ`: equalizer state (`Off`, `Init`, `Warm`, `Run`), tap count, adaptation step, and adapted symbol count.
+- `CMA Metric`: output magnitude squared (`mag2`), target modulus (`tgt`), constant-modulus error (`err`), largest
+  non-center tap (`side`), and total tap energy (`E`).
+
+For a useful equalizer, `syms` should increase, `mag2` should settle near `tgt`, `err` should settle lower after
+acquisition, and `side` should become non-zero when the equalizer is learning multipath/ISI correction.
+
+The same CMA equalizer can be tuned live from `Menu -> DSP -> CQPSK Equalizer...`: enable/disable, tap count,
+adaptation step (`mu`), target modulus, and reset are available without restarting or setting environment variables.
 
 ## Hotkeys (Main Screen)
 
@@ -39,6 +65,8 @@ trunking/scanner to be enabled, and RTL controls require RTL input).
 | `h` | Cycle history mode |
 | `x` / `X` | Toggle mute |
 | `z` | Toggle payload logging (`-Z`-like) |
+| `a` | Toggle call alert beeps |
+| `T` | Toggle P25 group affiliation section |
 
 ### Trunking / scanning
 
@@ -48,6 +76,7 @@ trunking/scanner to be enabled, and RTL controls require RTL input).
 | `y` | Toggle conventional scanning |
 | `C` | Return to control channel (when following a voice channel) |
 | `L` | Cycle active trunking channels |
+| `g` | Toggle follow group calls |
 | `w` | Toggle allow/white-list mode (uses imported group list) |
 | `u` | Toggle follow private calls |
 | `d` | Toggle follow data calls |
@@ -55,7 +84,7 @@ trunking/scanner to be enabled, and RTL controls require RTL input).
 | `k` / `l` | Set/clear talkgroup hold from the most recent TG (slot-aware) |
 | `!` / `@` | Lock out slot 1 / slot 2 (where applicable) |
 
-### Slots & gain
+### Slots, gain & privacy
 
 | Key | Action |
 |---|---|
@@ -64,6 +93,17 @@ trunking/scanner to be enabled, and RTL controls require RTL input).
 | `+` / `-` | Digital gain up/down |
 | `*` / `/` | Analog gain up/down |
 | `v` | Cycle input volume multiplier (non-RTL inputs) |
+| `4` | Toggle force privacy key over identifiers |
+| `6` | Toggle force RC4 key over missing PI/LE identifiers |
+
+### Filters
+
+| Key | Action |
+|---|---|
+| `V` | Toggle low-pass filter |
+| `B` | Toggle high-pass filter |
+| `N` | Toggle pulse-shaping band-pass filter |
+| `H` | Toggle digital high-pass filter |
 
 ### Visualizers (RTL input builds)
 
@@ -89,6 +129,8 @@ trunking/scanner to be enabled, and RTL controls require RTL input).
 | `M` | Toggle P25 Phase 2 modulation helper |
 | `F` | Toggle aggressive sync/CRC relax helpers |
 | `D` | DMR reset (useful when a system goes off the rails) |
+| `A` | Toggle ProVoice ESK mask (ProVoice modes) |
+| `S` | Toggle ProVoice standard/EA mode (ProVoice modes) |
 | `Z` | Simulate “no carrier” event |
 | `8` | Connect/reconnect TCP audio input |
 | `9` | Connect/reconnect rigctl |

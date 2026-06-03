@@ -3,7 +3,8 @@
  * Copyright (C) 2026 by arancormonk <180709949+arancormonk@users.noreply.github.com>
  */
 
-#pragma once
+#ifndef DSD_NEO_INCLUDE_DSD_NEO_PROTOCOL_P25_P25_TRUNK_SM_API_H_
+#define DSD_NEO_INCLUDE_DSD_NEO_PROTOCOL_P25_P25_TRUNK_SM_API_H_
 
 #include <dsd-neo/core/opts_fwd.h>
 #include <dsd-neo/core/state_fwd.h>
@@ -20,12 +21,16 @@ typedef struct p25_sm_api {
     void (*on_neighbor_update)(dsd_opts* opts, dsd_state* state, const long* freqs, int count);
     int (*next_cc_candidate)(dsd_state* state, long* out_freq);
     void (*tick)(dsd_opts* opts, dsd_state* state);
+    void (*on_queued_response)(dsd_opts* opts, dsd_state* state, int svc_type, int reason_code, int target);
+    void (*on_deny_response)(dsd_opts* opts, dsd_state* state, int svc_type, int reason_code, int target);
 } p25_sm_api;
 
-void p25_sm_set_api(p25_sm_api api);
+void p25_sm_set_api(const p25_sm_api* api);
 p25_sm_api p25_sm_get_api(void);
 void p25_sm_reset_api(void);
 
 #ifdef __cplusplus
 }
 #endif
+
+#endif /* DSD_NEO_INCLUDE_DSD_NEO_PROTOCOL_P25_P25_TRUNK_SM_API_H_ */

@@ -28,11 +28,10 @@ Required license/notice files in every shipped asset:
 ### Windows (ZIP)
 
 - [ ] Download `dsd-neo-msvc-x86_64-native-*.zip`.
-  - [ ] Unzip and confirm `dsd-neo-msvc/share/doc/dsd-neo/` contains all required files.
-- [ ] Download `dsd-neo-mingw-x86_64-native-*.zip`.
-  - [ ] Unzip and confirm `dsd-neo-mingw/share/doc/dsd-neo/` contains all required files.
+  - [ ] Unzip and confirm `share/doc/dsd-neo/` contains all required files.
 
 ## CI-side sanity
 
+- [ ] Release tags use `vX.Y.Z`, match `project(dsd-neo VERSION X.Y.Z ...)` in `CMakeLists.txt`, and verify with `git tag -v` against `release-keys/arancormonk-2026.pgp`.
 - [ ] For each workflow run, verify the staging steps did not emit “missing required license file” errors.
 - [ ] Spot-check nightly and tag builds across all OSes after any packaging changes.

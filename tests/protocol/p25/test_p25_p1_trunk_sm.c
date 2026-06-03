@@ -10,12 +10,15 @@
  * and next-CC iteration behavior.
  */
 
+#include <dsd-neo/core/opts.h>
+#include <dsd-neo/core/state.h>
+#include <dsd-neo/protocol/p25/p25_trunk_sm.h>
+#include <dsd-neo/runtime/config.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
-#include <string.h>
-
 #include "dsd-neo/core/opts_fwd.h"
+#include "dsd-neo/core/safe_api.h"
 #include "dsd-neo/core/state_fwd.h"
 #include "test_support.h"
 
@@ -23,13 +26,14 @@ struct RtlSdrContext;
 
 #define setenv dsd_test_setenv
 
-#include <dsd-neo/core/opts.h>
-#include <dsd-neo/core/state.h>
-#include <dsd-neo/protocol/p25/p25_trunk_sm.h>
-#include <dsd-neo/runtime/config.h>
+#if defined(__GNUC__) && !defined(__cplusplus)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmissing-prototypes"
+#endif
 
 // Stubs for rigctl/rtl to avoid external I/O
 bool
+// NOLINTNEXTLINE(misc-use-internal-linkage)
 SetFreq(int sockfd, long int freq) {
     (void)sockfd;
     (void)freq;
@@ -37,6 +41,7 @@ SetFreq(int sockfd, long int freq) {
 }
 
 bool
+// NOLINTNEXTLINE(misc-use-internal-linkage)
 SetModulation(int sockfd, int bandwidth) {
     (void)sockfd;
     (void)bandwidth;
@@ -44,13 +49,16 @@ SetModulation(int sockfd, int bandwidth) {
 }
 
 void
+// NOLINTNEXTLINE(misc-use-internal-linkage)
 return_to_cc(dsd_opts* opts, dsd_state* state) {
     (void)opts;
     (void)state;
 }
+// NOLINTNEXTLINE(misc-use-internal-linkage)
 struct RtlSdrContext* g_rtl_ctx = 0;
 
 int
+// NOLINTNEXTLINE(misc-use-internal-linkage)
 rtl_stream_tune(struct RtlSdrContext* ctx, uint32_t center_freq_hz) {
     (void)ctx;
     (void)center_freq_hz;
@@ -60,7 +68,7 @@ rtl_stream_tune(struct RtlSdrContext* ctx, uint32_t center_freq_hz) {
 static int
 expect_eq(const char* tag, long long got, long long want) {
     if (got != want) {
-        fprintf(stderr, "%s: got %lld want %lld\n", tag, got, want);
+        DSD_FPRINTF(stderr, "%s: got %lld want %lld\n", tag, got, want);
         return 1;
     }
     return 0;
@@ -75,7 +83,7 @@ main(int argc, char** argv) {
     // Use a temp cache dir to avoid touching HOME
     char dir[DSD_TEST_PATH_MAX];
     if (!dsd_test_mkdtemp(dir, sizeof(dir), "dsdneo_cc_cache")) {
-        fprintf(stderr, "dsd_test_mkdtemp failed\n");
+        DSD_FPRINTF(stderr, "dsd_test_mkdtemp failed\n");
         return 100;
     }
     setenv("DSD_NEO_CACHE_DIR", dir, 1);
@@ -83,8 +91,8 @@ main(int argc, char** argv) {
 
     static dsd_opts opts;
     static dsd_state state;
-    memset(&opts, 0, sizeof opts);
-    memset(&state, 0, sizeof state);
+    DSD_MEMSET(&opts, 0, sizeof opts);
+    DSD_MEMSET(&state, 0, sizeof state);
 
     // Seed system identity so cache helpers are active but point to temp dir
     state.p2_wacn = 0xABCDE;
@@ -119,12 +127,15 @@ main(int argc, char** argv) {
 
     // Mark IDEN 1 as TDMA to exercise slot detection; choose odd channel number => slot 1
     int iden = 1;
-    state.p25_chan_tdma[iden] = 1;
-    state.p25_chan_type[iden] = 1;         // FDMA/TDMA mapping type (not critical for this test)
-    state.p25_chan_spac[iden] = 1250;      // 12.5 kHz
-    state.p25_base_freq[iden] = 851000000; // 851.000 MHz
-    int channel = (iden << 12) | 0x0001;   // low bit = 1 → slot 1
-    int svc = 0;                           // service bits not used here
+    // Populate new dual-array
+    state.p25_iden_tdma[iden].base_freq = 851000000L / 5L;
+    state.p25_iden_tdma[iden].chan_type = 3;
+    state.p25_iden_tdma[iden].chan_spac = 100;
+    state.p25_iden_tdma[iden].trust = 2;
+    state.p25_iden_tdma[iden].populated = 1;
+    state.p25_chan_tdma_explicit[iden] = 2; // TDMA known
+    int channel = (iden << 12) | 0x0001;    // low bit = 1 → slot 1
+    int svc = 0;                            // service bits not used here
     int tg = 1234;
     int src = 5678;
     p25_sm_on_group_grant(&opts, &state, channel, svc, tg, src);
@@ -132,6 +143,7 @@ main(int argc, char** argv) {
     // Expect one tune and active slot set to 1 for TDMA
     rc |= expect_eq("tune_count after grant", state.p25_sm_tune_count, 1);
     rc |= expect_eq("active slot", state.p25_p2_active_slot, 1);
+    rc |= expect_eq("vc freq", state.p25_vc_freq[0], 851000000);
 
     // Release path: ensure it increments release count. Force no active slots to avoid deferral.
     state.p25_p2_audio_allowed[0] = 0;
@@ -143,3 +155,7 @@ main(int argc, char** argv) {
 
     return rc;
 }
+
+#if defined(__GNUC__) && !defined(__cplusplus)
+#pragma GCC diagnostic pop
+#endif

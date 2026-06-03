@@ -8,7 +8,8 @@
  * @brief UI → Demod command queue API and command IDs.
  */
 
-#pragma once
+#ifndef DSD_NEO_INCLUDE_DSD_NEO_UI_UI_CMD_H_
+#define DSD_NEO_INCLUDE_DSD_NEO_UI_UI_CMD_H_
 
 #include <stddef.h>
 #include <stdint.h>
@@ -40,6 +41,7 @@ enum UiCmdId {
     UI_CMD_HPF_D_TOGGLE = 55,
     UI_CMD_AGGR_SYNC_TOGGLE = 56,
     UI_CMD_CALL_ALERT_TOGGLE = 57,
+    UI_CMD_CALL_ALERT_EVENTS_SET = 58, // payload: uint8_t event mask (0 disables master switch)
 
     // Views and visualization controls
     UI_CMD_CONST_TOGGLE = 70,
@@ -220,3 +222,5 @@ struct UiCmd {
     size_t n; // payload length
     uint8_t data[UI_CMD_DATA_MAX];
 };
+
+#endif /* DSD_NEO_INCLUDE_DSD_NEO_UI_UI_CMD_H_ */

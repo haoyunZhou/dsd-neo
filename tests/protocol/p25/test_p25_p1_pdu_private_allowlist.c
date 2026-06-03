@@ -1,0 +1,256 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+/*
+ * Copyright (C) 2026 by arancormonk <180709949+arancormonk@users.noreply.github.com>
+ */
+
+/* Verify private-grant allow-list behavior in the P25p1 PDU helper path. */
+
+#include <dsd-neo/core/opts.h>
+#include <dsd-neo/core/state.h>
+#include <dsd-neo/core/state_ext.h>
+#include <dsd-neo/core/talkgroup_policy.h>
+#include <dsd-neo/protocol/p25/p25p1_pdu_trunking.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include "dsd-neo/core/opts_fwd.h"
+#include "dsd-neo/core/safe_api.h"
+#include "dsd-neo/core/state_fwd.h"
+#include "dsd-neo/protocol/p25/p25_cc_candidates.h"
+
+#if defined(__GNUC__) && !defined(__cplusplus)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmissing-prototypes"
+#endif
+
+struct RtlSdrContext;
+
+bool
+// NOLINTNEXTLINE(misc-use-internal-linkage)
+SetFreq(int sockfd, long int freq) {
+    (void)sockfd;
+    (void)freq;
+    return false;
+}
+
+bool
+// NOLINTNEXTLINE(misc-use-internal-linkage)
+SetModulation(int sockfd, int bandwidth) {
+    (void)sockfd;
+    (void)bandwidth;
+    return false;
+}
+// NOLINTNEXTLINE(misc-use-internal-linkage)
+struct RtlSdrContext* g_rtl_ctx = 0;
+
+int
+// NOLINTNEXTLINE(misc-use-internal-linkage)
+rtl_stream_tune(struct RtlSdrContext* ctx, uint32_t center_freq_hz) {
+    (void)ctx;
+    (void)center_freq_hz;
+    return 0;
+}
+
+static int
+expect_true(const char* tag, int cond) {
+    if (!cond) {
+        DSD_FPRINTF(stderr, "%s: expected true\n", tag);
+        return 1;
+    }
+    return 0;
+}
+
+static int
+seed_policy_group(dsd_state* st, uint32_t id, const char* mode, const char* name) {
+    dsd_tg_policy_entry row;
+    if (dsd_tg_policy_make_exact_entry(id, mode, name, DSD_TG_POLICY_SOURCE_IMPORTED, &row) != 0) {
+        return 1;
+    }
+    return dsd_tg_policy_append_exact(st, &row);
+}
+
+long int
+// NOLINTNEXTLINE(misc-use-internal-linkage)
+process_channel_to_freq(dsd_opts* opts, dsd_state* state, int channel) {
+    (void)opts;
+    (void)state;
+    if (channel == 0x100A) {
+        return 851125000;
+    }
+    return 0;
+}
+
+void
+// NOLINTNEXTLINE(misc-use-internal-linkage)
+p25_sm_on_neighbor_update(dsd_opts* opts, dsd_state* state, const long* freqs, int count) {
+    (void)opts;
+    (void)state;
+    (void)freqs;
+    (void)count;
+}
+
+void
+// NOLINTNEXTLINE(misc-use-internal-linkage)
+p25_confirm_idens_for_current_site(dsd_state* state) {
+    (void)state;
+}
+
+int
+p25_cc_add_candidate(dsd_state* state, long freq_hz, int bump_added) {
+    (void)state;
+    (void)freq_hz;
+    (void)bump_added;
+    return 0;
+}
+
+void
+p25_nb_add_ex(dsd_state* state, long freq, uint16_t sysid, uint8_t rfss, uint8_t site, uint8_t cfva) {
+    (void)state;
+    (void)freq;
+    (void)sysid;
+    (void)rfss;
+    (void)site;
+    (void)cfva;
+}
+
+void
+// NOLINTNEXTLINE(misc-use-internal-linkage)
+p25_reset_iden_tables(dsd_state* state) {
+    (void)state;
+}
+
+void
+// NOLINTNEXTLINE(misc-use-internal-linkage)
+process_MAC_VPDU(dsd_opts* opts, dsd_state* state, int type, unsigned long long int MAC[24]) {
+    (void)opts;
+    (void)state;
+    (void)type;
+    (void)MAC;
+}
+
+int
+// NOLINTNEXTLINE(misc-use-internal-linkage)
+p25_patch_tg_key_is_clear(const dsd_state* state, int group) {
+    (void)state;
+    (void)group;
+    return 0;
+}
+
+int
+// NOLINTNEXTLINE(misc-use-internal-linkage)
+p25_patch_sg_key_is_clear(const dsd_state* state, int group) {
+    (void)state;
+    (void)group;
+    return 0;
+}
+
+void
+// NOLINTNEXTLINE(misc-use-internal-linkage)
+p25_emit_enc_lockout_once(dsd_opts* opts, dsd_state* state, uint8_t slot, int tg, int svc_bits) {
+    (void)opts;
+    (void)state;
+    (void)slot;
+    (void)tg;
+    (void)svc_bits;
+}
+
+void
+// NOLINTNEXTLINE(misc-use-internal-linkage)
+p25_sm_on_group_grant(dsd_opts* opts, dsd_state* state, int channel, int svc_bits, int tg, int src) {
+    (void)opts;
+    (void)state;
+    (void)channel;
+    (void)svc_bits;
+    (void)tg;
+    (void)src;
+}
+
+void
+// NOLINTNEXTLINE(misc-use-internal-linkage)
+p25_sm_on_indiv_grant(dsd_opts* opts, dsd_state* state, int channel, int svc_bits, int dst, int src) {
+    (void)channel;
+    (void)svc_bits;
+    (void)dst;
+    (void)src;
+    if (!opts || !state) {
+        return;
+    }
+    state->p25_sm_tune_count++;
+    opts->p25_is_tuned = 1;
+}
+
+void
+// NOLINTNEXTLINE(misc-use-internal-linkage)
+p25_format_chan_suffix(const dsd_state* state, uint16_t channel, int slot_hint, char* out, size_t out_sz) {
+    (void)state;
+    (void)channel;
+    (void)slot_hint;
+    if (!out || out_sz == 0) {
+        return;
+    }
+    out[0] = '\0';
+}
+
+int
+main(void) {
+    int rc = 0;
+    static dsd_opts opts;
+    static dsd_state st;
+    uint8_t mpdu[64];
+    DSD_MEMSET(&opts, 0, sizeof opts);
+    DSD_MEMSET(&st, 0, sizeof st);
+    DSD_MEMSET(mpdu, 0, sizeof mpdu);
+
+    opts.p25_trunk = 1;
+    opts.trunk_tune_private_calls = 1;
+    opts.trunk_tune_data_calls = 1;
+    opts.trunk_tune_enc_calls = 1;
+    opts.trunk_use_allow_list = 1;
+    st.p25_cc_freq = 851000000;
+
+    // FDMA IDEN for channel 0x100A.
+    int id = 1;
+    st.p25_chan_iden = id;
+    // Populate new dual-array
+    st.p25_iden_fdma[id].base_freq = 851000000 / 5;
+    st.p25_iden_fdma[id].chan_type = 1;
+    st.p25_iden_fdma[id].chan_spac = 100;
+    st.p25_iden_fdma[id].trust = 2;
+    st.p25_iden_fdma[id].populated = 1;
+    st.p25_chan_tdma_explicit[id] = 1; // FDMA known
+
+    // Build ALT MBT Unit-to-Unit Voice Channel Grant - Extended (opcode 0x06).
+    mpdu[0] = 0x17; // ALT MBT format
+    mpdu[2] = 0x00; // MFID standard
+    mpdu[7] = 0x06; // opcode: UU Voice Channel Grant Extended
+    mpdu[8] = 0x00; // svc clear
+    mpdu[3] = 0x00;
+    mpdu[4] = 0x00;
+    mpdu[5] = 0x02; // source
+    mpdu[19] = 0x00;
+    mpdu[20] = 0x00;
+    mpdu[21] = 0x01; // target
+    mpdu[22] = 0x10;
+    mpdu[23] = 0x0A; // channel
+    mpdu[24] = 0x10;
+    mpdu[25] = 0x0A; // channelr
+
+    unsigned before = st.p25_sm_tune_count;
+    opts.p25_is_tuned = 0;
+    p25_decode_pdu_trunking(&opts, &st, mpdu);
+    rc |= expect_true("p1 pdu private unknown blocked in allow-list", st.p25_sm_tune_count == before);
+
+    rc |= expect_true("policy seed private target", seed_policy_group(&st, 1u, "A", "UU-ALLOW") == 0);
+    before = st.p25_sm_tune_count;
+    opts.p25_is_tuned = 0;
+    p25_decode_pdu_trunking(&opts, &st, mpdu);
+    rc |= expect_true("p1 pdu private known target tunes", st.p25_sm_tune_count == before + 1);
+
+    dsd_state_ext_free_all(&st);
+
+    return rc;
+}
+
+#if defined(__GNUC__) && !defined(__cplusplus)
+#pragma GCC diagnostic pop
+#endif

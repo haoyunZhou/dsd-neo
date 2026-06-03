@@ -5,16 +5,17 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
-
+#include "dsd-neo/core/safe_api.h"
+#include "dsd-neo/core/secret_redaction.h"
 #include "dsd-neo/core/state_fwd.h"
+#include "vendor_ap_key_parse.h"
 
 static inline uint64_t
 rol64(uint64_t x, int n) {
     return ((x << n) | (x >> (63 - n) >> 1)) & 0xffffffffffffffff;
 }
 
-void
+static void
 swapbit(uint64_t* internalstate, uint8_t bit) {
     unsigned char bitB = bit & 1;
     if (bitB) {
@@ -25,17 +26,17 @@ swapbit(uint64_t* internalstate, uint8_t bit) {
 }
 
 // MD2 functions
-void
+static void
 md2_init(MD2State* state) {
     state->x1 = 0;
     state->x2 = 0;
-    memset(state->h2, 0, (size_t)n1);
-    memset(state->h1, 0, (size_t)n1 * 3);
+    DSD_MEMSET(state->h2, 0, (size_t)n1);
+    DSD_MEMSET(state->h1, 0, (size_t)n1 * 3);
 }
 
-void
-md2_hashing(MD2State* state, unsigned char t1[], size_t b6) {
-    static unsigned char s4[256] = {
+static void
+md2_hashing(MD2State* state, const unsigned char t1[], size_t b6) {
+    static const unsigned char s4[256] = {
         13,  199, 11,  67,  237, 193, 164, 77,  115, 184, 141, 222, 73,  38,  147, 36,  150, 87,  21,  104, 12,  61,
         156, 101, 111, 145, 119, 22,  207, 35,  198, 37,  171, 167, 80,  30,  219, 28,  213, 121, 86,  29,  214, 242,
         6,   4,   89,  162, 110, 175, 19,  157, 3,   88,  234, 94,  144, 118, 159, 239, 100, 17,  182, 173, 238, 68,
@@ -73,9 +74,9 @@ md2_hashing(MD2State* state, unsigned char t1[], size_t b6) {
     }
 }
 
-void
+static void
 md2_end(MD2State* state, unsigned char h4[n1]) {
-    unsigned char h3[n1];
+    unsigned char h3[n1] = {0};
     int n4 = n1 - state->x2;
     for (int i = 0; i < n4; i++) {
         h3[i] = n4;
@@ -88,7 +89,7 @@ md2_end(MD2State* state, unsigned char h4[n1]) {
 }
 
 // RC4 functions
-uint64_t
+static uint64_t
 next(RC4State* state) {
     uint64_t z = (state->x += 0x9e3779b97f4a7c15);
     z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9;
@@ -96,10 +97,8 @@ next(RC4State* state) {
     return z ^ (z >> 31);
 }
 
-void
-rc4_init(RC4State* state, unsigned char key[]) {
-    int tmp;
-
+static void
+rc4_init(RC4State* state, const unsigned char key[]) {
     for (state->i_rc4 = 0; state->i_rc4 < 256; state->i_rc4++) {
         state->array_rc4[state->i_rc4] = state->i_rc4;
     }
@@ -107,7 +106,7 @@ rc4_init(RC4State* state, unsigned char key[]) {
     state->j_rc4 = 0;
     for (state->i_rc4 = 0; state->i_rc4 < 256; state->i_rc4++) {
         state->j_rc4 = (state->j_rc4 + state->array_rc4[state->i_rc4] + key[state->i_rc4 % 256]) % 256;
-        tmp = state->array_rc4[state->i_rc4];
+        int tmp = state->array_rc4[state->i_rc4];
         state->array_rc4[state->i_rc4] = state->array_rc4[state->j_rc4];
         state->array_rc4[state->j_rc4] = tmp;
     }
@@ -115,7 +114,7 @@ rc4_init(RC4State* state, unsigned char key[]) {
     state->j_rc4 = 0;
 }
 
-unsigned char
+static unsigned char
 rc4_output(RC4State* state) {
     uint8_t rndbyte, decal;
     int tmp, t;
@@ -148,16 +147,8 @@ rc4_output(RC4State* state) {
     return rndbyte;
 }
 
-/* Convert 64-bit integer to bytes (big-endian) */
-static void
-u64_to_bytes_be(uint64_t val, unsigned char* out) {
-    for (int i = 0; i < 8; i++) {
-        out[i] = (unsigned char)((val >> (56 - 8 * i)) & 0xFF);
-    }
-}
-
 // RC2 functions
-void
+static void
 rc2_keyschedule(RC2State* state) {
     unsigned i;
     i = 63;
@@ -167,7 +158,7 @@ rc2_keyschedule(RC2State* state) {
     } while (i--);
 }
 
-void
+static void
 rc2_encrypt(RC2State* state) {
     uint16_t x76, x54, x32, x10, i;
 
@@ -209,7 +200,7 @@ rc2_encrypt(RC2State* state) {
 
 // Main cryptographic functions
 void
-create_keys_rc2(CryptoContext* ctx, unsigned char key1[], size_t size1) {
+create_keys_rc2(CryptoContext* ctx, const unsigned char key1[], size_t size1) {
     unsigned char h4[n1];
 
     // Initialize MD2 and hash the key
@@ -297,7 +288,6 @@ encryption_rc2(CryptoContext* ctx, uint8_t bits[49]) {
 
 void
 decrypt_rc2(CryptoContext* ctx, uint8_t bits[49]) {
-    uint8_t tempy;
     ctx->internal_state = ctx->internal_zero;
 
     for (int sso = 0; sso < 49; sso++) {
@@ -321,43 +311,87 @@ decrypt_rc2(CryptoContext* ctx, uint8_t bits[49]) {
         }
 
         // XOR the bit and update internal state
-        tempy = bits[48 - sso];
+        uint8_t tempy = bits[48 - sso];
         bits[48 - sso] = bits[48 - sso] ^ (ctx->internal_state & 1);
         ctx->internal_state = rol64(ctx->internal_state, 1);
         swapbit(&ctx->internal_state, tempy);
     }
 }
 
-/* Key creation for Retevis AP */
-void
-retevis_rc2_keystream_creation(dsd_state* state, char* input) {
-
-    unsigned char key1[16] = {0};
-    unsigned char key2[16] = {0};
-
-    char buf[1024];
-    snprintf(buf, sizeof(buf), "%s", input);
-
-    char* pEnd;
-    uint64_t K1 = strtoull(buf, &pEnd, 16);
-    uint64_t K2 = strtoull(pEnd, &pEnd, 16);
-
-    u64_to_bytes_be(K1, &key1[0]);
-    u64_to_bytes_be(K2, &key1[8]);
-
-    for (int i = 0; i < 16; i++) {
-        key2[i] = key1[15 - i];
+int
+retevis_rc2_apply_frame49(dsd_state* state, char ambe_d[49]) {
+    if (state == NULL || ambe_d == NULL || state->retevis_ap != 1 || state->rc2_context == NULL) {
+        return 0;
+    }
+    if (dmr_ambe49_is_default_silence(ambe_d) == 1 || dmr_ambe49_has_zero_tail(ambe_d) == 1) {
+        return 0;
     }
 
-    // Initialize RC2 context
-    static CryptoContext rc2_ctx;
-    create_keys_rc2(&rc2_ctx, key2, sizeof(key2));
+    uint8_t frame1_cipher[49];
+    for (int i = 0; i < 49; i++) {
+        frame1_cipher[i] = (uint8_t)(((unsigned char)ambe_d[i]) & 1U);
+    }
+    decrypt_rc2((CryptoContext*)state->rc2_context, frame1_cipher);
+    DSD_MEMSET(ambe_d, 0, 49 * sizeof(char));
+    for (int i = 0; i < 49; i++) {
+        ambe_d[i] = (char)(frame1_cipher[i] & 1U);
+    }
+    return 1;
+}
+
+/* Key creation for Retevis AP */
+void
+retevis_rc2_keystream_creation(dsd_state* state, const char* input) {
+    if (state == NULL || input == NULL) {
+        return;
+    }
+
+    dsd_vendor_ap_key parsed;
+    const int parse_rc = dsd_vendor_ap_key_parse(input, &parsed);
+    if (parse_rc != DSD_VENDOR_AP_KEY_OK) {
+        DSD_FPRINTF(stderr, "DMR RETEVIS AP (RC2) key parse failed: expected 32 or 64 hex characters\n");
+        free(state->rc2_context);
+        state->rc2_context = NULL;
+        state->retevis_ap = 0;
+        return;
+    }
+
+    CryptoContext rc2_ctx;
+    DSD_MEMSET(&rc2_ctx, 0, sizeof(rc2_ctx));
+    if (parsed.nhex == 64U) {
+        create_keys_rc2(&rc2_ctx, parsed.hex, parsed.nhex);
+        DSD_FPRINTF(stderr, "DMR RETEVIS AP (RC2) 256-bit key loaded with forced application: %s\n",
+                    DSD_SECRET_REDACTED);
+    } else {
+        unsigned char key1[16];
+        DSD_MEMSET(key1, 0, sizeof(key1));
+        unsigned char key2[16];
+        DSD_MEMSET(key2, 0, sizeof(key2));
+
+        if (dsd_vendor_ap_key_hex_to_bytes(parsed.hex, parsed.nhex, key1, sizeof(key1)) != 0) {
+            DSD_FPRINTF(stderr, "DMR RETEVIS AP (RC2) key parse failed: invalid 128-bit key\n");
+            free(state->rc2_context);
+            state->rc2_context = NULL;
+            state->retevis_ap = 0;
+            return;
+        }
+        for (int i = 0; i < 16; i++) {
+            key2[i] = key1[15 - i];
+        }
+        create_keys_rc2(&rc2_ctx, key2, 16);
+        DSD_FPRINTF(stderr, "DMR RETEVIS AP (RC2) 128-bit key loaded with forced application: %s\n",
+                    DSD_SECRET_REDACTED);
+    }
 
     // Store context in DSD state
+    free(state->rc2_context);
     state->rc2_context = malloc(sizeof(CryptoContext));
-    memcpy(state->rc2_context, &rc2_ctx, sizeof(CryptoContext));
+    if (state->rc2_context == NULL) {
+        DSD_FPRINTF(stderr, "DMR RETEVIS AP (RC2) key allocation failed\n");
+        state->retevis_ap = 0;
+        return;
+    }
+    DSD_MEMCPY(state->rc2_context, &rc2_ctx, sizeof(CryptoContext));
 
-    fprintf(stderr, "DMR RETEVIS AP (RC2) 128-bit Key %016llX%016llX with Forced Application\n", (unsigned long long)K1,
-            (unsigned long long)K2);
     state->retevis_ap = 1;
 }

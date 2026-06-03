@@ -3,7 +3,8 @@
  * @file
  * @brief UI DSP runtime command opcodes for `UI_CMD_DSP_OP` payloads.
  */
-#pragma once
+#ifndef DSD_NEO_INCLUDE_DSD_NEO_UI_UI_DSP_CMD_H_
+#define DSD_NEO_INCLUDE_DSD_NEO_UI_UI_DSP_CMD_H_
 
 /** DSP control opcodes understood by the demod thread. */
 enum UiDspOp {
@@ -23,6 +24,11 @@ enum UiDspOp {
     UI_DSP_OP_FM_AGC_ATTACK_DELTA = 16, // a: delta (+/-)
     UI_DSP_OP_FM_AGC_DECAY_DELTA = 17,  // a: delta (+/-)
     UI_DSP_OP_TUNER_AUTOGAIN_TOGGLE = 18,
+    UI_DSP_OP_CQPSK_EQ_TOGGLE = 19,
+    UI_DSP_OP_CQPSK_EQ_TAPS_DELTA = 20,    // a: delta in taps (+/-2)
+    UI_DSP_OP_CQPSK_EQ_MU_DELTA = 21,      // a: delta in 0.0001 units
+    UI_DSP_OP_CQPSK_EQ_MODULUS_DELTA = 22, // a: delta in 0.01 units
+    UI_DSP_OP_CQPSK_EQ_RESET = 23,
 };
 
 /**
@@ -35,3 +41,5 @@ typedef struct {
     int c;
     int d;
 } UiDspPayload;
+
+#endif /* DSD_NEO_INCLUDE_DSD_NEO_UI_UI_DSP_CMD_H_ */

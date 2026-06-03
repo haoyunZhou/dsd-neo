@@ -7,7 +7,15 @@
   },
   "configurePresets": [
     {
+      "name": "warnings-as-errors",
+      "hidden": true,
+      "cacheVariables": {
+        "DSD_WARNINGS_AS_ERRORS": "ON"
+      }
+    },
+    {
       "name": "dev-debug",
+      "inherits": "warnings-as-errors",
       "displayName": "Dev Debug",
       "description": "Debug build (export compile_commands.json)",
       "binaryDir": "${sourceDir}/build/dev-debug",
@@ -18,6 +26,7 @@
     },
     {
       "name": "dev-release",
+      "inherits": "warnings-as-errors",
       "displayName": "Dev Release",
       "description": "Release build (LTO/fast-math enabled)",
       "binaryDir": "${sourceDir}/build/dev-release",
@@ -30,7 +39,55 @@
       }
     },
     {
+      "name": "perf-profile",
+      "inherits": "warnings-as-errors",
+      "displayName": "Perf Profile",
+      "description": "Optimized profiling build with debug symbols and frame pointers",
+      "binaryDir": "${sourceDir}/build/perf-profile",
+      "condition": {
+        "type": "notEquals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      },
+      "environment": {
+        "CC": "clang",
+        "CXX": "clang++"
+      },
+      "cacheVariables": {
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "BUILD_TESTING": "OFF",
+        "DSD_ENABLE_LTO": "OFF",
+        "DSD_ENABLE_FAST_MATH": "ON",
+        "CMAKE_C_FLAGS_RELWITHDEBINFO": "-O2 -g -DNDEBUG -fno-omit-frame-pointer",
+        "CMAKE_CXX_FLAGS_RELWITHDEBINFO": "-O2 -g -DNDEBUG -fno-omit-frame-pointer"
+      }
+    },
+    {
+      "name": "perf-bench",
+      "inherits": "warnings-as-errors",
+      "displayName": "Perf Bench",
+      "description": "Optimized benchmark build with tests, debug symbols, and frame pointers",
+      "binaryDir": "${sourceDir}/build/perf-bench",
+      "condition": {
+        "type": "notEquals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      },
+      "cacheVariables": {
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "BUILD_TESTING": "ON",
+        "DSD_ENABLE_LTO": "OFF",
+        "DSD_ENABLE_FAST_MATH": "ON",
+        "DSD_ENABLE_NATIVE": "OFF",
+        "CMAKE_C_FLAGS_RELWITHDEBINFO": "-O2 -g -DNDEBUG -fno-omit-frame-pointer",
+        "CMAKE_CXX_FLAGS_RELWITHDEBINFO": "-O2 -g -DNDEBUG -fno-omit-frame-pointer"
+      }
+    },
+    {
       "name": "asan-ubsan-debug",
+      "inherits": "warnings-as-errors",
       "displayName": "Debug + ASan/UBSan",
       "description": "Debug build with sanitizers enabled",
       "binaryDir": "${sourceDir}/build/asan-ubsan-debug",
@@ -42,7 +99,41 @@
       }
     },
     {
+      "name": "fuzz-asan-debug",
+      "inherits": "warnings-as-errors",
+      "displayName": "Debug + libFuzzer + ASan/UBSan",
+      "description": "Debug build with libFuzzer targets and sanitizer instrumentation",
+      "binaryDir": "${sourceDir}/build/fuzz-asan-debug",
+      "condition": {
+        "type": "notEquals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      },
+      "cacheVariables": {
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_C_COMPILER": "clang",
+        "CMAKE_CXX_COMPILER": "clang++",
+        "DSD_ENABLE_ASAN": "ON",
+        "DSD_ENABLE_UBSAN": "ON",
+        "DSD_ENABLE_FUZZING": "ON"
+      }
+    },
+    {
+      "name": "tsan-debug",
+      "inherits": "warnings-as-errors",
+      "displayName": "Debug + TSan",
+      "description": "Debug build with ThreadSanitizer enabled",
+      "binaryDir": "${sourceDir}/build/tsan-debug",
+      "cacheVariables": {
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "CMAKE_BUILD_TYPE": "Debug",
+        "DSD_ENABLE_TSAN": "ON"
+      }
+    },
+    {
       "name": "coverage-debug",
+      "inherits": "warnings-as-errors",
       "displayName": "Debug + Coverage",
       "description": "Debug build with GCC/Clang coverage instrumentation",
       "binaryDir": "${sourceDir}/build/coverage-debug",
@@ -57,6 +148,7 @@
     },
     {
       "name": "win-msvc-debug",
+      "inherits": "warnings-as-errors",
       "displayName": "Windows MSVC Debug",
       "description": "Windows Debug build with MSVC via vcpkg",
       "generator": "Visual Studio 17 2022",
@@ -76,6 +168,7 @@
     },
     {
       "name": "win-msvc-release",
+      "inherits": "warnings-as-errors",
       "displayName": "Windows MSVC Release",
       "description": "Windows Release build with MSVC via vcpkg",
       "generator": "Visual Studio 17 2022",
@@ -91,49 +184,6 @@
         "VCPKG_TARGET_TRIPLET": "x64-windows-dynamic-release",
         "VCPKG_OVERLAY_TRIPLETS": "${sourceDir}/vcpkg-triplets",
         "VCPKG_INSTALLED_DIR": "${sourceDir}/vcpkg_installed",
-        "BUILD_TESTING": "OFF",
-        "DSD_ENABLE_LTO": "ON",
-        "DSD_ENABLE_FAST_MATH": "ON"
-      }
-    },
-    {
-      "name": "win-mingw-debug",
-      "displayName": "Windows MinGW Debug",
-      "description": "Windows Debug build with MinGW-w64",
-      "generator": "MinGW Makefiles",
-      "binaryDir": "${sourceDir}/build/win-mingw-debug",
-      "condition": {
-        "type": "equals",
-        "lhs": "${hostSystemName}",
-        "rhs": "Windows"
-      },
-      "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Debug",
-        "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
-        "VCPKG_TARGET_TRIPLET": "x64-mingw-dynamic",
-        "VCPKG_OVERLAY_TRIPLETS": "${sourceDir}/vcpkg-triplets",
-        "VCPKG_INSTALLED_DIR": "${sourceDir}/vcpkg_installed",
-        "VCPKG_APPLOCAL_DEPS": "OFF"
-      }
-    },
-    {
-      "name": "win-mingw-release",
-      "displayName": "Windows MinGW Release",
-      "description": "Windows Release build with MinGW-w64",
-      "generator": "MinGW Makefiles",
-      "binaryDir": "${sourceDir}/build/win-mingw-release",
-      "condition": {
-        "type": "equals",
-        "lhs": "${hostSystemName}",
-        "rhs": "Windows"
-      },
-      "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Release",
-        "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
-        "VCPKG_TARGET_TRIPLET": "x64-mingw-dynamic-release",
-        "VCPKG_OVERLAY_TRIPLETS": "${sourceDir}/vcpkg-triplets",
-        "VCPKG_INSTALLED_DIR": "${sourceDir}/vcpkg_installed",
-        "VCPKG_APPLOCAL_DEPS": "OFF",
         "BUILD_TESTING": "OFF",
         "DSD_ENABLE_LTO": "ON",
         "DSD_ENABLE_FAST_MATH": "ON"
@@ -164,13 +214,57 @@
       "cleanFirst": true
     },
     {
+      "name": "perf-profile",
+      "configurePreset": "perf-profile",
+      "configuration": "RelWithDebInfo"
+    },
+    {
+      "name": "perf-profile-clean",
+      "configurePreset": "perf-profile",
+      "configuration": "RelWithDebInfo",
+      "cleanFirst": true
+    },
+    {
+      "name": "perf-bench",
+      "configurePreset": "perf-bench",
+      "configuration": "RelWithDebInfo"
+    },
+    {
+      "name": "perf-bench-clean",
+      "configurePreset": "perf-bench",
+      "configuration": "RelWithDebInfo",
+      "cleanFirst": true
+    },
+    {
       "name": "asan-ubsan-debug",
       "configurePreset": "asan-ubsan-debug",
       "configuration": "Debug"
     },
     {
+      "name": "fuzz-asan-debug",
+      "configurePreset": "fuzz-asan-debug",
+      "configuration": "Debug"
+    },
+    {
+      "name": "fuzz-asan-debug-clean",
+      "configurePreset": "fuzz-asan-debug",
+      "configuration": "Debug",
+      "cleanFirst": true
+    },
+    {
       "name": "asan-ubsan-debug-clean",
       "configurePreset": "asan-ubsan-debug",
+      "configuration": "Debug",
+      "cleanFirst": true
+    },
+    {
+      "name": "tsan-debug",
+      "configurePreset": "tsan-debug",
+      "configuration": "Debug"
+    },
+    {
+      "name": "tsan-debug-clean",
+      "configurePreset": "tsan-debug",
       "configuration": "Debug",
       "cleanFirst": true
     },
@@ -194,16 +288,6 @@
       "name": "win-msvc-release",
       "configurePreset": "win-msvc-release",
       "configuration": "Release"
-    },
-    {
-      "name": "win-mingw-debug",
-      "configurePreset": "win-mingw-debug",
-      "configuration": "Debug"
-    },
-    {
-      "name": "win-mingw-release",
-      "configurePreset": "win-mingw-release",
-      "configuration": "Release"
     }
   ],
   "testPresets": [
@@ -223,6 +307,19 @@
       "configuration": "Debug"
     },
     {
+      "name": "fuzz-asan-debug",
+      "configurePreset": "fuzz-asan-debug",
+      "configuration": "Debug"
+    },
+    {
+      "name": "tsan-debug",
+      "configurePreset": "tsan-debug",
+      "configuration": "Debug",
+      "environment": {
+        "TSAN_OPTIONS": "halt_on_error=1:second_deadlock_stack=1:history_size=7:suppressions=${sourceDir}/tools/tsan.supp"
+      }
+    },
+    {
       "name": "coverage-debug",
       "configurePreset": "coverage-debug",
       "configuration": "Debug"
@@ -235,16 +332,6 @@
     {
       "name": "win-msvc-release",
       "configurePreset": "win-msvc-release",
-      "configuration": "Release"
-    },
-    {
-      "name": "win-mingw-debug",
-      "configurePreset": "win-mingw-debug",
-      "configuration": "Debug"
-    },
-    {
-      "name": "win-mingw-release",
-      "configurePreset": "win-mingw-release",
       "configuration": "Release"
     }
   ]

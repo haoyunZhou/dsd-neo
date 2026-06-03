@@ -11,33 +11,29 @@
  * can include it directly.
  */
 
-#pragma once
+#ifndef DSD_NEO_INCLUDE_DSD_NEO_CORE_STATE_H_H
+#define DSD_NEO_INCLUDE_DSD_NEO_CORE_STATE_H_H
+
+#include <dsd-neo/platform/platform.h>
 
 #include <dsd-neo/core/state_ext.h>
 #include <dsd-neo/core/state_fwd.h>
 
-#include <stdbool.h>
 #include <stdint.h>
 #include <time.h>
 
-#include <dsd-neo/fec/rs_12_9.h>
+#include <dsd-neo/core/dibit.h>
 
 #include <dsd-neo/dsp/p25p1_heuristics.h>
+#include <dsd-neo/protocol/p25/p25_cc_candidates.h>
+#include <dsd-neo/protocol/p25/p25_status_symbol.h>
 
-enum {
+enum DSD_ATTR_PACKED {
     DSD_P25_P2_AUDIO_RING_DEPTH = 4,
+    DSD_TRUNK_CHAN_MAP_SIZE = 0xFFFF,
     DSD_VERTEX_KS_MAP_MAX = 64,
+    DSD_RTL_SYMBOL_CACHE_CAP = 512,
 };
-
-/* Forward declaration for mbelib decoder state (opaque in public API). */
-struct mbe_parameters;
-typedef struct mbe_parameters mbe_parms;
-
-/* Forward declaration for RTL-SDR stream context (opaque, always present in ABI) */
-struct RtlSdrContext;
-
-/* Forward declaration for Codec2 context (opaque, always present in ABI) */
-struct CODEC2;
 
 //event history (each item)
 // NOLINTBEGIN(clang-analyzer-optin.performance.Padding)
@@ -47,12 +43,12 @@ struct CODEC2;
 // readability/maintainability without measurable benefit. Suppress the padding
 // warning for this aggregate while keeping all other clang-tidy checks active.
 typedef struct {
-    uint8_t write;      //if this event needs to be written to a log file
+    uint8_t write;      // If this event needs to be written to a log file
     uint8_t color_pair; //this value corresponds to which color pair the line should be in ncurses
     int8_t systype;     //indentifier of which decoded system type this is from (P25, DMR, etc)
     int8_t subtype;     //subtype of systpe (VLC, TLC, PDU data, System Event, etc)
     uint32_t sys_id1;   //sys_id1 through 5 will be a hierarchy of system identifiers
-    uint32_t sys_id2;   //for example, trunked P25 has WACN:SYS:CC:SITE_ID:RFSS_ID
+    uint32_t sys_id2;   // For example, trunked P25 has WACN:SYS:CC:SITE_ID:RFSS_ID
     uint32_t sys_id3;   //conventional may only use NAC, RAN, or Color Codes
     uint32_t sys_id4;   //
     uint32_t sys_id5;   //
@@ -70,14 +66,14 @@ typedef struct {
     char s_name[200];   //same as above, but if loaded from a src value and not tg value
     char t_mode[200];   //mode, or A,B,D,DE from csv group import file
     char s_mode[200];   //mode, or A,B,D,DE from csv group import file
-    uint32_t channel;   //if this occurs on a trunking channel, which channel
+    uint32_t channel;   // If this occurs on a trunking channel, which channel
     time_t event_time;  //time event occurred
 
     uint8_t pdu[128 * 24];   //relevant link control, or full PDU if data call (in bytes)
     char sysid_string[200];  //string comprised of system unique identifiers
-    char alias[2000];        //if this event has a source radio talker alias or similar
+    char alias[2000];        // If this event has a source radio talker alias or similar
     char gps_s[2000];        //gps, if returned, expressed as a string
-    char text_message[2000]; //if this event is a decoded text message, then it goes here
+    char text_message[2000]; // If this event is a decoded text message, then it goes here
     char event_string[2000]; //user legible and printable string for the event that happened
     char internal_str[2000]; //string that relates to a DSD-neo generated event (ENC LO, error notices, etc)
 } Event_History;
@@ -116,13 +112,6 @@ typedef struct {
 } NOTCHFilter;
 
 //end new filters
-
-//group csv import struct
-typedef struct {
-    unsigned long int groupNumber;
-    char groupMode[8]; //char *?
-    char groupName[50];
-} groupinfo;
 
 typedef struct {
     uint8_t F1;
@@ -191,6 +180,29 @@ typedef struct {
     unsigned int ColorCode[NB_OF_DPMR_VOICE_FRAME_TO_DECODE / 2];
 } dPMRVoiceFS2Frame_t;
 
+/**
+ * @brief Consolidated per-slot IDEN entry for P25 frequency resolution.
+ *
+ * Each entry holds the complete set of parameters needed to resolve a 16-bit
+ * channel number to a frequency. Two arrays of this type exist in dsd_state:
+ * one for FDMA/non-TDMA identifiers and one for TDMA identifiers. This
+ * separation prevents multi-mode systems from cycling incompatible parameters
+ * in a single slot.
+ */
+typedef struct {
+    long int base_freq;       // base frequency in 5 Hz units (per IDEN_UP encoding)
+    int chan_type;            // 4-bit channel type (TDMA: slots-per-carrier; 1 for FDMA default)
+    int chan_spac;            // 10-bit channel spacing (in 0.125 kHz units)
+    int trans_off;            // transmit offset
+    uint8_t bw_vu;            // 4-bit VHF/UHF bandwidth (0=standard/not VHF-UHF, nonzero=VHF/UHF BW)
+    uint8_t trust;            // 0=unknown, 1=unconfirmed, 2=confirmed on matching CC
+    uint8_t populated;        // 0=empty, 1=has valid complete data from LCW/TSBK/MAC/PDU
+    unsigned long long wacn;  // WACN provenance (system context when IDEN was learned)
+    unsigned long long sysid; // SysID provenance
+    unsigned long long rfss;  // RFSS ID provenance
+    unsigned long long site;  // Site ID provenance
+} p25_iden_entry_t;
+
 struct dsd_state {
     int* dibit_buf;
     int* dibit_buf_p;
@@ -199,6 +211,9 @@ struct dsd_state {
     // Per-dibit reliability buffer (0..255). Aligned with dmr_payload_buf.
     uint8_t* dmr_reliab_buf;
     uint8_t* dmr_reliab_p;
+    // Per-dibit signed soft metrics. Aligned with dmr_payload_buf.
+    dsd_dibit_soft_t* dmr_soft_buf;
+    dsd_dibit_soft_t* dmr_soft_p;
     int repeat;
     short* audio_out_buf;
     short* audio_out_buf_p;
@@ -210,12 +225,12 @@ struct dsd_state {
     float* audio_out_float_buf_pR;
     float* aout_max_buf_p;
     float* aout_max_buf_pR;
-    mbe_parms* cur_mp;
-    mbe_parms* prev_mp;
-    mbe_parms* prev_mp_enhanced;
-    mbe_parms* cur_mp2;
-    mbe_parms* prev_mp2;
-    mbe_parms* prev_mp_enhanced2;
+    struct mbe_parameters* cur_mp;
+    struct mbe_parameters* prev_mp;
+    struct mbe_parameters* prev_mp_enhanced;
+    struct mbe_parameters* cur_mp2;
+    struct mbe_parameters* prev_mp2;
+    struct mbe_parameters* prev_mp_enhanced2;
     // 64-bit state placed early to reduce padding
     unsigned long long int payload_mi;
     unsigned long long int payload_miR;
@@ -250,6 +265,10 @@ struct dsd_state {
     double last_cc_sync_time_m;
     double last_vc_sync_time_m;
     double p25_last_vc_tune_time_m;
+    time_t rtl_fsk_reacquire_last_sync_time;
+    double rtl_fsk_reacquire_last_sync_m;
+    double rtl_fsk_reacquire_gap_start_m;
+    double rtl_fsk_reacquire_last_request_m;
     time_t
         last_active_time; //time the a 'call grant' was received, used to clear the active_channel strings after x seconds
     time_t last_t3_tune_time;   // last time a DMR T3 grant was received (wall clock)
@@ -279,15 +298,18 @@ struct dsd_state {
     long int trunk_vc_freq[2]; //protocol-agnostic alias (kept in sync with p25_vc_freq)
     // Trunking LCNs and maps
     long int trunk_lcn_freq[26];
-    long int trunk_chan_map[0xFFFF];
+    long int trunk_chan_map[DSD_TRUNK_CHAN_MAP_SIZE];
+    uint16_t trunk_chan_map_used[DSD_TRUNK_CHAN_MAP_SIZE];
+    uint32_t trunk_chan_map_used_count;
+    uint64_t trunk_chan_map_seq;
     // DMR Tier III: simple provenance/trust for learned LCN->freq mappings
     // 0=unset, 1=learned (unconfirmed), 2=trusted (confirmed on-current-site CC)
     uint8_t dmr_lcn_trust[0x1000];
-    groupinfo group_array[0x3FF];
     // DMR late entry MI
     uint64_t late_entry_mi_fragment[2][8][3];
     // Multi-key array
     unsigned long long int rkey_array[0x1FFFF];
+    unsigned char rkey_array_loaded[0x1FFFF];
     // Temporary audio buffers
     float audio_out_temp_buf[160];
     float* audio_out_temp_buf_p;
@@ -330,6 +352,9 @@ struct dsd_state {
     int sidx;
     float maxbuf[1024];
     float minbuf[1024];
+    double maxbuf_sum;
+    double minbuf_sum;
+    int minmax_sum_window;
     int midx;
     char err_str[64];
     char err_buf[64];
@@ -339,6 +364,26 @@ struct dsd_state {
     char ftype[16];
     int symbolcnt;
     int symbolc;
+    uint8_t symbol_replay_format;         /* DSD_SYMBOL_REPLAY_FORMAT_* */
+    uint8_t symbol_replay_header_checked; /* header probe already done for current symbol file */
+    uint8_t symbol_replay_has_soft;       /* current replay record supplied soft metrics */
+    dsd_dibit_soft_t symbol_replay_soft;
+    float symbol_replay_soft_symbol;
+    unsigned int symbol_replay_soft_records;
+    unsigned int symbol_capture_soft_records;
+
+    /* RTL DSP symbol-output cache. The RTL demod thread already produces
+       symbol-rate floats in blocks; this lets legacy getSymbol() consume them
+       without one ring read per dibit. */
+    float rtl_symbol_cache[DSD_RTL_SYMBOL_CACHE_CAP];
+    int rtl_symbol_cache_pos;
+    int rtl_symbol_cache_len;
+    int rtl_symbol_cache_output_kind;
+    int rtl_symbol_cache_channel_profile;
+    int rtl_symbol_cache_symbol_rate_hz;
+    int rtl_symbol_cache_levels;
+    uint32_t rtl_symbol_cache_generation;
+    int rtl_symbol_cache_published_pending;
 
     /* C4FM timing assist (clock loop hinting). Lightweight EL/M&M error drives
        occasional ±1 nudges of symbolCenter; disabled by default. */
@@ -352,9 +397,10 @@ struct dsd_state {
     /* M17 polarity auto-detection: 0=unknown, 1=normal, 2=inverted.
      * Set when preamble detected; overridden if user specifies -xz. */
     int m17_polarity;
-    /* Multi-rate sync hunting: cycle through SPS values when no sync found.
+    /* Multi-rate sync hunting: cycle through symbol-rate candidates when no sync found.
      * sps_hunt_counter: symbols searched without valid sync
-     * sps_hunt_idx: current SPS index in cycle (0=10, 1=20, 2=5, 3=8) */
+     * sps_hunt_idx: current rate/profile index
+     * (0=4800/4-level, 1=2400/4-level, 2=9600/binary, 3=6000/4-level, 4=4800/binary) */
     int sps_hunt_counter;
     int sps_hunt_idx;
     int lastsynctype;
@@ -411,6 +457,7 @@ struct dsd_state {
 
     //AES Key Segments
     int aes_key_loaded[2];
+    uint8_t aes_key_segments[2];
 
     //xl specific, we need to know if the ESS is from HDU, or from LDU2
     int xl_is_hdu;
@@ -419,6 +466,12 @@ struct dsd_state {
     unsigned int debug_audio_errorsR;
     unsigned int debug_header_errors;
     unsigned int debug_header_critical_errors;
+
+    // NID BCH correction statistics (P25 Phase 1)
+    unsigned int nid_corrections_total; /**< Running total of NID BCH corrections applied */
+    unsigned int nid_failures_total;    /**< Running total of NID decode failures */
+    unsigned int nid_parity_overrides;  /**< Count of accepted final parity-bit mismatches */
+
     int debug_mode; //debug misc things
 
     // Last dibit read
@@ -450,6 +503,14 @@ struct dsd_state {
 
     unsigned int color_code;
     unsigned int color_code_ok;
+    uint8_t dmr_confidence_locked;
+    uint8_t dmr_confidence_color_code;
+    uint8_t dmr_confidence_candidate_cc;
+    uint8_t dmr_confidence_candidate_count;
+    uint8_t dmr_confidence_voice_sync_seen[2];
+    uint8_t dmr_confidence_voice_open[2];
+    uint8_t dmr_confidence_voice_count[2];
+    uint8_t dmr_confidence_mismatch_count;
     unsigned int PI;
     unsigned int PI_ok;
     unsigned int LCSS;
@@ -518,8 +579,6 @@ struct dsd_state {
 
     dPMRVoiceFS2Frame_t dPMRVoiceFS2Frame;
 
-    /* Event_History_I* event_history_s; */
-
     //new audio filter structs
     LPFilter RCFilter;
     HPFilter HRCFilter;
@@ -558,6 +617,7 @@ struct dsd_state {
 
     //NXDN DES and AES, signal new VCALL_IV and new IV
     uint8_t nxdn_new_iv; //1 when a new IV comes in, else 0
+    uint16_t nxdn_pn95_seed;
 
     short int dmr_encL;
     short int dmr_encR;
@@ -567,9 +627,10 @@ struct dsd_state {
     int p2_scramble_offset; //offset counter for scrambling application
     int p2_vch_chan_num;    //vch channel number (0 or 1, not the 0-11 TS)
     int ess_b[2][96];       //external storage for ESS_B fragments
-    int fourv_counter[2];   //external reference counter for ESS_B fragment collection
-    int voice_counter[2];   //external reference counter for 18V x 2 P25p2 Superframe
-    int p2_is_lcch;         //flag to tell us when a frame is lcch and not sacch
+    int16_t ess_b_llr[2][96];
+    int fourv_counter[2]; //external reference counter for ESS_B fragment collection
+    int voice_counter[2]; //external reference counter for 18V x 2 P25p2 Superframe
+    int p2_is_lcch;       //flag to tell us when a frame is lcch and not sacch
     // P25p2 per-slot audio gating (set on MAC_PTT/ACTIVE, cleared on MAC_END/IDLE/SIGNAL)
     int p25_p2_audio_allowed[2];
     // P25p2 small output jitter buffers (per-slot ring of decoded 20 ms frames)
@@ -603,8 +664,12 @@ struct dsd_state {
     unsigned int p25_p2_rs_ess_corr;     // total corrected symbols over accepts
     unsigned int p25_p2_soft_erasure_ok; // soft-decision RS successful recoveries
     // P25P1 soft decision counters
-    unsigned int p25_p1_soft_golay_ok; // soft Golay corrections (hard would have failed)
-    unsigned int p25_p2_soft_ess_ok;   // soft ESS corrections
+    unsigned int p25_p1_soft_hamming_ok; // soft Hamming corrections
+    unsigned int p25_p1_soft_golay_ok;   // soft Golay corrections (hard would have failed)
+    unsigned int p25_p1_soft_rs_ok;      // soft RS erasure corrections (hard would have failed)
+    unsigned int p25_p2_soft_ess_ok;     // soft ESS corrections
+    unsigned int p25_p2_soft_ess_max_depth;
+    unsigned int p25_p1_soft_combined_ok;
     // P25p2 early ENC lockout counter (MAC_PTT-driven)
     unsigned int p25_p2_enc_lo_early;
     // P25p2 early ENC lockout hardening: require confirmation across two indications
@@ -612,22 +677,20 @@ struct dsd_state {
     uint32_t p25_p2_enc_pending_ttg[2];
 
     //iden freq storage for frequency calculations
-    int p25_chan_tdma[16];                  // set from iden_up vs iden_up_tdma (bit0 = TDMA flag)
-    uint8_t p25_chan_tdma_explicit[16];     // 0=unknown, 1=explicit FDMA, 2=explicit TDMA
+    // Bitmask per IDEN slot indicating which modulation classes have been seen:
+    //   bit 0x01 marks an FDMA/non-TDMA entry
+    //   bit 0x02 marks a TDMA entry for channel types 3, 4, or 5
+    // Values: 0=unknown, 1=FDMA only, 2=TDMA only, 3=both FDMA and TDMA
+    uint8_t p25_chan_tdma_explicit[16];
     uint8_t p25_lcw_retune_disabled_warned; // 1 once "LCW retune disabled" warning emitted
     int p25_chan_iden;
-    int p25_chan_type[16];
-    int p25_trans_off[16];
-    int p25_chan_spac[16];
-    long int p25_base_freq[16];
-    // Per-IDEN provenance and trust level
-    // - wacn/sysid/rfss/site capture the system/site context when the IDEN was learned
-    // - trust: 0=unknown, 1=unconfirmed (learned off-CC/adjacent), 2=confirmed on matching CC
-    unsigned long long int p25_iden_wacn[16];
-    unsigned long long int p25_iden_sysid[16];
-    unsigned long long int p25_iden_rfss[16];
-    unsigned long long int p25_iden_site[16];
-    uint8_t p25_iden_trust[16];
+
+    // Dual-array IDEN storage: separate FDMA and TDMA entries per slot.
+    // This prevents multi-mode systems from cycling incompatible parameters
+    // in a single slot when both TDMA and FDMA IDEN updates share the same
+    // 4-bit identifier ID.
+    p25_iden_entry_t p25_iden_fdma[16]; // FDMA/non-TDMA frequency-band entries
+    p25_iden_entry_t p25_iden_tdma[16]; // TDMA frequency-band entries
 
     //p25 frequency storage for trunking and display in ncurses
     int p25_cc_is_tdma;  // control channel modulation: 0=FDMA (C4FM), 1=TDMA (QPSK)
@@ -635,8 +698,10 @@ struct dsd_state {
 
     /* P25 trunk (RTL): CQPSK DSP chain selection for TDMA voice channels.
      *
-     * - p25_vc_cqpsk_pref: learned preference (-1=unknown/auto, 0=force off (legacy FM/QPSK slicer),
-     *   1=force on (OP25-style CQPSK+TED chain))
+     * - p25_vc_cqpsk_pref: learned preference (-1=unknown/auto,
+     *   1=prefer OP25-style CQPSK+TED chain). Value 0 is treated as no learned
+     *   TDMA preference so automatic retry logic does not force P25p2 through
+     *   the legacy FM/QPSK slicer.
      * - p25_vc_cqpsk_override: one-shot retry override applied on next VC tune (-1=none).
      *
      * These are ignored when the user explicitly forces CQPSK via env/config (DSD_NEO_CQPSK).
@@ -654,6 +719,8 @@ struct dsd_state {
     unsigned int p25_sm_tune_count;      // number of VC tunes via SM
     unsigned int p25_sm_release_count;   // number of release requests via SM
     unsigned int p25_sm_cc_return_count; // number of actual returns to CC via SM
+    unsigned int p25_sm_queued_count;    ///< number of Queued Response (QUE_RSP) messages received
+    unsigned int p25_sm_deny_count;      ///< number of Deny Response (DENY_RSP) messages received
     // One-shot flag to force immediate return-to-CC on explicit MAC_END/IDLE
     // or policy events; cleared by the SM after handling
     int p25_sm_force_release;
@@ -721,6 +788,54 @@ struct dsd_state {
     int p25_p1_voice_err_hist_pos;          // ring head
     unsigned int p25_p1_voice_err_hist_sum; // sum of values in window
 
+    /*
+     * P25 status symbol classification.
+     *
+     * Accumulates 2-bit status symbol values during P25 Phase 1 frame
+     * processing and produces a classification (infrastructure vs subscriber)
+     * for diagnostics and optional auto-PPM gating. Status-derived direction is
+     * advisory by default because some systems do not emit reliable direction
+     * hints. See <dsd-neo/protocol/p25/p25_status_symbol.h> for the accumulator
+     * API.
+     */
+
+    /** Accumulated status symbol values for the current data unit (2-bit each). */
+    uint8_t p25_ss_buf[P25_STATUS_ACCUM_MAX];
+    /** Number of status symbols collected so far in current data unit. */
+    uint8_t p25_ss_count;
+    /** Current data unit has an active accumulator; preserves NID status handoff from dispatcher. */
+    uint8_t p25_ss_frame_active;
+    /** Classification of the most recently completed data unit (p25_ss_classification_t). */
+    uint8_t p25_ss_classification;
+    /** Advisory AFC gate decision: 1 = allow PPM update, 0 = suppress if opt-in gate is enabled. */
+    uint8_t p25_afc_gate_allow;
+    /** A completed data unit has populated the advisory AFC gate decision. */
+    uint8_t p25_afc_gate_valid;
+    /** Count of frames classified as AFC-allowable (infrastructure). */
+    unsigned int p25_afc_allowed_count;
+    /** Count of frames classified as AFC-suppressible (subscriber/unknown). */
+    unsigned int p25_afc_suppressed_count;
+
+    /*
+     * P25 Protection Parameter state (from TSBK 0x3F, LCW 0x65)
+     *
+     * Stores the most recently announced encryption algorithm and key ID on
+     * the control channel.
+     */
+    uint8_t p25_prot_valid; ///< 1 once an announcement has been received
+    uint8_t p25_prot_algid; ///< Active encryption Algorithm ID (0 = none received)
+    uint16_t p25_prot_kid;  ///< Active encryption Key ID (0 = none received)
+
+    /*
+     * P25 Time and Date Announcement state (TSBK 0x35 bridged as MAC-like 0x75)
+     *
+     * Stores the most recently decoded system UTC time and local time offset.
+     */
+    uint8_t p25_sys_time_valid;        ///< 1 once a valid date/time has been received
+    time_t p25_sys_time;               ///< Decoded UTC time
+    uint8_t p25_sys_time_offset_valid; ///< 1 once a local time offset has been received
+    int16_t p25_sys_time_offset;       ///< Local time offset in minutes from UTC
+
     // P25 Phase 2 voice error moving average per slot (errs2 from AMBE decode)
     uint8_t p25_p2_voice_err_hist[2][64];
     int p25_p2_voice_err_hist_len; // window length (<=64), default 50
@@ -762,9 +877,12 @@ struct dsd_state {
 
     // P25 neighbors seen via Adjacent Status (best-effort)
     // Track a small set of recently announced neighbor/control candidates for UI purposes.
-    int p25_nb_count;            // number of active neighbor entries
-    long int p25_nb_freq[32];    // neighbor/control frequencies in Hz
-    time_t p25_nb_last_seen[32]; // last seen timestamp per entry
+    // Uses p25_nb_entry_t struct with per-neighbor site metadata (CFVA, SysID, RFSS, Site).
+    int p25_nb_count;                          // number of active neighbor entries
+    p25_nb_entry_t p25_nb_entries[P25_NB_MAX]; // neighbor entries with metadata
+
+    // P25 source unit WACN from LCW 0x49 (Source ID Extension)
+    uint32_t p25_src_nid; // 20-bit WACN from SUID extension
 
     // P25 current-call flags (per logical slot; FDMA uses slot 0)
     uint8_t p25_call_emergency[2]; // 1 if current call is emergency
@@ -772,8 +890,9 @@ struct dsd_state {
     uint8_t p25_call_is_packet[2]; // 1 if call/service marked as packet (data), else 0
 
     //experimental symbol file capture read throttle
-    int symbol_throttle; //throttle speed
-    int use_throttle;    //only use throttle if set to 1
+    int symbol_throttle;                     //throttle speed
+    int use_throttle;                        //only use throttle if set to 1
+    uint64_t symbol_replay_next_deadline_ns; //0 when uninitialized
 
     //dmr trunking stuff
     int dmr_rest_channel;
@@ -804,8 +923,7 @@ struct dsd_state {
     int edacs_f_mask;       //Calculated Mask for F Bits
     int edacs_s_mask;       //Calculated Mask for S Bits
 
-    //trunking group and lcn freq list
-    unsigned int group_tally; //tally number of groups imported from CSV file for referencing later
+    //trunking lcn freq list
     int lcn_freq_count;
     int lcn_freq_roll; //number we have 'rolled' to in search of the CC
     int is_con_plus;   //con_plus flag for knowing its safe to skip payload channel after x seconds of no voice sync
@@ -814,7 +932,7 @@ struct dsd_state {
     int nxdn_part_of_frame;
     int nxdn_ran;
     int nxdn_sf;
-    bool
+    uint8_t
         nxdn_sacch_non_superframe; //flag to indicate whether or not a sacch is a part of a superframe, or an individual piece
     uint8_t nxdn_sacch_frame_segment[4][18]; //part of frame by 18 bits
     uint8_t nxdn_sacch_frame_segcrc[4];
@@ -889,6 +1007,14 @@ struct dsd_state {
     int soft_symbol_frame_start; // Index where current frame started
     uint8_t m17_pbc_ct;          //pbc packet counter
     uint8_t m17_str_dt;          //stream contents
+    uint8_t m17_bert_locked;
+    uint16_t m17_bert_lfsr;
+    uint16_t m17_bert_lock_count;
+    uint16_t m17_bert_window_bits;
+    uint16_t m17_bert_window_errors;
+    uint32_t m17_bert_bits;
+    uint32_t m17_bert_errors;
+    uint32_t m17_bert_resyncs;
 
     uint8_t m17_can; //can value that was decoded from signal
     int m17_can_en;  //can value supplied to the encoding side
@@ -902,19 +1028,33 @@ struct dsd_state {
     char m17_dst_str[50];
 
     uint8_t m17_meta[16]; //packed meta
-    uint8_t m17_enc;      //enc type
-    uint8_t m17_enc_st;   //scrambler or data subtye
-    int m17encoder_tx;    //if TX (encode + decode) M17 Stream is enabled
-    int m17encoder_eot;   //signal if we need to send the EOT frame
+    uint8_t m17_text_meta_control_or;
+    uint8_t m17_text_meta_expected_bitmap;
+    uint8_t m17_text_meta_received_bitmap;
+    uint8_t m17_text_meta[52];
+    uint8_t m17_enc;               //enc type
+    uint8_t m17_enc_st;            //scrambler or data subtye
+    uint8_t m17_payload_decrypted; //current encrypted payload was successfully decrypted
+    uint8_t m17_signature_advertised;
+    uint8_t m17_signature_digest[16];
+    uint8_t m17_signature[64];
+    uint8_t m17_signature_received_mask;
+    uint8_t m17_signature_complete;
+    uint8_t m17_signature_bad_sequence;
+    uint8_t m17_signature_public_key[64];
+    uint8_t m17_signature_public_key_loaded;
+    uint8_t m17_signature_verification_status;
+    int m17encoder_tx;  // If TX (encode + decode) M17 Stream is enabled
+    int m17encoder_eot; //signal if we need to send the EOT frame
 
     //misc str storage
     char str50a[50];
     char str50b[50];
     char str50c[50];
     char m17dat[50];  //user supplied m17 data input string
-    char m17sms[800]; //user supplied sms text string
+    char m17sms[824]; //user supplied sms text string
 
-    //tyt_ap=1 active
+    // tyt_ap value 1 means active
     int tyt_ap;
     int tyt_bp;
     int tyt_ep;
@@ -1507,3 +1647,228 @@ struct dsd_state {
 };
 
 // NOLINTEND(clang-analyzer-optin.performance.Padding)
+
+static inline int
+dsd_state_trunk_chan_valid(uint32_t channel) {
+    return channel < DSD_TRUNK_CHAN_MAP_SIZE;
+}
+
+static inline int
+dsd_state_trunk_chan_tracked(uint32_t channel) {
+    return channel > 0U && dsd_state_trunk_chan_valid(channel);
+}
+
+static inline void
+dsd_state_track_trunk_chan(dsd_state* state, uint16_t channel) {
+    if (!state || !dsd_state_trunk_chan_tracked(channel)) {
+        return;
+    }
+
+    uint32_t count = state->trunk_chan_map_used_count;
+    if (count > DSD_TRUNK_CHAN_MAP_SIZE) {
+        count = DSD_TRUNK_CHAN_MAP_SIZE;
+    }
+
+    uint32_t insert = count;
+    for (uint32_t i = 0; i < count; i++) {
+        if (state->trunk_chan_map_used[i] == channel) {
+            state->trunk_chan_map_used_count = count;
+            return;
+        }
+        if (state->trunk_chan_map_used[i] > channel) {
+            insert = i;
+            break;
+        }
+    }
+
+    if (count >= DSD_TRUNK_CHAN_MAP_SIZE) {
+        state->trunk_chan_map_used_count = count;
+        return;
+    }
+
+    for (uint32_t i = count; i > insert; i--) {
+        state->trunk_chan_map_used[i] = state->trunk_chan_map_used[i - 1];
+    }
+    state->trunk_chan_map_used[insert] = channel;
+    state->trunk_chan_map_used_count = count + 1U;
+}
+
+static inline void
+dsd_state_untrack_trunk_chan(dsd_state* state, uint16_t channel) {
+    if (!state || !dsd_state_trunk_chan_tracked(channel)) {
+        return;
+    }
+
+    uint32_t count = state->trunk_chan_map_used_count;
+    if (count > DSD_TRUNK_CHAN_MAP_SIZE) {
+        count = DSD_TRUNK_CHAN_MAP_SIZE;
+    }
+
+    for (uint32_t i = 0; i < count; i++) {
+        if (state->trunk_chan_map_used[i] != channel) {
+            continue;
+        }
+        for (uint32_t j = i + 1U; j < count; j++) {
+            state->trunk_chan_map_used[j - 1U] = state->trunk_chan_map_used[j];
+        }
+        state->trunk_chan_map_used[count - 1U] = 0;
+        state->trunk_chan_map_used_count = count - 1U;
+        return;
+    }
+    state->trunk_chan_map_used_count = count;
+}
+
+static inline void
+dsd_state_set_trunk_chan_freq(dsd_state* state, uint32_t channel, long int freq) {
+    if (!state || !dsd_state_trunk_chan_valid(channel)) {
+        return;
+    }
+
+    const long int old_freq = state->trunk_chan_map[channel];
+    if (old_freq == freq) {
+        return;
+    }
+
+    state->trunk_chan_map[channel] = freq;
+    if (!dsd_state_trunk_chan_tracked(channel)) {
+        state->trunk_chan_map_seq++;
+        return;
+    }
+    if (old_freq == 0) {
+        dsd_state_track_trunk_chan(state, (uint16_t)channel);
+    } else if (freq == 0) {
+        dsd_state_untrack_trunk_chan(state, (uint16_t)channel);
+    }
+    state->trunk_chan_map_seq++;
+}
+
+static inline int
+dsd_state_minmax_window_size(int requested) {
+    if (requested < 1) {
+        return 1;
+    }
+    if (requested > 1024) {
+        return 1024;
+    }
+    return requested;
+}
+
+static inline void
+dsd_state_invalidate_minmax_sums(dsd_state* state) {
+    if (!state) {
+        return;
+    }
+    state->minmax_sum_window = 0;
+}
+
+static inline void
+dsd_state_recompute_minmax_sums(dsd_state* state, int requested_window) {
+    if (!state) {
+        return;
+    }
+
+    const int window = dsd_state_minmax_window_size(requested_window);
+    double min_sum = 0.0;
+    double max_sum = 0.0;
+    for (int i = 0; i < window; i++) {
+        min_sum += (double)state->minbuf[i];
+        max_sum += (double)state->maxbuf[i];
+    }
+
+    state->minbuf_sum = min_sum;
+    state->maxbuf_sum = max_sum;
+    state->minmax_sum_window = window;
+    if (state->midx < 0 || state->midx >= window) {
+        state->midx = 0;
+    }
+}
+
+static inline void
+dsd_state_push_minmax_window(dsd_state* state, int requested_window, float min_value, float max_value) {
+    if (!state) {
+        return;
+    }
+
+    const int window = dsd_state_minmax_window_size(requested_window);
+    if (state->minmax_sum_window != window) {
+        dsd_state_recompute_minmax_sums(state, window);
+    }
+
+    int idx = state->midx;
+    if (idx < 0 || idx >= window) {
+        idx = 0;
+    }
+
+    state->minbuf_sum += (double)min_value - (double)state->minbuf[idx];
+    state->maxbuf_sum += (double)max_value - (double)state->maxbuf[idx];
+    state->minbuf[idx] = min_value;
+    state->maxbuf[idx] = max_value;
+
+    idx++;
+    state->midx = (idx >= window) ? 0 : idx;
+    state->min = (float)(state->minbuf_sum / (double)window);
+    state->max = (float)(state->maxbuf_sum / (double)window);
+}
+
+/**
+ * @brief Rescale symbol timing state between two effective PCM rates.
+ *
+ * This helper updates only timing-related state. Callers that also need analog
+ * filter coefficients rebuilt should do that separately.
+ *
+ * @param state Decoder state to update.
+ * @param old_rate_hz Previous effective PCM rate.
+ * @param new_rate_hz New effective PCM rate.
+ */
+static inline void
+dsd_state_rescale_symbol_timing(dsd_state* state, int old_rate_hz, int new_rate_hz) {
+    if (!state) {
+        return;
+    }
+
+    if (old_rate_hz <= 0) {
+        old_rate_hz = 48000;
+    }
+    if (new_rate_hz <= 0) {
+        new_rate_hz = old_rate_hz;
+    }
+    if (old_rate_hz == new_rate_hz) {
+        return;
+    }
+
+    int old_sps = state->samplesPerSymbol > 0 ? state->samplesPerSymbol : 10;
+    long long scaled = (long long)old_sps * (long long)new_rate_hz;
+    int new_sps = (int)((scaled + (old_rate_hz / 2)) / old_rate_hz);
+    if (new_sps < 2) {
+        new_sps = 2;
+    } else if (new_sps > 64) {
+        new_sps = 64;
+    }
+
+    int new_center = (new_sps - 1) / 2;
+    if (new_sps > 2) {
+        int min_c = 1;
+        int max_c = new_sps - 2;
+        long long ratio_num = state->symbolCenter;
+        long long ratio_den = old_sps;
+        if ((ratio_num * 20LL) < ratio_den) {
+            ratio_num = 1;
+            ratio_den = 20;
+        } else if ((ratio_num * 20LL) > (19LL * ratio_den)) {
+            ratio_num = 19;
+            ratio_den = 20;
+        }
+        const long long center_scaled = ratio_num * (long long)new_sps;
+        new_center = (int)((center_scaled + (ratio_den / 2LL)) / ratio_den);
+        if (new_center < min_c) {
+            new_center = min_c;
+        } else if (new_center > max_c) {
+            new_center = max_c;
+        }
+    }
+
+    state->samplesPerSymbol = new_sps;
+    state->symbolCenter = new_center;
+    state->jitter = -1;
+}
+#endif /* DSD_NEO_INCLUDE_DSD_NEO_CORE_STATE_H_H */

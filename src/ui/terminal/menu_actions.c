@@ -9,22 +9,27 @@
  */
 
 #include "menu_actions.h"
-
 #include <dsd-neo/core/constants.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/power.h>
 #include <dsd-neo/core/state.h>
+#include <dsd-neo/io/rtl_stream_c.h>
 #include <dsd-neo/platform/audio.h>
 #include <dsd-neo/platform/posix_compat.h>
 #include <dsd-neo/runtime/config.h>
 #include <dsd-neo/runtime/exitflag.h>
 #include <dsd-neo/ui/ui_async.h>
 #include <dsd-neo/ui/ui_cmd.h>
+#include <dsd-neo/ui/ui_dsp_cmd.h>
 #include <stdint.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
+#if defined(__SSE__) || defined(__SSE2__)
+#include <xmmintrin.h>
+#endif
+#include "dsd-neo/core/safe_api.h"
+#include "dsd-neo/core/state_fwd.h"
+#include "dsd-neo/runtime/call_alert.h"
 #include "dsd-neo/ui/menu_core.h"
 #include "menu_callbacks.h"
 #include "menu_env.h"
@@ -32,12 +37,9 @@
 #include "menu_prompts.h"
 
 #ifdef USE_RADIO
-#include <dsd-neo/io/rtl_stream_c.h>
-#include <dsd-neo/ui/ui_dsp_cmd.h>
 #endif
 
 #if defined(__SSE__) || defined(__SSE2__)
-#include <xmmintrin.h>
 #endif
 
 // ---- Main menu actions ----
@@ -112,6 +114,119 @@ act_config_load(void* v) {
     ui_prompt_open_string_async("Load config from path", (def && *def) ? def : "", 512, cb_config_load, v);
 }
 
+static int
+config_profile_copy_source_path(const UiCtx* c, char* path, size_t path_size) {
+    if (!path || path_size == 0) {
+        return 0;
+    }
+    path[0] = '\0';
+
+    const char* src = NULL;
+    if (c && c->state && c->state->config_autosave_path[0] != '\0') {
+        src = c->state->config_autosave_path;
+    } else {
+        src = dsd_user_config_default_path();
+    }
+    if (!src || !*src) {
+        ui_statusf("No config path for profiles");
+        return 0;
+    }
+
+    int n = DSD_SNPRINTF(path, path_size, "%s", src);
+    if (n < 0 || n >= (int)path_size) {
+        path[path_size - 1] = '\0';
+        ui_statusf("Config path too long for profiles");
+        return 0;
+    }
+    return 1;
+}
+
+static void
+config_profile_free_context(ProfileSelCtx* pctx) {
+    if (!pctx) {
+        return;
+    }
+    if (pctx->names) {
+        for (int i = 0; i < pctx->n; i++) {
+            free((void*)pctx->names[i]);
+        }
+    }
+    free((void*)pctx->labels);
+    free((void*)pctx->names);
+    free(pctx);
+}
+
+static ProfileSelCtx*
+config_profile_create_context(dsd_state* state, const char* path, const char** names, int count) {
+    if (!state || !path || !*path || !names || count <= 0) {
+        return NULL;
+    }
+
+    ProfileSelCtx* pctx = (ProfileSelCtx*)calloc(1, sizeof(ProfileSelCtx));
+    if (!pctx) {
+        return NULL;
+    }
+    pctx->state = state;
+    pctx->n = count;
+    int n = DSD_SNPRINTF(pctx->path, sizeof pctx->path, "%s", path);
+    if (n < 0 || n >= (int)sizeof pctx->path) {
+        config_profile_free_context(pctx);
+        return NULL;
+    }
+
+    pctx->labels = (const char**)calloc((size_t)count, sizeof(char*));
+    pctx->names = (const char**)calloc((size_t)count, sizeof(char*));
+    if (!pctx->labels || !pctx->names) {
+        config_profile_free_context(pctx);
+        return NULL;
+    }
+
+    for (int i = 0; i < count; i++) {
+        pctx->names[i] = dsd_strdup(names[i] ? names[i] : "");
+        if (!pctx->names[i]) {
+            config_profile_free_context(pctx);
+            return NULL;
+        }
+        pctx->labels[i] = pctx->names[i];
+    }
+
+    return pctx;
+}
+
+void
+act_config_load_profile(void* v) {
+    UiCtx* c = (UiCtx*)v;
+    if (!c || !c->state) {
+        return;
+    }
+
+    char path[1024];
+    if (!config_profile_copy_source_path(c, path, sizeof path)) {
+        return;
+    }
+
+    const char* names[32];
+    char names_buf[1024];
+    int count =
+        dsd_user_config_list_profiles(path, names, names_buf, sizeof names_buf, (int)(sizeof names / sizeof names[0]));
+    if (count < 0) {
+        ui_statusf("Failed to read profiles from %s", path);
+        return;
+    }
+    if (count == 0) {
+        ui_statusf("No profiles found in %s", path);
+        return;
+    }
+
+    ProfileSelCtx* pctx = config_profile_create_context(c->state, path, names, count);
+    if (!pctx) {
+        ui_statusf("Out of memory");
+        return;
+    }
+
+    ui_chooser_start("Load Profile", pctx->labels, pctx->n, chooser_done_config_profile, pctx);
+}
+
 void
 act_config_save_current(void* v) {
     UiCtx* c = (UiCtx*)v;
@@ -143,7 +258,7 @@ act_config_save_current(void* v) {
 void
 act_config_save_default(void* v) {
     UiCtx* c = (UiCtx*)v;
-    if (!c) {
+    if (!c || !c->state) {
         return;
     }
     const char* path = dsd_user_config_default_path();
@@ -154,6 +269,8 @@ act_config_save_default(void* v) {
     dsdneoUserConfig cfg;
     dsd_snapshot_opts_to_user_config(c->opts, c->state, &cfg);
     if (dsd_user_config_save_atomic(path, &cfg) == 0) {
+        // Keep subsequent "save current" actions pinned to the default path used here.
+        DSD_SNPRINTF(c->state->config_autosave_path, sizeof(c->state->config_autosave_path), "%s", path);
         ui_statusf("Config saved to %s", path);
     } else {
         ui_statusf("Failed to save config to %s", path);
@@ -344,7 +461,7 @@ act_p2_params(void* v) {
     pc->step = 0;
     pc->w = pc->s = pc->n = 0ULL;
     char pre[64];
-    snprintf(pre, sizeof pre, "%llX", (unsigned long long)c->state->p2_wacn);
+    DSD_SNPRINTF(pre, sizeof pre, "%llX", (unsigned long long)c->state->p2_wacn);
     ui_prompt_open_string_async("Enter Phase 2 WACN (HEX)", pre, sizeof pre, cb_p2_step, pc);
 }
 
@@ -584,6 +701,45 @@ io_toggle_call_alert(void* vctx) {
     ui_post_cmd(UI_CMD_CALL_ALERT_TOGGLE, NULL, 0);
 }
 
+typedef struct {
+    const char* label;
+    uint8_t events;
+} CallAlertChoice;
+
+static const CallAlertChoice k_call_alert_choices[] = {
+    {"Off", 0},
+    {"Start", DSD_CALL_ALERT_EVENT_VOICE_START},
+    {"End", DSD_CALL_ALERT_EVENT_VOICE_END},
+    {"Data", DSD_CALL_ALERT_EVENT_DATA},
+    {"Start + End", DSD_CALL_ALERT_EVENT_VOICE_START | DSD_CALL_ALERT_EVENT_VOICE_END},
+    {"Start + Data", DSD_CALL_ALERT_EVENT_VOICE_START | DSD_CALL_ALERT_EVENT_DATA},
+    {"End + Data", DSD_CALL_ALERT_EVENT_VOICE_END | DSD_CALL_ALERT_EVENT_DATA},
+    {"All", DSD_CALL_ALERT_EVENT_ALL},
+};
+
+static const char* const k_call_alert_choice_labels[] = {"Off",         "Start",        "End",        "Data",
+                                                         "Start + End", "Start + Data", "End + Data", "All"};
+
+static void
+chooser_done_call_alert_events(void* u, int sel) {
+    UNUSED(u);
+    if (sel < 0 || sel >= (int)(sizeof k_call_alert_choices / sizeof k_call_alert_choices[0])) {
+        return;
+    }
+
+    uint8_t events = k_call_alert_choices[sel].events;
+    ui_post_cmd(UI_CMD_CALL_ALERT_EVENTS_SET, &events, sizeof events);
+    ui_statusf("Call alert events: %s", k_call_alert_choices[sel].label);
+}
+
+void
+io_select_call_alert_events(void* vctx) {
+    UNUSED(vctx);
+    ui_chooser_start("Call Alert Events", k_call_alert_choice_labels,
+                     (int)(sizeof k_call_alert_choice_labels / sizeof k_call_alert_choice_labels[0]),
+                     chooser_done_call_alert_events, NULL);
+}
+
 void
 io_toggle_cc_candidates(void* vctx) {
     UNUSED(vctx);
@@ -593,10 +749,15 @@ io_toggle_cc_candidates(void* vctx) {
 void
 io_enable_per_call_wav(void* vctx) {
     UiCtx* c = (UiCtx*)vctx;
+    if (!c || !c->opts) {
+        return;
+    }
     if (c->opts->dmr_stereo_wav == 1 && c->opts->wav_out_f != NULL) {
+        c->opts->dmr_stereo_wav = 0;
         ui_post_cmd(UI_CMD_WAV_STOP, NULL, 0);
         ui_statusf("Per-call WAV stop requested");
     } else {
+        c->opts->dmr_stereo_wav = 1;
         ui_post_cmd(UI_CMD_WAV_START, NULL, 0);
         ui_statusf("Per-call WAV start requested");
     }
@@ -682,7 +843,7 @@ io_set_pulse_device_common(void* vctx, int is_input, const char* chooser_title, 
         }
         int name_len = (int)strnlen(dev->name, 511);
         int desc_len = (int)strnlen(dev->description, 255);
-        snprintf(bufs[n], 768, "[%d] %.*s - %.*s", dev->index, name_len, dev->name, desc_len, dev->description);
+        DSD_SNPRINTF(bufs[n], 768, "[%d] %.*s - %.*s", dev->index, name_len, dev->name, desc_len, dev->description);
         labels[n] = bufs[n];
         names[n] = dsd_strdup(dev->name);
         n++;
@@ -729,7 +890,7 @@ io_set_udp_out(void* vctx) {
     }
     u->c = c;
     const char* src = c->opts->udp_hostname[0] ? c->opts->udp_hostname : "127.0.0.1";
-    snprintf(u->host, sizeof u->host, "%.*s", (int)sizeof(u->host) - 1, src);
+    DSD_SNPRINTF(u->host, sizeof u->host, "%.*s", (int)sizeof(u->host) - 1, src);
     ui_prompt_open_string_async("UDP blaster host", u->host, sizeof u->host, cb_udp_out_host, u);
 }
 
@@ -742,7 +903,7 @@ io_tcp_direct_link(void* vctx) {
     }
     u->c = c;
     const char* defh = c->opts->tcp_hostname[0] ? c->opts->tcp_hostname : "localhost";
-    snprintf(u->host, sizeof u->host, "%.*s", (int)sizeof(u->host) - 1, defh);
+    DSD_SNPRINTF(u->host, sizeof u->host, "%.*s", (int)sizeof(u->host) - 1, defh);
     ui_prompt_open_string_async("Enter TCP Direct Link Hostname", u->host, sizeof u->host, cb_tcp_host, u);
 }
 
@@ -816,7 +977,7 @@ io_rigctl_config(void* vctx) {
     }
     u->c = c;
     const char* defh = c->opts->rigctlhostname[0] ? c->opts->rigctlhostname : "localhost";
-    snprintf(u->host, sizeof u->host, "%.*s", (int)sizeof(u->host) - 1, defh);
+    DSD_SNPRINTF(u->host, sizeof u->host, "%.*s", (int)sizeof(u->host) - 1, defh);
     ui_prompt_open_string_async("Enter RIGCTL Hostname", u->host, sizeof u->host, cb_rig_host, u);
 }
 
@@ -881,7 +1042,7 @@ switch_to_udp(void* vctx) {
     }
     u->c = c;
     const char* defa = c->opts->udp_in_bindaddr[0] ? c->opts->udp_in_bindaddr : "127.0.0.1";
-    snprintf(u->addr, sizeof u->addr, "%.*s", (int)sizeof(u->addr) - 1, defa);
+    DSD_SNPRINTF(u->addr, sizeof u->addr, "%.*s", (int)sizeof(u->addr) - 1, defa);
     ui_prompt_open_string_async("Enter UDP bind address", u->addr, sizeof u->addr, cb_udp_in_addr, u);
 }
 
@@ -1102,7 +1263,7 @@ rtl_set_sql(void* v) {
 void
 rtl_set_vol(void* v) {
     UiCtx* c = (UiCtx*)v;
-    ui_prompt_open_int_async("Volume multiplier (0..3)", c->opts->rtl_volume_multiplier, cb_rtl_vol, c);
+    ui_prompt_open_int_async("Monitor gain multiplier (0..3)", c->opts->rtl_volume_multiplier, cb_rtl_vol, c);
 }
 
 void
@@ -1328,6 +1489,62 @@ void
 act_c4fm_clk_sync_toggle(void* v) {
     UNUSED(v);
     UiDspPayload p = {.op = UI_DSP_OP_C4FM_CLK_SYNC_TOGGLE};
+    ui_post_cmd(UI_CMD_DSP_OP, &p, sizeof p);
+}
+
+void
+act_cqpsk_eq_toggle(void* v) {
+    UNUSED(v);
+    UiDspPayload p = {.op = UI_DSP_OP_CQPSK_EQ_TOGGLE};
+    ui_post_cmd(UI_CMD_DSP_OP, &p, sizeof p);
+}
+
+void
+act_cqpsk_eq_taps_up(void* v) {
+    UNUSED(v);
+    UiDspPayload p = {.op = UI_DSP_OP_CQPSK_EQ_TAPS_DELTA, .a = +2};
+    ui_post_cmd(UI_CMD_DSP_OP, &p, sizeof p);
+}
+
+void
+act_cqpsk_eq_taps_dn(void* v) {
+    UNUSED(v);
+    UiDspPayload p = {.op = UI_DSP_OP_CQPSK_EQ_TAPS_DELTA, .a = -2};
+    ui_post_cmd(UI_CMD_DSP_OP, &p, sizeof p);
+}
+
+void
+act_cqpsk_eq_mu_up(void* v) {
+    UNUSED(v);
+    UiDspPayload p = {.op = UI_DSP_OP_CQPSK_EQ_MU_DELTA, .a = +1};
+    ui_post_cmd(UI_CMD_DSP_OP, &p, sizeof p);
+}
+
+void
+act_cqpsk_eq_mu_dn(void* v) {
+    UNUSED(v);
+    UiDspPayload p = {.op = UI_DSP_OP_CQPSK_EQ_MU_DELTA, .a = -1};
+    ui_post_cmd(UI_CMD_DSP_OP, &p, sizeof p);
+}
+
+void
+act_cqpsk_eq_modulus_up(void* v) {
+    UNUSED(v);
+    UiDspPayload p = {.op = UI_DSP_OP_CQPSK_EQ_MODULUS_DELTA, .a = +5};
+    ui_post_cmd(UI_CMD_DSP_OP, &p, sizeof p);
+}
+
+void
+act_cqpsk_eq_modulus_dn(void* v) {
+    UNUSED(v);
+    UiDspPayload p = {.op = UI_DSP_OP_CQPSK_EQ_MODULUS_DELTA, .a = -5};
+    ui_post_cmd(UI_CMD_DSP_OP, &p, sizeof p);
+}
+
+void
+act_cqpsk_eq_reset(void* v) {
+    UNUSED(v);
+    UiDspPayload p = {.op = UI_DSP_OP_CQPSK_EQ_RESET};
     ui_post_cmd(UI_CMD_DSP_OP, &p, sizeof p);
 }
 

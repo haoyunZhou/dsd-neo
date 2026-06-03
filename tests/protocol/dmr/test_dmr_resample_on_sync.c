@@ -16,16 +16,15 @@
  * ring-buffer-relative positions.
  */
 
+#include <dsd-neo/core/opts.h>
+#include <dsd-neo/core/state.h>
+#include <dsd-neo/core/sync_patterns.h>
+#include <dsd-neo/dsp/dmr_sync.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
+#include "dsd-neo/core/safe_api.h"
 
-#include <dsd-neo/core/opts.h>
-#include <dsd-neo/core/state.h>
-#include <dsd-neo/dsp/dmr_sync.h>
-
-/* Tolerance for floating point comparisons */
 #define FLOAT_TOL 0.01f
 
 static int g_test_count = 0;
@@ -49,6 +48,24 @@ check_float(const char* name, float expected, float actual, float tol) {
     }
 }
 
+static float
+sync_ascii_to_symbol(char dibit_char) {
+    switch (dibit_char) {
+        case '0': return +1.0f;
+        case '1': return +3.0f;
+        case '2': return -1.0f;
+        case '3': return -3.0f;
+        default: return 0.0f;
+    }
+}
+
+static void
+fill_symbols_from_sync_ascii(const char* sync, float out[DMR_SYNC_SYMBOLS]) {
+    for (int i = 0; i < DMR_SYNC_SYMBOLS; i++) {
+        out[i] = sync_ascii_to_symbol(sync[i]);
+    }
+}
+
 /**
  * @brief Test history buffer push and get operations.
  */
@@ -57,7 +74,7 @@ test_history_buffer_ops(void) {
     printf("=== test_history_buffer_ops ===\n");
 
     static struct dsd_state state;
-    memset(&state, 0, sizeof(state));
+    DSD_MEMSET(&state, 0, sizeof(state));
 
     /* Initialize history buffer */
     int ret = dmr_sample_history_init(&state);
@@ -100,12 +117,12 @@ test_history_buffer_wrap(void) {
     printf("=== test_history_buffer_wrap ===\n");
 
     static struct dsd_state state;
-    memset(&state, 0, sizeof(state));
+    DSD_MEMSET(&state, 0, sizeof(state));
 
     /* Use small buffer for wrap test */
     state.dmr_sample_history_size = 4;
     state.dmr_sample_history = (float*)malloc(sizeof(float) * 4);
-    memset(state.dmr_sample_history, 0, sizeof(float) * 4);
+    DSD_MEMSET(state.dmr_sample_history, 0, sizeof(float) * 4);
     state.dmr_sample_history_head = 0;
     state.dmr_sample_history_count = 0;
 
@@ -139,15 +156,14 @@ test_sync_correlation(void) {
     printf("=== test_sync_correlation ===\n");
 
     static struct dsd_state state;
-    memset(&state, 0, sizeof(state));
+    DSD_MEMSET(&state, 0, sizeof(state));
 
     /* Initialize history */
     dmr_sample_history_init(&state);
 
-    /* Push ideal BS_VOICE sync pattern: +3/-3 alternating pattern */
-    /* Pattern: {+3, -3, +3, +3, +3, +3, -3, -3, +3, -3, +3, +3, -3, +3, +3, -3, +3, -3, +3, +3, -3, +3, -3, +3} */
-    float bs_voice[] = {+3.0f, -3.0f, +3.0f, +3.0f, +3.0f, +3.0f, -3.0f, -3.0f, +3.0f, -3.0f, +3.0f, +3.0f,
-                        -3.0f, +3.0f, +3.0f, -3.0f, +3.0f, -3.0f, +3.0f, +3.0f, -3.0f, +3.0f, -3.0f, +3.0f};
+    /* Push canonical BS_VOICE sync pattern from sync_patterns.h. */
+    float bs_voice[DMR_SYNC_SYMBOLS];
+    fill_symbols_from_sync_ascii(DMR_BS_VOICE_SYNC, bs_voice);
 
     for (int i = 0; i < DMR_SYNC_SYMBOLS; i++) {
         dmr_sample_history_push(&state, bs_voice[i]);
@@ -179,7 +195,7 @@ test_symbol_extraction(void) {
     printf("=== test_symbol_extraction ===\n");
 
     static struct dsd_state state;
-    memset(&state, 0, sizeof(state));
+    DSD_MEMSET(&state, 0, sizeof(state));
 
     dmr_sample_history_init(&state);
 
@@ -195,8 +211,8 @@ test_symbol_extraction(void) {
     }
 
     /* Push sync pattern (BS_VOICE) */
-    float bs_voice[] = {+3.0f, -3.0f, +3.0f, +3.0f, +3.0f, +3.0f, -3.0f, -3.0f, +3.0f, -3.0f, +3.0f, +3.0f,
-                        -3.0f, +3.0f, +3.0f, -3.0f, +3.0f, -3.0f, +3.0f, +3.0f, -3.0f, +3.0f, -3.0f, +3.0f};
+    float bs_voice[DMR_SYNC_SYMBOLS];
+    fill_symbols_from_sync_ascii(DMR_BS_VOICE_SYNC, bs_voice);
     for (int i = 0; i < DMR_SYNC_SYMBOLS; i++) {
         dmr_sample_history_push(&state, bs_voice[i]);
     }
@@ -208,7 +224,7 @@ test_symbol_extraction(void) {
     /* Verify extracted symbols match what we pushed */
     for (int i = 0; i < DMR_SYNC_SYMBOLS; i++) {
         char name[32];
-        snprintf(name, sizeof(name), "extracted[%d]", i);
+        DSD_SNPRINTF(name, sizeof(name), "extracted[%d]", i);
         check_float(name, bs_voice[i], extracted[i], FLOAT_TOL);
     }
 
@@ -227,10 +243,10 @@ test_cach_redigitize(void) {
     printf("=== test_cach_redigitize ===\n");
 
     static struct dsd_opts opts;
-    memset(&opts, 0, sizeof(opts));
+    DSD_MEMSET(&opts, 0, sizeof(opts));
 
     static struct dsd_state state;
-    memset(&state, 0, sizeof(state));
+    DSD_MEMSET(&state, 0, sizeof(state));
 
     /* Initialize history buffer */
     dmr_sample_history_init(&state);
@@ -262,8 +278,8 @@ test_cach_redigitize(void) {
     }
 
     /* Fill sync region (24 symbols) with BS_VOICE pattern */
-    float bs_voice[] = {+3.0f, -3.0f, +3.0f, +3.0f, +3.0f, +3.0f, -3.0f, -3.0f, +3.0f, -3.0f, +3.0f, +3.0f,
-                        -3.0f, +3.0f, +3.0f, -3.0f, +3.0f, -3.0f, +3.0f, +3.0f, -3.0f, +3.0f, -3.0f, +3.0f};
+    float bs_voice[DMR_SYNC_SYMBOLS];
+    fill_symbols_from_sync_ascii(DMR_BS_VOICE_SYNC, bs_voice);
     for (int i = 0; i < DMR_SYNC_SYMBOLS; i++) {
         test_symbols[DMR_RESAMPLE_SYMBOLS + i] = bs_voice[i];
     }
@@ -276,7 +292,7 @@ test_cach_redigitize(void) {
     /* Allocate payload buffer */
     const int payload_len = DMR_RESAMPLE_SYMBOLS + DMR_SYNC_SYMBOLS;
     state.dmr_payload_buf = (int*)malloc(sizeof(int) * payload_len);
-    memset(state.dmr_payload_buf, 0xFF, sizeof(int) * payload_len);
+    DSD_MEMSET(state.dmr_payload_buf, 0xFF, sizeof(int) * payload_len);
     /* Mimic real decoder state: dmr_payload_p points one past the most recent dibit. */
     state.dmr_payload_p = state.dmr_payload_buf + payload_len;
 
@@ -322,18 +338,18 @@ test_full_resample_on_sync(void) {
     printf("=== test_full_resample_on_sync ===\n");
 
     static struct dsd_opts opts;
-    memset(&opts, 0, sizeof(opts));
+    DSD_MEMSET(&opts, 0, sizeof(opts));
     opts.msize = 128;
 
     static struct dsd_state state;
-    memset(&state, 0, sizeof(state));
+    DSD_MEMSET(&state, 0, sizeof(state));
 
     /* Initialize history buffer */
     dmr_sample_history_init(&state);
 
     /* Allocate payload buffer */
     state.dmr_payload_buf = (int*)malloc(sizeof(int) * DMR_RESAMPLE_SYMBOLS);
-    memset(state.dmr_payload_buf, 0xFF, sizeof(int) * DMR_RESAMPLE_SYMBOLS);
+    DSD_MEMSET(state.dmr_payload_buf, 0xFF, sizeof(int) * DMR_RESAMPLE_SYMBOLS);
 
     /* Push CACH + sync worth of symbols */
     /* CACH with mild DC offset */
@@ -351,8 +367,8 @@ test_full_resample_on_sync(void) {
     }
 
     /* Sync pattern with same DC offset */
-    float bs_voice[] = {+3.0f, -3.0f, +3.0f, +3.0f, +3.0f, +3.0f, -3.0f, -3.0f, +3.0f, -3.0f, +3.0f, +3.0f,
-                        -3.0f, +3.0f, +3.0f, -3.0f, +3.0f, -3.0f, +3.0f, +3.0f, -3.0f, +3.0f, -3.0f, +3.0f};
+    float bs_voice[DMR_SYNC_SYMBOLS];
+    fill_symbols_from_sync_ascii(DMR_BS_VOICE_SYNC, bs_voice);
     for (int i = 0; i < DMR_SYNC_SYMBOLS; i++) {
         dmr_sample_history_push(&state, bs_voice[i] + dc_offset);
     }

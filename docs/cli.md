@@ -5,18 +5,20 @@ Friendly, practical overview of the `dsd-neo` command line. This covers what you
 ## Cheatsheet
 
 - Help: `dsd-neo -h` | UI/logs: `-N`, `-Z` | List devices: `-O`
-- Inputs: `-i pulse | file.wav | rtl[:...] | rtltcp[:...] | soapy[:args[:freq[:gain[:ppm[:bw[:sql[:vol]]]]]]] | tcp[:host:7355] | udp[:bind:7355] | m17udp[:bind:17000] | -`
-- Outputs: `-o pulse | null | udp[:host:23456] | m17udp[:host:17000] | -`
+- Inputs: `-i pulse | file.wav | rtl[:...] | rtltcp[:...] | soapy[:args[:freq[:gain[:ppm[:bw[:sql[:vol]]]]]]] | tcp[:host[:port]] | udp[:bind_addr[:port]] | m17udp[:bind_addr[:port]] | -`
+- Outputs: `-o pulse | null | udp[:host[:port]] | m17udp[:host[:port]] | -`
 - Record/Logs: `-6 file.wav`, `-w file.wav`, `-P`, `-7 ./calls`, `-d ./mbe`, `-J events.log`, `--frame-log frames.log`, `-L lrrp.log`, `-Q dsp.bin`, `-c symbols.bin`, `-r *.mbe`
+- IQ capture/replay: `--iq-capture <path>`, `--iq-capture-format cu8|cf32`, `--iq-capture-max-mb <n>`, `--iq-replay <path>`, `--iq-replay-rate fast|realtime`, `--iq-loop`, `--iq-info <path>`
 - Levels/Audio: `-g 0|1..50`, `-n 0..100`, `-8`, `-V 0|1|2|3`, `-z 0|1|2`, `-y`, `-v 0xF`, `-nm`
 - Modes: `-fa | -fs | -f1 | -f2 | -fd | -fx | -fy | -fz | -fU | -fi | -fn | -fp | -fh | -fH | -fe | -fE | -fm`
-- Inversions/filtering: `-xx`, `-xr`, `-xd`, `-xz`, `-l`, `-u 3`, `-q`
-- Trunking/scan: `-T`, `-Y`, `-C chan.csv`, `-G group.csv`, `-W`, `-E`, `-p`, `-e`, `-I 1234`, `-U 4532`, `-B 12000`, `-t 1`, `--enc-lockout|--enc-follow`, `--no-p25p2-soft`, `--no-p25p1-soft-voice`
+- Inversions/filtering: `-xx`, `-xr`, `-xd`, `-xz`, `-l`, `-q`
+- Trunking/scan: `-T`, `-Y`, `--trunk-scan targets.csv`, `-C chan.csv`, `-G group.csv`, `-W`, `-E`, `-p`, `-e`, `-I 1234`, `-U 4532`, `-B 12000`, `-t 1`, `--enc-lockout|--enc-follow`
 - RTL‑SDR strings: `-i rtl:dev:freq:gain:ppm:bw:sql:vol[:bias=on|off]` or `-i rtltcp:host:port:freq:gain:ppm:bw:sql:vol[:bias=on|off]`
 - Soapy selection: `-i soapy`, `-i soapy:driver=airspy[,serial=...]`, or `-i soapy[:args]:freq[:gain[:ppm[:bw[:sql[:vol]]]]]` (discover args with `SoapySDRUtil --find`)
-- RTL retune control: `--rtl-udp-control <port>` (see `docs/udp-control.md`)
+- RTL retune control: `--rtl-udp-control <port>` binds to loopback by default; use
+  `--rtl-udp-control-bind <ipv4>` for explicit remote exposure (see `docs/udp-control.md`)
 - M17 encode: `-fZ -M M17:CAN:SRC:DST[:RATE[:VOX]]`, `-fP`, `-fB`
-- Keys: `-b`, `-H '<hex...>'`, `-R`, `-1`, `-2`, `-! '<hex...>'`, `-@ '<hex...>'`, `-5 '<hex...>'`, `-9`, `-A`, `-S bits:hex[:offset[:step]]`, `-k keys.csv`, `-K keys_hex.csv`, `--dmr-baofeng-pc5 <hex>`, `--dmr-csi-ee72 <hex>`, `--dmr-vertex-ks-csv <file>`, `-4`, `-0`, `-3`
+- Keys: `-b`, `-H '<hex...>'`, `-R`, `-1`, `-2`, `-! '<hex...>'`, `-@ '<hex...>'`, `-5 '<hex...>'`, `-9`, `-A`, `-S bits:hex[:offset[:step]]`, `-k keys.csv`, `-K keys_hex.csv`, `--dmr-baofeng-pc5 <hex>`, `--dmr-csi-ee72 <hex>`, `--dmr-vertex-ks-csv <file>`, `--dmr-force-algid <hex>`, `-4`, `-0`, `-3`
 - Tools: `--calc-lcn file`, `--calc-cc-freq 451.2375`, `--calc-cc-lcn 50`, `--calc-step 12500`, `--calc-start-lcn 1`, `--auto-ppm`, `--auto-ppm-snr 6`, `--rtltcp-autotune`, `--rdio-mode off|dirwatch|api|both`
 
 ## Quick Start
@@ -25,8 +27,12 @@ Friendly, practical overview of the `dsd-neo` command line. This covers what you
 - PulseAudio in, play out, UI on: `dsd-neo -i pulse -o pulse -N`
 - UDP audio in to PulseAudio out: `dsd-neo -i udp:0.0.0.0:7355 -o pulse -N`
 - Follow DMR trunking (TCP PCM input + rigctl): `dsd-neo -fs -i tcp -U 4532 -T -C dmr_t3_chan.csv -G group.csv -N`
-- Follow DMR trunking (RTL‑SDR): `dsd-neo -fs -i rtl:0:450M:26:-2:8 -T -C connect_plus_chan.csv -G group.csv -N`
+- Follow DMR trunking (RTL‑SDR): `dsd-neo -fs -i rtl:0:450M:26:-2:48:0:2 -T -C connect_plus_chan.csv -G group.csv -N`
 - Follow DMR trunking (SoapySDR): `dsd-neo -fs -i soapy:driver=airspy -T -C connect_plus_chan.csv -G group.csv -N`
+- Scan several P25/DMR targets with one tuner: `dsd-neo -ft -i rtl:0:851.0125M:22:0:48:0:2 --trunk-scan examples/trunk_scan_targets.csv -G examples/group.csv -N`
+- Capture RTL I/Q + metadata: `dsd-neo -i rtl:0:851.375M:22:0:48:0:2 --iq-capture p25-control.iq -N`
+- Inspect a capture: `dsd-neo --iq-info p25-control.iq.json`
+- Replay a capture through demod: `dsd-neo --iq-replay p25-control.iq.json -f1 -N`
 - Play saved MBE files: `dsd-neo -r *.mbe`
 - Decode MBE to a WAV (no speaker output): `dsd-neo -o null -w decoded.wav -r call.mbe`
 
@@ -41,11 +47,13 @@ Tip: If you run with no arguments and no config is loaded, `dsd-neo` starts the 
 - Default path (when `--config` is passed without a path): `${XDG_CONFIG_HOME:-$HOME/.config}/dsd-neo/config.ini`.
 - Alternatively, set `DSD_NEO_CONFIG=<path>` environment variable to enable config loading (this is the only way for a no-arg run to load a config).
 - Precedence detail: `--config /path/to/config.ini` > `--config` default path (ignores `DSD_NEO_CONFIG`) > `DSD_NEO_CONFIG`.
+- Explicit config paths may be absolute, relative, or use `~`/environment expansion; include paths are resolved relative to the containing config file.
 - `--interactive-setup` runs the wizard even when a config exists.
 - `--print-config` prints the effective config as INI after all env/CLI overrides.
 - In Soapy mode, shorthand `-i soapy[:args]:freq[:gain[:ppm[:bw[:sql[:vol]]]]]` is normalized first, so output shows
   `soapy_args` plus shared `rtl_*` tuning keys.
-- When config is enabled, the final settings are autosaved on exit. See `docs/config-system.md` for details.
+- When config is enabled, the final settings are autosaved on exit. Explicit `--profile NAME` runs disable autosave for
+  that process. See `docs/config-system.md` for details.
 
 ## Inputs (`-i`)
 
@@ -58,9 +66,9 @@ Tip: If you run with no arguments and no config is loaded, `dsd-neo` starts the 
   - Examples: `rtl:0:851.375M:22:-2:24:0:2`, `rtl:1:450M:0:0:12:0:2`
 - RTL‑TCP: `-i rtltcp[:host:port[:freq:gain:ppm:bw:sql:vol[:bias[=on|off]]]]`
 - SoapySDR: `-i soapy[:args[:freq[:gain[:ppm[:bw[:sql[:vol]]]]]]]`
-- TCP raw PCM16LE input (mono): `-i tcp[:host:port]` (default port 7355; sample rate uses `-s`, default 48000)
+- TCP raw PCM16LE input (mono): `-i tcp[:host:port]` (bare `tcp` connects to `localhost:7355`; sample rate uses `-s`, default 48000)
 - UDP PCM16 input: `-i udp[:bind_addr:port]` (defaults 127.0.0.1:7355)
-- M17 UDP/IP input: `-i m17udp[:bind_addr:port]` (defaults 127.0.0.1:17000)
+- M17 UDP/IP frame input: `-i m17udp[:bind_addr:port]` (defaults `127.0.0.1:17000`; use `0.0.0.0` only when LAN access is intended; use with `-fU`)
 - stdin (raw PCM16LE mono): `-i -` (sample rate uses `-s`)
 
 - Set sample rate: `-s <rate>` (WAV/TCP/UDP; 48k or 96k typical)
@@ -82,7 +90,7 @@ Tip: If paths or names contain spaces, wrap them in single quotes.
 - PulseAudio: `-o pulse` or a specific sink like `-o pulse:alsa_output.pci-0000_0d_00.3.analog-stereo`
 - Null (no audio): `-o null`
 - UDP audio out (raw PCM): `-o udp[:host:port]` (default 127.0.0.1:23456). See `docs/network-audio.md`.
-- M17 UDP/IP out: `-o m17udp[:host:port]` (default 127.0.0.1:17000)
+- M17 UDP/IP frame out: `-o m17udp[:host:port]` (default 127.0.0.1:17000)
 - stdout (raw decoded audio): `-o -` (see `docs/network-audio.md`)
 
 ## Display & UI
@@ -121,14 +129,40 @@ Tip: If paths or names contain spaces, wrap them in single quotes.
 - `--rdio-api-key <key>` Set API key for `/api/trunk-recorder-call-upload`
 - `--rdio-upload-timeout-ms <ms>` API timeout per call (default 5000 ms)
 - `--rdio-upload-retries <n>` API upload attempts per call (default 1)
+- `--rdio-api-delete-after-upload` Delete the per-call WAV after a successful API-only upload
 - `-r <files>` Play saved MBE files
 - `-c <file>` Save symbol captures to a .bin file
+- `--symbol-capture-format <soft|legacy>` Select symbol capture format. `soft` is the default and preserves dibit reliability, bit LLRs, and raw symbol values for replay; `legacy` writes the historical one-byte hard dibit stream.
 - `-d <dir>` Save raw MBE vocoder frames in this folder
 - `-J <file>` Append event log output
 - `--frame-log <file>` Append frame-level one-line timestamped traces
+
+For rdio-scanner API uploads that should not persist on disk, use API-only mode with a RAM-backed per-call WAV directory
+and post-upload deletion, for example `-7 /dev/shm/dsd-neo-rdio -P --rdio-mode api --rdio-api-delete-after-upload`.
+Rdio API uploads do not follow HTTP redirects; use the final trusted HTTP/HTTPS endpoint directly.
+DirWatch modes keep the WAV and JSON files because the watcher needs stable files to ingest.
 - `-L <file>` Append LRRP (location) data
 - `-Q <file>` Write structured DSP or M17 stream data to `./DSP/<file>`
 - `-q` Reverse mute: mute clear audio, unmute encrypted audio
+
+## IQ Capture And Replay
+
+- `--iq-capture <path>` Capture raw I/Q plus metadata sidecar.
+- `--iq-capture-format <cu8|cf32>` Capture format request (`cu8` default).
+- `--iq-capture-max-mb <n>` Capture byte cap in MiB (`0` unlimited).
+- `--iq-replay <path>` Replay capture metadata/data through the RTL pipeline.
+- `--iq-replay-rate <fast|realtime>` Replay pacing mode (`fast` default).
+- `--iq-loop` Loop replay when EOF is reached.
+- `--iq-info <path>` Print capture metadata summary and exit.
+
+Notes
+
+- Replay and capture are mutually exclusive in one invocation.
+- `--iq-replay` and `--iq-info` accept either the data file or the `.json` metadata path.
+- Retuned captures with v2 replay event timelines can be replayed. Older retuned captures without an event timeline are
+  reported by `--iq-info` and rejected by `--iq-replay`.
+- `-i iqreplay:...` is intentionally not a supported public input form; use `--iq-replay`.
+- More details and format notes: `docs/iq-capture-replay.md`.
 
 ## Levels & Audio
 
@@ -171,9 +205,10 @@ Notes
 - Inversions: `-xx` X2 non‑inverted, `-xr` DMR inverted, `-xd` dPMR inverted, `-xz` M17 inverted
 - Disable DMR/dPMR/NXDN/M17 input filtering: `-l`
 - Analog filter bitmap (advanced): `-v <hex>` (bitmask for HPF/LPF/PBF)
-- Unvoiced speech quality: `-u <1–64>` (default 3)
 - Modulation optimizations: `-ma` (auto), `-mc` (C4FM), `-mg` (GFSK), `-mq` (QPSK), `-m2` (P25p2 QPSK 6000 sps)
 - Relax CRC checks: `-F` (P25p2 MAC_SIGNAL, DMR RAS/CRC, NXDN SACCH/FACCH/CAC/F2U, M17 LSF/PKT)
+- M17 signed voice-stream verification: `--m17-signature-public-key <hex>` accepts a 64-byte secp256r1 public key as
+  raw `X||Y` hex.
 - P25p2 manual WACN/SYSID/CC: `-X <hex>` (e.g., `-X BEE00ABC123`)
 - DMR Tier III Location Area n‑bits: `-D <0–10>`
 - Env (C4FM timing layers):
@@ -186,12 +221,20 @@ Notes
 
 - Enable trunking (NXDN/P25/EDACS/DMR): `-T`
 - Conventional scan mode: `-Y` (not trunking; scans for sync on enabled decoders)
+- Single-tuner trunk scan mode: `--trunk-scan <targets.csv>`
+  - Rotates one tuner across CSV-defined P25 trunk, DMR trunk, and one-frequency DMR targets. Full guide:
+    `docs/trunk-scan.md`.
+  - Requires a live retuning path: RTL-family input opened by DSD-neo, or rigctl control such as `-U 4532`.
+  - Use per-target `chan_csv` entries in the target CSV; global `-C` is rejected in this mode.
+  - Cannot be combined with legacy `-Y` or IQ replay.
+  - Idle dwell: `--trunk-scan-dwell-ms <250..600000>` (default `3000`).
+  - Conventional DMR activity hold: `--trunk-scan-activity-hold-ms <250..600000>` (default `1200`).
+  - Single-tuner limitation: systems not currently parked can be missed while another target is being monitored.
 - Channel map CSV: `-C <file>` (e.g., `connect_plus_chan.csv`)
-- Group list CSV (allow/block + labels): `-G <file>`
+- Group list CSV (allow/block + labels, optional `priority/preempt/audio/record/stream` policy columns): `-G <file>`
 - CSV formats and examples: `docs/csv-formats.md` and `examples/`
 - Use group list as allow/whitelist: `-W`
 - Tune controls: `-E` disable group calls, `-p` disable private calls, `-e` enable data calls, `--enc-lockout` do not tune encrypted P25 calls, `--enc-follow` allow encrypted (default)
-- P25 soft-decision controls: `--no-p25p2-soft` disable P25p2 RS erasure marking, `--no-p25p1-soft-voice` disable P25p1 soft-decision voice FEC
 - Hold talkgroup: `-I <dec>`
 - rigctl over TCP: `-U <port>` (SDR++ default 4532)
 - Set rigctl bandwidth (Hz): `-B <hertz>` (e.g., 7000–48000 by mode)
@@ -202,14 +245,24 @@ Notes
   - Env (DMR): Hangtime and grant timeout overrides:
     - `DSD_NEO_DMR_HANGTIME=<seconds>` — post‑voice hangtime before returning to CC
     - `DSD_NEO_DMR_GRANT_TIMEOUT=<seconds>` — max seconds waiting for voice after grant
+  - Env (priority preemption):
+    - `DSD_NEO_TG_PREEMPT_MIN_DWELL_MS=<ms>` — minimum active call dwell before displacement (default `750`)
+    - `DSD_NEO_TG_PREEMPT_COOLDOWN_MS=<ms>` — cooldown between displacement attempts (default `1000`)
 
 ## RTL‑SDR details (`-i rtl` / `-i rtltcp`)
 
-- Fields: `dev` (device index), `freq` (Hz/MHz), `gain` (0–49), `ppm`, `bw` (kHz: 4, 6, 8, 12, 16, 24, 48), `sql` (dB or linear), `vol` (0–3; typical 1–3), optional `bias[=on|off]`.
+- Fields: `dev` (device index), `freq` (Hz/MHz), `gain` (0–49), `ppm`, `bw` (kHz: 4, 6, 8, 12, 16, 24, 48), `sql` (dB or linear), `vol` (monitor gain, 0–3; typical 1–3), optional `bias[=on|off]`.
+- For DMR data/LRRP on direct RTL input, use `bw=48` when possible, or at least `bw=24`; lower basebands may still decode voice but corrupt data PDUs.
+- Note: For EDACS analog voice follow, `sql <= 0` now uses a bounded fallback watchdog to avoid indefinite VC hold when no release marker is detected.
+- RTL USB, RTL-TCP, SoapySDR, and IQ replay digital decode run in the symbol domain. The digital decoder receives one
+  normalized float per FSK or CQPSK symbol decision; discriminator audio is not used for digital decode.
+- The trailing `vol` field and `rtl_volume` config key are monitor/non-symbol gain only. They do not scale RTL-family
+  digital symbols. `-8` enables the separate source monitor tap.
 - Examples:
   - `-i rtl:0:851.375M:22:-2:24:0:2`
   - `-i rtltcp:192.168.1.10:1234:851.375M:22:-2:24:0:2`
-- External retune control (RTL/RTL‑TCP): `--rtl-udp-control <port>` (see `docs/udp-control.md`)
+- External retune control (RTL/RTL‑TCP): `--rtl-udp-control <port>` listens on `127.0.0.1` by default. Use
+  `--rtl-udp-control-bind <ipv4>` only when the unauthenticated listener must be reachable remotely.
 
 Advanced (env)
 
@@ -222,9 +275,9 @@ Advanced (env)
 
 ## SoapySDR details (`-i soapy`)
 
-- Use this path for non-RTL radios exposed through Soapy modules.
+- Use this path for non-RTL radios exposed through Soapy modules. The backend requires SoapySDR 0.8.1 or newer.
 - Typical workflow:
-  1. Install SoapySDR runtime and the module for your radio.
+  1. Install SoapySDR 0.8.1 or newer and the module for your radio.
   2. Verify Soapy is installed and check plugin search paths: `SoapySDRUtil --info`
   3. Enumerate radios: `SoapySDRUtil --find`
   4. Probe one candidate and capture its args: `SoapySDRUtil --probe="driver=sdrplay"`
@@ -234,19 +287,31 @@ Advanced (env)
   `soapy[:args]:freq[:gain[:ppm[:bw[:sql[:vol]]]]]`.
 - Those trailing fields map to existing shared controls and keys:
   `rtl_freq`, `rtl_gain`, `rtl_ppm`, `rtl_bw_khz`, `rtl_sql`, `rtl_volume`.
+- Additional `[input]` keys expose Soapy-specific capabilities: `soapy_profile`, `soapy_stream_format`,
+  `soapy_antenna`, `soapy_clock`, `soapy_settings`, `soapy_gains`, and `soapy_bandwidth_hz`.
+- `soapy_settings = "key=value[,rx:key=value...]"` writes driver settings through Soapy. For example, SDRplay
+  modules may expose `rfnotch_ctrl`, `dabnotch_ctrl`, `biasT_ctrl`, `agc_setpoint`, or `rfgain_sel`.
+- `soapy_gains = "NAME:dB[,NAME:dB...]"` uses named gain stages and takes precedence over aggregate `rtl_gain`.
 - `--print-config` reflects shorthand as normalized config fields (`soapy_args` + `rtl_*`) rather than the raw input
   string.
 - If your Soapy args string itself contains `:`, prefer config keys (`soapy_args` + `rtl_*`) to avoid ambiguity.
 - `rtl_device` index selection is for `rtl` input and is ignored in Soapy mode.
 - Set an explicit `rtl_freq` for predictable startup frequency (otherwise defaults may not match your target system).
-- Some controls are RTL/RTL-TCP specific and not supported in the Soapy backend path (`bias tee`, direct sampling, offset tuning, xtal/IF-gain/testmode controls, RTL-TCP autotune).
-- The Soapy backend requires an RX stream format of `CF32` or `CS16` from the driver.
+- Some shortcuts are RTL/RTL-TCP specific and not supported in the Soapy backend path (RTL bias-tee UI/CLI shortcut,
+  direct sampling, offset tuning, xtal/IF-gain/testmode controls, RTL-TCP autotune). Use `soapy_settings` for
+  driver-specific controls when the Soapy module exposes them, such as SDRplay `biasT_ctrl`.
+- Native SDRplay/Airspy APIs are intentionally out of scope for now; non-RTL radios are controlled through SoapySDR.
+- The Soapy backend requires an RX stream format of `CF32` or `CS16` from the driver; `soapy_stream_format = "auto"`
+  prefers a supported native format first.
 
 Troubleshooting:
 
-- If you see `SoapySDR backend unavailable in this build.`, rebuild with Soapy enabled and installed.
+- If you see `SoapySDR backend unavailable in this build.`, rebuild with Soapy enabled and SoapySDR 0.8.1 or newer
+  installed.
 - If Soapy device discovery fails, verify Soapy modules are installed and `SOAPY_SDR_PLUGIN_PATH` includes the module directory for your driver.
 - If logs report `invalid args string` or `failed to create device`, re-check your `soapy:` args from `SoapySDRUtil --find` / `--probe`.
+- If logs report `invalid soapy_settings`, `setting ... is unavailable`, or `failed to write setting`, compare your
+  setting names and allowed values with `SoapySDRUtil --probe="<args>"`.
 - If logs report `RX stream formats do not include CF32 or CS16`, that driver/device stream format is not currently usable in this backend.
 - If logs report `SoapySDR: RX overflow count=...`, try lowering `rtl_bw_khz` (config key; for example 48 -> 16) and reduce system load.
 - Capability support varies by driver/device. Some radios do not support one or more of: frequency correction (PPM), manual gain range, or bandwidth control.
@@ -258,6 +323,9 @@ Troubleshooting:
 - Stream encoder: `-fZ` with `-M M17:CAN:SRC:DST[:INPUT_RATE[:VOX]]`
 - BERT encoder: `-fB`
 - Packet encoder: `-fP`
+
+The local encoders emit unencrypted, unsigned frames. M17 CSMA channel access is not implemented; see
+`docs/m17-support.md`.
 
 M17 `-M` details
 
@@ -278,8 +346,8 @@ Examples
 - dPMR/NXDN scrambler (decimal): `-R <dec>`
 - RC4/DES key (hex): `-1 <hex>`
 - TYT Basic Privacy (16‑bit, hex, enforced): `-2 <hex>`
-- TYT Advanced Privacy PC4 (hex stream): `-! '<hex…>'`
-- Retevis Advanced Privacy RC2 (hex stream): `-@ '<hex…>'`
+- TYT Advanced Privacy PC4 (128/256-bit hex stream, groups of 16): `-! '<hex…>'`
+- Retevis Advanced Privacy RC2 (128/256-bit hex stream, groups of 16): `-@ '<hex…>'`
 - TYT Enhanced Privacy AES‑128 (hex stream): `-5 '<hex…>'`
 - Baofeng AP PC5 key override (hex): `--dmr-baofeng-pc5 <hex>` (32 or 64 hex chars)
 - Connect Systems EE72 key override (hex): `--dmr-csi-ee72 <hex>` (18 hex chars)
@@ -291,7 +359,8 @@ Examples
   one-off manual keystream experiments.
 - Import keys CSV (decimal): `-k <file>`
 - Import keys CSV (hex): `-K <file>`
-- Force key over identifiers: `-4` (DMR BP/NXDN scrambler), `-0` (DMR RC4 when PI/LE missing)
+- Force key over identifiers: `-4` (DMR BP/NXDN scrambler), `-0` (DMR RC4 when PI/LE missing),
+  `--dmr-force-algid <hex>` (DMR ALGID when PI/LE missing; `-M` is reserved for M17 in DSD-neo)
 - Disable DMR Late Entry IDs: `-3` (avoid false ENC)
 
 ## Tools & Extras
@@ -315,18 +384,25 @@ These environment variables provide fine‑grained control for power users.
 
 Auto‑PPM (RTL‑SDR)
 
-- `DSD_NEO_AUTO_PPM=1` — enable spectrum‑based drift correction
+- `DSD_NEO_AUTO_PPM=1` — enable carrier/error-based drift correction with spectrum fallback
 - `DSD_NEO_AUTO_PPM_SNR_DB=<dB>` — SNR gate (default 6)
 - `DSD_NEO_AUTO_PPM_PWR_DB=<dB>` — absolute peak gate (default −80)
 - `DSD_NEO_AUTO_PPM_ZEROLOCK_PPM=<ppm>` — zero‑step lock guard (default 0.6)
 - `DSD_NEO_AUTO_PPM_ZEROLOCK_HZ=<Hz>` — frequency lock guard (default 60)
 - `DSD_NEO_AUTO_PPM_FREEZE=0/1` — freeze retunes during training (default 1)
+- `DSD_NEO_P25_AFC_STATUS_GATE=1` — opt in to suppress P25 Phase 1 auto-PPM updates when status symbols classify a frame as subscriber-originated or unknown. Default is advisory only because this direction hint is not reliable on every system.
+- `DSD_NEO_P25_SOFT_ERASURE_THRESHOLD=<0..255>` — shared P25 soft-decision erasure threshold override; defaults to 64. Lower values are more conservative; higher values expand ranked erasure retries.
+- `DSD_NEO_P25P1_SOFT_ERASURE_THRESHOLD=<0..255>` / `DSD_NEO_P25P2_SOFT_ERASURE_THRESHOLD=<0..255>` — phase-specific soft erasure threshold overrides. P25P2 keeps a balanced minimum weakest-symbol prefix even when all symbols are above threshold.
+- `DSD_NEO_P25_SOFT_HARD_OVERRIDE=0|1` — allow conservative soft candidates to override hard-corrected P25 FEC output; default is enabled with strict gates.
 
 Resampler
 
 - `DSD_NEO_RESAMP=48000` — target rate (default); `off` or `0` to disable
 
 FLL/TED controls
+
+These are non-symbol/advanced controls outside the RTL-family digital FSK symbol modem. RTL-family FSK digital decode
+selects its own symbol timing and normalization internally. CQPSK uses its OP25-style symbol chain.
 
 - `DSD_NEO_FLL=0/1` — disable/enable residual CFO frequency‑locked loop (default 0)
 - `DSD_NEO_FLL_ALPHA=<float>`, `DSD_NEO_FLL_BETA=<float>`, `DSD_NEO_FLL_DEADBAND=<float>`, `DSD_NEO_FLL_SLEW=<float>` — loop parameters (mode defaults when unset: analog-ish ≈ 0.0015/0.00015/0.0086/0.012; digital ≈ 0.008/0.0008/0.002/0.004)
@@ -335,6 +411,8 @@ FLL/TED controls
 - `DSD_NEO_TED_FORCE=1` — force TED
 
 FM/C4FM stabilization
+
+These knobs apply to monitor/non-symbol FM discriminator paths, not RTL-family digital symbol output.
 
 - `DSD_NEO_FM_AGC=1` — enable FM AGC (default off)
 - `DSD_NEO_FM_AGC_TARGET`, `DSD_NEO_FM_AGC_MIN`, `DSD_NEO_FM_AGC_ALPHA_UP`, `DSD_NEO_FM_AGC_ALPHA_DOWN`
@@ -351,6 +429,7 @@ Capture/retune behavior
 - `DSD_NEO_DISABLE_FS4_SHIFT=1` — disable +fs/4 capture shift
 - `DSD_NEO_OUTPUT_CLEAR_ON_RETUNE=1` — clear output on retune
 - `DSD_NEO_RETUNE_DRAIN_MS=<ms>` — drain time before retune
+- `DSD_NEO_RETUNE_MUTE_MS=<ms>` — input mute around RTL retunes, default 120ms
 
 RTL‑TCP networking
 
@@ -385,16 +464,22 @@ Tuner autogain (experimental)
 
 Audio/DSP helpers
 
+`DSD_NEO_DEEMPH`, `DSD_NEO_AUDIO_LPF`, and C4FM clock-assist controls are monitor/non-symbol audio helpers for the RTL
+path and non-RTL sample-window paths; they are not part of RTL-family digital FSK symbol decode.
+
 - `DSD_NEO_DEEMPH=off|50|75|nfm` — deemphasis curve
 - `DSD_NEO_AUDIO_LPF=<Hz>|off` — audio low‑pass filter cutoff (or disable)
 - `DSD_NEO_C4FM_CLK=el|mm` — C4FM clock assist mode (Early–Late or M&M)
 - `DSD_NEO_C4FM_CLK_SYNC=1` — enable C4FM clock sync
 - `DSD_NEO_COSTAS_BW=<float>`, `DSD_NEO_COSTAS_DAMPING=<float>` — Costas loop tuning
-- `DSD_NEO_CHANNEL_LPF=0|1` — channel LPF enable/disable (mode‑dependent default)
+- `DSD_NEO_CHANNEL_LPF=0|1` — channel LPF enable/disable (auto-enabled at RTL DSP rates >=20 kHz; mode passbands protect nominal channel edges)
 - `DSD_NEO_WINDOW_FREEZE=1` — freeze symbol‑center window timing for debugging
 - `DSD_NEO_COMBINE_ROT=0|1` — enable combined rotation (default 1)
 - `DSD_NEO_UPSAMPLE_FP=0|1` — enable upsampler fixed‑point path (default 1)
 - `DSD_NEO_CQPSK=1` — enable CQPSK demodulation
+- `DSD_NEO_CQPSK_EQ=0|1` — disable/enable CQPSK CMA equalizer for multipath/ISI mitigation (default on when CQPSK is active)
+- `DSD_NEO_CQPSK_EQ_TAPS=<odd 3..15>`, `DSD_NEO_CQPSK_EQ_MU=<float>`, `DSD_NEO_CQPSK_EQ_MODULUS=<float>` — CMA equalizer tuning
+  These controls are also available live in the ncurses DSP menu under `CQPSK Equalizer...`.
 - `DSD_NEO_CQPSK_SYNC_INV=1`, `DSD_NEO_CQPSK_SYNC_NEG=1` — CQPSK sync polarity tweaks
 
 Misc
@@ -427,8 +512,6 @@ P25 trunking timing
 - `DSD_NEO_P25_WD_MS=<ms>` — P25 state machine watchdog interval (20–2000)
 - `DSD_NEO_P25P1_ERR_HOLD_PCT=<percent>` — extend hangtime when P25p1 IMBE error % exceeds threshold (default 0 = off)
 - `DSD_NEO_P25P1_ERR_HOLD_S=<seconds>` — additional hold seconds when threshold exceeded (default 0 = off)
-- `DSD_NEO_P25P1_SOFT_ERASURE_THRESH=<0..255>` — P25p1 soft-decision erasure threshold (default 64; falls back to `DSD_NEO_P25P2_SOFT_ERASURE_THRESH`)
-- `DSD_NEO_P25P2_SOFT_ERASURE_THRESH=<0..255>` — P25p2 soft-decision erasure threshold (default 64)
 - `DSD_NEO_CC_CACHE=0|1` — enable/disable control channel frequency caching
 - `DSD_NEO_CACHE_DIR=<path>` — override cache directory for CC frequency cache
 
@@ -452,9 +535,13 @@ Debug (verbose/developer)
 - UDP in → Pulse out with UI: `dsd-neo -i udp -o pulse -N`
 - RTL‑TCP in with ncurses UI: `dsd-neo -i rtltcp:127.0.0.1:1234 -N`
 - SoapySDR in with explicit driver args: `dsd-neo -i soapy:driver=sdrplay -N`
+- SoapySDR with SDRplay settings in config: `soapy_settings = "rfnotch_ctrl=true,dabnotch_ctrl=true,biasT_ctrl=false,agc_setpoint=-30,rfgain_sel=4"`
 - SoapySDR args + RTL-style tuning in one input spec: `dsd-neo -i soapy:driver=sdrplay:851.375M:22:-2:24:0:2 -N`
 - Save per‑call WAVs to a folder: `dsd-neo -7 ./calls -P -N`
 - Strictly P25 Phase 1 from TCP audio: `dsd-neo -f1 -i tcp -N`
+- Capture I/Q while decoding RTL input: `dsd-neo -i rtl:0:851.375M:22:0:48:0:2 --iq-capture p25-control.iq -N`
+- Print capture metadata and replayability summary: `dsd-neo --iq-info p25-control.iq.json`
+- Replay capture in realtime loop mode: `dsd-neo --iq-replay p25-control.iq.json --iq-replay-rate realtime --iq-loop -N`
 
 ## Manual Validation Checklist
 

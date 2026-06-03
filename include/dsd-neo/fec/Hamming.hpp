@@ -2,7 +2,6 @@
 #ifndef HAMMING_HPP_e7123c3795b94d14b5774d5d8f016a04
 #define HAMMING_HPP_e7123c3795b94d14b5774d5d8f016a04
 
-#include <assert.h>
 #include <bitset>
 #include <string>
 
@@ -121,7 +120,7 @@ class Hamming_Inteface {
  */
 class Hamming_10_6_3 : public Hamming_Inteface {
   private:
-    static Hamming_10_6_3_data data;
+    static Hamming_10_6_3_data* data();
 
   public:
     /**
@@ -129,11 +128,16 @@ class Hamming_10_6_3 : public Hamming_Inteface {
      * \arg input The sequence to decode.
      * \return Count of detected errors.
      */
-    int decode(std::bitset<10>& input);
+    static int decode(std::bitset<10>& input);
 
     int
-    decode(int input, int* output) {
-        assert(input < 1024 && input >= 0);
+    decode(int input, int* output) override {
+        if (!output || input < 0 || input >= 1024) {
+            if (output) {
+                *output = 0;
+            }
+            return 2;
+        }
 
         std::bitset<10> bitset_input(input);
         int error_count = decode(bitset_input);
@@ -152,7 +156,11 @@ class Hamming_10_6_3 : public Hamming_Inteface {
     }
 
     int
-    decode(char* hex, char* parity) {
+    decode(char* hex, char* parity) override {
+        if (!hex || !parity) {
+            return 2;
+        }
+
         // Make a bitset from hex and parity
         std::bitset<10> value;
         // in the bitset 9 is the left-most and 0 is the right-most
@@ -177,11 +185,13 @@ class Hamming_10_6_3 : public Hamming_Inteface {
         return error_count;
     }
 
-    int encode(std::bitset<6>& input);
+    static int encode(const std::bitset<6>& input);
 
     int
-    encode(int input) {
-        assert(input < 64 && input >= 0);
+    encode(int input) override {
+        if (input < 0 || input >= 64) {
+            return 0;
+        }
 
         std::bitset<6> bitset_input(input);
 
@@ -189,7 +199,11 @@ class Hamming_10_6_3 : public Hamming_Inteface {
     }
 
     void
-    encode(char* hex, char* out_parity) {
+    encode(char* hex, char* out_parity) override {
+        if (!hex || !out_parity) {
+            return;
+        }
+
         // Make a bitset from hex
         std::bitset<6> value;
         // in the bitset 5 is the left-most and 0 is the right-most
@@ -221,18 +235,18 @@ class Hamming_10_6_3_TableImpl_data {
      * hand. Uses Hamming_10_6_3 to build the table.
      */
     Hamming_10_6_3_TableImpl_data() {
-        Hamming_10_6_3 hamming;
+        Hamming_10_6_3 codec;
 
         // Build the tables
         for (int i = 0; i < 1024; i++) {
             int fixed;
-            int error_count = hamming.decode(i, &fixed);
+            int error_count = codec.decode(i, &fixed);
             fixed_values[i] = fixed;
             error_counts[i] = error_count;
         }
 
         for (int i = 0; i < 64; i++) {
-            int parity = hamming.encode(i);
+            int parity = codec.encode(i);
             encode_parities[i] = parity;
         }
     }
@@ -243,18 +257,24 @@ class Hamming_10_6_3_TableImpl_data {
  */
 class Hamming_10_6_3_TableImpl : public Hamming_Inteface {
   private:
-    static Hamming_10_6_3_TableImpl_data data;
+    static Hamming_10_6_3_TableImpl_data* data();
 
   public:
-    int decode(int input, int* output);
+    int decode(int input, int* output) override;
 
     static int
-    convert_hex_to_int(char* hex) {
+    convert_hex_to_int(const char* hex) {
+        if (!hex) {
+            return -1;
+        }
+
         // Make an int from hex
         int value = 0;
         // in the bitset 9 is the left-most and 0 is the right-most
         for (unsigned int i = 0; i < 6; i++) {
-            assert(hex[i] == 0 || hex[i] == 1);
+            if (hex[i] != 0 && hex[i] != 1) {
+                return -1;
+            }
             value <<= 1;
             value |= hex[i];
         }
@@ -263,17 +283,25 @@ class Hamming_10_6_3_TableImpl : public Hamming_Inteface {
     }
 
     static int
-    convert_hex_parity_to_int(char* hex, char* parity) {
+    convert_hex_parity_to_int(const char* hex, const char* parity) {
+        if (!hex || !parity) {
+            return -1;
+        }
+
         // Make an int from hex and parity
         int value = 0;
         // in the bitset 9 is the left-most and 0 is the right-most
         for (unsigned int i = 0; i < 6; i++) {
-            assert(hex[i] == 0 || hex[i] == 1);
+            if (hex[i] != 0 && hex[i] != 1) {
+                return -1;
+            }
             value <<= 1;
             value |= hex[i];
         }
         for (unsigned int i = 0; i < 4; i++) {
-            assert(parity[i] == 0 || parity[i] == 1);
+            if (parity[i] != 0 && parity[i] != 1) {
+                return -1;
+            }
             value <<= 1;
             value |= parity[i];
         }
@@ -283,6 +311,9 @@ class Hamming_10_6_3_TableImpl : public Hamming_Inteface {
 
     static void
     convert_int_to_hex(int value, char* hex) {
+        if (!hex || value < 0) {
+            return;
+        }
         unsigned int v = value;
         for (unsigned int i = 0; i < 6; i++) {
             hex[5 - i] = v & 1;
@@ -291,8 +322,11 @@ class Hamming_10_6_3_TableImpl : public Hamming_Inteface {
     }
 
     int
-    decode(char* hex, char* parity) {
+    decode(char* hex, char* parity) override {
         int value = convert_hex_parity_to_int(hex, parity);
+        if (value < 0) {
+            return 2;
+        }
         int fixed;
         int error_count = decode(value, &fixed);
 
@@ -306,11 +340,14 @@ class Hamming_10_6_3_TableImpl : public Hamming_Inteface {
         return error_count;
     }
 
-    int encode(int input);
+    int encode(int input) override;
 
     void
-    encode(char* hex, char* out_parity) {
+    encode(char* hex, char* out_parity) override {
         int value = convert_hex_to_int(hex);
+        if (value < 0 || !out_parity) {
+            return;
+        }
         int parity = encode(value);
 
         // Put the calculated parity in the form of a char array

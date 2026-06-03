@@ -16,16 +16,21 @@
 #include <atomic>
 #include <cmath>
 #include <dsd-neo/dsp/demod_state.h>
+#include <dsd-neo/dsp/equalizer.h>
+#include <dsd-neo/dsp/ted.h>
 #include <dsd-neo/io/rtl_metrics.h>
+#include <dsd-neo/io/rtl_stream_c.h>
 #include <pffft.h>
 #include <string.h>
 
+#include "rtl_stream_shared.hpp"
+
 /* Spectrum capture and carrier diagnostics shared with RTL orchestrator. */
 static const int kSpecMaxN = 1024; /* Max FFT size (power of two) */
-float g_spec_db[kSpecMaxN];
-std::atomic<int> g_spec_rate_hz{0};
-std::atomic<int> g_spec_ready{0};
-std::atomic<int> g_spec_N{256}; /* default N */
+static float g_spec_db[kSpecMaxN];
+static std::atomic<int> g_spec_rate_hz{0};
+static std::atomic<int> g_spec_ready{0};
+static std::atomic<int> g_spec_N{256}; /* default N */
 std::atomic<double> g_spec_peak_db{-100.0};
 std::atomic<double> g_spec_snr_db{-100.0};
 /* Carrier diagnostics (updated alongside spectrum) */
@@ -36,15 +41,10 @@ static std::atomic<int> g_carrier_lock{0};
 static std::atomic<int> g_nco_q15{0};
 static std::atomic<int> g_demod_rate_hz{0};
 static std::atomic<int> g_costas_err_avg_q14{0};
+static std::atomic<int> g_costas_err_raw_avg_q14{0};
+static std::atomic<int> g_costas_conf_avg_q14{0};
+static std::atomic<int> g_costas_zero_conf_pct{0};
 static std::atomic<double> g_fll_band_edge_freq_rad{0.0}; /* FLL band-edge NCO freq (rad/sample) */
-
-/* Demodulator state (defined in rtl_sdr_fm.cpp) used for CFO/Costas metrics. */
-extern demod_state demod;
-
-/* SNR estimates from demod thread (defined in rtl_sdr_fm.cpp). */
-extern std::atomic<double> g_snr_c4fm_db;
-extern std::atomic<double> g_snr_qpsk_db;
-extern std::atomic<double> g_snr_gfsk_db;
 
 /* Supervisory tuner autogain gate (0/1), controlled via env/UI. */
 std::atomic<int> g_tuner_autogain_on{0};
@@ -64,6 +64,53 @@ std::atomic<double> g_auto_ppm_est_ppm{0.0};
 std::atomic<int> g_auto_ppm_last_dir{0};
 std::atomic<int> g_auto_ppm_cooldown{0};
 
+static int
+cqpsk_loop_lock_heuristic(float total_freq_rad, int out_rate_hz) {
+    static int prev_valid = 0;
+    static float prev_total_freq_rad = 0.0f;
+    static int freq_stable_blocks = 0;
+
+    if (!demod.cqpsk_enable || out_rate_hz <= 0) {
+        prev_valid = 0;
+        freq_stable_blocks = 0;
+        return 0;
+    }
+
+    const ted_state_t* ted = &demod.ted_state;
+    if (!demod.fll_band_edge_state.initialized || !demod.costas_state.initialized || ted->lock_count < 24) {
+        prev_total_freq_rad = total_freq_rad;
+        prev_valid = 1;
+        freq_stable_blocks = 0;
+        return 0;
+    }
+
+    double delta_hz = 0.0;
+    if (prev_valid) {
+        delta_hz = fabs((double)(total_freq_rad - prev_total_freq_rad)) * (double)out_rate_hz / (2.0 * M_PI);
+    }
+    prev_total_freq_rad = total_freq_rad;
+    prev_valid = 1;
+
+    if (delta_hz < 75.0) {
+        if (freq_stable_blocks < 1000) {
+            freq_stable_blocks++;
+        }
+    } else {
+        freq_stable_blocks = 0;
+    }
+
+    float ted_lock = ted->lock_accum / (float)ted->lock_count;
+    float costas_err = (float)demod.costas_err_avg_q14 / 16384.0f;
+    float fll_abs = fabsf(demod.fll_band_edge_state.freq);
+    float fll_limit = fabsf(demod.fll_band_edge_state.max_freq);
+    if (!std::isfinite(fll_limit) || fll_limit <= 0.0f) {
+        fll_limit = 1.0f;
+    }
+    float fll_lock_limit = fll_limit * 0.95f;
+
+    return (freq_stable_blocks >= 2 && ted_lock > 0.25f && costas_err < 0.65f && fll_abs < fll_lock_limit) ? 1 : 0;
+}
+
 static inline PFFFT_Setup*
 pffft_get_cached_setup(int N) {
     static PFFFT_Setup* setup = nullptr;
@@ -78,6 +125,340 @@ pffft_get_cached_setup(int N) {
         setup_N = N;
     }
     return setup;
+}
+
+static inline const float*
+rtl_metrics_hann_window(int N) {
+    alignas(16) static float window[kSpecMaxN];
+    static int window_N = 0;
+    if (window_N != N) {
+        if (N <= 1) {
+            window[0] = 1.0f;
+        } else {
+            const float scale = 2.0f * static_cast<float>(M_PI) / static_cast<float>(N - 1);
+            for (int n = 0; n < N; n++) {
+                window[n] = 0.5f * (1.0f - cosf(scale * static_cast<float>(n)));
+            }
+        }
+        window_N = N;
+    }
+    return window;
+}
+
+namespace {
+
+struct rtl_metrics_fft_frame {
+    int N = 0;
+    int take = 0;
+    int start = 0;
+    float meanI = 0.0f;
+    float meanQ = 0.0f;
+};
+
+struct rtl_metrics_peak_metrics {
+    int i_max = 0;
+    float p_max = -100.0f;
+    float spec_snr_db = -100.0f;
+    double df_spec_hz = 0.0;
+};
+
+struct rtl_metrics_nco_metrics {
+    float total_freq_rad = 0.0f;
+    double cfo_hz = 0.0;
+};
+
+} // namespace
+
+static int
+rtl_metrics_fft_size(void) {
+    int N = g_spec_N.load(std::memory_order_relaxed);
+    if (N < 64) {
+        N = 64;
+    }
+    if (N > kSpecMaxN) {
+        N = kSpecMaxN;
+    }
+    return N;
+}
+
+static rtl_metrics_fft_frame
+rtl_metrics_prepare_fft_input(const float* iq_interleaved, int pairs, int N, float* z) {
+    rtl_metrics_fft_frame frame = {};
+    frame.N = N;
+    frame.take = (pairs >= N) ? N : pairs;
+    frame.start = pairs - frame.take;
+
+    double sumI = 0.0;
+    double sumQ = 0.0;
+    for (int n = 0; n < frame.take; n++) {
+        int idx = frame.start + n;
+        sumI += static_cast<double>(iq_interleaved[(size_t)(idx << 1)]);
+        sumQ += static_cast<double>(iq_interleaved[(size_t)(idx << 1) + 1]);
+    }
+    if (frame.take > 0) {
+        frame.meanI = static_cast<float>(sumI / static_cast<double>(frame.take));
+        frame.meanQ = static_cast<float>(sumQ / static_cast<double>(frame.take));
+    }
+
+    if (frame.take < N) {
+        for (int n = 0; n < (N << 1); n++) {
+            z[n] = 0.0f;
+        }
+    }
+
+    const float* hann = rtl_metrics_hann_window(N);
+    for (int n = 0; n < frame.take; n++) {
+        int idx = frame.start + n;
+        float I = iq_interleaved[(size_t)(idx << 1)];
+        float Q = iq_interleaved[(size_t)(idx << 1) + 1];
+        float w = hann[n];
+        z[(n << 1)] = w * (I - frame.meanI);
+        z[(n << 1) + 1] = w * (Q - frame.meanQ);
+    }
+    return frame;
+}
+
+static double
+rtl_metrics_phase_cfo_hz(const float* iq_interleaved, const rtl_metrics_fft_frame& frame, int out_rate_hz) {
+    if (frame.take < 2 || out_rate_hz <= 0) {
+        return 0.0;
+    }
+
+    double acc_re = 0.0;
+    double acc_im = 0.0;
+    float prevI = iq_interleaved[(frame.start << 1)] - frame.meanI;
+    float prevQ = iq_interleaved[(frame.start << 1) + 1] - frame.meanQ;
+    for (int n = 1; n < frame.take; n++) {
+        int idx = frame.start + n;
+        float I = iq_interleaved[(size_t)(idx << 1)] - frame.meanI;
+        float Q = iq_interleaved[(size_t)(idx << 1) + 1] - frame.meanQ;
+        acc_re +=
+            static_cast<double>(prevI) * static_cast<double>(I) + static_cast<double>(prevQ) * static_cast<double>(Q);
+        acc_im +=
+            static_cast<double>(prevI) * static_cast<double>(Q) - static_cast<double>(prevQ) * static_cast<double>(I);
+        prevI = I;
+        prevQ = Q;
+    }
+
+    if (fabs(acc_re) <= 1e-9 && fabs(acc_im) <= 1e-9) {
+        return 0.0;
+    }
+    return atan2(acc_im, acc_re) * static_cast<double>(out_rate_hz) / (2.0 * M_PI);
+}
+
+static void
+rtl_metrics_smooth_spectrum_bins(int N, int out_rate_hz, const float* z) {
+    const float eps = 1e-12f;
+    const bool first = (g_spec_ready.load(std::memory_order_relaxed) == 0);
+    for (int k = 0; k < N; k++) {
+        int kk = k + (N >> 1);
+        if (kk >= N) {
+            kk -= N;
+        }
+        float re = z[(kk << 1)];
+        float im = z[(kk << 1) + 1];
+        float mag2 = re * re + im * im;
+        float db = 10.0f * log10f(mag2 + eps);
+        g_spec_db[k] = first ? db : (0.8f * g_spec_db[k] + 0.2f * db);
+    }
+    g_spec_rate_hz.store(out_rate_hz, std::memory_order_relaxed);
+    g_spec_ready.store(1, std::memory_order_release);
+}
+
+static void
+rtl_metrics_peak_search_bounds(int N, int* k_center_i, int* i_lo, int* i_hi) {
+    *k_center_i = N >> 1;
+    int W = N >> 2;
+    if (W < 8) {
+        W = 8;
+    }
+    *i_lo = *k_center_i - W;
+    *i_hi = *k_center_i + W;
+    if (*i_lo < 2) {
+        *i_lo = 2;
+    }
+    if (*i_hi > N - 3) {
+        *i_hi = N - 3;
+    }
+}
+
+static void
+rtl_metrics_peak_find_bin(int i_lo, int i_hi, int* i_max, float* p_max) {
+    *i_max = i_lo;
+    *p_max = g_spec_db[i_lo];
+    for (int k = i_lo + 1; k <= i_hi; k++) {
+        if (g_spec_db[k] > *p_max) {
+            *p_max = g_spec_db[k];
+            *i_max = k;
+        }
+    }
+}
+
+static float
+rtl_metrics_peak_noise_snr(int i_lo, int i_hi, int i_max, float p_max) {
+    alignas(16) float noise_bins[kSpecMaxN];
+    int noise_count = 0;
+    for (int k = i_lo; k <= i_hi; k++) {
+        if (k < i_max - 2 || k > i_max + 2) {
+            noise_bins[noise_count++] = g_spec_db[k];
+        }
+    }
+    if (noise_count < 16) {
+        return -100.0f;
+    }
+    int mid = noise_count / 2;
+    std::nth_element(noise_bins, noise_bins + mid, noise_bins + noise_count);
+    return p_max - noise_bins[mid];
+}
+
+static float
+rtl_metrics_peak_center_tone_filter(int N, int k_center_i, int i_max, float p_max, float spec_snr_db) {
+    if (N < 3 || i_max <= 0 || i_max + 1 >= N || i_max != k_center_i) {
+        return spec_snr_db;
+    }
+    float side_max = (g_spec_db[i_max - 1] > g_spec_db[i_max + 1]) ? g_spec_db[i_max - 1] : g_spec_db[i_max + 1];
+    if ((p_max - side_max) > 12.0f) {
+        return -100.0f;
+    }
+    return spec_snr_db;
+}
+
+static double
+rtl_metrics_peak_df_spec_hz(int N, int i_max, int out_rate_hz) {
+    if (!(N >= 3 && i_max > 0 && i_max + 1 < N && out_rate_hz > 0)) {
+        return 0.0;
+    }
+
+    double p1 = g_spec_db[i_max - 1];
+    double p2 = g_spec_db[i_max];
+    double p3 = g_spec_db[i_max + 1];
+    double denom = (p1 - 2.0 * p2 + p3);
+    double delta = (fabs(denom) > 1e-9) ? (0.5 * (p1 - p3) / denom) : 0.0;
+    if (delta < -0.5) {
+        delta = -0.5;
+    } else if (delta > 0.5) {
+        delta = 0.5;
+    }
+
+    double center = static_cast<double>(N) / 2.0;
+    double k_off = (static_cast<double>(i_max) + delta) - center;
+    return k_off * static_cast<double>(out_rate_hz) / static_cast<double>(N);
+}
+
+static rtl_metrics_peak_metrics
+rtl_metrics_compute_peak_metrics(int N, int out_rate_hz) {
+    rtl_metrics_peak_metrics peak = {};
+    int k_center_i = 0;
+    int i_lo = 0;
+    int i_hi = 0;
+    rtl_metrics_peak_search_bounds(N, &k_center_i, &i_lo, &i_hi);
+    rtl_metrics_peak_find_bin(i_lo, i_hi, &peak.i_max, &peak.p_max);
+    peak.spec_snr_db = rtl_metrics_peak_noise_snr(i_lo, i_hi, peak.i_max, peak.p_max);
+    peak.spec_snr_db = rtl_metrics_peak_center_tone_filter(N, k_center_i, peak.i_max, peak.p_max, peak.spec_snr_db);
+    peak.df_spec_hz = rtl_metrics_peak_df_spec_hz(N, peak.i_max, out_rate_hz);
+    return peak;
+}
+
+static rtl_metrics_nco_metrics
+rtl_metrics_compute_nco_metrics(int out_rate_hz) {
+    rtl_metrics_nco_metrics nco = {};
+    if (out_rate_hz <= 0) {
+        return nco;
+    }
+
+    if (demod.cqpsk_enable) {
+        float fll_freq = demod.fll_band_edge_state.freq;
+        float costas_freq = demod.costas_state.freq;
+        int sps = demod.ted_sps > 0 ? demod.ted_sps : 5;
+        float costas_freq_sample_rate = costas_freq / static_cast<float>(sps);
+        nco.total_freq_rad = fll_freq + costas_freq_sample_rate;
+        demod.fll_freq = nco.total_freq_rad;
+        demod.fll_phase = demod.fll_band_edge_state.phase + demod.costas_state.phase;
+    } else {
+        nco.total_freq_rad = demod.fll_freq;
+    }
+    nco.cfo_hz = static_cast<double>(nco.total_freq_rad) * static_cast<double>(out_rate_hz) / (2.0 * M_PI);
+    return nco;
+}
+
+static void
+rtl_metrics_store_nco_metrics(const rtl_metrics_nco_metrics& nco, int out_rate_hz) {
+    g_cfo_nco_hz.store(nco.cfo_hz, std::memory_order_relaxed);
+    int fll_freq_q15_compat = static_cast<int>(lrint(nco.total_freq_rad * (32768.0 / (2.0 * M_PI))));
+    g_nco_q15.store(fll_freq_q15_compat, std::memory_order_relaxed);
+    g_demod_rate_hz.store(out_rate_hz, std::memory_order_relaxed);
+    g_costas_err_avg_q14.store(demod.costas_err_avg_q14, std::memory_order_relaxed);
+    g_costas_err_raw_avg_q14.store(demod.costas_err_raw_avg_q14, std::memory_order_relaxed);
+    g_costas_conf_avg_q14.store(demod.costas_conf_avg_q14, std::memory_order_relaxed);
+    g_costas_zero_conf_pct.store(demod.costas_zero_conf_pct, std::memory_order_relaxed);
+}
+
+static int
+rtl_metrics_outer_loop_gate(double df_spec_hz, int out_rate_hz) {
+    if (!(demod.cqpsk_enable && demod.fll_enabled && out_rate_hz > 0)) {
+        return 0;
+    }
+    double snr_qpsk = g_snr_qpsk_db.load(std::memory_order_relaxed);
+    double abs_df = fabs(df_spec_hz);
+    return (snr_qpsk > -3.0 && abs_df > 150.0 && abs_df < 2500.0) ? 1 : 0;
+}
+
+static void
+rtl_metrics_outer_loop_bounds(float* fll_min, float* fll_max) {
+    *fll_min = demod.fll_band_edge_state.min_freq;
+    *fll_max = demod.fll_band_edge_state.max_freq;
+    if (!std::isfinite(*fll_min) || !std::isfinite(*fll_max) || *fll_min >= *fll_max) {
+        *fll_min = -1.0f;
+        *fll_max = 1.0f;
+    }
+}
+
+static float
+rtl_metrics_outer_loop_clamp(float value, float lo, float hi) {
+    if (value > hi) {
+        return hi;
+    }
+    if (value < lo) {
+        return lo;
+    }
+    return value;
+}
+
+static void
+rtl_metrics_outer_loop_update_legacy_integrator(float delta_applied, float fll_min, float fll_max) {
+    float i_new = demod.fll_state.integrator + delta_applied;
+    demod.fll_state.integrator = rtl_metrics_outer_loop_clamp(i_new, fll_min, fll_max);
+}
+
+static rtl_metrics_nco_metrics
+rtl_metrics_apply_cqpsk_outer_loop(const rtl_metrics_nco_metrics& base, double df_spec_hz, int out_rate_hz) {
+    rtl_metrics_nco_metrics nco = base;
+    if (!rtl_metrics_outer_loop_gate(df_spec_hz, out_rate_hz)) {
+        return nco;
+    }
+
+    const double k_outer = 0.05;
+    double delta_rad = k_outer * df_spec_hz * 2.0 * M_PI / static_cast<double>(out_rate_hz);
+    if (fabs(delta_rad) <= 1e-9) {
+        return nco;
+    }
+
+    float fll_min = 0.0f;
+    float fll_max = 0.0f;
+    rtl_metrics_outer_loop_bounds(&fll_min, &fll_max);
+
+    float f_old = demod.fll_band_edge_state.freq;
+    float f_new = rtl_metrics_outer_loop_clamp(f_old + static_cast<float>(delta_rad), fll_min, fll_max);
+    demod.fll_band_edge_state.freq = f_new;
+
+    int sps = demod.ted_sps > 0 ? demod.ted_sps : 5;
+    float costas_freq_sample_rate = demod.costas_state.freq / static_cast<float>(sps);
+    nco.total_freq_rad = f_new + costas_freq_sample_rate;
+    demod.fll_freq = nco.total_freq_rad;
+
+    rtl_metrics_outer_loop_update_legacy_integrator(f_new - f_old, fll_min, fll_max);
+    nco.cfo_hz = static_cast<double>(nco.total_freq_rad) * static_cast<double>(out_rate_hz) / (2.0 * M_PI);
+    return nco;
 }
 
 /**
@@ -97,159 +478,21 @@ rtl_metrics_update_spectrum_from_iq(const float* iq_interleaved, int len_interle
         return;
     }
     const int pairs = len_interleaved >> 1;
-    /* Use current FFT size; clamp to bounds */
-    int N = g_spec_N.load(std::memory_order_relaxed);
-    if (N < 64) {
-        N = 64;
-    }
-    if (N > kSpecMaxN) {
-        N = kSpecMaxN;
-    }
-    /* Prepare last N complex samples (I/Q) with DC removal and Hann window */
+    int N = rtl_metrics_fft_size();
     alignas(16) static float z[2 * kSpecMaxN];
-    int take = (pairs >= N) ? N : pairs;
-    int start = (pairs - take);
-    double sumI = 0.0;
-    double sumQ = 0.0;
-    for (int n = 0; n < take; n++) {
-        int idx = start + n;
-        float I = iq_interleaved[(size_t)(idx << 1) + 0];
-        float Q = iq_interleaved[(size_t)(idx << 1) + 1];
-        sumI += static_cast<double>(I);
-        sumQ += static_cast<double>(Q);
-    }
-    float meanI = (take > 0) ? static_cast<float>(sumI / static_cast<double>(take)) : 0.0f;
-    float meanQ = (take > 0) ? static_cast<float>(sumQ / static_cast<double>(take)) : 0.0f;
-    for (int n = 0; n < (N << 1); n++) {
-        z[n] = 0.0f;
-    }
-    for (int n = 0; n < take; n++) {
-        float w =
-            0.5f * (1.0f - cosf(2.0f * static_cast<float>(M_PI) * static_cast<float>(n) / static_cast<float>(N - 1)));
-        int idx = start + n;
-        float I = iq_interleaved[(size_t)(idx << 1) + 0];
-        float Q = iq_interleaved[(size_t)(idx << 1) + 1];
-        z[(n << 1) + 0] = w * (static_cast<float>(I) - meanI);
-        z[(n << 1) + 1] = w * (static_cast<float>(Q) - meanQ);
-    }
-    double phase_cfo_hz = 0.0;
-    if (take >= 2 && out_rate_hz > 0) {
-        double acc_re = 0.0;
-        double acc_im = 0.0;
-        float prevI = iq_interleaved[(start << 1) + 0] - meanI;
-        float prevQ = iq_interleaved[(start << 1) + 1] - meanQ;
-        for (int n = 1; n < take; n++) {
-            int idx = start + n;
-            float I = iq_interleaved[(size_t)(idx << 1) + 0] - meanI;
-            float Q = iq_interleaved[(size_t)(idx << 1) + 1] - meanQ;
-            acc_re += static_cast<double>(prevI) * static_cast<double>(I)
-                      + static_cast<double>(prevQ) * static_cast<double>(Q);
-            acc_im += static_cast<double>(prevI) * static_cast<double>(Q)
-                      - static_cast<double>(prevQ) * static_cast<double>(I);
-            prevI = I;
-            prevQ = Q;
-        }
-        if (fabs(acc_re) > 1e-9 || fabs(acc_im) > 1e-9) {
-            phase_cfo_hz = atan2(acc_im, acc_re) * static_cast<double>(out_rate_hz) / (2.0 * M_PI);
-        }
-    }
+    rtl_metrics_fft_frame frame = rtl_metrics_prepare_fft_input(iq_interleaved, pairs, N, z);
+    double phase_cfo_hz = rtl_metrics_phase_cfo_hz(iq_interleaved, frame, out_rate_hz);
     g_resid_cfo_phase_hz.store(phase_cfo_hz, std::memory_order_relaxed);
-    auto update_spectrum = [&](auto&& re_at, auto&& im_at) {
-        const float eps = 1e-12f;
-        const bool first = (g_spec_ready.load(std::memory_order_relaxed) == 0);
-        for (int k = 0; k < N; k++) {
-            int kk = k + (N >> 1);
-            if (kk >= N) {
-                kk -= N;
-            }
-            float re = re_at(kk);
-            float im = im_at(kk);
-            float mag2 = re * re + im * im;
-            float db = 10.0f * log10f(mag2 + eps);
-            float prev = g_spec_db[k];
-            if (first) {
-                g_spec_db[k] = db;
-            } else {
-                g_spec_db[k] = 0.8f * prev + 0.2f * db;
-            }
-        }
-        g_spec_rate_hz.store(out_rate_hz, std::memory_order_relaxed);
-        g_spec_ready.store(1, std::memory_order_release);
-    };
 
     PFFFT_Setup* setup = pffft_get_cached_setup(N);
     if (setup) {
         pffft_transform_ordered(setup, z, z, nullptr, PFFFT_FORWARD);
-        update_spectrum([&](int idx) { return z[(idx << 1) + 0]; }, [&](int idx) { return z[(idx << 1) + 1]; });
+        rtl_metrics_smooth_spectrum_bins(N, out_rate_hz, z);
     }
-    /* Compute peak/noise metrics and residual CFO from the strongest bin near DC. */
-    int k_center_i = N >> 1;
-    int W = N >> 2;
-    if (W < 8) {
-        W = 8;
-    }
-    int i_lo = k_center_i - W;
-    int i_hi = k_center_i + W;
-    if (i_lo < 2) {
-        i_lo = 2;
-    }
-    if (i_hi > N - 3) {
-        i_hi = N - 3;
-    }
-    int i_max = i_lo;
-    float p_max = g_spec_db[i_lo];
-    for (int k = i_lo + 1; k <= i_hi; k++) {
-        float v = g_spec_db[k];
-        if (v > p_max) {
-            p_max = v;
-            i_max = k;
-        }
-    }
-    alignas(16) float noise_bins[kSpecMaxN];
-    int noise_count = 0;
-    for (int k = i_lo; k <= i_hi; k++) {
-        if (k >= i_max - 2 && k <= i_max + 2) {
-            continue;
-        }
-        noise_bins[noise_count++] = g_spec_db[k];
-    }
-    float spec_snr_db = -100.0f;
-    if (noise_count >= 16) {
-        int mid = noise_count / 2;
-        std::nth_element(noise_bins, noise_bins + mid, noise_bins + noise_count);
-        spec_snr_db = p_max - noise_bins[mid];
-    }
-    if (i_max == k_center_i) {
-        float l = g_spec_db[i_max - 1];
-        float r = g_spec_db[i_max + 1];
-        float side_max = (l > r) ? l : r;
-        if ((p_max - side_max) > 12.0f) {
-            spec_snr_db = -100.0f;
-        }
-    }
-    g_spec_peak_db.store(p_max, std::memory_order_relaxed);
-    g_spec_snr_db.store(spec_snr_db, std::memory_order_relaxed);
-    double df_spec_hz = 0.0;
-    if (N >= 3 && i_max > 0 && i_max + 1 < N) {
-        double p1 = g_spec_db[i_max - 1];
-        double p2 = g_spec_db[i_max + 0];
-        double p3 = g_spec_db[i_max + 1];
-        double denom = (p1 - 2.0 * p2 + p3);
-        double delta = 0.0;
-        if (fabs(denom) > 1e-9) {
-            delta = 0.5 * (p1 - p3) / denom;
-            if (delta < -0.5) {
-                delta = -0.5;
-            }
-            if (delta > +0.5) {
-                delta = +0.5;
-            }
-        }
-        double center = static_cast<double>(N) / 2.0;
-        double k_off = (static_cast<double>(i_max) + delta) - center;
-        df_spec_hz = (out_rate_hz > 0) ? (k_off * static_cast<double>(out_rate_hz) / static_cast<double>(N)) : 0.0;
-    }
-    g_resid_cfo_spec_hz.store(df_spec_hz, std::memory_order_relaxed);
+    rtl_metrics_peak_metrics peak = rtl_metrics_compute_peak_metrics(N, out_rate_hz);
+    g_spec_peak_db.store(peak.p_max, std::memory_order_relaxed);
+    g_spec_snr_db.store(peak.spec_snr_db, std::memory_order_relaxed);
+    g_resid_cfo_spec_hz.store(peak.df_spec_hz, std::memory_order_relaxed);
 
     /* NCO CFO from Costas/FLL (native float freq in rad/sample, scaled by Fs/(2π))
      *
@@ -262,42 +505,8 @@ rtl_metrics_update_spectrum_from_iq(const float* iq_interleaved, int len_interle
      *
      * For non-CQPSK modes, we use the legacy fll_freq field.
      */
-    double cfo_hz = 0.0;
-    float total_freq_rad = 0.0f; /* Total NCO freq in rad/sample for legacy Q15 metric */
-    if (out_rate_hz > 0) {
-        if (demod.cqpsk_enable) {
-            /* CQPSK: Combine FLL band-edge and Costas frequencies.
-             * FLL freq is at sample rate, Costas freq is at symbol rate.
-             * Costas freq (rad/symbol) * (1/sps) = rad/sample equivalent.
-             */
-            float fll_freq = demod.fll_band_edge_state.freq; /* rad/sample */
-            float costas_freq = demod.costas_state.freq;     /* rad/symbol */
-            int sps = demod.ted_sps > 0 ? demod.ted_sps : 5;
-
-            /* Convert Costas freq from rad/symbol to rad/sample */
-            float costas_freq_sample_rate = costas_freq / static_cast<float>(sps);
-
-            total_freq_rad = fll_freq + costas_freq_sample_rate;
-            cfo_hz = static_cast<double>(total_freq_rad) * static_cast<double>(out_rate_hz) / (2.0 * M_PI);
-
-            /* Also update legacy fll_freq/fll_phase for any code that still reads them */
-            demod.fll_freq = total_freq_rad;
-            demod.fll_phase = demod.fll_band_edge_state.phase + demod.costas_state.phase;
-        } else {
-            /* Non-CQPSK: Use legacy FLL state */
-            total_freq_rad = demod.fll_freq;
-            cfo_hz = static_cast<double>(demod.fll_freq) * static_cast<double>(out_rate_hz) / (2.0 * M_PI);
-        }
-    }
-    g_cfo_nco_hz.store(cfo_hz, std::memory_order_relaxed);
-    /* Store native float freq as legacy Q15 for backwards-compatible metrics */
-    int fll_freq_q15_compat = static_cast<int>(lrint(total_freq_rad * (32768.0 / (2.0 * M_PI))));
-    g_nco_q15.store(fll_freq_q15_compat, std::memory_order_relaxed);
-    g_demod_rate_hz.store(out_rate_hz, std::memory_order_relaxed);
-    g_costas_err_avg_q14.store(demod.costas_err_avg_q14, std::memory_order_relaxed);
-    /* Store FLL band-edge freq for UI access (avoid data race on demod state) */
-    g_fll_band_edge_freq_rad.store(static_cast<double>(demod.fll_band_edge_state.freq), std::memory_order_relaxed);
-
+    rtl_metrics_nco_metrics nco = rtl_metrics_compute_nco_metrics(out_rate_hz);
+    rtl_metrics_store_nco_metrics(nco, out_rate_hz);
     /* Spectrum-assisted CFO correction for CQPSK:
      * When CQPSK path and FLL are enabled, and we see a reasonably strong
      * QPSK signal, use the residual CFO estimate from the spectrum to gently
@@ -314,72 +523,18 @@ rtl_metrics_update_spectrum_from_iq(const float* iq_interleaved, int len_interle
      * frequency at sample rate). The legacy fll_freq is updated as a side effect
      * for backwards compatibility with any code that reads it directly.
      */
-    if (demod.cqpsk_enable && demod.fll_enabled && out_rate_hz > 0) {
-        double snr_qpsk = g_snr_qpsk_db.load(std::memory_order_relaxed);
-        double abs_df = fabs(df_spec_hz);
-        /* Gate: require reasonable SNR and ignore wildly off/tiny residuals. */
-        const double k_df_min = 150.0; /* Hz: ignore residuals below ~150 Hz to reduce jitter */
-        const double k_df_max = 2500.0;
-        if (snr_qpsk > -3.0 && abs_df > k_df_min && abs_df < k_df_max) {
-            /* Outer-loop gain: fraction of residual per update. */
-            const double k_outer = 0.05;
-            /* Residual is after NCO; increase NCO CFO toward signal CFO.
-             * Convert residual Hz to rad/sample: delta_rad = df_hz * 2π / Fs */
-            double delta_rad = k_outer * df_spec_hz * 2.0 * M_PI / static_cast<double>(out_rate_hz);
-            if (fabs(delta_rad) > 1e-9) {
-                const float F_CLAMP = 0.25f; /* ~±0.25 rad/sample max CFO */
-
-                /* For OP25 flow, nudge the FLL band-edge state directly */
-                float f_old = demod.fll_band_edge_state.freq;
-                float f_new = f_old + static_cast<float>(delta_rad);
-                if (f_new > F_CLAMP) {
-                    f_new = F_CLAMP;
-                }
-                if (f_new < -F_CLAMP) {
-                    f_new = -F_CLAMP;
-                }
-                demod.fll_band_edge_state.freq = f_new;
-
-                /* Also update legacy fll_freq for backwards compatibility.
-                 * Combine FLL band-edge + Costas (scaled to sample rate). */
-                int sps = demod.ted_sps > 0 ? demod.ted_sps : 5;
-                float costas_freq_sample_rate = demod.costas_state.freq / static_cast<float>(sps);
-                total_freq_rad = f_new + costas_freq_sample_rate;
-                demod.fll_freq = total_freq_rad;
-
-                /* Also nudge legacy fll_state for non-OP25 paths that may read it */
-                float delta_applied = f_new - f_old;
-                float i_old = demod.fll_state.integrator;
-                float i_new = i_old + delta_applied;
-                if (i_new > F_CLAMP) {
-                    i_new = F_CLAMP;
-                }
-                if (i_new < -F_CLAMP) {
-                    i_new = -F_CLAMP;
-                }
-                demod.fll_state.integrator = i_new;
-
-                /* Store native float freq as legacy Q15 for backwards-compatible metrics */
-                int fll_q15_compat = static_cast<int>(lrint(total_freq_rad * (32768.0 / (2.0 * M_PI))));
-                g_nco_q15.store(fll_q15_compat, std::memory_order_relaxed);
-                /* Recompute NCO CFO export after adjustment */
-                cfo_hz = static_cast<double>(total_freq_rad) * static_cast<double>(out_rate_hz) / (2.0 * M_PI);
-                g_cfo_nco_hz.store(cfo_hz, std::memory_order_relaxed);
-            }
-        }
+    rtl_metrics_nco_metrics nudged = rtl_metrics_apply_cqpsk_outer_loop(nco, peak.df_spec_hz, out_rate_hz);
+    if (nudged.total_freq_rad != nco.total_freq_rad || nudged.cfo_hz != nco.cfo_hz) {
+        rtl_metrics_store_nco_metrics(nudged, out_rate_hz);
     }
 
-    /* Lock heuristic for CQPSK: based on SNR (Costas loop doesn't expose a direct lock flag).
-     * The spectrum-based df_spec_hz is not meaningful for CQPSK since the Costas NCO
-     * corrects carrier offset internally. Use SNR threshold instead. */
-    int locked = 0;
-    if (demod.cqpsk_enable) {
-        double snr = g_snr_qpsk_db.load(std::memory_order_relaxed);
-        /* Lock when SNR indicates good signal quality */
-        if (snr > 6.0) {
-            locked = 1;
-        }
-    }
+    /* Store FLL band-edge freq for UI access after any outer-loop nudge. */
+    g_fll_band_edge_freq_rad.store(static_cast<double>(demod.fll_band_edge_state.freq), std::memory_order_relaxed);
+
+    /* CQPSK lock is loop-health based, not an SNR proxy: require the carrier NCO
+     * to be stable, the Gardner TED eye metric to be positive, and Costas phase
+     * error to be bounded. */
+    int locked = cqpsk_loop_lock_heuristic(nudged.total_freq_rad, out_rate_hz);
     g_carrier_lock.store(locked, std::memory_order_relaxed);
 }
 
@@ -500,6 +655,19 @@ dsd_rtl_stream_get_costas_err_q14(void) {
     return g_costas_err_avg_q14.load(std::memory_order_relaxed);
 }
 
+/** @brief Get Costas discriminator health metrics for the latest DSP block. */
+extern "C" int
+dsd_rtl_stream_get_costas_metrics(rtl_stream_costas_metrics* out) {
+    if (!out) {
+        return -1;
+    }
+    out->err_smooth_avg_q14 = g_costas_err_avg_q14.load(std::memory_order_relaxed);
+    out->err_raw_avg_q14 = g_costas_err_raw_avg_q14.load(std::memory_order_relaxed);
+    out->confidence_avg_q14 = g_costas_conf_avg_q14.load(std::memory_order_relaxed);
+    out->zero_conf_pct = g_costas_zero_conf_pct.load(std::memory_order_relaxed);
+    return 0;
+}
+
 /** @brief Return the FLL band-edge frequency estimate in Hz. */
 extern "C" double
 dsd_rtl_stream_get_fll_band_edge_freq_hz(void) {
@@ -529,6 +697,15 @@ dsd_rtl_stream_reset_costas(void) {
     /* Reset phase and error, but preserve frequency estimate */
     demod.costas_state.phase = 0.0f;
     demod.costas_state.error = 0.0f;
+    demod.costas_state.error_smooth = 0.0f;
+    demod.costas_err_avg_q14 = 0;
+    demod.costas_err_raw_avg_q14 = 0;
+    demod.costas_conf_avg_q14 = 0;
+    demod.costas_zero_conf_pct = 0;
+    g_costas_err_avg_q14.store(0, std::memory_order_relaxed);
+    g_costas_err_raw_avg_q14.store(0, std::memory_order_relaxed);
+    g_costas_conf_avg_q14.store(0, std::memory_order_relaxed);
+    g_costas_zero_conf_pct.store(0, std::memory_order_relaxed);
     /* Note: deliberately NOT zeroing costas_state.freq - preserve it! */
 
     /* Reset differential decode history to (1,0) not (0,0).
@@ -537,6 +714,9 @@ dsd_rtl_stream_reset_costas(void) {
      * Using (1,0) means the first sample's diff output equals raw input. */
     demod.cqpsk_diff_prev_r = 1.0f;
     demod.cqpsk_diff_prev_j = 0.0f;
+    if (demod.cqpsk_enable) {
+        dsd_cqpsk_cma_equalizer_reset(&demod.cqpsk_eq_state, demod.cqpsk_eq_taps);
+    }
 }
 
 /* Smoothed SNR exports (for UI and protocol code). */

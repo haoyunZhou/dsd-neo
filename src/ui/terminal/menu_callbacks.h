@@ -9,7 +9,8 @@
  *
  * This header is internal to src/ui/terminal/ and should NOT be installed.
  */
-#pragma once
+#ifndef DSD_NEO_SRC_UI_TERMINAL_MENU_CALLBACKS_H_
+#define DSD_NEO_SRC_UI_TERMINAL_MENU_CALLBACKS_H_
 
 // ---- Simple path callbacks ----
 void cb_event_log_set(void* v, const char* path);
@@ -24,6 +25,7 @@ void cb_keys_hex(void* v, const char* p);
 // ---- Config callbacks ----
 void cb_config_load(void* v, const char* path);
 void cb_config_save_as(void* v, const char* path);
+void chooser_done_config_profile(void* u, int sel);
 
 // ---- Typed value callbacks ----
 void cb_setmod_bw(void* v, int ok, int bw);
@@ -103,3 +105,5 @@ void cb_m17_user_data(void* u, const char* text);
 // ---- Chooser completion handlers (from menu_prompts.c) ----
 void chooser_done_pulse_out(void* u, int sel);
 void chooser_done_pulse_in(void* u, int sel);
+
+#endif /* DSD_NEO_SRC_UI_TERMINAL_MENU_CALLBACKS_H_ */

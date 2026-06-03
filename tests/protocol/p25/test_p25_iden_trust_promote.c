@@ -14,17 +14,21 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
-#include <string.h>
-
 #include "dsd-neo/core/opts_fwd.h"
+#include "dsd-neo/core/safe_api.h"
 #include "dsd-neo/core/state_fwd.h"
+
+#if defined(__GNUC__) && !defined(__cplusplus)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmissing-prototypes"
+#endif
 
 struct RtlSdrContext;
 
 static int
 expect_eq_int(const char* tag, int got, int want) {
     if (got != want) {
-        fprintf(stderr, "%s: got %d want %d\n", tag, got, want);
+        DSD_FPRINTF(stderr, "%s: got %d want %d\n", tag, got, want);
         return 1;
     }
     return 0;
@@ -32,6 +36,7 @@ expect_eq_int(const char* tag, int got, int want) {
 
 // Stubs for unrelated external hooks
 bool
+// NOLINTNEXTLINE(misc-use-internal-linkage)
 SetFreq(int sockfd, long int freq) {
     (void)sockfd;
     (void)freq;
@@ -39,6 +44,7 @@ SetFreq(int sockfd, long int freq) {
 }
 
 bool
+// NOLINTNEXTLINE(misc-use-internal-linkage)
 SetModulation(int sockfd, int bandwidth) {
     (void)sockfd;
     (void)bandwidth;
@@ -46,13 +52,16 @@ SetModulation(int sockfd, int bandwidth) {
 }
 
 void
+// NOLINTNEXTLINE(misc-use-internal-linkage)
 return_to_cc(dsd_opts* opts, dsd_state* state) {
     (void)opts;
     (void)state;
 }
+// NOLINTNEXTLINE(misc-use-internal-linkage)
 struct RtlSdrContext* g_rtl_ctx = 0;
 
 int
+// NOLINTNEXTLINE(misc-use-internal-linkage)
 rtl_stream_tune(struct RtlSdrContext* ctx, uint32_t center_freq_hz) {
     (void)ctx;
     (void)center_freq_hz;
@@ -60,13 +69,15 @@ rtl_stream_tune(struct RtlSdrContext* ctx, uint32_t center_freq_hz) {
 }
 
 void
-unpack_byte_array_into_bit_array(uint8_t* input, uint8_t* output, int len) {
+// NOLINTNEXTLINE(misc-use-internal-linkage)
+unpack_byte_array_into_bit_array(const uint8_t* input, uint8_t* output, int len) {
     (void)input;
     (void)output;
     (void)len;
 }
 
 void
+// NOLINTNEXTLINE(misc-use-internal-linkage)
 apx_embedded_alias_header_phase2(dsd_opts* o, dsd_state* s, uint8_t slot, uint8_t* b) {
     (void)o;
     (void)s;
@@ -75,6 +86,7 @@ apx_embedded_alias_header_phase2(dsd_opts* o, dsd_state* s, uint8_t slot, uint8_
 }
 
 void
+// NOLINTNEXTLINE(misc-use-internal-linkage)
 apx_embedded_alias_blocks_phase2(dsd_opts* o, dsd_state* s, uint8_t slot, uint8_t* b) {
     (void)o;
     (void)s;
@@ -83,6 +95,7 @@ apx_embedded_alias_blocks_phase2(dsd_opts* o, dsd_state* s, uint8_t slot, uint8_
 }
 
 void
+// NOLINTNEXTLINE(misc-use-internal-linkage)
 l3h_embedded_alias_decode(dsd_opts* o, dsd_state* s, uint8_t slot, int16_t len, uint8_t* in) {
     (void)o;
     (void)s;
@@ -92,6 +105,7 @@ l3h_embedded_alias_decode(dsd_opts* o, dsd_state* s, uint8_t slot, int16_t len, 
 }
 
 void
+// NOLINTNEXTLINE(misc-use-internal-linkage)
 nmea_harris(dsd_opts* o, dsd_state* s, uint8_t* in, uint32_t src, int slot) {
     (void)o;
     (void)s;
@@ -104,7 +118,7 @@ int
 main(void) {
     int rc = 0;
     static dsd_state st;
-    memset(&st, 0, sizeof st);
+    DSD_MEMSET(&st, 0, sizeof st);
 
     // Current site identity
     st.p2_wacn = 0xABCDE;
@@ -114,42 +128,50 @@ main(void) {
 
     // Case A: WACN/SYSID match; RFSS/SITE unset → promote to 2
     int idA = 1;
-    st.p25_iden_wacn[idA] = st.p2_wacn;
-    st.p25_iden_sysid[idA] = st.p2_sysid;
-    st.p25_iden_rfss[idA] = 0;
-    st.p25_iden_site[idA] = 0;
-    st.p25_iden_trust[idA] = 1; // seen but unconfirmed
+    st.p25_iden_fdma[idA].wacn = st.p2_wacn;
+    st.p25_iden_fdma[idA].sysid = st.p2_sysid;
+    st.p25_iden_fdma[idA].rfss = 0;
+    st.p25_iden_fdma[idA].site = 0;
+    st.p25_iden_fdma[idA].trust = 1; // seen but unconfirmed
+    st.p25_iden_fdma[idA].populated = 1;
 
     // Case B: all match → promote to 2
     int idB = 2;
-    st.p25_iden_wacn[idB] = st.p2_wacn;
-    st.p25_iden_sysid[idB] = st.p2_sysid;
-    st.p25_iden_rfss[idB] = st.p2_rfssid;
-    st.p25_iden_site[idB] = st.p2_siteid;
-    st.p25_iden_trust[idB] = 1;
+    st.p25_iden_fdma[idB].wacn = st.p2_wacn;
+    st.p25_iden_fdma[idB].sysid = st.p2_sysid;
+    st.p25_iden_fdma[idB].rfss = st.p2_rfssid;
+    st.p25_iden_fdma[idB].site = st.p2_siteid;
+    st.p25_iden_fdma[idB].trust = 1;
+    st.p25_iden_fdma[idB].populated = 1;
 
     // Case C: RFSS mismatch → remain <2
     int idC = 3;
-    st.p25_iden_wacn[idC] = st.p2_wacn;
-    st.p25_iden_sysid[idC] = st.p2_sysid;
-    st.p25_iden_rfss[idC] = st.p2_rfssid + 1;
-    st.p25_iden_site[idC] = st.p2_siteid;
-    st.p25_iden_trust[idC] = 1;
+    st.p25_iden_fdma[idC].wacn = st.p2_wacn;
+    st.p25_iden_fdma[idC].sysid = st.p2_sysid;
+    st.p25_iden_fdma[idC].rfss = st.p2_rfssid + 1;
+    st.p25_iden_fdma[idC].site = st.p2_siteid;
+    st.p25_iden_fdma[idC].trust = 1;
+    st.p25_iden_fdma[idC].populated = 1;
 
     // Case D: SITE mismatch → remain <2
     int idD = 4;
-    st.p25_iden_wacn[idD] = st.p2_wacn;
-    st.p25_iden_sysid[idD] = st.p2_sysid;
-    st.p25_iden_rfss[idD] = st.p2_rfssid;
-    st.p25_iden_site[idD] = st.p2_siteid + 1;
-    st.p25_iden_trust[idD] = 1;
+    st.p25_iden_fdma[idD].wacn = st.p2_wacn;
+    st.p25_iden_fdma[idD].sysid = st.p2_sysid;
+    st.p25_iden_fdma[idD].rfss = st.p2_rfssid;
+    st.p25_iden_fdma[idD].site = st.p2_siteid + 1;
+    st.p25_iden_fdma[idD].trust = 1;
+    st.p25_iden_fdma[idD].populated = 1;
 
     p25_confirm_idens_for_current_site(&st);
 
-    rc |= expect_eq_int("trust A", st.p25_iden_trust[idA], 2);
-    rc |= expect_eq_int("trust B", st.p25_iden_trust[idB], 2);
-    rc |= expect_eq_int("trust C", st.p25_iden_trust[idC] == 2, 0);
-    rc |= expect_eq_int("trust D", st.p25_iden_trust[idD] == 2, 0);
+    rc |= expect_eq_int("trust A", st.p25_iden_fdma[idA].trust, 2);
+    rc |= expect_eq_int("trust B", st.p25_iden_fdma[idB].trust, 2);
+    rc |= expect_eq_int("trust C", st.p25_iden_fdma[idC].trust == 2, 0);
+    rc |= expect_eq_int("trust D", st.p25_iden_fdma[idD].trust == 2, 0);
 
     return rc;
 }
+
+#if defined(__GNUC__) && !defined(__cplusplus)
+#pragma GCC diagnostic pop
+#endif

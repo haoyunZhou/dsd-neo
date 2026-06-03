@@ -9,7 +9,8 @@
  *
  * This header is internal to src/ui/terminal/ and should NOT be installed.
  */
-#pragma once
+#ifndef DSD_NEO_SRC_UI_TERMINAL_MENU_ACTIONS_H_
+#define DSD_NEO_SRC_UI_TERMINAL_MENU_ACTIONS_H_
 
 // ---- Main menu actions ----
 void act_toggle_invert(void* v);
@@ -26,6 +27,7 @@ void act_dsp_out(void* v);
 
 // ---- Config actions ----
 void act_config_load(void* v);
+void act_config_load_profile(void* v);
 void act_config_save_current(void* v);
 void act_config_save_default(void* v);
 void act_config_save_as(void* v);
@@ -100,6 +102,7 @@ void act_set_p25_p1_err_sec(void* v);
 // ---- IO actions ----
 void io_toggle_mute_enc(void* vctx);
 void io_toggle_call_alert(void* vctx);
+void io_select_call_alert_events(void* vctx);
 void io_toggle_cc_candidates(void* vctx);
 void io_enable_per_call_wav(void* vctx);
 void io_save_symbol_capture(void* vctx);
@@ -205,5 +208,15 @@ void act_ted_gain_dn(void* v);
 void act_ted_force_toggle(void* v);
 void act_c4fm_clk_cycle(void* v);
 void act_c4fm_clk_sync_toggle(void* v);
+void act_cqpsk_eq_toggle(void* v);
+void act_cqpsk_eq_taps_up(void* v);
+void act_cqpsk_eq_taps_dn(void* v);
+void act_cqpsk_eq_mu_up(void* v);
+void act_cqpsk_eq_mu_dn(void* v);
+void act_cqpsk_eq_modulus_up(void* v);
+void act_cqpsk_eq_modulus_dn(void* v);
+void act_cqpsk_eq_reset(void* v);
 void act_toggle_dsp_panel(void* v);
 #endif
+
+#endif /* DSD_NEO_SRC_UI_TERMINAL_MENU_ACTIONS_H_ */

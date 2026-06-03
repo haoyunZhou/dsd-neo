@@ -9,45 +9,118 @@
  * This does not spawn the full ncurses UI; it exercises the config apply
  * command handler with a fake dsd_opts/dsd_state to ensure that applying a
  * config that changes basic fields does not crash and updates core fields as
- * expected. Backend-specific restarts (RTL/RTLTCP/TCP/UDP/Pulse) are covered
- * indirectly by existing integration paths and are intentionally not mocked
- * here to keep this test simple and portable.
+ * expected. Most backend-specific restarts remain covered indirectly by other
+ * integration paths; TCP reconnect is stubbed here because config-apply
+ * rollback semantics depend on the helper's success/failure result.
  */
 
-#include <dsd-neo/runtime/config.h>
-#include <dsd-neo/ui/ui_async.h>
-#include <dsd-neo/ui/ui_cmd.h>
-
+#include <dsd-neo/core/audio.h>
 #include <dsd-neo/core/init.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/opts_fwd.h>
 #include <dsd-neo/core/state.h>
 #include <dsd-neo/core/state_fwd.h>
+#include <dsd-neo/runtime/config.h>
+#include <dsd-neo/ui/ui_async.h>
+#include <dsd-neo/ui/ui_cmd.h>
+#include <math.h>
+#include <sndfile.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "dsd-neo/core/safe_api.h"
+#include "dsd-neo/platform/file_compat.h"
+#include "dsd-neo/platform/posix_compat.h"
+#include "dsd-neo/runtime/call_alert.h"
+#include "menu_actions.h"
+#include "menu_callbacks.h"
+#include "menu_internal.h"
+#include "test_support.h"
 
-#ifdef __cplusplus
-extern "C" {
+#ifdef USE_RADIO
+#include <dsd-neo/io/rtl_stream_c.h>
+#include <dsd-neo/ui/ui_dsp_cmd.h>
 #endif
-#define DSD_NEO_MAIN
-#include <dsd-neo/protocol/dmr/dmr_const.h>
-#include <dsd-neo/protocol/dstar/dstar_const.h>
-#include <dsd-neo/protocol/p25/p25p1_const.h>
-#include <dsd-neo/protocol/provoice/provoice_const.h>
-#include <dsd-neo/protocol/x2tdma/x2tdma_const.h>
-#undef DSD_NEO_MAIN
-#ifdef __cplusplus
-}
+
+#if defined(__GNUC__) && !defined(__cplusplus)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmissing-prototypes"
 #endif
 
 static int
 expect_true(const char* label, int cond) {
     if (!cond) {
-        fprintf(stderr, "FAIL: %s\n", label);
+        DSD_FPRINTF(stderr, "FAIL: %s\n", label);
         return 1;
     }
     return 0;
+}
+
+static int
+expect_int_eq(const char* label, int got, int want) {
+    if (got != want) {
+        DSD_FPRINTF(stderr, "FAIL: %s (got %d want %d)\n", label, got, want);
+        return 1;
+    }
+    return 0;
+}
+
+static int
+expect_u64_eq(const char* label, uint64_t got, uint64_t want) {
+    if (got != want) {
+        DSD_FPRINTF(stderr, "FAIL: %s (got %016llX want %016llX)\n", label, (unsigned long long)got,
+                    (unsigned long long)want);
+        return 1;
+    }
+    return 0;
+}
+
+static int
+expect_float_ne(const char* label, float lhs, float rhs) {
+    if (fabsf(lhs - rhs) <= 1e-6f) {
+        DSD_FPRINTF(stderr, "FAIL: %s (both %.6f)\n", label, lhs);
+        return 1;
+    }
+    return 0;
+}
+
+#ifdef USE_RADIO
+static int
+expect_float_close(const char* label, float got, float want, float tol) {
+    if (fabsf(got - want) > tol) {
+        DSD_FPRINTF(stderr, "FAIL: %s (got %.8f want %.8f tol %.8f)\n", label, got, want, tol);
+        return 1;
+    }
+    return 0;
+}
+#endif
+
+static int g_tcp_connect_audio_calls = 0;
+static int g_tcp_connect_audio_result = 0;
+static char g_last_tcp_connect_audio_host[256];
+static int g_last_tcp_connect_audio_port = 0;
+
+static void
+reset_tcp_connect_audio_fake(void) {
+    g_tcp_connect_audio_calls = 0;
+    g_tcp_connect_audio_result = 0;
+    g_last_tcp_connect_audio_host[0] = '\0';
+    g_last_tcp_connect_audio_port = 0;
+}
+
+int
+svc_tcp_connect_audio(dsd_opts* opts, const char* host, int port) { // NOLINT(misc-use-internal-linkage)
+    g_tcp_connect_audio_calls++;
+    DSD_SNPRINTF(g_last_tcp_connect_audio_host, sizeof g_last_tcp_connect_audio_host, "%s", host ? host : "");
+    g_last_tcp_connect_audio_port = port;
+
+    if (g_tcp_connect_audio_result == 0 && opts && host && port > 0) {
+        DSD_SNPRINTF(opts->tcp_hostname, sizeof opts->tcp_hostname, "%s", host);
+        opts->tcp_portno = port;
+        opts->audio_in_type = AUDIO_IN_TCP;
+    }
+    return g_tcp_connect_audio_result;
 }
 
 static void
@@ -63,13 +136,13 @@ typedef struct test_runtime {
 
 static int
 alloc_test_runtime(test_runtime* runtime) {
-    memset(runtime, 0, sizeof(*runtime));
+    DSD_MEMSET(runtime, 0, sizeof(*runtime));
 
     // dsd_state is multi-megabyte; keep it off the function stack.
     runtime->opts = (dsd_opts*)calloc(1, sizeof(*runtime->opts));
     runtime->state = (dsd_state*)calloc(1, sizeof(*runtime->state));
     if (runtime->opts == NULL || runtime->state == NULL) {
-        fprintf(stderr, "FAIL: alloc test runtime\n");
+        DSD_FPRINTF(stderr, "FAIL: alloc test runtime\n");
         free(runtime->opts);
         free(runtime->state);
         runtime->opts = NULL;
@@ -83,6 +156,16 @@ alloc_test_runtime(test_runtime* runtime) {
 
 static void
 free_test_runtime(test_runtime* runtime) {
+    if (runtime->opts != NULL) {
+        closeAudioInput(runtime->opts);
+        closeAudioOutput(runtime->opts);
+        if (runtime->opts->audio_in_file != NULL) {
+            sf_close(runtime->opts->audio_in_file);
+            runtime->opts->audio_in_file = NULL;
+        }
+        free(runtime->opts->audio_in_file_info);
+        runtime->opts->audio_in_file_info = NULL;
+    }
     if (runtime->state != NULL) {
         freeState(runtime->state);
     }
@@ -90,6 +173,133 @@ free_test_runtime(test_runtime* runtime) {
     free(runtime->opts);
     runtime->state = NULL;
     runtime->opts = NULL;
+}
+
+static int
+create_temp_config_file(const char* contents, char* out_path, size_t out_path_sz) {
+    if (!contents || !out_path || out_path_sz == 0) {
+        DSD_FPRINTF(stderr, "FAIL: invalid temp config request\n");
+        return 1;
+    }
+
+    char path[DSD_TEST_PATH_MAX] = {0};
+    int fd = dsd_test_mkstemp(path, sizeof path, "dsdneo_ui_profile_config");
+    if (fd < 0) {
+        DSD_FPRINTF(stderr, "FAIL: dsd_test_mkstemp failed for temp config\n");
+        return 1;
+    }
+    (void)dsd_close(fd);
+
+    FILE* fp = dsd_fopen_private(path, "w");
+    if (!fp) {
+        DSD_FPRINTF(stderr, "FAIL: fopen write failed for %s\n", path);
+        (void)remove(path);
+        return 1;
+    }
+    int write_failed = fputs(contents, fp) < 0;
+    int close_failed = fclose(fp) != 0;
+    if (write_failed || close_failed) {
+        DSD_FPRINTF(stderr, "FAIL: write failed for %s\n", path);
+        (void)remove(path);
+        return 1;
+    }
+
+    int n = DSD_SNPRINTF(out_path, out_path_sz, "%s", path);
+    if (n < 0 || n >= (int)out_path_sz) {
+        DSD_FPRINTF(stderr, "FAIL: temp config path too long\n");
+        (void)remove(path);
+        return 1;
+    }
+    return 0;
+}
+
+static int
+create_temp_wav_file(const char* prefix, int sample_rate, int channels, char* out_path, size_t out_path_sz) {
+    if (!prefix || !out_path || out_path_sz == 0 || sample_rate <= 0 || channels <= 0 || channels > 2) {
+        DSD_FPRINTF(stderr, "FAIL: invalid temp wav request\n");
+        return 1;
+    }
+
+    char base_path[DSD_TEST_PATH_MAX] = {0};
+    int fd = dsd_test_mkstemp(base_path, sizeof base_path, prefix);
+    if (fd < 0) {
+        DSD_FPRINTF(stderr, "FAIL: dsd_test_mkstemp failed for %s\n", prefix);
+        return 1;
+    }
+    (void)dsd_close(fd);
+    (void)remove(base_path);
+
+    if (DSD_SNPRINTF(out_path, out_path_sz, "%s.wav", base_path) >= (int)out_path_sz) {
+        DSD_FPRINTF(stderr, "FAIL: temp wav path too long for %s\n", prefix);
+        return 1;
+    }
+    (void)remove(out_path);
+
+    SF_INFO info = {0};
+    info.samplerate = sample_rate;
+    info.channels = channels;
+    info.format = SF_FORMAT_WAV | SF_FORMAT_PCM_16;
+
+    SNDFILE* sf = sf_open(out_path, SFM_WRITE, &info);
+    if (sf == NULL) {
+        DSD_FPRINTF(stderr, "FAIL: sf_open write failed for %s: %s\n", out_path, sf_strerror(NULL));
+        (void)remove(out_path);
+        return 1;
+    }
+
+    short samples[16] = {0};
+    sf_count_t sample_count = ((sf_count_t)channels) * 8;
+    if (sf_write_short(sf, samples, sample_count) != sample_count) {
+        DSD_FPRINTF(stderr, "FAIL: sf_write_short failed for %s\n", out_path);
+        sf_close(sf);
+        (void)remove(out_path);
+        return 1;
+    }
+    if (sf_close(sf) != 0) {
+        DSD_FPRINTF(stderr, "FAIL: sf_close failed for %s\n", out_path);
+        (void)remove(out_path);
+        return 1;
+    }
+    return 0;
+}
+
+static int
+create_temp_raw_pcm_wav_suffix(const char* prefix, const short* samples, size_t sample_count, char* out_path,
+                               size_t out_path_sz) {
+    if (!prefix || !samples || sample_count == 0 || !out_path || out_path_sz == 0) {
+        DSD_FPRINTF(stderr, "FAIL: invalid raw temp file request\n");
+        return 1;
+    }
+
+    char base_path[DSD_TEST_PATH_MAX] = {0};
+    int fd = dsd_test_mkstemp(base_path, sizeof base_path, prefix);
+    if (fd < 0) {
+        DSD_FPRINTF(stderr, "FAIL: dsd_test_mkstemp failed for %s\n", prefix);
+        return 1;
+    }
+    (void)dsd_close(fd);
+    (void)remove(base_path);
+
+    if (DSD_SNPRINTF(out_path, out_path_sz, "%s.wav", base_path) >= (int)out_path_sz) {
+        DSD_FPRINTF(stderr, "FAIL: temp raw wav path too long for %s\n", prefix);
+        return 1;
+    }
+
+    FILE* fp = dsd_fopen_private(out_path, "wb");
+    if (!fp) {
+        DSD_FPRINTF(stderr, "FAIL: fopen write failed for %s\n", out_path);
+        return 1;
+    }
+
+    size_t nwritten = fwrite(samples, sizeof(samples[0]), sample_count, fp);
+    fclose(fp);
+    if (nwritten != sample_count) {
+        DSD_FPRINTF(stderr, "FAIL: fwrite failed for %s\n", out_path);
+        (void)remove(out_path);
+        return 1;
+    }
+
+    return 0;
 }
 
 static int
@@ -103,19 +313,19 @@ test_basic_pulse_config_apply(void) {
 
     // Start from a known input/output so that config apply has something to
     // mutate. Use Pulse I/O to avoid depending on RTL or network resources.
-    snprintf(opts->audio_in_dev, sizeof opts->audio_in_dev, "%s", "pulse");
+    DSD_SNPRINTF(opts->audio_in_dev, sizeof opts->audio_in_dev, "%s", "pulse");
     opts->audio_in_type = AUDIO_IN_PULSE;
-    snprintf(opts->audio_out_dev, sizeof opts->audio_out_dev, "%s", "pulse");
+    DSD_SNPRINTF(opts->audio_out_dev, sizeof opts->audio_out_dev, "%s", "pulse");
     opts->audio_out_type = 0;
 
     dsdneoUserConfig cfg = {0};
     cfg.version = 1;
     cfg.has_input = 1;
     cfg.input_source = DSDCFG_INPUT_PULSE;
-    snprintf(cfg.pulse_input, sizeof cfg.pulse_input, "%s", "test-source");
+    DSD_SNPRINTF(cfg.pulse_input, sizeof cfg.pulse_input, "%s", "test-source");
     cfg.has_output = 1;
     cfg.output_backend = DSDCFG_OUTPUT_PULSE;
-    snprintf(cfg.pulse_output, sizeof cfg.pulse_output, "%s", "test-sink");
+    DSD_SNPRINTF(cfg.pulse_output, sizeof cfg.pulse_output, "%s", "test-sink");
     cfg.ncurses_ui = 1;
 
     // Public API: ui_post_cmd() enqueues; ui_drain_cmds() is called from the
@@ -129,6 +339,660 @@ test_basic_pulse_config_apply(void) {
     rc |= expect_true("pulse input preserved", strncmp(opts->audio_in_dev, "pulse", 5) == 0);
     rc |= expect_true("pulse output preserved", strncmp(opts->audio_out_dev, "pulse", 5) == 0);
     free_test_runtime(&runtime);
+    return rc;
+}
+
+static void
+free_test_profile_context(ProfileSelCtx* pctx) {
+    if (!pctx) {
+        return;
+    }
+    if (pctx->names) {
+        for (int i = 0; i < pctx->n; i++) {
+            free((void*)pctx->names[i]);
+        }
+    }
+    free((void*)pctx->labels);
+    free((void*)pctx->names);
+    free(pctx);
+}
+
+static ProfileSelCtx*
+make_test_profile_context(dsd_state* state, const char* path) {
+    ProfileSelCtx* pctx = (ProfileSelCtx*)calloc(1, sizeof(*pctx));
+    if (!pctx) {
+        return NULL;
+    }
+    pctx->state = state;
+    pctx->n = 2;
+    int n = DSD_SNPRINTF(pctx->path, sizeof pctx->path, "%s", path ? path : "");
+    if (n < 0 || n >= (int)sizeof pctx->path) {
+        free_test_profile_context(pctx);
+        return NULL;
+    }
+    pctx->labels = (const char**)calloc((size_t)pctx->n, sizeof(char*));
+    pctx->names = (const char**)calloc((size_t)pctx->n, sizeof(char*));
+    if (!pctx->labels || !pctx->names) {
+        free_test_profile_context(pctx);
+        return NULL;
+    }
+    pctx->names[0] = dsd_strdup("alpha");
+    pctx->names[1] = dsd_strdup("beta");
+    if (!pctx->names[0] || !pctx->names[1]) {
+        free_test_profile_context(pctx);
+        return NULL;
+    }
+    pctx->labels[0] = pctx->names[0];
+    pctx->labels[1] = pctx->names[1];
+    return pctx;
+}
+
+static int
+test_ui_profile_selection_applies_overlay_and_disables_autosave(void) {
+    static const char* ini = "version = 1\n"
+                             "\n"
+                             "[output]\n"
+                             "backend = \"null\"\n"
+                             "ncurses_ui = false\n"
+                             "\n"
+                             "[mode]\n"
+                             "decode = \"p25p1\"\n"
+                             "\n"
+                             "[profile.alpha]\n"
+                             "mode.decode = \"ysf\"\n"
+                             "\n"
+                             "[profile.beta]\n"
+                             "mode.decode = \"dmr\"\n"
+                             "output.ncurses_ui = true\n";
+
+    char path[DSD_TEST_PATH_MAX] = {0};
+    if (create_temp_config_file(ini, path, sizeof path) != 0) {
+        return 1;
+    }
+
+    test_runtime runtime;
+    if (alloc_test_runtime(&runtime) != 0) {
+        (void)remove(path);
+        return 1;
+    }
+    dsd_opts* opts = runtime.opts;
+    dsd_state* state = runtime.state;
+    state->config_autosave_enabled = 1;
+    DSD_SNPRINTF(state->config_autosave_path, sizeof state->config_autosave_path, "%s", path);
+
+    ProfileSelCtx* pctx = make_test_profile_context(state, path);
+    if (!pctx) {
+        DSD_FPRINTF(stderr, "FAIL: could not allocate profile test context\n");
+        free_test_runtime(&runtime);
+        (void)remove(path);
+        return 1;
+    }
+
+    chooser_done_config_profile(pctx, 1);
+    ui_drain_cmds(opts, state);
+
+    int rc = 0;
+    rc |= expect_int_eq("UI profile load disables autosave", state->config_autosave_enabled, 0);
+    rc |= expect_true("UI profile load retains config path", strcmp(state->config_autosave_path, path) == 0);
+    rc |= expect_true("UI profile overlay applies DMR mode",
+                      opts->frame_dmr == 1 && opts->frame_p25p1 == 0 && opts->frame_p25p2 == 0 && opts->frame_ysf == 0);
+    rc |= expect_int_eq("UI profile overlay applies ncurses flag", opts->use_ncurses_terminal, 1);
+
+    free_test_runtime(&runtime);
+    (void)remove(path);
+    return rc;
+}
+
+static int
+test_ui_profile_menu_no_profiles_does_not_apply_base_config(void) {
+    static const char* ini = "version = 1\n"
+                             "\n"
+                             "[output]\n"
+                             "backend = \"null\"\n"
+                             "ncurses_ui = true\n";
+
+    char path[DSD_TEST_PATH_MAX] = {0};
+    if (create_temp_config_file(ini, path, sizeof path) != 0) {
+        return 1;
+    }
+
+    test_runtime runtime;
+    if (alloc_test_runtime(&runtime) != 0) {
+        (void)remove(path);
+        return 1;
+    }
+    dsd_opts* opts = runtime.opts;
+    dsd_state* state = runtime.state;
+    UiCtx ctx = {opts, state};
+
+    state->config_autosave_enabled = 1;
+    DSD_SNPRINTF(state->config_autosave_path, sizeof state->config_autosave_path, "%s", path);
+
+    act_config_load_profile(&ctx);
+    ui_drain_cmds(opts, state);
+
+    int rc = 0;
+    rc |= expect_int_eq("no-profile UI load leaves autosave enabled", state->config_autosave_enabled, 1);
+    rc |= expect_true("no-profile UI load retains config path", strcmp(state->config_autosave_path, path) == 0);
+    rc |= expect_int_eq("no-profile UI load does not apply base ncurses flag", opts->use_ncurses_terminal, 0);
+
+    free_test_runtime(&runtime);
+    (void)remove(path);
+    return rc;
+}
+
+static int
+test_stereo_file_hot_swap_rolls_back_to_live_input(void) {
+    char mono_path[DSD_TEST_PATH_MAX] = {0};
+    char stereo_path[DSD_TEST_PATH_MAX] = {0};
+    if (create_temp_wav_file("dsdneo_cfg_apply_mono", 48000, 1, mono_path, sizeof mono_path) != 0
+        || create_temp_wav_file("dsdneo_cfg_apply_stereo", 48000, 2, stereo_path, sizeof stereo_path) != 0) {
+        (void)remove(mono_path);
+        (void)remove(stereo_path);
+        return 1;
+    }
+
+    test_runtime runtime;
+    if (alloc_test_runtime(&runtime) != 0) {
+        (void)remove(mono_path);
+        (void)remove(stereo_path);
+        return 1;
+    }
+    dsd_opts* opts = runtime.opts;
+    dsd_state* state = runtime.state;
+
+    dsd_opts_apply_input_sample_rate(opts, 48000);
+    DSD_SNPRINTF(opts->audio_in_dev, sizeof opts->audio_in_dev, "%s", mono_path);
+    opts->audio_in_type = AUDIO_IN_WAV;
+    opts->audio_in_file_info = (SF_INFO*)calloc(1, sizeof(*opts->audio_in_file_info));
+    if (opts->audio_in_file_info == NULL) {
+        DSD_FPRINTF(stderr, "FAIL: alloc mono SF_INFO\n");
+        free_test_runtime(&runtime);
+        (void)remove(mono_path);
+        (void)remove(stereo_path);
+        return 1;
+    }
+    opts->audio_in_file = sf_open(mono_path, SFM_READ, opts->audio_in_file_info);
+    if (opts->audio_in_file == NULL) {
+        DSD_FPRINTF(stderr, "FAIL: sf_open read failed for %s: %s\n", mono_path, sf_strerror(NULL));
+        free_test_runtime(&runtime);
+        (void)remove(mono_path);
+        (void)remove(stereo_path);
+        return 1;
+    }
+    state->samplesPerSymbol = 10;
+    state->symbolCenter = 4;
+    state->jitter = 5;
+
+    dsdneoUserConfig cfg = {0};
+    cfg.version = 1;
+    cfg.has_input = 1;
+    cfg.input_source = DSDCFG_INPUT_FILE;
+    cfg.file_sample_rate = 48000;
+    cfg.has_mode = 1;
+    cfg.decode_mode = DSDCFG_MODE_P25P2;
+    DSD_SNPRINTF(cfg.file_path, sizeof cfg.file_path, "%s", stereo_path);
+
+    ui_post_cmd(UI_CMD_CONFIG_APPLY, &cfg, sizeof cfg);
+    ui_drain_cmds(opts, state);
+
+    short sample = 0;
+    sf_count_t read_count = sf_read_short(opts->audio_in_file, &sample, 1);
+
+    int rc = 0;
+    rc |= expect_true("stereo hot swap keeps WAV input active", opts->audio_in_type == AUDIO_IN_WAV);
+    rc |= expect_true("stereo hot swap restores previous path", strcmp(opts->audio_in_dev, mono_path) == 0);
+    rc |= expect_true("stereo hot swap keeps previous handle", opts->audio_in_file != NULL);
+    rc |= expect_true("stereo hot swap keeps previous metadata",
+                      opts->audio_in_file_info != NULL && opts->audio_in_file_info->channels == 1);
+    rc |= expect_true("stereo hot swap preserves file sample rate", opts->wav_sample_rate == 48000);
+    rc |= expect_true("stereo hot swap keeps previous file readable", read_count == 1);
+    rc |= expect_true("stereo hot swap preserves restored file timing", state->samplesPerSymbol == 10);
+    rc |= expect_true("stereo hot swap preserves restored file center", state->symbolCenter == 4);
+    rc |= expect_true("stereo hot swap preserves restored file jitter", state->jitter == 5);
+
+    free_test_runtime(&runtime);
+    (void)remove(mono_path);
+    (void)remove(stereo_path);
+    return rc;
+}
+
+static int
+test_call_alert_off_selection_survives_ui_command_path(void) {
+    test_runtime runtime;
+    if (alloc_test_runtime(&runtime) != 0) {
+        return 1;
+    }
+    dsd_opts* opts = runtime.opts;
+    dsd_state* state = runtime.state;
+
+    opts->call_alert = 1;
+    opts->call_alert_events = DSD_CALL_ALERT_EVENT_ALL;
+
+    uint8_t events = 0;
+    ui_post_cmd(UI_CMD_CALL_ALERT_EVENTS_SET, &events, sizeof events);
+    ui_drain_cmds(opts, state);
+
+    int rc = 0;
+    rc |= expect_int_eq("call alert off selection disables master", opts->call_alert, 0);
+    rc |= expect_int_eq("call alert off selection stores empty mask", opts->call_alert_events, 0);
+    rc |= expect_int_eq(
+        "call alert off selection suppresses data event",
+        dsd_call_alert_event_enabled(opts->call_alert, opts->call_alert_events, DSD_CALL_ALERT_EVENT_DATA), 0);
+
+    dsdneoUserConfig snap;
+    dsd_snapshot_opts_to_user_config(opts, state, &snap);
+    rc |= expect_true("call alert snapshot includes alerts", snap.has_alerts);
+    rc |= expect_int_eq("call alert snapshot preserves disabled master", snap.call_alert_enabled, 0);
+    rc |= expect_int_eq("call alert snapshot preserves empty event mask", snap.call_alert_events, 0);
+
+    ui_post_cmd(UI_CMD_CALL_ALERT_TOGGLE, NULL, 0);
+    ui_drain_cmds(opts, state);
+
+    rc |= expect_int_eq("call alert toggle keeps empty selection disabled", opts->call_alert, 0);
+    rc |= expect_int_eq("call alert toggle preserves empty event mask", opts->call_alert_events, 0);
+    rc |= expect_int_eq(
+        "call alert toggle with empty selection suppresses data event",
+        dsd_call_alert_event_enabled(opts->call_alert, opts->call_alert_events, DSD_CALL_ALERT_EVENT_DATA), 0);
+
+    free_test_runtime(&runtime);
+    return rc;
+}
+
+static int
+test_ui_aes_key_command_clears_manual_hytera_fields(void) {
+    test_runtime runtime;
+    if (alloc_test_runtime(&runtime) != 0) {
+        return 1;
+    }
+    dsd_opts* opts = runtime.opts;
+    dsd_state* state = runtime.state;
+
+    state->H = 0x000000AABBCCDDEEULL;
+    state->K1 = 0x1111111111111111ULL;
+    state->K2 = 0x2222222222222222ULL;
+    state->K3 = 0x3333333333333333ULL;
+    state->K4 = 0x4444444444444444ULL;
+    state->keyloader = 1;
+    state->payload_keyid = 7;
+    state->payload_keyidR = 8;
+    opts->dmr_mute_encL = 1;
+    opts->dmr_mute_encR = 1;
+
+    struct AesKeyPayload {
+        uint64_t K1, K2, K3, K4;
+    } p = {
+        0x20029736A5D91042ULL,
+        0xC923EB0697484433ULL,
+        0x005EFC58A1905195ULL,
+        0xE28E9C7836AA2DB8ULL,
+    };
+
+    ui_post_cmd(UI_CMD_KEY_AES_SET, &p, sizeof p);
+    ui_drain_cmds(opts, state);
+
+    int rc = 0;
+    rc |= expect_u64_eq("UI AES A1 slot 0", state->A1[0], p.K1);
+    rc |= expect_u64_eq("UI AES A2 slot 0", state->A2[0], p.K2);
+    rc |= expect_u64_eq("UI AES A3 slot 0", state->A3[0], p.K3);
+    rc |= expect_u64_eq("UI AES A4 slot 0", state->A4[0], p.K4);
+    rc |= expect_u64_eq("UI AES A1 slot 1", state->A1[1], p.K1);
+    rc |= expect_u64_eq("UI AES A2 slot 1", state->A2[1], p.K2);
+    rc |= expect_u64_eq("UI AES A3 slot 1", state->A3[1], p.K3);
+    rc |= expect_u64_eq("UI AES A4 slot 1", state->A4[1], p.K4);
+    rc |= expect_int_eq("UI AES loaded slot 0", state->aes_key_loaded[0], 1);
+    rc |= expect_int_eq("UI AES loaded slot 1", state->aes_key_loaded[1], 1);
+    rc |= expect_int_eq("UI AES segment count slot 0", (int)state->aes_key_segments[0], 4);
+    rc |= expect_int_eq("UI AES segment count slot 1", (int)state->aes_key_segments[1], 4);
+    rc |= expect_u64_eq("UI AES clears H", state->H, 0ULL);
+    rc |= expect_u64_eq("UI AES clears K1", state->K1, 0ULL);
+    rc |= expect_u64_eq("UI AES clears K2", state->K2, 0ULL);
+    rc |= expect_u64_eq("UI AES clears K3", state->K3, 0ULL);
+    rc |= expect_u64_eq("UI AES clears K4", state->K4, 0ULL);
+    rc |= expect_int_eq("UI AES disables keyloader", state->keyloader, 0);
+    rc |= expect_int_eq("UI AES clears slot 0 payload key ID", state->payload_keyid, 0);
+    rc |= expect_int_eq("UI AES clears slot 1 payload key ID", state->payload_keyidR, 0);
+    rc |= expect_int_eq("UI AES unmutes encrypted left", opts->dmr_mute_encL, 0);
+    rc |= expect_int_eq("UI AES unmutes encrypted right", opts->dmr_mute_encR, 0);
+
+    free_test_runtime(&runtime);
+    return rc;
+}
+
+static int
+test_return_cc_uses_pulse_rate_not_stale_file_rate(void) {
+    test_runtime runtime;
+    if (alloc_test_runtime(&runtime) != 0) {
+        return 1;
+    }
+    dsd_opts* opts = runtime.opts;
+    dsd_state* state = runtime.state;
+
+    DSD_SNPRINTF(opts->audio_in_dev, sizeof opts->audio_in_dev, "%s", "pulse");
+    opts->audio_in_type = AUDIO_IN_PULSE;
+    opts->pulse_digi_rate_in = 48000;
+    opts->wav_sample_rate = 96000;
+    opts->p25_trunk = 1;
+    state->trunk_cc_freq = 851012500;
+    state->p25_cc_is_tdma = 0;
+    state->samplesPerSymbol = 20;
+    state->symbolCenter = 9;
+
+    ui_post_cmd(UI_CMD_RETURN_CC, NULL, 0);
+    ui_drain_cmds(opts, state);
+
+    int rc = 0;
+    rc |= expect_true("return CC recomputes FDMA timing from pulse input rate", state->samplesPerSymbol == 10);
+    rc |= expect_true("return CC recomputes pulse symbol center", state->symbolCenter == 4);
+    free_test_runtime(&runtime);
+    return rc;
+}
+
+static int
+test_file_config_apply_keeps_live_pulse_timing(void) {
+    char wav_path[DSD_TEST_PATH_MAX] = {0};
+    if (create_temp_wav_file("dsdneo_cfg_apply_cross_backend", 48000, 1, wav_path, sizeof wav_path) != 0) {
+        return 1;
+    }
+
+    test_runtime runtime;
+    if (alloc_test_runtime(&runtime) != 0) {
+        (void)remove(wav_path);
+        return 1;
+    }
+    dsd_opts* opts = runtime.opts;
+    dsd_state* state = runtime.state;
+
+    DSD_SNPRINTF(opts->audio_in_dev, sizeof opts->audio_in_dev, "%s", "pulse");
+    opts->audio_in_type = AUDIO_IN_PULSE;
+    opts->pulse_digi_rate_in = 48000;
+    opts->wav_sample_rate = 96000;
+    state->samplesPerSymbol = 10;
+    state->symbolCenter = 4;
+    state->jitter = 6;
+
+    dsdneoUserConfig cfg = {0};
+    cfg.version = 1;
+    cfg.has_input = 1;
+    cfg.input_source = DSDCFG_INPUT_FILE;
+    cfg.file_sample_rate = 48000;
+    DSD_SNPRINTF(cfg.file_path, sizeof cfg.file_path, "%s", wav_path);
+
+    ui_post_cmd(UI_CMD_CONFIG_APPLY, &cfg, sizeof cfg);
+    ui_drain_cmds(opts, state);
+
+    int rc = 0;
+    rc |= expect_true("cross-backend apply keeps pulse input live", opts->audio_in_type == AUDIO_IN_PULSE);
+    rc |= expect_true("cross-backend apply stages requested file path", strcmp(opts->audio_in_dev, wav_path) == 0);
+    rc |= expect_int_eq("cross-backend apply keeps live pulse timing rate", dsd_opts_current_input_timing_rate(opts),
+                        48000);
+    rc |= expect_true("cross-backend apply keeps pulse timing with stale file rate", state->samplesPerSymbol == 10);
+    rc |= expect_true("cross-backend apply keeps pulse symbol center with stale file rate", state->symbolCenter == 4);
+    rc |= expect_true("cross-backend apply preserves live jitter snapshot", state->jitter == 6);
+
+    free_test_runtime(&runtime);
+    (void)remove(wav_path);
+    return rc;
+}
+
+static int
+test_file_config_apply_keeps_live_socket_timing(void) {
+    char wav_path[DSD_TEST_PATH_MAX] = {0};
+    if (create_temp_wav_file("dsdneo_cfg_apply_socket_stage", 96000, 1, wav_path, sizeof wav_path) != 0) {
+        return 1;
+    }
+
+    const struct {
+        int audio_in_type;
+        const char* live_dev;
+        const char* label;
+    } cases[] = {
+        {AUDIO_IN_TCP, "tcp:127.0.0.1:7355", "tcp"},
+        {AUDIO_IN_UDP, "udp:127.0.0.1:7355", "udp"},
+    };
+
+    int rc = 0;
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        test_runtime runtime;
+        if (alloc_test_runtime(&runtime) != 0) {
+            (void)remove(wav_path);
+            return 1;
+        }
+
+        dsd_opts* opts = runtime.opts;
+        dsd_state* state = runtime.state;
+
+        DSD_SNPRINTF(opts->audio_in_dev, sizeof opts->audio_in_dev, "%s", cases[i].live_dev);
+        opts->audio_in_type = cases[i].audio_in_type;
+        opts->wav_sample_rate = 48000;
+        opts->staged_file_sample_rate = 0;
+        state->samplesPerSymbol = 10;
+        state->symbolCenter = 4;
+        state->jitter = 6;
+
+        dsdneoUserConfig cfg = {0};
+        cfg.version = 1;
+        cfg.has_input = 1;
+        cfg.input_source = DSDCFG_INPUT_FILE;
+        cfg.file_sample_rate = 96000;
+        DSD_SNPRINTF(cfg.file_path, sizeof cfg.file_path, "%s", wav_path);
+
+        ui_post_cmd(UI_CMD_CONFIG_APPLY, &cfg, sizeof cfg);
+        ui_drain_cmds(opts, state);
+
+        dsdneoUserConfig snap = {0};
+        dsd_snapshot_opts_to_user_config(opts, state, &snap);
+
+        char label[128];
+        DSD_SNPRINTF(label, sizeof label, "%s apply keeps live socket input active", cases[i].label);
+        rc |= expect_true(label, opts->audio_in_type == cases[i].audio_in_type);
+        DSD_SNPRINTF(label, sizeof label, "%s apply preserves live socket rate", cases[i].label);
+        rc |= expect_int_eq(label, opts->wav_sample_rate, 48000);
+        DSD_SNPRINTF(label, sizeof label, "%s apply stages requested file rate", cases[i].label);
+        rc |= expect_int_eq(label, opts->staged_file_sample_rate, 96000);
+        DSD_SNPRINTF(label, sizeof label, "%s apply keeps live socket timing", cases[i].label);
+        rc |= expect_int_eq(label, dsd_opts_current_input_timing_rate(opts), 48000);
+        DSD_SNPRINTF(label, sizeof label, "%s apply preserves socket sps", cases[i].label);
+        rc |= expect_int_eq(label, state->samplesPerSymbol, 10);
+        DSD_SNPRINTF(label, sizeof label, "%s apply preserves socket center", cases[i].label);
+        rc |= expect_int_eq(label, state->symbolCenter, 4);
+        DSD_SNPRINTF(label, sizeof label, "%s snapshot keeps staged file source", cases[i].label);
+        rc |= expect_true(label, snap.has_input && snap.input_source == DSDCFG_INPUT_FILE);
+        DSD_SNPRINTF(label, sizeof label, "%s snapshot keeps staged file rate", cases[i].label);
+        rc |= expect_int_eq(label, snap.file_sample_rate, 96000);
+
+        free_test_runtime(&runtime);
+    }
+
+    (void)remove(wav_path);
+    return rc;
+}
+
+static int
+test_tcp_hot_restart_failure_rolls_back_requested_spec_and_retries(void) {
+    test_runtime runtime;
+    if (alloc_test_runtime(&runtime) != 0) {
+        return 1;
+    }
+    dsd_opts* opts = runtime.opts;
+    dsd_state* state = runtime.state;
+
+    reset_tcp_connect_audio_fake();
+    g_tcp_connect_audio_result = -1;
+
+    opts->audio_in_type = AUDIO_IN_TCP;
+    DSD_SNPRINTF(opts->audio_in_dev, sizeof opts->audio_in_dev, "%s", "tcp:old.example:1200");
+    DSD_SNPRINTF(opts->tcp_hostname, sizeof opts->tcp_hostname, "%s", "old.example");
+    opts->tcp_portno = 1200;
+
+    dsdneoUserConfig cfg = {0};
+    cfg.version = 1;
+    cfg.has_input = 1;
+    cfg.input_source = DSDCFG_INPUT_TCP;
+    DSD_SNPRINTF(cfg.tcp_host, sizeof cfg.tcp_host, "%s", "new.example");
+    cfg.tcp_port = 1300;
+
+    ui_post_cmd(UI_CMD_CONFIG_APPLY, &cfg, sizeof cfg);
+    ui_drain_cmds(opts, state);
+
+    dsdneoUserConfig snap = {0};
+    dsd_snapshot_opts_to_user_config(opts, state, &snap);
+
+    int rc = 0;
+    rc |= expect_int_eq("tcp hot restart failure attempts reconnect", g_tcp_connect_audio_calls, 1);
+    rc |= expect_true("tcp hot restart failure targets requested host",
+                      strcmp(g_last_tcp_connect_audio_host, "new.example") == 0);
+    rc |= expect_int_eq("tcp hot restart failure targets requested port", g_last_tcp_connect_audio_port, 1300);
+    rc |= expect_true("tcp hot restart failure keeps live device spec",
+                      strcmp(opts->audio_in_dev, "tcp:old.example:1200") == 0);
+    rc |= expect_true("tcp hot restart failure keeps live host", strcmp(opts->tcp_hostname, "old.example") == 0);
+    rc |= expect_int_eq("tcp hot restart failure keeps live port", opts->tcp_portno, 1200);
+    rc |= expect_true("tcp hot restart failure snapshot reports live endpoint",
+                      snap.has_input && snap.input_source == DSDCFG_INPUT_TCP
+                          && strcmp(snap.tcp_host, "old.example") == 0);
+    rc |= expect_int_eq("tcp hot restart failure snapshot reports live port", snap.tcp_port, 1200);
+
+    g_tcp_connect_audio_calls = 0;
+    g_last_tcp_connect_audio_host[0] = '\0';
+    g_last_tcp_connect_audio_port = 0;
+
+    ui_post_cmd(UI_CMD_CONFIG_APPLY, &cfg, sizeof cfg);
+    ui_drain_cmds(opts, state);
+
+    rc |= expect_int_eq("tcp hot restart retries after previous failure", g_tcp_connect_audio_calls, 1);
+    rc |= expect_true("tcp hot restart retry keeps targeting requested host",
+                      strcmp(g_last_tcp_connect_audio_host, "new.example") == 0);
+    rc |= expect_int_eq("tcp hot restart retry keeps targeting requested port", g_last_tcp_connect_audio_port, 1300);
+
+    free_test_runtime(&runtime);
+    return rc;
+}
+
+static int
+test_file_hot_swap_rebuilds_filters_when_header_matches_configured_rate(void) {
+    char old_path[DSD_TEST_PATH_MAX] = {0};
+    char new_path[DSD_TEST_PATH_MAX] = {0};
+    if (create_temp_wav_file("dsdneo_cfg_apply_old_rate", 48000, 1, old_path, sizeof old_path) != 0
+        || create_temp_wav_file("dsdneo_cfg_apply_new_rate", 72000, 1, new_path, sizeof new_path) != 0) {
+        (void)remove(old_path);
+        (void)remove(new_path);
+        return 1;
+    }
+
+    test_runtime runtime;
+    if (alloc_test_runtime(&runtime) != 0) {
+        (void)remove(old_path);
+        (void)remove(new_path);
+        return 1;
+    }
+    dsd_opts* opts = runtime.opts;
+    dsd_state* state = runtime.state;
+
+    dsd_opts_apply_input_sample_rate(opts, 48000);
+    DSD_SNPRINTF(opts->audio_in_dev, sizeof opts->audio_in_dev, "%s", old_path);
+    opts->audio_in_type = AUDIO_IN_WAV;
+    opts->audio_in_file_info = (SF_INFO*)calloc(1, sizeof(*opts->audio_in_file_info));
+    if (opts->audio_in_file_info == NULL) {
+        DSD_FPRINTF(stderr, "FAIL: alloc old-rate SF_INFO\n");
+        free_test_runtime(&runtime);
+        (void)remove(old_path);
+        (void)remove(new_path);
+        return 1;
+    }
+    opts->audio_in_file = sf_open(old_path, SFM_READ, opts->audio_in_file_info);
+    if (opts->audio_in_file == NULL) {
+        DSD_FPRINTF(stderr, "FAIL: sf_open read failed for %s: %s\n", old_path, sf_strerror(NULL));
+        free_test_runtime(&runtime);
+        (void)remove(old_path);
+        (void)remove(new_path);
+        return 1;
+    }
+
+    state->samplesPerSymbol = 10;
+    state->symbolCenter = 4;
+    dsd_audio_rescale_symbol_timing(state, 48000, 48000);
+    float old_rc_coef = state->RCFilter.coef[0];
+
+    dsdneoUserConfig cfg = {0};
+    cfg.version = 1;
+    cfg.has_input = 1;
+    cfg.input_source = DSDCFG_INPUT_FILE;
+    cfg.file_sample_rate = 72000;
+    DSD_SNPRINTF(cfg.file_path, sizeof cfg.file_path, "%s", new_path);
+
+    ui_post_cmd(UI_CMD_CONFIG_APPLY, &cfg, sizeof cfg);
+    ui_drain_cmds(opts, state);
+
+    int rc = 0;
+    rc |= expect_true("file hot swap keeps WAV input active", opts->audio_in_type == AUDIO_IN_WAV);
+    rc |= expect_true("file hot swap updates active path", strcmp(opts->audio_in_dev, new_path) == 0);
+    rc |= expect_true("file hot swap adopts new WAV header rate", opts->wav_sample_rate == 72000);
+    rc |= expect_true("file hot swap rescales symbol timing to new rate", state->samplesPerSymbol == 15);
+    rc |= expect_float_ne("file hot swap rebuilds RCFilter coefficients", state->RCFilter.coef[0], old_rc_coef);
+
+    free_test_runtime(&runtime);
+    (void)remove(old_path);
+    (void)remove(new_path);
+    return rc;
+}
+
+static int
+test_same_path_headerless_wav_reconfig_keeps_requested_raw_rate(void) {
+    const short samples[] = {0x1234, -0x1234, 0x0456, -0x0456};
+    char path[DSD_TEST_PATH_MAX] = {0};
+    if (create_temp_raw_pcm_wav_suffix("dsdneo_cfg_apply_raw_same_path", samples, sizeof samples / sizeof samples[0],
+                                       path, sizeof path)
+        != 0) {
+        return 1;
+    }
+
+    test_runtime runtime;
+    if (alloc_test_runtime(&runtime) != 0) {
+        (void)remove(path);
+        return 1;
+    }
+    dsd_opts* opts = runtime.opts;
+    dsd_state* state = runtime.state;
+
+    dsd_opts_apply_input_sample_rate(opts, 72000);
+    DSD_SNPRINTF(opts->audio_in_dev, sizeof opts->audio_in_dev, "%s", path);
+    opts->audio_in_type = AUDIO_IN_WAV;
+
+    int active_sample_rate = 0;
+    int opened_as_container = 1;
+    if (dsd_audio_open_mono_file_input(path, opts->wav_sample_rate, &opts->audio_in_file, &opts->audio_in_file_info,
+                                       &active_sample_rate, &opened_as_container)
+        != 0) {
+        DSD_FPRINTF(stderr, "FAIL: dsd_audio_open_mono_file_input failed for %s: %s\n", path, sf_strerror(NULL));
+        free_test_runtime(&runtime);
+        (void)remove(path);
+        return 1;
+    }
+
+    state->samplesPerSymbol = 15;
+    state->symbolCenter = 6;
+
+    dsdneoUserConfig cfg = {0};
+    cfg.version = 1;
+    cfg.has_input = 1;
+    cfg.input_source = DSDCFG_INPUT_FILE;
+    cfg.file_sample_rate = 48000;
+    DSD_SNPRINTF(cfg.file_path, sizeof cfg.file_path, "%s", path);
+
+    ui_post_cmd(UI_CMD_CONFIG_APPLY, &cfg, sizeof cfg);
+    ui_drain_cmds(opts, state);
+
+    int rc = 0;
+    rc |= expect_int_eq("same-path raw wav opens as raw input", opened_as_container, 0);
+    rc |= expect_int_eq("same-path raw wav starts at configured raw rate", active_sample_rate, 72000);
+    rc |= expect_int_eq("same-path raw wav keeps requested reconfigured rate", opts->wav_sample_rate, 48000);
+    rc |= expect_int_eq("same-path raw wav keeps raw format metadata",
+                        opts->audio_in_file_info->format & SF_FORMAT_TYPEMASK, SF_FORMAT_RAW);
+    rc |= expect_int_eq("same-path raw wav rescales timing to requested rate", state->samplesPerSymbol, 10);
+    rc |= expect_int_eq("same-path raw wav rescales symbol center", state->symbolCenter, 4);
+
+    free_test_runtime(&runtime);
+    (void)remove(path);
     return rc;
 }
 
@@ -147,14 +1011,14 @@ test_same_value_rtl_ppm_retry_is_republished(void) {
     opts->rtl_dsp_bw_khz = 48;
     opts->rtl_volume_multiplier = 2;
     opts->rtlsdr_ppm_error = 0;
-    snprintf(opts->audio_in_dev, sizeof opts->audio_in_dev, "%s", "rtl:0:1000000:10:5:48:0:2");
+    DSD_SNPRINTF(opts->audio_in_dev, sizeof opts->audio_in_dev, "%s", "rtl:0:1000000:10:5:48:0:2");
 
     dsdneoUserConfig cfg = {0};
     cfg.version = 1;
     cfg.has_input = 1;
     cfg.input_source = DSDCFG_INPUT_RTL;
     cfg.rtl_device = 0;
-    snprintf(cfg.rtl_freq, sizeof cfg.rtl_freq, "%s", "1000000");
+    DSD_SNPRINTF(cfg.rtl_freq, sizeof cfg.rtl_freq, "%s", "1000000");
     cfg.rtl_gain = 10;
     cfg.rtl_ppm = 5;
     cfg.rtl_ppm_is_set = 1;
@@ -186,14 +1050,14 @@ test_zero_rtl_ppm_apply_updates_live_request(void) {
     opts->rtl_dsp_bw_khz = 48;
     opts->rtl_volume_multiplier = 2;
     opts->rtlsdr_ppm_error = 9;
-    snprintf(opts->audio_in_dev, sizeof opts->audio_in_dev, "%s", "rtl:0:1000000:10:0:48:0:2");
+    DSD_SNPRINTF(opts->audio_in_dev, sizeof opts->audio_in_dev, "%s", "rtl:0:1000000:10:0:48:0:2");
 
     dsdneoUserConfig cfg = {0};
     cfg.version = 1;
     cfg.has_input = 1;
     cfg.input_source = DSDCFG_INPUT_RTL;
     cfg.rtl_device = 0;
-    snprintf(cfg.rtl_freq, sizeof cfg.rtl_freq, "%s", "1000000");
+    DSD_SNPRINTF(cfg.rtl_freq, sizeof cfg.rtl_freq, "%s", "1000000");
     cfg.rtl_gain = 10;
     cfg.rtl_ppm = 0;
     cfg.rtl_ppm_is_set = 1;
@@ -222,14 +1086,14 @@ test_omitted_rtl_ppm_apply_preserves_live_request(void) {
     opts->rtl_dsp_bw_khz = 48;
     opts->rtl_volume_multiplier = 2;
     opts->rtlsdr_ppm_error = 9;
-    snprintf(opts->audio_in_dev, sizeof opts->audio_in_dev, "%s", "rtl:0:1000000:10:9:48:0:2");
+    DSD_SNPRINTF(opts->audio_in_dev, sizeof opts->audio_in_dev, "%s", "rtl:0:1000000:10:9:48:0:2");
 
     dsdneoUserConfig cfg = {0};
     cfg.version = 1;
     cfg.has_input = 1;
     cfg.input_source = DSDCFG_INPUT_RTL;
     cfg.rtl_device = 0;
-    snprintf(cfg.rtl_freq, sizeof cfg.rtl_freq, "%s", "1000000");
+    DSD_SNPRINTF(cfg.rtl_freq, sizeof cfg.rtl_freq, "%s", "1000000");
     cfg.rtl_gain = 10;
     cfg.rtl_bw_khz = 48;
     cfg.rtl_volume = 2;
@@ -244,16 +1108,100 @@ test_omitted_rtl_ppm_apply_preserves_live_request(void) {
     free_test_runtime(&runtime);
     return rc;
 }
+
+static int
+test_cqpsk_eq_dsp_ops_update_live_controls(void) {
+    test_runtime runtime;
+    if (alloc_test_runtime(&runtime) != 0) {
+        return 1;
+    }
+    dsd_opts* opts = runtime.opts;
+    dsd_state* state = runtime.state;
+
+    dsd_neo_config_init(opts);
+    rtl_stream_toggle_cqpsk(1);
+    rtl_stream_set_cqpsk_eq(1, 7, 0.0008f, 0.85f * 0.85f);
+
+    UiDspPayload p = {0};
+    rtl_stream_cqpsk_eq_status eq = {0};
+    int cfg_enable = 0;
+    int cfg_taps = 0;
+    float cfg_mu = 0.0f;
+    float cfg_modulus = 0.0f;
+    int rc = 0;
+
+    p.op = UI_DSP_OP_CQPSK_EQ_TOGGLE;
+    ui_post_cmd(UI_CMD_DSP_OP, &p, sizeof p);
+    ui_drain_cmds(opts, state);
+    (void)rtl_stream_get_cqpsk_eq_status(&eq);
+    rc |= expect_int_eq("CMA UI toggle disables live equalizer", eq.enabled, 0);
+
+    ui_post_cmd(UI_CMD_DSP_OP, &p, sizeof p);
+    ui_drain_cmds(opts, state);
+    (void)rtl_stream_get_cqpsk_eq_status(&eq);
+    rc |= expect_int_eq("CMA UI toggle enables live equalizer", eq.enabled, 1);
+
+    p = (UiDspPayload){.op = UI_DSP_OP_CQPSK_EQ_TAPS_DELTA, .a = +2};
+    ui_post_cmd(UI_CMD_DSP_OP, &p, sizeof p);
+    ui_drain_cmds(opts, state);
+    (void)rtl_stream_get_cqpsk_eq_status(&eq);
+    rc |= expect_int_eq("CMA taps delta updates live equalizer", eq.taps, 9);
+
+    p = (UiDspPayload){.op = UI_DSP_OP_CQPSK_EQ_MU_DELTA, .a = +1};
+    ui_post_cmd(UI_CMD_DSP_OP, &p, sizeof p);
+    ui_drain_cmds(opts, state);
+    (void)rtl_stream_get_cqpsk_eq_status(&eq);
+    rc |= expect_float_close("CMA mu delta updates live equalizer", eq.mu, 0.0009f, 0.000001f);
+
+    p = (UiDspPayload){.op = UI_DSP_OP_CQPSK_EQ_MODULUS_DELTA, .a = +5};
+    ui_post_cmd(UI_CMD_DSP_OP, &p, sizeof p);
+    ui_drain_cmds(opts, state);
+    (void)rtl_stream_get_cqpsk_eq_status(&eq);
+    rc |=
+        expect_float_close("CMA modulus delta updates live equalizer", eq.modulus, (0.85f * 0.85f) + 0.05f, 0.000001f);
+
+    dsd_neo_get_cqpsk_eq(&cfg_enable, &cfg_taps, &cfg_mu, &cfg_modulus);
+    rc |= expect_int_eq("CMA UI writes runtime enable", cfg_enable, 1);
+    rc |= expect_int_eq("CMA UI writes runtime taps", cfg_taps, 9);
+    rc |= expect_float_close("CMA UI writes runtime mu", cfg_mu, 0.0009f, 0.000001f);
+    rc |= expect_float_close("CMA UI writes runtime modulus", cfg_modulus, (0.85f * 0.85f) + 0.05f, 0.000001f);
+
+    p = (UiDspPayload){.op = UI_DSP_OP_CQPSK_EQ_RESET};
+    ui_post_cmd(UI_CMD_DSP_OP, &p, sizeof p);
+    ui_drain_cmds(opts, state);
+    (void)rtl_stream_get_cqpsk_eq_status(&eq);
+    rc |= expect_int_eq("CMA reset keeps configured taps", eq.taps, 9);
+    rc |= expect_int_eq("CMA reset initializes state", eq.initialized, 1);
+
+    free_test_runtime(&runtime);
+    return rc;
+}
 #endif
 
 int
 main(void) {
     int rc = 0;
     rc |= test_basic_pulse_config_apply();
+    rc |= test_ui_profile_selection_applies_overlay_and_disables_autosave();
+    rc |= test_ui_profile_menu_no_profiles_does_not_apply_base_config();
+    rc |= test_stereo_file_hot_swap_rolls_back_to_live_input();
+    rc |= test_call_alert_off_selection_survives_ui_command_path();
+    rc |= test_ui_aes_key_command_clears_manual_hytera_fields();
+    rc |= test_return_cc_uses_pulse_rate_not_stale_file_rate();
+    rc |= test_file_config_apply_keeps_live_pulse_timing();
+    rc |= test_file_config_apply_keeps_live_socket_timing();
+    rc |= test_tcp_hot_restart_failure_rolls_back_requested_spec_and_retries();
+    rc |= test_file_hot_swap_rebuilds_filters_when_header_matches_configured_rate();
+    rc |= test_same_path_headerless_wav_reconfig_keeps_requested_raw_rate();
 #ifdef USE_RADIO
     rc |= test_same_value_rtl_ppm_retry_is_republished();
     rc |= test_zero_rtl_ppm_apply_updates_live_request();
     rc |= test_omitted_rtl_ppm_apply_preserves_live_request();
+    rc |= test_cqpsk_eq_dsp_ops_update_live_controls();
 #endif
     return rc ? 1 : 0;
 }
+
+#if defined(__GNUC__) && !defined(__cplusplus)
+#pragma GCC diagnostic pop
+#endif

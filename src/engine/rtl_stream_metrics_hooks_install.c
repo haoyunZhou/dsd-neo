@@ -6,6 +6,8 @@
 #include <dsd-neo/runtime/rtl_stream_metrics_hooks.h>
 #include <stddef.h>
 
+#include "engine_hooks_install.h"
+
 #ifdef USE_RADIO
 #include <dsd-neo/io/rtl_stream_c.h>
 
@@ -22,6 +24,10 @@ dsd_engine_rtl_stream_metrics_hooks_install(void) {
     dsd_rtl_stream_metrics_hooks hooks = {0};
 #ifdef USE_RADIO
     hooks.output_rate_hz = dsd_rtl_stream_output_rate;
+    hooks.output_kind = rtl_stream_get_output_kind;
+    hooks.symbol_profile = rtl_stream_get_symbol_profile_full;
+    hooks.stream_generation = rtl_stream_output_generation;
+    hooks.set_symbol_profile = rtl_stream_set_symbol_profile;
     hooks.dsp_get = rtl_stream_dsp_get;
     hooks.ted_bias = rtl_stream_metrics_ted_bias;
     hooks.snr_bias_evm = rtl_stream_get_snr_bias_evm;
@@ -32,6 +38,7 @@ dsd_engine_rtl_stream_metrics_hooks_install(void) {
     hooks.snr_qpsk_const_db = rtl_stream_estimate_snr_qpsk_const;
     hooks.p25p1_ber_update = rtl_stream_p25p1_ber_update;
     hooks.p25p2_err_update = rtl_stream_p25p2_err_update;
+    hooks.stream_active = rtl_stream_is_active;
 #endif
-    dsd_rtl_stream_metrics_hooks_set(hooks);
+    dsd_rtl_stream_metrics_hooks_set(&hooks);
 }

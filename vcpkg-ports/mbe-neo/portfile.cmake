@@ -1,9 +1,10 @@
-# Always track the upstream main branch for Windows builds.
-set(VCPKG_USE_HEAD_VERSION ON)
+# Pinned for reproducible Windows/vcpkg builds. See docs/supply-chain-guardrails.md
+# for the refresh process.
 vcpkg_from_github(
     OUT_SOURCE_PATH SOURCE_PATH
     REPO arancormonk/mbelib-neo
-    HEAD_REF main
+    REF 6138cce7091d90e4be9e889ac166006265d3e8fb
+    SHA512 cace0083c1462c85436ec34b1f68730da42126c81bcbf0855da5f6b771ab5002776b785aee5786fe18c01bc8a736d33f7d6550f5820cd0909ddb23fb9065cefe
 )
 
 vcpkg_cmake_configure(

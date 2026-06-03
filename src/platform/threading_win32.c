@@ -3,7 +3,9 @@
  * Copyright (C) 2025 by arancormonk <180709949+arancormonk@users.noreply.github.com>
  */
 
+#define DSD_NEO_THREADING_NO_INLINE_CREATE
 #include <dsd-neo/platform/threading.h>
+#include <dsd-neo/platform/timing.h>
 
 #if DSD_PLATFORM_WIN_NATIVE
 
@@ -129,6 +131,38 @@ dsd_cond_timedwait(dsd_cond_t* cond, dsd_mutex_t* mutex, unsigned int timeout_ms
             return ETIMEDOUT;
         }
         return err;
+    }
+    return 0;
+}
+
+int
+dsd_cond_init_monotonic(dsd_cond_t* cond) {
+    return dsd_cond_init(cond);
+}
+
+int
+dsd_cond_timedwait_monotonic(dsd_cond_t* cond, dsd_mutex_t* mutex, uint64_t deadline_ns) {
+    if (!cond || !mutex) {
+        return EINVAL;
+    }
+
+    uint64_t now_ns = dsd_time_monotonic_ns();
+    if (deadline_ns <= now_ns) {
+        return ETIMEDOUT;
+    }
+    uint64_t remaining_ns = deadline_ns - now_ns;
+    uint64_t wait_ms_u64 = (remaining_ns + 999999ULL) / 1000000ULL;
+    if (wait_ms_u64 > 0xFFFFFFFFULL) {
+        wait_ms_u64 = 0xFFFFFFFFULL;
+    }
+    DWORD timeout_ms = (DWORD)wait_ms_u64;
+
+    if (!SleepConditionVariableCS(cond, mutex, timeout_ms)) {
+        DWORD err = GetLastError();
+        if (err == ERROR_TIMEOUT) {
+            return ETIMEDOUT;
+        }
+        return (int)err;
     }
     return 0;
 }

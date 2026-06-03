@@ -10,7 +10,8 @@
  * Declares the simple SPSC input ring and operations to reserve, commit,
  * write, and blockingly read samples with wrap-around handling.
  */
-#pragma once
+#ifndef DSD_NEO_INCLUDE_DSD_NEO_RUNTIME_INPUT_RING_H_
+#define DSD_NEO_INCLUDE_DSD_NEO_RUNTIME_INPUT_RING_H_
 
 #include <atomic>
 #include <stdint.h>
@@ -26,8 +27,11 @@ struct input_ring_state {
     std::atomic<size_t> tail;
     dsd_cond_t ready;
     dsd_mutex_t ready_m;
+    dsd_cond_t space;
+    std::atomic<int> space_notify_enabled;
     std::atomic<uint64_t> producer_drops; /* bytes dropped when full */
     std::atomic<uint64_t> read_timeouts;  /* waits for data */
+    std::atomic<uint64_t> discard_generation;
 };
 
 /**
@@ -67,6 +71,65 @@ input_ring_clear(struct input_ring_state* r) {
     r->tail.store(0);
     r->head.store(0);
 }
+
+/**
+ * @brief Publish that in-flight producer reservations are stale.
+ *
+ * Consumer-side purges can only move the consumer-owned tail. This generation
+ * lets producer callbacks detect a purge that happened after they reserved
+ * ring space but before they committed it.
+ */
+static inline void
+input_ring_request_discard(struct input_ring_state* r) {
+    if (!r) {
+        return;
+    }
+    (void)r->discard_generation.fetch_add(1, std::memory_order_acq_rel);
+}
+
+/**
+ * @brief Return the current producer discard generation.
+ */
+static inline uint64_t
+input_ring_discard_generation(const struct input_ring_state* r) {
+    return r ? r->discard_generation.load(std::memory_order_acquire) : 0ULL;
+}
+
+/**
+ * @brief Check whether a producer reservation is still current.
+ */
+static inline int
+input_ring_discard_generation_matches(const struct input_ring_state* r, uint64_t generation) {
+    return input_ring_discard_generation(r) == generation;
+}
+
+/**
+ * @brief Initialize input ring storage and synchronization primitives.
+ *
+ * @param r Input ring state.
+ * @param capacity Number of float elements in the ring (must be > 0).
+ * @return 0 on success, -1 on invalid args or allocation/init failure.
+ */
+int input_ring_init(struct input_ring_state* r, size_t capacity);
+
+/**
+ * @brief Destroy an initialized input ring.
+ *
+ * Safe to call multiple times; no-op on NULL.
+ *
+ * @param r Input ring state.
+ */
+void input_ring_destroy(struct input_ring_state* r);
+
+/**
+ * @brief Enable or disable consumer->producer space notifications.
+ *
+ * When enabled, input_ring_read_block() signals `space` after consuming data.
+ *
+ * @param r Input ring state.
+ * @param enabled Non-zero to enable notifications, zero to disable.
+ */
+void input_ring_enable_space_notify(struct input_ring_state* r, int enabled);
 
 /**
  * @brief Reserve writable regions in the input ring buffer.
@@ -109,6 +172,32 @@ void input_ring_write(struct input_ring_state* r, const float* data, size_t coun
 int input_ring_read_block(struct input_ring_state* r, float* out, size_t max_count);
 
 /**
+ * @brief Reserve readable regions in the input ring without copying.
+ *
+ * Blocks until at least one sample is available, then returns up to
+ * @p max_count samples as one or two contiguous spans. The caller owns the
+ * returned spans until it calls input_ring_read_commit().
+ *
+ * @param r         Input ring state.
+ * @param max_count Maximum number of samples to reserve.
+ * @param p1        [out] First readable region pointer.
+ * @param n1        [out] First readable region length.
+ * @param p2        [out] Second readable region pointer or NULL.
+ * @param n2        [out] Second readable region length.
+ * @return Number of reserved samples, 0 if max_count is 0, or -1 on exit/error.
+ */
+int input_ring_read_reserve(struct input_ring_state* r, size_t max_count, float** p1, size_t* n1, float** p2,
+                            size_t* n2);
+
+/**
+ * @brief Commit samples previously obtained with input_ring_read_reserve().
+ *
+ * @param r        Input ring state.
+ * @param consumed Number of samples consumed from the reserved spans.
+ */
+void input_ring_read_commit(struct input_ring_state* r, size_t consumed);
+
+/**
  * @brief Discard all pending samples (consumer-side purge).
  *
  * Safe for the consumer thread to call; only updates tail to match the latest
@@ -119,3 +208,5 @@ input_ring_discard_all_consumer(struct input_ring_state* r) {
     size_t h = r->head.load(std::memory_order_acquire);
     r->tail.store(h, std::memory_order_release);
 }
+
+#endif /* DSD_NEO_INCLUDE_DSD_NEO_RUNTIME_INPUT_RING_H_ */

@@ -7,23 +7,26 @@
 
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/io/udp_input.h>
+#include <dsd-neo/platform/atomic_compat.h>
 #include <dsd-neo/platform/platform.h>
 #include <dsd-neo/platform/sockets.h>
 #include <dsd-neo/platform/threading.h>
 #include <dsd-neo/platform/timing.h>
 #include <dsd-neo/runtime/exitflag.h>
+#include <errno.h>
 #if !DSD_PLATFORM_WIN_NATIVE
 #include <arpa/inet.h>
 #include <netinet/in.h>
-#include <sys/socket.h>
 #endif
-#include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
+#if !DSD_PLATFORM_WIN_NATIVE
+#include <sys/socket.h>
+#endif
 #include "dsd-neo/core/opts_fwd.h"
+#include "dsd-neo/core/safe_api.h"
 
 /** @brief Simple single-producer/single-consumer ring for PCM16 samples. */
 typedef struct udp_input_ring {
@@ -38,7 +41,7 @@ typedef struct udp_input_ring {
 /** @brief UDP input backend state shared across the reader thread and callers. */
 typedef struct udp_input_ctx {
     dsd_socket_t sockfd;
-    int running;
+    atomic_int running;
     udp_input_ring ring;
     dsd_thread_t th;
     int sample_rate;
@@ -64,9 +67,7 @@ ring_init(udp_input_ring* r, size_t cap_samples) {
  */
 static void
 ring_destroy(udp_input_ring* r) {
-    if (r->buf) {
-        free(r->buf);
-    }
+    free(r->buf);
     r->buf = NULL;
     r->cap = r->head = r->tail = 0;
     dsd_mutex_destroy(&r->m);
@@ -141,7 +142,7 @@ static DSD_THREAD_RETURN_TYPE
         DSD_THREAD_RETURN;
     }
 
-    while (ctx->running) {
+    while (atomic_load(&ctx->running)) {
         int n = dsd_socket_recv(ctx->sockfd, buf, max_bytes, 0);
         if (n < 0) {
             int err = dsd_socket_get_error();
@@ -157,7 +158,7 @@ static DSD_THREAD_RETURN_TYPE
             if (err == EINTR) {
                 continue;
             }
-            if (err == EAGAIN || err == EWOULDBLOCK) {
+            if (err == EAGAIN || (EWOULDBLOCK != EAGAIN && err == EWOULDBLOCK)) {
                 dsd_sleep_ms(1);
                 continue;
             }
@@ -216,7 +217,7 @@ udp_input_start(dsd_opts* opts, const char* bindaddr, int port, int samplerate) 
 
     dsd_socket_t sockfd = dsd_socket_create(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (sockfd == DSD_INVALID_SOCKET) {
-        fprintf(stderr, "Error creating UDP input socket\n");
+        DSD_FPRINTF(stderr, "Error creating UDP input socket\n");
         return -1;
     }
 
@@ -228,7 +229,7 @@ udp_input_start(dsd_opts* opts, const char* bindaddr, int port, int samplerate) 
     (void)dsd_socket_set_recv_timeout(sockfd, 200); // 200ms
 
     struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
+    DSD_MEMSET(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_port = htons((uint16_t)port);
     if (bindaddr && strlen(bindaddr) > 0) {
@@ -237,7 +238,7 @@ udp_input_start(dsd_opts* opts, const char* bindaddr, int port, int samplerate) 
         } else {
             /* Parse numeric address */
             if (dsd_socket_resolve(bindaddr, port, &addr) != 0) {
-                fprintf(stderr, "Invalid UDP bind address: %s\n", bindaddr);
+                DSD_FPRINTF(stderr, "Invalid UDP bind address: %s\n", bindaddr);
                 dsd_socket_close(sockfd);
                 return -1;
             }
@@ -247,7 +248,7 @@ udp_input_start(dsd_opts* opts, const char* bindaddr, int port, int samplerate) 
     }
 
     if (dsd_socket_bind(sockfd, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
-        fprintf(stderr, "Failed to bind UDP %s:%d\n", bindaddr ? bindaddr : "127.0.0.1", port);
+        DSD_FPRINTF(stderr, "Failed to bind UDP %s:%d\n", bindaddr ? bindaddr : "127.0.0.1", port);
         dsd_socket_close(sockfd);
         return -1;
     }
@@ -258,7 +259,7 @@ udp_input_start(dsd_opts* opts, const char* bindaddr, int port, int samplerate) 
         return -1;
     }
     ctx->sockfd = sockfd;
-    ctx->running = 1;
+    atomic_store(&ctx->running, 1);
     ctx->sample_rate = samplerate;
 
     // Ring capacity: ~500ms at samplerate
@@ -275,7 +276,7 @@ udp_input_start(dsd_opts* opts, const char* bindaddr, int port, int samplerate) 
 
     opts->udp_in_ctx = ctx;
     opts->udp_in_sockfd = sockfd;
-    int rc = dsd_thread_create(&ctx->th, (dsd_thread_fn)udp_rx_thread, opts);
+    int rc = dsd_thread_create(&ctx->th, udp_rx_thread, opts);
     if (rc != 0) {
         ring_destroy(&ctx->ring);
         dsd_socket_close(sockfd);
@@ -284,6 +285,7 @@ udp_input_start(dsd_opts* opts, const char* bindaddr, int port, int samplerate) 
         opts->udp_in_sockfd = DSD_INVALID_SOCKET;
         return -1;
     }
+    dsd_opts_reset_pcm_input_state(opts);
     return 0;
 }
 
@@ -297,15 +299,15 @@ udp_input_stop(dsd_opts* opts) {
         return;
     }
     udp_input_ctx* ctx = (udp_input_ctx*)opts->udp_in_ctx;
-    ctx->running = 0;
-    if (ctx->sockfd != DSD_INVALID_SOCKET) {
-        dsd_socket_shutdown(ctx->sockfd, SHUT_RD);
-        dsd_socket_close(ctx->sockfd);
-    }
-    ctx->sockfd = DSD_INVALID_SOCKET;
+    dsd_socket_t sockfd = ctx->sockfd;
+    atomic_store(&ctx->running, 0);
     // wake any blocked reader
     ring_signal(&ctx->ring);
     dsd_thread_join(ctx->th);
+    if (sockfd != DSD_INVALID_SOCKET) {
+        dsd_socket_close(sockfd);
+        ctx->sockfd = DSD_INVALID_SOCKET;
+    }
     ring_destroy(&ctx->ring);
     free(ctx);
     opts->udp_in_ctx = NULL;
@@ -329,13 +331,13 @@ udp_input_read_sample(dsd_opts* opts, int16_t* out) {
         return 0;
     }
     udp_input_ctx* ctx = (udp_input_ctx*)opts->udp_in_ctx;
-    if (!ctx->running) {
+    if (!atomic_load(&ctx->running)) {
         return 0;
     }
     // Block until we have a real sample (do not synthesize silence; it breaks symbol timing).
     dsd_mutex_lock(&ctx->ring.m);
     while (ring_used(&ctx->ring) == 0) {
-        if (exitflag || !ctx->running) {
+        if (exitflag || !atomic_load(&ctx->running)) {
             dsd_mutex_unlock(&ctx->ring.m);
             return 0;
         }

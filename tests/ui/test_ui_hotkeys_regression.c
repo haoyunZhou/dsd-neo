@@ -18,10 +18,14 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
-
 #include "dsd-neo/core/opts_fwd.h"
+#include "dsd-neo/core/safe_api.h"
 #include "dsd-neo/core/state_fwd.h"
+
+#if defined(__GNUC__) && !defined(__cplusplus)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmissing-prototypes"
+#endif
 
 /* Function under test (compiled from src/ui/terminal/dsd_ncurses_handler.c). */
 uint8_t ncurses_input_handler(dsd_opts* opts, dsd_state* state, int c);
@@ -38,35 +42,38 @@ static UiPostCapture g_cap;
 static int g_redraw_calls = 0;
 static int g_history_mode = 1;
 static int g_history_cycle_calls = 0;
+static int g_menu_open = 0;
+static int g_menu_handle_key_calls = 0;
+static int g_menu_last_key = ERR;
 
 int
-ui_post_cmd(int cmd_id, const void* payload, size_t payload_sz) {
+ui_post_cmd(int cmd_id, const void* payload, size_t payload_sz) { // NOLINT(misc-use-internal-linkage)
     g_cap.id = cmd_id;
     g_cap.n = payload_sz;
     if (payload_sz > sizeof(g_cap.data)) {
         payload_sz = sizeof(g_cap.data);
     }
     if (payload && payload_sz > 0) {
-        memcpy(g_cap.data, payload, payload_sz);
+        DSD_MEMCPY(g_cap.data, payload, payload_sz);
     } else {
-        memset(g_cap.data, 0, sizeof(g_cap.data));
+        DSD_MEMSET(g_cap.data, 0, sizeof(g_cap.data));
     }
     g_cap.calls++;
     return 0;
 }
 
 void
-ui_request_redraw(void) {
+ui_request_redraw(void) { // NOLINT(misc-use-internal-linkage)
     g_redraw_calls++;
 }
 
 int
-ui_history_get_mode(void) {
+ui_history_get_mode(void) { // NOLINT(misc-use-internal-linkage)
     return g_history_mode;
 }
 
 void
-ui_history_set_mode(int mode) {
+ui_history_set_mode(int mode) { // NOLINT(misc-use-internal-linkage)
     g_history_mode = mode % 3;
     if (g_history_mode < 0) {
         g_history_mode += 3;
@@ -74,27 +81,28 @@ ui_history_set_mode(int mode) {
 }
 
 int
-ui_history_cycle_mode(void) {
+ui_history_cycle_mode(void) { // NOLINT(misc-use-internal-linkage)
     g_history_cycle_calls++;
     ui_history_set_mode(g_history_mode + 1);
     return g_history_mode;
 }
 
 int
-ui_menu_is_open(void) {
-    return 0;
+ui_menu_is_open(void) { // NOLINT(misc-use-internal-linkage)
+    return g_menu_open;
 }
 
 int
-ui_menu_handle_key(int ch, dsd_opts* opts, dsd_state* state) {
-    (void)ch;
+ui_menu_handle_key(int ch, dsd_opts* opts, dsd_state* state) { // NOLINT(misc-use-internal-linkage)
     (void)opts;
     (void)state;
+    g_menu_handle_key_calls++;
+    g_menu_last_key = ch;
     return 0;
 }
 
 void
-ui_menu_open_async(dsd_opts* opts, dsd_state* state) {
+ui_menu_open_async(dsd_opts* opts, dsd_state* state) { // NOLINT(misc-use-internal-linkage)
     (void)opts;
     (void)state;
 }
@@ -108,22 +116,25 @@ wgetch(WINDOW* win) {
 }
 
 int
-rtl_stream_spectrum_get_size(void) {
+rtl_stream_spectrum_get_size(void) { // NOLINT(misc-use-internal-linkage)
     return 512;
 }
 
 static void
 cap_reset(void) {
-    memset(&g_cap, 0, sizeof(g_cap));
+    DSD_MEMSET(&g_cap, 0, sizeof(g_cap));
     g_redraw_calls = 0;
     g_history_cycle_calls = 0;
     g_history_mode = 1;
+    g_menu_open = 0;
+    g_menu_handle_key_calls = 0;
+    g_menu_last_key = ERR;
 }
 
 static uint32_t
 cap_u32(void) {
     uint32_t v = 0;
-    memcpy(&v, g_cap.data, sizeof(v));
+    DSD_MEMCPY(&v, g_cap.data, sizeof(v));
     return v;
 }
 
@@ -132,11 +143,20 @@ main(void) {
     dsd_opts* opts = (dsd_opts*)calloc(1, sizeof(*opts));
     dsd_state* state = (dsd_state*)calloc(1, sizeof(*state));
     if (!opts || !state) {
-        fprintf(stderr, "allocation failed\n");
+        DSD_FPRINTF(stderr, "allocation failed\n");
         free(state);
         free(opts);
         return 1;
     }
+
+    /* Open menu overlay should receive keys before hotkeys and keep input consumed. */
+    cap_reset();
+    g_menu_open = 1;
+    assert(ncurses_input_handler(opts, state, DSD_KEY_HISTORY) == 1);
+    assert(g_menu_handle_key_calls == 1);
+    assert(g_menu_last_key == DSD_KEY_HISTORY);
+    assert(g_history_cycle_calls == 0);
+    assert(g_cap.calls == 0);
 
     /* 'h' must cycle immediately in UI thread (no command queue dependency). */
     cap_reset();
@@ -206,8 +226,31 @@ main(void) {
     assert(g_cap.id == UI_CMD_TG_HOLD_SET);
     assert(cap_u32() == 4004U);
 
+    /* Crypto-affecting legacy hotkeys should post the expected command intents. */
+    cap_reset();
+    assert(ncurses_input_handler(opts, state, DSD_KEY_FORCE_PRIV) == 1);
+    assert(g_cap.calls == 1);
+    assert(g_cap.id == UI_CMD_FORCE_PRIV_TOGGLE);
+    assert(g_cap.n == 0);
+
+    cap_reset();
+    assert(ncurses_input_handler(opts, state, '6') == 1);
+    assert(g_cap.calls == 1);
+    assert(g_cap.id == UI_CMD_FORCE_RC4_TOGGLE);
+    assert(g_cap.n == 0);
+
+    cap_reset();
+    assert(ncurses_input_handler(opts, state, DSD_KEY_TRUNK_ENC) == 1);
+    assert(g_cap.calls == 1);
+    assert(g_cap.id == UI_CMD_TRUNK_ENC_TOGGLE);
+    assert(g_cap.n == 0);
+
     printf("UI_HOTKEYS_REGRESSION: OK\n");
     free(state);
     free(opts);
     return 0;
 }
+
+#if defined(__GNUC__) && !defined(__cplusplus)
+#pragma GCC diagnostic pop
+#endif

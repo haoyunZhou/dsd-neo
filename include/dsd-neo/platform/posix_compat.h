@@ -3,7 +3,8 @@
  * Copyright (C) 2025 by arancormonk <180709949+arancormonk@users.noreply.github.com>
  */
 
-#pragma once
+#ifndef DSD_NEO_INCLUDE_DSD_NEO_PLATFORM_POSIX_COMPAT_H_H
+#define DSD_NEO_INCLUDE_DSD_NEO_PLATFORM_POSIX_COMPAT_H_H
 
 /**
  * @file
@@ -15,8 +16,12 @@
  */
 
 #include <dsd-neo/platform/platform.h>
-#include <stddef.h>
 #include <stdint.h>
+#include <string.h> // IWYU pragma: keep
+#if !DSD_COMPILER_MSVC
+#include <strings.h> // IWYU pragma: keep
+#endif
+struct timeval; // IWYU pragma: keep
 
 #ifdef __cplusplus
 extern "C" {
@@ -49,14 +54,11 @@ int dsd_unsetenv(const char* name);
  * ============================================================================ */
 
 #if DSD_PLATFORM_WIN_NATIVE
-#include <string.h>
 #define dsd_strdup                        _strdup
 #define dsd_strtok_r(str, delim, saveptr) strtok_s(str, delim, saveptr)
 #define dsd_strcasecmp                    _stricmp
 #define dsd_strncasecmp                   _strnicmp
 #else
-#include <string.h>
-#include <strings.h>
 #define dsd_strdup      strdup
 #define dsd_strtok_r    strtok_r
 #define dsd_strcasecmp  strcasecmp
@@ -89,6 +91,14 @@ int getopt(int argc, char* const argv[], const char* optstring);
  * @return 0 on success, -1 on error.
  */
 int dsd_mkdir(const char* path, int mode);
+
+/**
+ * @brief Open a serial/control device for write-only output.
+ *
+ * @param path Device path selected by the user.
+ * @return File descriptor on success, -1 on error.
+ */
+int dsd_open_serial_write(const char* path);
 
 /* ============================================================================
  * Aligned Memory Allocation
@@ -129,25 +139,6 @@ int dsd_mkstemp(char* tmpl);
  * @return tmpl on success, NULL on error.
  */
 char* dsd_mkdtemp(char* tmpl);
-
-/* ============================================================================
- * GCC/Clang Attribute Compatibility
- * ============================================================================ */
-
-#if DSD_COMPILER_MSVC
-#define DSD_ATTR_UNUSED
-#define DSD_ATTR_NORETURN __declspec(noreturn)
-#define DSD_ATTR_PACKED
-#define DSD_ATTR_WEAK
-#define DSD_ATTR_FORMAT(archetype, string_index, first_to_check)
-#else
-#define DSD_ATTR_UNUSED   __attribute__((unused))
-#define DSD_ATTR_NORETURN __attribute__((noreturn))
-#define DSD_ATTR_PACKED   __attribute__((packed))
-#define DSD_ATTR_WEAK     __attribute__((weak))
-#define DSD_ATTR_FORMAT(archetype, string_index, first_to_check)                                                       \
-    __attribute__((format(archetype, string_index, first_to_check)))
-#endif
 
 /* ============================================================================
  * GCC Builtin Compatibility (__builtin_popcountll)
@@ -216,3 +207,4 @@ dsd_gettimeofday(struct timeval* tv, void* tz) {
 #ifdef __cplusplus
 }
 #endif
+#endif /* DSD_NEO_INCLUDE_DSD_NEO_PLATFORM_POSIX_COMPAT_H_H */

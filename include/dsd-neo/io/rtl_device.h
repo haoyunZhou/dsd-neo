@@ -12,12 +12,11 @@
  * control, PPM correction, and asynchronous USB ingestion into an input ring.
  */
 
-#pragma once
+#ifndef DSD_NEO_INCLUDE_DSD_NEO_IO_RTL_DEVICE_H_
+#define DSD_NEO_INCLUDE_DSD_NEO_IO_RTL_DEVICE_H_
 
+#include <stddef.h>
 #include <stdint.h>
-
-#include <dsd-neo/platform/threading.h>
-#include <dsd-neo/runtime/input_ring.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -25,6 +24,30 @@ extern "C" {
 
 /* Opaque handle for RTL-SDR device */
 struct rtl_device;
+struct input_ring_state;
+struct dsd_iq_capture_writer;
+
+/**
+ * @brief Optional SoapySDR-specific startup controls.
+ *
+ * String pointers may be NULL or empty. bandwidth_hz uses -1 for profile/default
+ * behavior, 0 for driver automatic/no explicit bandwidth request, and positive
+ * values for a requested hardware bandwidth in Hz. Fields appended after
+ * bandwidth_hz are read only by rtl_device_configure_soapy_sized() when the
+ * supplied config_size includes them.
+ */
+struct rtl_soapy_config {
+    const char* profile;
+    const char* antenna;
+    const char* clock_source;
+    const char* gains;
+    const char* stream_format;
+    int bandwidth_hz;
+    const char* settings;
+};
+
+#define RTL_SOAPY_CONFIG_LEGACY_SIZE offsetof(struct rtl_soapy_config, settings)
+#define RTL_SOAPY_CONFIG_SIZE        sizeof(struct rtl_soapy_config)
 
 /**
  * @brief Create and initialize a local RTL-SDR device over USB (librtlsdr).
@@ -63,6 +86,25 @@ struct rtl_device* rtl_device_create_tcp(const char* host, int port, struct inpu
  */
 struct rtl_device* rtl_device_create_soapy(const char* soapy_args, struct input_ring_state* input_ring,
                                            int combine_rotate_enabled);
+
+/**
+ * @brief Apply SoapySDR-specific profile and capability-aware startup options.
+ *
+ * Must be called after rtl_device_create_soapy() and before rtl_device_start_async().
+ * Preserves compatibility with callers built against the legacy six-field
+ * rtl_soapy_config layout and ignores fields appended after bandwidth_hz.
+ * Returns 0 for success, negative for failure/unsupported backend.
+ */
+int rtl_device_configure_soapy(struct rtl_device* dev, const struct rtl_soapy_config* config);
+
+/**
+ * @brief Apply SoapySDR-specific startup options with an explicit config size.
+ *
+ * Pass sizeof(struct rtl_soapy_config), or RTL_SOAPY_CONFIG_SIZE, to opt in to
+ * appended fields such as settings. Smaller sizes are accepted and only fields
+ * fully contained by config_size are read.
+ */
+int rtl_device_configure_soapy_sized(struct rtl_device* dev, const struct rtl_soapy_config* config, size_t config_size);
 
 /**
  * @brief Destroy an RTL-SDR device and free resources.
@@ -260,6 +302,64 @@ int rtl_device_set_tcp_autotune(struct rtl_device* dev, int onoff);
 int rtl_device_get_tcp_autotune(struct rtl_device* dev);
 
 /**
+ * @brief Attach or detach an optional IQ capture writer.
+ *
+ * The stream/orchestrator owns the writer lifetime. The device stores only a
+ * borrowed pointer used by ingestion callbacks.
+ *
+ * @param dev RTL-SDR device handle.
+ * @param writer Borrowed writer pointer, or NULL to detach.
+ */
+void rtl_device_set_iq_capture_writer(struct rtl_device* dev, struct dsd_iq_capture_writer* writer);
+
+/**
+ * @brief Hold IQ capture submission while a live reconfigure timeline is being stamped.
+ *
+ * Samples received during the hold are omitted from capture data and recorded as mute spans.
+ *
+ * @param dev RTL-SDR device handle.
+ */
+void rtl_device_begin_capture_reconfigure(struct rtl_device* dev);
+
+/**
+ * @brief Release a capture reconfigure hold after reset/post-reset events are armed.
+ *
+ * @param dev RTL-SDR device handle.
+ */
+void rtl_device_end_capture_reconfigure(struct rtl_device* dev);
+
+/**
+ * @brief Increment capture retune diagnostics when a capture writer is attached.
+ *
+ * @param dev RTL-SDR device handle.
+ */
+void rtl_device_note_capture_retune(struct rtl_device* dev);
+void rtl_device_record_capture_retune(struct rtl_device* dev, uint64_t center_frequency_hz,
+                                      uint64_t capture_center_frequency_hz, uint32_t sample_rate_hz,
+                                      const char* reason);
+void rtl_device_record_capture_reset(struct rtl_device* dev, uint64_t center_frequency_hz,
+                                     uint64_t capture_center_frequency_hz, uint32_t sample_rate_hz, const char* reason);
+
+/**
+ * @brief Snapshot replay/capture retune count accumulated by the device.
+ *
+ * @param dev RTL-SDR device handle.
+ * @return Capture retune count.
+ */
+uint32_t rtl_device_get_capture_retune_count(struct rtl_device* dev);
+
+/**
+ * @brief Return backend-native sample format.
+ *
+ * Returns @ref dsd_iq_sample_format integral values (e.g., DSD_IQ_FORMAT_CU8).
+ * Returns 0 when unknown/not yet selected.
+ *
+ * @param dev RTL-SDR device handle.
+ * @return Sample format code or 0.
+ */
+int rtl_device_get_native_sample_format(const struct rtl_device* dev);
+
+/**
  * @brief Set (or clear) RTL and tuner crystal reference frequencies.
  *
  * Pass 0 to leave either value unchanged at the driver default.
@@ -296,6 +396,22 @@ int rtl_device_set_testmode(struct rtl_device* dev, int on);
  */
 int rtl_device_set_if_gain(struct rtl_device* dev, int stage, int gain_tenth_db);
 
+/**
+ * @brief Get a snapshot of TCP connection quality metrics.
+ *
+ * Returns a copy of the latest metrics collected by the TCP reader thread.
+ * Safe to call from a different thread (e.g., UI poll thread).
+ * Returns a zeroed snapshot if the device is NULL or not a TCP backend.
+ *
+ * @param dev RTL-SDR device handle.
+ * @param out Pointer to snapshot struct to fill.
+ * @return 0 on success; -1 if dev is NULL or metrics unavailable.
+ */
+struct tcp_quality_snapshot;
+int rtl_device_get_tcp_quality_snapshot(struct rtl_device* dev, struct tcp_quality_snapshot* out);
+
 #ifdef __cplusplus
 }
 #endif
+
+#endif /* DSD_NEO_INCLUDE_DSD_NEO_IO_RTL_DEVICE_H_ */

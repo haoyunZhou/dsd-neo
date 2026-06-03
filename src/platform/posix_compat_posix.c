@@ -9,14 +9,14 @@
 #endif
 
 #include <dsd-neo/platform/posix_compat.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <stdlib.h>
+#include <sys/stat.h>
 #include <sys/types.h>
-
 #include "dsd-neo/platform/platform.h"
 
 #if !DSD_PLATFORM_WIN_NATIVE
-
-#include <stdlib.h>
-#include <sys/stat.h>
 
 #if defined(__APPLE__) && defined(__MACH__)
 /*
@@ -42,18 +42,21 @@ dsd_mkdir(const char* path, int mode) {
     return mkdir(path, (mode_t)mode);
 }
 
+int
+dsd_open_serial_write(const char* path) {
+    if (!path || path[0] == '\0') {
+        errno = EINVAL;
+        return -1;
+    }
+    return open(path, O_WRONLY | O_NOCTTY);
+}
+
 void*
 dsd_aligned_alloc(size_t alignment, size_t size) {
     void* ptr = NULL;
-#if defined(_ISOC11_SOURCE) || (defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L)
-    /* C11 aligned_alloc requires size to be multiple of alignment */
-    size_t aligned_size = (size + alignment - 1) & ~(alignment - 1);
-    ptr = aligned_alloc(alignment, aligned_size);
-#else
     if (posix_memalign(&ptr, alignment, size) != 0) {
         ptr = NULL;
     }
-#endif
     return ptr;
 }
 

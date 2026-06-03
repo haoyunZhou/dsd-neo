@@ -14,6 +14,8 @@
 #ifndef DSD_NEO_RUNTIME_CONFIG_H
 #define DSD_NEO_RUNTIME_CONFIG_H
 
+#include <dsd-neo/platform/platform.h>
+
 /* Include schema types first (before extern "C" for C++ compat) */
 #include <dsd-neo/runtime/config_schema.h>
 
@@ -59,6 +61,9 @@ extern "C" {
  *     Values: "off" or "0" to disable; integer Hz (e.g., 48000) to enable/override.
  *
  * Residual CFO frequency-locked loop (FLL)
+ * These are non-symbol/advanced controls outside the RTL-family digital FSK
+ * symbol modem. RTL-family digital FSK selects timing and level
+ * normalization internally; CQPSK uses its OP25-style symbol chain.
  * - DSD_NEO_FLL
  *     Enable residual carrier frequency correction (RTL demod path).
  *     Values: "1" to enable; "0"/unset/other to disable. Default: disabled.
@@ -82,7 +87,7 @@ extern "C" {
  *     Force TED to run even when the pipeline would normally gate it off (e.g., non-integer SPS).
  *     Values: 1 enable, else disabled. Default: 0.
  *
- * C4FM clock assist (symbol-domain)
+ * C4FM clock assist (sample-window path)
  * - DSD_NEO_C4FM_CLK
  *     Enable a lightweight clock loop on the C4FM (P25p1) symbol path.
  *     Values: "el" for Early-Late, "mm" for Mueller&Mueller, "0"/"off" to disable.
@@ -93,6 +98,8 @@ extern "C" {
  *     Values: 1 enable, else disabled. Default: 0 (disabled; assist runs only pre-sync).
  *
  * Audio processing
+ * These controls apply to monitor/non-symbol discriminator audio, not the
+ * RTL-family digital FSK symbol stream.
  * - DSD_NEO_DEEMPH
  *     Post-demod deemphasis time constant. Applies only when the active demod preset enables deemphasis.
  *     Values: "75" (75µs, default), "50" (50µs), "nfm" (~750µs), "off" (disable).
@@ -100,7 +107,8 @@ extern "C" {
  *     Optional one-pole low-pass filter after demod. Approximate cutoff in Hz.
  *     Values: "off" or "0" to disable; integer (e.g., 3000, 5000) to enable. Default: off.
  *
- * FM/C4FM amplitude stabilization (pre-discriminator)
+ * FM/C4FM amplitude stabilization (non-symbol pre-discriminator)
+ * These controls are bypassed for RTL-family digital FSK symbol output.
  * - DSD_NEO_FM_AGC
  *     Enable a constant-envelope limiter/AGC on complex I/Q before FM discrimination. Helps stabilize
  *     RTL-SDR amplitude bounce (e.g., +/-3 dB) that can raise P25 P1 error rates.
@@ -130,8 +138,8 @@ extern "C" {
  * - DSD_NEO_CHANNEL_LPF
  *     Optional complex low-pass on the RTL DSP baseband after half-band/CIC
  *     decimation. Intended to narrow out-of-channel noise when running at
- *     higher baseband rates (e.g., 24 kHz). By default this is enabled only
- *     for analog-like modes at >=20 kHz and disabled for digital voice modes.
+ *     higher baseband rates (e.g., 24 kHz). By default this is enabled for
+ *     RTL baseband rates >=20 kHz and uses a mode-appropriate passband.
  *     Values: 0 to force off; non-zero to force on regardless of mode.
  * Frontend tuning behavior
  * - DSD_NEO_DISABLE_FS4_SHIFT
@@ -143,6 +151,9 @@ extern "C" {
  * - DSD_NEO_RETUNE_DRAIN_MS
  *     Maximum time in milliseconds to wait for output ring to drain on retune/hop when not clearing.
  *     Default: 50ms.
+ * - DSD_NEO_RETUNE_MUTE_MS
+ *     Input sample mute duration around RTL retunes. This drops tuner-settling samples before they can train
+ *     CQPSK/TED/FLL state. Values: integer 10..1000. Default: 120ms.
  *
  * TCP audio input
  * - DSD_NEO_TCPIN_BACKOFF_MS
@@ -162,6 +173,7 @@ extern "C" {
  * Debug/advanced knobs (centralized for maintainability)
  * - DSD_NEO_DEBUG_SYNC, DSD_NEO_DEBUG_CQPSK
  * - DSD_NEO_CQPSK, DSD_NEO_CQPSK_SYNC_INV, DSD_NEO_CQPSK_SYNC_NEG
+ * - DSD_NEO_CQPSK_EQ, DSD_NEO_CQPSK_EQ_TAPS, DSD_NEO_CQPSK_EQ_MU, DSD_NEO_CQPSK_EQ_MODULUS
  * - DSD_NEO_SYNC_WARMSTART
  * - DSD_NEO_FTZ_DAZ
  * - DSD_NEO_NO_BOOTSTRAP
@@ -174,13 +186,12 @@ extern "C" {
  *
  * Protocol timers/holds
  * - DSD_NEO_P25_* and DSD_NEO_DMR_* (hangtimes, grace windows, holds, watchdog)
- * - DSD_NEO_P25P1_SOFT_ERASURE_THRESH, DSD_NEO_P25P2_SOFT_ERASURE_THRESH
  *
  * Cache/path knobs
  * - DSD_NEO_CACHE_DIR, DSD_NEO_CC_CACHE
  */
 
-typedef enum {
+typedef enum DSD_ATTR_PACKED {
     DSD_NEO_DEEMPH_UNSET = 0,
     DSD_NEO_DEEMPH_OFF,
     DSD_NEO_DEEMPH_50,
@@ -275,6 +286,14 @@ typedef struct dsdneoRuntimeConfig {
     int cqpsk_sync_inv;
     int cqpsk_sync_neg_is_set;
     int cqpsk_sync_neg;
+    int cqpsk_eq_is_set;
+    int cqpsk_eq_enable;
+    int cqpsk_eq_taps_is_set;
+    int cqpsk_eq_taps;
+    int cqpsk_eq_mu_is_set;
+    float cqpsk_eq_mu;
+    int cqpsk_eq_modulus_is_set;
+    float cqpsk_eq_modulus;
 
     /* Sync warm-start (kill-switch) */
     int sync_warmstart_is_set;
@@ -304,11 +323,19 @@ typedef struct dsdneoRuntimeConfig {
     int p25p1_err_hold_pct_is_set;
     int p25p1_err_hold_s_is_set;
 
-    /* P25 soft-decision erasure thresholds (0..255) */
-    int p25p1_soft_erasure_thresh_is_set;
-    int p25p1_soft_erasure_thresh;
-    int p25p2_soft_erasure_thresh_is_set;
-    int p25p2_soft_erasure_thresh;
+    /* P25 status-symbol AFC gate. Off by default because status-derived direction is advisory. */
+    int p25_afc_status_gate_is_set;
+    int p25_afc_status_gate_enable;
+
+    /* P25 soft-decision recovery knobs. */
+    int p25_soft_erasure_threshold_is_set;
+    int p25_soft_erasure_threshold;
+    int p25p1_soft_erasure_threshold_is_set;
+    int p25p1_soft_erasure_threshold;
+    int p25p2_soft_erasure_threshold_is_set;
+    int p25p2_soft_erasure_threshold;
+    int p25_soft_hard_override_is_set;
+    int p25_soft_hard_override_enable;
 
     /* Input processing knobs */
     int input_volume_is_set;
@@ -457,6 +484,8 @@ typedef struct dsdneoRuntimeConfig {
     int output_clear_on_retune;
     int retune_drain_ms_is_set;
     int retune_drain_ms;
+    int retune_mute_ms_is_set;
+    int retune_mute_ms;
 
     /* TCP audio input */
     int tcpin_backoff_ms_is_set;
@@ -578,6 +607,27 @@ void dsd_neo_set_c4fm_clk_sync(int enable);
 /** @brief Return C4FM clock-assist-while-sync flag (0/1). */
 int dsd_neo_get_c4fm_clk_sync(void);
 
+/**
+ * @brief Publish CQPSK CMA equalizer runtime controls for future CQPSK path resets.
+ *
+ * Pass negative values to keep the current value for that field. The same
+ * bounds used by the environment parser are applied here.
+ *
+ * @param enable Non-negative to set equalizer enable (0/1); negative to keep existing.
+ * @param taps Positive tap count; clamped to odd values in [3, 15]. Non-positive keeps existing.
+ * @param mu Positive CMA adaptation step in [0.000001, 0.01]; negative keeps existing.
+ * @param modulus Positive target output magnitude squared in [0.05, 4.0]; negative keeps existing.
+ */
+void dsd_neo_set_cqpsk_eq(int enable, int taps, float mu, float modulus);
+
+/**
+ * @brief Read the CQPSK CMA equalizer runtime controls from the active config snapshot.
+ *
+ * Any output pointer may be NULL. When a field has not been explicitly set,
+ * this returns the built-in default for that field.
+ */
+void dsd_neo_get_cqpsk_eq(int* enable, int* taps, float* mu, float* modulus);
+
 /*
  * User configuration (INI file)
  *
@@ -586,7 +636,7 @@ int dsd_neo_get_c4fm_clk_sync(void);
  * on stable, user-facing knobs (input, output, decode mode, trunking).
  */
 
-typedef enum {
+typedef enum DSD_ATTR_PACKED {
     DSDCFG_INPUT_UNSET = 0,
     DSDCFG_INPUT_PULSE,
     DSDCFG_INPUT_RTL,
@@ -597,9 +647,13 @@ typedef enum {
     DSDCFG_INPUT_UDP
 } dsdneoUserInputSource;
 
-typedef enum { DSDCFG_OUTPUT_UNSET = 0, DSDCFG_OUTPUT_PULSE, DSDCFG_OUTPUT_NULL } dsdneoUserOutputBackend;
+typedef enum DSD_ATTR_PACKED {
+    DSDCFG_OUTPUT_UNSET = 0,
+    DSDCFG_OUTPUT_PULSE,
+    DSDCFG_OUTPUT_NULL
+} dsdneoUserOutputBackend;
 
-typedef enum {
+typedef enum DSD_ATTR_PACKED {
     DSDCFG_MODE_UNSET = 0,
     DSDCFG_MODE_AUTO,
     DSDCFG_MODE_P25P1,
@@ -618,7 +672,7 @@ typedef enum {
     DSDCFG_MODE_TETRA
 } dsdneoUserDecodeMode;
 
-typedef enum {
+typedef enum DSD_ATTR_PACKED {
     DSDCFG_DEMOD_UNSET = 0,
     DSDCFG_DEMOD_AUTO,
     DSDCFG_DEMOD_C4FM,
@@ -640,11 +694,19 @@ typedef struct dsdneoUserConfig {
     int rtl_ppm_is_set; /* distinguish explicit 0 from omitted */
     int rtl_bw_khz;
     int rtl_sql;
-    int rtl_volume;
+    int rtl_volume;   /* monitor/non-symbol gain; does not scale symbol streams */
     int rtl_auto_ppm; /* bool */
     char rtltcp_host[128];
     int rtltcp_port;
     char soapy_args[256];
+    char soapy_profile[32];
+    char soapy_stream_format[16];
+    char soapy_antenna[64];
+    char soapy_clock[64];
+    char soapy_settings[1024];
+    char soapy_gains[512];
+    int soapy_bandwidth_hz;
+    int soapy_bandwidth_hz_is_set;
     char file_path[1024];
     int file_sample_rate;
     char tcp_host[128];
@@ -675,10 +737,22 @@ typedef struct dsdneoUserConfig {
     int trunk_tune_data_calls;
     int trunk_tune_enc_calls;
 
+    /* [trunk_scan] */
+    int has_trunk_scan;
+    int trunk_scan_enabled;
+    char trunk_scan_targets_csv[1024];
+    int trunk_scan_idle_dwell_ms;
+    int trunk_scan_activity_hold_ms;
+
     /* [logging] */
     int has_logging;
     char event_log[1024];
     char frame_log[1024];
+
+    /* [alerts] */
+    int has_alerts;
+    int call_alert_enabled; /* bool */
+    int call_alert_events;  /* bitmask of dsd_call_alert_event_t values */
 
     /* [recording] */
     int has_recording;
@@ -692,6 +766,7 @@ typedef struct dsdneoUserConfig {
     char rdio_api_key[256];
     int rdio_upload_timeout_ms;
     int rdio_upload_retries;
+    int rdio_api_delete_after_upload; /* bool */
 
     /* [dsp] */
     int has_dsp;
@@ -721,6 +796,18 @@ const char* dsd_user_config_default_path(void);
 int dsd_user_config_load(const char* path, dsdneoUserConfig* cfg);
 
 /**
+ * @brief Load a user config from an already-open stream.
+ *
+ * The stream must be readable and seekable. The parser rewinds it as needed.
+ *
+ * @param stream Open INI stream.
+ * @param source_name Display name used for include-cycle tracking.
+ * @param cfg [out] Destination user config.
+ * @return 0 on success; non-zero on error.
+ */
+int dsd_user_config_load_stream(FILE* stream, const char* source_name, dsdneoUserConfig* cfg);
+
+/**
  * @brief Atomically write cfg to the given path (for interactive save).
  *
  * @param path Destination path for the INI file.
@@ -737,6 +824,31 @@ int dsd_user_config_save_atomic(const char* path, const dsdneoUserConfig* cfg);
  * @param state Decoder state to mutate.
  */
 void dsd_apply_user_config_to_opts(const dsdneoUserConfig* cfg, dsd_opts* opts, dsd_state* state);
+
+/**
+ * @brief Apply config defaults before CLI parsing without activating file-rate timing yet.
+ *
+ * Bootstrap uses this to stage config-backed input/output defaults first, then
+ * let CLI overrides settle before any file-input sample-rate side effects are
+ * committed into decoder timing.
+ *
+ * @param cfg User config to apply.
+ * @param opts Decoder options to mutate.
+ * @param state Decoder state to mutate.
+ */
+void dsd_apply_user_config_to_opts_pre_cli(const dsdneoUserConfig* cfg, dsd_opts* opts, dsd_state* state);
+
+/**
+ * @brief Finalize config-file input sample-rate defaults after CLI parsing.
+ *
+ * Applies the configured file sample rate only when the config-file input
+ * still survived CLI parsing for this run.
+ *
+ * @param cfg User config to finalize.
+ * @param opts Decoder options to mutate.
+ * @param state Decoder state to mutate.
+ */
+void dsd_finalize_user_config_file_input_after_cli(const dsdneoUserConfig* cfg, dsd_opts* opts, dsd_state* state);
 
 /**
  * @brief Snapshot current opts/state into a user config (for save/print).
@@ -798,6 +910,20 @@ int dsd_config_expand_path(const char* input, char* output, size_t output_size);
 int dsd_user_config_load_profile(const char* path, const char* profile_name, dsdneoUserConfig* cfg);
 
 /**
+ * @brief Load a user config with optional profile overlay from an already-open stream.
+ *
+ * The stream must be readable and seekable. The parser rewinds it as needed.
+ *
+ * @param stream Open INI stream.
+ * @param source_name Display name used for include-cycle tracking.
+ * @param profile_name Profile name (NULL for base config only).
+ * @param cfg [out] Destination user config.
+ * @return 0 on success; non-zero on error.
+ */
+int dsd_user_config_load_profile_stream(FILE* stream, const char* source_name, const char* profile_name,
+                                        dsdneoUserConfig* cfg);
+
+/**
  * @brief List available profile names in a config file.
  *
  * Scans the INI file for [profile.NAME] sections and returns the names.
@@ -813,6 +939,21 @@ int dsd_user_config_list_profiles(const char* path, const char** names, char* na
                                   int max_names);
 
 /**
+ * @brief List available profile names from an already-open config stream.
+ *
+ * The stream must be readable and seekable. The parser rewinds it before use.
+ *
+ * @param stream Open INI stream.
+ * @param names Output array of profile name pointers (caller provides).
+ * @param names_buf Buffer to store profile name strings.
+ * @param names_buf_size Size of names buffer.
+ * @param max_names Maximum number of names to return.
+ * @return Number of profiles found, or -1 on error.
+ */
+int dsd_user_config_list_profiles_stream(FILE* stream, const char** names, char* names_buf, size_t names_buf_size,
+                                         int max_names);
+
+/**
  * @brief Validate a config file and collect diagnostics.
  *
  * Parses the config file and checks for:
@@ -826,6 +967,17 @@ int dsd_user_config_list_profiles(const char* path, const char** names, char* na
  * @return 0 if no errors; non-zero if errors present.
  */
 int dsd_user_config_validate(const char* path, dsdcfg_diagnostics_t* diags);
+
+/**
+ * @brief Validate an already-open config stream and collect diagnostics.
+ *
+ * The stream must be readable and seekable. The parser rewinds it before use.
+ *
+ * @param stream Open INI stream.
+ * @param diags [out] Diagnostic results (caller frees via dsd_user_config_diags_free).
+ * @return 0 if no errors; non-zero if errors present.
+ */
+int dsd_user_config_validate_stream(FILE* stream, dsdcfg_diagnostics_t* diags);
 
 /**
  * @brief Free diagnostic results from validation.

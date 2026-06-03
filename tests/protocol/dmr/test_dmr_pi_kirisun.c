@@ -11,9 +11,8 @@
 #include <dsd-neo/protocol/dmr/dmr.h>
 #include <stdint.h>
 #include <stdio.h>
-#include <string.h>
-
 #include "dsd-neo/core/opts_fwd.h"
+#include "dsd-neo/core/safe_api.h"
 #include "dsd-neo/core/state_fwd.h"
 
 static void
@@ -22,10 +21,10 @@ load_single_burst_value(dsd_state* state, uint8_t slot, uint16_t sb_value) {
     uint8_t encoded[16];
     uint8_t data_matrix[32];
     uint8_t interleaved[32];
-    memset(info, 0, sizeof(info));
-    memset(encoded, 0, sizeof(encoded));
-    memset(data_matrix, 0, sizeof(data_matrix));
-    memset(interleaved, 0, sizeof(interleaved));
+    DSD_MEMSET(info, 0, sizeof(info));
+    DSD_MEMSET(encoded, 0, sizeof(encoded));
+    DSD_MEMSET(data_matrix, 0, sizeof(data_matrix));
+    DSD_MEMSET(interleaved, 0, sizeof(interleaved));
 
     for (int i = 0; i < 11; i++) {
         info[i] = (uint8_t)((sb_value >> (10 - i)) & 1U);
@@ -46,12 +45,23 @@ load_single_burst_value(dsd_state* state, uint8_t slot, uint16_t sb_value) {
     }
 }
 
+static uint8_t
+hytera_pi_checksum(const uint8_t pi[10]) {
+    uint8_t checksum = 0;
+    for (int i = 0; i < 9; i++) {
+        checksum = (uint8_t)((checksum + pi[i]) & 0xFFU);
+    }
+    checksum = (uint8_t)(~checksum & 0xFFU);
+    checksum++;
+    return checksum;
+}
+
 static void
 test_pi_kirisun_slot0_sets_fields_and_le_mode(void) {
     static dsd_opts opts;
     static dsd_state state;
-    memset(&opts, 0, sizeof(opts));
-    memset(&state, 0, sizeof(state));
+    DSD_MEMSET(&opts, 0, sizeof(opts));
+    DSD_MEMSET(&state, 0, sizeof(state));
 
     state.currentslot = 0;
     uint8_t pi[10] = {0x36, 0x0A, 0x40, 0x11, 0x22, 0x33, 0x44, 0x00, 0x00, 0x01};
@@ -68,8 +78,8 @@ static void
 test_pi_kirisun_requires_crc_ok(void) {
     static dsd_opts opts;
     static dsd_state state;
-    memset(&opts, 0, sizeof(opts));
-    memset(&state, 0, sizeof(state));
+    DSD_MEMSET(&opts, 0, sizeof(opts));
+    DSD_MEMSET(&state, 0, sizeof(state));
 
     opts.dmr_le = 1;
     state.currentslot = 0;
@@ -83,11 +93,110 @@ test_pi_kirisun_requires_crc_ok(void) {
 }
 
 static void
+test_pi_dmra_normalizes_aes128_and_expands_iv(void) {
+    static dsd_opts opts;
+    static dsd_state state;
+    DSD_MEMSET(&opts, 0, sizeof(opts));
+    DSD_MEMSET(&state, 0, sizeof(state));
+
+    state.currentslot = 0;
+    state.DMRvcL = 9;
+    uint8_t pi[10] = {0x04, 0x10, 0x12, 0x11, 0x22, 0x33, 0x44, 0x00, 0x00, 0x00};
+    dmr_pi(&opts, &state, pi, 1, 0);
+
+    const unsigned long long next_mi =
+        ((unsigned long long)state.aes_iv[4] << 24ULL) | ((unsigned long long)state.aes_iv[5] << 16ULL)
+        | ((unsigned long long)state.aes_iv[6] << 8ULL) | ((unsigned long long)state.aes_iv[7] << 0ULL);
+
+    assert(state.payload_algid == 0x24);
+    assert(state.payload_keyid == 0x12);
+    assert(state.aes_iv[0] == 0x11);
+    assert(state.aes_iv[1] == 0x22);
+    assert(state.aes_iv[2] == 0x33);
+    assert(state.aes_iv[3] == 0x44);
+    assert(state.payload_mi == next_mi);
+    assert(state.DMRvcL == 0);
+}
+
+static void
+test_pi_dmra_normalizes_des_on_slot1_and_expands_iv(void) {
+    static dsd_opts opts;
+    static dsd_state state;
+    DSD_MEMSET(&opts, 0, sizeof(opts));
+    DSD_MEMSET(&state, 0, sizeof(state));
+
+    state.currentslot = 1;
+    state.DMRvcR = 7;
+    uint8_t pi[10] = {0x02, 0x10, 0x34, 0xCA, 0xFE, 0xBA, 0xBE, 0x00, 0x00, 0x00};
+    dmr_pi(&opts, &state, pi, 1, 0);
+
+    assert(state.payload_algidR == 0x22);
+    assert(state.payload_keyidR == 0x34);
+    assert((uint32_t)(state.payload_miN >> 32ULL) == 0xCAFEBABEU);
+    assert((uint32_t)state.payload_miR == (uint32_t)state.payload_miN);
+    assert(state.DMRvcR == 0);
+}
+
+static void
+test_pi_dmra_rejects_algid_outside_dmra_range(void) {
+    static dsd_opts opts;
+    static dsd_state state;
+    DSD_MEMSET(&opts, 0, sizeof(opts));
+    DSD_MEMSET(&state, 0, sizeof(state));
+
+    state.currentslot = 0;
+    uint8_t pi[10] = {0x26, 0x10, 0x56, 0x11, 0x22, 0x33, 0x44, 0x00, 0x00, 0x00};
+    dmr_pi(&opts, &state, pi, 1, 0);
+
+    assert(state.payload_algid == 0);
+    assert(state.payload_keyid == 0);
+    assert(state.payload_mi == 0);
+}
+
+static void
+test_pi_hytera_enhanced_checksum_sets_slot1_fields(void) {
+    static dsd_opts opts;
+    static dsd_state state;
+    DSD_MEMSET(&opts, 0, sizeof(opts));
+    DSD_MEMSET(&state, 0, sizeof(state));
+
+    opts.dmr_le = 1;
+    state.currentslot = 1;
+    uint8_t pi[10] = {0x02, 0x68, 0x34, 0x01, 0x23, 0x45, 0x67, 0x89, 0x00, 0x00};
+    pi[9] = hytera_pi_checksum(pi);
+    dmr_pi(&opts, &state, pi, 1, 0);
+
+    assert((state.dmr_soR & 0x40U) != 0U);
+    assert(state.payload_algidR == 0x02);
+    assert(state.payload_keyidR == 0x34);
+    assert(state.payload_miR == 0x0123456789ULL);
+    assert(opts.dmr_le == 2);
+}
+
+static void
+test_pi_refreshes_sync_time_when_trunk_tuned(void) {
+    static dsd_opts opts;
+    static dsd_state state;
+    DSD_MEMSET(&opts, 0, sizeof(opts));
+    DSD_MEMSET(&state, 0, sizeof(state));
+
+    opts.trunk_is_tuned = 1;
+    state.currentslot = 0;
+    uint8_t pi[10] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+    dmr_pi(&opts, &state, pi, 1, 0);
+
+    assert(state.last_vc_sync_time > 0);
+    assert(state.last_cc_sync_time > 0);
+    assert(state.last_vc_sync_time_m > 0.0);
+    assert(state.last_cc_sync_time_m > 0.0);
+}
+
+static void
 test_alg_refresh_advances_kirisun_mi(void) {
     static dsd_opts opts;
     static dsd_state state;
-    memset(&opts, 0, sizeof(opts));
-    memset(&state, 0, sizeof(state));
+    DSD_MEMSET(&opts, 0, sizeof(opts));
+    DSD_MEMSET(&state, 0, sizeof(state));
 
     state.currentslot = 0;
     state.payload_algid = 0x36;
@@ -107,8 +216,8 @@ static void
 test_sbrc_kirisun_gate_rejects_non_kirisun_calls(void) {
     static dsd_opts opts;
     static dsd_state state;
-    memset(&opts, 0, sizeof(opts));
-    memset(&state, 0, sizeof(state));
+    DSD_MEMSET(&opts, 0, sizeof(opts));
+    DSD_MEMSET(&state, 0, sizeof(state));
 
     opts.dmr_le = 3;
     state.currentslot = 1;
@@ -126,8 +235,8 @@ static void
 test_sbrc_kirisun_gate_accepts_kirisun_calls(void) {
     static dsd_opts opts;
     static dsd_state state;
-    memset(&opts, 0, sizeof(opts));
-    memset(&state, 0, sizeof(state));
+    DSD_MEMSET(&opts, 0, sizeof(opts));
+    DSD_MEMSET(&state, 0, sizeof(state));
 
     opts.dmr_le = 3;
     state.currentslot = 1;
@@ -145,8 +254,8 @@ static void
 test_sbrc_kirisun_gate_ignores_stale_kirisun_alg(void) {
     static dsd_opts opts;
     static dsd_state state;
-    memset(&opts, 0, sizeof(opts));
-    memset(&state, 0, sizeof(state));
+    DSD_MEMSET(&opts, 0, sizeof(opts));
+    DSD_MEMSET(&state, 0, sizeof(state));
 
     opts.dmr_le = 3;
     state.currentslot = 1;
@@ -168,6 +277,11 @@ main(void) {
 
     test_pi_kirisun_slot0_sets_fields_and_le_mode();
     test_pi_kirisun_requires_crc_ok();
+    test_pi_dmra_normalizes_aes128_and_expands_iv();
+    test_pi_dmra_normalizes_des_on_slot1_and_expands_iv();
+    test_pi_dmra_rejects_algid_outside_dmra_range();
+    test_pi_hytera_enhanced_checksum_sets_slot1_fields();
+    test_pi_refreshes_sync_time_when_trunk_tuned();
     test_alg_refresh_advances_kirisun_mi();
     test_sbrc_kirisun_gate_rejects_non_kirisun_calls();
     test_sbrc_kirisun_gate_accepts_kirisun_calls();

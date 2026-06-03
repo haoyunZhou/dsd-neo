@@ -16,11 +16,11 @@
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/state.h>
 #include <dsd-neo/dsp/dmr_sync.h>
+#include <dsd-neo/dsp/sync_calibration.h>
 #include <math.h>
 #include <stdio.h>
-#include <string.h>
+#include "dsd-neo/core/safe_api.h"
 
-/* Tolerance for floating point comparisons */
 #define FLOAT_TOL 0.01f
 
 static int g_test_count = 0;
@@ -51,7 +51,7 @@ check_float_range(const char* name, float min, float max, float actual) {
  * Expected results:
  *   - max = +3.0, min = -3.0
  *   - center = 0.0
- *   - umid = +1.875 (center + 0.625 * (max - center))
+ *   - umid = +1.875 (center + DSD_WARM_START_MID_FRACTION * (max - center))
  *   - lmid = -1.875
  */
 static void
@@ -64,11 +64,11 @@ test_ideal_sync_pattern(void) {
                                             +3.0f, -3.0f, +3.0f, +3.0f, -3.0f, +3.0f, -3.0f, +3.0f};
 
     static struct dsd_opts opts;
-    memset(&opts, 0, sizeof(opts));
+    DSD_MEMSET(&opts, 0, sizeof(opts));
     opts.msize = 128;
 
     static struct dsd_state state;
-    memset(&state, 0, sizeof(state));
+    DSD_MEMSET(&state, 0, sizeof(state));
 
     dmr_init_thresholds_from_sync(&opts, &state, sync_symbols);
 
@@ -78,8 +78,8 @@ test_ideal_sync_pattern(void) {
     check_float("center", 0.0f, state.center, FLOAT_TOL);
 
     /* Mid thresholds: 62.5% from center toward extremes */
-    float expected_umid = 0.0f + (3.0f - 0.0f) * 0.625f;  /* 1.875 */
-    float expected_lmid = 0.0f + (-3.0f - 0.0f) * 0.625f; /* -1.875 */
+    float expected_umid = 0.0f + (3.0f - 0.0f) * DSD_WARM_START_MID_FRACTION;  /* 1.875 */
+    float expected_lmid = 0.0f + (-3.0f - 0.0f) * DSD_WARM_START_MID_FRACTION; /* -1.875 */
     check_float("umid", expected_umid, state.umid, FLOAT_TOL);
     check_float("lmid", expected_lmid, state.lmid, FLOAT_TOL);
 
@@ -110,11 +110,11 @@ test_dc_offset_pattern(void) {
                                             -3.0f + dc_offset, +3.0f + dc_offset, -3.0f + dc_offset, +3.0f + dc_offset};
 
     static struct dsd_opts opts;
-    memset(&opts, 0, sizeof(opts));
+    DSD_MEMSET(&opts, 0, sizeof(opts));
     opts.msize = 128;
 
     static struct dsd_state state;
-    memset(&state, 0, sizeof(state));
+    DSD_MEMSET(&state, 0, sizeof(state));
 
     dmr_init_thresholds_from_sync(&opts, &state, sync_symbols);
 
@@ -144,11 +144,11 @@ test_scaled_amplitude_pattern(void) {
                                             -3.0f * scale, +3.0f * scale, -3.0f * scale, +3.0f * scale};
 
     static struct dsd_opts opts;
-    memset(&opts, 0, sizeof(opts));
+    DSD_MEMSET(&opts, 0, sizeof(opts));
     opts.msize = 128;
 
     static struct dsd_state state;
-    memset(&state, 0, sizeof(state));
+    DSD_MEMSET(&state, 0, sizeof(state));
 
     dmr_init_thresholds_from_sync(&opts, &state, sync_symbols);
 
@@ -170,10 +170,10 @@ test_null_handling(void) {
     float sync_symbols[DMR_SYNC_SYMBOLS] = {0};
 
     static struct dsd_opts opts;
-    memset(&opts, 0, sizeof(opts));
+    DSD_MEMSET(&opts, 0, sizeof(opts));
 
     static struct dsd_state state;
-    memset(&state, 0, sizeof(state));
+    DSD_MEMSET(&state, 0, sizeof(state));
 
     /* Initialize to known values */
     state.max = 999.0f;
@@ -204,11 +204,11 @@ test_buffer_prefill(void) {
                                             +3.0f, -3.0f, +3.0f, +3.0f, -3.0f, +3.0f, -3.0f, +3.0f};
 
     static struct dsd_opts opts;
-    memset(&opts, 0, sizeof(opts));
+    DSD_MEMSET(&opts, 0, sizeof(opts));
     opts.msize = 64; /* Smaller than 1024 for test */
 
     static struct dsd_state state;
-    memset(&state, 0, sizeof(state));
+    DSD_MEMSET(&state, 0, sizeof(state));
 
     dmr_init_thresholds_from_sync(&opts, &state, sync_symbols);
 
@@ -258,11 +258,11 @@ test_noisy_pattern(void) {
     }
 
     static struct dsd_opts opts;
-    memset(&opts, 0, sizeof(opts));
+    DSD_MEMSET(&opts, 0, sizeof(opts));
     opts.msize = 128;
 
     static struct dsd_state state;
-    memset(&state, 0, sizeof(state));
+    DSD_MEMSET(&state, 0, sizeof(state));
 
     dmr_init_thresholds_from_sync(&opts, &state, sync_symbols);
 

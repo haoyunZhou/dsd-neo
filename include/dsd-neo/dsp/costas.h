@@ -19,7 +19,8 @@
  *   - costas = op25_repeater.costas_loop_cc (carrier tracking at symbol rate)
  */
 
-#pragma once
+#ifndef DSD_NEO_INCLUDE_DSD_NEO_DSP_COSTAS_H_
+#define DSD_NEO_INCLUDE_DSD_NEO_DSP_COSTAS_H_
 
 #ifdef __cplusplus
 extern "C" {
@@ -37,6 +38,7 @@ typedef struct {
     float alpha;
     float beta;
     float error;
+    float error_smooth;
     int initialized;
 } dsd_costas_loop_state_t;
 
@@ -73,9 +75,9 @@ typedef struct {
     float taps_upper_i[FLL_BAND_EDGE_MAX_TAPS];
     int n_taps;
 
-    /* Filter delay line */
-    float delay_r[FLL_BAND_EDGE_MAX_TAPS];
-    float delay_i[FLL_BAND_EDGE_MAX_TAPS];
+    /* Filter delay line, mirrored once to make reverse history reads wrap-free. */
+    float delay_r[FLL_BAND_EDGE_MAX_TAPS * 2];
+    float delay_i[FLL_BAND_EDGE_MAX_TAPS * 2];
     int delay_idx;
 
     int sps; /* Samples per symbol (for reinit detection) */
@@ -173,7 +175,7 @@ void dsd_costas_reset(dsd_costas_loop_state_t* c);
  * Key OP25 parameters (from p25_demodulator_dev.py and gardner_cc_impl.cc):
  *   - gain_mu = 0.025
  *   - gain_omega = 0.1 * gain_mu^2 = 0.0000625
- *   - omega_rel = 0.002 (±0.2%)
+ *   - omega_rel = 0.002 absolute samples/symbol clamp
  *
  * @param d Demodulator state. Input: lowpassed (sample-rate IQ after AGC).
  *          Output: lowpassed (symbol-rate samples).
@@ -181,15 +183,16 @@ void dsd_costas_reset(dsd_costas_loop_state_t* c);
 void op25_gardner_cc(struct demod_state* d);
 
 /**
- * @brief External differential phasor decoder (matches GNU Radio diff_phasor_cc).
+ * @brief External differential phasor decoder.
  *
  * Computes y[n] = x[n] * conj(x[n-1]) to produce differential phase output.
  *
  * From OP25's p25_demodulator_dev.py line 408:
  *   self.diffdec = digital.diff_phasor_cc()
  *
- * This is applied AFTER Gardner timing recovery, producing differential
- * phase symbols for the Costas loop.
+ * This is applied AFTER Gardner timing recovery, producing raw differential
+ * phase symbols for the Costas loop. Costas handles magnitude normalization and
+ * reliability weighting before updating the carrier loop.
  *
  * @param d Demodulator state. Modifies lowpassed in-place to differential phasors.
  */
@@ -202,7 +205,10 @@ void op25_diff_phasor_cc(struct demod_state* d);
  *   op25/gr-op25_repeater/lib/costas_loop_cc_impl.cc
  *
  * This operates on DIFFERENTIALLY DECODED symbols (after diff_phasor_cc).
- * The phase detector expects symbols at axis-aligned positions.
+ * The phase detector expects OP25 differential QPSK symbols at diagonal
+ * positions. Reliable phasors are normalized before phase detection, and raw
+ * phasor magnitude is used as a confidence weight so fades do not fully train
+ * the loop.
  *
  * Signal flow:
  *   Input: Symbol-rate differential phasors from diff_phasor_cc
@@ -277,3 +283,5 @@ void op25_fll_band_edge_cc(struct demod_state* d);
 #ifdef __cplusplus
 }
 #endif
+
+#endif /* DSD_NEO_INCLUDE_DSD_NEO_DSP_COSTAS_H_ */

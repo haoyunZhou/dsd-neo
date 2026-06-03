@@ -37,7 +37,7 @@ prepare_complex_scratch(const float* in, int in_len, const float* hist_i, const 
         scratch[2 * kk + 1] = hist_q[k];
     }
 
-    std::memcpy(scratch + (size_t)hist_len * 2, in, (size_t)samples * 2 * sizeof(float));
+    DSD_MEMCPY(scratch + (size_t)hist_len * 2, in, (size_t)samples * 2 * sizeof(float));
 
     const float last_i = (samples > 0) ? in[(samples - 1) << 1] : 0.0f;
     const float last_q = (samples > 0) ? in[((samples - 1) << 1) + 1] : 0.0f;
@@ -62,10 +62,8 @@ update_complex_history(const float* in, int samples, float* hist_i, float* hist_
     }
 
     const int need = hist_len - samples;
-    if (need > 0) {
-        std::memmove(hist_i, hist_i + (hist_len - need), (size_t)need * sizeof(float));
-        std::memmove(hist_q, hist_q + (hist_len - need), (size_t)need * sizeof(float));
-    }
+    DSD_MEMMOVE(hist_i, hist_i + (hist_len - need), (size_t)need * sizeof(float));
+    DSD_MEMMOVE(hist_q, hist_q + (hist_len - need), (size_t)need * sizeof(float));
     for (int k = 0; k < samples; k++) {
         hist_i[need + k] = in[k << 1];
         hist_q[need + k] = in[(k << 1) + 1];
@@ -82,8 +80,8 @@ prepare_real_scratch(const float* in, int in_len, const float* hist, int hist_le
     }
 
     float* scratch = tls_scratch_real.data();
-    std::memcpy(scratch, hist, (size_t)hist_len * sizeof(float));
-    std::memcpy(scratch + hist_len, in, (size_t)in_len * sizeof(float));
+    DSD_MEMCPY(scratch, hist, (size_t)hist_len * sizeof(float));
+    DSD_MEMCPY(scratch + hist_len, in, (size_t)in_len * sizeof(float));
 
     const float last = in[in_len - 1];
     for (int k = 0; k < pad; k++) {
@@ -96,15 +94,13 @@ prepare_real_scratch(const float* in, int in_len, const float* hist, int hist_le
 static void
 update_real_history(const float* in, int in_len, float* hist, int hist_len) {
     if (in_len >= hist_len) {
-        std::memcpy(hist, in + (in_len - hist_len), (size_t)hist_len * sizeof(float));
+        DSD_MEMCPY(hist, in + (in_len - hist_len), (size_t)hist_len * sizeof(float));
         return;
     }
 
     const int need = hist_len - in_len;
-    if (need > 0) {
-        std::memmove(hist, hist + in_len, (size_t)need * sizeof(float));
-    }
-    std::memcpy(hist + need, in, (size_t)in_len * sizeof(float));
+    DSD_MEMMOVE(hist, hist + in_len, (size_t)need * sizeof(float));
+    DSD_MEMCPY(hist + need, in, (size_t)in_len * sizeof(float));
 }
 
 } /* namespace */
@@ -225,7 +221,6 @@ simd_hb_decim2_complex_neon(const float* in, int in_len, float* out, float* hist
         xq = scratch[2 * ii + 1];
     };
 
-    /* Process 2 output samples at a time */
     int n = 0;
     for (; n + 1 < out_ch_len; n += 2) {
         float32x4_t acc = vdupq_n_f32(0.0f);
@@ -243,7 +238,6 @@ simd_hb_decim2_complex_neon(const float* in, int in_len, float* out, float* hist
         float32x4_t center_val = vld1q_f32(center_arr);
         acc = vfmaq_f32(acc, tap_c, center_val);
 
-        /* Half-band: only even tap indices */
         for (int e = 0; e < center; e += 2) {
             float ce = taps[e];
             if (ce == 0.0f) {
@@ -271,7 +265,6 @@ simd_hb_decim2_complex_neon(const float* in, int in_len, float* out, float* hist
         vst1q_f32(out + (n << 1), acc);
     }
 
-    /* Scalar epilogue */
     for (; n < out_ch_len; n++) {
         int center_idx = left_len + (n << 1);
         float accI = 0.0f;

@@ -16,10 +16,11 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
 #include <dsd-neo/dsp/demod_pipeline.h>
 #include <dsd-neo/dsp/demod_state.h>
+#include <dsd-neo/runtime/mem.h>
 #include <vector>
+#include "dsd-neo/core/safe_api.h"
 
 static double
 rms(const std::vector<float>& x) {
@@ -63,40 +64,14 @@ copy_i_to_audio_demod(struct demod_state* d) {
     d->result_len = Npairs;
 }
 
-static int
-run_once(double fs, double f) {
-    const int M = 4;
-    const double amp = 0.8;
-    int Npairs = 4096;
-    std::vector<float> iq((size_t)Npairs * 2);
-    gen_tone_iq(iq, fs, f, amp);
-
-    demod_state* d = (demod_state*)malloc(sizeof(demod_state));
+static void
+free_demod_state(demod_state* d) {
     if (!d) {
-        return 0;
+        return;
     }
-    std::memset(d, 0, sizeof(*d));
-    d->lowpassed = d->input_cb_buf; // use internal buffer
-    d->lp_len = Npairs * 2;
-    for (int i = 0; i < d->lp_len; i++) {
-        d->input_cb_buf[i] = iq[(size_t)i];
-    }
-    d->downsample_passes = 0;
-    d->post_downsample = M;
-    d->mode_demod = &copy_i_to_audio_demod;
-    d->rate_out = (int)fs;
-    d->deemph = 0;
-    d->audio_lpf_enable = 0;
-    d->iq_dc_block_enable = 0;
-    d->squelch_gate_open = 1;
-    d->squelch_env = 1.0f;
-    d->squelch_env_attack = 0.125f;
-    d->squelch_env_release = 0.03125f;
-
-    full_demod(d);
-    int rv = d->result_len;
+    dsd_neo_aligned_free(d->post_polydecim_taps);
+    dsd_neo_aligned_free(d->post_polydecim_hist);
     free(d);
-    return rv;
 }
 
 int
@@ -118,7 +93,7 @@ main(void) {
     if (!d1) {
         return 1;
     }
-    std::memset(d1, 0, sizeof(*d1));
+    DSD_MEMSET(d1, 0, sizeof(*d1));
     for (int i = 0; i < N; i++) {
         d1->input_cb_buf[i] = iq_pass[(size_t)i];
     }
@@ -140,10 +115,10 @@ main(void) {
     gen_tone_iq(iq_stop, Fs, f_stop, 0.8);
     demod_state* d2 = (demod_state*)malloc(sizeof(demod_state));
     if (!d2) {
-        free(d1);
+        free_demod_state(d1);
         return 1;
     }
-    std::memset(d2, 0, sizeof(*d2));
+    DSD_MEMSET(d2, 0, sizeof(*d2));
     for (int i = 0; i < N; i++) {
         d2->input_cb_buf[i] = iq_stop[(size_t)i];
     }
@@ -161,11 +136,11 @@ main(void) {
     int out_len_stop = d2->result_len;
 
     if (!(out_len_pass >= (Npairs / M) - 2 && out_len_pass <= (Npairs / M) + 2)) {
-        std::fprintf(stderr, "polydecim: unexpected length pass=%d ref=%d\n", out_len_pass, Npairs / M);
+        DSD_FPRINTF(stderr, "polydecim: unexpected length pass=%d ref=%d\n", out_len_pass, Npairs / M);
         return 1;
     }
     if (!(out_len_stop == out_len_pass)) {
-        std::fprintf(stderr, "polydecim: length mismatch stop=%d pass=%d\n", out_len_stop, out_len_pass);
+        DSD_FPRINTF(stderr, "polydecim: length mismatch stop=%d pass=%d\n", out_len_stop, out_len_pass);
         return 1;
     }
     std::vector<float> y_pass((size_t)out_len_pass);
@@ -179,19 +154,19 @@ main(void) {
     double rp = rms(y_pass);
     double rs = rms(y_stop);
     if (rp <= 1e-9 || rs <= 0.0) {
-        std::fprintf(stderr, "polydecim: degenerate RMS rp=%.3f rs=%.3f\n", rp, rs);
-        free(d1);
-        free(d2);
+        DSD_FPRINTF(stderr, "polydecim: degenerate RMS rp=%.3f rs=%.3f\n", rp, rs);
+        free_demod_state(d1);
+        free_demod_state(d2);
         return 1;
     }
     double att_db = 20.0 * std::log10(rs / rp);
     if (!(att_db <= -15.0)) { // conservative bound
-        std::fprintf(stderr, "polydecim: attenuation too small %.2f dB\n", att_db);
-        free(d1);
-        free(d2);
+        DSD_FPRINTF(stderr, "polydecim: attenuation too small %.2f dB\n", att_db);
+        free_demod_state(d1);
+        free_demod_state(d2);
         return 1;
     }
-    free(d1);
-    free(d2);
+    free_demod_state(d1);
+    free_demod_state(d2);
     return 0;
 }

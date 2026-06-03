@@ -22,9 +22,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
 #include "dsd-neo/core/opts_fwd.h"
+#include "dsd-neo/core/safe_api.h"
 #include "dsd-neo/core/state_fwd.h"
+
+#if defined(__GNUC__) && !defined(__cplusplus)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmissing-prototypes"
+#endif
 
 // Minimal stubs for direct link with dmr_pdu.c
 const char*
@@ -38,14 +43,15 @@ dsd_unicode_supported(void) {
 }
 
 void
-unpack_byte_array_into_bit_array(uint8_t* input, uint8_t* output, int len) {
+unpack_byte_array_into_bit_array(const uint8_t* input, uint8_t* output, int len) {
     (void)input;
     if (len > 0) {
-        memset(output, 0, (size_t)len);
+        DSD_MEMSET(output, 0, (size_t)len);
     }
 }
 
 void
+// NOLINTNEXTLINE(misc-use-internal-linkage)
 lip_protocol_decoder(dsd_opts* opts, dsd_state* state, uint8_t* input) {
     (void)opts;
     (void)state;
@@ -53,6 +59,7 @@ lip_protocol_decoder(dsd_opts* opts, dsd_state* state, uint8_t* input) {
 }
 
 void
+// NOLINTNEXTLINE(misc-use-internal-linkage)
 decode_cellocator(dsd_opts* opts, dsd_state* state, uint8_t* input, int len) {
     (void)opts;
     (void)state;
@@ -72,21 +79,22 @@ watchdog_event_datacall(dsd_opts* opts, dsd_state* state, uint32_t src, uint32_t
 
 void
 getTimeC_buf(char out[9]) {
-    snprintf(out, 9, "%s", "11:22:33");
+    DSD_SNPRINTF(out, 9, "%s", "11:22:33");
 }
 
 void
 getDateS_buf(char out[11]) {
-    snprintf(out, 11, "%s", "1999/01/02");
+    DSD_SNPRINTF(out, 11, "%s", "1999/01/02");
 }
 
 // Under test
 void decode_ip_pdu(dsd_opts* opts, dsd_state* state, uint16_t len, uint8_t* input);
+void utf8_to_text(dsd_state* state, uint8_t wr, uint16_t len, const uint8_t* input);
 
 static int
 expect_has_substr(const char* buf, const char* needle, const char* tag) {
     if (!buf || !strstr(buf, needle)) {
-        fprintf(stderr, "%s: missing '%s' in '%s'\n", tag, needle, buf ? buf : "(null)");
+        DSD_FPRINTF(stderr, "%s: missing '%s' in '%s'\n", tag, needle, buf ? buf : "(null)");
         return 1;
     }
     return 0;
@@ -95,7 +103,7 @@ expect_has_substr(const char* buf, const char* needle, const char* tag) {
 static int
 expect_nonempty(const char* buf, const char* tag) {
     if (!buf || buf[0] == '\0') {
-        fprintf(stderr, "%s: empty output\n", tag);
+        DSD_FPRINTF(stderr, "%s: empty output\n", tag);
         return 1;
     }
     return 0;
@@ -103,7 +111,7 @@ expect_nonempty(const char* buf, const char* tag) {
 
 static size_t
 build_ipv4_udp_lrrp(uint8_t* out, size_t cap, uint8_t ihl_words) {
-    memset(out, 0, cap);
+    DSD_MEMSET(out, 0, cap);
 
     const size_t ip_header_len = (size_t)ihl_words * 4u;
     const size_t lrrp_len = 16u;          // LRRP header (2) + token stream (14)
@@ -179,7 +187,7 @@ build_ipv4_udp_lrrp(uint8_t* out, size_t cap, uint8_t ihl_words) {
 
 static size_t
 build_ipv4_udp_vertex_tms(uint8_t* out, size_t cap, uint8_t ihl_words) {
-    memset(out, 0, cap);
+    DSD_MEMSET(out, 0, cap);
 
     const size_t ip_header_len = (size_t)ihl_words * 4u;
     const size_t vtx_hdr_len = 21u;
@@ -233,7 +241,7 @@ build_ipv4_udp_vertex_tms(uint8_t* out, size_t cap, uint8_t ihl_words) {
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,             // reserved/unknown
         0x00, 0x00, 0x00, 0x00, 0x00                          // reserved/unknown
     };
-    memcpy(out + p, vtx_hdr, sizeof(vtx_hdr));
+    DSD_MEMCPY(out + p, vtx_hdr, sizeof(vtx_hdr));
     p += sizeof(vtx_hdr);
 
     out[p++] = 0x00;
@@ -244,14 +252,51 @@ build_ipv4_udp_vertex_tms(uint8_t* out, size_t cap, uint8_t ihl_words) {
     return ip_total_len;
 }
 
+static size_t
+build_ipv4_udp_empty_payload(uint8_t* out, size_t cap, uint16_t dst_port) {
+    DSD_MEMSET(out, 0, cap);
+
+    const size_t ip_header_len = 20u;
+    const size_t udp_len = 8u;
+    const size_t ip_total_len = ip_header_len + udp_len;
+    if (cap < ip_total_len) {
+        return 0;
+    }
+
+    out[0] = (uint8_t)((4u << 4) | 5u);
+    out[2] = (uint8_t)((ip_total_len >> 8) & 0xFFu);
+    out[3] = (uint8_t)(ip_total_len & 0xFFu);
+    out[8] = 0x40;
+    out[9] = 0x11;
+
+    out[12] = 1;
+    out[13] = 2;
+    out[14] = 3;
+    out[15] = 4;
+    out[16] = 5;
+    out[17] = 6;
+    out[18] = 7;
+    out[19] = 8;
+
+    const size_t udp_off = ip_header_len;
+    out[udp_off + 0] = 0x30;
+    out[udp_off + 1] = 0x39;
+    out[udp_off + 2] = (uint8_t)((dst_port >> 8) & 0xFFu);
+    out[udp_off + 3] = (uint8_t)(dst_port & 0xFFu);
+    out[udp_off + 4] = (uint8_t)((udp_len >> 8) & 0xFFu);
+    out[udp_off + 5] = (uint8_t)(udp_len & 0xFFu);
+
+    return ip_total_len;
+}
+
 int
 main(void) {
     int rc = 0;
 
     static dsd_opts opts;
     static dsd_state st;
-    memset(&opts, 0, sizeof opts);
-    memset(&st, 0, sizeof st);
+    DSD_MEMSET(&opts, 0, sizeof opts);
+    DSD_MEMSET(&st, 0, sizeof st);
     st.currentslot = 0;
     opts.lrrp_file_output = 0;
 
@@ -291,8 +336,40 @@ main(void) {
         rc |= expect_has_substr(st.event_history_s[0].Event_History_Items[0].text_message, "HI", "vtx5007 text");
     }
 
+    // Case 4: EF Johnson Atlas Data Registration Server on UDP/9361 should be labeled.
+    {
+        size_t plen = build_ipv4_udp_empty_payload(pkt, sizeof pkt, 9361);
+        st.dmr_lrrp_gps[0][0] = '\0';
+        decode_ip_pdu(&opts, &st, (uint16_t)plen, pkt);
+        rc |= expect_has_substr(st.dmr_lrrp_gps[0], "P25 Atlas SRC(IP): 1.2.3.4; DST(IP): 5.6.7.8;", "atlas9361 label");
+    }
+
+    // Case 5: Short/empty UDP TMS payload should be reported as truncated, not indexed past the payload.
+    {
+        size_t plen = build_ipv4_udp_empty_payload(pkt, sizeof pkt, 4007);
+        st.dmr_lrrp_gps[0][0] = '\0';
+        decode_ip_pdu(&opts, &st, (uint16_t)plen, pkt);
+        rc |= expect_has_substr(st.dmr_lrrp_gps[0], "Truncated;", "tms4007 short payload");
+    }
+
+    // Case 6: UTF-8 event text appends one bounded character at a time.
+    {
+        const uint8_t text[] = {'A', 'B', 'C'};
+        st.event_history_s[0].Event_History_Items[0].text_message[0] = '\0';
+        utf8_to_text(&st, 1, (uint16_t)sizeof text, text);
+        if (strcmp(st.event_history_s[0].Event_History_Items[0].text_message, "ABC") != 0) {
+            DSD_FPRINTF(stderr, "utf8 text append: got '%s'\n",
+                        st.event_history_s[0].Event_History_Items[0].text_message);
+            rc |= 1;
+        }
+    }
+
     free(st.event_history_s);
     st.event_history_s = NULL;
 
     return rc;
 }
+
+#if defined(__GNUC__) && !defined(__cplusplus)
+#pragma GCC diagnostic pop
+#endif

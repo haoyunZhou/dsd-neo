@@ -11,14 +11,12 @@
  * serve as reference and fallback. CPU detection selects best available SIMD.
  */
 
-#include <dsd-neo/dsp/simd_fir.h>
-
 #include <atomic>
 #include <cstring>
-
+#include <dsd-neo/dsp/simd_fir.h>
+#include "dsd-neo/core/safe_api.h"
 #include "simd_x86_cpu.h"
 
-/* Forward declarations for SIMD specializations (defined in arch-specific TUs) */
 #if defined(__x86_64__) || defined(_M_X64)
 extern "C" void simd_fir_complex_apply_sse2(const float* in, int in_len, float* out, float* hist_i, float* hist_q,
                                             const float* taps, int taps_len);
@@ -65,8 +63,8 @@ simd_fir_complex_apply_scalar(const float* in, int in_len, float* out, float* hi
     const int center = (taps_len - 1) >> 1;
 
     /* Get last sample for edge handling */
-    float lastI = (N > 0) ? in[(N - 1) << 1] : 0.0f;
-    float lastQ = (N > 0) ? in[((N - 1) << 1) + 1] : 0.0f;
+    float lastI = in[(N - 1) << 1];
+    float lastQ = in[((N - 1) << 1) + 1];
 
     /* Lambda to fetch sample from history or input */
     auto get_iq = [&](int src_idx, float& xi, float& xq) {
@@ -124,10 +122,8 @@ simd_fir_complex_apply_scalar(const float* in, int in_len, float* out, float* hi
         }
     } else {
         int need = hist_len - N;
-        if (need > 0) {
-            std::memmove(hist_i, hist_i + (hist_len - need), (size_t)need * sizeof(float));
-            std::memmove(hist_q, hist_q + (hist_len - need), (size_t)need * sizeof(float));
-        }
+        DSD_MEMMOVE(hist_i, hist_i + (hist_len - need), (size_t)need * sizeof(float));
+        DSD_MEMMOVE(hist_q, hist_q + (hist_len - need), (size_t)need * sizeof(float));
         for (int k = 0; k < N; k++) {
             hist_i[need + k] = in[k << 1];
             hist_q[need + k] = in[(k << 1) + 1];
@@ -213,8 +209,8 @@ simd_hb_decim2_complex_scalar(const float* in, int in_len, float* out, float* hi
         }
     } else {
         int keep = left_len - ch_len;
-        std::memmove(hist_i, hist_i + ch_len, (size_t)keep * sizeof(float));
-        std::memmove(hist_q, hist_q + ch_len, (size_t)keep * sizeof(float));
+        DSD_MEMMOVE(hist_i, hist_i + ch_len, (size_t)keep * sizeof(float));
+        DSD_MEMMOVE(hist_q, hist_q + ch_len, (size_t)keep * sizeof(float));
         for (int k = 0; k < ch_len; k++) {
             hist_i[keep + k] = in[k << 1];
             hist_q[keep + k] = in[(k << 1) + 1];
@@ -276,13 +272,11 @@ simd_hb_decim2_real_scalar(const float* in, int in_len, float* out, float* hist,
 
     /* Update history */
     if (in_len >= hist_len) {
-        std::memcpy(hist, in + (in_len - hist_len), (size_t)hist_len * sizeof(float));
+        DSD_MEMCPY(hist, in + (in_len - hist_len), (size_t)hist_len * sizeof(float));
     } else {
         int need = hist_len - in_len;
-        if (need > 0) {
-            std::memmove(hist, hist + in_len, (size_t)need * sizeof(float));
-        }
-        std::memcpy(hist + need, in, (size_t)in_len * sizeof(float));
+        DSD_MEMMOVE(hist, hist + in_len, (size_t)need * sizeof(float));
+        DSD_MEMCPY(hist + need, in, (size_t)in_len * sizeof(float));
     }
 
     return out_len;
@@ -303,6 +297,11 @@ static const char* g_impl_name = "scalar";
 
 /* Dispatch init state: 0 = not started, 1 = in progress, 2 = done */
 static std::atomic<int> g_fir_init_done{0};
+
+static inline bool
+simd_fir_prefer_scalar_for_block(int in_len, int taps_len) {
+    return in_len > 0 && taps_len > 0 && in_len < taps_len * 2;
+}
 
 static void
 simd_fir_init_dispatch() {
@@ -350,6 +349,10 @@ simd_fir_init_dispatch() {
 extern "C" void
 simd_fir_complex_apply(const float* in, int in_len, float* out, float* hist_i, float* hist_q, const float* taps,
                        int taps_len) {
+    if (simd_fir_prefer_scalar_for_block(in_len, taps_len)) {
+        simd_fir_complex_apply_scalar(in, in_len, out, hist_i, hist_q, taps, taps_len);
+        return;
+    }
     if (g_fir_init_done.load(std::memory_order_acquire) != 2) {
         simd_fir_init_dispatch();
     }
@@ -359,6 +362,9 @@ simd_fir_complex_apply(const float* in, int in_len, float* out, float* hist_i, f
 extern "C" int
 simd_hb_decim2_complex(const float* in, int in_len, float* out, float* hist_i, float* hist_q, const float* taps,
                        int taps_len) {
+    if (simd_fir_prefer_scalar_for_block(in_len, taps_len)) {
+        return simd_hb_decim2_complex_scalar(in, in_len, out, hist_i, hist_q, taps, taps_len);
+    }
     if (g_fir_init_done.load(std::memory_order_acquire) != 2) {
         simd_fir_init_dispatch();
     }
@@ -367,6 +373,9 @@ simd_hb_decim2_complex(const float* in, int in_len, float* out, float* hist_i, f
 
 extern "C" int
 simd_hb_decim2_real(const float* in, int in_len, float* out, float* hist, const float* taps, int taps_len) {
+    if (simd_fir_prefer_scalar_for_block(in_len, taps_len)) {
+        return simd_hb_decim2_real_scalar(in, in_len, out, hist, taps, taps_len);
+    }
     if (g_fir_init_done.load(std::memory_order_acquire) != 2) {
         simd_fir_init_dispatch();
     }

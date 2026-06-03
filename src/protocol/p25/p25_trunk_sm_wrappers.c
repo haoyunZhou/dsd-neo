@@ -11,6 +11,7 @@
  */
 
 #include <dsd-neo/core/dsd_time.h>
+#include <dsd-neo/core/state.h>
 #include <dsd-neo/protocol/p25/p25_cc_candidates.h>
 #include <dsd-neo/protocol/p25/p25_trunk_sm.h>
 #include <dsd-neo/protocol/p25/p25_trunk_sm_api.h>
@@ -29,7 +30,7 @@ now_monotonic(void) {
  * ============================================================================ */
 
 static void
-p25_sm_on_neighbor_update_default(dsd_opts* opts, dsd_state* state, const long* freqs, int count) {
+p25_sm_on_neighbor_update_default(const dsd_opts* opts, dsd_state* state, const long* freqs, int count) {
     if (count <= 0 || !state || !freqs) {
         return;
     }
@@ -40,6 +41,12 @@ p25_sm_on_neighbor_update_default(dsd_opts* opts, dsd_state* state, const long* 
         long f = freqs[i];
         if (f == 0) {
             continue;
+        }
+        if (state->p25_cc_freq != 0 && f == state->p25_cc_freq) {
+            state->trunk_lcn_freq[0] = f;
+            if (state->lcn_freq_count < 1) {
+                state->lcn_freq_count = 1;
+            }
         }
         // Track neighbor list for UI
         p25_nb_add(state, f);
@@ -82,7 +89,7 @@ p25_sm_next_cc_candidate(dsd_state* state, long* out_freq) {
  * ============================================================================ */
 
 static void
-p25_sm_init_default(dsd_opts* opts, dsd_state* state) {
+p25_sm_init_default(const dsd_opts* opts, dsd_state* state) {
     p25_sm_init_ctx(p25_sm_get_ctx(), opts, state);
 }
 
@@ -156,4 +163,52 @@ p25_sm_tick(dsd_opts* opts, dsd_state* state) {
         return;
     }
     p25_sm_tick_default(opts, state);
+}
+
+/* ============================================================================
+ * Queued/Deny Response Wrappers
+ * ============================================================================ */
+
+static void
+p25_sm_on_queued_response_default(dsd_opts* opts, dsd_state* state, int svc_type, int reason_code, int target) {
+    (void)svc_type;
+    (void)reason_code;
+    (void)target;
+    if (!opts || !state) {
+        return;
+    }
+    state->p25_sm_queued_count++;
+    p25_sm_release(p25_sm_get_ctx(), opts, state, "queued-rsp");
+}
+
+void
+p25_sm_on_queued_response(dsd_opts* opts, dsd_state* state, int svc_type, int reason_code, int target) {
+    p25_sm_api api = p25_sm_get_api();
+    if (api.on_queued_response) {
+        api.on_queued_response(opts, state, svc_type, reason_code, target);
+        return;
+    }
+    p25_sm_on_queued_response_default(opts, state, svc_type, reason_code, target);
+}
+
+static void
+p25_sm_on_deny_response_default(dsd_opts* opts, dsd_state* state, int svc_type, int reason_code, int target) {
+    (void)svc_type;
+    (void)reason_code;
+    (void)target;
+    if (!opts || !state) {
+        return;
+    }
+    state->p25_sm_deny_count++;
+    p25_sm_release(p25_sm_get_ctx(), opts, state, "deny-rsp");
+}
+
+void
+p25_sm_on_deny_response(dsd_opts* opts, dsd_state* state, int svc_type, int reason_code, int target) {
+    p25_sm_api api = p25_sm_get_api();
+    if (api.on_deny_response) {
+        api.on_deny_response(opts, state, svc_type, reason_code, target);
+        return;
+    }
+    p25_sm_on_deny_response_default(opts, state, svc_type, reason_code, target);
 }

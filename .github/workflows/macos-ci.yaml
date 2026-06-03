@@ -4,55 +4,88 @@ on:
   workflow_dispatch: {}
   push:
     branches: [main, master]
+    tags:
+      - "v*.*.*"
     paths-ignore:
       - ".*"
-      - ".github/*.yml"
-      - ".github/*.yaml"
-      - ".github/**/*.yml"
-      - ".github/**/*.yaml"
       - "**/*.md"
+  pull_request:
+    branches: [main, master]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
 
 jobs:
   build-portable-dmg:
     runs-on: macos-latest
+    if: github.event_name == 'pull_request'
     permissions:
-      contents: write
+      actions: read
+      contents: read
     env:
       HOMEBREW_NO_AUTO_UPDATE: "1"
       HOMEBREW_NO_INSTALL_CLEANUP: "1"
       HOMEBREW_NO_ANALYTICS: "1"
     steps:
       - name: Checkout
-        uses: actions/checkout@v6.0.2
-
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
       - name: Compute dependency SHAs (for cache key)
         id: dep-shas
         shell: bash
         run: |
           set -euo pipefail
-          echo "mbe_sha=$(git ls-remote https://github.com/arancormonk/mbelib-neo HEAD | cut -f1)" >> "$GITHUB_OUTPUT"
-          echo "codec2_sha=$(git ls-remote https://github.com/arancormonk/codec2 HEAD | cut -f1)" >> "$GITHUB_OUTPUT"
-          echo "rtlsdr_sha=$(git ls-remote https://github.com/arancormonk/rtl-sdr HEAD | cut -f1)" >> "$GITHUB_OUTPUT"
+          {
+            source tools/ci-dependency-pins.env
+            echo "mbe_sha=$MBELIB_NEO_SHA"
+            echo "codec2_sha=$CODEC2_SHA"
+            echo "rtlsdr_sha=$RTL_SDR_SHA"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Prepare dependency environment
         shell: bash
         run: |
           set -euxo pipefail
-          echo "DEPS_PREFIX=${GITHUB_WORKSPACE}/.deps" >> "$GITHUB_ENV"
           # Homebrew locations (arm64=/opt/homebrew, x86_64=/usr/local)
           HB_PREFIX=$(brew --prefix)
-          echo "HB_PREFIX=$HB_PREFIX" >> "$GITHUB_ENV"
-          echo "PKG_CONFIG_PATH=${GITHUB_WORKSPACE}/.deps/lib/pkgconfig:${GITHUB_WORKSPACE}/.deps/lib64/pkgconfig:${HB_PREFIX}/lib/pkgconfig:/usr/local/lib/pkgconfig:${PKG_CONFIG_PATH:-}" >> "$GITHUB_ENV"
-          echo "CMAKE_PREFIX_PATH=${GITHUB_WORKSPACE}/.deps:${HB_PREFIX}:/usr/local:${CMAKE_PREFIX_PATH:-}" >> "$GITHUB_ENV"
-          echo "DYLD_LIBRARY_PATH=${GITHUB_WORKSPACE}/.deps/lib:${GITHUB_WORKSPACE}/.deps/lib64:${DYLD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+          {
+            echo "DEPS_PREFIX=${GITHUB_WORKSPACE}/.deps"
+            echo "HB_PREFIX=$HB_PREFIX"
+            echo "PKG_CONFIG_PATH=${GITHUB_WORKSPACE}/.deps/lib/pkgconfig:${GITHUB_WORKSPACE}/.deps/lib64/pkgconfig:${HB_PREFIX}/lib/pkgconfig:/usr/local/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+            echo "CMAKE_PREFIX_PATH=${GITHUB_WORKSPACE}/.deps:${HB_PREFIX}:/usr/local:${CMAKE_PREFIX_PATH:-}"
+            echo "DYLD_LIBRARY_PATH=${GITHUB_WORKSPACE}/.deps/lib:${GITHUB_WORKSPACE}/.deps/lib64:${DYLD_LIBRARY_PATH:-}"
+          } >> "$GITHUB_ENV"
 
       - name: Restore dependency cache
-        uses: actions/cache@v5.0.4
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ${{ env.DEPS_PREFIX }}
           key: deps-${{ runner.os }}-${{ steps.dep-shas.outputs.mbe_sha }}-${{ steps.dep-shas.outputs.codec2_sha }}-${{ steps.dep-shas.outputs.rtlsdr_sha }}
           restore-keys: |
             deps-${{ runner.os }}-
+
+      - name: Validate dependency cache
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mf="$DEPS_PREFIX/.manifest"
+          if [ -d "$DEPS_PREFIX" ]; then
+            if [ -f "$mf" ] &&
+               grep -Fxq "mbe_sha=${{ steps.dep-shas.outputs.mbe_sha }}" "$mf" &&
+               grep -Fxq "codec2_sha=${{ steps.dep-shas.outputs.codec2_sha }}" "$mf" &&
+               grep -Fxq "rtlsdr_sha=${{ steps.dep-shas.outputs.rtlsdr_sha }}" "$mf"; then
+              echo "Dependency cache manifest matches requested SHAs"
+            else
+              echo "Dependency cache manifest is missing or stale; clearing $DEPS_PREFIX"
+              rm -rf "$DEPS_PREFIX"
+            fi
+          fi
+          mkdir -p "$DEPS_PREFIX"
 
       - name: Install base toolchain + libs (Homebrew)
         shell: bash
@@ -71,16 +104,18 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          echo "CCACHE_DIR=${GITHUB_WORKSPACE}/.ccache" >> "$GITHUB_ENV"
-          echo "CC=ccache clang" >> "$GITHUB_ENV"
-          echo "CXX=ccache clang++" >> "$GITHUB_ENV"
-          echo "CCACHE_BASEDIR=${GITHUB_WORKSPACE}" >> "$GITHUB_ENV"
-          echo "CCACHE_NOHASHDIR=true" >> "$GITHUB_ENV"
-          echo "CCACHE_SLOPPINESS=time_macros" >> "$GITHUB_ENV"
+          {
+            echo "CCACHE_DIR=${GITHUB_WORKSPACE}/.ccache"
+            echo "CC=ccache clang"
+            echo "CXX=ccache clang++"
+            echo "CCACHE_BASEDIR=${GITHUB_WORKSPACE}"
+            echo "CCACHE_NOHASHDIR=true"
+            echo "CCACHE_SLOPPINESS=time_macros"
+          } >> "$GITHUB_ENV"
           mkdir -p "${GITHUB_WORKSPACE}/.ccache"
 
       - name: Restore ccache
-        uses: actions/cache@v5.0.4
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ${{ env.CCACHE_DIR }}
           key: ccache-${{ runner.os }}-${{ github.sha }}
@@ -110,9 +145,7 @@ jobs:
             fi
             echo "Cached mbelib-neo does not match desired SHA; rebuilding"
           fi
-          git clone --depth 1 https://github.com/arancormonk/mbelib-neo /tmp/mbelib-neo
-          git -C /tmp/mbelib-neo fetch --depth 1 origin "$want_sha"
-          git -C /tmp/mbelib-neo checkout "$want_sha"
+          tools/fetch-pinned-git.sh https://github.com/arancormonk/mbelib-neo "$want_sha" /tmp/mbelib-neo
           cmake -S /tmp/mbelib-neo -B /tmp/mbelib-neo/build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON \
             -DCMAKE_INSTALL_PREFIX="$DEPS_PREFIX" \
@@ -140,9 +173,7 @@ jobs:
               exit 0
             fi
           fi
-          git clone --depth 1 https://github.com/arancormonk/codec2 /tmp/codec2
-          git -C /tmp/codec2 fetch --depth 1 origin "$want_sha"
-          git -C /tmp/codec2 checkout "$want_sha"
+          tools/fetch-pinned-git.sh https://github.com/arancormonk/codec2 "$want_sha" /tmp/codec2
           cmake -S /tmp/codec2 -B /tmp/codec2/build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON \
             -DCMAKE_INSTALL_PREFIX="$DEPS_PREFIX" \
@@ -170,9 +201,7 @@ jobs:
               exit 0
             fi
           fi
-          git clone --depth 1 https://github.com/arancormonk/rtl-sdr /tmp/rtl-sdr
-          git -C /tmp/rtl-sdr fetch --depth 1 origin "$want_sha"
-          git -C /tmp/rtl-sdr checkout "$want_sha"
+          tools/fetch-pinned-git.sh https://github.com/arancormonk/rtl-sdr "$want_sha" /tmp/rtl-sdr
           cmake -S /tmp/rtl-sdr -B /tmp/rtl-sdr/build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release -DDETACH_KERNEL_DRIVER=ON \
             -DCMAKE_INSTALL_PREFIX="$DEPS_PREFIX" \
@@ -186,11 +215,261 @@ jobs:
           set -euxo pipefail
           mkdir -p "$DEPS_PREFIX"
           mf="$DEPS_PREFIX/.manifest"
-          : > "$mf"
-          echo "mbe_sha=${{ steps.dep-shas.outputs.mbe_sha }}" >> "$mf"
-          echo "codec2_sha=${{ steps.dep-shas.outputs.codec2_sha }}" >> "$mf"
-          echo "rtlsdr_sha=${{ steps.dep-shas.outputs.rtlsdr_sha }}" >> "$mf"
-          echo "updated=$(date -u +%FT%TZ)" >> "$mf"
+          {
+            echo "mbe_sha=${{ steps.dep-shas.outputs.mbe_sha }}"
+            echo "codec2_sha=${{ steps.dep-shas.outputs.codec2_sha }}"
+            echo "rtlsdr_sha=${{ steps.dep-shas.outputs.rtlsdr_sha }}"
+            echo "updated=$(date -u +%FT%TZ)"
+          } > "$mf"
+
+      - name: Show dependency versions
+        shell: bash
+        run: |
+          set -euxo pipefail
+          pkg-config --modversion codec2 || true
+          pkg-config --modversion librtlsdr || true
+          pkg-config --modversion SoapySDR || true
+          pkg-config --modversion libpulse || true
+          pkg-config --modversion sndfile || true
+
+      - name: Configure (Release preset)
+        shell: bash
+        run: |
+          cmake --preset dev-release -G Ninja \
+            -DDSD_ENABLE_LTO=OFF -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DDSD_REQUIRE_RTLSDR=ON -DDSD_REQUIRE_SOAPYSDR=ON \
+            -DBUILD_TESTING=OFF \
+            -DCURSES_LIBRARY="$HB_PREFIX/opt/ncurses/lib/libncursesw.dylib" \
+            -DCURSES_INCLUDE_PATH="$HB_PREFIX/opt/ncurses/include"
+
+      - name: Build
+        shell: bash
+        run: |
+          cmake --build --preset dev-release -j
+
+      - name: Smoke test - show CLI help
+        shell: bash
+        run: |
+          ./build/dev-release/apps/dsd-cli/dsd-neo -h || true
+
+      - name: Verify release hardening
+        shell: bash
+        run: |
+          tools/check_release_hardening.sh build/dev-release/apps/dsd-cli/dsd-neo build/dev-release
+
+  package-portable-dmg:
+    name: Package portable DMG
+    runs-on: macos-latest
+    if: github.event_name != 'pull_request'
+    permissions:
+      actions: read
+      attestations: write
+      artifact-metadata: write
+      contents: read
+      id-token: write
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_INSTALL_CLEANUP: "1"
+      HOMEBREW_NO_ANALYTICS: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+      - name: Validate release tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        id: release
+        shell: bash
+        env:
+          RELEASE_TAG_CREATED: ${{ github.event.created }}
+        run: tools/ci_validate_release_tag.sh
+
+      - name: Compute dependency SHAs (for cache key)
+        id: dep-shas
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            source tools/ci-dependency-pins.env
+            echo "mbe_sha=$MBELIB_NEO_SHA"
+            echo "codec2_sha=$CODEC2_SHA"
+            echo "rtlsdr_sha=$RTL_SDR_SHA"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Prepare dependency environment
+        shell: bash
+        run: |
+          set -euxo pipefail
+          # Homebrew locations (arm64=/opt/homebrew, x86_64=/usr/local)
+          HB_PREFIX=$(brew --prefix)
+          {
+            echo "DEPS_PREFIX=${GITHUB_WORKSPACE}/.deps"
+            echo "HB_PREFIX=$HB_PREFIX"
+            echo "PKG_CONFIG_PATH=${GITHUB_WORKSPACE}/.deps/lib/pkgconfig:${GITHUB_WORKSPACE}/.deps/lib64/pkgconfig:${HB_PREFIX}/lib/pkgconfig:/usr/local/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+            echo "CMAKE_PREFIX_PATH=${GITHUB_WORKSPACE}/.deps:${HB_PREFIX}:/usr/local:${CMAKE_PREFIX_PATH:-}"
+            echo "DYLD_LIBRARY_PATH=${GITHUB_WORKSPACE}/.deps/lib:${GITHUB_WORKSPACE}/.deps/lib64:${DYLD_LIBRARY_PATH:-}"
+          } >> "$GITHUB_ENV"
+
+      - name: Restore dependency cache
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ env.DEPS_PREFIX }}
+          key: deps-${{ runner.os }}-${{ steps.dep-shas.outputs.mbe_sha }}-${{ steps.dep-shas.outputs.codec2_sha }}-${{ steps.dep-shas.outputs.rtlsdr_sha }}
+          restore-keys: |
+            deps-${{ runner.os }}-
+
+      - name: Validate dependency cache
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mf="$DEPS_PREFIX/.manifest"
+          if [ -d "$DEPS_PREFIX" ]; then
+            if [ -f "$mf" ] &&
+               grep -Fxq "mbe_sha=${{ steps.dep-shas.outputs.mbe_sha }}" "$mf" &&
+               grep -Fxq "codec2_sha=${{ steps.dep-shas.outputs.codec2_sha }}" "$mf" &&
+               grep -Fxq "rtlsdr_sha=${{ steps.dep-shas.outputs.rtlsdr_sha }}" "$mf"; then
+              echo "Dependency cache manifest matches requested SHAs"
+            else
+              echo "Dependency cache manifest is missing or stale; clearing $DEPS_PREFIX"
+              rm -rf "$DEPS_PREFIX"
+            fi
+          fi
+          mkdir -p "$DEPS_PREFIX"
+
+      - name: Install base toolchain + libs (Homebrew)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          # Many deps we build from source (cached) to align with Linux/Windows flows
+          brew install cmake ninja pkg-config ccache \
+            libsndfile pulseaudio fftw libusb ncurses soapysdr
+          # Prefer Homebrew packages when available
+          brew install codec2 rtl-sdr || true
+          brew --version
+          cmake --version
+          pkg-config --version
+
+      - name: Prepare ccache environment
+        shell: bash
+        run: |
+          set -euxo pipefail
+          {
+            echo "CCACHE_DIR=${GITHUB_WORKSPACE}/.ccache"
+            echo "CC=ccache clang"
+            echo "CXX=ccache clang++"
+            echo "CCACHE_BASEDIR=${GITHUB_WORKSPACE}"
+            echo "CCACHE_NOHASHDIR=true"
+            echo "CCACHE_SLOPPINESS=time_macros"
+          } >> "$GITHUB_ENV"
+          mkdir -p "${GITHUB_WORKSPACE}/.ccache"
+
+      - name: Restore ccache
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-${{ runner.os }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ runner.os }}-
+
+      - name: Initialize ccache
+        shell: bash
+        run: |
+          ccache --version
+          ccache --zero-stats
+          ccache --set-config=max_size=500M
+          ccache --set-config=compression=true
+
+      - name: Build and install mbelib-neo (required, cached)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mf="$DEPS_PREFIX/.manifest"
+          want_sha='${{ steps.dep-shas.outputs.mbe_sha }}'
+          pc1="$DEPS_PREFIX/lib/pkgconfig/libmbe-neo.pc"
+          pc2="$DEPS_PREFIX/lib64/pkgconfig/libmbe-neo.pc"
+          if [ -f "$pc1" ] || [ -f "$pc2" ]; then
+            if [ -f "$mf" ] && grep -q "^mbe_sha=$want_sha$" "$mf"; then
+              echo "Using cached mbelib-neo in $DEPS_PREFIX"
+              exit 0
+            fi
+            echo "Cached mbelib-neo does not match desired SHA; rebuilding"
+          fi
+          tools/fetch-pinned-git.sh https://github.com/arancormonk/mbelib-neo "$want_sha" /tmp/mbelib-neo
+          cmake -S /tmp/mbelib-neo -B /tmp/mbelib-neo/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON \
+            -DCMAKE_INSTALL_PREFIX="$DEPS_PREFIX" \
+            -DCMAKE_OSX_ARCHITECTURES=arm64
+          cmake --build /tmp/mbelib-neo/build -j
+          cmake --install /tmp/mbelib-neo/build
+
+      - name: Ensure codec2 (cached fallback if not found)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mf="$DEPS_PREFIX/.manifest"
+          want_sha='${{ steps.dep-shas.outputs.codec2_sha }}'
+          pc1="$DEPS_PREFIX/lib/pkgconfig/codec2.pc"
+          pc2="$DEPS_PREFIX/lib64/pkgconfig/codec2.pc"
+          if [ -f "$pc1" ] || [ -f "$pc2" ]; then
+            if [ -f "$mf" ] && grep -q "^codec2_sha=$want_sha$" "$mf"; then
+              echo "Using cached codec2 in $DEPS_PREFIX"
+              exit 0
+            fi
+            echo "Cached codec2 does not match desired SHA; rebuilding"
+          else
+            if pkg-config --exists codec2; then
+              echo "Using system codec2"
+              exit 0
+            fi
+          fi
+          tools/fetch-pinned-git.sh https://github.com/arancormonk/codec2 "$want_sha" /tmp/codec2
+          cmake -S /tmp/codec2 -B /tmp/codec2/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON \
+            -DCMAKE_INSTALL_PREFIX="$DEPS_PREFIX" \
+            -DCMAKE_OSX_ARCHITECTURES=arm64
+          cmake --build /tmp/codec2/build -j
+          cmake --install /tmp/codec2/build
+
+      - name: Ensure RTL-SDR (cached fallback if not found)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mf="$DEPS_PREFIX/.manifest"
+          want_sha='${{ steps.dep-shas.outputs.rtlsdr_sha }}'
+          pc1="$DEPS_PREFIX/lib/pkgconfig/librtlsdr.pc"
+          pc2="$DEPS_PREFIX/lib64/pkgconfig/librtlsdr.pc"
+          if [ -f "$pc1" ] || [ -f "$pc2" ]; then
+            if [ -f "$mf" ] && grep -q "^rtlsdr_sha=$want_sha$" "$mf"; then
+              echo "Using cached rtl-sdr in $DEPS_PREFIX"
+              exit 0
+            fi
+            echo "Cached rtl-sdr does not match desired SHA; rebuilding"
+          else
+            if pkg-config --exists librtlsdr; then
+              echo "Using system rtl-sdr"
+              exit 0
+            fi
+          fi
+          tools/fetch-pinned-git.sh https://github.com/arancormonk/rtl-sdr "$want_sha" /tmp/rtl-sdr
+          cmake -S /tmp/rtl-sdr -B /tmp/rtl-sdr/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DDETACH_KERNEL_DRIVER=ON \
+            -DCMAKE_INSTALL_PREFIX="$DEPS_PREFIX" \
+            -DCMAKE_OSX_ARCHITECTURES=arm64
+          cmake --build /tmp/rtl-sdr/build -j
+          cmake --install /tmp/rtl-sdr/build
+
+      - name: Update deps manifest
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$DEPS_PREFIX"
+          mf="$DEPS_PREFIX/.manifest"
+          {
+            echo "mbe_sha=${{ steps.dep-shas.outputs.mbe_sha }}"
+            echo "codec2_sha=${{ steps.dep-shas.outputs.codec2_sha }}"
+            echo "rtlsdr_sha=${{ steps.dep-shas.outputs.rtlsdr_sha }}"
+            echo "updated=$(date -u +%FT%TZ)"
+          } > "$mf"
 
       - name: Show dependency versions
         shell: bash
@@ -223,6 +502,7 @@ jobs:
           ./build/dev-release/apps/dsd-cli/dsd-neo -h || true
 
       - name: Stage portable tree
+        if: github.event_name != 'pull_request'
         id: stage
         shell: bash
         run: |
@@ -254,7 +534,7 @@ jobs:
           # Helper: collect dylib deps of a file and copy non-system libs into $STAGE/lib
           collect_deps() {
             local file="$1"
-            local libs lib base src
+            local libs lib base
             libs=$(otool -L "$file" | tail -n +2 | awk '{print $1}')
             for lib in $libs; do
               # Skip system libraries
@@ -280,9 +560,9 @@ jobs:
             changed=0
             for lib in "$STAGE"/lib/*.dylib; do
               [ -f "$lib" ] || continue
-              before=$(ls -1 "$STAGE"/lib | wc -l)
+              before=$(find "$STAGE/lib" -mindepth 1 -maxdepth 1 -type f | wc -l)
               collect_deps "$lib"
-              after=$(ls -1 "$STAGE"/lib | wc -l)
+              after=$(find "$STAGE/lib" -mindepth 1 -maxdepth 1 -type f | wc -l)
               if [ "$after" -gt "$before" ]; then changed=1; fi
             done
             [ "$changed" -eq 0 ] && break
@@ -331,7 +611,17 @@ jobs:
           done
 
           # Emit manifest for auditing
-          (cd "$STAGE/lib" && ls -1 *.dylib 2>/dev/null | sort -f) > "$STAGE/dylibs-manifest.txt" || true
+          find "$STAGE/lib" -maxdepth 1 -type f -name '*.dylib' -exec basename {} \; | sort -f > "$STAGE/dylibs-manifest.txt"
+
+      - name: Verify staged release hardening
+        shell: bash
+        run: |
+          set -euo pipefail
+          tools/check_release_hardening.sh dist/dsd-neo-macos/bin/dsd-neo build/dev-release
+          find dist/dsd-neo-macos/lib -maxdepth 1 -type f -name '*.dylib' -print0 |
+            while IFS= read -r -d '' lib; do
+              tools/check_release_hardening.sh "$lib" build/dev-release
+            done
 
       - name: Smoke test staged binary
         shell: bash
@@ -367,8 +657,10 @@ jobs:
           cp -a "$stage" "$imgroot/"
           # Create a compressed read-only DMG from imgroot (contains dsd-neo-macos/)
           hdiutil create -fs HFS+ -volname "dsd-neo" -srcfolder "$imgroot" -format UDZO -imagekey zlib-level=9 "$dmg"
-          echo "DMG_PATH=$dmg" >> "$GITHUB_OUTPUT"
-          echo "ART_NAME=$artName" >> "$GITHUB_OUTPUT"
+          {
+            echo "DMG_PATH=$dmg"
+            echo "ART_NAME=$artName"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Verify DMG contents (mount and run help)
         shell: bash
@@ -385,27 +677,119 @@ jobs:
           trap - EXIT
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v7.0.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ steps.dmg.outputs.ART_NAME }}
           path: ${{ steps.dmg.outputs.DMG_PATH }}
           retention-days: 7
 
-      - name: Upload release asset
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2.6.1
+      - name: Generate artifact SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610
         with:
-          files: ${{ steps.dmg.outputs.DMG_PATH }}
-          name: ${{ steps.dmg.outputs.ART_NAME }}
-          generate_release_notes: true
-
-      - name: Upload nightly asset (overwrite)
-        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
-        uses: svenstaro/upload-release-action@v2
-        with:
-          repo_token: ${{ secrets.GITHUB_TOKEN }}
-          tag: nightly
-          prerelease: true
           file: ${{ steps.dmg.outputs.DMG_PATH }}
-          asset_name: ${{ steps.dmg.outputs.ART_NAME }}.dmg
-          overwrite: true
+          format: spdx-json
+          output-file: ${{ steps.dmg.outputs.DMG_PATH }}.spdx.json
+          artifact-name: ${{ steps.dmg.outputs.ART_NAME }}.spdx.json
+          upload-artifact: true
+          upload-release-assets: false
+
+      - name: Attest artifact provenance
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
+        with:
+          subject-path: ${{ steps.dmg.outputs.DMG_PATH }}
+
+      - name: Attest artifact SBOM
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
+        with:
+          subject-path: ${{ steps.dmg.outputs.DMG_PATH }}
+          sbom-path: ${{ steps.dmg.outputs.DMG_PATH }}.spdx.json
+
+  publish-portable-dmg:
+    name: Publish portable DMG
+    needs: package-portable-dmg
+    runs-on: ubuntu-latest
+    if: >-
+      github.repository == 'arancormonk/dsd-neo' &&
+      (startsWith(github.ref, 'refs/tags/v') ||
+      ((github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')))
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Prepare artifact naming
+        id: names
+        shell: bash
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          arch='arm64'
+          if [ "$REF_TYPE" = 'tag' ] && [ -n "$REF_NAME" ]; then
+            dmg="dist/dsd-neo-macos-${arch}-portable-${REF_NAME}.dmg"
+            artName="dsd-neo-macos-${arch}-portable-${REF_NAME}"
+            title="dsd-neo ${REF_NAME#v}"
+          else
+            dmg="dist/dsd-neo-macos-${arch}-portable-nightly.dmg"
+            artName="dsd-neo-macos-${arch}-portable-nightly"
+            title="nightly"
+          fi
+          mkdir -p dist
+          {
+            echo "DMG_PATH=$dmg"
+            echo "ART_NAME=$artName"
+            echo "RELEASE_TITLE=$title"
+          } >> "$GITHUB_OUTPUT"
+      - name: Download package artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ steps.names.outputs.ART_NAME }}
+          path: dist
+      - name: Download package SBOM artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ steps.names.outputs.ART_NAME }}.spdx.json
+          path: dist
+      - name: Normalize downloaded SBOM filename
+        shell: bash
+        run: |
+          set -euo pipefail
+          mv -f "dist/${{ steps.names.outputs.ART_NAME }}.spdx.json" "${{ steps.names.outputs.DMG_PATH }}.spdx.json"
+      - name: Verify downloaded release files
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f "${{ steps.names.outputs.DMG_PATH }}"
+          test -f "${{ steps.names.outputs.DMG_PATH }}.spdx.json"
+      - name: Upload release asset
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda
+        with:
+          files: |
+            ${{ steps.names.outputs.DMG_PATH }}
+            ${{ steps.names.outputs.DMG_PATH }}.spdx.json
+          name: ${{ steps.names.outputs.RELEASE_TITLE }}
+          generate_release_notes: true
+          overwrite_files: true
+          fail_on_unmatched_files: true
+          token: ${{ github.token }}
+      - name: Upload nightly assets (overwrite)
+        if: >-
+          (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+          (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda
+        with:
+          tag_name: nightly
+          name: nightly
+          prerelease: true
+          make_latest: false
+          target_commitish: ${{ github.sha }}
+          files: |
+            ${{ steps.names.outputs.DMG_PATH }}
+            ${{ steps.names.outputs.DMG_PATH }}.spdx.json
+          overwrite_files: true
+          fail_on_unmatched_files: true
+          token: ${{ github.token }}

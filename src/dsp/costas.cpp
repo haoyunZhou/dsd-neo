@@ -22,13 +22,16 @@
 #include <dsd-neo/dsp/costas.h>
 #include <dsd-neo/dsp/demod_state.h>
 #include <dsd-neo/runtime/config.h>
-
+#include "dsd-neo/core/safe_api.h"
 #include "dsd-neo/dsp/ted.h"
+
+static void fll_band_edge_design_filter(dsd_fll_band_edge_state_t* f, int sps, float rolloff, int n_taps);
 
 namespace {
 
 constexpr float kTwoPi = 6.28318530717958647692f;
 constexpr float kPi = 3.14159265358979323846f;
+static bool g_warned_ted_dl_oversize = false;
 
 static inline bool
 debug_cqpsk_enabled(void) {
@@ -38,6 +41,17 @@ debug_cqpsk_enabled(void) {
         cfg = dsd_neo_get_config();
     }
     return cfg && cfg->debug_cqpsk_enable;
+}
+
+static inline void
+fll_band_edge_clear_delay(dsd_fll_band_edge_state_t* f) {
+    if (!f) {
+        return;
+    }
+    for (int i = 0; i < FLL_BAND_EDGE_MAX_TAPS * 2; i++) {
+        f->delay_r[i] = 0.0f;
+        f->delay_i[i] = 0.0f;
+    }
 }
 
 /* MMSE interpolator parameters - match OP25/GNU Radio */
@@ -142,18 +156,116 @@ mmse_interp_cc(const float* dl, float mu, float* out_r, float* out_j) {
     *out_j = mmse_interp_8tap(sj, mu);
 }
 
-/* Branchless clip (matches GNU Radio) */
+/* Saturating clip equivalent to GNU Radio's branchless_clip. */
 static inline float
-branchless_clip(float x, float limit) {
-    float a = x + limit;
-    float b = x - limit;
-    if (a < 0.0f) {
-        a = 0.0f;
+clipf_limit(float x, float limit) {
+    if (x > limit) {
+        return limit;
     }
-    if (b > 0.0f) {
-        b = 0.0f;
+    if (x < -limit) {
+        return -limit;
     }
-    return 0.5f * (a + b);
+    return x;
+}
+
+static inline void
+dsd_sincosf(float phase, float* out_sin, float* out_cos) {
+#if defined(__GNUC__) && !defined(__clang__) && !defined(_MSC_VER)
+    __builtin_sincosf(phase, out_sin, out_cos);
+#else
+    *out_sin = sinf(phase);
+    *out_cos = cosf(phase);
+#endif
+}
+
+static inline void
+dsd_sincosf_clamped_half_pi(float phase, float* out_sin, float* out_cos) {
+    float x2 = phase * phase;
+    *out_sin = phase
+               * (1.0f
+                  + x2
+                        * (-0.16666666666666666667f
+                           + x2
+                                 * (0.00833333333333333333f
+                                    + x2
+                                          * (-0.00019841269841269841f
+                                             + x2 * (0.00000275573192239859f + x2 * -0.00000002505210838544f)))));
+    *out_cos = 1.0f
+               + x2
+                     * (-0.5f
+                        + x2
+                              * (0.04166666666666666667f
+                                 + x2
+                                       * (-0.00138888888888888889f
+                                          + x2 * (0.00002480158730158730f + x2 * -0.00000027557319223986f))));
+}
+
+static inline void
+dsd_sincosf_wrapped_two_pi(float phase, float* out_sin, float* out_cos) {
+    if (!std::isfinite(phase) || phase < -kTwoPi || phase > kTwoPi) {
+        dsd_sincosf(phase, out_sin, out_cos);
+        return;
+    }
+
+    if (phase > kPi) {
+        phase -= kTwoPi;
+    } else if (phase < -kPi) {
+        phase += kTwoPi;
+    }
+
+    if (phase > (kPi / 2.0f)) {
+        float sin_v = 0.0f;
+        float cos_v = 0.0f;
+        dsd_sincosf_clamped_half_pi(kPi - phase, &sin_v, &cos_v);
+        *out_sin = sin_v;
+        *out_cos = -cos_v;
+        return;
+    }
+    if (phase < (-kPi / 2.0f)) {
+        float sin_v = 0.0f;
+        float cos_v = 0.0f;
+        dsd_sincosf_clamped_half_pi(-kPi - phase, &sin_v, &cos_v);
+        *out_sin = sin_v;
+        *out_cos = -cos_v;
+        return;
+    }
+
+    dsd_sincosf_clamped_half_pi(phase, out_sin, out_cos);
+}
+
+static int
+cqpsk_symbol_rate_hz(const demod_state* d) {
+    if (!d || d->rate_out <= 0 || d->ted_sps <= 0) {
+        return 4800;
+    }
+    return (d->rate_out + (d->ted_sps / 2)) / d->ted_sps;
+}
+
+static float
+op25_gardner_gain_mu_for_state(const demod_state* d, const ted_state_t* ted) {
+    const float requested = (d && d->ted_gain > 0.0f) ? d->ted_gain : 0.025f;
+    const dsdneoRuntimeConfig* cfg = dsd_neo_get_config();
+    if (!cfg) {
+        dsd_neo_config_init(NULL);
+        cfg = dsd_neo_get_config();
+    }
+    if ((d && d->ted_gain_is_set) || (cfg && cfg->ted_gain_is_set)) {
+        return requested;
+    }
+
+    if (cqpsk_symbol_rate_hz(d) < 5500) {
+        return requested;
+    }
+    if (!ted || ted->lock_count < 240) {
+        return requested;
+    }
+
+    float lock_metric = ted->lock_accum / (float)ted->lock_count;
+    if (lock_metric < 0.05f) {
+        return requested;
+    }
+
+    return 0.018f;
 }
 
 /*
@@ -163,15 +275,606 @@ branchless_clip(float x, float limit) {
  *   return ((sample.real() > 0 ? 1.0 : -1.0) * sample.imag() -
  *           (sample.imag() > 0 ? 1.0 : -1.0) * sample.real());
  *
- * This expects symbols at axis-aligned positions (0°, 90°, 180°, 270°).
+ * This expects the OP25 differential QPSK constellation at diagonal positions.
  */
 static inline float
 phase_detector_4(float real, float imag) {
     return ((real > 0.0f ? 1.0f : -1.0f) * imag - (imag > 0.0f ? 1.0f : -1.0f) * real);
 }
 
+constexpr float kCqpskCostasDetectorTargetMag = 0.85f * 0.85f;
+constexpr float kCqpskCostasConfidenceFloorMag = 0.10f;
+constexpr float kCqpskCostasConfidenceFullMag = 0.35f;
+constexpr float kCqpskCostasConfidenceFloorMag2 = kCqpskCostasConfidenceFloorMag * kCqpskCostasConfidenceFloorMag;
+constexpr float kCqpskCostasConfidenceFullMag2 = kCqpskCostasConfidenceFullMag * kCqpskCostasConfidenceFullMag;
+constexpr float kCqpskCostasErrorSmoothAlpha = 0.25f;
+constexpr float kCqpskCostasErrorSmoothAlphaMin = 0.10f;
+constexpr float kCqpskCostasErrorKickDeltaLow = 0.02f;
+constexpr float kCqpskCostasErrorKickDeltaHigh = 0.18f;
+constexpr float kCqpskCostasErrorSmoothBootstrap = 1.0e-6f;
+
+static inline float
+smoothstep(float edge0, float edge1, float x) {
+    if (x <= edge0) {
+        return 0.0f;
+    }
+    if (x >= edge1) {
+        return 1.0f;
+    }
+    float t = (x - edge0) / (edge1 - edge0);
+    return t * t * (3.0f - 2.0f * t);
+}
+
+static inline float
+cqpsk_costas_confidence_from_mag(float mag) {
+    if (!std::isfinite(mag)) {
+        return 0.0f;
+    }
+    return smoothstep(kCqpskCostasConfidenceFloorMag, kCqpskCostasConfidenceFullMag, mag);
+}
+
+static inline float
+cqpsk_costas_error_smooth_alpha(float error_raw, float error_smooth) {
+    if (!std::isfinite(error_raw) || !std::isfinite(error_smooth)
+        || std::fabs(error_smooth) <= kCqpskCostasErrorSmoothBootstrap) {
+        return kCqpskCostasErrorSmoothAlpha;
+    }
+
+    /* Treat abrupt discriminator disagreement as a phase kick and lower the
+     * EMA gain; sustained error converges back through the smoothed state. */
+    float kick =
+        smoothstep(kCqpskCostasErrorKickDeltaLow, kCqpskCostasErrorKickDeltaHigh, std::fabs(error_raw - error_smooth));
+    return kCqpskCostasErrorSmoothAlpha + (kCqpskCostasErrorSmoothAlphaMin - kCqpskCostasErrorSmoothAlpha) * kick;
+}
+
+static inline float
+normalize_costas_detector_sample(float real, float imag, float* out_real, float* out_imag) {
+    float mag2 = real * real + imag * imag;
+    if (!std::isfinite(mag2)) {
+        *out_real = 0.0f;
+        *out_imag = 0.0f;
+        return 0.0f;
+    }
+
+    if (mag2 <= kCqpskCostasConfidenceFloorMag2) {
+        *out_real = real;
+        *out_imag = imag;
+        return 0.0f;
+    }
+
+    float mag = sqrtf(mag2);
+    float confidence = (mag2 >= kCqpskCostasConfidenceFullMag2) ? 1.0f : cqpsk_costas_confidence_from_mag(mag);
+
+    float scale = kCqpskCostasDetectorTargetMag / mag;
+    if (!std::isfinite(scale)) {
+        *out_real = 0.0f;
+        *out_imag = 0.0f;
+        return 0.0f;
+    }
+    *out_real = real * scale;
+    *out_imag = imag * scale;
+    return confidence;
+}
+
 /* NaN check helper */
 #define IS_NAN(x) ((x) != (x))
+
+static inline int
+clampi(int value, int min_value, int max_value) {
+    if (value < min_value) {
+        return min_value;
+    }
+    if (value > max_value) {
+        return max_value;
+    }
+    return value;
+}
+
+static inline float
+clampf_range(float value, float min_value, float max_value) {
+    if (value < min_value) {
+        return min_value;
+    }
+    if (value > max_value) {
+        return max_value;
+    }
+    return value;
+}
+
+static inline int
+q14_from_ratio(float ratio, int max_q14) {
+    const int scaled = (int)std::lrint(ratio * 16384.0f);
+    return clampi(scaled, 0, max_q14);
+}
+
+static inline int
+percent_from_count(int count, int total) {
+    if (total <= 0) {
+        return 0;
+    }
+    const int pct = (int)std::lrint((100.0 * (double)count) / (double)total);
+    return clampi(pct, 0, 100);
+}
+
+struct gardner_loop_context_t {
+    float* iq_in;
+    float* iq_out;
+    float* dl;
+    int buf_len;
+    int nc;
+    int i;
+    int o;
+    int dl_index;
+    int twice_sps;
+    float mu;
+    float omega;
+    float gain_mu;
+    float gain_omega;
+    float last_r;
+    float last_j;
+    float lock_accum;
+    int lock_count;
+};
+
+struct costas_metrics_acc_t {
+    float err_abs_acc;
+    float err_raw_abs_acc;
+    float confidence_acc;
+    int zero_conf_count;
+};
+
+struct costas_loop_context_t {
+    float phase;
+    float freq;
+    float alpha;
+    float beta;
+    float max_freq;
+    float min_freq;
+    float max_phase;
+    float min_phase;
+    float error_smooth;
+    float last_error;
+    costas_metrics_acc_t metrics;
+};
+
+struct fll_loop_context_t {
+    float phase;
+    float freq;
+    float alpha;
+    float beta;
+    float max_freq;
+    float min_freq;
+    int n_taps;
+    float* delay_r;
+    float* delay_i;
+    int delay_idx;
+};
+
+static inline int
+gardner_need_reinit(const ted_state_t* ted, int sps, int* is_first_init) {
+    const int first_init = (ted->omega_mid == 0.0f || ted->twice_sps < 2);
+    if (is_first_init) {
+        *is_first_init = first_init;
+    }
+    if (first_init) {
+        return 1;
+    }
+    return (ted->sps > 0 && ted->sps != sps) ? 1 : 0;
+}
+
+static inline int
+gardner_reinit_state(demod_state* d, ted_state_t* ted, int sps, int is_first_init, float* omega) {
+    if (debug_cqpsk_enabled()) {
+        DSD_FPRINTF(stderr, "[GARDNER] TED %s: sps=%d->%d old_omega=%.3f old_mu=%.3f (mu=%d for warmup)\n",
+                    is_first_init ? "init" : "sps_change", ted->sps, sps, ted->omega, ted->mu, sps);
+    }
+
+    ted->mu = (float)sps;
+    *omega = (float)sps;
+    ted->omega = *omega;
+    ted->omega_rel = 0.002f;
+    ted->omega_mid = *omega;
+    ted->omega_min = *omega * (1.0f - ted->omega_rel);
+    ted->omega_max = *omega * (1.0f + ted->omega_rel);
+
+    const int twice_sps_op25 = 2 * (int)ceilf(ted->omega_max);
+    const int twice_sps_mmse = (int)ceilf(ted->omega_max / 2.0f) + MMSE_NTAPS + 1;
+    const int twice_sps_required = (twice_sps_op25 > twice_sps_mmse) ? twice_sps_op25 : twice_sps_mmse;
+    if (twice_sps_required > TED_DL_SIZE) {
+        if (!g_warned_ted_dl_oversize) {
+            DSD_FPRINTF(stderr, "[GARDNER] disabled: required delay line %d exceeds TED_DL_SIZE=%d (sps=%d)\n",
+                        twice_sps_required, TED_DL_SIZE, sps);
+            g_warned_ted_dl_oversize = true;
+        }
+        d->lp_len = 0;
+        return 0;
+    }
+
+    ted->twice_sps = twice_sps_required;
+    ted->dl_index = 0;
+    ted->sps = sps;
+    ted->dl[0] = 0.0f;
+    ted->dl[1] = 0.0f;
+    return 1;
+}
+
+static inline void
+gardner_init_loop_context(demod_state* d, ted_state_t* ted, float gain_mu, float gain_omega,
+                          gardner_loop_context_t* ctx) {
+    ctx->iq_in = d->lowpassed;
+    ctx->iq_out = d->timing_buf;
+    ctx->dl = ted->dl;
+    ctx->buf_len = d->lp_len;
+    ctx->nc = d->lp_len >> 1;
+    ctx->i = 0;
+    ctx->o = 0;
+    ctx->dl_index = ted->dl_index;
+    ctx->twice_sps = ted->twice_sps;
+    ctx->mu = ted->mu;
+    ctx->omega = ted->omega;
+    ctx->gain_mu = gain_mu;
+    ctx->gain_omega = gain_omega;
+    ctx->last_r = ted->last_r;
+    ctx->last_j = ted->last_j;
+    ctx->lock_accum = ted->lock_accum;
+    ctx->lock_count = ted->lock_count;
+}
+
+static inline void
+gardner_commit_loop_context(demod_state* d, ted_state_t* ted, const gardner_loop_context_t* ctx) {
+    ted->mu = ctx->mu;
+    ted->omega = ctx->omega;
+    ted->dl_index = ctx->dl_index;
+    ted->last_r = ctx->last_r;
+    ted->last_j = ctx->last_j;
+    ted->lock_accum = ctx->lock_accum;
+    ted->lock_count = ctx->lock_count;
+
+    if (ctx->o >= 2) {
+        d->lowpassed = ctx->iq_out;
+        d->lp_len = ctx->o;
+    } else {
+        d->lp_len = 0;
+    }
+}
+
+static inline void
+gardner_push_delay_sample(gardner_loop_context_t* ctx, float in_r, float in_j) {
+    const size_t dl_i = (size_t)ctx->dl_index;
+    const size_t dl_i2 = (size_t)ctx->dl_index + (size_t)ctx->twice_sps;
+    ctx->dl[dl_i * 2] = in_r;
+    ctx->dl[dl_i * 2 + 1] = in_j;
+    ctx->dl[dl_i2 * 2] = in_r;
+    ctx->dl[dl_i2 * 2 + 1] = in_j;
+    ctx->dl_index++;
+    if (ctx->dl_index >= ctx->twice_sps) {
+        ctx->dl_index = 0;
+    }
+}
+
+static inline int
+gardner_consume_until_ready(gardner_loop_context_t* ctx) {
+    while (ctx->mu > 1.0f && ctx->i < ctx->nc) {
+        ctx->mu -= 1.0f;
+
+        const size_t ii = (size_t)ctx->i;
+        float in_r = ctx->iq_in[ii * 2];
+        float in_j = ctx->iq_in[ii * 2 + 1];
+        if (IS_NAN(in_r)) {
+            in_r = 0.0f;
+        }
+        if (IS_NAN(in_j)) {
+            in_j = 0.0f;
+        }
+
+        gardner_push_delay_sample(ctx, in_r, in_j);
+        ctx->i++;
+    }
+    return (ctx->i < ctx->nc) ? 1 : 0;
+}
+
+static inline void
+gardner_compute_half_timing(float mu, float omega, int* half_sps, float* half_mu) {
+    const float half_omega = omega / 2.0f;
+    int hsps = (int)floorf(half_omega);
+    float hmu = mu + half_omega - (float)hsps;
+    if (hmu > 1.0f) {
+        hmu -= 1.0f;
+        hsps += 1;
+    }
+    if (hsps < 0) {
+        hsps = 0;
+    }
+    *half_sps = hsps;
+    *half_mu = hmu;
+}
+
+static inline int
+gardner_interpolate_symbol(const gardner_loop_context_t* ctx, int half_sps, float half_mu, float* mid_r, float* mid_j,
+                           float* sym_r, float* sym_j) {
+    const int max_mid_idx = ctx->dl_index + MMSE_NTAPS - 1;
+    const int max_sym_idx = ctx->dl_index + half_sps + MMSE_NTAPS - 1;
+    if (max_mid_idx >= 2 * ctx->twice_sps || max_sym_idx >= 2 * ctx->twice_sps) {
+        return 0;
+    }
+
+    mmse_interp_cc(ctx->dl + (size_t)ctx->dl_index * 2, ctx->mu, mid_r, mid_j);
+    mmse_interp_cc(ctx->dl + (size_t)(ctx->dl_index + half_sps) * 2, half_mu, sym_r, sym_j);
+    return 1;
+}
+
+static inline float
+gardner_compute_symbol_error(float last_r, float last_j, float sym_r, float sym_j, float mid_r, float mid_j) {
+    const float error_real = (last_r - sym_r) * mid_r;
+    const float error_imag = (last_j - sym_j) * mid_j;
+    float symbol_error = error_real + error_imag;
+    if (IS_NAN(symbol_error)) {
+        symbol_error = 0.0f;
+    }
+    return clipf_limit(symbol_error, 1.0f);
+}
+
+static inline void
+gardner_update_lock_accum(gardner_loop_context_t* ctx, float sym_r, float sym_j, float mid_r, float mid_j) {
+    const float ie2 = sym_r * sym_r;
+    const float io2 = mid_r * mid_r;
+    const float qe2 = sym_j * sym_j;
+    const float qo2 = mid_j * mid_j;
+    const float yi = ((ie2 + io2) != 0.0f) ? (ie2 - io2) / (ie2 + io2) : 0.0f;
+    const float yq = ((qe2 + qo2) != 0.0f) ? (qe2 - qo2) / (qe2 + qo2) : 0.0f;
+    ctx->lock_accum += yi + yq;
+    ctx->lock_count++;
+}
+
+static inline void
+gardner_update_loop(gardner_loop_context_t* ctx, const ted_state_t* ted, float symbol_error, float sym_r, float sym_j) {
+    const float sym_mag = sqrtf(sym_r * sym_r + sym_j * sym_j);
+    ctx->omega += ctx->gain_omega * symbol_error * sym_mag;
+    ctx->omega = ted->omega_mid + clipf_limit(ctx->omega - ted->omega_mid, ted->omega_rel);
+    ctx->mu += ctx->omega + ctx->gain_mu * symbol_error;
+}
+
+static inline void
+costas_init_if_needed(dsd_costas_loop_state_t* c) {
+    if (c->initialized) {
+        return;
+    }
+    const float loop_bw = 0.008f;
+    const float damping = 0.70710678118654752440f;
+    const float denom = 1.0f + 2.0f * damping * loop_bw + loop_bw * loop_bw;
+    c->alpha = (4.0f * damping * loop_bw) / denom;
+    c->beta = (4.0f * loop_bw * loop_bw) / denom;
+    c->max_freq = 1.0f;
+    c->min_freq = -1.0f;
+    c->damping = damping;
+    c->loop_bw = loop_bw;
+    c->initialized = 1;
+}
+
+static inline void
+costas_prepare_loop_context(const dsd_costas_loop_state_t* c, costas_loop_context_t* ctx) {
+    ctx->max_phase = kPi / 2.0f;
+    ctx->min_phase = -ctx->max_phase;
+    ctx->phase = std::isfinite(c->phase) ? clampf_range(c->phase, ctx->min_phase, ctx->max_phase) : 0.0f;
+    ctx->freq = c->freq;
+    ctx->alpha = c->alpha;
+    ctx->beta = c->beta;
+    ctx->max_freq = c->max_freq;
+    ctx->min_freq = c->min_freq;
+    ctx->error_smooth = std::isfinite(c->error_smooth) ? c->error_smooth : 0.0f;
+    ctx->last_error = 0.0f;
+    ctx->metrics.err_abs_acc = 0.0f;
+    ctx->metrics.err_raw_abs_acc = 0.0f;
+    ctx->metrics.confidence_acc = 0.0f;
+    ctx->metrics.zero_conf_count = 0;
+}
+
+static inline void
+costas_process_symbol(costas_loop_context_t* ctx, float in_r, float in_j, float* out_r, float* out_j) {
+    float nco_r = 0.0f;
+    float nco_j = 0.0f;
+    dsd_sincosf_clamped_half_pi(-ctx->phase, &nco_j, &nco_r);
+
+    const float rot_r = in_r * nco_r - in_j * nco_j;
+    const float rot_j = in_r * nco_j + in_j * nco_r;
+
+    float det_r = 0.0f;
+    float det_j = 0.0f;
+    const float confidence = normalize_costas_detector_sample(rot_r, rot_j, &det_r, &det_j);
+
+    float error = 0.0f;
+    float error_raw = 0.0f;
+    if (confidence <= 0.0f || !std::isfinite(confidence)) {
+        ctx->error_smooth = 0.0f;
+        ctx->metrics.zero_conf_count++;
+    } else {
+        error_raw = clipf_limit(phase_detector_4(det_r, det_j) * confidence, 1.0f);
+        const float smooth_alpha = cqpsk_costas_error_smooth_alpha(error_raw, ctx->error_smooth);
+        ctx->error_smooth += smooth_alpha * (error_raw - ctx->error_smooth);
+        error = clipf_limit(ctx->error_smooth, 1.0f);
+        ctx->metrics.confidence_acc += confidence;
+    }
+
+    ctx->last_error = error;
+    ctx->metrics.err_abs_acc += fabsf(error);
+    ctx->metrics.err_raw_abs_acc += fabsf(error_raw);
+
+    ctx->freq += ctx->beta * error;
+    ctx->phase += ctx->freq + ctx->alpha * error;
+    ctx->phase = clampf_range(ctx->phase, ctx->min_phase, ctx->max_phase);
+    ctx->freq = clampf_range(ctx->freq, ctx->min_freq, ctx->max_freq);
+
+    *out_r = det_r;
+    *out_j = det_j;
+}
+
+static inline void
+costas_store_metrics(demod_state* d, const costas_metrics_acc_t* metrics, int pairs) {
+    if (pairs <= 0) {
+        d->costas_err_avg_q14 = 0;
+        d->costas_err_raw_avg_q14 = 0;
+        d->costas_conf_avg_q14 = 0;
+        d->costas_zero_conf_pct = 0;
+        return;
+    }
+
+    const float inv_pairs = 1.0f / (float)pairs;
+    d->costas_err_avg_q14 = q14_from_ratio(metrics->err_abs_acc * inv_pairs, 32767);
+    d->costas_err_raw_avg_q14 = q14_from_ratio(metrics->err_raw_abs_acc * inv_pairs, 32767);
+    d->costas_conf_avg_q14 = q14_from_ratio(metrics->confidence_acc * inv_pairs, 16384);
+    d->costas_zero_conf_pct = percent_from_count(metrics->zero_conf_count, pairs);
+}
+
+static inline void
+costas_commit_loop(dsd_costas_loop_state_t* c, const costas_loop_context_t* ctx) {
+    c->phase = ctx->phase;
+    c->freq = ctx->freq;
+    c->error = ctx->last_error;
+    c->error_smooth = ctx->error_smooth;
+}
+
+static inline int
+fll_need_reinit(const dsd_fll_band_edge_state_t* f, int sps, int* is_first_init) {
+    const int first_init = !f->initialized;
+    if (is_first_init) {
+        *is_first_init = first_init;
+    }
+    if (first_init) {
+        return 1;
+    }
+    return (f->sps > 0 && f->sps != sps) ? 1 : 0;
+}
+
+static inline void
+fll_configure_loop_params(dsd_fll_band_edge_state_t* f, int sps) {
+    const float loop_bw = kTwoPi / (float)sps / 350.0f;
+    const float damping = 0.70710678118654752440f;
+    const float denom = 1.0f + 2.0f * damping * loop_bw + loop_bw * loop_bw;
+    f->loop_bw = loop_bw;
+    f->alpha = (4.0f * damping * loop_bw) / denom;
+    f->beta = (4.0f * loop_bw * loop_bw) / denom;
+    f->max_freq = 1.0f;
+    f->min_freq = -1.0f;
+}
+
+static inline void
+fll_reinit_state(demod_state* d, dsd_fll_band_edge_state_t* f, int sps, int is_first_init) {
+    const float excess_bw = 0.2f;
+    const int filter_size = 2 * sps + 1;
+    fll_band_edge_design_filter(f, sps, excess_bw, filter_size);
+    fll_configure_loop_params(f, sps);
+
+    f->phase = 0.0f;
+    if (is_first_init) {
+        f->freq = 0.0f;
+    }
+    f->delay_idx = 0;
+    fll_band_edge_clear_delay(f);
+
+    if (debug_cqpsk_enabled()) {
+        const float sample_rate = (float)(d->rate_out > 0 ? d->rate_out : 24000);
+        const float freq_hz = f->freq * (sample_rate / kTwoPi);
+        if (is_first_init) {
+            DSD_FPRINTF(stderr, "[FLL] init: sps=%d filter_size=%d loop_bw=%.6f\n", sps, filter_size, f->loop_bw);
+        } else {
+            DSD_FPRINTF(stderr, "[FLL] sps_change: sps=%d filter_size=%d freq=%.1fHz (preserved)\n", sps, filter_size,
+                        freq_hz);
+        }
+    }
+}
+
+static inline void
+fll_prepare_loop_context(dsd_fll_band_edge_state_t* f, fll_loop_context_t* ctx) {
+    ctx->phase = f->phase;
+    ctx->freq = f->freq;
+    ctx->alpha = f->alpha;
+    ctx->beta = f->beta;
+    ctx->max_freq = f->max_freq;
+    ctx->min_freq = f->min_freq;
+    ctx->n_taps = f->n_taps;
+    ctx->delay_r = f->delay_r;
+    ctx->delay_i = f->delay_i;
+    ctx->delay_idx = f->delay_idx;
+}
+
+static inline void
+fll_convolve_band_edges(const dsd_fll_band_edge_state_t* f, const fll_loop_context_t* ctx, float* lower_r,
+                        float* lower_i, float* upper_r, float* upper_i) {
+    *lower_r = 0.0f;
+    *lower_i = 0.0f;
+    *upper_r = 0.0f;
+    *upper_i = 0.0f;
+
+    const int delay_base = ctx->delay_idx + ctx->n_taps;
+    for (int k = 0; k < ctx->n_taps; k++) {
+        const int idx = delay_base - k;
+        const float dr = ctx->delay_r[idx];
+        const float di = ctx->delay_i[idx];
+
+        *lower_r += dr * f->taps_lower_r[k] - di * f->taps_lower_i[k];
+        *lower_i += dr * f->taps_lower_i[k] + di * f->taps_lower_r[k];
+        *upper_r += dr * f->taps_upper_r[k] - di * f->taps_upper_i[k];
+        *upper_i += dr * f->taps_upper_i[k] + di * f->taps_upper_r[k];
+    }
+}
+
+static inline float
+fll_compute_error(float lower_r, float lower_i, float upper_r, float upper_i) {
+    const float lower_mag2 = lower_r * lower_r + lower_i * lower_i;
+    const float upper_mag2 = upper_r * upper_r + upper_i * upper_i;
+    return clipf_limit(upper_mag2 - lower_mag2, 1.0f);
+}
+
+static inline void
+fll_advance_loop(fll_loop_context_t* ctx, float error) {
+    ctx->freq += ctx->beta * error;
+    ctx->freq = clampf_range(ctx->freq, ctx->min_freq, ctx->max_freq);
+
+    ctx->phase += ctx->freq + ctx->alpha * error;
+    while (ctx->phase > kTwoPi) {
+        ctx->phase -= kTwoPi;
+    }
+    while (ctx->phase < -kTwoPi) {
+        ctx->phase += kTwoPi;
+    }
+}
+
+static inline void
+fll_process_sample(const dsd_fll_band_edge_state_t* f, fll_loop_context_t* ctx, float in_r, float in_i, float* out_r,
+                   float* out_i) {
+    float nco_r = 0.0f;
+    float nco_i = 0.0f;
+    dsd_sincosf_wrapped_two_pi(ctx->phase, &nco_i, &nco_r);
+
+    *out_r = in_r * nco_r - in_i * nco_i;
+    *out_i = in_r * nco_i + in_i * nco_r;
+
+    ctx->delay_r[ctx->delay_idx] = *out_r;
+    ctx->delay_i[ctx->delay_idx] = *out_i;
+    ctx->delay_r[ctx->delay_idx + ctx->n_taps] = *out_r;
+    ctx->delay_i[ctx->delay_idx + ctx->n_taps] = *out_i;
+
+    float lower_r = 0.0f;
+    float lower_i = 0.0f;
+    float upper_r = 0.0f;
+    float upper_i = 0.0f;
+    fll_convolve_band_edges(f, ctx, &lower_r, &lower_i, &upper_r, &upper_i);
+
+    ctx->delay_idx++;
+    if (ctx->delay_idx == ctx->n_taps) {
+        ctx->delay_idx = 0;
+    }
+
+    const float error = fll_compute_error(lower_r, lower_i, upper_r, upper_i);
+    fll_advance_loop(ctx, error);
+}
+
+static inline void
+fll_commit_loop(dsd_fll_band_edge_state_t* f, const fll_loop_context_t* ctx) {
+    f->phase = ctx->phase;
+    f->freq = ctx->freq;
+    f->delay_idx = ctx->delay_idx;
+}
 
 } // namespace
 
@@ -194,6 +897,7 @@ dsd_costas_reset(dsd_costas_loop_state_t* c) {
     c->phase = 0.0f;
     c->freq = 0.0f;
     c->error = 0.0f;
+    c->error_smooth = 0.0f;
     c->initialized = 0;
 }
 
@@ -223,296 +927,69 @@ dsd_costas_reset(dsd_costas_loop_state_t* c) {
  */
 extern "C" void
 op25_gardner_cc(struct demod_state* d) {
-    if (!d || !d->lowpassed || d->lp_len < 2) {
-        return;
-    }
-    if (!d->cqpsk_enable) {
+    if (!d || !d->lowpassed || d->lp_len < 2 || !d->cqpsk_enable) {
         return;
     }
 
     ted_state_t* ted = &d->ted_state;
-
-    const int buf_len = d->lp_len;
-    const int nc = buf_len >> 1; /* input complex samples */
-    if (nc < 4) {
+    if ((d->lp_len >> 1) < 4) {
         return;
     }
 
-    /* Get TED parameters */
     const int sps = d->ted_sps > 0 ? d->ted_sps : 5;
     float omega = ted->omega;
-
-    /*
-     * Reinitialize TED state when SPS changes (e.g., P25P1 CC 5 sps -> P25P2 VC 4 sps).
-     *
-     * This mirrors OP25's set_omega() behavior.
-     */
-    int need_reinit = (ted->omega_mid == 0.0f || ted->twice_sps < 2);
-    if (!need_reinit && ted->sps > 0 && ted->sps != sps) {
-        need_reinit = 1;
+    int is_first_init = 0;
+    if (gardner_need_reinit(ted, sps, &is_first_init) && !gardner_reinit_state(d, ted, sps, is_first_init, &omega)) {
+        return;
     }
 
-    int is_first_init = (ted->omega_mid == 0.0f || ted->twice_sps < 2);
+    const float gain_mu = op25_gardner_gain_mu_for_state(d, ted);
+    d->ted_effective_gain = gain_mu;
+    const float gain_omega = 0.1f * gain_mu * gain_mu;
 
-    if (need_reinit) {
-        /* Debug: log TED SPS change when DSD_NEO_DEBUG_CQPSK=1 */
-        if (debug_cqpsk_enabled()) {
-            fprintf(stderr, "[GARDNER] TED %s: sps=%d->%d old_omega=%.3f old_mu=%.3f (mu=%d for warmup)\n",
-                    is_first_init ? "init" : "sps_change", ted->sps, sps, ted->omega, ted->mu, sps);
-        }
+    gardner_loop_context_t ctx;
+    gardner_init_loop_context(d, ted, gain_mu, gain_omega, &ctx);
+    ctx.omega = omega;
 
-        /* Reset mu on any reinitialization (first init OR SPS change).
-         *
-         * OP25's set_omega() preserves d_mu because OP25 uses freq_xlat for
-         * channel selection within a fixed wideband capture - the timing phase
-         * relationship is maintained across channels since the samples are
-         * continuous.
-         *
-         * dsd-neo uses hardware retuning (RTL-SDR center frequency changes),
-         * which means we're receiving completely new samples from a different
-         * RF frequency. Preserving mu across retunes is incorrect because:
-         *
-         * 1. The old timing phase has no relationship to the new signal
-         * 2. When switching from 5 SPS (omega=5) to 4 SPS (omega=4), a preserved
-         *    mu=3.992 puts sampling at 99.8% through the symbol (edge) instead
-         *    of near the center, causing poor constellation quality
-         *
-         * Initialize mu to sps (not 0) so the TED consumes fresh samples before
-         * outputting the first symbol. OP25 relies on GNU Radio's set_history()
-         * to pre-fill the delay line, but dsd-neo doesn't have that mechanism.
-         * With mu=0, the inner loop "while (mu > 1.0)" doesn't run, causing
-         * the first symbol to be interpolated from stale/zeroed delay line data.
-         * With mu=sps, the TED first fills the delay line with ~sps fresh samples
-         * before computing and outputting the first valid symbol. */
-        ted->mu = (float)sps;
-
-        omega = (float)sps;
-        ted->omega = omega;
-
-        /* OP25 uses d_omega_rel = 0.002 (±0.2%) - from gardner_cc_impl.cc line 73.
-         * Store omega_rel in state for use in clipping formula. */
-        ted->omega_rel = 0.002f;
-        ted->omega_mid = omega;
-        ted->omega_min = omega * (1.0f - ted->omega_rel);
-        ted->omega_max = omega * (1.0f + ted->omega_rel);
-
-        int twice_sps_op25 = 2 * (int)ceilf(ted->omega_max);
-        int twice_sps_mmse = (int)ceilf(ted->omega_max / 2.0f) + MMSE_NTAPS + 1;
-        int twice_sps_required = (twice_sps_op25 > twice_sps_mmse) ? twice_sps_op25 : twice_sps_mmse;
-
-        if (twice_sps_required > TED_DL_SIZE) {
-            d->lp_len = 0;
-            return;
-        }
-        ted->twice_sps = twice_sps_required;
-        ted->dl_index = 0;
-        ted->sps = sps;
-
-        /* OP25's set_omega() only clears the FIRST element of the delay line:
-         *   *d_dl = gr_complex(0,0);  // NOT memset for entire buffer!
-         *
-         * This preserves existing samples in the delay line, allowing immediate
-         * symbol output without warmup delay. The old samples may be from a
-         * different channel, but they provide valid timing phase continuity.
-         *
-         * Clearing the entire buffer forces the TED to wait for the delay line
-         * to fill before producing valid symbols, wasting the first ~sps samples
-         * after each channel change. */
-        ted->dl[0] = 0.0f;
-        ted->dl[1] = 0.0f;
-
-        /* OP25's set_omega() does NOT reset last_sample or lock accumulator.
-         * Preserve these for phase continuity across SPS changes. */
-    }
-
-    /* OP25 gains: gain_mu=0.025, gain_omega=0.1*gain_mu^2
-     * From p25_demodulator_dev.py lines 58, 398 */
-    float gain_mu = d->ted_gain > 0.0f ? d->ted_gain : 0.025f;
-    float gain_omega = 0.1f * gain_mu * gain_mu;
-
-    float* iq_in = d->lowpassed;
-    float* iq_out = d->timing_buf;
-
-    float mu = ted->mu;
-    int dl_index = ted->dl_index;
-    int twice_sps = ted->twice_sps;
-    float* dl = ted->dl;
-
-    /* Last sample for Gardner (OP25: d_last_sample) */
-    float last_r = ted->last_r;
-    float last_j = ted->last_j;
-
-    /* Lock detector accumulator */
-    float lock_accum = ted->lock_accum;
-    int lock_count = ted->lock_count;
-
-    int i = 0; /* input index */
-    int o = 0; /* output index (interleaved floats) */
-
-    /*
-     * Main loop: OP25's gardner_cc_impl::general_work() structure
-     */
-    while (o < buf_len && i < nc) {
-        /*
-         * Inner loop: consume samples while mu > 1.0, filling delay line
-         * OP25 lines 145-152: push to delay line, no rotation
-         */
-        while (mu > 1.0f && i < nc) {
-            mu -= 1.0f;
-
-            /* Get input sample - NO NCO rotation */
-            const size_t ii = (size_t)i;
-            float in_r = iq_in[ii * 2];
-            float in_j = iq_in[ii * 2 + 1];
-
-            /* NaN check (matches OP25) */
-            if (IS_NAN(in_r)) {
-                in_r = 0.0f;
-            }
-            if (IS_NAN(in_j)) {
-                in_j = 0.0f;
-            }
-
-            /* Push to delay line at both dl_index and dl_index + twice_sps
-             * This is OP25's circular buffer trick for wrap-free interpolation */
-            const size_t dl_i = (size_t)dl_index;
-            const size_t dl_i2 = (size_t)dl_index + (size_t)twice_sps;
-            dl[dl_i * 2] = in_r;
-            dl[dl_i * 2 + 1] = in_j;
-            dl[dl_i2 * 2] = in_r;
-            dl[dl_i2 * 2 + 1] = in_j;
-
-            dl_index++;
-            if (dl_index >= twice_sps) {
-                dl_index = 0;
-            }
-
-            i++;
-        }
-
-        if (i >= nc) {
+    while (ctx.o < ctx.buf_len && ctx.i < ctx.nc) {
+        if (!gardner_consume_until_ready(&ctx)) {
             break;
         }
 
-        /*
-         * Symbol output: OP25 lines 154-194
-         * Interpolate, compute Gardner error, output
-         */
+        int half_sps = 0;
+        float half_mu = 0.0f;
+        gardner_compute_half_timing(ctx.mu, ctx.omega, &half_sps, &half_mu);
 
-        /* Compute half-omega parameters (OP25 style) */
-        float half_omega = omega / 2.0f;
-        int half_sps = (int)floorf(half_omega);
-        float half_mu = mu + half_omega - (float)half_sps;
-        if (half_mu > 1.0f) {
-            half_mu -= 1.0f;
-            half_sps += 1;
-        }
-        if (half_sps < 0) {
-            half_sps = 0;
-        }
-
-        /* Bounds check for MMSE reads */
-        int max_mid_idx = dl_index + MMSE_NTAPS - 1;
-        int max_sym_idx = dl_index + half_sps + MMSE_NTAPS - 1;
-        if (max_mid_idx >= 2 * twice_sps || max_sym_idx >= 2 * twice_sps) {
-            mu += omega;
+        float mid_r = 0.0f;
+        float mid_j = 0.0f;
+        float sym_r = 0.0f;
+        float sym_j = 0.0f;
+        if (!gardner_interpolate_symbol(&ctx, half_sps, half_mu, &mid_r, &mid_j, &sym_r, &sym_j)) {
+            ctx.mu += ctx.omega;
             continue;
         }
 
-        /* OP25: interp_samp_mid at dl_index (mid-symbol point) */
-        float mid_r, mid_j;
-        mmse_interp_cc(dl + (size_t)dl_index * 2, mu, &mid_r, &mid_j);
-
-        /* OP25: interp_samp at dl_index + half_sps (symbol point) */
-        float sym_r, sym_j;
-        mmse_interp_cc(dl + (size_t)(dl_index + half_sps) * 2, half_mu, &sym_r, &sym_j);
-
-        /* OP25 Gardner error: (last - current) * mid
-         * From gardner_cc_impl.cc lines 169-172 */
-        float error_real = (last_r - sym_r) * mid_r;
-        float error_imag = (last_j - sym_j) * mid_j;
-        float symbol_error = error_real + error_imag;
-
-        if (IS_NAN(symbol_error)) {
-            symbol_error = 0.0f;
-        }
-        if (symbol_error < -1.0f) {
-            symbol_error = -1.0f;
-        }
-        if (symbol_error > 1.0f) {
-            symbol_error = 1.0f;
-        }
-
-        /*
-         * OP25 Lock detector (Yair Linn method)
-         * From gardner_cc_impl.cc lines 177-185
-         *
-         * IEEE Transactions on Wireless Communications Vol 5, No 2, Feb 2006
-         */
-        float ie2 = sym_r * sym_r;
-        float io2 = mid_r * mid_r;
-        float qe2 = sym_j * sym_j;
-        float qo2 = mid_j * mid_j;
-        float yi = ((ie2 + io2) != 0.0f) ? (ie2 - io2) / (ie2 + io2) : 0.0f;
-        float yq = ((qe2 + qo2) != 0.0f) ? (qe2 - qo2) / (qe2 + qo2) : 0.0f;
-        lock_accum += yi + yq;
-        lock_count++;
-
-        /* OP25 omega update: d_omega += d_gain_omega * symbol_error * abs(interp_samp)
-         * From gardner_cc_impl.cc line 187 */
-        float sym_mag = sqrtf(sym_r * sym_r + sym_j * sym_j);
-        omega = omega + gain_omega * symbol_error * sym_mag;
-
-        /* Clip omega to valid range using branchless_clip
-         * From gardner_cc_impl.cc line 188:
-         *   d_omega = d_omega_mid + gr::branchless_clip(d_omega-d_omega_mid, d_omega_rel);
-         * OP25 passes d_omega_rel directly, but the intended range is [omega_min, omega_max]
-         * which equals omega_mid ± (omega_mid * omega_rel). We must scale by omega_mid
-         * to get the correct ±0.2% tolerance (e.g., ±0.01 samples at 5 sps). */
-        omega = ted->omega_mid + branchless_clip(omega - ted->omega_mid, ted->omega_mid * ted->omega_rel);
-
-        /* Save current symbol as last for next iteration */
-        last_r = sym_r;
-        last_j = sym_j;
-
-        /* OP25 mu update: d_mu += d_omega + d_gain_mu * symbol_error
-         * From gardner_cc_impl.cc line 190 */
-        mu += omega + gain_mu * symbol_error;
-
-        /* Output interpolated sample - NO carrier correction, just timing */
-        iq_out[o++] = sym_r;
-        iq_out[o++] = sym_j;
+        const float symbol_error = gardner_compute_symbol_error(ctx.last_r, ctx.last_j, sym_r, sym_j, mid_r, mid_j);
+        gardner_update_lock_accum(&ctx, sym_r, sym_j, mid_r, mid_j);
+        gardner_update_loop(&ctx, ted, symbol_error, sym_r, sym_j);
+        ctx.last_r = sym_r;
+        ctx.last_j = sym_j;
+        ctx.iq_out[ctx.o++] = sym_r;
+        ctx.iq_out[ctx.o++] = sym_j;
     }
 
-    /* Save state */
-    ted->mu = mu;
-    ted->omega = omega;
-    ted->dl_index = dl_index;
-    ted->last_r = last_r;
-    ted->last_j = last_j;
-    ted->lock_accum = lock_accum;
-    ted->lock_count = lock_count;
-
-    /* Copy output back to lowpassed buffer and update length */
-    if (o >= 2) {
-        for (int j = 0; j < o; j++) {
-            d->lowpassed[j] = iq_out[j];
-        }
-        d->lp_len = o;
-    } else {
-        d->lp_len = 0;
-    }
+    gardner_commit_loop_context(d, ted, &ctx);
 }
 
 /*
- * External differential phasor (matches GNU Radio digital.diff_phasor_cc).
+ * External differential phasor.
  *
  * y[n] = x[n] * conj(x[n-1])
  *
  * From OP25's p25_demodulator_dev.py line 408:
  *   self.diffdec = digital.diff_phasor_cc()
  *
- * This is applied AFTER Gardner timing recovery, producing differential
+ * This is applied AFTER Gardner timing recovery, producing raw differential
  * phase symbols for the Costas loop.
  */
 extern "C" void
@@ -554,7 +1031,10 @@ op25_diff_phasor_cc(struct demod_state* d) {
  *   op25/gr-op25_repeater/lib/costas_loop_cc_impl.cc
  *
  * This operates on DIFFERENTIALLY DECODED symbols (after diff_phasor_cc).
- * The phase detector expects symbols at axis-aligned positions.
+ * The phase detector expects OP25 differential QPSK symbols at diagonal
+ * positions. dsd-neo normalizes reliable phasor magnitudes before detection,
+ * weights loop updates by raw phasor magnitude, and smooths discriminator
+ * error so noisy simulcast symbols do not kick the loop as hard.
  *
  * Signal flow:
  *   Input: Symbol-rate differential phasors from diff_phasor_cc
@@ -577,118 +1057,32 @@ op25_diff_phasor_cc(struct demod_state* d) {
  */
 extern "C" void
 op25_costas_loop_cc(struct demod_state* d) {
-    if (!d || !d->lowpassed || d->lp_len < 2) {
-        return;
-    }
-    if (!d->cqpsk_enable) {
+    if (!d || !d->lowpassed || d->lp_len < 2 || !d->cqpsk_enable) {
         return;
     }
 
     dsd_costas_loop_state_t* c = &d->costas_state;
-
-    /* Initialize Costas loop parameters if not already set.
-     *
-     * OP25 parameters from p25_demodulator_dev.py:
-     *   costas_alpha = 0.008 (this is loop_bw, NOT alpha!)
-     *   costas = op25_repeater.costas_loop_cc(costas_alpha, 4, TWO_PI/4)
-     *
-     * The third argument (TWO_PI/4 = π/2) is max_phase.
-     *
-     * In costas_loop_cc_impl constructor:
-     *   set_loop_bandwidth(loop_bw) calls update_gains():
-     *     denom = 1.0 + 2.0*damping*loop_bw + loop_bw^2
-     *     alpha = (4*damping*loop_bw) / denom
-     *     beta = (4*loop_bw^2) / denom
-     *
-     * With loop_bw=0.008, damping=sqrt(2)/2=0.7071:
-     *   denom = 1.0 + 2.0*0.7071*0.008 + 0.008^2 = 1.01137
-     *   alpha = (4*0.7071*0.008) / 1.01137 = 0.0223
-     *   beta = (4*0.008^2) / 1.01137 = 0.000253
-     */
-    if (!c->initialized) {
-        float loop_bw = 0.008f;
-        float damping = 0.70710678118654752440f; /* sqrt(2)/2 */
-        float denom = 1.0f + 2.0f * damping * loop_bw + loop_bw * loop_bw;
-        c->alpha = (4.0f * damping * loop_bw) / denom;
-        c->beta = (4.0f * loop_bw * loop_bw) / denom;
-        c->max_freq = 1.0f; /* OP25 default */
-        c->min_freq = -1.0f;
-        c->damping = damping;
-        c->loop_bw = loop_bw;
-        /* Phase/freq already reset by dsd_costas_reset or zero-init */
-        c->initialized = 1;
-    }
+    costas_init_if_needed(c);
 
     const int pairs = d->lp_len >> 1;
     float* iq = d->lowpassed;
 
-    float phase = c->phase;
-    float freq = c->freq;
-    const float alpha = c->alpha;
-    const float beta = c->beta;
-    const float max_freq = c->max_freq;
-    const float min_freq = c->min_freq;
-
-    /* OP25 max_phase = TWO_PI/4 = π/2 */
-    const float max_phase = kPi / 2.0f;
-    const float min_phase = -max_phase;
+    costas_loop_context_t ctx;
+    costas_prepare_loop_context(c, &ctx);
 
     for (int n = 0; n < pairs; n++) {
         const size_t nn = (size_t)n;
-        float in_r = iq[nn * 2];
-        float in_j = iq[nn * 2 + 1];
-
-        /* OP25: nco_out = gr_expj(-d_phase)
-         * From costas_loop_cc_impl.cc line 146 */
-        float nco_r = cosf(-phase);
-        float nco_j = sinf(-phase);
-
-        /* OP25: optr[i] = iptr[i] * nco_out
-         * Complex multiply: out = in * nco */
-        float out_r = in_r * nco_r - in_j * nco_j;
-        float out_j = in_r * nco_j + in_j * nco_r;
-
-        /* OP25 phase error detector for QPSK (order=4)
-         * From costas_loop_cc_impl.cc line 150:
-         *   d_error = (*this.*d_phase_detector)(optr[i]);
-         *
-         * Note: OP25 does NOT apply PT_45 rotation here (line 149 is commented out).
-         * The phase detector expects axis-aligned symbols. */
-        float error = phase_detector_4(out_r, out_j);
-        error = branchless_clip(error, 1.0f);
-
-        /* OP25 advance_loop (PI controller)
-         * From costas_loop_cc_impl.cc lines 169-173:
-         *   d_freq = d_freq + d_beta * error
-         *   d_phase = d_phase + d_freq + d_alpha * error */
-        freq = freq + beta * error;
-        phase = phase + freq + alpha * error;
-
-        /* OP25 phase_limit (clamp to ±max_phase, NOT wrap)
-         * From costas_loop_cc_impl.cc lines 183-188 */
-        if (phase > max_phase) {
-            phase = max_phase;
-        } else if (phase < min_phase) {
-            phase = min_phase;
-        }
-
-        /* OP25 frequency_limit
-         * From costas_loop_cc_impl.cc lines 191-196 */
-        if (freq > max_freq) {
-            freq = max_freq;
-        } else if (freq < min_freq) {
-            freq = min_freq;
-        }
-
-        /* Write carrier-corrected output */
+        const float in_r = iq[nn * 2];
+        const float in_j = iq[nn * 2 + 1];
+        float out_r = 0.0f;
+        float out_j = 0.0f;
+        costas_process_symbol(&ctx, in_r, in_j, &out_r, &out_j);
         iq[nn * 2] = out_r;
         iq[nn * 2 + 1] = out_j;
     }
 
-    /* Save state */
-    c->phase = phase;
-    c->freq = freq;
-    c->error = 0.0f; /* Last error not particularly useful at symbol rate */
+    costas_commit_loop(c, &ctx);
+    costas_store_metrics(d, &ctx.metrics, pairs);
 }
 
 /*
@@ -701,11 +1095,7 @@ dsd_fll_band_edge_reset(dsd_fll_band_edge_state_t* f) {
     }
     f->phase = 0.0f;
     f->freq = 0.0f;
-    /* Clear delay line */
-    for (int i = 0; i < FLL_BAND_EDGE_MAX_TAPS; i++) {
-        f->delay_r[i] = 0.0f;
-        f->delay_i[i] = 0.0f;
-    }
+    fll_band_edge_clear_delay(f);
     f->delay_idx = 0;
     /* Don't clear initialized or taps - they can be reused */
 }
@@ -843,11 +1233,11 @@ dsd_fll_band_edge_init(dsd_fll_band_edge_state_t* f, int sps) {
     /* Debug: log FLL init when DSD_NEO_DEBUG_CQPSK=1 */
     if (debug_cqpsk_enabled()) {
         if (is_first_init) {
-            fprintf(stderr, "[FLL-INIT] first init sps=%d\n", sps);
+            DSD_FPRINTF(stderr, "[FLL-INIT] first init sps=%d\n", sps);
         } else if (is_sps_change) {
-            fprintf(stderr, "[FLL-INIT] sps change %d->%d (freq preserved)\n", f->sps, sps);
+            DSD_FPRINTF(stderr, "[FLL-INIT] sps change %d->%d (freq preserved)\n", f->sps, sps);
         } else {
-            fprintf(stderr, "[FLL-INIT] retune reset sps=%d (freq preserved)\n", sps);
+            DSD_FPRINTF(stderr, "[FLL-INIT] retune reset sps=%d (freq preserved)\n", sps);
         }
     }
 
@@ -911,10 +1301,7 @@ dsd_fll_band_edge_init(dsd_fll_band_edge_state_t* f, int sps) {
     f->phase = 0.0f;
     /* f->freq preserved - LO offset is similar across nearby frequencies */
     f->delay_idx = 0;
-    for (int i = 0; i < FLL_BAND_EDGE_MAX_TAPS; i++) {
-        f->delay_r[i] = 0.0f;
-        f->delay_i[i] = 0.0f;
-    }
+    fll_band_edge_clear_delay(f);
 }
 
 /*
@@ -928,226 +1315,51 @@ dsd_fll_band_edge_init(dsd_fll_band_edge_state_t* f, int sps) {
  */
 extern "C" void
 op25_fll_band_edge_cc(struct demod_state* d) {
-    if (!d || !d->lowpassed || d->lp_len < 2) {
-        return;
-    }
-    if (!d->cqpsk_enable) {
+    if (!d || !d->lowpassed || d->lp_len < 2 || !d->cqpsk_enable) {
         return;
     }
 
     dsd_fll_band_edge_state_t* f = &d->fll_band_edge_state;
+    const int sps = d->ted_sps > 0 ? d->ted_sps : 5;
 
-    /* Get SPS from TED state or default */
-    int sps = d->ted_sps > 0 ? d->ted_sps : 5;
-
-    /* Redesign filters when SPS changes, matching GNU Radio's set_samples_per_symbol().
-     *
-     * GNU Radio's set_samples_per_symbol():
-     * 1. Redesigns the band-edge filters for the new SPS
-     * 2. Preserves the frequency estimate (d_freq is NOT touched)
-     *
-     * This is critical because:
-     * - Band-edge frequencies are SPS-dependent: ±(1+rolloff)/(2*sps)
-     *   5 sps -> band-edges at ±0.12 normalized
-     *   4 sps -> band-edges at ±0.15 normalized
-     * - Using wrong-SPS filters causes garbage band-edge energy estimates
-     * - The LO offset (tracked by freq) is independent of symbol rate
-     *
-     * OP25 behavior note: OP25 production (gnuradio <= 3.10.9.2) has this
-     * commented out due to thread-safety issues, but OP25 dev calls it when
-     * _fll_threadsafe is True. We don't have threading constraints. */
-    int is_first_init = !f->initialized;
-    int is_sps_change = f->initialized && f->sps != sps && f->sps > 0;
-    int need_reinit = is_first_init || is_sps_change;
-
-    if (need_reinit) {
-        /* OP25 parameters from p25_demodulator_dev.py line 403:
-         *   self.fll = digital.fll_band_edge_cc(sps, excess_bw, 2*sps+1, TWO_PI/sps/350)
-         */
-        float excess_bw = 0.2f;
-        int filter_size = 2 * sps + 1;
-        float loop_bw = kTwoPi / (float)sps / 350.0f;
-
-        /* Design the band-edge filters (sets f->initialized = 1) */
-        fll_band_edge_design_filter(f, sps, excess_bw, filter_size);
-
-        /* Set loop parameters using GNU Radio's control_loop update_gains() formula */
-        f->loop_bw = loop_bw;
-        float damping = 0.70710678118654752440f; /* sqrt(2)/2 - critically damped */
-        float denom = 1.0f + 2.0f * damping * loop_bw + loop_bw * loop_bw;
-        f->alpha = (4.0f * damping * loop_bw) / denom;
-        f->beta = (4.0f * loop_bw * loop_bw) / denom;
-        f->max_freq = 1.0f; /* rad/sample limit */
-        f->min_freq = -1.0f;
-
-        if (is_first_init) {
-            /* First init: zero all state */
-            f->phase = 0.0f;
-            f->freq = 0.0f;
-            f->delay_idx = 0;
-            for (int i = 0; i < FLL_BAND_EDGE_MAX_TAPS; i++) {
-                f->delay_r[i] = 0.0f;
-                f->delay_i[i] = 0.0f;
-            }
-        } else {
-            /* SPS change: preserve freq (LO offset), clear delay line (filter changed) */
-            f->phase = 0.0f;
-            /* f->freq preserved - LO offset is independent of symbol rate */
-            f->delay_idx = 0;
-            for (int i = 0; i < FLL_BAND_EDGE_MAX_TAPS; i++) {
-                f->delay_r[i] = 0.0f;
-                f->delay_i[i] = 0.0f;
-            }
-        }
-
-        /* Debug: log FLL init/reinit when DSD_NEO_DEBUG_CQPSK=1 */
-        if (debug_cqpsk_enabled()) {
-            float freq_hz = f->freq * ((float)(d->rate_out > 0 ? d->rate_out : 24000) / kTwoPi);
-            if (is_first_init) {
-                fprintf(stderr, "[FLL] init: sps=%d filter_size=%d loop_bw=%.6f\n", sps, filter_size, loop_bw);
-            } else {
-                fprintf(stderr, "[FLL] sps_change: sps=%d filter_size=%d freq=%.1fHz (preserved)\n", sps, filter_size,
-                        freq_hz);
-            }
-        }
+    int is_first_init = 0;
+    if (fll_need_reinit(f, sps, &is_first_init)) {
+        fll_reinit_state(d, f, sps, is_first_init);
     }
 
     const int pairs = d->lp_len >> 1;
     float* iq = d->lowpassed;
 
-    float phase = f->phase;
-    float freq = f->freq;
-    const float alpha = f->alpha;
-    const float beta = f->beta;
-    const float max_freq = f->max_freq;
-    const float min_freq = f->min_freq;
-    const int n_taps = f->n_taps;
-
-    float* delay_r = f->delay_r;
-    float* delay_i = f->delay_i;
-    int delay_idx = f->delay_idx;
+    fll_loop_context_t ctx;
+    fll_prepare_loop_context(f, &ctx);
 
     for (int n = 0; n < pairs; n++) {
         const size_t nn = (size_t)n;
-        float in_r = iq[nn * 2];
-        float in_i = iq[nn * 2 + 1];
-
-        /* NCO rotation: out = in * exp(+j*phase)
-         * From GNU Radio fll_band_edge_cc_impl.cc:
-         *   nco_out = gr_expj(d_phase)  // Note: POSITIVE phase!
-         *   out[i] = in[i] * nco_out
-         */
-        float nco_r = cosf(phase);
-        float nco_i = sinf(phase);
-        float out_r = in_r * nco_r - in_i * nco_i;
-        float out_i = in_r * nco_i + in_i * nco_r;
-
-        /* Update delay line */
-        delay_r[delay_idx] = out_r;
-        delay_i[delay_idx] = out_i;
-
-        /* Compute band-edge filter outputs */
-        float lower_r = 0.0f, lower_i = 0.0f;
-        float upper_r = 0.0f, upper_i = 0.0f;
-
-        for (int k = 0; k < n_taps; k++) {
-            int idx = (delay_idx - k + n_taps) % n_taps;
-            float dr = delay_r[idx];
-            float di = delay_i[idx];
-
-            /* Lower band-edge filter: complex multiply */
-            lower_r += dr * f->taps_lower_r[k] - di * f->taps_lower_i[k];
-            lower_i += dr * f->taps_lower_i[k] + di * f->taps_lower_r[k];
-
-            /* Upper band-edge filter: complex multiply */
-            upper_r += dr * f->taps_upper_r[k] - di * f->taps_upper_i[k];
-            upper_i += dr * f->taps_upper_i[k] + di * f->taps_upper_r[k];
-        }
-
-        /* Advance delay line index */
-        delay_idx = (delay_idx + 1) % n_taps;
-
-        /* Compute frequency error: |upper|^2 - |lower|^2
-         *
-         * From GNU Radio fll_band_edge_cc_impl.cc:
-         *   out_upper = d_filter_lower->filter(out[i]);  // Note: SWAPPED!
-         *   out_lower = d_filter_upper->filter(out[i]);  // Note: SWAPPED!
-         *   error = norm(out_lower) - norm(out_upper);
-         *
-         * GNU Radio swaps the filter outputs - d_filter_lower produces out_upper
-         * and d_filter_upper produces out_lower. This is intentional: the "lower"
-         * band-edge filter detects energy that appears in the upper sideband when
-         * there's a positive frequency offset.
-         *
-         * In dsd-neo, we use taps_lower to compute lower_* and taps_upper to compute
-         * upper_*, so we need to swap the error formula to match GNU Radio's behavior:
-         *   error = norm(upper) - norm(lower)  (equivalent to their swapped version)
-         */
-        float lower_mag2 = lower_r * lower_r + lower_i * lower_i;
-        float upper_mag2 = upper_r * upper_r + upper_i * upper_i;
-        float error = upper_mag2 - lower_mag2;
-
-        /* Clamp error */
-        if (error > 1.0f) {
-            error = 1.0f;
-        }
-        if (error < -1.0f) {
-            error = -1.0f;
-        }
-
-        /* GNU Radio control_loop advance_loop() - second-order loop filter.
-         * From gr-blocks/include/gnuradio/blocks/control_loop.h:
-         *   d_freq = d_freq + d_beta * error    (integral path)
-         *   d_phase = d_phase + d_freq + d_alpha * error  (phase with proportional term)
-         *
-         * The alpha*error term provides the proportional path for fast transient
-         * response. Without it, the loop is sluggish and may not track properly.
-         */
-        freq = freq + beta * error;
-
-        /* Frequency limit (control_loop::frequency_limit) */
-        if (freq > max_freq) {
-            freq = max_freq;
-        } else if (freq < min_freq) {
-            freq = min_freq;
-        }
-
-        /* Phase advance with proportional term (the key fix!) */
-        phase = phase + freq + alpha * error;
-
-        /* Phase wrap to [-2pi, 2pi] (control_loop::phase_wrap)
-         * GNU Radio wraps to ±2π, not ±π */
-        while (phase > kTwoPi) {
-            phase -= kTwoPi;
-        }
-        while (phase < -kTwoPi) {
-            phase += kTwoPi;
-        }
-
-        /* Write output */
+        const float in_r = iq[nn * 2];
+        const float in_i = iq[nn * 2 + 1];
+        float out_r = 0.0f;
+        float out_i = 0.0f;
+        fll_process_sample(f, &ctx, in_r, in_i, &out_r, &out_i);
         iq[nn * 2] = out_r;
         iq[nn * 2 + 1] = out_i;
     }
 
-    /* Save state */
-    f->phase = phase;
-    f->freq = freq;
-    f->delay_idx = delay_idx;
+    fll_commit_loop(f, &ctx);
 
     /* Debug: Log FLL band-edge state when DSD_NEO_DEBUG_CQPSK=1 */
     {
         static int call_count = 0;
-        static float prev_freq = 0.0f;
         if (debug_cqpsk_enabled() && (++call_count % 50) == 0) {
+            static float prev_freq = 0.0f;
             /* Convert freq rad/sample to Hz: f_hz = freq * Fs / (2π) */
             float Fs = (float)d->rate_out;
-            float freq_hz = freq * Fs / kTwoPi;
-            float delta_freq_hz = (freq - prev_freq) * Fs / kTwoPi;
-            prev_freq = freq;
+            float freq_hz = ctx.freq * Fs / kTwoPi;
+            float delta_freq_hz = (ctx.freq - prev_freq) * Fs / kTwoPi;
+            prev_freq = ctx.freq;
             /* Estimate "locked" heuristic: freq change is small */
             const char* lock_status = (fabsf(delta_freq_hz) < 10.0f) ? "locked" : "tracking";
-            fprintf(stderr, "[FLL-BE] freq:%.1fHz delta:%.2fHz phase:%.3f alpha:%.6f beta:%.9f (%s)\n", freq_hz,
-                    delta_freq_hz, phase, f->alpha, f->beta, lock_status);
+            DSD_FPRINTF(stderr, "[FLL-BE] freq:%.1fHz delta:%.2fHz phase:%.3f alpha:%.6f beta:%.9f (%s)\n", freq_hz,
+                        delta_freq_hz, ctx.phase, f->alpha, f->beta, lock_status);
         }
     }
 }

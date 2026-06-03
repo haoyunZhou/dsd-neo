@@ -15,8 +15,13 @@ dsd-neo -i rtl:0:851.375M:22:-2:24:0:2 --rtl-udp-control 9911 -N
 
 Notes:
 
-- The listener binds to `0.0.0.0:<port>` (all interfaces).
-- There is no authentication. Use a firewall or run only on trusted networks.
+- The listener binds to `127.0.0.1:<port>` by default.
+- The option also accepts `--rtl-udp-control=<port>`.
+- To expose the unauthenticated listener beyond the local machine, pass an explicit numeric IPv4 bind address, for
+  example `--rtl-udp-control 9911 --rtl-udp-control-bind 0.0.0.0`.
+- Port `0` disables the listener.
+- There is no authentication. Do not bind to `0.0.0.0` or a LAN address unless the host firewall and network are
+  trusted.
 
 ## Message Format
 
@@ -24,6 +29,9 @@ Each UDP datagram is **exactly 5 bytes**:
 
 - Byte 0: command (`0x00` = retune)
 - Bytes 1..4: unsigned 32-bit little-endian frequency in **Hz**
+
+Shorter datagrams and datagrams with any other command byte are ignored. Keep senders to exactly 5 bytes; oversized UDP
+datagrams may be truncated by the socket layer before DSD-neo sees them.
 
 Example: tune to 851.375 MHz
 
@@ -47,6 +55,7 @@ PY
 
 Remote example (send to another host running DSD-neo):
 
+- Start DSD-neo with an explicit non-loopback bind address, for example
+  `--rtl-udp-control 9911 --rtl-udp-control-bind 0.0.0.0`.
 - Replace `127.0.0.1` with that host's IP address.
 - Ensure the UDP port is reachable (firewall/NAT).
-

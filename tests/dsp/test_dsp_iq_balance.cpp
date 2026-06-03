@@ -7,11 +7,12 @@
    corrupted with a small conjugate (image) component. */
 
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <dsd-neo/dsp/demod_pipeline.h>
 #include <dsd-neo/dsp/demod_state.h>
 #include <stdio.h>
-#include <string.h>
+#include "dsd-neo/core/safe_api.h"
 
 static double
 impropriety_ratio(const float* x, int pairs) {
@@ -36,16 +37,16 @@ main(void) {
     if (!s) {
         return 1;
     }
-    memset(s, 0, sizeof(*s));
+    DSD_MEMSET(s, 0, sizeof(*s));
 
     const int pairs = 512;
     static float buf[(size_t)pairs * 2];
     // Generate QPSK-like random symbols
-    int seed = 12345;
+    uint32_t seed = 12345U;
     for (int n = 0; n < pairs; n++) {
-        seed = (1103515245 * seed + 12345);
-        int bi = (seed >> 16) & 1;
-        int bq = (seed >> 17) & 1;
+        seed = 1103515245U * seed + 12345U;
+        int bi = (int)((seed >> 16) & 1U);
+        int bq = (int)((seed >> 17) & 1U);
         float I = bi ? 8000.0f : -8000.0f;
         float Q = bq ? 8000.0f : -8000.0f;
         // Inject small conjugate image: y = z + a*conj(z)
@@ -59,7 +60,7 @@ main(void) {
 
     double pre = impropriety_ratio(buf, pairs);
     if (pre < 0.01) {
-        fprintf(stderr, "IQBAL test: pre impropriety unexpectedly small %.4f\n", pre);
+        DSD_FPRINTF(stderr, "IQBAL test: pre impropriety unexpectedly small %.4f\n", pre);
         free(s);
         return 1;
     }
@@ -78,7 +79,7 @@ main(void) {
 
     double post = impropriety_ratio(s->lowpassed, s->lp_len / 2);
     if (!(post < pre)) {
-        fprintf(stderr, "IQBAL test: post impropriety %.4f not reduced from %.4f\n", post, pre);
+        DSD_FPRINTF(stderr, "IQBAL test: post impropriety %.4f not reduced from %.4f\n", post, pre);
         free(s);
         return 1;
     }

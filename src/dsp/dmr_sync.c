@@ -17,6 +17,7 @@
 
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/state.h>
+#include <dsd-neo/core/sync_patterns.h>
 #include <dsd-neo/dsp/dmr_sync.h>
 #include <dsd-neo/dsp/sync_calibration.h>
 #include <stdlib.h>
@@ -44,32 +45,28 @@
  * Dibit encoding: 01 = +3, 11 = -3 (only these two used in sync)
  * ───────────────────────────────────────────────────────────────────────────── */
 
-/* Sync patterns as ideal symbol values (+3.0 or -3.0) */
-static const float DMR_SYNC_PATTERNS[DMR_SYNC_PATTERN_COUNT][DMR_SYNC_SYMBOLS] = {
-    /* DMR_SYNC_BS_DATA: 0xDFF57D75DF5D */
-    {-3, +3, -3, -3, -3, -3, +3, +3, -3, +3, -3, -3, +3, -3, -3, +3, -3, +3, -3, -3, +3, -3, +3, -3},
-
-    /* DMR_SYNC_BS_VOICE: 0x755FD7DF75F7 */
-    {+3, -3, +3, +3, +3, +3, -3, -3, +3, -3, +3, +3, -3, +3, +3, -3, +3, -3, +3, +3, -3, +3, -3, +3},
-
-    /* DMR_SYNC_MS_DATA: 0xD5D7F77FD757 */
-    {-3, +3, +3, -3, -3, +3, +3, -3, -3, -3, +3, -3, +3, -3, -3, -3, -3, +3, +3, -3, +3, +3, -3, +3},
-
-    /* DMR_SYNC_MS_VOICE: 0x7F7D5DD57DFD */
-    {+3, -3, -3, +3, +3, -3, -3, +3, +3, +3, -3, +3, -3, +3, +3, +3, +3, -3, -3, +3, -3, -3, +3, -3},
-
-    /* DMR_SYNC_DM_TS1_DATA: 0xF7FDD5DDFD55 */
-    {-3, -3, +3, -3, -3, -3, +3, -3, -3, +3, +3, -3, -3, +3, -3, -3, -3, -3, +3, -3, +3, +3, +3, +3},
-
-    /* DMR_SYNC_DM_TS2_DATA: 0xD7557F5FF7F5 */
-    {-3, +3, -3, +3, +3, +3, +3, -3, +3, -3, -3, +3, +3, -3, -3, -3, -3, +3, -3, -3, +3, -3, +3, +3},
-
-    /* DMR_SYNC_DM_TS1_VOICE: 0x5D577F7757FF */
-    {+3, +3, -3, +3, +3, -3, +3, -3, +3, -3, -3, +3, -3, +3, -3, +3, +3, -3, +3, -3, -3, -3, -3, -3},
-
-    /* DMR_SYNC_DM_TS2_VOICE: 0x7DFFD5F55D5F */
-    {+3, -3, +3, -3, -3, -3, -3, +3, -3, +3, +3, -3, -3, +3, +3, +3, +3, -3, +3, +3, -3, +3, -3, -3},
+/* Canonical sync strings from sync_patterns.h as single source-of-truth. */
+static const char* DMR_SYNC_ASCII_PATTERNS[DMR_SYNC_PATTERN_COUNT] = {
+    DMR_BS_DATA_SYNC,
+    DMR_BS_VOICE_SYNC,
+    DMR_MS_DATA_SYNC,
+    DMR_MS_VOICE_SYNC,
+    DMR_DIRECT_MODE_TS1_DATA_SYNC,
+    DMR_DIRECT_MODE_TS2_DATA_SYNC,
+    DMR_DIRECT_MODE_TS1_VOICE_SYNC,
+    DMR_DIRECT_MODE_TS2_VOICE_SYNC,
 };
+
+static inline float
+dmr_sync_ascii_to_symbol(char dibit_char) {
+    switch (dibit_char) {
+        case '0': return +1.0f;
+        case '1': return +3.0f;
+        case '2': return -1.0f;
+        case '3': return -3.0f;
+        default: return 0.0f;
+    }
+}
 
 /* ─────────────────────────────────────────────────────────────────────────────
  * Sample History Management
@@ -100,7 +97,7 @@ dmr_sample_history_push(dsd_state* state, float sample) {
 }
 
 float
-dmr_sample_history_get(dsd_state* state, int offset) {
+dmr_sample_history_get(const dsd_state* state, int offset) {
     /* DMR API uses offset convention where 0 = most recent, negative = older.
      * Generic API uses 'back' where 0 = most recent, positive = older.
      * Convert: back = -offset when offset <= 0 */
@@ -115,7 +112,7 @@ dmr_sample_history_get(dsd_state* state, int offset) {
  * ───────────────────────────────────────────────────────────────────────────── */
 
 float
-dmr_sync_score(dsd_state* state, float offset, float sps, dmr_sync_pattern_t pattern) {
+dmr_sync_score(const dsd_state* state, float offset, float sps, dmr_sync_pattern_t pattern) {
     if (state == NULL || state->dmr_sample_history == NULL) {
         return 0.0f;
     }
@@ -123,22 +120,29 @@ dmr_sync_score(dsd_state* state, float offset, float sps, dmr_sync_pattern_t pat
         return 0.0f;
     }
 
-    const float* ideal = DMR_SYNC_PATTERNS[pattern];
+    const char* ideal = DMR_SYNC_ASCII_PATTERNS[pattern];
+    if (ideal == NULL) {
+        return 0.0f;
+    }
     float score = 0.0f;
 
     /* Calculate correlation: sum of (received * ideal) for each symbol */
     for (int i = 0; i < DMR_SYNC_SYMBOLS; i++) {
+        char dibit = ideal[i];
+        if (dibit == '\0') {
+            return 0.0f;
+        }
         /* Symbol position relative to current (offset is negative for past) */
         int sym_offset = (int)(offset - (DMR_SYNC_SYMBOLS - 1 - i) * sps);
         float symbol = dmr_sample_history_get(state, sym_offset);
-        score += symbol * ideal[i];
+        score += symbol * dmr_sync_ascii_to_symbol(dibit);
     }
 
     return score;
 }
 
 void
-dmr_extract_sync_symbols(dsd_state* state, float offset, float sps, float symbols[DMR_SYNC_SYMBOLS]) {
+dmr_extract_sync_symbols(const dsd_state* state, float offset, float sps, float symbols[DMR_SYNC_SYMBOLS]) {
     if (state == NULL || state->dmr_sample_history == NULL || symbols == NULL) {
         return;
     }
@@ -156,7 +160,7 @@ dmr_extract_sync_symbols(dsd_state* state, float offset, float sps, float symbol
  * ───────────────────────────────────────────────────────────────────────────── */
 
 void
-dmr_init_thresholds_from_sync(dsd_opts* opts, dsd_state* state, const float sync_symbols[DMR_SYNC_SYMBOLS]) {
+dmr_init_thresholds_from_sync(const dsd_opts* opts, dsd_state* state, const float sync_symbols[DMR_SYNC_SYMBOLS]) {
     if (state == NULL || sync_symbols == NULL) {
         return;
     }
@@ -190,9 +194,9 @@ dmr_init_thresholds_from_sync(dsd_opts* opts, dsd_state* state, const float sync
     state->min = actual_minus3;
     state->center = (state->max + state->min) / 2.0f;
 
-    /* Calculate mid-thresholds (62.5% toward extremes from center) */
-    state->umid = state->center + (state->max - state->center) * 0.625f;
-    state->lmid = state->center + (state->min - state->center) * 0.625f;
+    /* Warm-start mid-thresholds use a slight outer bias for noisy-sync robustness. */
+    state->umid = state->center + (state->max - state->center) * DSD_WARM_START_MID_FRACTION;
+    state->lmid = state->center + (state->min - state->center) * DSD_WARM_START_MID_FRACTION;
 
     /* Reference values (80% of extremes) */
     state->maxref = state->max * 0.80f;
@@ -204,6 +208,7 @@ dmr_init_thresholds_from_sync(dsd_opts* opts, dsd_state* state, const float sync
             state->maxbuf[i] = state->max;
             state->minbuf[i] = state->min;
         }
+        dsd_state_invalidate_minmax_sums(state);
     }
 }
 
@@ -221,7 +226,7 @@ dmr_init_thresholds_from_sync(dsd_opts* opts, dsd_state* state, const float sync
  * @return Dibit value (0-3)
  */
 static int
-dmr_digitize_symbol(dsd_state* state, float symbol) {
+dmr_digitize_symbol(const dsd_state* state, float symbol) {
     /* 4-level slicer using calibrated thresholds */
     if (symbol > state->center) {
         if (symbol > state->umid) {

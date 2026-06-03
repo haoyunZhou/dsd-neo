@@ -62,8 +62,14 @@ rtl_device = 0
 rtl_freq = "851.375M"       # supports K/M/G suffix or raw Hz
 
 [output]
-backend = "pulse"           # pulse / null / (future output types)
+backend = "pulse"           # pulse / null
 ncurses_ui = true           # map to -N / use_ncurses_terminal
+
+[alerts]
+enabled = false             # map to -a / call alert toggle
+voice_start = true
+voice_end = true
+data = true
 
 [trunking]
 enabled = true
@@ -88,9 +94,12 @@ Configuration values of type `PATH` support shell-like expansion:
 - Missing variables expand to empty string (no error).
 
 Path expansion is applied to:
+- Explicit config paths passed through `--config`, a single positional
+  `*.ini`, `DSD_NEO_CONFIG`, and interactive config load/save prompts
 - `[input] file_path`
 - `[trunking] chan_csv`
 - `[trunking] group_csv`
+- `[trunk_scan] targets_csv`
 - `[logging] event_log`
 - `[logging] frame_log`
 - `[recording] per_call_wav_dir`
@@ -152,6 +161,9 @@ dsd-neo --config config.ini --profile p25_trunk
 dsd-neo --config config.ini --list-profiles
 ```
 
+The ncurses Config menu also supports `Load Profile...`, which lists profiles from
+the active config path and applies the selected overlay to the running session.
+
 ### Behavior
 
 - Base config is loaded first.
@@ -171,6 +183,7 @@ Config files can include other files using the `include` directive:
 # Main config file
 include = "/etc/dsd-neo/system.ini"
 include = "~/.config/dsd-neo/local.ini"
+include = "site-overrides.ini"  # relative to this config file's directory
 
 version = 1
 
@@ -200,6 +213,7 @@ explicitly requested.
 - CLI: `--config` (uses default path) or `--config /path/to/config.ini`
 - Convenience: `dsd-neo /path/to/config.ini` (single positional `*.ini`) is treated as `--config /path/to/config.ini`.
 - Environment: `DSD_NEO_CONFIG=/path/to/config.ini`
+- Explicit paths may be absolute, relative to the current working directory, or use `~`/environment expansion.
 
 When both are present, CLI wins:
 
@@ -213,6 +227,7 @@ If the file cannot be read or parsed:
 - Proceed without applying any user config values (defaults + env + CLI).
 - If config loading was enabled (`--config` or `DSD_NEO_CONFIG`), autosave is still enabled for decode runs and the
   effective settings are written back on exit (this can create the file).
+- If `--profile NAME` is specified and that profile is missing, startup fails instead of falling back silently.
 
 ### Default Path
 
@@ -229,6 +244,9 @@ config location is used:
 
 If the default file does not exist, it will be created when settings are saved
 (DSD-neo autosaves on exit whenever config loading is enabled).
+
+Autosave is disabled when an explicit `--profile NAME` is loaded successfully, because saving the effective config would
+flatten the profile overlay back into the base file and remove profile sections.
 
 ---
 
@@ -254,18 +272,20 @@ small subset is exposed as config keys for convenience (for example
 |-----|------|-------------|---------|
 | `source` | ENUM | Input source type (`pulse|rtl|rtltcp|soapy|file|tcp|udp`) | `pulse` |
 | `pulse_source` | STRING | PulseAudio source device | (empty) |
+| `pulse_input` | STRING | Deprecated alias for `pulse_source` | (empty) |
 | `rtl_device` | INT (0-255) | RTL-SDR device index | `0` |
 | `rtl_freq` | FREQ | RTL-SDR frequency | `851.375M` |
 | `rtl_gain` | INT (0-49) | RTL-SDR gain in dB | `0` |
 | `rtl_ppm` | INT (-1000-1000) | Frequency correction | `0` |
 | `rtl_bw_khz` | INT (4-48) | DSP bandwidth | `48` |
 | `rtl_sql` | INT (-100-0) | Squelch level | `0` |
-| `rtl_volume` | INT (1-3) | Volume multiplier | `2` |
-| `auto_ppm` | BOOL | Enable spectrum-based RTL auto-PPM correction | `false` |
-| `rtl_auto_ppm` | BOOL | Enable spectrum-based RTL auto-PPM correction (alias for `auto_ppm`) | `false` |
+| `rtl_volume` | INT (1-3) | RTL monitor/non-symbol gain multiplier | `2` |
+| `auto_ppm` | BOOL | Enable carrier/error-based RTL auto-PPM correction | `false` |
+| `rtl_auto_ppm` | BOOL | Deprecated alias for `auto_ppm` | `false` |
 | `rtltcp_host` | STRING | RTL-TCP hostname | `127.0.0.1` |
 | `rtltcp_port` | INT (1-65535) | RTL-TCP port | `1234` |
 | `soapy_args` | STRING | SoapySDR device selection args (from SoapySDRUtil `--find`/`--probe`) | (empty) |
+| `soapy_settings` | STRING | SoapySDR driver settings (`key=value`, `rx:key=value`) | (empty) |
 | `file_path` | PATH | Input file path (WAV/BIN/RAW/SYM) | (empty) |
 | `file_sample_rate` | INT (8000-192000) | File sample rate (WAV/RAW) | `48000` |
 | `tcp_host` | STRING | TCP PCM input host | `127.0.0.1` |
@@ -276,8 +296,9 @@ small subset is exposed as config keys for convenience (for example
 **[output] section:**
 | Key | Type | Description | Default |
 |-----|------|-------------|---------|
-| `backend` | ENUM | Audio output backend | `pulse` |
+| `backend` | ENUM | Audio output backend (`pulse|null`) | `pulse` |
 | `pulse_sink` | STRING | PulseAudio sink device | (empty) |
+| `pulse_output` | STRING | Deprecated alias for `pulse_sink` | (empty) |
 | `ncurses_ui` | BOOL | Enable ncurses UI | `false` |
 
 **[mode] section:**
@@ -298,11 +319,30 @@ small subset is exposed as config keys for convenience (for example
 | `tune_data_calls` | BOOL | Follow data calls | `false` |
 | `tune_enc_calls` | BOOL | Follow encrypted calls | `true` |
 
+**[trunk_scan] section:**
+| Key | Type | Description | Default |
+|-----|------|-------------|---------|
+| `enabled` | BOOL | Enable single-tuner trunk scan | `false` |
+| `targets_csv` | PATH | Scan target list CSV | (empty) |
+| `idle_dwell_ms` | INT (250-600000) | Default idle dwell per target | `3000` |
+| `activity_hold_ms` | INT (250-600000) | Conventional DMR activity hold | `1200` |
+
 **[logging] section:**
 | Key | Type | Description | Default |
 |-----|------|-------------|---------|
 | `event_log` | PATH | Event history log file path | (empty) |
 | `frame_log` | PATH | Frame trace log file path | (empty) |
+
+**[alerts] section:**
+| Key | Type | Description | Default |
+|-----|------|-------------|---------|
+| `enabled` | BOOL | Enable audible call-alert beeps | `false` |
+| `call_alert` | BOOL | Deprecated alias for `enabled` | `false` |
+| `voice_start` | BOOL | Beep when a voice call starts | `true` |
+| `start` | BOOL | Deprecated alias for `voice_start` | `true` |
+| `voice_end` | BOOL | Beep when a voice call ends | `true` |
+| `end` | BOOL | Deprecated alias for `voice_end` | `true` |
+| `data` | BOOL | Beep when a data call is logged | `true` |
 
 **[recording] section:**
 | Key | Type | Description | Default |
@@ -317,8 +357,12 @@ small subset is exposed as config keys for convenience (for example
 | `rdio_api_key` | STRING | rdio API key | (empty) |
 | `rdio_upload_timeout_ms` | INT | rdio API timeout per call in ms | `5000` |
 | `rdio_upload_retries` | INT | rdio API upload attempts per call | `1` |
+| `rdio_api_delete_after_upload` | BOOL | Delete per-call WAV after successful API-only upload | `false` |
 
 Note: `per_call_wav` and `static_wav` are mutually exclusive (same as `-P` vs `-w` on the CLI).
+For RAM-backed rdio API staging, set `per_call_wav_dir` to a tmpfs/RAM-disk path and enable
+`rdio_api_delete_after_upload`. DirWatch modes keep files for watcher ingestion.
+Rdio API uploads do not follow HTTP redirects. Configure `rdio_api_url` as the final trusted HTTP/HTTPS endpoint.
 
 **[dsp] section:**
 | Key | Type | Description | Default |
@@ -401,20 +445,26 @@ version = 1
 ## Notes on Input Sources
 
 - **RTL-SDR (`source = "rtl"`)**: Uses the `rtl_*` keys for frequency,
-  gain, PPM correction, bandwidth, squelch, volume, and auto-PPM.
+  gain, PPM correction, bandwidth, squelch, monitor gain, and auto-PPM.
   Omitted values use sensible defaults. To switch the input to RTL at
   startup, set at least `rtl_freq` (and optionally `rtl_device`).
+  Digital RTL decode runs in the symbol domain: the decoder receives one
+  normalized FSK or CQPSK symbol per decision, not discriminator audio.
+  `rtl_volume` affects only the separate monitor/non-symbol audio path.
 
 - **RTL-TCP (`source = "rtltcp"`)**: Uses `rtltcp_host`/`rtltcp_port`
   for the network endpoint, plus the same `rtl_*` tuning keys. To switch
   the input to RTL-TCP at startup, set at least `rtltcp_host`.
 
 - **SoapySDR (`source = "soapy"`)**:
+  - Requires SoapySDR 0.8.1 or newer when the backend is enabled.
   - Uses `soapy_args` for device selection only (same semantics as CLI `-i soapy[:args]`).
   - CLI also supports optional shorthand tuning:
     `-i soapy[:args]:freq[:gain[:ppm[:bw[:sql[:vol]]]]]`.
   - Reuses existing `rtl_*` tuning keys (`rtl_freq`, `rtl_gain`, `rtl_ppm`, `rtl_bw_khz`, `rtl_sql`, `rtl_volume`)
     so trunking and retune behavior remains unchanged.
+  - Digital decode uses the same normalized symbol-domain stream as RTL USB, RTL-TCP, and IQ replay.
+  - `rtl_volume` remains a monitor/non-symbol gain key; it does not scale RTL-family digital symbols.
   - `rtl_device` and `rtltcp_*` endpoint keys are not used in Soapy mode.
   - Set `rtl_freq` explicitly for predictable startup frequency with non-RTL radios.
   - If frequency resolves to `0`, radio startup fails with `Please specify a frequency.`
@@ -451,8 +501,8 @@ CLI modulation options.
 
 If you choose RTL/RTLTCP/Soapy input and omit specific tuning fields, DSD-neo
 falls back to its built-in radio defaults: center frequency 850 MHz, DSP
-bandwidth 48 kHz, and volume multiplier 2. The template still shows 851.375M
-as the example frequency.
+bandwidth 48 kHz, and monitor gain multiplier 2. The template still shows
+851.375M as the example frequency.
 
 ### Soapy Config Usage
 
@@ -460,6 +510,11 @@ as the example frequency.
 [input]
 source = "soapy"
 soapy_args = "driver=sdrplay,serial=123456"
+soapy_profile = "sdrplay"
+soapy_stream_format = "auto"
+soapy_settings = "rfnotch_ctrl=true,dabnotch_ctrl=true,biasT_ctrl=false,agc_setpoint=-30,rfgain_sel=4"
+soapy_gains = "IFGR:35"
+soapy_bandwidth_hz = 200000
 
 # Soapy tuning reuses rtl_* keys
 rtl_freq = "851.375M"
@@ -472,13 +527,22 @@ rtl_volume = 2
 
 If you omit `soapy_args`, DSD-neo uses the default Soapy device args (equivalent to `-i soapy`).
 For multiple identical devices, prefer including a stable selector like `serial=...`.
+Soapy-specific keys are optional: profiles default to `auto`, stream format defaults to `auto`,
+`soapy_settings` is applied only when present, named gains are only applied when `soapy_gains` is present, and
+`soapy_bandwidth_hz = 0` leaves bandwidth selection to the driver.
+`soapy_settings` accepts comma/semicolon-separated `key=value` items for device settings, plus `rx:key=value` or
+`rx0:key=value` for RX channel 0 settings. Startup fails if an item is malformed, the scope is unknown, the key/value
+is rejected by Soapy metadata, or the driver rejects `writeSetting`.
 
 ### Soapy Troubleshooting
 
-- If device discovery is empty, run `SoapySDRUtil --find` first and verify your hardware module is installed.
+- If device discovery is empty, run `SoapySDRUtil --find` first and verify SoapySDR 0.8.1 or newer plus your hardware
+  module are installed.
 - If Soapy devices/modules are not discovered, confirm plugin discovery path via `SOAPY_SDR_PLUGIN_PATH`.
 - Driver capabilities differ by hardware: some devices may not support PPM correction, bandwidth selection, or manual
   gain range controls.
+- Native SDRplay/Airspy APIs are not used by this backend; driver-specific controls are exposed through Soapy settings
+  when the installed Soapy module provides them.
 - Expected sample-rate and gain behavior can vary by driver; requested values may be quantized/clamped to supported
   ranges.
 - See `docs/soapysdr.md` for a full non-RTL setup flow.
@@ -496,6 +560,48 @@ When `[trunking] enabled = true`:
   or scan mode (`-T`/`-Y`), trunking inherited from the config is disabled for
   that run.
 
+When `[trunk_scan] enabled = true`:
+
+- `targets_csv` is required and must use the target format in `docs/csv-formats.md`.
+- Global `[trunking] chan_csv` is rejected; each trunk target must name its own `chan_csv` if it needs a channel map.
+- The group policy remains global, so `[trunking] group_csv`, `allow_list`, and tune controls apply uniformly across all
+  scan targets.
+- One tuner is rotated across targets. Calls on systems that are not currently parked can be missed.
+- Runtime still needs a retuning path, either RTL-family input opened by DSD-neo or rigctl tuning. IQ replay is rejected.
+- Full user workflow, examples, and troubleshooting: `docs/trunk-scan.md`.
+
+Example:
+
+```ini
+[input]
+source = "rtl"
+rtl_freq = "851.0125M"
+rtl_gain = 22
+rtl_bw_khz = 48
+
+[mode]
+decode = "tdma"
+
+[trunking]
+group_csv = "~/radio/group.csv"
+
+[trunk_scan]
+enabled = true
+targets_csv = "~/radio/trunk_scan_targets.csv"
+idle_dwell_ms = 3000
+activity_hold_ms = 1200
+```
+
+Config/CLI interaction:
+
+- `--validate-config` reports an error when `trunk_scan.enabled = true` lacks `targets_csv`.
+- `--validate-config` reports an error when trunk scan and `[trunking] chan_csv` are both enabled.
+- If trunk scan is inherited from a config file, one-off CLI arguments that select another input, mode, channel map,
+  file/replay input, trunking mode, or legacy scan mode disable the inherited scan for that run. UI-only flags such as
+  `-N` and trunk-scan timing overrides keep the inherited scan enabled.
+- Explicit profile runs preserve the profile's trunk scan settings and disable autosave for that process, like other
+  profile-based runs.
+
 ---
 
 ## Startup Behavior
@@ -505,7 +611,8 @@ When `[trunking] enabled = true`:
 3. One-shot commands (`--dump-config-template`, `--validate-config`,
    `--list-profiles`, `--print-config`) execute and exit immediately.
    Before `--print-config` renders, Soapy shorthand input specs are normalized
-   into `soapy_args` plus shared `rtl_*` tuning keys.
+   into `soapy_args` plus shared `rtl_*` tuning keys. Explicit `soapy_settings`
+   values are rendered under their normalized key.
 4. If no CLI args and no config is loaded, the interactive bootstrap wizard runs.
 5. When a config is loaded: interactive bootstrap is skipped unless
    `--interactive-setup` is specified.
@@ -528,10 +635,11 @@ through selecting input, mode, trunking, and UI options.
 
 - When the wizard completes, settings are automatically saved to the
   config path (default or explicit).
-- Auto-save only occurs when config is enabled (`--config` or `DSD_NEO_CONFIG`).
+- Auto-save only occurs when config is enabled (`--config`, `DSD_NEO_CONFIG`, or a single positional `*.ini`).
 - Outside the wizard, the app also auto-saves the effective settings at exit
   whenever a config path is in use. To avoid having your file rewritten,
-  run without `--config` and without `DSD_NEO_CONFIG`.
+  run without `--config`, without `DSD_NEO_CONFIG`, and without a single positional `*.ini`.
+- Explicit profile runs (`--profile NAME`) disable autosave for that process.
 
 ### Config and CLI Interaction
 
@@ -614,7 +722,7 @@ restart to take full effect.
 ## Summary
 
 - INI-based config with clear precedence (CLI > env > config > defaults).
-- Platform-specific default paths with automatic discovery.
+- Platform-specific default paths when config loading is explicitly enabled.
 - Validation with line-number diagnostics.
 - Template generation for discoverability.
 - Path expansion (`~`, `$VAR`, `${VAR}`) for portability.

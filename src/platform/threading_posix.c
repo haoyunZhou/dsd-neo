@@ -9,6 +9,8 @@
 #define _GNU_SOURCE
 #endif
 
+#define DSD_NEO_THREADING_NO_INLINE_CREATE
+
 /* Include sched.h early:
  * - Linux: CPU_* affinity macros (requires _GNU_SOURCE)
  * - macOS: struct sched_param/SCHED_* constants for pthread scheduling */
@@ -16,18 +18,32 @@
 // IWYU can incorrectly suggest libc-internal bits headers for sched_param.
 // Keep the portable public header explicitly.
 // IWYU pragma: no_include <bits/types/struct_sched_param.h>
-#include <sched.h> // IWYU pragma: keep
+#include <dsd-neo/platform/threading.h>
+#include <dsd-neo/platform/timing.h>
+#include <errno.h>
+#include <pthread.h>
+#include <sched.h>
+#include <stdint.h>
+#include <time.h>
+#include "dsd-neo/core/safe_api.h"
+#include "dsd-neo/platform/platform.h"
+
 #endif
 
-#include <dsd-neo/platform/threading.h>
-#include <pthread.h>
-
-#include "dsd-neo/platform/platform.h"
+#include <dsd-neo/platform/timing.h> // IWYU pragma: keep (macOS monotonic/realtime time declarations)
 
 #if !DSD_PLATFORM_WIN_NATIVE
 
-#include <errno.h>
-#include <time.h>
+struct timespec;
+
+static void
+timespec_from_ns(uint64_t ns, struct timespec* ts) {
+    if (!ts) {
+        return;
+    }
+    ts->tv_sec = (time_t)(ns / 1000000000ULL);
+    ts->tv_nsec = (long)(ns % 1000000000ULL);
+}
 
 /*============================================================================
  * Thread Functions
@@ -137,6 +153,76 @@ dsd_cond_timedwait(dsd_cond_t* cond, dsd_mutex_t* mutex, unsigned int timeout_ms
 }
 
 int
+dsd_cond_init_monotonic(dsd_cond_t* cond) {
+    if (!cond) {
+        return EINVAL;
+    }
+#if defined(__APPLE__) && defined(__MACH__)
+    return pthread_cond_init(cond, NULL);
+#elif defined(CLOCK_MONOTONIC)
+    pthread_condattr_t attr;
+    int rc = pthread_condattr_init(&attr);
+    if (rc != 0) {
+        return rc;
+    }
+    rc = pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+    if (rc != 0) {
+        (void)pthread_condattr_destroy(&attr);
+        return rc;
+    }
+    rc = pthread_cond_init(cond, &attr);
+    (void)pthread_condattr_destroy(&attr);
+    return rc;
+#else
+    return pthread_cond_init(cond, NULL);
+#endif
+}
+
+int
+dsd_cond_timedwait_monotonic(dsd_cond_t* cond, dsd_mutex_t* mutex, uint64_t deadline_ns) {
+    if (!cond || !mutex) {
+        return EINVAL;
+    }
+
+#if defined(__APPLE__) && defined(__MACH__)
+    uint64_t now_ns = dsd_time_monotonic_ns();
+    if (deadline_ns <= now_ns) {
+        return ETIMEDOUT;
+    }
+    uint64_t rel_ns = deadline_ns - now_ns;
+    struct timespec rel;
+    timespec_from_ns(rel_ns, &rel);
+    return pthread_cond_timedwait_relative_np(cond, mutex, &rel);
+#elif defined(CLOCK_MONOTONIC)
+    struct timespec ts;
+    timespec_from_ns(deadline_ns, &ts);
+    return pthread_cond_timedwait(cond, mutex, &ts);
+#else
+    const uint64_t k_max_wait_ns = 50ULL * 1000000ULL;
+    for (;;) {
+        uint64_t now_ns = dsd_time_monotonic_ns();
+        if (now_ns >= deadline_ns) {
+            return ETIMEDOUT;
+        }
+
+        uint64_t wait_ns = deadline_ns - now_ns;
+        if (wait_ns > k_max_wait_ns) {
+            wait_ns = k_max_wait_ns;
+        }
+
+        uint64_t rt_deadline_ns = dsd_time_realtime_ns() + wait_ns;
+        struct timespec ts;
+        timespec_from_ns(rt_deadline_ns, &ts);
+        int rc = pthread_cond_timedwait(cond, mutex, &ts);
+        if (rc == ETIMEDOUT) {
+            continue;
+        }
+        return rc;
+    }
+#endif
+}
+
+int
 dsd_cond_signal(dsd_cond_t* cond) {
     if (!cond) {
         return EINVAL;
@@ -183,7 +269,7 @@ int
 dsd_thread_set_affinity(int cpu_index) {
 #if DSD_PLATFORM_LINUX
     cpu_set_t cpuset;
-    CPU_ZERO(&cpuset);
+    DSD_MEMSET(&cpuset, 0, sizeof(cpuset));
     CPU_SET((unsigned)cpu_index, &cpuset);
     return pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
 #else

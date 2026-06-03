@@ -10,7 +10,8 @@
  * Declares generic PDU decoders implemented in `src/protocol/dmr/dmr_pdu.c`.
  */
 
-#pragma once
+#ifndef DSD_NEO_INCLUDE_DSD_NEO_PROTOCOL_PDU_H_
+#define DSD_NEO_INCLUDE_DSD_NEO_PROTOCOL_PDU_H_
 
 #include <dsd-neo/core/opts_fwd.h>
 #include <dsd-neo/core/state_fwd.h>
@@ -23,8 +24,9 @@ extern "C" {
 
 void decode_ip_pdu(dsd_opts* opts, dsd_state* state, uint16_t len, uint8_t* input);
 void decode_cellocator(dsd_opts* opts, dsd_state* state, uint8_t* input, int len);
-void decode_ars(dsd_opts* opts, dsd_state* state, uint8_t* input, int len);
 
 #ifdef __cplusplus
 }
 #endif
+
+#endif /* DSD_NEO_INCLUDE_DSD_NEO_PROTOCOL_PDU_H_ */

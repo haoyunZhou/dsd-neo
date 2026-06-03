@@ -3,42 +3,53 @@
  * Copyright (C) 2026 by arancormonk <180709949+arancormonk@users.noreply.github.com>
  */
 
-#define DSD_NEO_MAIN
-#include <dsd-neo/protocol/dmr/dmr_const.h>
-#include <dsd-neo/protocol/dstar/dstar_const.h>
-#include <dsd-neo/protocol/p25/p25p1_const.h>
-#include <dsd-neo/protocol/provoice/provoice_const.h>
-#include <dsd-neo/protocol/x2tdma/x2tdma_const.h>
-#undef DSD_NEO_MAIN
-
+#include <dsd-neo/core/dsd_time.h>
 #include <dsd-neo/core/init.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/state.h>
+#include <dsd-neo/core/synctype_ids.h>
 #include <dsd-neo/engine/frame_processing.h>
-#include "dsd-neo/core/opts_fwd.h"
-#include "dsd-neo/core/state_fwd.h"
-
+#include <dsd-neo/io/rtl_stream_c.h>
+#include <dsd-neo/runtime/rtl_stream_metrics_hooks.h>
+#include <dsd-neo/runtime/trunk_cc_candidates.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
+#include "dsd-neo/core/opts_fwd.h"
+#include "dsd-neo/core/safe_api.h"
+#include "dsd-neo/core/state_fwd.h"
+
+#if defined(__GNUC__) && !defined(__cplusplus)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmissing-prototypes"
+#endif
 
 static int
 expect_true(const char* tag, int cond) {
     if (!cond) {
-        fprintf(stderr, "%s failed\n", tag);
+        DSD_FPRINTF(stderr, "%s failed\n", tag);
         return 1;
     }
     return 0;
 }
 
+#ifdef USE_RADIO
+static int
+fake_rtl_fsk_output_kind(void) {
+    return RTL_STREAM_OUTPUT_SYMBOL_FSK;
+}
+#endif
+
 int
-ui_start(dsd_opts* opts, dsd_state* state) {
+ui_start(dsd_opts* opts, dsd_state* state) { // NOLINT(misc-use-internal-linkage)
     (void)opts;
     (void)state;
     return 0;
 }
 
 void
-ui_stop(void) {}
+ui_stop(void) { // NOLINT(misc-use-internal-linkage)
+}
 
 static int
 init_test_runtime(dsd_opts** opts_out, dsd_state** state_out) {
@@ -46,7 +57,7 @@ init_test_runtime(dsd_opts** opts_out, dsd_state** state_out) {
     dsd_opts* opts = (dsd_opts*)calloc(1, sizeof(*opts));
     dsd_state* state = (dsd_state*)calloc(1, sizeof(*state));
     if (opts == NULL || state == NULL) {
-        fprintf(stderr, "alloc-failed: runtime\n");
+        DSD_FPRINTF(stderr, "alloc-failed: runtime\n");
         free(opts);
         free(state);
         return 1;
@@ -79,6 +90,10 @@ main(void) {
         return 1;
     }
 
+    // DMR payload and reliability history share noCarrier's generic reset path.
+    // Seed both buffers with sentinels and move the payload pointer into the
+    // dibit buffer to catch regressions that reset through the wrong backing
+    // store after carrier loss.
     for (int i = 0; i < 200; i++) {
         state->dmr_payload_buf[i] = 0x7F7F7F7F;
         if (state->dmr_reliab_buf != NULL) {
@@ -99,7 +114,7 @@ main(void) {
 
     for (int i = 0; i < 200; i++) {
         if (state->dmr_payload_buf[i] != 0) {
-            fprintf(stderr, "dmr payload buf[%d] not reset: %d\n", i, state->dmr_payload_buf[i]);
+            DSD_FPRINTF(stderr, "dmr payload buf[%d] not reset: %d\n", i, state->dmr_payload_buf[i]);
             rc = 1;
             break;
         }
@@ -109,12 +124,102 @@ main(void) {
         rc |= expect_true("dmr-reliab-pointer-buffer", state->dmr_reliab_p == state->dmr_reliab_buf + 200);
         for (int i = 0; i < 200; i++) {
             if (state->dmr_reliab_buf[i] != 0U) {
-                fprintf(stderr, "dmr reliab buf[%d] not reset: %u\n", i, (unsigned)state->dmr_reliab_buf[i]);
+                DSD_FPRINTF(stderr, "dmr reliab buf[%d] not reset: %u\n", i, (unsigned)state->dmr_reliab_buf[i]);
                 rc = 1;
                 break;
             }
         }
     }
+
+    // A recent P25 voice-channel sync means noCarrier should keep trunk tuning
+    // state intact even when the control-channel timer is stale. This preserves
+    // an active voice call rather than forcing an unnecessary control-channel
+    // reacquisition.
+    opts->p25_trunk = 1;
+    opts->p25_is_tuned = 1;
+    opts->trunk_is_tuned = 1;
+    state->last_cc_sync_time = time(NULL) - 11;
+    state->last_vc_sync_time = time(NULL);
+    state->p25_vc_freq[0] = 851012500;
+    state->p25_vc_freq[1] = 851012500;
+
+    noCarrier(opts, state);
+
+    rc |= expect_true("p25-vc-sync-preserves-tuned", opts->p25_is_tuned == 1);
+    rc |= expect_true("p25-vc-sync-preserves-alias", opts->trunk_is_tuned == 1);
+    rc |= expect_true("p25-vc-sync-preserves-freq", state->p25_vc_freq[0] == 851012500);
+
+    // Once both control and voice sync are stale, the same reset path should
+    // clear the tuned flags and cached voice frequencies so scanning can resume
+    // from a clean trunking state.
+    opts->p25_is_tuned = 1;
+    opts->trunk_is_tuned = 1;
+    state->last_cc_sync_time = time(NULL) - 11;
+    state->last_vc_sync_time = time(NULL) - 11;
+    state->p25_vc_freq[0] = 851012500;
+    state->p25_vc_freq[1] = 851012500;
+
+    noCarrier(opts, state);
+
+    rc |= expect_true("p25-stale-vc-clears-tuned", opts->p25_is_tuned == 0);
+    rc |= expect_true("p25-stale-vc-clears-freq", state->p25_vc_freq[0] == 0 && state->p25_vc_freq[1] == 0);
+
+    // Trunk scan keeps long-lived discovery state across carrier gaps. The test
+    // keeps DMR confidence and P25 control-channel candidates populated while
+    // still requiring transient P25 frame metrics to be reset.
+    opts->trunk_scan_enabled = 1;
+    state->dmr_color_code = 5;
+    state->dmr_confidence_locked = 1;
+    state->dmr_confidence_color_code = 5;
+    state->dmr_confidence_candidate_cc = 5;
+    state->dmr_confidence_candidate_count = 2;
+    state->dmr_confidence_voice_sync_seen[0] = 1;
+    state->p25_cc_cache_loaded = 1;
+    state->p25_p1_fec_ok = 7;
+    dsd_trunk_cc_candidates* cc = dsd_trunk_cc_candidates_get(state);
+    if (cc == NULL) {
+        DSD_FPRINTF(stderr, "alloc-failed: cc-candidates\n");
+        rc = 1;
+    } else {
+        cc->count = 2;
+        cc->idx = 1;
+        cc->candidates[0] = 851012500L;
+        cc->candidates[1] = 852012500L;
+    }
+
+    noCarrier(opts, state);
+
+    rc |=
+        expect_true("trunk-scan-preserves-dmr-confidence",
+                    state->dmr_color_code == 5 && state->dmr_confidence_locked == 1
+                        && state->dmr_confidence_color_code == 5 && state->dmr_confidence_candidate_cc == 5
+                        && state->dmr_confidence_candidate_count == 2 && state->dmr_confidence_voice_sync_seen[0] == 1);
+    rc |= expect_true("trunk-scan-preserves-p25-cache", state->p25_cc_cache_loaded == 1 && cc != NULL && cc->count == 2
+                                                            && cc->idx == 1 && cc->candidates[0] == 851012500L
+                                                            && cc->candidates[1] == 852012500L);
+    rc |= expect_true("trunk-scan-still-resets-p25-metrics", state->p25_p1_fec_ok == 0);
+
+#ifdef USE_RADIO
+    // Radio builds also exercise the RTL/FSK reacquisition counters. A recovered
+    // sync must close the current gap and refresh the last-sync timer without
+    // depending on real hardware.
+    dsd_rtl_stream_metrics_hooks hooks = {.output_kind = fake_rtl_fsk_output_kind};
+    dsd_rtl_stream_metrics_hooks_set(&hooks);
+    opts->audio_in_type = AUDIO_IN_RTL;
+    state->rtl_ctx = (struct RtlSdrContext*)state;
+    state->lastsynctype = DSD_SYNC_YSF_POS;
+    state->rtl_fsk_reacquire_gap_start_m = dsd_time_now_monotonic_s() - 1.0;
+    state->rtl_fsk_reacquire_last_sync_m = state->rtl_fsk_reacquire_gap_start_m - 1.0;
+    state->rtl_fsk_reacquire_last_sync_time = time(NULL) - 2;
+    double old_reacquire_sync_m = state->rtl_fsk_reacquire_last_sync_m;
+
+    noCarrier(opts, state);
+
+    rc |= expect_true("rtl-fsk-recovered-sync-clears-gap", state->rtl_fsk_reacquire_gap_start_m == 0.0);
+    rc |= expect_true("rtl-fsk-recovered-sync-refreshes-timer",
+                      state->rtl_fsk_reacquire_last_sync_m > old_reacquire_sync_m);
+    dsd_rtl_stream_metrics_hooks_set(NULL);
+#endif
 
     free_test_runtime(opts, state);
 
@@ -123,3 +228,7 @@ main(void) {
     }
     return rc;
 }
+
+#if defined(__GNUC__) && !defined(__cplusplus)
+#pragma GCC diagnostic pop
+#endif

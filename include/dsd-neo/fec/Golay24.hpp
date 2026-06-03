@@ -10,14 +10,11 @@
  * because it matches expected P25 outputs where ITPP did not.
  */
 
-#include <assert.h>
-#include <stdio.h>
-
 #define POLY 0xAE3
 
 class Golay24 {
   private:
-    unsigned int
+    static unsigned int
     golay(unsigned int cw)
     /* This function calculates [23,12] Golay codewords.
        The format of the returned int is
@@ -37,7 +34,7 @@ class Golay24 {
         return ((cw << 12) | c); /* assemble codeword */
     }
 
-    int
+    static int
     parity(unsigned int cw)
     /* This function checks the overall parity of codeword cw.
        If parity is even, 0 is returned, else 1. */
@@ -56,7 +53,7 @@ class Golay24 {
         return (p & 1);
     }
 
-    unsigned int
+    static unsigned int
     syndrome(unsigned int cw)
     /* This function calculates and returns the syndrome
        of a [23,12] Golay codeword. */
@@ -73,7 +70,7 @@ class Golay24 {
         return (cw << 12); /* value pairs with upper bits of cw */
     }
 
-    int
+    static int
     weight(unsigned int cw)
     /* This function calculates the weight of
        23 bit codeword cw. */
@@ -95,14 +92,12 @@ class Golay24 {
         return (bits);
     }
 
-    unsigned int
+    static unsigned int
     rotate_left(unsigned int cw, int n)
     /* This function rotates 23 bit codeword cw left by n bits. */
     {
-        int i;
-
         if (n != 0) {
-            for (i = 1; i <= n; i++) {
+            for (int i = 1; i <= n; i++) {
                 if ((cw & 0x400000l) != 0) {
                     cw = (cw << 1) | 1;
                 } else {
@@ -114,14 +109,12 @@ class Golay24 {
         return (cw & 0x7fffffl);
     }
 
-    unsigned int
+    static unsigned int
     rotate_right(unsigned int cw, int n)
     /* This function rotates 23 bit codeword cw right by n bits. */
     {
-        int i;
-
         if (n != 0) {
-            for (i = 1; i <= n; i++) {
+            for (int i = 1; i <= n; i++) {
                 if ((cw & 1) != 0) {
                     cw = (cw >> 1) | 0x400000l;
                 } else {
@@ -134,7 +127,7 @@ class Golay24 {
     }
 
   public:
-    unsigned int
+    static unsigned int
     correct(unsigned int cw, int* errs, unsigned int* errors_detected)
     /* This function corrects Golay [23,12] codeword cw, returning the
        corrected codeword. This function will produce the corrected codeword
@@ -142,11 +135,10 @@ class Golay24 {
        codeword for four or more errors, possibly not the intended
        one. *errs is set to the number of bit errors corrected. */
     {
-        unsigned char w;   /* current syndrome limit weight, 2 or 3 */
-        unsigned int mask; /* mask for bit flipping */
-        int i, j;          /* index */
-        unsigned int s,    /* calculated syndrome */
-            cwsaver;       /* saves initial value of cw */
+        unsigned char w;      /* current syndrome limit weight, 2 or 3 */
+        unsigned int mask;    /* mask for bit flipping */
+        int i, j;             /* index */
+        unsigned int cwsaver; /* saves initial value of cw */
 
         cwsaver = cw; /* save */
         *errs = 0;
@@ -167,8 +159,8 @@ class Golay24 {
                 w = 2;               /* lower the threshold while bit diddling */
             }
 
-            s = syndrome(cw); /* look for errors */
-            if (s)            /* errors exist */
+            unsigned int s = syndrome(cw); /* look for errors */
+            if (s)                         /* errors exist */
             {
                 (*errors_detected)++;
                 for (i = 0; i < 23; i++) /* check syndrome of each cyclic shift */
@@ -193,7 +185,7 @@ class Golay24 {
         return (cwsaver); /* return original if no corrections */
     } /* correct */
 
-    unsigned int
+    static unsigned int
     encode(unsigned int data) {
         unsigned int codeword = golay(data); /* make a test codeword */
         if (parity(codeword)) {
@@ -203,12 +195,12 @@ class Golay24 {
         return codeword;
     }
 
-    unsigned int
+    static unsigned int
     encode23(unsigned int data) {
         return golay(data); /* make a test codeword */
     }
 
-    int
+    static int
     decode(int* errs, unsigned int* cw)
     /* This function decodes codeword *cw. Here error correction is attempted,
        with *errs set to the number of
@@ -231,7 +223,7 @@ class Golay24 {
         return (0); /* no errors */
     } /* decode */
 
-    int
+    static int
     detect(int* errs, unsigned int cw)
     /* This function decodes codeword cw. Here error detection is performed on cw,
        returning 0 if no errors exist, 1 if an overall parity error exists, and
@@ -261,21 +253,54 @@ class Golay24 {
  */
 class DSDGolay24 : public Golay24 {
   public:
-    unsigned int
+    static bool
+    bit_is_valid(char bit) {
+        return bit == 0 || bit == 1;
+    }
+
+    static bool
+    word_bits_are_valid(const char* word, unsigned int length) {
+        if (!word || length > 12) {
+            return false;
+        }
+        for (unsigned int i = 0; i < length; i++) {
+            if (!bit_is_valid(word[i])) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static bool
+    parity_bits_are_valid(const char* parity) {
+        if (!parity) {
+            return false;
+        }
+        for (unsigned int i = 0; i < 12; i++) {
+            if (!bit_is_valid(parity[i])) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static unsigned int
     adapt_to_codeword(const char* word, unsigned int length, const char* parity) {
+        if (!word_bits_are_valid(word, length) || !parity_bits_are_valid(parity)) {
+            return 0;
+        }
+
         unsigned int codeword = 0;
 
         // Data needs to be packed with the 12 bits of parity as the most significant
         // bits and 12 bits of data as the less significant. All these discovered by trial and error.
         for (unsigned int i = 0; i < 12; i++) {
             unsigned int pbit = (unsigned int)(unsigned char)parity[11 - i];
-            assert(pbit == 0 || pbit == 1);
             codeword <<= 1;
             codeword |= pbit;
         }
         for (unsigned int i = 0; i < length; i++) {
             unsigned int bit = (unsigned int)(unsigned char)word[length - 1 - i];
-            assert(bit == 0 || bit == 1);
             codeword <<= 1;
             codeword |= bit;
         }
@@ -287,22 +312,29 @@ class DSDGolay24 : public Golay24 {
         return codeword;
     }
 
-    void
+    static void
     adapt_to_word(unsigned int codeword, char* word, unsigned int length) {
+        if (!word || length > 12) {
+            return;
+        }
+
         // put back in word the bits from codeword
         for (unsigned int i = 0, mask = 1 << (12 - length); i < length; i++, mask <<= 1) {
             word[i] = (codeword & mask) != 0 ? 1 : 0;
         }
     }
 
-    unsigned int
-    adapt_from_word(char* word, unsigned int length) {
+    static unsigned int
+    adapt_from_word(const char* word, unsigned int length) {
+        if (!word_bits_are_valid(word, length)) {
+            return 0;
+        }
+
         unsigned int codeword = 0;
 
         // encode the hex bits into a codeword
         for (unsigned int i = 0; i < length; i++) {
             unsigned int bit = (unsigned int)(unsigned char)word[length - 1 - i];
-            assert(bit == 0 || bit == 1);
             codeword <<= 1;
             codeword |= bit;
         }
@@ -325,8 +357,15 @@ class DSDGolay24 : public Golay24 {
      *           in this case the original data remains unchanged.
      *         0 if the data was successfully error corrected.
      */
-    int
+    static int
     decode_6(char* hex, const char* parity, int* fixed_errors) {
+        if (fixed_errors) {
+            *fixed_errors = 0;
+        }
+        if (!fixed_errors || !word_bits_are_valid(hex, 6) || !parity_bits_are_valid(parity)) {
+            return 1;
+        }
+
         unsigned int codeword = adapt_to_codeword(hex, 6, parity);
         // codeword now contains:
         // bits  0- 5: zeros
@@ -354,8 +393,15 @@ class DSDGolay24 : public Golay24 {
         return uncorrectable_errors;
     }
 
-    int
+    static int
     decode_12(char* dodeca, const char* parity, int* fixed_errors) {
+        if (fixed_errors) {
+            *fixed_errors = 0;
+        }
+        if (!fixed_errors || !word_bits_are_valid(dodeca, 12) || !parity_bits_are_valid(parity)) {
+            return 1;
+        }
+
         unsigned int codeword = adapt_to_codeword(dodeca, 12, parity);
         // codeword contains:
         // bits  0-11: dodeca bits
@@ -382,8 +428,12 @@ class DSDGolay24 : public Golay24 {
         return uncorrectable_errors;
     }
 
-    void
-    encode_6(char* hex, char* out_parity) {
+    static void
+    encode_6(const char* hex, char* out_parity) {
+        if (!out_parity || !word_bits_are_valid(hex, 6)) {
+            return;
+        }
+
         unsigned int data = adapt_from_word(hex, 6);
         unsigned int codeword = Golay24::encode(data);
 
@@ -393,8 +443,12 @@ class DSDGolay24 : public Golay24 {
         }
     }
 
-    void
-    encode_12(char* dodeca, char* out_parity) {
+    static void
+    encode_12(const char* dodeca, char* out_parity) {
+        if (!out_parity || !word_bits_are_valid(dodeca, 12)) {
+            return;
+        }
+
         unsigned int data = adapt_from_word(dodeca, 12);
         unsigned int codeword = Golay24::encode(data);
 

@@ -15,7 +15,8 @@
  * re-implementing table lookups and MCO fallbacks.
  */
 
-#pragma once
+#ifndef DSD_NEO_INCLUDE_DSD_NEO_PROTOCOL_P25_P25P2_MAC_PARSE_H_
+#define DSD_NEO_INCLUDE_DSD_NEO_PROTOCOL_P25_P25P2_MAC_PARSE_H_
 
 #include <stdint.h>
 
@@ -35,6 +36,16 @@ struct p25p2_mac_result {
     int len_c;
 };
 
+struct p25p2_iden_update {
+    uint8_t iden;
+    uint8_t chan_type;
+    uint8_t bw_vu;
+    int bandwidth;
+    int trans_off;
+    int chan_spac;
+    long int base_freq;
+};
+
 /**
  * Derive MAC message lengths and header fields from a VPDU/TSBK buffer.
  *
@@ -48,7 +59,12 @@ struct p25p2_mac_result {
  * @return 0 on success, negative on error.
  */
 int p25p2_mac_parse(int type, const unsigned long long mac[24], struct p25p2_mac_result* out);
+int p25p2_mac_decode_iden_standard(const unsigned long long mac[24], int pos, struct p25p2_iden_update* out);
+int p25p2_mac_decode_iden_vuhf(const unsigned long long mac[24], int pos, struct p25p2_iden_update* out);
+int p25p2_mac_decode_iden_tdma(const unsigned long long mac[24], int pos, struct p25p2_iden_update* out);
 
 #ifdef __cplusplus
 }
 #endif
+
+#endif /* DSD_NEO_INCLUDE_DSD_NEO_PROTOCOL_P25_P25P2_MAC_PARSE_H_ */

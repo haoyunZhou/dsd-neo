@@ -13,22 +13,32 @@
  */
 
 #include <dsd-neo/protocol/p25/p25_trunk_sm_api.h>
+#include <errno.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
-
+#include <string.h>
 #include "dsd-neo/core/opts_fwd.h"
+#include "dsd-neo/core/safe_api.h"
 #include "dsd-neo/core/state_fwd.h"
+#include "test_support.h"
+
+#if defined(__GNUC__) && !defined(__cplusplus)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmissing-prototypes"
+#endif
 
 // Alias decode helper stubs referenced by VPDU handler
 void
-unpack_byte_array_into_bit_array(uint8_t* input, uint8_t* output, int len) {
+// NOLINTNEXTLINE(misc-use-internal-linkage)
+unpack_byte_array_into_bit_array(const uint8_t* input, uint8_t* output, int len) {
     (void)input;
     (void)output;
     (void)len;
 }
 
 void
+// NOLINTNEXTLINE(misc-use-internal-linkage)
 apx_embedded_alias_header_phase2(dsd_opts* opts, dsd_state* state, uint8_t slot, uint8_t* lc_bits) {
     (void)opts;
     (void)state;
@@ -37,6 +47,7 @@ apx_embedded_alias_header_phase2(dsd_opts* opts, dsd_state* state, uint8_t slot,
 }
 
 void
+// NOLINTNEXTLINE(misc-use-internal-linkage)
 apx_embedded_alias_blocks_phase2(dsd_opts* opts, dsd_state* state, uint8_t slot, uint8_t* lc_bits) {
     (void)opts;
     (void)state;
@@ -45,6 +56,7 @@ apx_embedded_alias_blocks_phase2(dsd_opts* opts, dsd_state* state, uint8_t slot,
 }
 
 void
+// NOLINTNEXTLINE(misc-use-internal-linkage)
 l3h_embedded_alias_decode(dsd_opts* opts, dsd_state* state, uint8_t slot, int16_t len, uint8_t* input) {
     (void)opts;
     (void)state;
@@ -54,6 +66,7 @@ l3h_embedded_alias_decode(dsd_opts* opts, dsd_state* state, uint8_t slot, int16_
 }
 
 void
+// NOLINTNEXTLINE(misc-use-internal-linkage)
 nmea_harris(dsd_opts* opts, dsd_state* state, uint8_t* input, uint32_t src, int slot) {
     (void)opts;
     (void)state;
@@ -64,6 +77,7 @@ nmea_harris(dsd_opts* opts, dsd_state* state, uint8_t* input, uint32_t src, int 
 
 // Rigctl/rtl stubs referenced by linked objects
 bool
+// NOLINTNEXTLINE(misc-use-internal-linkage)
 SetFreq(int sockfd, long int freq) {
     (void)sockfd;
     (void)freq;
@@ -71,6 +85,7 @@ SetFreq(int sockfd, long int freq) {
 }
 
 bool
+// NOLINTNEXTLINE(misc-use-internal-linkage)
 SetModulation(int sockfd, int bandwidth) {
     (void)sockfd;
     (void)bandwidth;
@@ -78,13 +93,16 @@ SetModulation(int sockfd, int bandwidth) {
 }
 
 void
+// NOLINTNEXTLINE(misc-use-internal-linkage)
 return_to_cc(dsd_opts* opts, dsd_state* state) {
     (void)opts;
     (void)state;
 }
+// NOLINTNEXTLINE(misc-use-internal-linkage)
 struct RtlSdrContext* g_rtl_ctx = 0;
 
 int
+// NOLINTNEXTLINE(misc-use-internal-linkage)
 rtl_stream_tune(struct RtlSdrContext* ctx, uint32_t center_freq_hz) {
     (void)ctx;
     (void)center_freq_hz;
@@ -168,7 +186,16 @@ sm_test_api(void) {
 static int
 expect_eq(const char* tag, long got, long want) {
     if (got != want) {
-        fprintf(stderr, "%s: got %ld want %ld\n", tag, got, want);
+        DSD_FPRINTF(stderr, "%s: got %ld want %ld\n", tag, got, want);
+        return 1;
+    }
+    return 0;
+}
+
+static int
+expect_str_has(const char* tag, const char* haystack, const char* needle) {
+    if (!haystack || !strstr(haystack, needle)) {
+        DSD_FPRINTF(stderr, "%s: missing '%s' in '%s'\n", tag, needle, haystack ? haystack : "(null)");
         return 1;
     }
     return 0;
@@ -177,12 +204,66 @@ expect_eq(const char* tag, long got, long want) {
 // Test shim entry (implemented in src/protocol/p25/p25_test_shim.c)
 void p25_test_invoke_mac_vpdu_with_state(const unsigned char* mac_bytes, int mac_len, int p25_trunk, long p25_cc_freq,
                                          int iden, int type, int tdma, long base, int spac);
+void p25_test_process_mac_vpdu(int type, const unsigned char* mac_bytes, int mac_len);
+const char* p25_extended_function_class0_operand_label(uint8_t operand);
+int p25_extended_function_operand_is_ack(uint8_t operand);
+
+static int
+test_extended_function_command_abbreviated(void) {
+    int rc = 0;
+
+    rc |= expect_str_has("extfn label inhibit", p25_extended_function_class0_operand_label(0x7F), "Radio Inhibit");
+    rc |= expect_str_has("extfn label detach", p25_extended_function_class0_operand_label(0x7D), "Radio Detach");
+    rc |= expect_eq("extfn ack bit", p25_extended_function_operand_is_ack(0xFF), 1);
+    rc |= expect_eq("extfn no ack bit", p25_extended_function_operand_is_ack(0x7F), 0);
+
+    unsigned char mac[24] = {0};
+    mac[0] = 0x01;
+    mac[1] = 0x64;
+    mac[2] = 0x00;
+    mac[3] = 0xFF;
+    mac[4] = 0x12;
+    mac[5] = 0x34;
+    mac[6] = 0x56;
+    mac[7] = 0xAB;
+    mac[8] = 0xCD;
+    mac[9] = 0xEF;
+
+    dsd_test_capture_stderr cap;
+    if (dsd_test_capture_stderr_begin(&cap, "p25_ext_fn_0x64") != 0) {
+        DSD_FPRINTF(stderr, "capture stderr begin failed: %s\n", strerror(errno));
+        return rc | 100;
+    }
+    p25_test_process_mac_vpdu(0, mac, 10);
+    dsd_test_capture_stderr_end(&cap);
+
+    FILE* f = fopen(cap.path, "r");
+    if (!f) {
+        DSD_FPRINTF(stderr, "open capture failed: %s\n", strerror(errno));
+        return rc | 101;
+    }
+    char buf[1024];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    buf[n] = '\0';
+
+    rc |= expect_str_has("extfn output title", buf, "Extended Function Command - Abbreviated");
+    rc |= expect_str_has("extfn output class operand", buf, "Class: 00 Operand: FF");
+    rc |= expect_str_has("extfn output argument", buf, "Arg/Src: 123456");
+    rc |= expect_str_has("extfn output target", buf, "Target: 11259375");
+    rc |= expect_str_has("extfn output label", buf, "Radio Inhibit Ack");
+
+    return rc;
+}
 
 int
 main(void) {
     int rc = 0;
 
-    p25_sm_set_api(sm_test_api());
+    {
+        p25_sm_api api = sm_test_api();
+        p25_sm_set_api(&api);
+    }
 
     // Build TSBK-mapped vPDU: DUID=0x07, opcode=0x40 (Group Voice)
     // svc=0x00 (clear), channel=0x100A (iden=1, ch=10), group=0x4567, source=0x00ABCDEF
@@ -229,5 +310,11 @@ main(void) {
     rc |= expect_eq("grant2 svc", g_svc, 0x87);
     rc |= expect_eq("grant2 channel", g_channel, 0x100A);
 
+    rc |= test_extended_function_command_abbreviated();
+
     return rc;
 }
+
+#if defined(__GNUC__) && !defined(__cplusplus)
+#pragma GCC diagnostic pop
+#endif

@@ -12,12 +12,15 @@
  * refactoring.
  */
 
-#pragma once
+#ifndef DSD_NEO_INCLUDE_DSD_NEO_DSP_DEMOD_STATE_H_
+#define DSD_NEO_INCLUDE_DSD_NEO_DSP_DEMOD_STATE_H_
 
-#include <stdint.h>
+#include <dsd-neo/platform/platform.h>
 
 #include <dsd-neo/dsp/costas.h>
+#include <dsd-neo/dsp/equalizer.h>
 #include <dsd-neo/dsp/fll.h>
+#include <dsd-neo/dsp/fsk_modem.h>
 #include <dsd-neo/dsp/ted.h>
 #include <dsd-neo/platform/threading.h>
 
@@ -44,17 +47,20 @@
 #endif
 
 /* Channel LPF profile ids */
-enum {
+enum DSD_ATTR_PACKED {
     DSD_CH_LPF_PROFILE_WIDE = 0,
-    DSD_CH_LPF_PROFILE_6K25 = 1,      /* 6.25 kHz modes: 3500 Hz cutoff */
-    DSD_CH_LPF_PROFILE_12K5 = 2,      /* 12.5 kHz 4FSK modes: 5100 Hz cutoff */
-    DSD_CH_LPF_PROFILE_PROVOICE = 3,  /* ProVoice: 6250 Hz cutoff */
-    DSD_CH_LPF_PROFILE_P25_C4FM = 4,  /* P25 C4FM: 5200 Hz cutoff */
-    DSD_CH_LPF_PROFILE_P25_CQPSK = 5, /* P25 CQPSK/LSM: 7250 Hz cutoff */
+    DSD_CH_LPF_PROFILE_6K25 = 1,      /* 6.25 kHz modes: protects the 3125 Hz channel edge */
+    DSD_CH_LPF_PROFILE_12K5 = 2,      /* 12.5 kHz 4FSK modes: protects the 6250 Hz channel edge */
+    DSD_CH_LPF_PROFILE_PROVOICE = 3,  /* ProVoice: protects the 6250 Hz channel edge */
+    DSD_CH_LPF_PROFILE_P25_C4FM = 4,  /* P25 C4FM: protects the 6250 Hz channel edge */
+    DSD_CH_LPF_PROFILE_P25_CQPSK = 5, /* P25 CQPSK/LSM: 12.5 kHz edge plus guard */
 };
 
-/* Forward declaration to avoid heavy dependencies here */
-struct output_state;
+enum DSD_ATTR_PACKED dsd_demod_output_kind {
+    DSD_DEMOD_OUTPUT_AUDIO_MONITOR = 0,
+    DSD_DEMOD_OUTPUT_SYMBOL_FSK = 1,
+    DSD_DEMOD_OUTPUT_SYMBOL_CQPSK = 2,
+};
 
 /**
  * @brief Aggregate state container for the demodulator processing chain.
@@ -68,6 +74,7 @@ struct output_state;
  *  - src/dsp/demod_pipeline.cpp
  *  - src/dsp/resampler.cpp
  */
+// NOLINTBEGIN(clang-analyzer-optin.performance.Padding)
 struct demod_state {
     /* Large aligned buffers first to minimize padding */
     alignas(64) float hb_i_buf[MAXIMUM_BUF_LENGTH / 2];
@@ -78,6 +85,9 @@ struct demod_state {
     alignas(64) float result[MAXIMUM_BUF_LENGTH];
     alignas(64) float timing_buf[MAXIMUM_BUF_LENGTH];
     alignas(64) float resamp_outbuf[MAXIMUM_BUF_LENGTH * 4];
+    alignas(64) float channel_lpf_hist_i[144]; /* sized for up to 144-tap symmetric FIR (tap-1) */
+    alignas(64) float channel_lpf_hist_q[144];
+    alignas(64) float channel_lpf_plan_taps[144];
 
     /* Pointers and 64-bit items next */
     dsd_thread_t thread;
@@ -87,7 +97,6 @@ struct demod_state {
     float* resamp_hist; /* mirrored history window, length = 2*K */
     int (*discriminator)(int, int, int, int);
     void (*mode_demod)(struct demod_state*);
-    struct output_state* output_target;
     double fm_agc_ema_rms;      /* normalized RMS estimator (0..~1.0) */
     float* post_polydecim_taps; /* normalized taps length K */
     float* post_polydecim_hist; /* circular history length K */
@@ -117,6 +126,10 @@ struct demod_state {
     int rate_out;
     int rate_out2;
     float pre_r, pre_j;
+    /* 1 once pre_r/pre_j hold a valid sample from a prior block; 0 before the
+       first sample has been observed. Replaces an older (prev==0) heuristic
+       that false-seeded on a genuinely-zero first sample. */
+    int fm_demod_history_valid;
     int post_downsample;
     float output_scale;
     float squelch_level;
@@ -153,11 +166,12 @@ struct demod_state {
     int channel_lpf_enable; /* gate */
     int channel_lpf_hist_len;
     int channel_lpf_profile;       /* see DSD_CH_LPF_PROFILE_* */
-    float channel_lpf_hist_i[144]; /* sized for up to 144-tap symmetric FIR (tap-1) */
-    float channel_lpf_hist_q[144];
-    float channel_pwr;           /* mean power (RMS^2 proxy) measured after channel LPF */
-    float channel_squelch_level; /* squelch threshold (linear power); 0 = disabled */
-    int channel_squelched;       /* 1 if squelched this block, 0 otherwise */
+    int channel_lpf_plan_rate_out; /* cached rate for channel_lpf_plan_taps */
+    int channel_lpf_plan_profile;  /* cached profile for channel_lpf_plan_taps */
+    int channel_lpf_plan_taps_len; /* cached tap count; 0 = not designed */
+    float channel_pwr;             /* mean power (RMS^2 proxy) measured after channel LPF */
+    float channel_squelch_level;   /* squelch threshold (linear power); 0 = disabled */
+    int channel_squelched;         /* 1 if squelched this block, 0 otherwise */
 
     /* Polyphase rational resampler (L/M) */
     int resamp_enabled;
@@ -187,11 +201,14 @@ struct demod_state {
      * Total CFO for metrics = fll_band_edge_state.freq + costas_state.freq/sps */
     dsd_costas_loop_state_t costas_state;          /* Symbol-rate Costas loop */
     dsd_fll_band_edge_state_t fll_band_edge_state; /* Sample-rate FLL band-edge */
+    dsd_fsk_modem_state fsk_modem_state;           /* Symbol-rate FSK modem */
 
     /* Timing error detector (Gardner) - native float */
     int ted_enabled;
     int ted_force;            /* allow forcing TED even for FM/C4FM paths */
     float ted_gain;           /* loop gain, typically 0.01..0.1 */
+    int ted_gain_is_set;      /* env/API/UI override; disables automatic mode-specific gain changes */
+    float ted_effective_gain; /* loop gain actually used by mode-specific TED */
     int ted_sps;              /* nominal samples per symbol */
     int ted_sps_override;     /* >0 = manual override (used during P25P2 VC tunes) */
     int costas_reset_pending; /* 1 = reset Costas loop on next retune (set when SPS override changes) */
@@ -216,6 +233,9 @@ struct demod_state {
 
     /* CQPSK (H-DQPSK) path enable for P25 LSM/TDMA */
     int cqpsk_enable;
+    int output_kind;    /* dsd_demod_output_kind */
+    int symbol_rate_hz; /* output symbol rate for SYMBOL_* paths */
+    int symbol_levels;  /* 2 or 4 for SYMBOL_FSK; 4 for SYMBOL_CQPSK */
 
     /* CQPSK pre-Costas differential phasor history (previous raw sample) */
     float cqpsk_diff_prev_r;
@@ -227,6 +247,14 @@ struct demod_state {
      *   out = in * (reference / rms)
      * OP25 uses: rms_agc.rms_agc(alpha=0.45, reference=0.85) */
     float cqpsk_agc_avg; /* running average of mag^2 (d_avg in op25) */
+
+    /* Optional GNU Radio-style CMA equalizer for CQPSK/H-DQPSK multipath/ISI.
+     * Runs at symbol rate after Gardner and before differential phasor decode. */
+    dsd_cqpsk_cma_equalizer_state_t cqpsk_eq_state;
+    int cqpsk_eq_enable;
+    int cqpsk_eq_taps;
+    float cqpsk_eq_mu;
+    float cqpsk_eq_modulus;
 
     /* Generic mode-aware IQ balance (image suppression) */
     int iqbal_enable;        /* 0/1 gate */
@@ -260,5 +288,12 @@ struct demod_state {
     int post_polydecim_phase;     /* sample phase accumulator [0..M-1] */
 
     /* Costas diagnostics (updated per block) */
-    int costas_err_avg_q14; /* average |err| scaled to Q14 for UI/metrics */
+    int costas_err_avg_q14;     /* average smoothed |err| scaled to Q14 for UI/metrics */
+    int costas_err_raw_avg_q14; /* average raw |err| before smoothing, scaled to Q14 */
+    int costas_conf_avg_q14;    /* average Costas confidence, scaled to Q14 */
+    int costas_zero_conf_pct;   /* percent of symbols with zero Costas confidence */
 };
+
+// NOLINTEND(clang-analyzer-optin.performance.Padding)
+
+#endif /* DSD_NEO_INCLUDE_DSD_NEO_DSP_DEMOD_STATE_H_ */

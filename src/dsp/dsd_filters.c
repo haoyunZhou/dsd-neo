@@ -3,15 +3,21 @@
  * Copyright (C) 2025 by arancormonk <180709949+arancormonk@users.noreply.github.com>
  */
 
+#include <dsd-neo/dsp/sps_filters.h>
 #include <math.h>
 #include <string.h>
+#include "dsd-neo/core/safe_api.h"
 
-#define FIR_MAX_TAPS 1024
+#define FIR_MAX_TAPS          1024
+#define SPS_FIR_DESIGN_INTERP 0
+#define SPS_FIR_DESIGN_RRC    1
 
 typedef struct {
     const float* base; /* design taps at base_sps */
     int base_len;
     int base_sps;
+    int design_kind; /* SPS_FIR_DESIGN_* */
+    float rrc_alpha; /* used when design_kind == SPS_FIR_DESIGN_RRC */
     float taps[FIR_MAX_TAPS];
     float hist[FIR_MAX_TAPS];
     int taps_len;
@@ -25,8 +31,8 @@ reset_sps_fir(sps_fir* f) {
     if (!f) {
         return;
     }
-    memset(f->taps, 0, sizeof(f->taps));
-    memset(f->hist, 0, sizeof(f->hist));
+    DSD_MEMSET(f->taps, 0, sizeof(f->taps));
+    DSD_MEMSET(f->hist, 0, sizeof(f->hist));
     f->taps_len = 0;
     f->head = -1;
     f->last_sps = 0;
@@ -47,17 +53,54 @@ interp_base(const float* base, int len, float idx) {
     return base[i0] + frac * (base[i1] - base[i0]);
 }
 
-static void
-design_sps_fir(sps_fir* f, int sps) {
-    if (!f || !f->base || f->base_len <= 0 || f->base_sps <= 0 || sps <= 1) {
-        if (f) {
-            f->ready = 0;
+/*
+ * Root-raised-cosine impulse response h(t), T=1 symbol.
+ * Matches the standard closed-form expression, including singularities at
+ * t = 0 and t = ±1/(4*alpha).
+ */
+static float
+rrc_impulse(float t_sym, float alpha) {
+    const float pi = 3.14159265358979323846f;
+    const float eps = 1e-6f;
+    if (alpha <= 0.0f || alpha > 1.0f) {
+        if (fabsf(t_sym) < eps) {
+            return 1.0f;
         }
-        return;
+        float x = pi * t_sym;
+        return sinf(x) / x;
     }
-    double span = (double)(f->base_len - 1) / (double)f->base_sps;
-    double desired = span * (double)sps;
-    int taps_len = (int)(desired + 0.5) + 1; /* preserve span + center tap */
+
+    if (fabsf(t_sym) < eps) {
+        return 1.0f + alpha * ((4.0f / pi) - 1.0f);
+    }
+
+    float four_a_t = 4.0f * alpha * t_sym;
+    if (fabsf(fabsf(four_a_t) - 1.0f) < 1e-4f) {
+        float a = pi / (4.0f * alpha);
+        float t1 = (1.0f + (2.0f / pi)) * sinf(a);
+        float t2 = (1.0f - (2.0f / pi)) * cosf(a);
+        return (alpha / 1.41421356237309504880f) * (t1 + t2);
+    }
+
+    float num = sinf(pi * t_sym * (1.0f - alpha)) + (four_a_t * cosf(pi * t_sym * (1.0f + alpha)));
+    float den = pi * t_sym * (1.0f - (four_a_t * four_a_t));
+    if (fabsf(den) < eps) {
+        return 0.0f;
+    }
+    return num / den;
+}
+
+static int
+sps_fir_compute_taps_len(const sps_fir* f, int sps) {
+    int taps_len = 0;
+    if (sps == f->base_sps && f->base_len <= FIR_MAX_TAPS) {
+        /* Exact base design when no SPS change is requested. */
+        taps_len = f->base_len;
+    } else {
+        double span = (double)(f->base_len - 1) / (double)f->base_sps;
+        double desired = span * (double)sps;
+        taps_len = (int)(desired + 0.5) + 1; /* preserve span + center tap */
+    }
     if (taps_len < 3) {
         taps_len = 3;
     }
@@ -65,20 +108,33 @@ design_sps_fir(sps_fir* f, int sps) {
         taps_len += 1; /* prefer odd length for symmetry */
     }
     if (taps_len > FIR_MAX_TAPS) {
-        taps_len = FIR_MAX_TAPS;
-        if ((taps_len & 1) == 0) {
-            taps_len -= 1;
+        /* Clamp to max and force odd tap count for symmetric center tap. */
+        taps_len = FIR_MAX_TAPS - 1;
+    }
+    return taps_len;
+}
+
+static void
+sps_fir_design_taps(sps_fir* f, int sps, int taps_len) {
+    if (sps == f->base_sps && taps_len == f->base_len) {
+        DSD_MEMCPY(f->taps, f->base, (size_t)taps_len * sizeof(float));
+    } else {
+        float mid_new = 0.5f * (float)(taps_len - 1);
+        float mid_base = 0.5f * (float)(f->base_len - 1);
+        for (int n = 0; n < taps_len; n++) {
+            float t_sym = ((float)n - mid_new) / (float)sps;
+            if (f->design_kind == SPS_FIR_DESIGN_RRC) {
+                f->taps[n] = rrc_impulse(t_sym, f->rrc_alpha);
+            } else {
+                float base_idx = t_sym * (float)f->base_sps + mid_base;
+                f->taps[n] = interp_base(f->base, f->base_len, base_idx);
+            }
         }
     }
+}
 
-    float mid_new = 0.5f * (float)(taps_len - 1);
-    float mid_base = 0.5f * (float)(f->base_len - 1);
-    for (int n = 0; n < taps_len; n++) {
-        float t_sym = ((float)n - mid_new) / (float)sps;
-        float base_idx = t_sym * (float)f->base_sps + mid_base;
-        f->taps[n] = interp_base(f->base, f->base_len, base_idx);
-    }
-
+static void
+sps_fir_normalize_and_clear(sps_fir* f, int taps_len) {
     double sum = 0.0;
     for (int n = 0; n < taps_len; n++) {
         sum += f->taps[n];
@@ -91,6 +147,20 @@ design_sps_fir(sps_fir* f, int sps) {
         f->taps[n] *= inv_sum;
         f->hist[n] = 0.0f;
     }
+}
+
+static void
+design_sps_fir(sps_fir* f, int sps) {
+    if (!f || !f->base || f->base_len <= 0 || f->base_sps <= 0 || sps <= 1) {
+        if (f) {
+            f->ready = 0;
+        }
+        return;
+    }
+
+    int taps_len = sps_fir_compute_taps_len(f, sps);
+    sps_fir_design_taps(f, sps, taps_len);
+    sps_fir_normalize_and_clear(f, taps_len);
 
     f->taps_len = taps_len;
     f->head = -1;
@@ -196,26 +266,26 @@ static const float nxcoeffs[135] = {
 
 // dPMR filter - root raised cosine alpha=0.2 at 48 kHz (sps=20)
 static const float dpmrcoeffs[135] = {
-    -0.0000983004, 0.0058388841,  0.0119748846,  0.0179185547,  0.0232592816,  0.0275919612,  0.0305433586,
-    0.0317982965,  0.0311240307,  0.0283911865,  0.0235897433,  0.0168387650,  0.0083888763,  -0.0013831396,
-    -0.0119878087, -0.0228442151, -0.0333082708, -0.0427067804, -0.0503756642, -0.0557003599, -0.0581561791,
-    -0.0573462646, -0.0530347941, -0.0451732069, -0.0339174991, -0.0196350217, -0.0028997157, 0.0155246961,
-    0.0347134030,  0.0536202583,  0.0711271166,  0.0861006725,  0.0974542022,  0.1042112035,  0.1055676660,
-    0.1009496091,  0.0900625944,  0.0729301774,  0.0499186839,  0.0217462748,  -0.0105250265, -0.0455148664,
-    -0.0815673067, -0.1168095612, -0.1492246435, -0.1767350726, -0.1972941202, -0.2089805758, -0.2100926829,
-    -0.1992367833, -0.1754063031, -0.1380470370, -0.0871052089, -0.0230554989, 0.0530929052,  0.1398131936,
-    0.2351006721,  0.3365341927,  0.4413570929,  0.5465745033,  0.6490630781,  0.7456885564,  0.8334261381,
-    0.9094784589,  0.9713859928,  1.0171250045,  1.0451886943,  1.0546479089,  1.0451886943,  1.0171250045,
-    0.9713859928,  0.9094784589,  0.8334261381,  0.7456885564,  0.6490630781,  0.5465745033,  0.4413570929,
-    0.3365341927,  0.2351006721,  0.1398131936,  0.0530929052,  -0.0230554989, -0.0871052089, -0.1380470370,
-    -0.1754063031, -0.1992367833, -0.2100926829, -0.2089805758, -0.1972941202, -0.1767350726, -0.1492246435,
-    -0.1168095612, -0.0815673067, -0.0455148664, -0.0105250265, 0.0217462748,  0.0499186839,  0.0729301774,
-    0.0900625944,  0.1009496091,  0.1055676660,  0.1042112035,  0.0974542022,  0.0861006725,  0.0711271166,
-    0.0536202583,  0.0347134030,  0.0155246961,  -0.0028997157, -0.0196350217, -0.0339174991, -0.0451732069,
-    -0.0530347941, -0.0573462646, -0.0581561791, -0.0557003599, -0.0503756642, -0.0427067804, -0.0333082708,
-    -0.0228442151, -0.0119878087, -0.0013831396, 0.0083888763,  0.0168387650,  0.0235897433,  0.0283911865,
-    0.0311240307,  0.0317982965,  0.0305433586,  0.0275919612,  0.0232592816,  0.0179185547,  0.0119748846,
-    0.0058388841,  -0.0000983004};
+    -0.0000983004f, 0.0058388841f,  0.0119748846f,  0.0179185547f,  0.0232592816f,  0.0275919612f,  0.0305433586f,
+    0.0317982965f,  0.0311240307f,  0.0283911865f,  0.0235897433f,  0.0168387650f,  0.0083888763f,  -0.0013831396f,
+    -0.0119878087f, -0.0228442151f, -0.0333082708f, -0.0427067804f, -0.0503756642f, -0.0557003599f, -0.0581561791f,
+    -0.0573462646f, -0.0530347941f, -0.0451732069f, -0.0339174991f, -0.0196350217f, -0.0028997157f, 0.0155246961f,
+    0.0347134030f,  0.0536202583f,  0.0711271166f,  0.0861006725f,  0.0974542022f,  0.1042112035f,  0.1055676660f,
+    0.1009496091f,  0.0900625944f,  0.0729301774f,  0.0499186839f,  0.0217462748f,  -0.0105250265f, -0.0455148664f,
+    -0.0815673067f, -0.1168095612f, -0.1492246435f, -0.1767350726f, -0.1972941202f, -0.2089805758f, -0.2100926829f,
+    -0.1992367833f, -0.1754063031f, -0.1380470370f, -0.0871052089f, -0.0230554989f, 0.0530929052f,  0.1398131936f,
+    0.2351006721f,  0.3365341927f,  0.4413570929f,  0.5465745033f,  0.6490630781f,  0.7456885564f,  0.8334261381f,
+    0.9094784589f,  0.9713859928f,  1.0171250045f,  1.0451886943f,  1.0546479089f,  1.0451886943f,  1.0171250045f,
+    0.9713859928f,  0.9094784589f,  0.8334261381f,  0.7456885564f,  0.6490630781f,  0.5465745033f,  0.4413570929f,
+    0.3365341927f,  0.2351006721f,  0.1398131936f,  0.0530929052f,  -0.0230554989f, -0.0871052089f, -0.1380470370f,
+    -0.1754063031f, -0.1992367833f, -0.2100926829f, -0.2089805758f, -0.1972941202f, -0.1767350726f, -0.1492246435f,
+    -0.1168095612f, -0.0815673067f, -0.0455148664f, -0.0105250265f, 0.0217462748f,  0.0499186839f,  0.0729301774f,
+    0.0900625944f,  0.1009496091f,  0.1055676660f,  0.1042112035f,  0.0974542022f,  0.0861006725f,  0.0711271166f,
+    0.0536202583f,  0.0347134030f,  0.0155246961f,  -0.0028997157f, -0.0196350217f, -0.0339174991f, -0.0451732069f,
+    -0.0530347941f, -0.0573462646f, -0.0581561791f, -0.0557003599f, -0.0503756642f, -0.0427067804f, -0.0333082708f,
+    -0.0228442151f, -0.0119878087f, -0.0013831396f, 0.0083888763f,  0.0168387650f,  0.0235897433f,  0.0283911865f,
+    0.0311240307f,  0.0317982965f,  0.0305433586f,  0.0275919612f,  0.0232592816f,  0.0179185547f,  0.0119748846f,
+    0.0058388841f,  -0.0000983004f};
 #define DPMR_BASE_SPS     20
 #define DPMR_BASE_TAP_LEN (int)(sizeof(dpmrcoeffs) / sizeof(dpmrcoeffs[0]))
 
@@ -251,35 +321,51 @@ static const float p25_base_coeffs[91] = {
     6.5614198114868558e-05f,  2.0151157806489272e-04f,  2.5136032328468153e-04f};
 #define P25_BASE_TAP_LEN (int)(sizeof(p25_base_coeffs) / sizeof(p25_base_coeffs[0]))
 
-static sps_fir g_fir_p25 = {.base = p25_base_coeffs, .base_len = P25_BASE_TAP_LEN, .base_sps = P25_BASE_SPS};
-static sps_fir g_fir_dmr = {.base = dmrcoeffs, .base_len = DMR_BASE_TAP_LEN, .base_sps = DMR_BASE_SPS};
-static sps_fir g_fir_nxdn = {.base = nxcoeffs, .base_len = NXDN_BASE_TAP_LEN, .base_sps = NXDN_BASE_SPS};
-static sps_fir g_fir_dpmr = {.base = dpmrcoeffs, .base_len = DPMR_BASE_TAP_LEN, .base_sps = DPMR_BASE_SPS};
-static sps_fir g_fir_m17 = {.base = m17coeffs, .base_len = M17_BASE_TAP_LEN, .base_sps = M17_BASE_SPS};
+static sps_fir g_fir_p25 = {.base = p25_base_coeffs,
+                            .base_len = P25_BASE_TAP_LEN,
+                            .base_sps = P25_BASE_SPS,
+                            .design_kind = SPS_FIR_DESIGN_INTERP};
+static sps_fir g_fir_dmr = {.base = dmrcoeffs,
+                            .base_len = DMR_BASE_TAP_LEN,
+                            .base_sps = DMR_BASE_SPS,
+                            .design_kind = SPS_FIR_DESIGN_RRC,
+                            .rrc_alpha = 0.7f};
+static sps_fir g_fir_nxdn = {
+    .base = nxcoeffs, .base_len = NXDN_BASE_TAP_LEN, .base_sps = NXDN_BASE_SPS, .design_kind = SPS_FIR_DESIGN_INTERP};
+static sps_fir g_fir_dpmr = {.base = dpmrcoeffs,
+                             .base_len = DPMR_BASE_TAP_LEN,
+                             .base_sps = DPMR_BASE_SPS,
+                             .design_kind = SPS_FIR_DESIGN_RRC,
+                             .rrc_alpha = 0.2f};
+static sps_fir g_fir_m17 = {.base = m17coeffs,
+                            .base_len = M17_BASE_TAP_LEN,
+                            .base_sps = M17_BASE_SPS,
+                            .design_kind = SPS_FIR_DESIGN_RRC,
+                            .rrc_alpha = 0.5f};
 
 float
-dmr_filter(float sample, int sps) {
-    return apply_sps_fir(&g_fir_dmr, sample, sps);
+dmr_filter(float sample, int samples_per_symbol) {
+    return apply_sps_fir(&g_fir_dmr, sample, samples_per_symbol);
 }
 
 float
-nxdn_filter(float sample, int sps) {
-    return apply_sps_fir(&g_fir_nxdn, sample, sps);
+nxdn_filter(float sample, int samples_per_symbol) {
+    return apply_sps_fir(&g_fir_nxdn, sample, samples_per_symbol);
 }
 
 float
-dpmr_filter(float sample, int sps) {
-    return apply_sps_fir(&g_fir_dpmr, sample, sps);
+dpmr_filter(float sample, int samples_per_symbol) {
+    return apply_sps_fir(&g_fir_dpmr, sample, samples_per_symbol);
 }
 
 float
-m17_filter(float sample, int sps) {
-    return apply_sps_fir(&g_fir_m17, sample, sps);
+m17_filter(float sample, int samples_per_symbol) {
+    return apply_sps_fir(&g_fir_m17, sample, samples_per_symbol);
 }
 
 float
-p25_filter(float sample, int sps) {
-    return apply_sps_fir(&g_fir_p25, sample, sps);
+p25_filter(float sample, int samples_per_symbol) {
+    return apply_sps_fir(&g_fir_p25, sample, samples_per_symbol);
 }
 
 void

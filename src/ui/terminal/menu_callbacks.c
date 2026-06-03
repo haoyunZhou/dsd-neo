@@ -9,7 +9,6 @@
  */
 
 #include "menu_callbacks.h"
-
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/state.h>
 #include <dsd-neo/platform/posix_compat.h>
@@ -17,10 +16,9 @@
 #include <dsd-neo/ui/ui_async.h>
 #include <dsd-neo/ui/ui_cmd.h>
 #include <stdint.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
+#include "dsd-neo/core/safe_api.h"
 #include "dsd-neo/ui/menu_core.h"
 #include "menu_env.h"
 #include "menu_internal.h"
@@ -47,26 +45,34 @@ clamp_int_with_notice(const char* label, int value, int min_v, int max_v, int* a
 static double
 clamp_double_with_notice(const char* label, double value, double min_v, double max_v, int* adjusted) {
     double out = value;
+    int was_adjusted = 0;
     if (out < min_v) {
         out = min_v;
+        was_adjusted = 1;
     }
     if (out > max_v) {
         out = max_v;
+        was_adjusted = 1;
     }
     if (adjusted) {
-        *adjusted = (out != value) ? 1 : 0;
+        *adjusted = was_adjusted;
     }
-    if (out != value) {
+    if (was_adjusted) {
         ui_statusf("%s adjusted to %.3f (range %.3f..%.3f)", label ? label : "Value", out, min_v, max_v);
     }
     return out;
+}
+
+static UiCtx*
+mutable_ui_ctx_from_callback(void* user) {
+    return (UiCtx*)user;
 }
 
 // ---- Simple path callbacks ----
 
 void
 cb_event_log_set(void* v, const char* path) {
-    UiCtx* c = (UiCtx*)v;
+    const UiCtx* c = mutable_ui_ctx_from_callback(v);
     if (!c) {
         return;
     }
@@ -78,7 +84,7 @@ cb_event_log_set(void* v, const char* path) {
 
 void
 cb_static_wav(void* v, const char* path) {
-    UiCtx* c = (UiCtx*)v;
+    const UiCtx* c = mutable_ui_ctx_from_callback(v);
     if (!c) {
         return;
     }
@@ -90,7 +96,7 @@ cb_static_wav(void* v, const char* path) {
 
 void
 cb_raw_wav(void* v, const char* path) {
-    UiCtx* c = (UiCtx*)v;
+    const UiCtx* c = mutable_ui_ctx_from_callback(v);
     if (!c) {
         return;
     }
@@ -102,7 +108,7 @@ cb_raw_wav(void* v, const char* path) {
 
 void
 cb_dsp_out(void* v, const char* name) {
-    UiCtx* c = (UiCtx*)v;
+    const UiCtx* c = mutable_ui_ctx_from_callback(v);
     if (!c) {
         return;
     }
@@ -114,7 +120,7 @@ cb_dsp_out(void* v, const char* name) {
 
 void
 cb_import_chan(void* v, const char* p) {
-    UiCtx* c = (UiCtx*)v;
+    const UiCtx* c = mutable_ui_ctx_from_callback(v);
     if (!c) {
         return;
     }
@@ -126,7 +132,7 @@ cb_import_chan(void* v, const char* p) {
 
 void
 cb_import_group(void* v, const char* p) {
-    UiCtx* c = (UiCtx*)v;
+    const UiCtx* c = mutable_ui_ctx_from_callback(v);
     if (!c) {
         return;
     }
@@ -138,7 +144,7 @@ cb_import_group(void* v, const char* p) {
 
 void
 cb_keys_dec(void* v, const char* p) {
-    UiCtx* c = (UiCtx*)v;
+    const UiCtx* c = mutable_ui_ctx_from_callback(v);
     if (!c) {
         return;
     }
@@ -150,7 +156,7 @@ cb_keys_dec(void* v, const char* p) {
 
 void
 cb_keys_hex(void* v, const char* p) {
-    UiCtx* c = (UiCtx*)v;
+    const UiCtx* c = mutable_ui_ctx_from_callback(v);
     if (!c) {
         return;
     }
@@ -164,7 +170,7 @@ cb_keys_hex(void* v, const char* p) {
 
 void
 cb_config_load(void* v, const char* path) {
-    UiCtx* c = (UiCtx*)v;
+    const UiCtx* c = mutable_ui_ctx_from_callback(v);
     if (!c) {
         return;
     }
@@ -174,7 +180,7 @@ cb_config_load(void* v, const char* path) {
     }
 
     dsdneoUserConfig cfg;
-    memset(&cfg, 0, sizeof cfg);
+    DSD_MEMSET(&cfg, 0, sizeof cfg);
     if (dsd_user_config_load(path, &cfg) != 0) {
         ui_statusf("Failed to load config from %s", path);
         return;
@@ -183,7 +189,7 @@ cb_config_load(void* v, const char* path) {
     // Treat UI-loaded configs as the active config path for later saves/autosave.
     if (c->state) {
         c->state->config_autosave_enabled = 1;
-        snprintf(c->state->config_autosave_path, sizeof c->state->config_autosave_path, "%s", path);
+        DSD_SNPRINTF(c->state->config_autosave_path, sizeof c->state->config_autosave_path, "%s", path);
         c->state->config_autosave_path[sizeof c->state->config_autosave_path - 1] = '\0';
     }
 
@@ -191,9 +197,52 @@ cb_config_load(void* v, const char* path) {
     ui_statusf("Config loaded from %s", path);
 }
 
+static void
+config_profile_free_context(ProfileSelCtx* pctx) {
+    if (!pctx) {
+        return;
+    }
+    if (pctx->names) {
+        for (int i = 0; i < pctx->n; i++) {
+            free((void*)pctx->names[i]);
+        }
+    }
+    free((void*)pctx->labels);
+    free((void*)pctx->names);
+    free(pctx);
+}
+
+void
+chooser_done_config_profile(void* u, int sel) {
+    ProfileSelCtx* pctx = (ProfileSelCtx*)u;
+    if (!pctx) {
+        return;
+    }
+
+    if (sel >= 0 && sel < pctx->n && pctx->names && pctx->names[sel] && pctx->path[0] != '\0') {
+        const char* profile = pctx->names[sel];
+        dsdneoUserConfig cfg;
+        DSD_MEMSET(&cfg, 0, sizeof cfg);
+        if (dsd_user_config_load_profile(pctx->path, profile, &cfg) != 0) {
+            ui_statusf("Failed to load profile %s from %s", profile, pctx->path);
+        } else {
+            if (pctx->state) {
+                pctx->state->config_autosave_enabled = 0;
+                DSD_SNPRINTF(pctx->state->config_autosave_path, sizeof pctx->state->config_autosave_path, "%s",
+                             pctx->path);
+                pctx->state->config_autosave_path[sizeof pctx->state->config_autosave_path - 1] = '\0';
+            }
+            ui_post_cmd(UI_CMD_CONFIG_APPLY, &cfg, sizeof cfg);
+            ui_statusf("Profile loaded: %s", profile);
+        }
+    }
+
+    config_profile_free_context(pctx);
+}
+
 void
 cb_config_save_as(void* v, const char* path) {
-    UiCtx* c = (UiCtx*)v;
+    const UiCtx* c = mutable_ui_ctx_from_callback(v);
     if (!c) {
         return;
     }
@@ -214,7 +263,7 @@ cb_config_save_as(void* v, const char* path) {
 
 void
 cb_setmod_bw(void* v, int ok, int bw) {
-    UiCtx* c = (UiCtx*)v;
+    const UiCtx* c = mutable_ui_ctx_from_callback(v);
     if (!c) {
         return;
     }
@@ -230,7 +279,7 @@ cb_setmod_bw(void* v, int ok, int bw) {
 
 void
 cb_tg_hold(void* v, int ok, int tg) {
-    UiCtx* c = (UiCtx*)v;
+    const UiCtx* c = mutable_ui_ctx_from_callback(v);
     if (!c) {
         return;
     }
@@ -247,7 +296,7 @@ cb_tg_hold(void* v, int ok, int tg) {
 
 void
 cb_hangtime(void* v, int ok, double s) {
-    UiCtx* c = (UiCtx*)v;
+    const UiCtx* c = mutable_ui_ctx_from_callback(v);
     if (!c) {
         return;
     }
@@ -268,7 +317,7 @@ cb_hangtime(void* v, int ok, double s) {
 
 void
 cb_slot_pref(void* v, int ok, int p) {
-    UiCtx* c = (UiCtx*)v;
+    const UiCtx* c = mutable_ui_ctx_from_callback(v);
     if (!c) {
         return;
     }
@@ -285,7 +334,7 @@ cb_slot_pref(void* v, int ok, int p) {
 
 void
 cb_slots_on(void* v, int ok, int m) {
-    UiCtx* c = (UiCtx*)v;
+    const UiCtx* c = mutable_ui_ctx_from_callback(v);
     if (!c) {
         return;
     }
@@ -303,7 +352,7 @@ cb_slots_on(void* v, int ok, int m) {
 
 void
 cb_tyt_ap(void* v, const char* s) {
-    UiCtx* c = (UiCtx*)v;
+    const UiCtx* c = mutable_ui_ctx_from_callback(v);
     if (!c) {
         return;
     }
@@ -315,7 +364,7 @@ cb_tyt_ap(void* v, const char* s) {
 
 void
 cb_retevis_rc2(void* v, const char* s) {
-    UiCtx* c = (UiCtx*)v;
+    const UiCtx* c = mutable_ui_ctx_from_callback(v);
     if (!c) {
         return;
     }
@@ -327,7 +376,7 @@ cb_retevis_rc2(void* v, const char* s) {
 
 void
 cb_tyt_ep(void* v, const char* s) {
-    UiCtx* c = (UiCtx*)v;
+    const UiCtx* c = mutable_ui_ctx_from_callback(v);
     if (!c) {
         return;
     }
@@ -339,7 +388,7 @@ cb_tyt_ep(void* v, const char* s) {
 
 void
 cb_ken_scr(void* v, const char* s) {
-    UiCtx* c = (UiCtx*)v;
+    const UiCtx* c = mutable_ui_ctx_from_callback(v);
     if (!c) {
         return;
     }
@@ -351,7 +400,7 @@ cb_ken_scr(void* v, const char* s) {
 
 void
 cb_anytone_bp(void* v, const char* s) {
-    UiCtx* c = (UiCtx*)v;
+    const UiCtx* c = mutable_ui_ctx_from_callback(v);
     if (!c) {
         return;
     }
@@ -363,7 +412,7 @@ cb_anytone_bp(void* v, const char* s) {
 
 void
 cb_xor_ks(void* v, const char* s) {
-    UiCtx* c = (UiCtx*)v;
+    const UiCtx* c = mutable_ui_ctx_from_callback(v);
     if (!c) {
         return;
     }
@@ -377,7 +426,7 @@ cb_xor_ks(void* v, const char* s) {
 
 void
 cb_key_basic(void* v, int ok, int val) {
-    UiCtx* c = (UiCtx*)v;
+    const UiCtx* c = mutable_ui_ctx_from_callback(v);
     if (!c) {
         return;
     }
@@ -393,7 +442,7 @@ cb_key_basic(void* v, int ok, int val) {
 
 void
 cb_key_scrambler(void* v, int ok, int val) {
-    UiCtx* c = (UiCtx*)v;
+    const UiCtx* c = mutable_ui_ctx_from_callback(v);
     if (!c) {
         return;
     }
@@ -409,7 +458,7 @@ cb_key_scrambler(void* v, int ok, int val) {
 
 void
 cb_key_rc4des(void* v, const char* text) {
-    UiCtx* c = (UiCtx*)v;
+    const UiCtx* c = mutable_ui_ctx_from_callback(v);
     if (!c) {
         return;
     }
@@ -498,9 +547,7 @@ cb_hytera_step(void* u, const char* text) {
         return;
     }
 
-    struct {
-        uint64_t H, K1, K2, K3, K4;
-    } p = {hc->H, hc->K1, hc->K2, hc->K3, hc->K4};
+    const uint64_t p[5] = {hc->H, hc->K1, hc->K2, hc->K3, hc->K4};
 
     ui_post_cmd(UI_CMD_KEY_HYTERA_SET, &p, sizeof p);
     ui_statusf("Hytera key set");
@@ -540,9 +587,7 @@ cb_aes_step(void* u, const char* text) {
         return;
     }
 
-    struct {
-        uint64_t K1, K2, K3, K4;
-    } p = {ac->K1, ac->K2, ac->K3, ac->K4};
+    const uint64_t p[4] = {ac->K1, ac->K2, ac->K3, ac->K4};
 
     ui_post_cmd(UI_CMD_KEY_AES_SET, &p, sizeof p);
     free(ac);
@@ -575,22 +620,19 @@ cb_p2_step(void* u, const char* text) {
     pc->step++;
     char pre[64];
     if (pc->step == 1) {
-        snprintf(pre, sizeof pre, "%llX",
-                 (unsigned long long)((pc->c && pc->c->state) ? pc->c->state->p2_sysid : 0ULL));
+        DSD_SNPRINTF(pre, sizeof pre, "%llX",
+                     (unsigned long long)((pc->c && pc->c->state) ? pc->c->state->p2_sysid : 0ULL));
         ui_prompt_open_string_async(p2_step_title(pc->step), pre, sizeof pre, cb_p2_step, pc);
         return;
     }
     if (pc->step == 2) {
-        snprintf(pre, sizeof pre, "%llX", (unsigned long long)((pc->c && pc->c->state) ? pc->c->state->p2_cc : 0ULL));
+        DSD_SNPRINTF(pre, sizeof pre, "%llX",
+                     (unsigned long long)((pc->c && pc->c->state) ? pc->c->state->p2_cc : 0ULL));
         ui_prompt_open_string_async(p2_step_title(pc->step), pre, sizeof pre, cb_p2_step, pc);
         return;
     }
 
-    struct {
-        uint64_t w;
-        uint64_t s;
-        uint64_t n;
-    } p = {pc->w, pc->s, pc->n};
+    const uint64_t p[3] = {pc->w, pc->s, pc->n};
 
     ui_post_cmd(UI_CMD_P25_P2_PARAMS_SET, &p, sizeof p);
     free(pc);
@@ -600,7 +642,7 @@ cb_p2_step(void* u, const char* text) {
 
 void
 cb_io_save_symbol_capture(void* v, const char* path) {
-    UiCtx* c = (UiCtx*)v;
+    const UiCtx* c = mutable_ui_ctx_from_callback(v);
     if (!c) {
         return;
     }
@@ -612,7 +654,7 @@ cb_io_save_symbol_capture(void* v, const char* path) {
 
 void
 cb_io_read_symbol_bin(void* v, const char* path) {
-    UiCtx* c = (UiCtx*)v;
+    const UiCtx* c = mutable_ui_ctx_from_callback(v);
     if (!c) {
         return;
     }
@@ -639,7 +681,7 @@ cb_udp_out_port(void* u, int ok, int port) {
         int32_t port;
     } payload = {0};
 
-    snprintf(payload.host, sizeof payload.host, "%s", ctx->host);
+    DSD_SNPRINTF(payload.host, sizeof payload.host, "%s", ctx->host);
     payload.port = port;
     ui_post_cmd(UI_CMD_UDP_OUT_CFG, &payload, sizeof payload);
     ui_statusf("UDP out requested: %s:%d", ctx->host, ctx->port);
@@ -656,7 +698,7 @@ cb_udp_out_host(void* u, const char* host) {
         free(ctx);
         return;
     }
-    snprintf(ctx->host, sizeof ctx->host, "%s", host);
+    DSD_SNPRINTF(ctx->host, sizeof ctx->host, "%s", host);
     int port_default = ctx->c->opts->udp_portno > 0 ? ctx->c->opts->udp_portno : 23456;
     ui_prompt_open_int_async("UDP blaster port", port_default, cb_udp_out_port, ctx);
 }
@@ -678,7 +720,7 @@ cb_tcp_port(void* u, int ok, int port) {
         int32_t port;
     } payload = {0};
 
-    snprintf(payload.host, sizeof payload.host, "%s", ctx->host);
+    DSD_SNPRINTF(payload.host, sizeof payload.host, "%s", ctx->host);
     payload.port = ctx->port;
     ui_post_cmd(UI_CMD_TCP_CONNECT_AUDIO_CFG, &payload, sizeof payload);
     ui_statusf("TCP connect requested: %s:%d", ctx->host, ctx->port);
@@ -695,7 +737,7 @@ cb_tcp_host(void* u, const char* host) {
         free(ctx);
         return;
     }
-    snprintf(ctx->host, sizeof ctx->host, "%s", host);
+    DSD_SNPRINTF(ctx->host, sizeof ctx->host, "%s", host);
     int defp = ctx->c->opts->tcp_portno > 0 ? ctx->c->opts->tcp_portno : 7355;
     ui_prompt_open_int_async("Enter TCP Direct Link Port Number", defp, cb_tcp_port, ctx);
 }
@@ -717,7 +759,7 @@ cb_udp_in_port(void* u, int ok, int port) {
         int32_t port;
     } payload = {0};
 
-    snprintf(payload.bind, sizeof payload.bind, "%s", ctx->addr);
+    DSD_SNPRINTF(payload.bind, sizeof payload.bind, "%s", ctx->addr);
     payload.port = ctx->port;
     ui_post_cmd(UI_CMD_UDP_INPUT_CFG, &payload, sizeof payload);
     ui_statusf("UDP input set requested: %s:%d", ctx->addr, ctx->port);
@@ -734,7 +776,7 @@ cb_udp_in_addr(void* u, const char* addr) {
         free(ctx);
         return;
     }
-    snprintf(ctx->addr, sizeof ctx->addr, "%s", addr);
+    DSD_SNPRINTF(ctx->addr, sizeof ctx->addr, "%s", addr);
     int defp = ctx->c->opts->udp_in_portno > 0 ? ctx->c->opts->udp_in_portno : 7355;
     ui_prompt_open_int_async("Enter UDP bind port", defp, cb_udp_in_port, ctx);
 }
@@ -756,7 +798,7 @@ cb_rig_port(void* u, int ok, int port) {
         int32_t port;
     } payload = {0};
 
-    snprintf(payload.host, sizeof payload.host, "%s", ctx->host);
+    DSD_SNPRINTF(payload.host, sizeof payload.host, "%s", ctx->host);
     payload.port = ctx->port;
     ui_post_cmd(UI_CMD_RIGCTL_CONNECT_CFG, &payload, sizeof payload);
     ui_statusf("Rigctl connect requested: %s:%d", ctx->host, ctx->port);
@@ -773,14 +815,14 @@ cb_rig_host(void* u, const char* host) {
         free(ctx);
         return;
     }
-    snprintf(ctx->host, sizeof ctx->host, "%s", host);
+    DSD_SNPRINTF(ctx->host, sizeof ctx->host, "%s", host);
     int defp = ctx->c->opts->rigctlportno > 0 ? ctx->c->opts->rigctlportno : 4532;
     ui_prompt_open_int_async("Enter RIGCTL Port Number", defp, cb_rig_port, ctx);
 }
 
 void
 cb_switch_to_wav(void* v, const char* path) {
-    UiCtx* c = (UiCtx*)v;
+    const UiCtx* c = mutable_ui_ctx_from_callback(v);
     if (!c) {
         return;
     }
@@ -792,7 +834,7 @@ cb_switch_to_wav(void* v, const char* path) {
 
 void
 cb_switch_to_symbol(void* v, const char* path) {
-    UiCtx* c = (UiCtx*)v;
+    const UiCtx* c = mutable_ui_ctx_from_callback(v);
     if (!c) {
         return;
     }
@@ -812,7 +854,7 @@ cb_switch_to_symbol(void* v, const char* path) {
 
 void
 cb_gain_dig(void* u, int ok, double g) {
-    UiCtx* c = (UiCtx*)u;
+    const UiCtx* c = mutable_ui_ctx_from_callback(u);
     if (!c) {
         return;
     }
@@ -829,7 +871,7 @@ cb_gain_dig(void* u, int ok, double g) {
 
 void
 cb_gain_ana(void* u, int ok, double g) {
-    UiCtx* c = (UiCtx*)u;
+    const UiCtx* c = mutable_ui_ctx_from_callback(u);
     if (!c) {
         return;
     }
@@ -846,7 +888,7 @@ cb_gain_ana(void* u, int ok, double g) {
 
 void
 cb_input_vol(void* u, int ok, int m) {
-    UiCtx* c = (UiCtx*)u;
+    const UiCtx* c = mutable_ui_ctx_from_callback(u);
     if (!c) {
         return;
     }
@@ -865,7 +907,7 @@ cb_input_vol(void* u, int ok, int m) {
 
 void
 cb_rtl_dev(void* u, int ok, int i) {
-    UiCtx* c = (UiCtx*)u;
+    const UiCtx* c = mutable_ui_ctx_from_callback(u);
     if (!c) {
         return;
     }
@@ -877,7 +919,7 @@ cb_rtl_dev(void* u, int ok, int i) {
 
 void
 cb_rtl_freq(void* u, int ok, int f) {
-    UiCtx* c = (UiCtx*)u;
+    const UiCtx* c = mutable_ui_ctx_from_callback(u);
     if (!c) {
         return;
     }
@@ -889,7 +931,7 @@ cb_rtl_freq(void* u, int ok, int f) {
 
 void
 cb_rtl_gain(void* u, int ok, int g) {
-    UiCtx* c = (UiCtx*)u;
+    const UiCtx* c = mutable_ui_ctx_from_callback(u);
     if (!c) {
         return;
     }
@@ -906,7 +948,7 @@ cb_rtl_gain(void* u, int ok, int g) {
 
 void
 cb_rtl_ppm(void* u, int ok, int p) {
-    UiCtx* c = (UiCtx*)u;
+    const UiCtx* c = mutable_ui_ctx_from_callback(u);
     if (!c) {
         return;
     }
@@ -923,7 +965,7 @@ cb_rtl_ppm(void* u, int ok, int p) {
 
 void
 cb_rtl_bw(void* u, int ok, int bw) {
-    UiCtx* c = (UiCtx*)u;
+    const UiCtx* c = mutable_ui_ctx_from_callback(u);
     if (!c) {
         return;
     }
@@ -954,7 +996,7 @@ cb_rtl_bw(void* u, int ok, int bw) {
 
 void
 cb_rtl_sql(void* u, int ok, double dB) {
-    UiCtx* c = (UiCtx*)u;
+    const UiCtx* c = mutable_ui_ctx_from_callback(u);
     if (!c) {
         return;
     }
@@ -966,17 +1008,17 @@ cb_rtl_sql(void* u, int ok, double dB) {
 
 void
 cb_rtl_vol(void* u, int ok, int m) {
-    UiCtx* c = (UiCtx*)u;
+    const UiCtx* c = mutable_ui_ctx_from_callback(u);
     if (!c) {
         return;
     }
     if (ok) {
         int adjusted = 0;
-        m = clamp_int_with_notice("RTL volume", m, 0, 3, &adjusted);
+        m = clamp_int_with_notice("RTL monitor gain", m, 0, 3, &adjusted);
         int32_t v = m;
         ui_post_cmd(UI_CMD_RTL_SET_VOL_MULT, &v, sizeof v);
         if (!adjusted) {
-            ui_statusf("Applying RTL volume: %dX", m);
+            ui_statusf("Applying RTL monitor gain: %dX", m);
         }
     }
 }
@@ -985,7 +1027,7 @@ cb_rtl_vol(void* u, int ok, int m) {
 
 void
 cb_input_warn(void* v, int ok, double thr) {
-    UiCtx* c = (UiCtx*)v;
+    const UiCtx* c = mutable_ui_ctx_from_callback(v);
     if (!c) {
         return;
     }
@@ -1015,7 +1057,7 @@ cb_set_p25_num(void* u, int ok, double val) {
 
 void
 cb_audio_lpf(void* v, int ok, int hz) {
-    UiCtx* c = (UiCtx*)v;
+    const UiCtx* c = mutable_ui_ctx_from_callback(v);
     if (!c || !ok) {
         return;
     }
@@ -1062,7 +1104,7 @@ cb_auto_ppm_zerohz(void* v, int ok, int h) {
 
 void
 cb_tcp_prebuf(void* v, int ok, int ms) {
-    UiCtx* c = (UiCtx*)v;
+    const UiCtx* c = mutable_ui_ctx_from_callback(v);
     if (!ok) {
         return;
     }
@@ -1074,7 +1116,7 @@ cb_tcp_prebuf(void* v, int ok, int ms) {
 
 void
 cb_tcp_rcvbuf(void* v, int ok, int sz) {
-    UiCtx* c = (UiCtx*)v;
+    const UiCtx* c = mutable_ui_ctx_from_callback(v);
     if (!ok) {
         return;
     }
@@ -1090,7 +1132,7 @@ cb_tcp_rcvbuf(void* v, int ok, int sz) {
 
 void
 cb_tcp_rcvtimeo(void* v, int ok, int ms) {
-    UiCtx* c = (UiCtx*)v;
+    const UiCtx* c = mutable_ui_ctx_from_callback(v);
     if (!ok) {
         return;
     }
@@ -1108,7 +1150,7 @@ cb_tcp_rcvtimeo(void* v, int ok, int ms) {
 
 void
 cb_lr_custom(void* v, const char* path) {
-    UiCtx* c = (UiCtx*)v;
+    const UiCtx* c = mutable_ui_ctx_from_callback(v);
     if (!c) {
         return;
     }
@@ -1158,7 +1200,7 @@ cb_env_edit_name(void* u, const char* name) {
         free(ec);
         return;
     }
-    snprintf(ec->name, sizeof ec->name, "%s", name);
+    DSD_SNPRINTF(ec->name, sizeof ec->name, "%s", name);
     const char* cur = dsd_neo_env_get(ec->name);
     ui_prompt_open_string_async("Enter value (empty to clear)", cur ? cur : "", 256, cb_env_edit_value, ec);
 }
@@ -1179,23 +1221,19 @@ cb_m17_user_data(void* u, const char* text) {
 
 static void
 chooser_free_lists(const char** names, char** bufs, int n, const char** labels) {
-    for (int i = 0; i < n; i++) {
-        if (names) {
+    if (names) {
+        for (int i = 0; i < n; i++) {
             free((void*)names[i]);
         }
-        if (bufs) {
+    }
+    if (bufs) {
+        for (int i = 0; i < n; i++) {
             free(bufs[i]);
         }
     }
-    if (labels) {
-        free((void*)labels);
-    }
-    if (names) {
-        free((void*)names);
-    }
-    if (bufs) {
-        free((void*)bufs);
-    }
+    free((void*)labels);
+    free((void*)names);
+    free((void*)bufs);
 }
 
 void
