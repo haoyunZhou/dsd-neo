@@ -95,6 +95,12 @@ p25p2_add_secondary_cc_candidates(dsd_opts* opts, dsd_state* state, int rfssid, 
         return;
     }
 
+    /*
+     * Load persisted candidates before direct SCCB promotion so a full cache
+     * cannot evict the freshly validated current-site frequency.
+     */
+    p25_cc_try_load_cache(opts, state);
+
     long notify[2] = {0, 0};
     int notify_count = 0;
     for (int i = 0; i < count && i < 2; i++) {
@@ -513,14 +519,14 @@ typedef struct {
     int iter_idx;
 } p25p2_vpdu_ctx;
 
-static void p25p2_vpdu_emit_json(p25p2_vpdu_ctx* ctx);
+static void p25p2_vpdu_emit_json(const p25p2_vpdu_ctx* ctx);
 static void p25p2_vpdu_lcch_signal_update(p25p2_vpdu_ctx* ctx);
-static int p25p2_vpdu_validate_len_and_warn(p25p2_vpdu_ctx* ctx);
+static int p25p2_vpdu_validate_len_and_warn(const p25p2_vpdu_ctx* ctx);
 static void p25p2_vpdu_dispatch_blocks(p25p2_vpdu_ctx* ctx);
 static int p25p2_vpdu_advance_segment(p25p2_vpdu_ctx* ctx);
 
 static void
-p25p2_vpdu_emit_json(p25p2_vpdu_ctx* ctx) {
+p25p2_vpdu_emit_json(const p25p2_vpdu_ctx* ctx) {
     uint8_t mfid = (uint8_t)ctx->mac[2];
     uint8_t opcode = (uint8_t)ctx->mac[1];
     const char* tag = NULL;
@@ -571,7 +577,7 @@ p25p2_vpdu_seen_unknown_len(uint8_t mfid, uint8_t opcode) {
 }
 
 static int
-p25p2_vpdu_validate_len_and_warn(p25p2_vpdu_ctx* ctx) {
+p25p2_vpdu_validate_len_and_warn(const p25p2_vpdu_ctx* ctx) {
     if (ctx->len_b != 0) {
         return 1;
     }
@@ -836,6 +842,7 @@ p25p2_vpdu_mark_enc_lockout(dsd_opts* opts, dsd_state* state, int slot, int talk
         return;
     }
     p25_emit_enc_lockout_once(opts, state, (uint8_t)slot, talkgroup, /*svc_bits*/ 0);
+    state->p25_p2_enc_lockout_muted[slot & 1] = 1;
 }
 
 static void
@@ -3264,6 +3271,7 @@ p25p2_vpdu_iter_block_44(p25p2_vpdu_ctx* ctx) {
         DSD_FPRINTF(stderr, "CC: %03X; ", cc);
 
         p25p2_vpdu_gate_slot_audio(state, eslot);
+        state->p25_p2_enc_lockout_muted[eslot & 1] = 0;
         other_audio = p25p2_vpdu_other_slot_audio_with_history(state, eslot, mac_hold, voice_hold);
         if (!other_audio) {
             (void)p25p2_vpdu_force_release_after_grace(opts, state);

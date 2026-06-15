@@ -237,6 +237,7 @@ init_opts_runtime_and_network_defaults(dsd_opts* opts) {
     opts->aggressive_framesync = 1;
     /* DMR: strict CRC gating by default (use -F to relax, like other protocols). */
     opts->dmr_crc_relaxed_default = 0;
+    opts->dmr_debug_burst = 0;
     opts->iq_capture_requested = 0;
     opts->iq_replay_requested = 0;
     opts->iq_replay_loop = 0;
@@ -727,6 +728,8 @@ init_state_protocol_defaults_a(dsd_state* state) {
     state->fourv_counter[1] = 0;
     state->voice_counter[0] = 0;
     state->voice_counter[1] = 0;
+    state->p25_p2_enc_lockout_muted[0] = 0;
+    state->p25_p2_enc_lockout_muted[1] = 0;
 
     state->K = 0;
     state->R = 0;
@@ -866,6 +869,7 @@ init_state_p25_and_trunk_defaults(dsd_state* state) {
     state->p25_p2_enc_pending[1] = 0;
     state->p25_p2_enc_pending_ttg[0] = 0;
     state->p25_p2_enc_pending_ttg[1] = 0;
+    state->p25_p2_active_slot = -1;
     state->p25_cc_is_tdma =
         2; //init on 2, TSBK NET_STS will set 0, TDMA NET_STS will set 1. //used to determine if we need to change symbol rate when cc hunting
     state->p25_sys_is_tdma = 0;

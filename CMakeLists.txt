@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(dsd-neo VERSION 2.0.0 LANGUAGES C CXX)
+project(dsd-neo VERSION 2.0.1 LANGUAGES C CXX)
 if(POLICY CMP0083)
     cmake_policy(SET CMP0083 NEW)
 endif()
@@ -243,6 +243,15 @@ endfunction()
 set(_dsd_release_like_config
     "$<OR:$<CONFIG:Release>,$<CONFIG:RelWithDebInfo>,$<CONFIG:MinSizeRel>>"
 )
+set(_dsd_not_static_library
+    "$<NOT:$<STREQUAL:$<TARGET_PROPERTY:TYPE>,STATIC_LIBRARY>>"
+)
+set(_dsd_not_object_library
+    "$<NOT:$<STREQUAL:$<TARGET_PROPERTY:TYPE>,OBJECT_LIBRARY>>"
+)
+set(_dsd_linkable_target
+    "$<AND:${_dsd_not_static_library},${_dsd_not_object_library}>"
+)
 
 if(DSD_ENABLE_HARDENING)
     if(
@@ -342,9 +351,6 @@ if(DSD_ENABLE_HARDENING)
             endif()
         endif()
     elseif(MSVC)
-        set(_dsd_linkable_target
-            "$<AND:$<NOT:$<STREQUAL:$<TARGET_PROPERTY:TYPE>,STATIC_LIBRARY>>,$<NOT:$<STREQUAL:$<TARGET_PROPERTY:TYPE>,OBJECT_LIBRARY>>>"
-        )
         target_link_options(
             dsd-neo_hardening
             INTERFACE
@@ -408,8 +414,16 @@ if(DSD_ENABLE_WARNINGS)
     if(DSD_WARNINGS_AS_ERRORS)
         if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
             target_compile_options(dsd-neo_warnings INTERFACE -Werror)
+            target_link_options(
+                dsd-neo_warnings
+                INTERFACE "$<${_dsd_linkable_target}:-Werror>"
+            )
         elseif(MSVC)
             target_compile_options(dsd-neo_warnings INTERFACE /WX)
+            target_link_options(
+                dsd-neo_warnings
+                INTERFACE "$<${_dsd_linkable_target}:/WX>"
+            )
         endif()
     endif()
 endif()

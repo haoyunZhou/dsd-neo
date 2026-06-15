@@ -40,6 +40,7 @@
 #include <dsd-neo/ui/ui_prims.h>
 #include <stdarg.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include "dsd-neo/core/opts_fwd.h"
@@ -47,13 +48,13 @@
 #include "dsd-neo/core/secret_redaction.h"
 #include "dsd-neo/core/state_fwd.h"
 #include "dsd-neo/platform/platform.h"
+#include "ui_snr_readout.h"
 
 #ifdef USE_RADIO
 #include <dsd-neo/io/rtl_stream_c.h>
 #include <dsd-neo/ui/keymap.h>
 #include <dsd-neo/ui/ncurses_snr.h>
 #include <dsd-neo/ui/ncurses_visualizers.h>
-#include <math.h>
 #endif
 
 static int
@@ -815,7 +816,7 @@ ui_render_forced_key_status(const dsd_state* state) {
 }
 
 static void
-ui_render_scanner_and_reverse_status(dsd_opts* opts, dsd_state* state) {
+ui_render_scanner_and_reverse_status(const dsd_opts* opts, const dsd_state* state) {
     if (opts->scanner_mode == 1) {
         printw("| Scan Mode: ");
         if (state->lcn_freq_roll != 0) {
@@ -831,7 +832,7 @@ ui_render_scanner_and_reverse_status(dsd_opts* opts, dsd_state* state) {
 }
 
 static void
-ui_render_crypto_key_and_scanner_status(dsd_opts* opts, dsd_state* state) {
+ui_render_crypto_key_and_scanner_status(const dsd_opts* opts, const dsd_state* state) {
     ui_render_forced_key_status(state);
     ui_render_scanner_and_reverse_status(opts, state);
 }
@@ -976,136 +977,6 @@ ui_render_audio_decode_header_fields(dsd_opts* opts, const dsd_state* state) {
     }
 }
 
-#ifdef USE_RADIO
-enum {
-    UI_SNR_INVALID_DB = -50,
-    UI_SNR_STALE_THRESHOLD_CDB = 5, /* 0.05 dB in centi-dB */
-    UI_SNR_STALE_LIMIT = 40
-};
-
-static double
-ui_snr_get_c4fm_value(void) {
-    static double last_c4_snr = -999.0;
-    static int last_c4_stable = 0;
-
-    double snr = rtl_stream_get_snr_c4fm();
-    if (snr <= (double)UI_SNR_INVALID_DB) {
-        double fb = rtl_stream_estimate_snr_c4fm_eye();
-        if (fb > (double)UI_SNR_INVALID_DB) {
-            snr = fb;
-            last_c4_stable = 0;
-        }
-        return snr;
-    }
-
-    int delta_cdb = (int)(fabs(snr - last_c4_snr) * 100.0);
-    if (delta_cdb < UI_SNR_STALE_THRESHOLD_CDB) {
-        if (++last_c4_stable >= UI_SNR_STALE_LIMIT) {
-            double fb = rtl_stream_estimate_snr_c4fm_eye();
-            if (fb > (double)UI_SNR_INVALID_DB) {
-                snr = fb;
-            }
-            last_c4_stable = 0;
-        }
-    } else {
-        last_c4_stable = 0;
-    }
-    last_c4_snr = snr;
-    return snr;
-}
-
-static double
-ui_snr_get_qpsk_value(void) {
-    static double last_qp_snr = -999.0;
-    static int last_qp_stable = 0;
-
-    double snr = rtl_stream_get_snr_cqpsk();
-    if (snr <= (double)UI_SNR_INVALID_DB) {
-        double fb = rtl_stream_estimate_snr_qpsk_const();
-        if (fb > (double)UI_SNR_INVALID_DB) {
-            snr = fb;
-            last_qp_stable = 0;
-        } else {
-            double snr_c = rtl_stream_get_snr_c4fm();
-            double snr_g = rtl_stream_get_snr_gfsk();
-            double snr_fb = (snr_c > snr_g) ? snr_c : snr_g;
-            if (snr_fb > (double)UI_SNR_INVALID_DB) {
-                snr = snr_fb;
-            }
-        }
-        return snr;
-    }
-
-    int delta_cdb = (int)(fabs(snr - last_qp_snr) * 100.0);
-    if (delta_cdb < UI_SNR_STALE_THRESHOLD_CDB) {
-        if (++last_qp_stable >= UI_SNR_STALE_LIMIT) {
-            double fb = rtl_stream_estimate_snr_qpsk_const();
-            if (fb > (double)UI_SNR_INVALID_DB) {
-                snr = fb;
-            }
-            last_qp_stable = 0;
-        }
-    } else {
-        last_qp_stable = 0;
-    }
-    last_qp_snr = snr;
-    return snr;
-}
-
-static double
-ui_snr_get_gfsk_value(void) {
-    static double last_gf_snr = -999.0;
-    static int last_gf_stable = 0;
-
-    double snr = rtl_stream_get_snr_gfsk();
-    if (snr <= (double)UI_SNR_INVALID_DB) {
-        double fb = rtl_stream_estimate_snr_gfsk_eye();
-        if (fb > (double)UI_SNR_INVALID_DB) {
-            snr = fb;
-            last_gf_stable = 0;
-        }
-        return snr;
-    }
-
-    int delta_cdb = (int)(fabs(snr - last_gf_snr) * 100.0);
-    if (delta_cdb < UI_SNR_STALE_THRESHOLD_CDB) {
-        if (++last_gf_stable >= UI_SNR_STALE_LIMIT) {
-            double fb = rtl_stream_estimate_snr_gfsk_eye();
-            if (fb > (double)UI_SNR_INVALID_DB) {
-                snr = fb;
-            }
-            last_gf_stable = 0;
-        }
-    } else {
-        last_gf_stable = 0;
-    }
-    last_gf_snr = snr;
-    return snr;
-}
-
-static const char*
-ui_snr_mod_label(int rf_mod) {
-    if (rf_mod == 1) {
-        return "QPSK";
-    }
-    if (rf_mod == 2) {
-        return "GFSK";
-    }
-    return "C4FM";
-}
-
-static double
-ui_snr_value_for_mod(int rf_mod) {
-    if (rf_mod == 1) {
-        return ui_snr_get_qpsk_value();
-    }
-    if (rf_mod == 2) {
-        return ui_snr_get_gfsk_value();
-    }
-    return ui_snr_get_c4fm_value();
-}
-#endif
-
 static void
 ui_render_demod_snr_line(const dsd_opts* opts, const dsd_state* state) {
     if (opts == NULL || state == NULL) {
@@ -1116,18 +987,18 @@ ui_render_demod_snr_line(const dsd_opts* opts, const dsd_state* state) {
     /* Demod SNR (per modulation) */
 #ifdef USE_RADIO
     {
-        double snr = ui_snr_value_for_mod(state->rf_mod);
-        const char* m = ui_snr_mod_label(state->rf_mod);
-        if (snr > (double)UI_SNR_INVALID_DB) {
+        ui_snr_readout snr = ui_snr_readout_for_mod(state->rf_mod);
+        const char* m = snr.mod_label;
+        if (snr.valid) {
             /* Show current SNR as a compact, colorized meter */
             char snr_value[16];
-            if (DSD_SNPRINTF(snr_value, sizeof(snr_value), "%.1f", snr) < 0) {
+            if (DSD_SNPRINTF(snr_value, sizeof(snr_value), "%.1f", snr.snr_db) < 0) {
                 snr_value[0] = '\0';
             }
             ui_print_snr_db_field(snr_value);
             addch(' ');
             /* Pass current modulation for per-mod color bands */
-            print_snr_meter(opts, snr, state->rf_mod);
+            print_snr_meter(opts, snr.snr_db, state->rf_mod);
             printw(" (%s)", m);
         } else {
             /* Show placeholder so users can see the field even when no estimate */
@@ -1434,6 +1305,12 @@ typedef struct {
     uint16_t string_size;
 } ui_history_render_ctx;
 
+typedef struct {
+    uint8_t slot;
+    uint16_t idx;
+    time_t sort_time;
+} ui_history_item_ref;
+
 static void
 ui_history_render_header(const dsd_state* state, int history_mode) {
     int rows = 0;
@@ -1659,97 +1536,97 @@ ui_history_render_dual_slot_item(const Event_History* item, uint8_t slot, const 
     (void)ui_history_print_detail_line(ctx->history_stop_y, slot, "DSD-neo: ", item->internal_str);
 }
 
-static uint16_t
-ui_history_single_slot_start_index(const dsd_state* state, uint8_t slot, uint16_t skip) {
-    uint16_t idx = 1;
-    while (idx < 255 && skip > 0) {
-        const Event_History* item = &state->event_history_s[slot].Event_History_Items[idx];
-        if (ui_eh_item_has_content(item)) {
-            skip--;
-        }
-        idx++;
-    }
-    return idx;
-}
-
-static void
-ui_history_advance_dual_indices(const dsd_state* state, uint16_t* idx0, uint16_t* idx1) {
-    while (*idx0 < 255 && !ui_eh_item_has_content(&state->event_history_s[0].Event_History_Items[*idx0])) {
-        (*idx0)++;
-    }
-    while (*idx1 < 255 && !ui_eh_item_has_content(&state->event_history_s[1].Event_History_Items[*idx1])) {
-        (*idx1)++;
-    }
-}
-
 static int
-ui_history_take_latest_dual_item(const dsd_state* state, uint16_t* idx0, uint16_t* idx1, uint8_t* slot, uint16_t* idx) {
-    ui_history_advance_dual_indices(state, idx0, idx1);
-    if (*idx0 >= 255 && *idx1 >= 255) {
-        return 0;
-    }
+ui_history_item_ref_compare(const void* lhs, const void* rhs) {
+    const ui_history_item_ref* a = (const ui_history_item_ref*)lhs;
+    const ui_history_item_ref* b = (const ui_history_item_ref*)rhs;
 
-    time_t t0 = (*idx0 < 255) ? state->event_history_s[0].Event_History_Items[*idx0].event_time : 0;
-    time_t t1 = (*idx1 < 255) ? state->event_history_s[1].Event_History_Items[*idx1].event_time : 0;
-    if (*idx1 < 255 && (*idx0 >= 255 || t1 > t0)) {
-        *slot = 1;
-        *idx = *idx1;
-        (*idx1)++;
-    } else {
-        *slot = 0;
-        *idx = *idx0;
-        (*idx0)++;
+    if (a->sort_time > b->sort_time) {
+        return -1;
     }
-    return 1;
+    if (a->sort_time < b->sort_time) {
+        return 1;
+    }
+    if (a->idx < b->idx) {
+        return -1;
+    }
+    if (a->idx > b->idx) {
+        return 1;
+    }
+    if (a->slot < b->slot) {
+        return -1;
+    }
+    if (a->slot > b->slot) {
+        return 1;
+    }
+    return 0;
 }
 
-static void
-ui_history_skip_dual_items(const dsd_state* state, uint16_t skip, uint16_t* idx0, uint16_t* idx1) {
-    uint8_t slot = 0;
-    uint16_t idx = 0;
-    while (skip > 0 && ui_history_take_latest_dual_item(state, idx0, idx1, &slot, &idx)) {
-        (void)slot;
-        (void)idx;
-        skip--;
+static size_t
+ui_history_collect_slot_items(const dsd_state* state, uint8_t slot, ui_history_item_ref* refs, size_t count,
+                              size_t cap) {
+    if (state == NULL || state->event_history_s == NULL || refs == NULL || count >= cap || slot >= 2) {
+        return count;
     }
-}
 
-static void
-ui_history_render_single_slot(const dsd_state* state, const ui_history_render_ctx* ctx) {
-    uint8_t slot = state->eh_slot;
-    uint16_t idx = ui_history_single_slot_start_index(state, slot, state->eh_index);
-
-    for (int shown = 0; shown < ctx->events_to_show && idx < 255; idx++) {
-        if (!ui_history_has_room_for_line(ctx->history_stop_y)) {
-            break;
-        }
+    for (uint16_t idx = 1; idx < 255 && count < cap; idx++) {
         const Event_History* item = &state->event_history_s[slot].Event_History_Items[idx];
         if (!ui_eh_item_has_content(item)) {
             continue;
         }
+        refs[count].slot = slot;
+        refs[count].idx = idx;
+        refs[count].sort_time = ui_history_event_sort_time(item->event_string, item->event_time);
+        count++;
+    }
+    return count;
+}
+
+static size_t
+ui_history_collect_sorted_items(const dsd_state* state, uint8_t slot, ui_history_item_ref* refs, size_t cap) {
+    size_t count = 0;
+    if (slot < 2) {
+        count = ui_history_collect_slot_items(state, slot, refs, count, cap);
+    } else {
+        count = ui_history_collect_slot_items(state, 0, refs, count, cap);
+        count = ui_history_collect_slot_items(state, 1, refs, count, cap);
+    }
+
+    if (count > 1) {
+        qsort(refs, count, sizeof(refs[0]), ui_history_item_ref_compare);
+    }
+    return count;
+}
+
+static void
+ui_history_render_item_refs(const dsd_state* state, const ui_history_render_ctx* ctx, const ui_history_item_ref* refs,
+                            size_t count) {
+    size_t pos = state->eh_index;
+    if (pos > count) {
+        pos = count;
+    }
+
+    for (int shown = 0; shown < ctx->events_to_show && pos < count; pos++) {
+        if (!ui_history_has_room_for_line(ctx->history_stop_y)) {
+            break;
+        }
+        const uint8_t slot = refs[pos].slot;
+        const uint16_t idx = refs[pos].idx;
+        const Event_History* item = &state->event_history_s[slot].Event_History_Items[idx];
         shown++;
-        ui_history_render_single_slot_item(item, ctx);
+        if (state->eh_slot < 2) {
+            ui_history_render_single_slot_item(item, ctx);
+        } else {
+            ui_history_render_dual_slot_item(item, slot, ctx);
+        }
     }
 }
 
 static void
-ui_history_render_dual_slots(const dsd_state* state, const ui_history_render_ctx* ctx) {
-    uint16_t idx0 = 1;
-    uint16_t idx1 = 1;
-    ui_history_skip_dual_items(state, state->eh_index, &idx0, &idx1);
-
-    for (int shown = 0; shown < ctx->events_to_show; shown++) {
-        if (!ui_history_has_room_for_line(ctx->history_stop_y)) {
-            break;
-        }
-        uint8_t slot = 0;
-        uint16_t idx = 0;
-        if (!ui_history_take_latest_dual_item(state, &idx0, &idx1, &slot, &idx)) {
-            break;
-        }
-        const Event_History* item = &state->event_history_s[slot].Event_History_Items[idx];
-        ui_history_render_dual_slot_item(item, slot, ctx);
-    }
+ui_history_render_sorted_slot_items(const dsd_state* state, const ui_history_render_ctx* ctx, uint8_t slot) {
+    ui_history_item_ref refs[508];
+    size_t count = ui_history_collect_sorted_items(state, slot, refs, sizeof(refs) / sizeof(refs[0]));
+    ui_history_render_item_refs(state, ctx, refs, count);
 }
 
 static void
@@ -1764,9 +1641,9 @@ ui_render_event_history_section(const dsd_state* state) {
         ui_history_setup_render_ctx(history_mode, &history_draw_footer, &ctx);
         if (state->event_history_s != NULL) {
             if (state->eh_slot < 2) {
-                ui_history_render_single_slot(state, &ctx);
+                ui_history_render_sorted_slot_items(state, &ctx, state->eh_slot);
             } else {
-                ui_history_render_dual_slots(state, &ctx);
+                ui_history_render_sorted_slot_items(state, &ctx, 2);
             }
         }
     }
@@ -2324,7 +2201,7 @@ ui_render_edacs_channel_label(const dsd_state* state, int lcn) {
 }
 
 static void
-ui_render_edacs_lcn_row(const dsd_opts* opts, dsd_state* state, int lcn) {
+ui_render_edacs_lcn_row(const dsd_opts* opts, const dsd_state* state, int lcn) {
     int a = (edacs_channel_tree[lcn][2] >> state->edacs_a_shift) & state->edacs_a_mask;
     int f = (edacs_channel_tree[lcn][2] >> state->edacs_f_shift) & state->edacs_f_mask;
     int s = edacs_channel_tree[lcn][2] & state->edacs_s_mask;

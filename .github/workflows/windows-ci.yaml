@@ -26,14 +26,17 @@ jobs:
     permissions:
       actions: read
       contents: read
+      packages: read
     env:
       # Use a release-only triplet to avoid building debug variants of vcpkg deps.
       VCPKG_DEFAULT_TRIPLET: x64-windows-dynamic-release
       VCPKG_TARGET_TRIPLET: x64-windows-dynamic-release
       VCPKG_OVERLAY_TRIPLETS: ${{ github.workspace }}\vcpkg-triplets
-      # Do not write GitHub Packages/vcpkg binary cache from pull_request jobs.
+      # Pull requests may restore existing vcpkg binaries but must not write new cache entries.
       VCPKG_EXE: ${{ github.workspace }}/vcpkg/vcpkg.exe
-      VCPKG_BINARY_SOURCES: "clear"
+      VCPKG_NUGET_FEED: https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json
+      VCPKG_NUGET_USER: ${{ github.repository_owner }}
+      VCPKG_BINARY_SOURCES: "clear;nuget,https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json,read"
       # Enable sccache GitHub Actions backend.
       SCCACHE_GHA_ENABLED: "true"
     steps:
@@ -58,12 +61,32 @@ jobs:
         with:
           # run-vcpkg v11.5 requires a full 40-char SHA1.
           # Keep this in sync with vcpkg.json's builtin-baseline.
-          vcpkgGitCommitId: "d015e31e90838a4c9dfa3eed45979bc70d9357fc"
+          vcpkgGitCommitId: "f3e10653cc27d62a37a3763cd84b38bca07c6075"
 
+      - name: Configure vcpkg binary cache
+        shell: pwsh
+        env:
+          VCPKG_NUGET_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $nuget = (& $env:VCPKG_EXE fetch nuget | Select-Object -Last 1)
+          if (-not $nuget) { throw "vcpkg fetch nuget did not return a path" }
+
+          & $nuget sources add `
+            -Source "$env:VCPKG_NUGET_FEED" `
+            -StorePasswordInClearText `
+            -Name GitHubPackages `
+            -UserName "$env:VCPKG_NUGET_USER" `
+            -Password "$env:VCPKG_NUGET_TOKEN" `
+            -NonInteractive
 
       - name: Install vcpkg dependencies (MSVC)
         shell: pwsh
-        run: vcpkg install --triplet $env:VCPKG_DEFAULT_TRIPLET --overlay-triplets "$env:GITHUB_WORKSPACE\\vcpkg-triplets" --x-manifest-root "$env:GITHUB_WORKSPACE"
+        run: >-
+          vcpkg install
+          --triplet $env:VCPKG_DEFAULT_TRIPLET
+          --overlay-triplets "$env:GITHUB_WORKSPACE\\vcpkg-triplets"
+          --x-manifest-root "$env:GITHUB_WORKSPACE"
+          --only-binarycaching
 
       - name: Configure (MSVC Release)
         shell: pwsh
@@ -145,7 +168,7 @@ jobs:
         with:
           # run-vcpkg v11.5 requires a full 40-char SHA1.
           # Keep this in sync with vcpkg.json's builtin-baseline.
-          vcpkgGitCommitId: "d015e31e90838a4c9dfa3eed45979bc70d9357fc"
+          vcpkgGitCommitId: "f3e10653cc27d62a37a3763cd84b38bca07c6075"
 
       - name: Configure vcpkg binary cache
         shell: pwsh
@@ -338,6 +361,13 @@ jobs:
       actions: read
       contents: write
     steps:
+      - name: Checkout release helpers
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
       - name: Prepare artifact naming
         id: names
         shell: bash
@@ -382,18 +412,30 @@ jobs:
           set -euo pipefail
           test -f "${{ steps.names.outputs.ZIP_PATH }}"
           test -f "${{ steps.names.outputs.ZIP_PATH }}.spdx.json"
-      - name: Upload native MSVC release asset
+      - name: Wait for release metadata
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda
-        with:
-          files: |
-            ${{ steps.names.outputs.ZIP_PATH }}
-            ${{ steps.names.outputs.ZIP_PATH }}.spdx.json
-          name: ${{ steps.names.outputs.RELEASE_TITLE }}
-          generate_release_notes: true
-          overwrite_files: true
-          fail_on_unmatched_files: true
-          token: ${{ github.token }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: tools/ci_wait_for_release.sh
+      - name: Upload native MSVC release assets
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          ZIP_PATH: ${{ steps.names.outputs.ZIP_PATH }}
+          SBOM_PATH: ${{ steps.names.outputs.ZIP_PATH }}.spdx.json
+        run: |
+          set -euo pipefail
+          gh release upload "${RELEASE_TAG}" \
+            "${ZIP_PATH}" \
+            "${SBOM_PATH}" \
+            --repo "${RELEASE_REPOSITORY}" \
+            --clobber
       - name: Upload native MSVC nightly assets (overwrite)
         if: >-
           (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
