@@ -50,6 +50,7 @@ target_sources(dsd-neo_engine PRIVATE
   engine.c
   frame_sync_hooks_install.c
   p25_optional_hooks_install.c
+  trunk_scan.c
   trunk_tuning.c
   trunk_tuning_hooks_install.c
   rtl_stream_io_hooks_install.c

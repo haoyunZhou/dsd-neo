@@ -80,6 +80,8 @@ dsd_synctype_to_string(int synctype) {
         case DSD_SYNC_M17_PKT_NEG: /* 87 */ return "M17 PKT";
         case DSD_SYNC_M17_PRE_POS: /* 98 */
         case DSD_SYNC_M17_PRE_NEG: /* 99 */ return "M17 PRE";
+        case DSD_SYNC_M17_EOT_POS: /* 100 */
+        case DSD_SYNC_M17_EOT_NEG: /* 101 */ return "M17 EOT";
         case DSD_SYNC_NONE: /* -1 */ return "NONE";
         default: break;
     }

@@ -211,8 +211,9 @@ check_public_handler_table(void) {
     assert(strcmp(dsd_protocol_handlers[1].name, "D-STAR") == 0);
     assert(strcmp(dsd_protocol_handlers[2].name, "DMR") == 0);
     assert(strcmp(dsd_protocol_handlers[9].name, "dPMR") == 0);
-    assert(strcmp(dsd_protocol_handlers[10].name, "P25P1") == 0);
-    assert(dsd_protocol_handlers[11].name == NULL);
+    assert(strcmp(dsd_protocol_handlers[10].name, "TETRA") == 0);
+    assert(strcmp(dsd_protocol_handlers[11].name, "P25P1") == 0);
+    assert(dsd_protocol_handlers[12].name == NULL);
 }
 
 int
@@ -220,6 +221,7 @@ main(void) {
     check_public_handler_table();
     run_dispatch_case(DSD_SYNC_DMR_BS_VOICE_POS, TEST_HANDLER_DMR);
     run_dispatch_case(DSD_SYNC_DPMR_FS1_POS, TEST_HANDLER_DPMR);
+    run_dispatch_case(DSD_SYNC_TETRA_NDB_POS, TEST_HANDLER_TETRA);
     run_dispatch_case(DSD_SYNC_P25P1_POS, TEST_HANDLER_P25P1);
     run_dispatch_case(-1, TEST_HANDLER_P25P1);
 
