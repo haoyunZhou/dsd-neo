@@ -154,7 +154,7 @@ import_trunking_csvs_if_needed(dsd_opts* opts, dsd_state* state) {
         LOG_NOTICE("Imported channel map from %s\n", opts->chan_in_file);
     }
 
-    if (trunk_enabled && opts->group_in_file[0] != '\0' && state->group_tally == 0) {
+    if (trunk_enabled && opts->group_in_file[0] != '\0') {
         if (csvGroupImport(opts, state) != 0) {
             return -1;
         }
@@ -184,8 +184,10 @@ open_recording_outputs_if_needed(dsd_opts* opts, dsd_state* state) {
             dsd_mkdir(wav_file_directory, 0700);
         }
         srand((unsigned)time(NULL));
-        opts->wav_out_f = open_wav_file(opts->wav_out_dir, opts->wav_out_file, 8000, 0);
-        opts->wav_out_fR = open_wav_file(opts->wav_out_dir, opts->wav_out_fileR, 8000, 0);
+        opts->wav_out_f =
+            open_wav_file(opts->wav_out_dir, opts->wav_out_file, sizeof opts->wav_out_file, 8000, 0);
+        opts->wav_out_fR =
+            open_wav_file(opts->wav_out_dir, opts->wav_out_fileR, sizeof opts->wav_out_fileR, 8000, 0);
     } else if (opts->static_wav_file == 1 && opts->wav_out_f == NULL && opts->wav_out_file[0] != '\0') {
         openWavOutFileLR(opts, state);
     }
@@ -852,7 +854,7 @@ dsd_engine_setup_io(dsd_opts* opts, dsd_state* state) {
         opts->playoffsetR = 0;
         opts->delay = 0;
 
-        if (openAudioInDevice(opts) != 0) {
+        if (openAudioInDevice(opts, state) != 0) {
             return -1;
         }
     }
@@ -862,7 +864,7 @@ dsd_engine_setup_io(dsd_opts* opts, dsd_state* state) {
         opts->playoffset = 0;
         opts->playoffsetR = 0;
         opts->delay = 0;
-        if (openAudioInDevice(opts) != 0) {
+        if (openAudioInDevice(opts, state) != 0) {
             return -1;
         }
     }

@@ -610,7 +610,7 @@ dsd_parse_short_opts(int argc, char** argv, dsd_opts* opts, dsd_state* state, in
                 LOG_NOTICE("Debug Mode Enabled; \n");
                 break;
             case 'O':
-                audio_list_devices();
+                dsd_audio_list_devices();
                 cli_set_exit_rc(out_exit_rc, 0);
                 return DSD_PARSE_ONE_SHOT;
             case 'M':
@@ -882,8 +882,10 @@ dsd_parse_short_opts(int argc, char** argv, dsd_opts* opts, dsd_state* state, in
                 }
                 LOG_NOTICE("Per Call Wav File Enabled.\n");
                 srand(time(NULL));
-                opts->wav_out_f = open_wav_file(opts->wav_out_dir, opts->wav_out_file, 8000, 0);
-                opts->wav_out_fR = open_wav_file(opts->wav_out_dir, opts->wav_out_fileR, 8000, 0);
+                opts->wav_out_f =
+                    open_wav_file(opts->wav_out_dir, opts->wav_out_file, sizeof opts->wav_out_file, 8000, 0);
+                opts->wav_out_fR =
+                    open_wav_file(opts->wav_out_dir, opts->wav_out_fileR, sizeof opts->wav_out_fileR, 8000, 0);
                 opts->dmr_stereo_wav = 1;
                 break;
             case '7':

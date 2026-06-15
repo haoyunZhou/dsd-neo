@@ -27,6 +27,7 @@ enum {
     TEST_HANDLER_YSF,
     TEST_HANDLER_M17,
     TEST_HANDLER_P25P2,
+    TEST_HANDLER_TETRA,
     TEST_HANDLER_DPMR,
     TEST_HANDLER_P25P1,
 };
@@ -145,6 +146,18 @@ dsd_dispatch_handle_p25p2(dsd_opts* opts, dsd_state* state) {
     (void)opts;
     (void)state;
     record_handler(TEST_HANDLER_P25P2);
+}
+
+int
+dsd_dispatch_matches_tetra(int synctype) {
+    return DSD_SYNC_IS_TETRA(synctype);
+}
+
+void
+dsd_dispatch_handle_tetra(dsd_opts* opts, dsd_state* state) {
+    (void)opts;
+    (void)state;
+    record_handler(TEST_HANDLER_TETRA);
 }
 
 int

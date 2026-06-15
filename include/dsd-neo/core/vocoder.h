@@ -17,6 +17,8 @@
 #include <dsd-neo/core/opts_fwd.h>
 #include <dsd-neo/core/state_fwd.h>
 
+#include <stdint.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -39,6 +41,21 @@ typedef enum {
     DSD_VOCODER_ACELP     = 6, /**< ACELP via external subprocess — TETRA */
 } dsd_vocoder_type_t;
 
+typedef struct {
+    uint8_t bit;
+    uint8_t reliability;
+} dsd_vocoder_soft_bit;
+
+static inline dsd_vocoder_soft_bit
+dsd_vocoder_soft_bit_from_hard_llr(int bit, int16_t llr) {
+    int reliability = llr < 0 ? -(int)llr : (int)llr;
+    if (reliability > 255) {
+        reliability = 255;
+    }
+    dsd_vocoder_soft_bit out = {(uint8_t)(bit ? 1 : 0), (uint8_t)reliability};
+    return out;
+}
+
 /**
  * @brief Map a synctype ID to the vocoder it requires.
  *
@@ -54,6 +71,8 @@ dsd_vocoder_type_t dsd_vocoder_from_synctype(int synctype);
 
 void processMbeFrame(dsd_opts* opts, dsd_state* state, char imbe_fr[8][23], char ambe_fr[4][24],
                      char imbe7100_fr[7][24]);
+void processMbeFrameSoft(dsd_opts* opts, dsd_state* state, dsd_vocoder_soft_bit imbe_fr[8][23],
+                         dsd_vocoder_soft_bit ambe_fr[4][24], dsd_vocoder_soft_bit imbe7100_fr[7][24]);
 void soft_mbe(dsd_opts* opts, dsd_state* state, char imbe_fr[8][23], char ambe_fr[4][24], char imbe7100_fr[7][24]);
 void playMbeFiles(dsd_opts* opts, dsd_state* state, int argc, char** argv);
 

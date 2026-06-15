@@ -22,7 +22,11 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#if DSD_PLATFORM_POSIX
 #include <unistd.h>
+#elif DSD_PLATFORM_WIN_NATIVE
+#include <direct.h>
+#endif
 #include "dsd-neo/core/opts_fwd.h"
 #include "dsd-neo/core/safe_api.h"
 #include "dsd-neo/core/state_fwd.h"

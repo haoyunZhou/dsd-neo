@@ -275,6 +275,9 @@ struct dsd_opts {
     int use_hpf;
     int use_pbf;
     int use_hpf_d;
+    int uvquality;
+    int p25_p2_soft_erasure;
+    int p25_p1_soft_voice;
     int floating_point;
     // Small flags and bytes
     uint8_t const_norm_mode;         //0=radial (percentile) norm, 1=unit-circle norm
