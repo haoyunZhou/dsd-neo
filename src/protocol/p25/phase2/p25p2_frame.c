@@ -24,6 +24,7 @@
 #include <dsd-neo/core/vocoder.h>
 #include <dsd-neo/fec/ez.h>
 #include <dsd-neo/protocol/p25/p25.h>
+#include <dsd-neo/protocol/p25/p25_crypto.h>
 #include <dsd-neo/protocol/p25/p25_lfsr.h>
 #include <dsd-neo/protocol/p25/p25_trunk_sm.h>
 #include <dsd-neo/protocol/p25/p25_xcch.h>
@@ -43,57 +44,13 @@
 #include "dsd-neo/core/secret_redaction.h"
 #include "dsd-neo/core/state_fwd.h"
 #include "dsd-neo/platform/platform.h"
-
-#ifdef USE_RADIO
-#endif
+#include "p25p2_frame_internal.h"
 
 extern int p2bit[4320];
 extern int16_t p2llr[1400];
 extern int16_t p2xllr[1400];
 extern int ess_a[2][168];
 extern int16_t ess_a_llr[2][168];
-
-#if defined(DSD_NEO_P25P2_TEST_STUB)
-#define p25_sm_emit_active(opts, state, slot) ((void)(opts), (void)(state), (void)(slot))
-#define p25_sm_emit_idle(opts, state, slot)   ((void)(opts), (void)(state), (void)(slot))
-#define p25_sm_on_release(opts, state)        ((void)(opts), (void)(state))
-#endif
-
-static int p25p2_ess_other_slot_active(const dsd_state* state, int other);
-static int p25p2_ess_have_decrypt_key(int alg, unsigned long long int key, int aes_loaded);
-static void p25p2_ess_release_or_defer_cc(dsd_opts* opts, dsd_state* state);
-static void p25p2_ess_clear_call_banner(dsd_state* state, int slot);
-
-#if defined(DSD_NEO_P25P2_TEST_STUB)
-static int
-p25p2_frame_test_stub_media_allowed(const dsd_opts* opts, const dsd_state* state, int slot) {
-    if (!opts || opts->trunk_use_allow_list != 1) {
-        return 1;
-    }
-    int target = (slot == 0) ? state->lasttg : state->lasttgR;
-    return (target > 0 && state->tg_hold == (unsigned long)target) ? 1 : 0;
-}
-
-static int
-p25p2_frame_test_stub_can_decrypt(const dsd_state* state, int slot, int alg) {
-    if (!state || slot < 0 || slot > 1) {
-        return 0;
-    }
-    if (alg == 0 || alg == 0x80) {
-        return 1;
-    }
-    unsigned long long key = (slot == 0) ? state->R : state->RR;
-    if ((alg == 0xAA || alg == 0x81 || alg == 0x9F) && key != 0ULL) {
-        return 1;
-    }
-    if ((alg == 0x84 || alg == 0x89) && state->aes_key_loaded[slot] == 1) {
-        return 1;
-    }
-    return 0;
-}
-
-void p25p2_test_decode_voice_frame_for_lockout(dsd_opts* opts, dsd_state* state);
-#endif
 
 static int
 p25_p2_s16_frames_have_audio(short frames[18][160]) {
@@ -107,118 +64,6 @@ p25_p2_s16_frames_have_audio(short frames[18][160]) {
     return 0;
 }
 
-static int DSD_ATTR_USED
-p25p2_frame_slot_audio_allowed(const dsd_opts* opts, const dsd_state* state, int slot, int alg) {
-#if defined(DSD_NEO_P25P2_TEST_STUB)
-    return p25p2_frame_test_stub_can_decrypt(state, slot, alg)
-           && p25p2_frame_test_stub_media_allowed(opts, state, slot);
-#else
-    return dsd_p25p2_decode_audio_allowed(opts, state, slot, alg);
-#endif
-}
-
-static int
-p25p2_frame_slot_service_options(const dsd_state* state, int slot) {
-    return (slot == 0) ? state->dmr_so : state->dmr_soR;
-}
-
-static int
-p25p2_frame_slot_algid(const dsd_state* state, int slot) {
-    return (slot == 0) ? state->payload_algid : state->payload_algidR;
-}
-
-static int
-p25p2_frame_slot_has_decrypt_key(const dsd_state* state, int slot, int alg) {
-    if (!state || slot < 0 || slot > 1 || alg == 0 || alg == 0x80) {
-        return 0;
-    }
-
-    unsigned long long int key = (slot == 0) ? state->R : state->RR;
-    return p25p2_ess_have_decrypt_key(alg, key, state->aes_key_loaded[slot]);
-}
-
-static int
-p25p2_frame_slot_marked_encrypted(const dsd_state* state, int slot, int alg) {
-    if (alg == 0x80) {
-        return 0;
-    }
-    if (alg != 0) {
-        return 1;
-    }
-    int svc = p25p2_frame_slot_service_options(state, slot);
-    return (svc & 0x40) != 0;
-}
-
-static int
-p25p2_frame_encrypted_lockout_blocks_voice(const dsd_opts* opts, const dsd_state* state, int slot) {
-    if (!opts || !state || slot < 0 || slot > 1 || opts->trunk_tune_enc_calls != 0) {
-        return 0;
-    }
-
-    int alg = p25p2_frame_slot_algid(state, slot);
-    if (!p25p2_frame_slot_marked_encrypted(state, slot, alg)) {
-        return 0;
-    }
-    if (p25p2_frame_slot_has_decrypt_key(state, slot, alg)) {
-        return 0;
-    }
-    return 1;
-}
-
-static void
-p25p2_frame_clear_locked_slot_state(dsd_state* state, int slot) {
-    if (!state || slot < 0 || slot > 1) {
-        return;
-    }
-    if (slot == 0) {
-        state->payload_algid = 0;
-        state->payload_keyid = 0;
-        state->payload_miP = 0ULL;
-        state->dmrburstL = 0;
-        state->fourv_counter[0] = 0;
-        state->voice_counter[0] = 0;
-        state->DMRvcL = 0;
-        state->dropL = 256;
-        return;
-    }
-    state->payload_algidR = 0;
-    state->payload_keyidR = 0;
-    state->payload_miN = 0ULL;
-    state->dmrburstR = 0;
-    state->fourv_counter[1] = 0;
-    state->voice_counter[1] = 0;
-    state->DMRvcR = 0;
-    state->dropR = 256;
-}
-
-static void
-p25p2_frame_set_enc_lockout_marker(dsd_state* state, int slot, int muted) {
-    if (!state || slot < 0 || slot > 1) {
-        return;
-    }
-    state->p25_p2_enc_lockout_muted[slot] = (uint8_t)(muted ? 1U : 0U);
-}
-
-// Reached through 2V/4V voice-frame dispatch; keep visible to analyzer builds.
-static void DSD_ATTR_USED
-p25p2_frame_apply_encrypted_lockout(dsd_opts* opts, dsd_state* state, int slot) {
-    if (!opts || !state || slot < 0 || slot > 1) {
-        return;
-    }
-
-    p25_sm_emit_idle(opts, state, slot);
-    p25p2_frame_set_enc_lockout_marker(state, slot, 1);
-    p25p2_frame_clear_locked_slot_state(state, slot);
-
-    int other = slot ^ 1;
-    if (opts->p25_trunk == 1 && opts->p25_is_tuned == 1 && !p25p2_ess_other_slot_active(state, other)) {
-        p25p2_ess_release_or_defer_cc(opts, state);
-        return;
-    }
-
-    p25p2_ess_clear_call_banner(state, slot);
-}
-
 static int
 p25p2_next_voice_slot(dsd_state* state, int slot) {
     int idx = state->voice_counter[slot] % 18;
@@ -229,8 +74,8 @@ p25p2_next_voice_slot(dsd_state* state, int slot) {
 // Clear per-slot audio gates, small audio rings, encryption indicators, and
 // UI call banners for both logical slots. Intended for use on call teardown
 // before returning to the control channel.
-static void
-p25_p2_teardown_call(dsd_opts* opts, dsd_state* state) {
+void
+p25p2_teardown_call(dsd_opts* opts, dsd_state* state) {
     if (!state) {
         return;
     }
@@ -255,8 +100,10 @@ p25_p2_teardown_call(dsd_opts* opts, dsd_state* state) {
 
     state->p25_p2_audio_allowed[0] = 0;
     state->p25_p2_audio_allowed[1] = 0;
-    p25p2_frame_set_enc_lockout_marker(state, 0, 0);
-    p25p2_frame_set_enc_lockout_marker(state, 1, 0);
+    state->p25_p2_media_rejected[0] = 0;
+    state->p25_p2_media_rejected[1] = 0;
+    p25_crypto_reset_slot(state, 0);
+    p25_crypto_reset_slot(state, 1);
     p25_p2_audio_ring_reset(state, -1);
     // Clear buffered short audio frames to avoid replaying stale samples on
     // subsequent short calls that never reach the normal SS18 playback path.
@@ -272,6 +119,10 @@ p25_p2_teardown_call(dsd_opts* opts, dsd_state* state) {
     state->p25_call_emergency[1] = 0;
     state->p25_call_priority[0] = 0;
     state->p25_call_priority[1] = 0;
+    state->dmr_so = 0;
+    state->dmr_soR = 0;
+    state->p25_service_options_valid[0] = 0;
+    state->p25_service_options_valid[1] = 0;
     state->payload_algid = 0;
     state->payload_keyid = 0;
     state->payload_miP = 0ULL;
@@ -283,26 +134,22 @@ p25_p2_teardown_call(dsd_opts* opts, dsd_state* state) {
 }
 
 //DUID Look Up Table from OP25
-static const int16_t duid_lookup[256] =
-    {
-        //128 triggers false 4V on bad signal
-        0,  0,  0,  -1, 0,  -1, -1, 1,  0,  -1, -1, 4,  -1, 8,  2,  -1, 0,  -1, -1, 1,  -1, 1,  1,  1,  -1, 3,  9,  -1,
-        5,  -1, -1, 1,  0,  -1, -1, 10, -1, 6,  2,  -1, -1, 3,  2,  -1, 2,  -1, 2,  2,  -1, 3,  7,  -1, 11, -1, -1, 1,
-        3,  3,  -1, 3,  -1, 3,  2,  -1, 0,  -1, -1, 4,  -1, 6,  12, -1, -1, 4,  4,  4,  5,  -1, -1, 4,  -1, 13, 7,  -1,
-        5,  -1, -1, 1,  5,  -1, -1, 4,  5,  5,  5,  -1, -1, 6,  7,  -1, 6,  6,  -1, 6,  14, -1, -1, 4,  -1, 6,  2,  -1,
-        7,  -1, 7,  7,  -1, 6,  7,  -1, -1, 3,  7,  -1, 5,  -1, -1, 15, -1, -1, -1, 10, -1, 8,  12, -1, -1, 8,  9,  -1,
-        8,  8,  -1, 8, //first value was 0 for 4V, changing to -1 for testing -- 1000 0000 (perfect 4V should be 0000 0000, so is this the correct hamming distance?)
-        -1, 13, 9,  -1, 11, -1, -1, 1,  9,  -1, 9,  9,  -1, 8,  9,  -1, -1, 10, 10, 10, 11, -1, -1, 10, 14, -1, -1, 10,
-        -1, 8,  2,  -1, 11, -1, -1, 10, 11, 11, 11, -1, -1, 3,  9,  -1, 11, -1, -1, 15, -1, 13, 12, -1, 12, -1, 12, 12,
-        14, -1, -1, 4,  -1, 8,  12, -1, 13, 13, -1, 13, -1, 13, 12, -1, -1, 13, 9,  -1, 5,  -1, -1, 15, 14, -1, -1, 10,
-        -1, 6,  12, -1, 14, 14, 14, -1, 14, -1, -1, 15, -1, 13, 7,  -1, 11, -1, -1, 15, 14, -1, -1, 15, -1, 15, 15, 15,
+static const int16_t duid_lookup[256] = {
+    //128 triggers false 4V on bad signal
+    0,  0,  0,  -1, 0,  -1, -1, 1,  0,  -1, -1, 4,  -1, 8,  2,  -1, 0,  -1, -1, 1,  -1, 1,  1,  1,  -1, 3,  9,  -1, 5,
+    -1, -1, 1,  0,  -1, -1, 10, -1, 6,  2,  -1, -1, 3,  2,  -1, 2,  -1, 2,  2,  -1, 3,  7,  -1, 11, -1, -1, 1,  3,  3,
+    -1, 3,  -1, 3,  2,  -1, 0,  -1, -1, 4,  -1, 6,  12, -1, -1, 4,  4,  4,  5,  -1, -1, 4,  -1, 13, 7,  -1, 5,  -1, -1,
+    1,  5,  -1, -1, 4,  5,  5,  5,  -1, -1, 6,  7,  -1, 6,  6,  -1, 6,  14, -1, -1, 4,  -1, 6,  2,  -1, 7,  -1, 7,  7,
+    -1, 6,  7,  -1, -1, 3,  7,  -1, 5,  -1, -1, 15, -1, -1, -1, 10, -1, 8,  12, -1, -1, 8,  9,  -1, 8,  8,  -1, 8,  -1,
+    13, 9,  -1, 11, -1, -1, 1,  9,  -1, 9,  9,  -1, 8,  9,  -1, -1, 10, 10, 10, 11, -1, -1, 10, 14, -1, -1, 10, -1, 8,
+    2,  -1, 11, -1, -1, 10, 11, 11, 11, -1, -1, 3,  9,  -1, 11, -1, -1, 15, -1, 13, 12, -1, 12, -1, 12, 12, 14, -1, -1,
+    4,  -1, 8,  12, -1, 13, 13, -1, 13, -1, 13, 12, -1, -1, 13, 9,  -1, 5,  -1, -1, 15, 14, -1, -1, 10, -1, 6,  12, -1,
+    14, 14, 14, -1, 14, -1, -1, 15, -1, 13, 7,  -1, 11, -1, -1, 15, 14, -1, -1, 15, -1, 15, 15, 15,
 };
 
 static const uint8_t duid_canonical[16] = {
     0x00U, 0x17U, 0x2EU, 0x39U, 0x4BU, 0x5CU, 0x65U, 0x72U, 0x8DU, 0x9AU, 0xA3U, 0xB4U, 0xC6U, 0xD1U, 0xE8U, 0xFFU,
 };
-
-extern int16_t p2llr[1400];
 
 static uint8_t
 p25p2_abs_llr_reliability(int16_t llr) {
@@ -367,8 +214,8 @@ p25p2_duid_flip_cost(uint8_t received, uint8_t candidate, const uint8_t reliab8[
     return cost;
 }
 
-static int
-p25p2_duid_lookup_soft(uint8_t received, const uint8_t reliab8[8]) {
+int
+p25p2_duid_lookup_soft(uint8_t received, const uint8_t* reliab8) {
     int hard = duid_lookup[received];
     if (reliab8 == NULL || p25p2_duid_is_exact(received, hard)) {
         return hard;
@@ -409,13 +256,6 @@ p25p2_duid_lookup_soft(uint8_t received, const uint8_t reliab8[8]) {
     return best_decoded;
 }
 
-#if defined(DSD_NEO_P25P2_TEST_STUB)
-int
-p25p2_duid_lookup_soft_test(uint8_t received, const uint8_t reliab8[8]) {
-    return p25p2_duid_lookup_soft(received, reliab8);
-}
-#endif
-
 //4V and 2V deinterleave schedule
 static const int c0[25] = {23, 5, 22, 4, 21, 3, 20, 2, 19, 1, 18, 0, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6};
 
@@ -436,10 +276,10 @@ static char ambe_fr2[4][24] = {0};
 static char ambe_fr3[4][24] = {0};
 static char ambe_fr4[4][24] = {0};
 
-static int ts_counter = 0;     //timeslot counter for time slots 0-11
-int p2bit[4320] = {0};         //4320
-static int p2lbit[8640] = {0}; //bits generated by lsfr scrambler, doubling up for offset roll-over
-static int p2xbit[4320] = {0}; //bits xored from p2bit and p2lbit
+static int ts_counter = 0;         //timeslot counter for time slots 0-11
+int p2bit[4320] = {0};             //4320
+static uint8_t p2lbit[8640] = {0}; //bits generated by LFSR scrambler, doubling up for offset roll-over
+static int p2xbit[4320] = {0};     //bits xored from p2bit and p2lbit
 
 /* Per-bit soft metrics for captured 700 dibits (1400 bits). */
 int16_t p2llr[1400] = {0};  /* bit LLRs before descramble */
@@ -530,7 +370,7 @@ p2_dibit_buffer(dsd_opts* opts, dsd_state* state) {
         /* Capture hard dibits and per-bit soft metrics in parallel. */
         dibit = getDibitSoft(opts, state, &soft);
 
-        //dibit inversion handled internally by getDibit if sync type is inverted
+        //dibit inversion is handled internally when the sync type is inverted
         p2bit[((size_t)i * 2)] = (dibit >> 1) & 1;
         p2bit[((size_t)i * 2) + 1] = (dibit & 1);
 
@@ -546,26 +386,8 @@ process_Frame_Scramble(dsd_opts* opts, const dsd_state* state) {
 
     //The bits of the scramble sequence corresponding to signal bits that are not scrambled or not used are discarded.
     //descramble frame scrambled by LFSR of WACN, SysID, and CC(NAC)
-    unsigned long long int seed = 0;
-
-    //below calc is the same as shifting left the required number of bits.
-    seed = ((state->p2_wacn * 16777216) + (state->p2_sysid * 4096) + state->p2_cc);
-
-    for (int i = 0; i < 4320; i++) {
-        // External LFSR per TIA‑102 BBAC Fig. 7.1 (TDMA frame scrambler)
-        // 44‑bit Fibonacci LFSR with feedback polynomial:
-        //   x^44 + x^34 + x^20 + x^15 + x^9 + x^4 + 1
-        // Seed composition (MSB→LSB): WACN[20] | SYSID[12] | NAC(CC)[12]
-
-        //assign our scramble bit to the array
-        p2lbit[i] = (seed >> 43) & 0x1;
-        //assign same bit to position +4320 to allow for a rollover with an offset value
-        p2lbit[i + 4320] = (seed >> 43) & 0x1;
-        //compute our next scramble bit and shift the seed register and append bit to LSB
-        unsigned long long int bit =
-            ((seed >> 33) ^ (seed >> 19) ^ (seed >> 14) ^ (seed >> 8) ^ (seed >> 3) ^ (seed >> 43)) & 0x1;
-        seed = (seed << 1) | bit;
-    }
+    p25p2_generate_scramble_bits(state->p2_wacn, state->p2_sysid, state->p2_cc, p2lbit, 4320U);
+    DSD_MEMCPY(p2lbit + 4320, p2lbit, 4320U * sizeof(p2lbit[0]));
 
     for (int i = 0; i < 4300; i++) {
         //offset by 20 for sync, then 360 for each ts frame off from start of superframe
@@ -581,6 +403,19 @@ process_Frame_Scramble(dsd_opts* opts, const dsd_state* state) {
     }
 }
 
+enum {
+    P25P2_RS_ERASURE_CAPACITY = 28,
+    P25P2_FACCH_FIXED_ERASURES_COUNT = 18,
+    P25P2_SACCH_FIXED_ERASURES_COUNT = 11,
+};
+
+static const int P25P2_FACCH_FIXED_ERASURES[P25P2_FACCH_FIXED_ERASURES_COUNT] = {
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 54, 55, 56, 57, 58, 59, 60, 61, 62,
+};
+static const int P25P2_SACCH_FIXED_ERASURES[P25P2_SACCH_FIXED_ERASURES_COUNT] = {
+    0, 1, 2, 3, 4, 57, 58, 59, 60, 61, 62,
+};
+
 static int
 p25p2_decode_facch_ranked(int payload[156], int parity[114], int scrambled, int* used_dynamic_erasure) {
     int original_payload[156];
@@ -588,19 +423,19 @@ p25p2_decode_facch_ranked(int payload[156], int parity[114], int scrambled, int*
     DSD_MEMCPY(original_payload, payload, sizeof(original_payload));
     DSD_MEMCPY(original_parity, parity, sizeof(original_parity));
 
-    const int fixed_erasures[28] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 54, 55, 56, 57, 58, 59, 60, 61, 62};
-    int ec = ez_rs28_facch_soft(payload, parity, fixed_erasures, 18);
+    int ec = ez_rs28_facch(payload, parity, P25P2_FACCH_FIXED_ERASURES, P25P2_FACCH_FIXED_ERASURES_COUNT);
     if (ec >= 0) {
         *used_dynamic_erasure = 0;
         return ec;
     }
 
-    int erasures[28] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 54, 55, 56, 57, 58, 59, 60, 61, 62};
-    int n_erasures = p25p2_facch_soft_erasures(ts_counter, scrambled, erasures, 18, 10);
-    for (int n = 19; n <= n_erasures; n++) {
+    int erasures[P25P2_RS_ERASURE_CAPACITY] = {0};
+    DSD_MEMCPY(erasures, P25P2_FACCH_FIXED_ERASURES, sizeof(P25P2_FACCH_FIXED_ERASURES));
+    int n_erasures = p25p2_facch_soft_erasures(ts_counter, scrambled, erasures, P25P2_FACCH_FIXED_ERASURES_COUNT, 10);
+    for (int n = P25P2_FACCH_FIXED_ERASURES_COUNT + 1; n <= n_erasures; n++) {
         DSD_MEMCPY(payload, original_payload, sizeof(original_payload));
         DSD_MEMCPY(parity, original_parity, sizeof(original_parity));
-        ec = ez_rs28_facch_soft(payload, parity, erasures, n);
+        ec = ez_rs28_facch(payload, parity, erasures, n);
         if (ec >= 0) {
             *used_dynamic_erasure = 1;
             return ec;
@@ -620,19 +455,19 @@ p25p2_decode_sacch_ranked(int payload[180], int parity[132], int scrambled, int*
     DSD_MEMCPY(original_payload, payload, sizeof(original_payload));
     DSD_MEMCPY(original_parity, parity, sizeof(original_parity));
 
-    const int fixed_erasures[28] = {0, 1, 2, 3, 4, 57, 58, 59, 60, 61, 62};
-    int ec = ez_rs28_sacch_soft(payload, parity, fixed_erasures, 11);
+    int ec = ez_rs28_sacch(payload, parity, P25P2_SACCH_FIXED_ERASURES, P25P2_SACCH_FIXED_ERASURES_COUNT);
     if (ec >= 0) {
         *used_dynamic_erasure = 0;
         return ec;
     }
 
-    int erasures[28] = {0, 1, 2, 3, 4, 57, 58, 59, 60, 61, 62};
-    int n_erasures = p25p2_sacch_soft_erasures(ts_counter, scrambled, erasures, 11, 16);
-    for (int n = 12; n <= n_erasures; n++) {
+    int erasures[P25P2_RS_ERASURE_CAPACITY] = {0};
+    DSD_MEMCPY(erasures, P25P2_SACCH_FIXED_ERASURES, sizeof(P25P2_SACCH_FIXED_ERASURES));
+    int n_erasures = p25p2_sacch_soft_erasures(ts_counter, scrambled, erasures, P25P2_SACCH_FIXED_ERASURES_COUNT, 16);
+    for (int n = P25P2_SACCH_FIXED_ERASURES_COUNT + 1; n <= n_erasures; n++) {
         DSD_MEMCPY(payload, original_payload, sizeof(original_payload));
         DSD_MEMCPY(parity, original_parity, sizeof(original_parity));
-        ec = ez_rs28_sacch_soft(payload, parity, erasures, n);
+        ec = ez_rs28_sacch(payload, parity, erasures, n);
         if (ec >= 0) {
             *used_dynamic_erasure = 1;
             return ec;
@@ -645,8 +480,9 @@ p25p2_decode_sacch_ranked(int payload[180], int parity[132], int scrambled, int*
     return ec;
 }
 
-static void
-process_FACCHc(dsd_opts* opts, dsd_state* state) {
+void
+p25p2_process_facchc(dsd_opts* opts, dsd_state* state, int timeslot_index) {
+    ts_counter = timeslot_index;
     //gather and process FACCH w/o scrambling (S-OEMI) so we know what to do with the containing data.
     for (int i = 0; i < 72; i++) {
         facch[state->currentslot][i] = p2bit[i + 2 + (ts_counter * 360)];
@@ -668,7 +504,7 @@ process_FACCHc(dsd_opts* opts, dsd_state* state) {
         facch_rs[state->currentslot][i + 42] = p2bit[i + 246 + (ts_counter * 360)];
     }
 
-    //send payload and parity to ez_rs28_facch for error correction (RS(63,35), t=14)
+    //send payload and parity for FACCH error correction (RS(63,35), t=14)
     int ec = -2;
 
     int used_dynamic_erasure = 0;
@@ -683,8 +519,10 @@ process_FACCHc(dsd_opts* opts, dsd_state* state) {
 
     if (state->currentslot == 0) {
         state->dmr_so = opcode;
+        state->p25_service_options_valid[0] = 0;
     } else {
         state->dmr_soR = opcode;
+        state->p25_service_options_valid[1] = 0;
     }
 
     if (ec >= 0) {
@@ -728,7 +566,7 @@ process_FACCHs(dsd_opts* opts, dsd_state* state) {
         facch_rs[state->currentslot][i + 42] = p2xbit[i + 246 + (ts_counter * 360)];
     }
 
-    //send payload and parity to ez_rs28_facch for error correction (RS(63,35), t=14)
+    //send payload and parity for FACCH error correction (RS(63,35), t=14)
     int ec = -2;
 
     int used_dynamic_erasure = 0;
@@ -743,8 +581,10 @@ process_FACCHs(dsd_opts* opts, dsd_state* state) {
 
     if (state->currentslot == 0) {
         state->dmr_so = opcode;
+        state->p25_service_options_valid[0] = 0;
     } else {
         state->dmr_soR = opcode;
+        state->p25_service_options_valid[1] = 0;
     }
 
     if (ec >= 0) {
@@ -765,8 +605,9 @@ process_FACCHs(dsd_opts* opts, dsd_state* state) {
     }
 }
 
-static void
-process_SACCHc(dsd_opts* opts, dsd_state* state) {
+void
+p25p2_process_sacchc(dsd_opts* opts, dsd_state* state, int timeslot_index) {
+    ts_counter = timeslot_index;
     //gather and process SACCH w/o scrambling (I-OEMI) so we know what to do with the containing data.
     for (int i = 0; i < 72; i++) {
         sacch[state->currentslot][i] = p2bit[i + 2 + (ts_counter * 360)];
@@ -784,7 +625,7 @@ process_SACCHc(dsd_opts* opts, dsd_state* state) {
         sacch_rs[state->currentslot][i + 60] = p2bit[i + 246 + (ts_counter * 360)];
     }
 
-    //send payload and parity to ez_rs28_sacch for error correction (RS(63,35), t=14)
+    //send payload and parity for SACCH error correction (RS(63,35), t=14)
     int ec = -2;
 
     int used_dynamic_erasure = 0;
@@ -800,8 +641,10 @@ process_SACCHc(dsd_opts* opts, dsd_state* state) {
     //set inverse true for SACCH
     if (state->currentslot == 0) {
         state->dmr_soR = opcode;
+        state->p25_service_options_valid[1] = 0;
     } else {
         state->dmr_so = opcode;
+        state->p25_service_options_valid[0] = 0;
     }
 
     if (ec >= 0) {
@@ -841,7 +684,7 @@ process_SACCHs(dsd_opts* opts, dsd_state* state) {
         sacch_rs[state->currentslot][i + 60] = p2xbit[i + 246 + (ts_counter * 360)];
     }
 
-    //send payload and parity to ez_rs28_sacch for error correction (RS(63,35), t=14)
+    //send payload and parity for SACCH error correction (RS(63,35), t=14)
     int ec = -2;
 
     int used_dynamic_erasure = 0;
@@ -857,8 +700,10 @@ process_SACCHs(dsd_opts* opts, dsd_state* state) {
     //set inverse true for SACCH
     if (state->currentslot == 0) {
         state->dmr_soR = opcode;
+        state->p25_service_options_valid[1] = 0;
     } else {
         state->dmr_so = opcode;
+        state->p25_service_options_valid[0] = 0;
     }
 
     if (ec >= 0) {
@@ -879,8 +724,9 @@ process_SACCHs(dsd_opts* opts, dsd_state* state) {
     }
 }
 
-static void
-process_ISCH(dsd_opts* opts, dsd_state* state) {
+void
+p25p2_process_isch(dsd_opts* opts, dsd_state* state, int framing_index) {
+    framing_counter = framing_index;
     UNUSED(opts);
 
     isch = 0;
@@ -921,17 +767,58 @@ process_ISCH(dsd_opts* opts, dsd_state* state) {
 }
 
 static void DSD_ATTR_USED
-p25p2_emit_active_if_allowed(dsd_opts* opts, dsd_state* state) {
+p25p2_emit_voice_activity(dsd_opts* opts, dsd_state* state) {
     if (!state) {
         return;
     }
     int slot = state->currentslot & 1;
-    if (!state->p25_p2_audio_allowed[slot]) {
+    if (opts && opts->trunk_tune_enc_calls == 0 && p25_crypto_companion_suppressed(state, slot)) {
         return;
     }
     p25_sm_emit_active(opts, state, slot);
     state->last_vc_sync_time = time(NULL);
     state->last_vc_sync_time_m = dsd_time_now_monotonic_s();
+}
+
+static int
+p25p2_voice_crypto_is_authoritatively_clear(const dsd_state* state, int slot) {
+    if (!state || slot < 0 || slot > 1) {
+        return 0;
+    }
+
+    const int algid = (slot == 0) ? state->payload_algid : state->payload_algidR;
+    if (algid == 0x80) {
+        return 1;
+    }
+
+    if (state->gi[slot] == 1) {
+        return 0;
+    }
+    const int talkgroup = (slot == 0) ? state->lasttg : state->lasttgR;
+    return p25_patch_tg_key_is_clear(state, talkgroup) || p25_patch_sg_key_is_clear(state, talkgroup);
+}
+
+static void
+p25p2_prepare_voice_crypto(dsd_opts* opts, dsd_state* state) {
+    if (!opts || !state) {
+        return;
+    }
+    const int slot = state->currentslot;
+    if (slot < 0 || slot > 1) {
+        return;
+    }
+    if (state->p25_p2_media_rejected[slot]) {
+        state->p25_p2_audio_allowed[slot] = 0;
+        return;
+    }
+    const int svc = (slot == 0) ? state->dmr_so : state->dmr_soR;
+    if ((svc & 0x40) != 0 && !p25p2_voice_crypto_is_authoritatively_clear(state, slot)) {
+        p25_sm_emit_crypto_pending(opts, state, slot);
+    }
+    if (p25_crypto_audio_permitted(opts, state, slot)) {
+        const int alg = (slot == 0) ? state->payload_algid : state->payload_algidR;
+        state->p25_p2_audio_allowed[slot] = dsd_p25p2_decode_audio_allowed(opts, state, slot, alg);
+    }
 }
 
 static int
@@ -1057,6 +944,20 @@ p25p2_zero_voice_frame(dsd_state* state, int frame_index) {
 }
 
 static void
+p25p2_open_mbe_for_ready_slot(dsd_opts* opts, dsd_state* state, int slot) {
+    if (!opts || !state || slot < 0 || slot > 1 || !p25_crypto_audio_permitted(opts, state, slot)
+        || !state->p25_p2_audio_allowed[slot] || opts->mbe_out_dir[0] == 0) {
+        return;
+    }
+    if (slot == 0 && opts->mbe_out_f == NULL) {
+        openMbeOutFile(opts, state);
+    }
+    if (slot == 1 && opts->mbe_out_fR == NULL) {
+        openMbeOutFileR(opts, state);
+    }
+}
+
+static void
 p25p2_decode_and_store_voice_frame(dsd_opts* opts, dsd_state* state, dsd_vocoder_soft_bit ambe_soft[4][24],
                                    int frame_index, int push_ring) {
     int slot = state->currentslot;
@@ -1064,37 +965,22 @@ p25p2_decode_and_store_voice_frame(dsd_opts* opts, dsd_state* state, dsd_vocoder
         p25p2_zero_voice_frame(state, frame_index);
         return;
     }
-    if (p25p2_frame_encrypted_lockout_blocks_voice(opts, state, slot)) {
-        int alg = p25p2_frame_slot_algid(state, slot);
-        state->p25_p2_audio_allowed[slot] = 0;
-        p25_p2_audio_ring_reset(state, slot);
-        p25p2_zero_voice_frame(state, frame_index);
-        if (alg != 0 && alg != 0x80) {
-            p25p2_frame_apply_encrypted_lockout(opts, state, slot);
-        }
-        return;
-    }
-    if (!state->p25_p2_audio_allowed[slot]) {
+    if (!p25_crypto_audio_permitted(opts, state, slot) || !state->p25_p2_audio_allowed[slot]) {
+        dsd_mbe_log_ambe_soft_frame(opts, state, ambe_soft);
         p25p2_zero_voice_frame(state, frame_index);
         return;
     }
+    p25p2_open_mbe_for_ready_slot(opts, state, slot);
     processMbeFrameSoft(opts, state, NULL, ambe_soft, NULL);
     p25p2_store_decoded_voice_frame(state, frame_index, push_ring);
 }
-
-#if defined(DSD_NEO_P25P2_TEST_STUB)
-void
-p25p2_test_decode_voice_frame_for_lockout(dsd_opts* opts, dsd_state* state) {
-    dsd_vocoder_soft_bit ambe_soft[4][24] = {{{0}}};
-    p25p2_decode_and_store_voice_frame(opts, state, ambe_soft, 0, 0);
-}
-#endif
 
 static void
 process_4V(dsd_opts* opts, dsd_state* state) {
     dsd_vocoder_soft_bit ambe_soft[4][4][24] = {{{{0}}}};
 
-    p25p2_emit_active_if_allowed(opts, state);
+    p25p2_prepare_voice_crypto(opts, state);
+    p25p2_emit_voice_activity(opts, state);
     p25p2_unpack_voice_frames(4, ambe_soft);
     p25p2_collect_ess_b_fragment(state);
     p25p2_increment_fourv_counter(state);
@@ -1122,7 +1008,7 @@ p25p2_ess_load_payload_and_parity(dsd_state* state, int payload[96], int parity[
 
 static int
 p25p2_ess_decode_with_soft_erasures(dsd_state* state, int payload[96], int parity[168], int* ec) {
-    *ec = ez_rs28_ess(payload, parity);
+    *ec = ez_rs28_ess(payload, parity, NULL, 0);
     if (*ec >= 0 && *ec < 15) {
         return 1;
     }
@@ -1139,7 +1025,7 @@ p25p2_ess_decode_with_soft_erasures(dsd_state* state, int payload[96], int parit
     for (int n = 1; n <= n_erasures; n++) {
         DSD_MEMCPY(payload, original_payload, sizeof(original_payload));
         DSD_MEMCPY(parity, original_parity, sizeof(original_parity));
-        *ec = ez_rs28_ess_soft(payload, parity, erasures, n);
+        *ec = ez_rs28_ess(payload, parity, erasures, n);
         if (*ec >= 0) {
             state->p25_p2_soft_ess_ok++;
             if ((unsigned int)n > state->p25_p2_soft_ess_max_depth) {
@@ -1176,6 +1062,31 @@ p25p2_ess_payload_to_hex(const int payload[96], unsigned long long int* essb_hex
     }
 }
 
+typedef struct {
+    unsigned long long int essb_hex1;
+    unsigned long long int essb_hex2;
+    uint64_t mi;
+    int algid;
+    int keyid;
+    int corrections;
+    int accepted;
+} p25p2_ess_result;
+
+static p25p2_ess_result
+p25p2_ess_decode(dsd_state* state) {
+    int payload[96] = {0};
+    int parity[168] = {0};
+    p25p2_ess_load_payload_and_parity(state, payload, parity);
+
+    p25p2_ess_result result = {.corrections = 69};
+    result.accepted = p25p2_ess_decode_with_soft_erasures(state, payload, parity, &result.corrections);
+    result.algid = p25p2_ess_algid_from_payload(payload);
+    p25p2_ess_payload_to_hex(payload, &result.essb_hex1, &result.essb_hex2);
+    result.keyid = (int)((result.essb_hex1 >> 8) & 0xFFFF);
+    result.mi = ((result.essb_hex1 & 0xFF) << 56) | ((result.essb_hex2 & 0xFFFFFFFFFFFFFF00) >> 8);
+    return result;
+}
+
 static double
 p25p2_frame_mac_hold_s(const dsd_state* state, double fallback) {
     const dsdneoRuntimeConfig* cfg = dsd_neo_get_config();
@@ -1202,28 +1113,31 @@ p25p2_frame_vc_grace_s(const dsd_state* state, double fallback) {
 
 static void
 p25p2_ess_maybe_enable_audio_slot(const dsd_opts* opts, dsd_state* state, int slot, int alg, int burst) {
+    if (state->p25_p2_media_rejected[slot]) {
+        state->p25_p2_audio_allowed[slot] = 0;
+        return;
+    }
+    if (!p25_crypto_audio_permitted(opts, state, slot)) {
+        state->p25_p2_audio_allowed[slot] = 0;
+        return;
+    }
     if (state->p25_p2_audio_allowed[slot] != 0) {
-        p25p2_frame_set_enc_lockout_marker(state, slot, 0);
         return;
     }
     int in_call = ((burst >= 20 && burst <= 22) || voice);
-    int allow = in_call && p25p2_frame_slot_audio_allowed(opts, state, slot, alg);
+    int allow = in_call && dsd_p25p2_decode_audio_allowed(opts, state, slot, alg);
     if (allow) {
         state->p25_p2_audio_allowed[slot] = 1;
-        p25p2_frame_set_enc_lockout_marker(state, slot, 0);
     }
 }
 
 static void
-p25p2_ess_apply_slot0(const dsd_opts* opts, dsd_state* state, unsigned long long int essb_hex1,
-                      unsigned long long int essb_hex2) {
-    state->payload_algid = (essb_hex1 >> 24) & 0xFF;
-    state->payload_keyid = (essb_hex1 >> 8) & 0xFFFF;
-    state->payload_miP = ((essb_hex1 & 0xFF) << 56) | ((essb_hex2 & 0xFFFFFFFFFFFFFF00) >> 8);
+p25p2_ess_apply_slot0(dsd_opts* opts, dsd_state* state, const p25p2_ess_result* result) {
+    (void)p25_crypto_resolve(opts, state, DSD_P25_CRYPTO_PHASE2, 0, result->algid, result->keyid, result->mi,
+                             state->lasttg);
     p25p2_ess_maybe_enable_audio_slot(opts, state, 0, state->payload_algid, state->dmrburstL);
 
     if (state->payload_algid == 0x80 || state->payload_algid == 0x0) {
-        p25p2_frame_set_enc_lockout_marker(state, 0, 0);
         return;
     }
 
@@ -1235,14 +1149,22 @@ p25p2_ess_apply_slot0(const dsd_opts* opts, dsd_state* state, unsigned long long
     DSD_FPRINTF(stderr, " ESSB");
 
     if (state->R != 0 && state->payload_algid == 0xAA) {
-        DSD_FPRINTF(stderr, " Key %s", DSD_SECRET_REDACTED);
+        char key_text[19];
+        DSD_FPRINTF(stderr, " Key %s",
+                    dsd_secret_format_hex(key_text, sizeof key_text, opts->show_keys, state->R, 10U, 1));
     }
     if (state->R != 0 && state->payload_algid == 0x81) {
-        DSD_FPRINTF(stderr, " Key %s", DSD_SECRET_REDACTED);
+        char key_text[19];
+        DSD_FPRINTF(stderr, " Key %s",
+                    dsd_secret_format_hex(key_text, sizeof key_text, opts->show_keys, state->R, 16U, 1));
     }
     if ((state->payload_algid == 0x84 || state->payload_algid == 0x89) && state->aes_key_loaded[0] == 1) {
         DSD_FPRINTF(stderr, "\n ");
-        DSD_FPRINTF(stderr, "Key: %s ", DSD_SECRET_REDACTED);
+        const unsigned long long segments[4] = {state->A1[0], state->A2[0], state->A3[0], state->A4[0]};
+        char key_text[68];
+        DSD_FPRINTF(stderr, "Key: %s ",
+                    dsd_secret_format_u64_segments(key_text, sizeof key_text, opts->show_keys, segments,
+                                                   (state->payload_algid == 0x84) ? 4U : 2U));
     }
 
     if (state->payload_algid == 0x84 || state->payload_algid == 0x89) {
@@ -1251,15 +1173,12 @@ p25p2_ess_apply_slot0(const dsd_opts* opts, dsd_state* state, unsigned long long
 }
 
 static void
-p25p2_ess_apply_slot1(const dsd_opts* opts, dsd_state* state, unsigned long long int essb_hex1,
-                      unsigned long long int essb_hex2) {
-    state->payload_algidR = (essb_hex1 >> 24) & 0xFF;
-    state->payload_keyidR = (essb_hex1 >> 8) & 0xFFFF;
-    state->payload_miN = ((essb_hex1 & 0xFF) << 56) | ((essb_hex2 & 0xFFFFFFFFFFFFFF00) >> 8);
+p25p2_ess_apply_slot1(dsd_opts* opts, dsd_state* state, const p25p2_ess_result* result) {
+    (void)p25_crypto_resolve(opts, state, DSD_P25_CRYPTO_PHASE2, 1, result->algid, result->keyid, result->mi,
+                             state->lasttgR);
     p25p2_ess_maybe_enable_audio_slot(opts, state, 1, state->payload_algidR, state->dmrburstR);
 
     if (state->payload_algidR == 0x80 || state->payload_algidR == 0x0) {
-        p25p2_frame_set_enc_lockout_marker(state, 1, 0);
         return;
     }
 
@@ -1271,115 +1190,27 @@ p25p2_ess_apply_slot1(const dsd_opts* opts, dsd_state* state, unsigned long long
     DSD_FPRINTF(stderr, " ESSB");
 
     if (state->RR != 0 && state->payload_algidR == 0xAA) {
-        DSD_FPRINTF(stderr, " Key %s", DSD_SECRET_REDACTED);
+        char key_text[19];
+        DSD_FPRINTF(stderr, " Key %s",
+                    dsd_secret_format_hex(key_text, sizeof key_text, opts->show_keys, state->RR, 10U, 1));
     }
     if (state->RR != 0 && state->payload_algidR == 0x81) {
-        DSD_FPRINTF(stderr, " Key %s", DSD_SECRET_REDACTED);
+        char key_text[19];
+        DSD_FPRINTF(stderr, " Key %s",
+                    dsd_secret_format_hex(key_text, sizeof key_text, opts->show_keys, state->RR, 16U, 1));
     }
     if ((state->payload_algidR == 0x84 || state->payload_algidR == 0x89) && state->aes_key_loaded[1] == 1) {
         DSD_FPRINTF(stderr, "\n ");
-        DSD_FPRINTF(stderr, "Key: %s ", DSD_SECRET_REDACTED);
+        const unsigned long long segments[4] = {state->A1[1], state->A2[1], state->A3[1], state->A4[1]};
+        char key_text[68];
+        DSD_FPRINTF(stderr, "Key: %s ",
+                    dsd_secret_format_u64_segments(key_text, sizeof key_text, opts->show_keys, segments,
+                                                   (state->payload_algidR == 0x84) ? 4U : 2U));
     }
 
     if (state->payload_algidR == 0x84 || state->payload_algidR == 0x89) {
         p25_lfsr128_slot(state, 1);
     }
-}
-
-static int
-p25p2_ess_have_decrypt_key(int alg, unsigned long long int key, int aes_loaded) {
-    if ((alg == 0xAA || alg == 0x81 || alg == 0x9F) && key != 0ULL) {
-        return 1;
-    }
-    if ((alg == 0x84 || alg == 0x89) && aes_loaded == 1) {
-        return 1;
-    }
-    return 0;
-}
-
-static void
-p25p2_ess_clear_call_banner(dsd_state* state, int slot) {
-    DSD_SNPRINTF(state->call_string[slot], sizeof state->call_string[slot], "%s", "                     ");
-}
-
-static void
-p25p2_ess_select_slot_crypto(dsd_state* state, int* ttg, int* alg, unsigned long long int* key, int* aes_loaded) {
-    int slot = state->currentslot;
-    *ttg = 0;
-    *alg = 0;
-    *key = 0ULL;
-    *aes_loaded = state->aes_key_loaded[slot];
-    if (state->currentslot == 0) {
-        *ttg = state->lasttg;
-        *alg = state->payload_algid;
-        if (*alg == 0xAA || *alg == 0x81 || *alg == 0x9F) {
-            *key = state->R;
-        }
-    }
-    if (state->currentslot == 1) {
-        *ttg = state->lasttgR;
-        *alg = state->payload_algidR;
-        if (*alg == 0xAA || *alg == 0x81 || *alg == 0x9F) {
-            *key = state->RR;
-        }
-    }
-}
-
-static int
-p25p2_ess_other_slot_active(const dsd_state* state, int other) {
-    double mac_hold = p25p2_frame_mac_hold_s(state, 0.75);
-    double nowm_hold = dsd_time_now_monotonic_s();
-    int other_recent = (state->p25_p2_last_mac_active_m[other] > 0.0)
-                       && ((nowm_hold - state->p25_p2_last_mac_active_m[other]) <= mac_hold);
-    return state->p25_p2_audio_allowed[other] || state->p25_p2_audio_ring_count[other] > 0 || other_recent;
-}
-
-static void DSD_ATTR_USED
-p25p2_ess_release_or_defer_cc(dsd_opts* opts, dsd_state* state) {
-    DSD_FPRINTF(stderr, " No Enc Following on P25p2 Trunking; ");
-    double vc_grace = p25p2_frame_vc_grace_s(state, 0.75);
-    double nowm = dsd_time_now_monotonic_s();
-    double dt_since_tune = (state->p25_last_vc_tune_time_m > 0.0) ? (nowm - state->p25_last_vc_tune_time_m) : 1e9;
-    if (dt_since_tune >= vc_grace) {
-        DSD_FPRINTF(stderr, "Return to CC; \n");
-        state->p25_sm_force_release = 1;
-        p25_p2_teardown_call(opts, state);
-        p25_sm_on_release(opts, state);
-        return;
-    }
-    DSD_FPRINTF(stderr, "Defer (VC grace); stay on VC. \n");
-}
-
-static void
-p25p2_ess_apply_enc_lockout(dsd_opts* opts, dsd_state* state) {
-    int ttg = 0;
-    int alg = 0;
-    unsigned long long int key = 0;
-    int aes_loaded = 0;
-    p25p2_ess_select_slot_crypto(state, &ttg, &alg, &key, &aes_loaded);
-
-    if (alg == 0 || alg == 0x80 || opts->p25_trunk != 1 || opts->p25_is_tuned != 1 || opts->trunk_tune_enc_calls != 0) {
-        return;
-    }
-    if (ttg == 0 || p25p2_ess_have_decrypt_key(alg, key, aes_loaded)) {
-        return;
-    }
-
-    int eslot = state->currentslot & 1;
-    p25_emit_enc_lockout_once(opts, state, (uint8_t)eslot, ttg, /*svc_bits*/ 0);
-    state->p25_p2_audio_allowed[eslot] = 0;
-    p25_p2_audio_ring_reset(state, eslot);
-    p25p2_frame_set_enc_lockout_marker(state, eslot, 1);
-    p25p2_frame_clear_locked_slot_state(state, eslot);
-
-    int other = eslot ^ 1;
-    if (!p25p2_ess_other_slot_active(state, other)) {
-        p25p2_ess_release_or_defer_cc(opts, state);
-        return;
-    }
-
-    DSD_FPRINTF(stderr, " No Enc Following on P25p2 Trunking; Other slot active; stay on VC. \n");
-    p25p2_ess_clear_call_banner(state, eslot);
 }
 
 static void
@@ -1402,44 +1233,107 @@ p25p2_ess_handle_decode_failure(dsd_state* state) {
     }
 }
 
-void
-process_ESS(dsd_opts* opts, dsd_state* state) {
-    int payload[96] = {0};
-    int parity[168] = {0};
-    p25p2_ess_load_payload_and_parity(state, payload, parity);
+static int
+p25p2_ess_stage_rekey(dsd_state* state, const p25p2_ess_result* result) {
+    const int slot = state->currentslot;
+    if (slot < 0 || slot > 1 || result->algid == 0 || state->p25_crypto_state[slot] != DSD_P25_CRYPTO_DECRYPTABLE) {
+        return 0;
+    }
 
-    int ec = 69;
-    int ess_accept = p25p2_ess_decode_with_soft_erasures(state, payload, parity, &ec);
-    int algid = p25p2_ess_algid_from_payload(payload);
-    unsigned long long int essb_hex1 = 0;
-    unsigned long long int essb_hex2 = 0;
-    p25p2_ess_payload_to_hex(payload, &essb_hex1, &essb_hex2);
+    const int current_algid = slot == 0 ? state->payload_algid : state->payload_algidR;
+    const int current_keyid = slot == 0 ? state->payload_keyid : state->payload_keyidR;
+    if (current_algid == result->algid && current_keyid == result->keyid) {
+        return 0;
+    }
+
+    state->p25_p2_rekey[slot].algid = (uint8_t)result->algid;
+    state->p25_p2_rekey[slot].keyid = (uint16_t)result->keyid;
+    state->p25_p2_rekey[slot].mi = result->mi;
+    state->p25_p2_rekey[slot].pending = 1U;
+    return 1;
+}
+
+static void
+p25p2_ess_apply_result(dsd_opts* opts, dsd_state* state, int slot, const p25p2_ess_result* result) {
+    if (slot < 0 || slot > 1) {
+        return;
+    }
+    DSD_MEMSET(&state->p25_p2_rekey[slot], 0, sizeof(state->p25_p2_rekey[slot]));
+    if (slot == 0) {
+        p25p2_ess_apply_slot0(opts, state, result);
+    } else {
+        p25p2_ess_apply_slot1(opts, state, result);
+    }
+}
+
+static void
+p25p2_commit_deferred_rekeys(dsd_opts* opts, dsd_state* state) {
+    if (!opts || !state) {
+        return;
+    }
+    for (int slot = 0; slot < 2; slot++) {
+        const dsd_p25_p2_rekey_state rekey = state->p25_p2_rekey[slot];
+        if (!rekey.pending) {
+            continue;
+        }
+        const p25p2_ess_result result = {
+            .mi = rekey.mi,
+            .algid = rekey.algid,
+            .keyid = rekey.keyid,
+            .accepted = 1,
+        };
+        DSD_FPRINTF(stderr, "%s", KYEL);
+        p25p2_ess_apply_result(opts, state, slot, &result);
+        DSD_FPRINTF(stderr, "%s", KNRM);
+    }
+}
+
+static int
+p25p2_has_deferred_rekeys(const dsd_state* state) {
+    return state && (state->p25_p2_rekey[0].pending || state->p25_p2_rekey[1].pending);
+}
+
+static void
+p25p2_resolve_deferred_rekeys_on_abort(dsd_opts* opts, dsd_state* state) {
+    if (!p25p2_has_deferred_rekeys(state)) {
+        return;
+    }
+
+    if (opts && opts->pulse_digi_rate_out == 8000) {
+        if (opts->floating_point == 1) {
+            playSynthesizedVoiceFS4(opts, state);
+        } else if (opts->floating_point == 0) {
+            playSynthesizedVoiceSS18(opts, state);
+            state->voice_counter[0] = 0;
+            state->voice_counter[1] = 0;
+        }
+    }
+
+    // If no output path is active, applying the identity still purges the
+    // abandoned old-key buffers before subsequent voice can be decoded.
+    p25p2_commit_deferred_rekeys(opts, state);
+}
+
+void
+p25p2_process_ess(dsd_opts* opts, dsd_state* state, int defer_rekey) {
+    const p25p2_ess_result result = p25p2_ess_decode(state);
 
     DSD_FPRINTF(stderr, "%s", KYEL);
     if (opts->payload == 1) {
-        DSD_FPRINTF(stderr, " VCH %d - ESS_B %08llX%016llX ERR = %02d", state->currentslot + 1, essb_hex1, essb_hex2,
-                    ec);
+        DSD_FPRINTF(stderr, " VCH %d - ESS_B %08llX%016llX ERR = %02d", state->currentslot + 1, result.essb_hex1,
+                    result.essb_hex2, result.corrections);
     }
 
-    if (ess_accept) {
+    if (result.accepted) {
         state->p25_p2_rs_ess_ok++;
-        state->p25_p2_rs_ess_corr += (unsigned int)ec;
-        if (state->currentslot == 0) {
-            p25p2_ess_apply_slot0(opts, state, essb_hex1, essb_hex2);
+        state->p25_p2_rs_ess_corr += (unsigned int)result.corrections;
+        if (!defer_rekey || !p25p2_ess_stage_rekey(state, &result)) {
+            p25p2_ess_apply_result(opts, state, state->currentslot, &result);
         }
-        if (state->currentslot == 1) {
-            p25p2_ess_apply_slot1(opts, state, essb_hex1, essb_hex2);
-        }
-
-#define P25p2_ENC_LO //disable if this behavior is detremental
-#ifdef P25p2_ENC_LO
-        p25p2_ess_apply_enc_lockout(opts, state);
-#endif //P25p2_ENC_LO
     } else {
         p25p2_ess_handle_decode_failure(state);
     }
 
-    UNUSED(algid);
     DSD_FPRINTF(stderr, "%s", KNRM);
     if (state->currentslot >= 0 && state->currentslot < 2) {
         state->fourv_counter[state->currentslot] = 0;
@@ -1482,11 +1376,12 @@ void
 process_2V(dsd_opts* opts, dsd_state* state) {
     dsd_vocoder_soft_bit ambe_soft[4][4][24] = {{{{0}}}};
 
-    p25p2_emit_active_if_allowed(opts, state);
+    p25p2_prepare_voice_crypto(opts, state);
+    p25p2_emit_voice_activity(opts, state);
     p25p2_unpack_voice_frames(2, ambe_soft);
     p25p2_collect_ess_a(state);
 
-    process_ESS(opts, state);
+    p25p2_process_ess(opts, state, 1);
     if (opts->payload == 1) {
         DSD_FPRINTF(stderr, "\n");
     }
@@ -1526,7 +1421,7 @@ p25p2_duid_collect_and_decode(int timeslot_index) {
 static void
 p25p2_duid_print_frame_header(void) {
     char timestr[9];
-    getTimeC_buf(timestr);
+    (void)dsd_format_local_datetime(time(NULL), DSD_LOCAL_DATETIME_TIME_COLON, timestr, sizeof timestr);
     DSD_FPRINTF(stderr, "\n%s        P25p2 ", timestr);
 }
 
@@ -1542,15 +1437,7 @@ p25p2_duid_maybe_open_mbe(dsd_opts* opts, dsd_state* state, int slot) {
     }
 
     voice = 1;
-    if (opts->mbe_out_dir[0] == 0) {
-        return;
-    }
-    if (slot == 0 && opts->mbe_out_f == NULL) {
-        openMbeOutFile(opts, state);
-    }
-    if (slot == 1 && opts->mbe_out_fR == NULL) {
-        openMbeOutFileR(opts, state);
-    }
+    p25p2_open_mbe_for_ready_slot(opts, state, slot);
 }
 
 static int
@@ -1570,7 +1457,7 @@ p25p2_duid_set_channel_label_and_sacch(dsd_opts* opts, dsd_state* state) {
 
     if (duid_decoded == 13) {
         DSD_FPRINTF(stderr, "LCCH  ");
-        if (opts->p25_is_tuned == 0) {
+        if (opts->trunk_is_tuned == 0) {
             rotate_symbol_out_file(opts, state);
         }
         return 0;
@@ -1585,7 +1472,7 @@ p25p2_duid_set_channel_label_and_sacch(dsd_opts* opts, dsd_state* state) {
 
 static int
 p25p2_duid_compute_pending_release(dsd_opts* opts, dsd_state* state, time_t now) {
-    if (duid_decoded != 13 || opts->p25_is_tuned != 1 || ((now - state->last_vc_sync_time) <= opts->trunk_hangtime)) {
+    if (duid_decoded != 13 || opts->trunk_is_tuned != 1 || ((now - state->last_vc_sync_time) <= opts->trunk_hangtime)) {
         return 0;
     }
 
@@ -1600,7 +1487,7 @@ p25p2_duid_compute_pending_release(dsd_opts* opts, dsd_state* state, time_t now)
                           && (dsd_time_now_monotonic_s() - state->p25_p2_last_mac_active_m[0]) <= mac_hold;
     int right_mac_active = (state->p25_p2_last_mac_active_m[1] > 0.0)
                            && (dsd_time_now_monotonic_s() - state->p25_p2_last_mac_active_m[1]) <= mac_hold;
-    if (opts->p25_trunk == 1) {
+    if (opts->trunk_enable == 1) {
         return !(left_mac_active || right_mac_active);
     }
 
@@ -1610,13 +1497,13 @@ p25p2_duid_compute_pending_release(dsd_opts* opts, dsd_state* state, time_t now)
     state->voice_counter[1] = 0;
     DSD_MEMSET(state->s_l4, 0, sizeof(state->s_l4));
     DSD_MEMSET(state->s_r4, 0, sizeof(state->s_r4));
-    opts->p25_is_tuned = 0;
+    opts->trunk_is_tuned = 0;
     return 0;
 }
 
 static void
 p25p2_duid_clear_idle_state(const dsd_opts* opts, dsd_state* state, time_t now) {
-    if (duid_decoded == 13 && ((now - state->last_active_time) > 2) && opts->p25_is_tuned == 0) {
+    if (duid_decoded == 13 && ((now - state->last_active_time) > 2) && opts->trunk_is_tuned == 0) {
         DSD_MEMSET(state->active_channel, 0, sizeof(state->active_channel));
         state->voice_counter[0] = 0;
         state->voice_counter[1] = 0;
@@ -1656,8 +1543,8 @@ p25p2_duid_dispatch(dsd_opts* opts, dsd_state* state, time_t now, int p2_pending
                 process_SACCHs(opts, state);
             }
             break;
-        case 12: process_SACCHc(opts, state); break;
-        case 15: process_FACCHc(opts, state); break;
+        case 12: p25p2_process_sacchc(opts, state, ts_counter); break;
+        case 15: p25p2_process_facchc(opts, state, ts_counter); break;
         case 9:
             if (valid_site) {
                 process_FACCHs(opts, state);
@@ -1665,10 +1552,10 @@ p25p2_duid_dispatch(dsd_opts* opts, dsd_state* state, time_t now, int p2_pending
             break;
         case 13:
             state->p2_is_lcch = 1;
-            process_SACCHc(opts, state);
+            p25p2_process_sacchc(opts, state, ts_counter);
             if (p2_pending_release) {
-                p25_p2_teardown_call(opts, state);
-                p25_sm_on_release(opts, state);
+                p25p2_teardown_call(opts, state);
+                p25_sm_release(NULL, opts, state, "p2-lcch-timeout");
             }
             break;
         case 4:
@@ -1685,18 +1572,13 @@ p25p2_duid_dispatch(dsd_opts* opts, dsd_state* state, time_t now, int p2_pending
 }
 
 static int
-p25p2_duid_should_abort(dsd_state* state, int err_counter) {
+p25p2_duid_should_abort(dsd_opts* opts, dsd_state* state, int err_counter) {
     if (err_counter <= 1) {
         return 0;
     }
 
-    state->payload_algid = 0;
-    state->payload_keyid = 0;
-    state->payload_algidR = 0;
-    state->payload_keyidR = 0;
+    p25p2_resolve_deferred_rekeys_on_abort(opts, state);
     state->p2_is_lcch = 0;
-    p25p2_frame_set_enc_lockout_marker(state, 0, 0);
-    p25p2_frame_set_enc_lockout_marker(state, 1, 0);
     state->fourv_counter[0] = 0;
     state->fourv_counter[1] = 0;
     state->voice_counter[0] = 0;
@@ -1704,10 +1586,36 @@ p25p2_duid_should_abort(dsd_state* state, int err_counter) {
     return 1;
 }
 
-static void
-p25p2_duid_post_timeslot(dsd_opts* opts, dsd_state* state, int sacch_status) {
-    if (opts->use_ncurses_terminal == 1) {
-        ui_publish_both_and_redraw(opts, state);
+static int
+p25p2_duid_output_float_pair(dsd_opts* opts, dsd_state* state, int sacch_status, int output_pair) {
+    if (!output_pair || opts->floating_point != 1 || opts->pulse_digi_rate_out != 8000
+        || (sacch_status != 0 && !p25p2_has_deferred_rekeys(state))) {
+        return 0;
+    }
+    playSynthesizedVoiceFS4(opts, state);
+    return 1;
+}
+
+static int
+p25p2_duid_output_short_pair(dsd_opts* opts, dsd_state* state, int output_pair) {
+    const int output_ready =
+        state->voice_counter[0] >= 18 || state->voice_counter[1] >= 18 || p25p2_has_deferred_rekeys(state);
+    if (!output_pair || !output_ready || opts->floating_point != 0 || opts->pulse_digi_rate_out != 8000) {
+        return 0;
+    }
+    playSynthesizedVoiceSS18(opts, state);
+    state->voice_counter[0] = 0;
+    state->voice_counter[1] = 0;
+    return 1;
+}
+
+void
+p25p2_duid_post_timeslot(dsd_opts* opts, dsd_state* state, int timeslot_index, int sacch_status) {
+    ts_counter = timeslot_index;
+    const int output_pair = (ts_counter & 1) != 0;
+
+    if (dsd_opts_frontend_active(opts)) {
+        dsd_telemetry_publish_both_and_redraw(opts, state);
     }
 
     watchdog_event_history(opts, state, 0);
@@ -1717,14 +1625,13 @@ p25p2_duid_post_timeslot(dsd_opts* opts, dsd_state* state, int sacch_status) {
 
     vc_counter = vc_counter + 360;
 
-    if (sacch_status == 0 && ts_counter & 1 && opts->floating_point == 1 && opts->pulse_digi_rate_out == 8000) {
-        playSynthesizedVoiceFS4(opts, state);
-    }
-    if ((state->voice_counter[0] >= 18 || state->voice_counter[1] >= 18) && opts->floating_point == 0
-        && opts->pulse_digi_rate_out == 8000 && ts_counter & 1) {
-        playSynthesizedVoiceSS18(opts, state);
-        state->voice_counter[0] = 0;
-        state->voice_counter[1] = 0;
+    int audio_drained = p25p2_duid_output_float_pair(opts, state, sacch_status, output_pair);
+    audio_drained |= p25p2_duid_output_short_pair(opts, state, output_pair);
+    if (audio_drained) {
+        // Both logical slots have reached the output stage. Promote any ESS
+        // identity changes only now so their purge cannot discard or decrypt
+        // the completed boundary superframe with the next stream.
+        p25p2_commit_deferred_rekeys(opts, state);
     }
 
     if (state->currentslot == 0) {
@@ -1739,7 +1646,7 @@ p25p2_duid_post_timeslot(dsd_opts* opts, dsd_state* state, int sacch_status) {
 
 static void DSD_ATTR_USED
 p25p2_duid_fallback_release(dsd_opts* opts, dsd_state* state) {
-    if (opts->p25_trunk != 1 || opts->p25_is_tuned != 1) {
+    if (opts->trunk_enable != 1 || opts->trunk_is_tuned != 1) {
         return;
     }
 
@@ -1750,13 +1657,13 @@ p25p2_duid_fallback_release(dsd_opts* opts, dsd_state* state) {
     double vc_grace = p25p2_frame_vc_grace_s(state, 0.75);
     if (no_recent_voice && both_slots_idle && dt_since_tune >= vc_grace) {
         state->p25_sm_force_release = 1;
-        p25_p2_teardown_call(opts, state);
-        p25_sm_on_release(opts, state);
+        p25p2_teardown_call(opts, state);
+        p25_sm_release(NULL, opts, state, "p2-duid-timeout");
     }
 }
 
-static void
-process_P2_DUID(dsd_opts* opts, dsd_state* state) {
+void
+p25p2_process_duid(dsd_opts* opts, dsd_state* state) {
     vc_counter = 0;
     int err_counter = 0;
     const time_t now = time(NULL);
@@ -1770,11 +1677,11 @@ process_P2_DUID(dsd_opts* opts, dsd_state* state) {
         int p2_pending_release = p25p2_duid_compute_pending_release(opts, state, now);
         p25p2_duid_clear_idle_state(opts, state, now);
         p25p2_duid_dispatch(opts, state, now, p2_pending_release, &err_counter);
-        if (p25p2_duid_should_abort(state, err_counter)) {
+        if (p25p2_duid_should_abort(opts, state, err_counter)) {
             goto END;
         }
 
-        p25p2_duid_post_timeslot(opts, state, sacch_status);
+        p25p2_duid_post_timeslot(opts, state, ts_counter, sacch_status);
     }
 
     p25p2_duid_fallback_release(opts, state);
@@ -1791,7 +1698,7 @@ processP2(dsd_opts* opts, dsd_state* state) {
     //look at our ISCH values and determine location in superframe before running frame scramble
     for (framing_counter = 0; framing_counter < 4; framing_counter++) {
         //run ISCH in here so we know when to start descramble offset
-        process_ISCH(opts, state);
+        p25p2_process_isch(opts, state, framing_counter);
     }
 
     //set initial current slot depending on offset value
@@ -1805,7 +1712,7 @@ processP2(dsd_opts* opts, dsd_state* state) {
     process_Frame_Scramble(opts, state);
 
     //process DUID will run through all collected frames and handle them appropriately
-    process_P2_DUID(opts, state);
+    p25p2_process_duid(opts, state);
 
     state->dmr_stereo = 0;
     state->p2_is_lcch = 0;

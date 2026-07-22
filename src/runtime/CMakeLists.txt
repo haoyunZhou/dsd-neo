@@ -15,6 +15,7 @@ target_sources(
         control_pump.c
         freq_parse.c
         input_spec.c
+        input_level.c
         path_policy.c
         frame_sync_hooks.c
         trunk_scan_hooks.c
@@ -34,7 +35,6 @@ target_sources(
         shutdown.c
         log.cpp
         mem.cpp
-        comp.c
         ring.cpp
         input_ring.cpp
         worker_pool.cpp
@@ -65,6 +65,11 @@ target_include_directories(
     PRIVATE ${_PUBLIC_INCLUDES}
 )
 
+target_compile_definitions(
+    dsd-neo_runtime
+    PRIVATE DSD_RUNTIME_HAS_TERMINAL_UI=$<BOOL:${DSD_ENABLE_TERMINAL_UI}>
+)
+
 # Link platform abstraction library for threading primitives
 target_link_libraries(
     dsd-neo_runtime
@@ -76,6 +81,9 @@ target_link_libraries(
         dsd-neo_feature_curl
 )
 target_link_libraries(dsd-neo_runtime PRIVATE dsd-neo_io_iq)
+if(WIN32)
+    target_link_libraries(dsd-neo_runtime PRIVATE gdi32)
+endif()
 
 target_link_libraries(dsd-neo_runtime PRIVATE dsd-neo_warnings)
 

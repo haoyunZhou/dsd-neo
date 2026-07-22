@@ -96,6 +96,45 @@ rules:
         - /src/third_party/**
     pattern: assert(...)
 
+  - id: dsd-neo.no-floating-point-equality-in-tests
+    languages: [c, cpp]
+    severity: ERROR
+    message: Compare floating-point test values with an explicit tolerance instead of == or !=.
+    paths:
+      include:
+        - /tests/**
+    pattern-either:
+      - patterns:
+          - pattern-inside: |
+              $RET $FUNC(...) {
+                ...
+                double $FLOAT_VALUE = ...;
+                ...
+              }
+          - pattern-either:
+              - pattern: $OTHER == $FLOAT_VALUE
+              - pattern: $OTHER != $FLOAT_VALUE
+              - pattern: $FLOAT_VALUE == $OTHER
+              - pattern: $FLOAT_VALUE != $OTHER
+          - metavariable-regex:
+              metavariable: $OTHER
+              regex: '^[A-Za-z_]'
+      - patterns:
+          - pattern-inside: |
+              $RET $FUNC(...) {
+                ...
+                float $FLOAT_VALUE = ...;
+                ...
+              }
+          - pattern-either:
+              - pattern: $OTHER == $FLOAT_VALUE
+              - pattern: $OTHER != $FLOAT_VALUE
+              - pattern: $FLOAT_VALUE == $OTHER
+              - pattern: $FLOAT_VALUE != $OTHER
+          - metavariable-regex:
+              metavariable: $OTHER
+              regex: '^[A-Za-z_]'
+
   - id: dsd-neo.no-weak-process-rng
     languages: [c, cpp]
     severity: ERROR
@@ -197,21 +236,6 @@ rules:
       - pattern: mkstemp(...)
       - pattern: mkstemps(...)
 
-  - id: dsd-neo.no-deprecated-dsd-sprintf
-    languages: [c, cpp]
-    severity: ERROR
-    message: Use DSD_SNPRINTF with an explicit destination size instead of deprecated DSD_SPRINTF.
-    paths:
-      include:
-        - /apps/**
-        - /include/**
-        - /src/**
-        - /tests/**
-      exclude:
-        - /include/dsd-neo/core/safe_api.h
-        - /src/third_party/**
-    pattern: DSD_SPRINTF(...)
-
   - id: dsd-neo.no-sizeof-function-parameter-in-dsd-snprintf
     languages: [c, cpp]
     severity: ERROR
@@ -254,7 +278,6 @@ rules:
         - /src/fec/ez.cpp
         - /src/io/radio/rtl_metrics.cpp
         - /tests/protocol/p25/test_p25_p2_rs28_limits.cpp
-        - /tests/protocol/p25/test_p25_p2_rs28_wrappers.cpp
     pattern-either:
       - pattern: '#include "src/third_party/..."'
       - pattern: '#include <src/third_party/...>'

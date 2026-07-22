@@ -5,7 +5,10 @@
 
 #include <dsd-neo/core/init.h>
 #include <dsd-neo/core/opts.h>
+#include <dsd-neo/core/p25_cqpsk_dibit.h>
 #include <dsd-neo/core/state.h>
+#include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include "dsd-neo/core/opts_fwd.h"
@@ -20,6 +23,10 @@ test_init_opts_clears_trunk_scan_targets_csv(void) {
     if (opts.trunk_scan_targets_csv[0] != '\0') {
         DSD_FPRINTF(stderr, "initOpts did not clear trunk_scan_targets_csv\n");
         return 20;
+    }
+    if (opts.show_keys != 0U) {
+        DSD_FPRINTF(stderr, "initOpts did not default show_keys to redacted\n");
+        return 21;
     }
     return 0;
 }
@@ -46,10 +53,23 @@ main(void) {
     state->nid_corrections_total = 12;
     state->nid_failures_total = 34;
     state->nid_parity_overrides = 56;
+    state->p25_p1_accepted_frames = 71U;
+    state->p25_p1_clean_frames = 72U;
+    state->p25_p1_corrected_frames = 73U;
+    state->p25_p1_concealed_frames = 74U;
+    state->p25_p1_accepted_corrections = 75U;
+    state->p25_p1_suppressed_tail_frames = 76U;
+    state->p25_p1_excluded_tail_corrections = 77U;
     state->trunk_chan_map[0x0123] = 851000000L;
     state->trunk_chan_map_used[0] = 0x0123U;
     state->trunk_chan_map_used_count = 1U;
     state->trunk_chan_map_seq = 99U;
+    state->p25_enc_tg_cache_next = 3U;
+    for (int i = 0; i < DSD_P25_ENC_TG_CACHE_DEPTH; i++) {
+        state->p25_enc_tg_cache_until[i] = 1234567890 + i;
+        state->p25_enc_tg_cache_tg[i] = (uint32_t)(2400 + i);
+        state->p25_enc_tg_cache_is_group[i] = (uint8_t)(i % 2);
+    }
     state->rtl_symbol_cache[0] = 1234.0f;
     state->rtl_symbol_cache[DSD_RTL_SYMBOL_CACHE_CAP - 1] = 5678.0f;
     state->rtl_symbol_cache_pos = 2;
@@ -60,10 +80,20 @@ main(void) {
     state->rtl_symbol_cache_levels = 4;
     state->rtl_symbol_cache_generation = 42U;
     state->rtl_symbol_cache_published_pending = 2;
+    state->rtl_fsk_sps_num = 24000;
+    state->rtl_fsk_sps_den = 9600;
+    state->rtl_fsk_sps_accum = 4800;
+    state->p25_cqpsk_dibit_map_idx = DSD_P25_CQPSK_DIBIT_MAP_N1200;
     state->ess_b[0][95] = 1;
     state->ess_b_llr[1][95] = 123;
     state->fourv_counter[0] = 2;
+    state->data_header_dd_format[0] = 0x16U;
+    state->data_header_dd_format[1] = 0x18U;
+    state->data_header_bit_padding[0] = 16U;
+    state->data_header_bit_padding[1] = 7U;
     state->p25_p1_soft_hamming_ok = 77U;
+    state->p25_last_cc_msg_time = 1234567890;
+    state->p25_last_cc_msg_time_m = 12345.5;
     state->K = 42;
     state->R = 0x1234567891ULL;
     state->RR = 0x1234567892ULL;
@@ -72,6 +102,7 @@ main(void) {
     state->K2 = 0x2222222222222222ULL;
     state->K3 = 0x3333333333333333ULL;
     state->K4 = 0x4444444444444444ULL;
+    state->hytera_key_segments = 4U;
     state->M = 0x21;
     state->payload_mi = 0x1111222233334444ULL;
     state->payload_miR = 0x5555666677778888ULL;
@@ -81,7 +112,23 @@ main(void) {
     state->payload_algidR = 0x89;
     state->payload_keyid = 0x1234;
     state->payload_keyidR = 0x5678;
-    state->p25_p2_enc_lockout_muted[0] = 1U;
+    state->p25_crypto_state[0] = DSD_P25_CRYPTO_BLOCKED;
+    state->p25_p1_hdu_crypto_fresh = 1;
+    state->p25_p1_crypto_conflict.active = 1U;
+    state->p25_p1_crypto_conflict.algid = 0xA0U;
+    state->p25_p1_crypto_conflict.keyid = 0x0064U;
+    state->p25_policy_tg[0] = 0x1234U;
+    state->p25_policy_tg[1] = 0x5678U;
+    state->p25_mac_frag[0].active = 1U;
+    state->p25_mac_frag[0].opcode = 0x89U;
+    state->p25_mac_frag[0].data_len = 4U;
+    state->p25_mac_frag[0].collected = 2U;
+    state->p25_mac_frag[0].data[0] = 0xAAU;
+    state->p25_mac_frag[1].active = 1U;
+    state->p25_mac_frag[1].opcode = 0x8AU;
+    state->p25_mac_frag[1].data_len = 8U;
+    state->p25_mac_frag[1].collected = 6U;
+    state->p25_mac_frag[1].data[5] = 0xBBU;
     state->dropL = 1;
     state->dropR = 2;
     state->nxdn_cipher_type = 3U;
@@ -126,7 +173,8 @@ main(void) {
         return 2;
     }
     if (state->K != 0 || state->R != 0ULL || state->RR != 0ULL || state->H != 0ULL || state->K1 != 0ULL
-        || state->K2 != 0ULL || state->K3 != 0ULL || state->K4 != 0ULL || state->M != 0) {
+        || state->K2 != 0ULL || state->K3 != 0ULL || state->K4 != 0ULL || state->hytera_key_segments != 0U
+        || state->M != 0) {
         DSD_FPRINTF(stderr, "initState did not clear manual crypto key fields\n");
         freeState(state);
         free(state);
@@ -134,8 +182,11 @@ main(void) {
     }
     if (state->payload_mi != 0ULL || state->payload_miR != 0ULL || state->payload_miN != 0ULL
         || state->payload_miP != 0ULL || state->payload_algid != 0 || state->payload_algidR != 0
-        || state->payload_keyid != 0 || state->payload_keyidR != 0 || state->p25_p2_enc_lockout_muted[0] != 0U
-        || state->p25_p2_enc_lockout_muted[1] != 0U) {
+        || state->payload_keyid != 0 || state->payload_keyidR != 0
+        || state->p25_crypto_state[0] != DSD_P25_CRYPTO_UNKNOWN || state->p25_crypto_state[1] != DSD_P25_CRYPTO_UNKNOWN
+        || state->p25_p1_hdu_crypto_fresh != 0 || state->p25_p1_crypto_conflict.active != 0U
+        || state->p25_p1_crypto_conflict.algid != 0U || state->p25_p1_crypto_conflict.keyid != 0U
+        || state->p25_policy_tg[0] != 0U || state->p25_policy_tg[1] != 0U) {
         DSD_FPRINTF(stderr, "initState did not clear payload crypto metadata\n");
         freeState(state);
         free(state);
@@ -173,16 +224,15 @@ main(void) {
         free(state);
         return 19;
     }
-    if (!state->dmr_reliab_buf || state->dmr_reliab_p != state->dmr_reliab_buf + 200 || !state->dmr_soft_buf
-        || state->dmr_soft_p != state->dmr_soft_buf + 200) {
+    if (!state->dmr_soft_buf || state->dmr_soft_p != state->dmr_soft_buf + 200) {
         DSD_FPRINTF(stderr, "initState did not allocate/reset dibit soft-decision buffers\n");
         freeState(state);
         free(state);
         return 9;
     }
     for (int i = 0; i < 200; i++) {
-        if (state->dmr_reliab_buf[i] != 0 || state->dmr_soft_buf[i].reliability != 0
-            || state->dmr_soft_buf[i].llr[0] != 0 || state->dmr_soft_buf[i].llr[1] != 0) {
+        if (state->dmr_soft_buf[i].reliability != 0 || state->dmr_soft_buf[i].llr[0] != 0
+            || state->dmr_soft_buf[i].llr[1] != 0) {
             DSD_FPRINTF(stderr, "initState did not clear dibit soft-decision buffer prefix\n");
             freeState(state);
             free(state);
@@ -194,6 +244,14 @@ main(void) {
         freeState(state);
         free(state);
         return 3;
+    }
+    if (state->p25_p1_accepted_frames != 0U || state->p25_p1_clean_frames != 0U || state->p25_p1_corrected_frames != 0U
+        || state->p25_p1_concealed_frames != 0U || state->p25_p1_accepted_corrections != 0U
+        || state->p25_p1_suppressed_tail_frames != 0U || state->p25_p1_excluded_tail_corrections != 0U) {
+        DSD_FPRINTF(stderr, "expected P25P1 session voice counters to be reset after initState\n");
+        freeState(state);
+        free(state);
+        return 29;
     }
     if (state->ess_b[0][95] != 0 || state->ess_b_llr[1][95] != 0 || state->fourv_counter[0] != 0
         || state->fourv_counter[1] != 0) {
@@ -208,6 +266,30 @@ main(void) {
         free(state);
         return 12;
     }
+    if (state->data_header_dd_format[0] != 0U || state->data_header_dd_format[1] != 0U
+        || state->data_header_bit_padding[0] != 0U || state->data_header_bit_padding[1] != 0U) {
+        DSD_FPRINTF(stderr, "initState did not clear transient DMR short-data metadata\n");
+        freeState(state);
+        free(state);
+        return 28;
+    }
+    if (state->p25_last_cc_msg_time != 0 || !isfinite(state->p25_last_cc_msg_time_m)
+        || fabs(state->p25_last_cc_msg_time_m) > 1e-12) {
+        DSD_FPRINTF(stderr, "initState did not clear P25 decoded control-channel timestamps\n");
+        freeState(state);
+        free(state);
+        return 27;
+    }
+    for (int i = 0; i < 2; i++) {
+        if (state->p25_mac_frag[i].active != 0U || state->p25_mac_frag[i].opcode != 0U
+            || state->p25_mac_frag[i].data_len != 0U || state->p25_mac_frag[i].collected != 0U
+            || state->p25_mac_frag[i].data[0] != 0U || state->p25_mac_frag[i].data[5] != 0U) {
+            DSD_FPRINTF(stderr, "initState did not clear P25P2 MAC fragment state\n");
+            freeState(state);
+            free(state);
+            return 26;
+        }
+    }
 
     // Sparse trunk map bookkeeping must reset before any first live grant arrives.
     if (state->trunk_chan_map_used_count != 0U || state->trunk_chan_map[0x0123] != 0
@@ -218,11 +300,28 @@ main(void) {
         return 4;
     }
 
+    if (state->p25_enc_tg_cache_next != 0U) {
+        DSD_FPRINTF(stderr, "initState did not reset P25 encrypted TG cache cursor\n");
+        freeState(state);
+        free(state);
+        return 24;
+    }
+    for (int i = 0; i < DSD_P25_ENC_TG_CACHE_DEPTH; i++) {
+        if (state->p25_enc_tg_cache_until[i] != 0 || state->p25_enc_tg_cache_tg[i] != 0U
+            || state->p25_enc_tg_cache_is_group[i] != 0U) {
+            DSD_FPRINTF(stderr, "initState did not reset P25 encrypted TG cache\n");
+            freeState(state);
+            free(state);
+            return 25;
+        }
+    }
+
     if (state->rtl_symbol_cache_pos != 0 || state->rtl_symbol_cache_len != 0 || state->rtl_symbol_cache_output_kind != 0
         || state->rtl_symbol_cache_channel_profile != 0 || state->rtl_symbol_cache_symbol_rate_hz != 0
         || state->rtl_symbol_cache_levels != 0 || state->rtl_symbol_cache_generation != 0U
-        || state->rtl_symbol_cache_published_pending != 0 || state->rtl_symbol_cache[0] != 0.0f
-        || state->rtl_symbol_cache[DSD_RTL_SYMBOL_CACHE_CAP - 1] != 0.0f) {
+        || state->rtl_symbol_cache_published_pending != 0 || state->rtl_fsk_sps_num != 0 || state->rtl_fsk_sps_den != 0
+        || state->rtl_fsk_sps_accum != 0 || state->p25_cqpsk_dibit_map_idx != DSD_P25_CQPSK_DIBIT_MAP_IDENTITY
+        || state->rtl_symbol_cache[0] != 0.0f || state->rtl_symbol_cache[DSD_RTL_SYMBOL_CACHE_CAP - 1] != 0.0f) {
         DSD_FPRINTF(stderr, "initState did not clear RTL symbol cache state\n");
         freeState(state);
         free(state);

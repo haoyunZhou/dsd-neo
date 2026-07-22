@@ -23,32 +23,37 @@ Optional compiled dependencies are:
 - SoapySDR 0.8.1 or newer for non-RTL SDR devices; the CMake package must
   export an imported target (`SoapySDR` or `SoapySDR::SoapySDR`)
 - Codec2 for additional vocoder paths
-- libcurl for rdio-scanner API uploads
+- libcurl 7.56.0 or newer for rdio-scanner API uploads. Builds older than
+  7.85 use the integer protocol-mask option needed by the Ubuntu 20.04
+  AppImage toolchain; remove that branch when portable packaging no longer
+  supports libcurl below 7.85.
 - PortAudio on non-Windows builds when selected
 - help2man for generated man pages
 
-Vendored compiled third-party components are:
+Vendored and embedded third-party components include:
 
 - ezpwd Reed-Solomon under `src/third_party/ezpwd/`
 - PFFFT/FFTPACK under `src/third_party/pffft/`
 - Tiny AES code in `src/crypto/crypt-aes.c`
 
-Vendored code retains upstream notices. License and attribution details are in
-`THIRD_PARTY.md`.
+Vendored code and embedded upstream-derived snippets retain upstream notices.
+License and attribution details are in `THIRD_PARTY.md`.
 
 Registry-managed vcpkg dependencies are pinned by the manifest
-`builtin-baseline`. At baseline `f3e10653cc27d62a37a3763cd84b38bca07c6075`,
-the `openssl` port resolves to OpenSSL `3.6.2` and the `curl` port resolves to
-curl `8.19.0`; system-package builds enforce the OpenSSL requirement through
-`find_package(OpenSSL 3.0 REQUIRED)`.
+`builtin-baseline` (`cd61e1e26a038e82d6550a3ebbe0fbbfe7da78e3` in the current
+manifest). The baseline, overlay ports, and triplets are the source of truth
+for exact registry versions; system-package builds enforce the OpenSSL
+requirement through `find_package(OpenSSL 3.0 REQUIRED)`.
 
 ## Packaging Dependencies
 
 Windows builds use vcpkg overlays under `vcpkg-ports/` and triplets under
 `vcpkg-triplets/`. AppImage builds use pinned CI source checkouts for compiled
 dependencies that are not suitable from the Ubuntu 20.04 base image, including
-SoapySDR 0.8.1 or newer. Overlay ports and CI source checkouts must use
-immutable source references and hashes as described in
+SoapySDR 0.8.1 or newer. Linux source-install validation uses pinned Docker
+images from `tools/ci-dependency-pins.env` to exercise apt, dnf, zypper, apk,
+and pacman bootstrap paths. Overlay ports, CI source checkouts, and validation
+container images must use immutable source references and hashes as described in
 `docs/supply-chain-guardrails.md`.
 
 ## Tooling Dependencies

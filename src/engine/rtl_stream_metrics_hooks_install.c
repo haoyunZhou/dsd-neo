@@ -3,6 +3,7 @@
  * Copyright (C) 2026 by arancormonk <180709949+arancormonk@users.noreply.github.com>
  */
 
+#include <dsd-neo/runtime/config.h>
 #include <dsd-neo/runtime/rtl_stream_metrics_hooks.h>
 #include <stddef.h>
 
@@ -14,8 +15,22 @@
 unsigned int dsd_rtl_stream_output_rate(void);
 
 static int
-rtl_stream_metrics_ted_bias(void) {
-    return rtl_stream_ted_bias(NULL);
+rtl_stream_metrics_cqpsk_timing_bias(void) {
+    return rtl_stream_cqpsk_timing_bias(NULL);
+}
+
+static int
+rtl_stream_metrics_apply_demod_profile(int cqpsk_enable, int symbol_rate_hz, int levels, int channel_profile,
+                                       int ted_sps) {
+    const dsdneoRuntimeConfig* cfg = dsd_neo_get_config();
+    if (!cfg || !cfg->cqpsk_is_set) {
+        rtl_stream_toggle_cqpsk(cqpsk_enable);
+    }
+    rtl_stream_clear_ted_sps_override();
+    if (ted_sps > 0) {
+        rtl_stream_set_ted_sps_no_override(ted_sps);
+    }
+    return rtl_stream_set_symbol_profile(symbol_rate_hz, levels, channel_profile);
 }
 #endif
 
@@ -27,18 +42,21 @@ dsd_engine_rtl_stream_metrics_hooks_install(void) {
     hooks.output_kind = rtl_stream_get_output_kind;
     hooks.symbol_profile = rtl_stream_get_symbol_profile_full;
     hooks.stream_generation = rtl_stream_output_generation;
-    hooks.set_symbol_profile = rtl_stream_set_symbol_profile;
-    hooks.dsp_get = rtl_stream_dsp_get;
-    hooks.ted_bias = rtl_stream_metrics_ted_bias;
+    hooks.apply_demod_profile = rtl_stream_metrics_apply_demod_profile;
+    hooks.cqpsk_status = rtl_stream_get_cqpsk_status;
+    hooks.request_cqpsk_reacquire = rtl_stream_request_cqpsk_reacquire;
+    hooks.cqpsk_timing_bias = rtl_stream_metrics_cqpsk_timing_bias;
     hooks.snr_bias_evm = rtl_stream_get_snr_bias_evm;
     hooks.snr_c4fm_db = rtl_stream_get_snr_c4fm;
     hooks.snr_c4fm_eye_db = rtl_stream_estimate_snr_c4fm_eye;
     hooks.snr_cqpsk_db = rtl_stream_get_snr_cqpsk;
     hooks.snr_gfsk_db = rtl_stream_get_snr_gfsk;
+    hooks.snr_gfsk_eye_db = rtl_stream_estimate_snr_gfsk_eye;
     hooks.snr_qpsk_const_db = rtl_stream_estimate_snr_qpsk_const;
     hooks.p25p1_ber_update = rtl_stream_p25p1_ber_update;
     hooks.p25p2_err_update = rtl_stream_p25p2_err_update;
     hooks.stream_active = rtl_stream_is_active;
+    hooks.input_level = rtl_stream_get_input_level;
 #endif
     dsd_rtl_stream_metrics_hooks_set(&hooks);
 }

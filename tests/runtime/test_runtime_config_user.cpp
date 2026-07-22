@@ -10,6 +10,7 @@
  * without touching CLI or environment precedence.
  */
 
+#include <dsd-neo/core/frontend_types.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/state.h>
 #include <dsd-neo/runtime/config.h>
@@ -23,6 +24,7 @@
 #include "dsd-neo/core/state_fwd.h"
 #include "dsd-neo/platform/file_compat.h"
 #include "dsd-neo/runtime/call_alert.h"
+#include "dsd-neo/runtime/config_schema.h"
 #include "test_support.h"
 
 static int
@@ -83,9 +85,18 @@ render_config_to_buffer(const dsdneoUserConfig* cfg, char* out, size_t out_sz) {
 }
 
 static int
+expect_contains(const char* label, const char* haystack, const char* needle) {
+    if (!haystack || !needle || !strstr(haystack, needle)) {
+        DSD_FPRINTF(stderr, "FAIL: %s missing \"%s\" in:\n%s\n", label, needle ? needle : "(null)",
+                    haystack ? haystack : "(null)");
+        return 1;
+    }
+    return 0;
+}
+
+static int
 test_apply_file_input_rescales_symbol_timing(void) {
     dsdneoUserConfig cfg = {};
-    cfg.version = 1;
     cfg.has_input = 1;
     cfg.input_source = DSDCFG_INPUT_FILE;
     cfg.file_sample_rate = 44100;
@@ -131,15 +142,338 @@ test_apply_file_input_rescales_symbol_timing(void) {
 }
 
 static int
+test_decode_mode_and_load_guards(void) {
+    static const char* ini = "[mode]\n"
+                             "decode = \"edacs_pv\"\n";
+
+    char path[DSD_TEST_PATH_MAX];
+    if (write_temp_config(ini, path, sizeof path) != 0) {
+        return 1;
+    }
+
+    dsdneoUserConfig cfg;
+    if (dsd_user_config_load(path, &cfg) != 0) {
+        DSD_FPRINTF(stderr, "dsd_user_config_load failed for canonical decode config %s\n", path);
+        (void)remove(path);
+        return 1;
+    }
+
+    int rc = 0;
+    if (!cfg.has_mode || cfg.decode_mode != DSDCFG_MODE_EDACS_PV) {
+        DSD_FPRINTF(stderr, "decode mode edacs_pv not parsed as EDACS/PV, mode=%d\n", (int)cfg.decode_mode);
+        rc |= 1;
+    }
+
+    dsdneoUserConfig bad_cfg;
+    if (dsd_user_config_load(NULL, &bad_cfg) == 0) {
+        DSD_FPRINTF(stderr, "load NULL path should fail\n");
+        rc |= 1;
+    }
+    if (dsd_user_config_load(path, NULL) == 0) {
+        DSD_FPRINTF(stderr, "load NULL config should fail\n");
+        rc |= 1;
+    }
+
+    (void)remove(path);
+    return rc;
+}
+
+static int
+test_persisted_v1_load_boundary(void) {
+    struct persisted_config_case {
+        const char* label;
+        const char* contents;
+        int should_load;
+    } cases[] = {
+        {"persisted version 1", "version = 1\n\n[mode]\ndecode = \"dmr\"\n", 1},
+        {"unsupported version", "version = 2\n\n[mode]\ndecode = \"dmr\"\n", 0},
+        {"non-integer version", "version = old\n\n[mode]\ndecode = \"dmr\"\n", 0},
+    };
+
+    int result = 0;
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        char path[DSD_TEST_PATH_MAX];
+        if (write_temp_config(cases[i].contents, path, sizeof path) != 0) {
+            return 1;
+        }
+
+        dsdneoUserConfig cfg;
+        int load_rc = dsd_user_config_load(path, &cfg);
+        if (cases[i].should_load) {
+            if (load_rc != 0 || !cfg.has_mode || cfg.decode_mode != DSDCFG_MODE_DMR) {
+                DSD_FPRINTF(stderr, "%s should load through the persisted-config boundary (rc=%d)\n", cases[i].label,
+                            load_rc);
+                result = 1;
+            }
+        } else if (load_rc == 0) {
+            DSD_FPRINTF(stderr, "%s should be rejected\n", cases[i].label);
+            result = 1;
+        }
+        (void)remove(path);
+    }
+    return result;
+}
+
+static int
+test_integer_overflow_is_rejected_consistently(void) {
+    static const char* ini = "[input]\n"
+                             "source = \"rtl\"\n"
+                             "rtl_device = 999999999999999999999999\n";
+
+    char path[DSD_TEST_PATH_MAX];
+    if (write_temp_config(ini, path, sizeof path) != 0) {
+        return 1;
+    }
+
+    dsdcfg_diagnostics_t diags;
+    DSD_MEMSET(&diags, 0, sizeof diags);
+    int rc = 0;
+    if (dsd_user_config_validate(path, &diags) == 0 || diags.error_count == 0) {
+        DSD_FPRINTF(stderr, "out-of-range integer should fail validation\n");
+        rc = 1;
+    }
+    dsdcfg_diags_free(&diags);
+
+    dsdneoUserConfig cfg;
+    if (dsd_user_config_load(path, &cfg) != 0 || cfg.rtl_device != 0) {
+        DSD_FPRINTF(stderr, "out-of-range integer should leave the base default, got %d\n", cfg.rtl_device);
+        rc = 1;
+    }
+
+    (void)remove(path);
+    return rc;
+}
+
+static int
+test_unknown_section_warnings_do_not_mutate_loaded_config(void) {
+    static const char* ini = "[input]\n"
+                             "source = \"pulse\"\n"
+                             "\n"
+                             "[unexpected]\n"
+                             "source = \"rtl\"\n"
+                             "rtl_device = 9\n"
+                             "rtl_freq = \"851.0125M\"\n"
+                             "\n"
+                             "[mode]\n"
+                             "decode = \"nxdn48\"\n";
+
+    char path[DSD_TEST_PATH_MAX];
+    if (write_temp_config(ini, path, sizeof path) != 0) {
+        return 1;
+    }
+
+    dsdcfg_diagnostics_t diags;
+    DSD_MEMSET(&diags, 0, sizeof(diags));
+    int validate_rc = dsd_user_config_validate(path, &diags);
+
+    int rc = 0;
+    if (validate_rc != 0 || diags.error_count != 0 || diags.warning_count == 0) {
+        DSD_FPRINTF(stderr, "expected unknown section to validate with warning only, rc=%d errors=%d warnings=%d\n",
+                    validate_rc, diags.error_count, diags.warning_count);
+        rc |= 1;
+    }
+    int found_unknown_section = 0;
+    for (int i = 0; i < diags.count; i++) {
+        if (diags.items[i].level == DSDCFG_DIAG_WARNING && strcmp(diags.items[i].section, "unexpected") == 0
+            && strstr(diags.items[i].message, "Unknown section")) {
+            found_unknown_section = 1;
+            break;
+        }
+    }
+    if (!found_unknown_section) {
+        DSD_FPRINTF(stderr, "missing unknown-section warning diagnostic\n");
+        rc |= 1;
+    }
+    dsdcfg_diags_free(&diags);
+
+    dsdneoUserConfig cfg;
+    if (dsd_user_config_load(path, &cfg) != 0) {
+        DSD_FPRINTF(stderr, "dsd_user_config_load failed for warning-only config %s\n", path);
+        (void)remove(path);
+        return 1;
+    }
+    if (!cfg.has_input || cfg.input_source != DSDCFG_INPUT_PULSE) {
+        DSD_FPRINTF(stderr, "unknown section mutated input source=%d has_input=%d\n", (int)cfg.input_source,
+                    cfg.has_input);
+        rc |= 1;
+    }
+    if (cfg.rtl_device == 9 || cfg.rtl_freq[0] != '\0') {
+        DSD_FPRINTF(stderr, "unknown section leaked RTL fields device=%d freq=%s\n", cfg.rtl_device, cfg.rtl_freq);
+        rc |= 1;
+    }
+    if (!cfg.has_mode || cfg.decode_mode != DSDCFG_MODE_NXDN48) {
+        DSD_FPRINTF(stderr, "known mode section after unknown section did not load, mode=%d has=%d\n",
+                    (int)cfg.decode_mode, cfg.has_mode);
+        rc |= 1;
+    }
+
+    static dsd_opts opts;
+    static dsd_state state;
+    reset_opts_and_state(opts, state);
+    dsd_apply_user_config_to_opts(&cfg, &opts, &state);
+    if (opts.audio_in_type == AUDIO_IN_RTL || strncmp(opts.audio_in_dev, "rtl:", 4) == 0) {
+        DSD_FPRINTF(stderr, "unknown section applied RTL input to live opts: type=%d dev=%s\n", opts.audio_in_type,
+                    opts.audio_in_dev);
+        rc |= 1;
+    }
+
+    (void)remove(path);
+    return rc;
+}
+
+static int
+test_render_input_variants_and_save_atomic(void) {
+    dsdneoUserConfig cfg;
+    DSD_MEMSET(&cfg, 0, sizeof cfg);
+    cfg.has_input = 1;
+    cfg.has_output = 1;
+    cfg.output_backend = DSDCFG_OUTPUT_PULSE;
+    DSD_SNPRINTF(cfg.pulse_output, sizeof cfg.pulse_output, "%s", "speaker");
+    cfg.frontend_kind = DSD_FRONTEND_TERMINAL;
+    cfg.frontend_kind_is_set = 1;
+    cfg.has_mode = 1;
+    cfg.decode_mode = DSDCFG_MODE_M17;
+    cfg.has_demod = 1;
+    cfg.demod_path = DSDCFG_DEMOD_AUTO;
+    cfg.has_logging = 1;
+    DSD_SNPRINTF(cfg.event_log, sizeof cfg.event_log, "%s", "/tmp/events.log");
+    DSD_SNPRINTF(cfg.frame_log, sizeof cfg.frame_log, "%s", "/tmp/frames.log");
+    DSD_SNPRINTF(cfg.p25_sm_log, sizeof cfg.p25_sm_log, "%s", "/tmp/p25-sm.log");
+    cfg.has_recording = 1;
+    cfg.per_call_wav = 0;
+    DSD_SNPRINTF(cfg.per_call_wav_dir, sizeof cfg.per_call_wav_dir, "%s", "/tmp/wav");
+    DSD_SNPRINTF(cfg.static_wav_path, sizeof cfg.static_wav_path, "%s", "/tmp/static.wav");
+    DSD_SNPRINTF(cfg.raw_wav_path, sizeof cfg.raw_wav_path, "%s", "/tmp/raw.wav");
+    cfg.rdio_mode = DSD_RDIO_MODE_DIRWATCH;
+    cfg.rdio_system_id = 12;
+    DSD_SNPRINTF(cfg.rdio_api_url, sizeof cfg.rdio_api_url, "%s", "http://rdio.local");
+    DSD_SNPRINTF(cfg.rdio_api_key, sizeof cfg.rdio_api_key, "%s", "secret");
+    cfg.rdio_upload_timeout_ms = 6000;
+    cfg.rdio_upload_retries = 2;
+    cfg.rdio_api_delete_after_upload = 1;
+    cfg.has_dsp = 1;
+    cfg.iq_balance = 1;
+    cfg.iq_dc_block = 1;
+
+    char rendered[8192];
+    int rc = 0;
+
+    cfg.input_source = DSDCFG_INPUT_RTL;
+    cfg.rtl_device = 3;
+    DSD_SNPRINTF(cfg.rtl_freq, sizeof cfg.rtl_freq, "%s", "851.375M");
+    cfg.rtl_gain = 29;
+    cfg.rtl_ppm = 0;
+    cfg.rtl_ppm_is_set = 1;
+    cfg.rtl_bw_khz = 16;
+    cfg.rtl_sql = -45;
+    cfg.rtl_volume = 4;
+    cfg.rtl_auto_ppm = 1;
+    if (render_config_to_buffer(&cfg, rendered, sizeof rendered) != 0) {
+        return 1;
+    }
+    if (strstr(rendered, "version =") != NULL) {
+        DSD_FPRINTF(stderr, "rendered config must not emit the persisted version marker:\n%s\n", rendered);
+        rc |= 1;
+    }
+    rc |= expect_contains("render rtl source", rendered, "source = \"rtl\"\n");
+    rc |= expect_contains("render rtl device", rendered, "rtl_device = 3\n");
+    rc |= expect_contains("render rtl explicit zero ppm", rendered, "rtl_ppm = 0\n");
+    rc |= expect_contains("render auto demod", rendered, "demod = \"auto\"\n");
+    rc |= expect_contains("render pulse sink", rendered, "pulse_sink = \"speaker\"\n");
+    rc |= expect_contains("render event log", rendered, "event_log = \"/tmp/events.log\"\n");
+    rc |= expect_contains("render static wav", rendered, "static_wav = \"/tmp/static.wav\"\n");
+    rc |= expect_contains("render raw wav", rendered, "raw_wav = \"/tmp/raw.wav\"\n");
+    rc |= expect_contains("render rdio api key", rendered, "rdio_api_key = \"secret\"\n");
+    rc |= expect_contains("render dsp balance", rendered, "iq_balance = true\n");
+
+    cfg.input_source = DSDCFG_INPUT_RTLTCP;
+    DSD_SNPRINTF(cfg.rtltcp_host, sizeof cfg.rtltcp_host, "%s", "127.0.0.1");
+    cfg.rtltcp_port = 1234;
+    if (render_config_to_buffer(&cfg, rendered, sizeof rendered) != 0) {
+        return 1;
+    }
+    rc |= expect_contains("render rtltcp source", rendered, "source = \"rtltcp\"\n");
+    rc |= expect_contains("render rtltcp host", rendered, "rtltcp_host = \"127.0.0.1\"\n");
+    rc |= expect_contains("render rtltcp port", rendered, "rtltcp_port = 1234\n");
+
+    cfg.input_source = DSDCFG_INPUT_FILE;
+    DSD_SNPRINTF(cfg.file_path, sizeof cfg.file_path, "%s", "/tmp/input.wav");
+    cfg.file_sample_rate = 96000;
+    if (render_config_to_buffer(&cfg, rendered, sizeof rendered) != 0) {
+        return 1;
+    }
+    rc |= expect_contains("render file source", rendered, "source = \"file\"\n");
+    rc |= expect_contains("render file path", rendered, "file_path = \"/tmp/input.wav\"\n");
+    rc |= expect_contains("render file sample rate", rendered, "file_sample_rate = 96000\n");
+
+    cfg.input_source = DSDCFG_INPUT_TCP;
+    DSD_SNPRINTF(cfg.tcp_host, sizeof cfg.tcp_host, "%s", "localhost");
+    cfg.tcp_port = 7355;
+    if (render_config_to_buffer(&cfg, rendered, sizeof rendered) != 0) {
+        return 1;
+    }
+    rc |= expect_contains("render tcp source", rendered, "source = \"tcp\"\n");
+    rc |= expect_contains("render tcp host", rendered, "tcp_host = \"localhost\"\n");
+    rc |= expect_contains("render tcp port", rendered, "tcp_port = 7355\n");
+
+    char base_path[DSD_TEST_PATH_MAX];
+    int fd = dsd_test_mkstemp(base_path, sizeof base_path, "dsdneo_config_save");
+    if (fd < 0) {
+        DSD_FPRINTF(stderr, "dsd_test_mkstemp failed for save path\n");
+        return 1;
+    }
+    (void)dsd_close(fd);
+    (void)remove(base_path);
+
+    char save_dir[DSD_TEST_PATH_MAX];
+    char save_subdir[DSD_TEST_PATH_MAX];
+    char save_path[DSD_TEST_PATH_MAX];
+    DSD_SNPRINTF(save_dir, sizeof save_dir, "%s.d", base_path);
+    DSD_SNPRINTF(save_subdir, sizeof save_subdir, "%s/sub", save_dir);
+    DSD_SNPRINTF(save_path, sizeof save_path, "%s/config.ini", save_subdir);
+
+    if (dsd_user_config_save_atomic(NULL, &cfg) == 0 || dsd_user_config_save_atomic("", &cfg) == 0
+        || dsd_user_config_save_atomic(save_path, NULL) == 0) {
+        DSD_FPRINTF(stderr, "save_atomic guard should reject NULL/empty inputs\n");
+        rc |= 1;
+    }
+    if (dsd_user_config_save_atomic(save_path, &cfg) != 0) {
+        DSD_FPRINTF(stderr, "save_atomic failed for %s: %s\n", save_path, strerror(errno));
+        rc |= 1;
+    } else {
+        dsdneoUserConfig loaded;
+        if (dsd_user_config_load(save_path, &loaded) != 0) {
+            DSD_FPRINTF(stderr, "load saved config failed for %s\n", save_path);
+            rc |= 1;
+        } else {
+            rc |= (loaded.input_source == DSDCFG_INPUT_TCP) ? 0 : 1;
+            if (loaded.input_source != DSDCFG_INPUT_TCP || strcmp(loaded.tcp_host, "localhost") != 0
+                || loaded.tcp_port != 7355 || loaded.decode_mode != DSDCFG_MODE_M17
+                || loaded.demod_path != DSDCFG_DEMOD_AUTO || !loaded.has_dsp || !loaded.iq_balance
+                || !loaded.iq_dc_block) {
+                DSD_FPRINTF(stderr,
+                            "saved config reload mismatch source=%d host=%s port=%d mode=%d demod=%d dsp=%d/%d\n",
+                            (int)loaded.input_source, loaded.tcp_host, loaded.tcp_port, (int)loaded.decode_mode,
+                            (int)loaded.demod_path, loaded.iq_balance, loaded.iq_dc_block);
+                rc |= 1;
+            }
+        }
+    }
+
+    (void)remove(save_path);
+    (void)remove(save_subdir);
+    (void)remove(save_dir);
+    return rc;
+}
+
+static int
 test_load_and_apply_basic(void) {
     /*
      * Load one representative user config that touches every public section.
      * The first half verifies parsed config fields; the second half applies the
      * snapshot to opts/state and checks the runtime-facing values.
      */
-    static const char* ini = "version = 1\n"
-                             "\n"
-                             "[input]\n"
+    static const char* ini = "[input]\n"
                              "source = \"rtl\"\n"
                              "rtl_device = 1\n"
                              "rtl_freq = \"851.375M\"\n"
@@ -151,7 +485,7 @@ test_load_and_apply_basic(void) {
                              "\n"
                              "[output]\n"
                              "backend = \"null\"\n"
-                             "ncurses_ui = true\n"
+                             "frontend = \"terminal\"\n"
                              "\n"
                              "[mode]\n"
                              "decode = \"dmr\"\n"
@@ -171,6 +505,7 @@ test_load_and_apply_basic(void) {
                              "[logging]\n"
                              "event_log = \"/tmp/events.log\"\n"
                              "frame_log = \"/tmp/frames.log\"\n"
+                             "p25_sm_log = \"/tmp/p25-sm.log\"\n"
                              "\n"
                              "[alerts]\n"
                              "enabled = true\n"
@@ -206,7 +541,8 @@ test_load_and_apply_basic(void) {
         DSD_FPRINTF(stderr, "input section not parsed as RTL\n");
         rc |= 1;
     }
-    if (!cfg.has_output || cfg.output_backend != DSDCFG_OUTPUT_NULL || cfg.ncurses_ui != 1) {
+    if (!cfg.has_output || cfg.output_backend != DSDCFG_OUTPUT_NULL || cfg.frontend_kind != DSD_FRONTEND_TERMINAL
+        || !cfg.frontend_kind_is_set) {
         DSD_FPRINTF(stderr, "output section not parsed correctly\n");
         rc |= 1;
     }
@@ -245,15 +581,15 @@ test_load_and_apply_basic(void) {
         DSD_FPRINTF(stderr, "audio_out_dev mismatch: \"%s\"\n", opts.audio_out_dev);
         rc |= 1;
     }
-    if (opts.use_ncurses_terminal != 1) {
-        DSD_FPRINTF(stderr, "use_ncurses_terminal not enabled\n");
+    if (opts.frontend_kind != DSD_FRONTEND_TERMINAL) {
+        DSD_FPRINTF(stderr, "terminal frontend not enabled\n");
         rc |= 1;
     }
     if (!(opts.frame_dmr == 1 && opts.frame_p25p1 == 0 && opts.frame_p25p2 == 0 && opts.frame_ysf == 0)) {
         DSD_FPRINTF(stderr, "DMR mode flags not applied as expected\n");
         rc |= 1;
     }
-    if (!(opts.p25_trunk == 1 && opts.trunk_enable == 1)) {
+    if (opts.trunk_enable != 1) {
         DSD_FPRINTF(stderr, "trunking not enabled in opts\n");
         rc |= 1;
     }
@@ -278,9 +614,10 @@ test_load_and_apply_basic(void) {
                     opts.trunk_scan_activity_hold_ms);
         rc |= 1;
     }
-    if (strcmp(opts.event_out_file, "/tmp/events.log") != 0 || strcmp(opts.frame_log_file, "/tmp/frames.log") != 0) {
-        DSD_FPRINTF(stderr, "logging paths not applied correctly event=%s frame=%s\n", opts.event_out_file,
-                    opts.frame_log_file);
+    if (strcmp(opts.event_out_file, "/tmp/events.log") != 0 || strcmp(opts.frame_log_file, "/tmp/frames.log") != 0
+        || strcmp(opts.p25_sm_log_file, "/tmp/p25-sm.log") != 0) {
+        DSD_FPRINTF(stderr, "logging paths not applied correctly event=%s frame=%s p25_sm=%s\n", opts.event_out_file,
+                    opts.frame_log_file, opts.p25_sm_log_file);
         rc |= 1;
     }
     if (opts.dmr_stereo_wav != 1 || strcmp(opts.wav_out_dir, "/tmp/wav") != 0) {
@@ -311,9 +648,7 @@ test_load_and_apply_basic(void) {
 
 static int
 test_load_and_apply_alerts_empty_event_mask(void) {
-    static const char* ini = "version = 1\n"
-                             "\n"
-                             "[alerts]\n"
+    static const char* ini = "[alerts]\n"
                              "enabled = true\n"
                              "voice_start = false\n"
                              "voice_end = false\n"
@@ -371,9 +706,7 @@ test_load_and_apply_alerts_empty_event_mask(void) {
 
 static int
 test_load_and_apply_soapy_input_no_args(void) {
-    static const char* ini = "version = 1\n"
-                             "\n"
-                             "[input]\n"
+    static const char* ini = "[input]\n"
                              "source = \"soapy\"\n"
                              "rtl_freq = \"155.340M\"\n";
 
@@ -428,9 +761,7 @@ test_load_and_apply_soapy_input_no_args(void) {
 
 static int
 test_load_and_apply_soapy_input_with_args(void) {
-    static const char* ini = "version = 1\n"
-                             "\n"
-                             "[input]\n"
+    static const char* ini = "[input]\n"
                              "source = \"soapy\"\n"
                              "soapy_args = \"driver=airspy,serial=ABC123\"\n"
                              "soapy_profile = \"airspy\"\n"
@@ -712,10 +1043,65 @@ test_snapshot_roundtrip_zero_rtl_ppm(void) {
 }
 
 static int
+test_snapshot_rtl_and_rtltcp_device_specs(void) {
+    static dsd_opts opts;
+    static dsd_state state;
+    dsdneoUserConfig snap;
+    int rc = 0;
+
+    reset_opts_and_state(opts, state);
+    DSD_SNPRINTF(opts.audio_in_dev, sizeof opts.audio_in_dev, "%s", "rtl:7:451.125M:19:-2:12:-55:6");
+    opts.rtlsdr_center_freq = 451125000U;
+    opts.rtl_gain_value = 21;
+    opts.rtlsdr_ppm_error = -4;
+    opts.rtl_dsp_bw_khz = 12;
+    opts.rtl_squelch_level = 2.0;
+    opts.rtl_volume_multiplier = 6;
+    opts.rtl_auto_ppm = 1;
+
+    dsd_snapshot_opts_to_user_config(&opts, &state, &snap);
+    if (!snap.has_input || snap.input_source != DSDCFG_INPUT_RTL || snap.rtl_device != 7) {
+        DSD_FPRINTF(stderr, "snapshot RTL source/device mismatch source=%d device=%d\n", (int)snap.input_source,
+                    snap.rtl_device);
+        rc |= 1;
+    }
+    if (strcmp(snap.rtl_freq, "451125000") != 0 || snap.rtl_gain != 21 || snap.rtl_ppm != -4 || snap.rtl_bw_khz != 12
+        || snap.rtl_sql != 0 || snap.rtl_volume != 6 || !snap.rtl_ppm_is_set || snap.rtl_auto_ppm != 1) {
+        DSD_FPRINTF(stderr, "snapshot RTL tuning mismatch freq=%s gain=%d ppm=%d bw=%d sql=%d vol=%d auto=%d\n",
+                    snap.rtl_freq, snap.rtl_gain, snap.rtl_ppm, snap.rtl_bw_khz, snap.rtl_sql, snap.rtl_volume,
+                    snap.rtl_auto_ppm);
+        rc |= 1;
+    }
+
+    reset_opts_and_state(opts, state);
+    DSD_SNPRINTF(opts.audio_in_dev, sizeof opts.audio_in_dev, "%s", "rtltcp:radio.local:1234:769.00625M:28:3:24:-47:5");
+    opts.rtlsdr_center_freq = 769006250U;
+    opts.rtl_gain_value = 28;
+    opts.rtlsdr_ppm_error = 3;
+    opts.rtl_dsp_bw_khz = 24;
+    opts.rtl_squelch_level = 1e-30;
+    opts.rtl_volume_multiplier = 5;
+
+    dsd_snapshot_opts_to_user_config(&opts, &state, &snap);
+    if (!snap.has_input || snap.input_source != DSDCFG_INPUT_RTLTCP || strcmp(snap.rtltcp_host, "radio.local") != 0
+        || snap.rtltcp_port != 1234) {
+        DSD_FPRINTF(stderr, "snapshot RTLTCP source mismatch source=%d host=%s port=%d\n", (int)snap.input_source,
+                    snap.rtltcp_host, snap.rtltcp_port);
+        rc |= 1;
+    }
+    if (strcmp(snap.rtl_freq, "769006250") != 0 || snap.rtl_gain != 28 || snap.rtl_ppm != 3 || snap.rtl_bw_khz != 24
+        || snap.rtl_sql != -120 || snap.rtl_volume != 5 || !snap.rtl_ppm_is_set) {
+        DSD_FPRINTF(stderr, "snapshot RTLTCP tuning mismatch freq=%s gain=%d ppm=%d bw=%d sql=%d vol=%d\n",
+                    snap.rtl_freq, snap.rtl_gain, snap.rtl_ppm, snap.rtl_bw_khz, snap.rtl_sql, snap.rtl_volume);
+        rc |= 1;
+    }
+
+    return rc;
+}
+
+static int
 test_load_and_apply_rtltcp_regression(void) {
-    static const char* ini = "version = 1\n"
-                             "\n"
-                             "[input]\n"
+    static const char* ini = "[input]\n"
                              "source = \"rtltcp\"\n"
                              "rtltcp_host = \"127.0.0.1\"\n"
                              "rtltcp_port = 1234\n"
@@ -761,16 +1147,14 @@ test_load_and_apply_rtltcp_regression(void) {
 
 static int
 test_snapshot_roundtrip(void) {
-    static const char* ini = "version = 1\n"
-                             "\n"
-                             "[input]\n"
+    static const char* ini = "[input]\n"
                              "source = \"udp\"\n"
                              "udp_addr = \"127.0.0.1\"\n"
                              "udp_port = 9000\n"
                              "\n"
                              "[output]\n"
                              "backend = \"pulse\"\n"
-                             "ncurses_ui = false\n"
+                             "frontend = \"none\"\n"
                              "\n"
                              "[mode]\n"
                              "decode = \"analog\"\n"
@@ -848,9 +1232,7 @@ test_snapshot_roundtrip(void) {
 
 static int
 test_apply_demod_lock(void) {
-    static const char* ini = "version = 1\n"
-                             "\n"
-                             "[mode]\n"
+    static const char* ini = "[mode]\n"
                              "decode = \"auto\"\n"
                              "demod = \"qpsk\"\n";
 
@@ -1001,15 +1383,30 @@ test_apply_logging_retargets_frame_log_file(void) {
     opts.frame_log_write_error_reported = 1;
     DSD_SNPRINTF(opts.frame_log_file, sizeof opts.frame_log_file, "%s", "/tmp/frames-old.log");
     opts.frame_log_file[sizeof opts.frame_log_file - 1] = '\0';
+    FILE* first_p25_handle = tmpfile();
+    if (!first_p25_handle) {
+        DSD_FPRINTF(stderr, "tmpfile failed: %s\n", strerror(errno));
+        return 1;
+    }
+    opts.p25_sm_log_f = first_p25_handle;
+    opts.p25_sm_log_open_error_reported = 1;
+    opts.p25_sm_log_write_error_reported = 1;
+    DSD_SNPRINTF(opts.p25_sm_log_file, sizeof opts.p25_sm_log_file, "%s", "/tmp/p25-sm-old.log");
+    opts.p25_sm_log_file[sizeof opts.p25_sm_log_file - 1] = '\0';
 
     dsdneoUserConfig cfg = {};
-    cfg.version = 1;
     cfg.has_logging = 1;
     DSD_SNPRINTF(cfg.frame_log, sizeof cfg.frame_log, "%s", "/tmp/frames-new.log");
     cfg.frame_log[sizeof cfg.frame_log - 1] = '\0';
+    DSD_SNPRINTF(cfg.p25_sm_log, sizeof cfg.p25_sm_log, "%s", "/tmp/p25-sm-new.log");
+    cfg.p25_sm_log[sizeof cfg.p25_sm_log - 1] = '\0';
 
     dsd_apply_user_config_to_opts(&cfg, &opts, &state);
 
+    /*
+     * Retargeting to new frame-log paths must close existing handles, replace the
+     * remembered path strings, and clear sticky open/write error state.
+     */
     int rc = 0;
     if (opts.frame_log_f != NULL) {
         DSD_FPRINTF(stderr, "frame log handle should be closed after retarget\n");
@@ -1027,6 +1424,22 @@ test_apply_logging_retargets_frame_log_file(void) {
         DSD_FPRINTF(stderr, "frame log write error state should reset after retarget\n");
         rc |= 1;
     }
+    if (opts.p25_sm_log_f != NULL) {
+        DSD_FPRINTF(stderr, "P25 SM log handle should be closed after retarget\n");
+        rc |= 1;
+    }
+    if (strcmp(opts.p25_sm_log_file, "/tmp/p25-sm-new.log") != 0) {
+        DSD_FPRINTF(stderr, "P25 SM log path not updated after retarget: %s\n", opts.p25_sm_log_file);
+        rc |= 1;
+    }
+    if (opts.p25_sm_log_open_error_reported != 0) {
+        DSD_FPRINTF(stderr, "P25 SM log open error state should reset after retarget\n");
+        rc |= 1;
+    }
+    if (opts.p25_sm_log_write_error_reported != 0) {
+        DSD_FPRINTF(stderr, "P25 SM log write error state should reset after retarget\n");
+        rc |= 1;
+    }
 
     FILE* second_handle = tmpfile();
     if (!second_handle) {
@@ -1036,10 +1449,23 @@ test_apply_logging_retargets_frame_log_file(void) {
     opts.frame_log_f = second_handle;
     opts.frame_log_open_error_reported = 1;
     opts.frame_log_write_error_reported = 1;
+    FILE* second_p25_handle = tmpfile();
+    if (!second_p25_handle) {
+        DSD_FPRINTF(stderr, "tmpfile failed: %s\n", strerror(errno));
+        return 1;
+    }
+    opts.p25_sm_log_f = second_p25_handle;
+    opts.p25_sm_log_open_error_reported = 1;
+    opts.p25_sm_log_write_error_reported = 1;
     cfg.frame_log[0] = '\0';
+    cfg.p25_sm_log[0] = '\0';
 
     dsd_apply_user_config_to_opts(&cfg, &opts, &state);
 
+    /*
+     * Clearing configured paths is the disable case: both handles close, paths
+     * become empty, and the same sticky error flags reset for future attempts.
+     */
     if (opts.frame_log_f != NULL) {
         DSD_FPRINTF(stderr, "frame log handle should be closed when disabling logging path\n");
         rc |= 1;
@@ -1056,6 +1482,22 @@ test_apply_logging_retargets_frame_log_file(void) {
         DSD_FPRINTF(stderr, "frame log write error state should reset when disabling logging path\n");
         rc |= 1;
     }
+    if (opts.p25_sm_log_f != NULL) {
+        DSD_FPRINTF(stderr, "P25 SM log handle should be closed when disabling logging path\n");
+        rc |= 1;
+    }
+    if (opts.p25_sm_log_file[0] != '\0') {
+        DSD_FPRINTF(stderr, "P25 SM log path should be cleared when disabling logging path\n");
+        rc |= 1;
+    }
+    if (opts.p25_sm_log_open_error_reported != 0) {
+        DSD_FPRINTF(stderr, "P25 SM log open error state should reset when disabling logging path\n");
+        rc |= 1;
+    }
+    if (opts.p25_sm_log_write_error_reported != 0) {
+        DSD_FPRINTF(stderr, "P25 SM log write error state should reset when disabling logging path\n");
+        rc |= 1;
+    }
 
     return rc;
 }
@@ -1063,7 +1505,6 @@ test_apply_logging_retargets_frame_log_file(void) {
 static int
 test_apply_mode_ysf_uses_config_profile_behavior(void) {
     dsdneoUserConfig cfg = {};
-    cfg.version = 1;
     cfg.has_mode = 1;
     cfg.decode_mode = DSDCFG_MODE_YSF;
 
@@ -1078,9 +1519,9 @@ test_apply_mode_ysf_uses_config_profile_behavior(void) {
         DSD_FPRINTF(stderr, "YSF config mode flags not applied as expected\n");
         rc |= 1;
     }
-    if (opts.pulse_digi_out_channels != 2 || opts.dmr_stereo != 1 || opts.dmr_mono != 0) {
-        DSD_FPRINTF(stderr, "YSF config profile audio mismatch channels=%d stereo=%d mono=%d\n",
-                    opts.pulse_digi_out_channels, opts.dmr_stereo, opts.dmr_mono);
+    if (opts.pulse_digi_out_channels != 2 || opts.dmr_stereo != 1) {
+        DSD_FPRINTF(stderr, "YSF config profile audio mismatch channels=%d stereo=%d\n", opts.pulse_digi_out_channels,
+                    opts.dmr_stereo);
         rc |= 1;
     }
     if (strcmp(opts.output_name, "YSF") != 0) {
@@ -1155,12 +1596,18 @@ int
 main(void) {
     int rc = 0;
     rc |= test_apply_file_input_rescales_symbol_timing();
+    rc |= test_decode_mode_and_load_guards();
+    rc |= test_persisted_v1_load_boundary();
+    rc |= test_integer_overflow_is_rejected_consistently();
+    rc |= test_unknown_section_warnings_do_not_mutate_loaded_config();
+    rc |= test_render_input_variants_and_save_atomic();
     rc |= test_load_and_apply_basic();
     rc |= test_load_and_apply_alerts_empty_event_mask();
     rc |= test_load_and_apply_soapy_input_no_args();
     rc |= test_load_and_apply_soapy_input_with_args();
     rc |= test_snapshot_roundtrip_soapy_args();
     rc |= test_snapshot_roundtrip_zero_rtl_ppm();
+    rc |= test_snapshot_rtl_and_rtltcp_device_specs();
     rc |= test_load_and_apply_rtltcp_regression();
     rc |= test_snapshot_roundtrip();
     rc |= test_apply_demod_lock();

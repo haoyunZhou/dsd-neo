@@ -8,13 +8,14 @@
  */
 
 #include <curses.h>
+#include <dsd-neo/app_control/frontend.h>
 #include <dsd-neo/core/constants.h>
 #include <dsd-neo/core/dsd_time.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/state.h>
 #include <dsd-neo/core/synctype_ids.h>
-#include <dsd-neo/io/rtl_stream_c.h>
 #include <dsd-neo/protocol/p25/p25_cc_candidates.h>
+#include <dsd-neo/protocol/p25/p25_frequency.h>
 #include <dsd-neo/protocol/p25/p25_sm_watchdog.h>
 #include <dsd-neo/protocol/p25/p25_trunk_sm.h>
 #include <dsd-neo/runtime/config.h>
@@ -31,9 +32,6 @@
 
 #ifdef USE_RTLSDR
 #endif
-
-/* Alias for shared last synctype tracking (defined in ncurses_utils.c) */
-#define lls ncurses_last_synctype
 
 static int
 ui_is_p25_synctype(int synctype) {
@@ -60,9 +58,7 @@ ui_fdma_denom(const dsd_state* state, int iden) {
 
 static int
 ui_tdma_denom(const p25_iden_entry_t* tdma) {
-    static const int slots_per_carrier[16] = {1, 1, 1, 2, 4, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
-    int type = tdma->chan_type & 0xF;
-    int denom = slots_per_carrier[type];
+    int denom = p25_channel_type_slots_per_carrier(tdma->chan_type);
     return (denom > 0) ? denom : 1;
 }
 
@@ -219,6 +215,14 @@ ui_p25_print_iden_line(int id, const p25_iden_entry_t* entry, int has_other_clas
     addch(' ');
     printw("IDEN %d: %s type:%d base:%.6lfMHz spac:%.6lfMHz off:%d trust:%s", id, mode_tag, entry->chan_type & 0xF,
            base_mhz, spac_mhz, entry->trans_off, trust_str);
+    if (entry->bw_vu != 0U) {
+        int bw_hz = p25_iden_vu_bandwidth_hz(entry->bw_vu);
+        if (bw_hz > 0) {
+            printw(" bw:%dHz", bw_hz);
+        } else {
+            printw(" bw:?raw:%X", entry->bw_vu & 0xF);
+        }
+    }
     if (entry->wacn || entry->sysid) {
         printw(" W:%05llX S:%03llX", entry->wacn, entry->sysid);
     }
@@ -312,15 +316,50 @@ ui_freq_in_cc_candidates(const dsd_state* state, long freq) {
 
 static int
 ui_format_neighbor_line(const dsd_state* state, int idx, time_t now, char* out, size_t out_len) {
-    long freq = state->p25_nb_entries[idx].freq;
-    long age = (long)((state->p25_nb_entries[idx].last_seen != 0) ? (now - state->p25_nb_entries[idx].last_seen) : 0);
+    if (!out || out_len == 0U) {
+        return 0;
+    }
+    const p25_nb_entry_t* entry = &state->p25_nb_entries[idx];
+    long freq = entry->freq;
+    long age = (long)((entry->last_seen != 0) ? (now - entry->last_seen) : 0);
     int is_cc = (freq == state->p25_cc_freq);
     int in_cands = ui_freq_in_cc_candidates(state, freq);
     if (age < 0) {
         age = 0;
     }
-    return DSD_SNPRINTF(out, out_len, "%.6lf MHz%s%s age:%lds", (double)freq / 1000000.0, is_cc ? " [CC]" : "",
-                        in_cands ? " [C]" : "", age);
+    char wacn[24] = {0};
+    char lra[16] = {0};
+    char cfva[64] = {0};
+    if (entry->wacn_valid) {
+        DSD_SNPRINTF(wacn, sizeof wacn, " W:%05X", entry->wacn);
+    }
+    if (entry->lra_valid) {
+        DSD_SNPRINTF(lra, sizeof lra, " LRA:%02X", entry->lra);
+    }
+    if (entry->cfva_valid) {
+        char tags[48] = {0};
+        (void)p25_format_adjacent_cfva(entry->cfva, tags, sizeof(tags));
+        DSD_SNPRINTF(cfva, sizeof cfva, " CFVA:%s", tags[0] ? tags : "-");
+    } else {
+        DSD_SNPRINTF(cfva, sizeof cfva, "%s", " CFVA:?");
+    }
+    int n = DSD_SNPRINTF(out, out_len, "%.6lf MHz%s%s SYS:%03X R:%03u S:%03u%s%s%s age:%lds", (double)freq / 1000000.0,
+                         is_cc ? " [CC]" : "", in_cands ? " [C]" : "", entry->sysid, entry->rfss, entry->site, wacn,
+                         lra, cfva, age);
+    return (n < 0) ? n : (int)strlen(out);
+}
+
+static int
+ui_format_secondary_cc_line(const dsd_state* state, int idx, time_t now, char* out, size_t out_len) {
+    const p25_secondary_cc_entry_t* entry = &state->p25_secondary_cc_entries[idx];
+    long age = (long)((entry->last_seen != 0) ? (now - entry->last_seen) : 0);
+    int in_cands = ui_freq_in_cc_candidates(state, entry->freq);
+    if (age < 0) {
+        age = 0;
+    }
+    return DSD_SNPRINTF(out, out_len, "%.6lf MHz%s CH:%04X R:%03u S:%03u SSC:%02X age:%lds",
+                        (double)entry->freq / 1000000.0, in_cands ? " [C]" : "", entry->channel, entry->rfss,
+                        entry->site, entry->ssc, age);
 }
 
 int
@@ -390,7 +429,7 @@ compute_p25p2_voice_avg_err(const dsd_state* s, int slot, double* out_avg) {
 
 static int
 ui_print_p25_sync_metric(const dsd_state* state) {
-    int cur = lls;
+    int cur = ncurses_last_synctype;
     int prev = state->lastsynctype;
     const char* cur_s = dsd_synctype_to_string(cur);
     const char* prev_s = dsd_synctype_to_string(prev);
@@ -556,7 +595,7 @@ ui_print_p2_rs_metric(const dsd_state* state) {
 
 static int
 ui_print_p25p2_metrics(const dsd_opts* opts, const dsd_state* state, int is_p25p1, int is_p25p2) {
-    if (!is_p25p2 && !(is_p25p1 && opts && opts->p25_trunk == 1)) {
+    if (!is_p25p2 && !(is_p25p1 && opts && opts->trunk_enable == 1)) {
         return 0;
     }
     int lines = 0;
@@ -572,14 +611,15 @@ ui_print_p25_rtl_metrics(int is_p25p1, int is_p25p2) {
     if (!is_p25p1 && !is_p25p2) {
         return 0;
     }
-    rtl_stream_decode_health health;
-    DSD_MEMSET(&health, 0, sizeof(health));
-    if (rtl_stream_get_decode_health(&health) != 0 || !health.valid) {
+    dsd_frontend_metrics metrics;
+    (void)dsd_app_frontend_get_metrics(&metrics);
+    const dsd_frontend_decode_health* health = &metrics.decode_health;
+    if (!health->valid) {
         return 0;
     }
-    printw("| RTL Health: P1 FEC %u/%u P2 FACCH %u/%u SACCH %u/%u VERR %u\n", health.p25p1_fec_ok, health.p25p1_fec_err,
-           health.p25p2_facch_ok, health.p25p2_facch_err, health.p25p2_sacch_ok, health.p25p2_sacch_err,
-           health.p25p2_voice_err);
+    printw("| RTL Health: P1 FEC %u/%u P2 FACCH %u/%u SACCH %u/%u VERR %u\n", health->p25p1_fec_ok,
+           health->p25p1_fec_err, health->p25p2_facch_ok, health->p25p2_facch_err, health->p25p2_sacch_ok,
+           health->p25p2_sacch_err, health->p25p2_voice_err);
     return 1;
 #else
     UNUSED(is_p25p1);
@@ -726,8 +766,151 @@ ui_print_p25_sm_cc_mode(const dsd_state* state) {
 }
 
 static int
+ui_print_p25_site_status_metric(const dsd_state* state) {
+    if (!state->p25_site_lra_valid && !state->p25_site_network_active_valid && !state->p25_cc_prot_valid) {
+        return 0;
+    }
+    char lra[12] = "-";
+    char net[16] = "-";
+    char prot[12] = "-";
+    if (state->p25_site_lra_valid) {
+        DSD_SNPRINTF(lra, sizeof lra, "%02X", state->p25_site_lra);
+    }
+    if (state->p25_site_network_active_valid) {
+        DSD_SNPRINTF(net, sizeof net, "%s", state->p25_site_network_active ? "active" : "failsoft");
+    }
+    if (state->p25_cc_prot_valid) {
+        DSD_SNPRINTF(prot, sizeof prot, "%02X", state->p25_cc_prot_algid);
+    }
+    printw("| Site: LRA:%s Net:%s protected-CC-ALGID:%s\n", lra, net, prot);
+    return 1;
+}
+
+static void
+ui_print_p25_service_wrap_prefix(const char* prefix, int prefix_len, int continuation) {
+    ui_print_lborder_green();
+    if (!continuation) {
+        addnstr(prefix, prefix_len);
+        return;
+    }
+    for (int i = 0; i < prefix_len; i++) {
+        addch(' ');
+    }
+}
+
+static void
+ui_print_p25_service_wrap_newline(const char* prefix, int prefix_len, int* lines, int* used) {
+    addch('\n');
+    (*lines)++;
+    *used = 1 + prefix_len;
+    ui_print_p25_service_wrap_prefix(prefix, prefix_len, 1);
+}
+
+static const char*
+ui_p25_service_next_token(const char* text, const char** out_token, int* out_len) {
+    const char* comma = strchr(text, ',');
+    int len = comma ? (int)(comma - text) : (int)strlen(text);
+    const char* next = comma ? comma + 1 : text + len;
+    if (*next == ' ') {
+        next++;
+    }
+    *out_token = text;
+    *out_len = len;
+    return next;
+}
+
+static void
+ui_print_p25_service_token_text(const char* token, int len, const char* prefix, int prefix_len, int cols, int* lines,
+                                int* used) {
+    while (len > 0) {
+        int avail = cols - *used;
+        if (avail <= 0) {
+            ui_print_p25_service_wrap_newline(prefix, prefix_len, lines, used);
+            avail = cols - *used;
+        }
+        int chunk = (len < avail) ? len : avail;
+        addnstr(token, chunk);
+        token += chunk;
+        len -= chunk;
+        *used += chunk;
+    }
+}
+
+static void
+ui_print_p25_service_token(const char* token, int len, const char* prefix, int prefix_len, int cols, int* lines,
+                           int* used) {
+    int sep = (*used > 1 + prefix_len) ? 2 : 0;
+    if (sep > 0 && *used + sep + len > cols) {
+        ui_print_p25_service_wrap_newline(prefix, prefix_len, lines, used);
+        sep = 0;
+    }
+    if (sep > 0) {
+        addstr(", ");
+        *used += sep;
+    }
+    ui_print_p25_service_token_text(token, len, prefix, prefix_len, cols, lines, used);
+}
+
+static int
+ui_print_p25_service_names_wrapped(const char* label, const char* names) {
+    char prefix[32] = {0};
+    int prefix_len = DSD_SNPRINTF(prefix, sizeof(prefix), " %s: ", label);
+    if (prefix_len < 0) {
+        prefix_len = 0;
+    }
+    if (prefix_len >= (int)sizeof(prefix)) {
+        prefix_len = (int)sizeof(prefix) - 1;
+    }
+
+    int cols = ui_screen_cols_default80();
+    const int min_cols = 1 + prefix_len + 8;
+    if (cols < min_cols) {
+        cols = min_cols;
+    }
+
+    const char* text = (names && names[0]) ? names : "-";
+    int lines = 1;
+    int used = 1 + prefix_len;
+    ui_print_p25_service_wrap_prefix(prefix, prefix_len, 0);
+
+    const char* p = text;
+    while (*p) {
+        const char* token = NULL;
+        int len = 0;
+        p = ui_p25_service_next_token(p, &token, &len);
+        ui_print_p25_service_token(token, len, prefix, prefix_len, cols, &lines, &used);
+    }
+    addch('\n');
+    return lines;
+}
+
+static int
+ui_print_p25_service_metric(const dsd_state* state) {
+    if (!state->p25_sys_services_valid) {
+        return 0;
+    }
+    char available[512] = {0};
+    char supported[512] = {0};
+    size_t available_count =
+        p25_format_system_service_names(state->p25_sys_services_available, available, sizeof(available));
+    size_t supported_count =
+        p25_format_system_service_names(state->p25_sys_services_supported, supported, sizeof(supported));
+    printw("| Services: Avail:%06X(%u) Supp:%06X(%u) RPL:%u\n", state->p25_sys_services_available,
+           (unsigned)available_count, state->p25_sys_services_supported, (unsigned)supported_count,
+           state->p25_sys_services_request_priority);
+    int lines = 1;
+    if (state->p25_sys_services_available == state->p25_sys_services_supported) {
+        lines += ui_print_p25_service_names_wrapped("Avail/Supp", available);
+    } else {
+        lines += ui_print_p25_service_names_wrapped("Avail", available);
+        lines += ui_print_p25_service_names_wrapped("Supp", supported);
+    }
+    return lines;
+}
+
+static int
 ui_print_p25_trunk_metrics(const dsd_opts* opts, const dsd_state* state) {
-    if (!opts || opts->p25_trunk != 1) {
+    if (!opts || opts->trunk_enable != 1) {
         return 0;
     }
     int lines = 0;
@@ -739,6 +922,8 @@ ui_print_p25_trunk_metrics(const dsd_opts* opts, const dsd_state* state) {
     lines += ui_print_p25_sm_path(state);
     lines += ui_print_p25_sm_iden_summary(state);
     lines += ui_print_p25_sm_cc_mode(state);
+    lines += ui_print_p25_site_status_metric(state);
+    lines += ui_print_p25_service_metric(state);
     return lines;
 }
 
@@ -833,14 +1018,14 @@ ui_print_p25p1_sm_timers_metric(const dsd_state* state) {
     double dt_vc = ui_time_diff_maybe_monotonic(now, state->last_vc_sync_time, nowm, state->last_vc_sync_time_m);
     double dt_tune =
         ui_time_diff_maybe_monotonic(now, state->p25_last_vc_tune_time, nowm, state->p25_last_vc_tune_time_m);
-    double tdu_age = ui_time_diff_maybe_monotonic(now, state->p25_p1_last_tdu, nowm, state->p25_p1_last_tdu_m);
+    double tdu_age = (state->p25_p1_last_tdu_m > 0.0) ? nowm - state->p25_p1_last_tdu_m : -1.0;
     printw("| SM Timers: dCC=%4.1fs dVC=%4.1fs dTune=%4.1fs TDU_age=%4.1fs\n", dt_cc, dt_vc, dt_tune, tdu_age);
     return 1;
 }
 
 static int
 ui_print_p25p1_sm_flags_metric(const dsd_opts* opts, const dsd_state* state) {
-    int tuned = (opts->p25_is_tuned == 1 || opts->trunk_is_tuned == 1) ? 1 : 0;
+    int tuned = (opts->trunk_is_tuned == 1) ? 1 : 0;
     int tick = p25_sm_in_tick();
     const char* hold = (state->tg_hold != 0) ? "on" : "-";
     printw("| SM Flags: tuned:%d force_rel:%d tick:%d hold:%s\n", tuned, state->p25_sm_force_release ? 1 : 0, tick,
@@ -859,7 +1044,7 @@ ui_print_p25p1_policy_metric(const dsd_opts* opts) {
 
 static int
 ui_print_p25p1_sm_metrics(const dsd_opts* opts, const dsd_state* state, int is_p25p1) {
-    if (!is_p25p1 || !opts || opts->p25_trunk != 1) {
+    if (!is_p25p1 || !opts || opts->trunk_enable != 1) {
         return 0;
     }
     int lines = 0;
@@ -889,8 +1074,8 @@ ui_print_p25_metrics(const dsd_opts* opts, const dsd_state* state) {
         return 0;
     }
     int lines = 0;
-    int is_p25p1 = DSD_SYNC_IS_P25P1(lls);
-    int is_p25p2 = DSD_SYNC_IS_P25P2(lls);
+    int is_p25p1 = DSD_SYNC_IS_P25P1(ncurses_last_synctype);
+    int is_p25p2 = DSD_SYNC_IS_P25P2(ncurses_last_synctype);
     lines += ui_print_p25_core_metrics(state, is_p25p1, is_p25p2);
     lines += ui_print_p25p2_metrics(opts, state, is_p25p1, is_p25p2);
     lines += ui_print_p25_rtl_metrics(is_p25p1, is_p25p2);
@@ -906,7 +1091,7 @@ ui_print_p25_cc_candidates(const dsd_opts* opts, const dsd_state* state) {
     if (!opts || !state) {
         return;
     }
-    if (opts->p25_trunk != 1) {
+    if (opts->trunk_enable != 1) {
         return;
     }
     const dsd_trunk_cc_candidates* cc = dsd_trunk_cc_candidates_peek(state);
@@ -939,6 +1124,44 @@ ui_print_p25_cc_candidates(const dsd_opts* opts, const dsd_state* state) {
 }
 
 void
+ui_print_p25_secondary_ccs(const dsd_opts* opts, const dsd_state* state) {
+    if (!opts || !state) {
+        return;
+    }
+    if (opts->trunk_enable != 1) {
+        return;
+    }
+    if (state->p25_secondary_cc_count <= 0) {
+        ui_print_lborder_green();
+        addstr(" (none)\n");
+        return;
+    }
+    int cols = ui_screen_cols_default80();
+    int shown = 0;
+    int line_used = 0;
+    time_t now = time(NULL);
+    int count = state->p25_secondary_cc_count;
+    if (count > P25_SECONDARY_CC_MAX) {
+        count = P25_SECONDARY_CC_MAX;
+    }
+    for (int i = 0; i < count && shown < P25_SECONDARY_CC_MAX; i++) {
+        if (state->p25_secondary_cc_entries[i].freq == 0) {
+            continue;
+        }
+        char buf[96];
+        int m = ui_format_secondary_cc_line(state, i, now, buf, sizeof(buf));
+        if (m < 0) {
+            m = 0;
+        }
+        ui_emit_wrapped_item(buf, m, cols, &line_used);
+        shown++;
+    }
+    if (shown > 0 && line_used > 0) {
+        addch('\n');
+    }
+}
+
+void
 ui_print_p25_neighbors(const dsd_opts* opts, const dsd_state* state) {
     if (!opts || !state) {
         return;
@@ -957,7 +1180,7 @@ ui_print_p25_neighbors(const dsd_opts* opts, const dsd_state* state) {
     time_t now = time(NULL);
     for (int i = 0; i < n && shown < 20; i++) {
         int k = idxs[i];
-        char buf[80];
+        char buf[160];
         int m = ui_format_neighbor_line(state, k, now, buf, sizeof(buf));
         if (m < 0) {
             m = 0;

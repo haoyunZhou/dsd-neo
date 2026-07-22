@@ -58,7 +58,7 @@
         "CMAKE_BUILD_TYPE": "RelWithDebInfo",
         "BUILD_TESTING": "OFF",
         "DSD_ENABLE_LTO": "OFF",
-        "DSD_ENABLE_FAST_MATH": "ON",
+        "DSD_ENABLE_FAST_MATH": "OFF",
         "CMAKE_C_FLAGS_RELWITHDEBINFO": "-O2 -g -DNDEBUG -fno-omit-frame-pointer",
         "CMAKE_CXX_FLAGS_RELWITHDEBINFO": "-O2 -g -DNDEBUG -fno-omit-frame-pointer"
       }
@@ -297,11 +297,6 @@
       "configuration": "Debug"
     },
     {
-      "name": "dev-release",
-      "configurePreset": "dev-release",
-      "configuration": "Release"
-    },
-    {
       "name": "asan-ubsan-debug",
       "configurePreset": "asan-ubsan-debug",
       "configuration": "Debug"
@@ -328,11 +323,6 @@
       "name": "win-msvc-debug",
       "configurePreset": "win-msvc-debug",
       "configuration": "Debug"
-    },
-    {
-      "name": "win-msvc-release",
-      "configurePreset": "win-msvc-release",
-      "configuration": "Release"
     }
   ]
 }

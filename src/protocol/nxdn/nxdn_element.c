@@ -26,7 +26,7 @@
 #include <dsd-neo/core/talkgroup_policy.h>
 #include <dsd-neo/crypto/aes.h>
 #include <dsd-neo/crypto/des.h>
-#include <dsd-neo/protocol/dmr/dmr_utils_api.h>
+#include <dsd-neo/dsp/frame_sync.h>
 #include <dsd-neo/protocol/nxdn/nxdn_alias_decode.h>
 #include <dsd-neo/protocol/nxdn/nxdn_deperm.h>
 #include <dsd-neo/protocol/nxdn/nxdn_lfsr.h>
@@ -43,6 +43,7 @@
 #include "dsd-neo/core/safe_api.h"
 #include "dsd-neo/core/secret_redaction.h"
 #include "dsd-neo/core/state_fwd.h"
+#include "nxdn_crc.h"
 
 static inline void dsd_append(char* dst, size_t dstsz, const char* src);
 typedef void (*nxdn_element_handler_fn)(dsd_opts* opts, dsd_state* state, const uint8_t* elements,
@@ -93,7 +94,7 @@ static void nxdn_element_handle_vcall_iv(dsd_opts* opts, dsd_state* state, const
                                          size_t elements_bits);
 static void nxdn_pdu_scrambler_keystream_creation(uint8_t* ks, int lfsr, int len_bits);
 static void nxdn_lfsr128_expand_iv_from_mi64(uint64_t mi, uint8_t out[16]);
-static int nxdn_load_data_aes_key(const dsd_state* state, uint8_t key_id, uint8_t out_key[32], uint64_t* key_stub);
+static int nxdn_load_data_aes_key(const dsd_state* state, uint8_t key_id, uint8_t out_key[32]);
 static void nxdn_sdcall_header(dsd_opts* opts, dsd_state* state, const uint8_t* Message);
 static void nxdn_dcall_header(dsd_opts* opts, dsd_state* state, const uint8_t* Message, size_t message_bits);
 static void nxdn_sdcall_iv(dsd_opts* opts, dsd_state* state, const uint8_t* Message);
@@ -101,8 +102,6 @@ static int nxdn_dcall_data(dsd_opts* opts, dsd_state* state, int type, const uin
 static void NXDN_decode_VCALL(dsd_opts* opts, dsd_state* state, const uint8_t* Message);
 static void NXDN_decode_VCALL_ARIB(dsd_opts* opts, dsd_state* state, const uint8_t* Message);
 static void NXDN_decode_VCALL_IV(dsd_opts* opts, dsd_state* state, const uint8_t* Message);
-static void NXDN_decode_Alias(const dsd_opts* opts, dsd_state* state, const uint8_t* Message);
-static void NXDN_decode_ALIAS_ARIB(const dsd_opts* opts, dsd_state* state, const uint8_t* Message);
 void NXDN_decode_VCALL_ASSGN(dsd_opts* opts, dsd_state* state, const uint8_t* Message);
 static void nxdn_print_dfa_bandwidth(uint8_t bw);
 static void nxdn_cch_info_channel_version(dsd_state* state, uint32_t location_id, uint8_t channel1sts,
@@ -134,8 +133,7 @@ nxdn_print_group_label(const dsd_state* state, uint32_t id) {
 
 static void
 nxdn_anchor_control_channel_from_current_tuner(const dsd_opts* opts, dsd_state* state, int only_if_missing) {
-    if ((opts->trunk_enable != 1 && opts->p25_trunk != 1) || opts->trunk_is_tuned != 0
-        || (only_if_missing && state->p25_cc_freq != 0)) {
+    if ((opts->trunk_enable != 1) || opts->trunk_is_tuned != 0 || (only_if_missing && state->p25_cc_freq != 0)) {
         return;
     }
 
@@ -192,7 +190,7 @@ NXDN_SACCH_Full_decode(dsd_opts* opts, dsd_state* state) {
         DSD_FPRINTF(stderr, "\n");
         DSD_FPRINTF(stderr, " Full SACCH Payload ");
         for (i = 0; i < 9; i++) {
-            sacch_bytes[i] = (uint8_t)ConvertBitIntoBytes(&SACCH[(size_t)i * 8], 8);
+            sacch_bytes[i] = (uint8_t)convert_bits_into_output(&SACCH[(size_t)i * 8], 8);
             DSD_FPRINTF(stderr, "[%02X]", sacch_bytes[i]);
         }
     }
@@ -253,8 +251,8 @@ nxdn_element_is_standard_alias(const uint8_t* elements, size_t elements_bits) {
         return 0;
     }
 
-    const uint8_t mfid = (uint8_t)ConvertBitIntoBytes(&elements[8], 8);
-    const uint16_t subtype = (uint16_t)ConvertBitIntoBytes(&elements[16], 16);
+    const uint8_t mfid = (uint8_t)convert_bits_into_output(&elements[8], 8);
+    const uint16_t subtype = (uint16_t)convert_bits_into_output(&elements[16], 16);
     return (mfid == 0x68U && subtype == 0x8204U) ? 1 : 0;
 }
 
@@ -263,11 +261,11 @@ nxdn_element_print_prop_form(const dsd_opts* opts, const uint8_t* elements, size
     DSD_FPRINTF(stderr, "%s", KYEL);
     DSD_FPRINTF(stderr, " PROP_FORM");
     if (opts != NULL && opts->payload == 1 && elements != NULL && elements_bits >= 72U) {
-        const uint8_t mfid = (uint8_t)ConvertBitIntoBytes(&elements[8], 8);
+        const uint8_t mfid = (uint8_t)convert_bits_into_output(&elements[8], 8);
         DSD_FPRINTF(stderr, "\n MFID: %02X; Message: ", mfid);
         for (int i = 2; i < 9; i++) {
             const size_t bit_offset = (size_t)i * 8U;
-            DSD_FPRINTF(stderr, "%02X", (uint8_t)ConvertBitIntoBytes(&elements[bit_offset], 8));
+            DSD_FPRINTF(stderr, "%02X", (uint8_t)convert_bits_into_output(&elements[bit_offset], 8));
         }
     }
     DSD_FPRINTF(stderr, "%s", KNRM);
@@ -282,7 +280,7 @@ nxdn_element_handle_alias(const dsd_opts* opts, dsd_state* state, const uint8_t*
     DSD_FPRINTF(stderr, "%s", KYEL);
     DSD_FPRINTF(stderr, " ALIAS");
     DSD_FPRINTF(stderr, "%s", KNRM);
-    NXDN_decode_Alias(opts, state, elements);
+    nxdn_alias_decode_prop(opts, state, elements, nxdn_alias_crc_ok(state));
 }
 
 static const char*
@@ -316,8 +314,8 @@ nxdn_element_handle_dst_info(dsd_opts* opts, dsd_state* state, const uint8_t* el
 
     const uint8_t start = elements[8] & 1U;
     const uint8_t end = elements[9] & 1U;
-    const uint8_t option = (uint8_t)ConvertBitIntoBytes(&elements[8], 8);
-    const uint8_t num_chars_field = (uint8_t)ConvertBitIntoBytes(&elements[10], 6);
+    const uint8_t option = (uint8_t)convert_bits_into_output(&elements[8], 8);
+    const uint8_t num_chars_field = (uint8_t)convert_bits_into_output(&elements[10], 6);
     size_t requested_chars = (start == 0U) ? 25U : (size_t)num_chars_field + 1U;
     const size_t available_chars = (elements_bits - NXDN_DST_INFO_HEADER_BITS) / 8U;
 
@@ -329,7 +327,7 @@ nxdn_element_handle_dst_info(dsd_opts* opts, dsd_state* state, const uint8_t* el
     }
 
     for (size_t i = 0; i < requested_chars; i++) {
-        uint8_t c = (uint8_t)ConvertBitIntoBytes(&elements[NXDN_DST_INFO_HEADER_BITS + (i * 8U)], 8);
+        uint8_t c = (uint8_t)convert_bits_into_output(&elements[NXDN_DST_INFO_HEADER_BITS + (i * 8U)], 8);
         if (c >= 0x20U && c <= 0x7EU) {
             station_id_string[i] = (char)c;
         }
@@ -410,13 +408,11 @@ nxdn_element_handle_disc(dsd_opts* opts, dsd_state* state, const uint8_t* elemen
     DSD_SNPRINTF(state->call_string[0], sizeof(state->call_string[0]), "%s", "");
     DSD_SNPRINTF(state->nxdn_call_type, sizeof(state->nxdn_call_type), "%s", "");
 
-    if ((opts->trunk_enable == 1 || opts->p25_trunk == 1) && state->p25_cc_freq != 0
-        && (opts->trunk_is_tuned == 1 || opts->p25_is_tuned == 1)) {
-        dsd_trunk_tune_result tune_result = dsd_trunk_tuning_hook_tune_to_cc(opts, state, state->p25_cc_freq, 0);
+    if ((opts->trunk_enable == 1) && state->p25_cc_freq != 0 && (opts->trunk_is_tuned == 1)) {
+        dsd_trunk_tune_result tune_result = dsd_trunk_tuning_hook_tune_to_cc(opts, state, state->p25_cc_freq, 0, NULL);
         if (!dsd_trunk_tune_result_is_ok(tune_result)) {
             return;
         }
-        opts->p25_is_tuned = 0;
         opts->trunk_is_tuned = 0;
 
         DSD_MEMSET(state->nxdn_sacch_frame_segment, 1, sizeof(state->nxdn_sacch_frame_segment));
@@ -511,7 +507,7 @@ NXDN_Elements_Content_decode(dsd_opts* opts, dsd_state* state, uint8_t CrcCorrec
     state->NxdnElementsContent.VCallCrcIsGood = CrcCorrect;
 
     if (MessageTypeExt == 0xE7U) {
-        NXDN_decode_ALIAS_ARIB(opts, state, ElementsContent);
+        nxdn_alias_decode_arib(opts, state, ElementsContent, nxdn_alias_crc_ok(state));
         return;
     }
 
@@ -609,15 +605,12 @@ nxdn_lfsr128_expand_iv_from_mi64(uint64_t mi, uint8_t out[16]) {
 }
 
 static int
-nxdn_load_data_aes_key(const dsd_state* state, uint8_t key_id, uint8_t out_key[32], uint64_t* key_stub) {
+nxdn_load_data_aes_key(const dsd_state* state, uint8_t key_id, uint8_t out_key[32]) {
     if (state == NULL || out_key == NULL) {
         return 0;
     }
 
     DSD_MEMSET(out_key, 0, 32U);
-    if (key_stub != NULL) {
-        *key_stub = 0ULL;
-    }
 
     if (state->keyloader == 1) {
         for (int i = 0; i < 8; i++) {
@@ -626,18 +619,12 @@ nxdn_load_data_aes_key(const dsd_state* state, uint8_t key_id, uint8_t out_key[3
             out_key[i + 16] = (uint8_t)((state->rkey_array[key_id + 0x201] >> (56 - (i * 8))) & 0xFFU);
             out_key[i + 24] = (uint8_t)((state->rkey_array[key_id + 0x301] >> (56 - (i * 8))) & 0xFFU);
         }
-        if (key_stub != NULL) {
-            *key_stub = state->rkey_array[key_id + 0x301];
-        }
     } else {
         for (int i = 0; i < 8; i++) {
             out_key[i + 0] = (uint8_t)((state->K1 >> (56 - (i * 8))) & 0xFFU);
             out_key[i + 8] = (uint8_t)((state->K2 >> (56 - (i * 8))) & 0xFFU);
             out_key[i + 16] = (uint8_t)((state->K3 >> (56 - (i * 8))) & 0xFFU);
             out_key[i + 24] = (uint8_t)((state->K4 >> (56 - (i * 8))) & 0xFFU);
-        }
-        if (key_stub != NULL) {
-            *key_stub = state->K4;
         }
     }
 
@@ -656,9 +643,9 @@ nxdn_sdcall_iv(dsd_opts* opts, dsd_state* state, const uint8_t* Message) {
 
     uint8_t idas = (strcmp(state->nxdn_location_category, "Type-D") == 0) ? 1U : 0U;
     if (idas != 0U) {
-        state->payload_mi = (unsigned long long int)ConvertBitIntoBytes(Message + 8, 22);
+        state->payload_mi = (unsigned long long int)convert_bits_into_output(Message + 8, 22);
     } else {
-        state->payload_mi = (unsigned long long int)ConvertBitIntoBytes(Message + 8, 64);
+        state->payload_mi = (unsigned long long int)convert_bits_into_output(Message + 8, 64);
         if (state->payload_algid == 3) {
             nxdn_lfsr128_expand_iv_from_mi64((uint64_t)state->payload_mi, state->aes_ivR);
         }
@@ -681,21 +668,21 @@ nxdn_sdcall_header(dsd_opts* opts, dsd_state* state, const uint8_t* Message) {
     DSD_MEMSET(state->aes_ivR, 0, sizeof(state->aes_ivR));
 
     uint8_t idas = (strcmp(state->nxdn_location_category, "Type-D") == 0) ? 1U : 0U;
-    uint8_t cc_option = (uint8_t)ConvertBitIntoBytes(Message + 8, 8);
-    uint8_t call_type = (uint8_t)ConvertBitIntoBytes(Message + 16, 3);
-    uint8_t dcall_opt = (uint8_t)ConvertBitIntoBytes(Message + 19, 5);
-    uint16_t source = (uint16_t)ConvertBitIntoBytes(Message + 24, 16);
-    uint16_t target = (uint16_t)ConvertBitIntoBytes(Message + 40, 16);
-    uint8_t cipher = (uint8_t)ConvertBitIntoBytes(Message + 56, 2);
-    uint8_t key_id = (uint8_t)ConvertBitIntoBytes(Message + 58, 6);
-    uint16_t pkt_info = (uint16_t)ConvertBitIntoBytes(Message + 64, 16);
+    uint8_t cc_option = (uint8_t)convert_bits_into_output(Message + 8, 8);
+    uint8_t call_type = (uint8_t)convert_bits_into_output(Message + 16, 3);
+    uint8_t dcall_opt = (uint8_t)convert_bits_into_output(Message + 19, 5);
+    uint16_t source = (uint16_t)convert_bits_into_output(Message + 24, 16);
+    uint16_t target = (uint16_t)convert_bits_into_output(Message + 40, 16);
+    uint8_t cipher = (uint8_t)convert_bits_into_output(Message + 56, 2);
+    uint8_t key_id = (uint8_t)convert_bits_into_output(Message + 58, 6);
+    uint16_t pkt_info = (uint16_t)convert_bits_into_output(Message + 64, 16);
 
     uint8_t confirmed_delivery = Message[64];
     uint8_t spare1 = Message[65];
     uint8_t selective_retry = Message[66];
     uint8_t spare2 = Message[67];
-    uint8_t block_count = (uint8_t)ConvertBitIntoBytes(Message + 68, 4);
-    uint8_t pad_bytes = (uint8_t)ConvertBitIntoBytes(Message + 72, 5);
+    uint8_t block_count = (uint8_t)convert_bits_into_output(Message + 68, 4);
+    uint8_t pad_bytes = (uint8_t)convert_bits_into_output(Message + 72, 5);
     uint8_t start_frag = Message[77];
     uint8_t circulate = Message[78];
 
@@ -794,23 +781,23 @@ nxdn_dcall_header_parse(struct nxdn_dcall_header_info* info, dsd_state* state, c
 
     DSD_MEMSET(info, 0, sizeof(*info));
     info->idas = (strcmp(state->nxdn_location_category, "Type-D") == 0) ? 1U : 0U;
-    info->cc_option = (uint8_t)ConvertBitIntoBytes(Message + 8, 8);
-    info->call_type = (uint8_t)ConvertBitIntoBytes(Message + 16, 3);
-    info->dcall_opt = (uint8_t)ConvertBitIntoBytes(Message + 19, 5);
-    info->source = (uint16_t)ConvertBitIntoBytes(Message + 24, 16);
-    info->target = (uint16_t)ConvertBitIntoBytes(Message + 40, 16);
-    info->cipher = (uint8_t)ConvertBitIntoBytes(Message + 56, 2);
-    info->key_id = (uint8_t)ConvertBitIntoBytes(Message + 58, 6);
-    info->pkt_info = (uint32_t)ConvertBitIntoBytes(Message + 64, 24);
+    info->cc_option = (uint8_t)convert_bits_into_output(Message + 8, 8);
+    info->call_type = (uint8_t)convert_bits_into_output(Message + 16, 3);
+    info->dcall_opt = (uint8_t)convert_bits_into_output(Message + 19, 5);
+    info->source = (uint16_t)convert_bits_into_output(Message + 24, 16);
+    info->target = (uint16_t)convert_bits_into_output(Message + 40, 16);
+    info->cipher = (uint8_t)convert_bits_into_output(Message + 56, 2);
+    info->key_id = (uint8_t)convert_bits_into_output(Message + 58, 6);
+    info->pkt_info = (uint32_t)convert_bits_into_output(Message + 64, 24);
     info->confirmed_delivery = Message[64];
     info->spare1 = Message[65];
     info->selective_retry = Message[66];
     info->spare2 = Message[67];
-    info->block_count = (uint8_t)ConvertBitIntoBytes(Message + 68, 4);
-    info->pad_bytes = (uint8_t)ConvertBitIntoBytes(Message + 72, 5);
+    info->block_count = (uint8_t)convert_bits_into_output(Message + 68, 4);
+    info->pad_bytes = (uint8_t)convert_bits_into_output(Message + 72, 5);
     info->start_frag = Message[77];
     info->circulate = Message[78];
-    info->tx_frag_count = (uint16_t)ConvertBitIntoBytes(Message + 79, 9);
+    info->tx_frag_count = (uint16_t)convert_bits_into_output(Message + 79, 9);
 
     if (info->idas != 0U) {
         info->source_ch = (uint16_t)((info->source >> 11) & 0x1FU);
@@ -821,12 +808,12 @@ nxdn_dcall_header_parse(struct nxdn_dcall_header_info* info, dsd_state* state, c
 
     if (info->cipher > 1U && message_bits >= (NXDN_DCALL_IV_OFFSET_BITS + NXDN_DCALL_IV_PRESENCE_BITS)) {
         const uint8_t iv_presence =
-            (uint8_t)ConvertBitIntoBytes(Message + NXDN_DCALL_IV_OFFSET_BITS, NXDN_DCALL_IV_PRESENCE_BITS);
+            (uint8_t)convert_bits_into_output(Message + NXDN_DCALL_IV_OFFSET_BITS, NXDN_DCALL_IV_PRESENCE_BITS);
         const size_t iv_bits = (info->idas != 0U) ? NXDN_DCALL_IDAS_IV_BITS : NXDN_DCALL_WIDE_IV_BITS;
         if (iv_presence != 0U && message_bits >= (NXDN_DCALL_IV_OFFSET_BITS + iv_bits)) {
             info->iv_available = 1U;
-            state->payload_mi =
-                (unsigned long long int)ConvertBitIntoBytes(Message + NXDN_DCALL_IV_OFFSET_BITS, (uint32_t)iv_bits);
+            state->payload_mi = (unsigned long long int)convert_bits_into_output(Message + NXDN_DCALL_IV_OFFSET_BITS,
+                                                                                 (uint32_t)iv_bits);
             if (info->idas == 0U && info->cipher == 3U) {
                 nxdn_lfsr128_expand_iv_from_mi64((uint64_t)state->payload_mi, state->aes_ivR);
             }
@@ -957,8 +944,8 @@ nxdn_dcall_prepare(dsd_state* state, const uint8_t* Message, size_t message_bits
     }
 
     ctx->have_events = (state->event_history_s != NULL);
-    ctx->pf_num = (uint8_t)ConvertBitIntoBytes(Message + 8, 4);
-    ctx->blk_num = (uint8_t)ConvertBitIntoBytes(Message + 12, 4);
+    ctx->pf_num = (uint8_t)convert_bits_into_output(Message + 8, 4);
+    ctx->blk_num = (uint8_t)convert_bits_into_output(Message + 12, 4);
     DSD_FPRINTF(stderr, "\n %sData Call (%u/%u); %s", KCYN, (unsigned)ctx->pf_num, (unsigned)ctx->blk_num, KNRM);
 
     ctx->byte_len = nxdn_dcall_byte_len(state, type);
@@ -1018,18 +1005,17 @@ nxdn_dcall_prepare(dsd_state* state, const uint8_t* Message, size_t message_bits
 }
 
 static void
-nxdn_dcall_apply_decryption(dsd_state* state, const struct nxdn_dcall_data_context* ctx) {
+nxdn_dcall_apply_decryption(const dsd_opts* opts, dsd_state* state, const struct nxdn_dcall_data_context* ctx) {
     uint8_t ks[NXDN_DCALL_MAX_BITS];
     uint8_t aes_key[32];
     DSD_MEMSET(ks, 0, sizeof(ks));
     DSD_MEMSET(aes_key, 0, sizeof(aes_key));
 
     uint64_t key = 0ULL;
-    uint64_t aes_key_stub = 0ULL;
     int aes_key_loaded = 0;
     if (state->payload_algid != 0) {
         if (state->payload_algid == 3) {
-            aes_key_loaded = nxdn_load_data_aes_key(state, (uint8_t)state->payload_keyid, aes_key, &aes_key_stub);
+            aes_key_loaded = nxdn_load_data_aes_key(state, (uint8_t)state->payload_keyid, aes_key);
         } else if (state->keyloader == 1) {
             key = state->rkey_array[state->payload_keyid];
         } else {
@@ -1043,24 +1029,30 @@ nxdn_dcall_apply_decryption(dsd_state* state, const struct nxdn_dcall_data_conte
     }
 
     if (state->payload_algid == 1 && key != 0ULL) {
-        DSD_FPRINTF(stderr, " Key: %s;", DSD_SECRET_REDACTED);
+        char key_text[16];
+        DSD_FPRINTF(stderr, " Key: %s;",
+                    dsd_secret_format_decimal(key_text, sizeof key_text, opts->show_keys, key, 5U));
         nxdn_pdu_scrambler_keystream_creation(ks, (int)(key & 0x7FFFU), ctx->total_bits);
     } else if (state->payload_algid == 2 && key != 0ULL) {
-        DSD_FPRINTF(stderr, " Key: %s;", DSD_SECRET_REDACTED);
+        char key_text[17];
+        DSD_FPRINTF(stderr, " Key: %s;",
+                    dsd_secret_format_hex(key_text, sizeof key_text, opts->show_keys, key, 16U, 0));
         const int nblocks = (ctx->total_bytes + 7) / 8;
         uint8_t ks_bytes[NXDN_DCALL_MAX_BYTES];
         DSD_MEMSET(ks_bytes, 0, sizeof(ks_bytes));
-        des_multi_keystream_output(state->payload_mi, key, ks_bytes, 1, nblocks);
+        des_ofb_keystream_output(state->payload_mi, key, ks_bytes, nblocks);
         unpack_byte_array_into_bit_array(ks_bytes, ks, nblocks * 8);
     } else if (state->payload_algid == 3 && aes_key_loaded == 1) {
         if (state->payload_mi != 0ULL) {
             nxdn_lfsr128_expand_iv_from_mi64((uint64_t)state->payload_mi, state->aes_ivR);
         }
-        DSD_FPRINTF(stderr, " KS: %s;", DSD_SECRET_REDACTED);
+        char key_text[65];
+        DSD_FPRINTF(stderr, " Key: %s;",
+                    dsd_secret_format_byte_hex(key_text, sizeof key_text, opts->show_keys, aes_key, sizeof(aes_key)));
         const int nblocks = (ctx->total_bytes + 15) / 16;
         uint8_t ks_bytes[NXDN_DCALL_MAX_BYTES];
         DSD_MEMSET(ks_bytes, 0, sizeof(ks_bytes));
-        aes_ofb_keystream_output(state->aes_ivR, aes_key, ks_bytes, 2, nblocks);
+        aes_ofb_keystream_output(state->aes_ivR, aes_key, ks_bytes, DSD_AES_KEY_256, nblocks);
         unpack_byte_array_into_bit_array(ks_bytes, ks, nblocks * 16);
     }
 
@@ -1076,7 +1068,7 @@ nxdn_dcall_print_payload(const dsd_opts* opts, const dsd_state* state, const str
     }
     DSD_FPRINTF(stderr, "\n DATA: ");
     for (int i = 0; i < ctx->total_bytes; i++) {
-        DSD_FPRINTF(stderr, "%02X", (uint8_t)ConvertBitIntoBytes(state->dmr_pdu_sf[0] + ((size_t)i * 8U), 8));
+        DSD_FPRINTF(stderr, "%02X", (uint8_t)convert_bits_into_output(state->dmr_pdu_sf[0] + ((size_t)i * 8U), 8));
     }
 }
 
@@ -1084,6 +1076,7 @@ static void
 nxdn_dcall_watchdog(dsd_opts* opts, dsd_state* state, const char* event_text) {
     DSD_SNPRINTF(state->event_history_s[0].Event_History_Items[0].text_message,
                  sizeof(state->event_history_s[0].Event_History_Items[0].text_message), "%s", event_text);
+    dsd_event_history_mark_dirty(&state->event_history_s[0]);
     const uint32_t source = (uint32_t)state->dmr_lrrp_source[0];
     const uint32_t target = (uint32_t)state->dmr_lrrp_target[0];
     char comp_string[128];
@@ -1099,7 +1092,7 @@ nxdn_dcall_handle_reverse_gps(const dsd_opts* opts, dsd_state* state, const stru
     const int reverse_len = ctx->total_bytes - 4;
     int src_idx = ctx->total_bytes - 5;
     for (int i = 0; i < reverse_len; i++, src_idx--) {
-        reverse_bytes[i] = (uint8_t)ConvertBitIntoBytes(state->dmr_pdu_sf[0] + ((size_t)src_idx * 8U), 8);
+        reverse_bytes[i] = (uint8_t)convert_bits_into_output(state->dmr_pdu_sf[0] + ((size_t)src_idx * 8U), 8);
     }
 
     if (opts->payload == 1) {
@@ -1120,8 +1113,8 @@ nxdn_dcall_handle_reverse_gps(const dsd_opts* opts, dsd_state* state, const stru
 
 static void
 nxdn_dcall_handle_crc_ok(dsd_opts* opts, dsd_state* state, const struct nxdn_dcall_data_context* ctx) {
-    const uint8_t opcode = (uint8_t)ConvertBitIntoBytes(state->dmr_pdu_sf[0], 8);
-    const uint8_t nmea = (uint8_t)ConvertBitIntoBytes(state->dmr_pdu_sf[0] + 8, 8);
+    const uint8_t opcode = (uint8_t)convert_bits_into_output(state->dmr_pdu_sf[0], 8);
+    const uint8_t nmea = (uint8_t)convert_bits_into_output(state->dmr_pdu_sf[0] + 8, 8);
     const uint32_t reverse = (uint32_t)convert_bits_into_output(state->dmr_pdu_sf[0], 24);
 
     if (opcode == 0x06U && (nmea == (uint8_t)'$' || nmea == (uint8_t)'!')) {
@@ -1132,7 +1125,7 @@ nxdn_dcall_handle_crc_ok(dsd_opts* opts, dsd_state* state, const struct nxdn_dca
     } else if (reverse == 0U && ctx->total_bytes > 8) {
         nxdn_dcall_handle_reverse_gps(opts, state, ctx);
     } else if (ctx->have_events) {
-        const uint16_t fmt = (uint16_t)ConvertBitIntoBytes(state->dmr_pdu_sf[0], 16);
+        const uint16_t fmt = (uint16_t)convert_bits_into_output(state->dmr_pdu_sf[0], 16);
         char event_text[64];
         DSD_SNPRINTF(event_text, sizeof(event_text), "Unknown Data Call Format: %04X;", fmt);
         nxdn_dcall_watchdog(opts, state, event_text);
@@ -1165,10 +1158,10 @@ nxdn_dcall_data(dsd_opts* opts, dsd_state* state, int type, const uint8_t* Messa
         return 0;
     }
 
-    nxdn_dcall_apply_decryption(state, &ctx);
-    const int crc_offset_bits = ctx.total_bits - 32;
+    nxdn_dcall_apply_decryption(opts, state, &ctx);
+    const size_t crc_offset_bits = (size_t)ctx.total_bits - 32U;
     const uint32_t crc_ext = (uint32_t)convert_bits_into_output(state->dmr_pdu_sf[0] + crc_offset_bits, 32);
-    const uint32_t crc_chk = nxdn_message_crc32(state->dmr_pdu_sf[0], crc_offset_bits);
+    const uint32_t crc_chk = nxdn_crc32_bits(state->dmr_pdu_sf[0], crc_offset_bits);
     nxdn_dcall_print_payload(opts, state, &ctx);
     if (crc_ext == crc_chk) {
         nxdn_dcall_handle_crc_ok(opts, state, &ctx);
@@ -1377,18 +1370,13 @@ nxdn_policy_tune_allowed(const dsd_opts* opts, const dsd_state* state, uint32_t 
     DSD_MEMSET(&decision, 0, sizeof(decision));
 
     if (is_private_call) {
-        rc = dsd_tg_policy_evaluate_private_call(opts, state, source, target, 0, data_call,
-                                                 DSD_TG_POLICY_PRIVATE_ALLOWLIST_UNKNOWN_BLOCK,
-                                                 DSD_TG_POLICY_HOLD_COMPAT_GRANT, &decision);
+        rc = dsd_tg_policy_evaluate_private_call(opts, state, source, target, 0, data_call, &decision);
     } else {
-        rc = dsd_tg_policy_evaluate_group_call(opts, state, target, source, 0, data_call,
-                                               DSD_TG_POLICY_HOLD_COMPAT_GRANT, &decision);
+        rc = dsd_tg_policy_evaluate_group_call(opts, state, target, source, 0, data_call, &decision);
         if (rc == 0 && allow_source_fallback && source != 0 && source != target
             && decision.match == DSD_TG_POLICY_MATCH_NONE) {
             dsd_tg_policy_decision source_decision;
-            if (dsd_tg_policy_evaluate_group_call(opts, state, source, source, 0, data_call,
-                                                  DSD_TG_POLICY_HOLD_COMPAT_GRANT, &source_decision)
-                    == 0
+            if (dsd_tg_policy_evaluate_group_call(opts, state, source, source, 0, data_call, &source_decision) == 0
                 && source_decision.match != DSD_TG_POLICY_MATCH_NONE) {
                 decision = source_decision;
             }
@@ -1401,41 +1389,6 @@ nxdn_policy_tune_allowed(const dsd_opts* opts, const dsd_state* state, uint32_t 
     return rc == 0 && decision.tune_allowed;
 }
 
-static const char*
-nxdn_policy_block_reason_label(uint32_t block_reasons) {
-    if (block_reasons & DSD_TG_POLICY_BLOCK_HOLD) {
-        return "hold";
-    }
-    if (block_reasons & DSD_TG_POLICY_BLOCK_PRIVATE_DISABLED) {
-        return "private-disabled";
-    }
-    if (block_reasons & DSD_TG_POLICY_BLOCK_GROUP_DISABLED) {
-        return "group-disabled";
-    }
-    if (block_reasons & DSD_TG_POLICY_BLOCK_DATA_DISABLED) {
-        return "data-disabled";
-    }
-    if (block_reasons & DSD_TG_POLICY_BLOCK_ENCRYPTED_DISABLED) {
-        return "enc-disabled";
-    }
-    if (block_reasons & DSD_TG_POLICY_BLOCK_ALLOWLIST) {
-        return "allowlist";
-    }
-    if (block_reasons & DSD_TG_POLICY_BLOCK_MODE) {
-        return "mode";
-    }
-    if (block_reasons & DSD_TG_POLICY_BLOCK_AUDIO) {
-        return "audio";
-    }
-    if (block_reasons & DSD_TG_POLICY_BLOCK_RECORD) {
-        return "record";
-    }
-    if (block_reasons & DSD_TG_POLICY_BLOCK_STREAM) {
-        return "stream";
-    }
-    return "policy";
-}
-
 static void
 nxdn_policy_log_block(const dsd_opts* opts, int is_private_call, uint32_t target, uint32_t source,
                       const dsd_tg_policy_decision* decision) {
@@ -1446,7 +1399,7 @@ nxdn_policy_log_block(const dsd_opts* opts, int is_private_call, uint32_t target
         return;
     }
     DSD_FPRINTF(stderr, " [NXDN %s blocked:%s tgt=%u src=%u]", is_private_call ? "private" : "group",
-                nxdn_policy_block_reason_label(decision->block_reasons), target, source);
+                dsd_tg_policy_block_reason_label(decision->block_reasons), target, source);
 }
 
 static uint8_t
@@ -1475,12 +1428,12 @@ static void
 nxdn_vcall_assgn_parse(dsd_state* state, const uint8_t* Message, struct nxdn_vcall_assgn_info* info) {
     DSD_MEMSET(info, 0, sizeof(*info));
     info->message_type = nxdn_message_type_from_bits(Message);
-    info->cc_option = (uint8_t)ConvertBitIntoBytes(&Message[8], 8);
-    info->call_type = (uint8_t)ConvertBitIntoBytes(&Message[16], 3);
-    info->voice_call_option = (uint8_t)ConvertBitIntoBytes(&Message[19], 5);
-    info->source_unit_id = (uint16_t)ConvertBitIntoBytes(&Message[24], 16);
-    info->destination_id = (uint16_t)ConvertBitIntoBytes(&Message[40], 16);
-    info->channel = (uint16_t)ConvertBitIntoBytes(&Message[62], 10);
+    info->cc_option = (uint8_t)convert_bits_into_output(&Message[8], 8);
+    info->call_type = (uint8_t)convert_bits_into_output(&Message[16], 3);
+    info->voice_call_option = (uint8_t)convert_bits_into_output(&Message[19], 5);
+    info->source_unit_id = (uint16_t)convert_bits_into_output(&Message[24], 16);
+    info->destination_id = (uint16_t)convert_bits_into_output(&Message[40], 16);
+    info->channel = (uint16_t)convert_bits_into_output(&Message[62], 10);
 
     state->NxdnElementsContent.CCOption = info->cc_option;
     state->NxdnElementsContent.CallType = info->call_type;
@@ -1489,7 +1442,7 @@ nxdn_vcall_assgn_parse(dsd_state* state, const uint8_t* Message, struct nxdn_vca
     state->NxdnElementsContent.DestinationID = info->destination_id;
 
     if (state->nxdn_rcn == 1) {
-        info->ofn = (uint16_t)ConvertBitIntoBytes(&Message[64], 16);
+        info->ofn = (uint16_t)convert_bits_into_output(&Message[64], 16);
     }
 }
 
@@ -1531,12 +1484,12 @@ nxdn_vcall_assgn_print(const dsd_state* state, const struct nxdn_vcall_assgn_inf
 static void
 nxdn_vcall_assgn_adjust_duplicate(dsd_opts* opts, const dsd_state* state, time_t now,
                                   struct nxdn_vcall_assgn_info* info) {
-    if (info->message_type == 0x05U && opts->p25_is_tuned == 1 && opts->p25_trunk == 1
+    if (info->message_type == 0x05U && opts->trunk_is_tuned == 1 && opts->trunk_enable == 1
         && (now - state->last_vc_sync_time) > opts->trunk_hangtime) {
         info->message_type = 0x04U;
-        opts->p25_is_tuned = 0;
+        opts->trunk_is_tuned = 0;
     }
-    if (info->message_type == 0x05U && opts->p25_is_tuned == 1 && opts->p25_trunk == 1 && state->tg_hold != 0
+    if (info->message_type == 0x05U && opts->trunk_is_tuned == 1 && opts->trunk_enable == 1 && state->tg_hold != 0
         && state->tg_hold == info->destination_id) {
         info->message_type = 0x04U;
     }
@@ -1596,7 +1549,7 @@ nxdn_vcall_assgn_frequency(dsd_opts* opts, dsd_state* state, const struct nxdn_v
 static int
 nxdn_vcall_assgn_setup_tuned_call(dsd_opts* opts, dsd_state* state, const struct nxdn_vcall_assgn_info* info,
                                   long int freq) {
-    dsd_trunk_tune_result tune_result = dsd_trunk_tuning_hook_tune_to_freq(opts, state, freq, 0);
+    dsd_trunk_tune_result tune_result = dsd_trunk_tuning_hook_tune_to_freq(opts, state, freq, 0, NULL);
     if (!dsd_trunk_tune_result_is_ok(tune_result)) {
         return 0;
     }
@@ -1612,11 +1565,14 @@ nxdn_vcall_assgn_setup_tuned_call(dsd_opts* opts, dsd_state* state, const struct
 }
 
 static void
-nxdn_vcall_assgn_load_scrambler_key(dsd_state* state, const struct nxdn_vcall_assgn_info* info) {
+nxdn_vcall_assgn_load_scrambler_key(const dsd_opts* opts, dsd_state* state, const struct nxdn_vcall_assgn_info* info) {
     if (state->rkey_array[info->destination_id] != 0) {
         state->R = state->rkey_array[info->destination_id];
         DSD_FPRINTF(stderr, " %s", KYEL);
-        DSD_FPRINTF(stderr, " Key Loaded: %s", DSD_SECRET_REDACTED);
+        char key_text[24];
+        DSD_FPRINTF(stderr, " Key Loaded: %s",
+                    dsd_secret_format_decimal(key_text, sizeof key_text, opts->show_keys,
+                                              state->rkey_array[info->destination_id], 0U));
         state->payload_miN = state->R;
     }
     if (state->M == 1) {
@@ -1627,10 +1583,10 @@ nxdn_vcall_assgn_load_scrambler_key(dsd_state* state, const struct nxdn_vcall_as
 static int
 nxdn_vcall_assgn_can_tune(const dsd_opts* opts, const dsd_state* state, int policy_allowed, int hold_matches,
                           long int freq) {
-    if (!opts || !state || opts->p25_trunk != 1 || !policy_allowed || state->p25_cc_freq == 0 || freq == 0) {
+    if (!opts || !state || opts->trunk_enable != 1 || !policy_allowed || state->p25_cc_freq == 0 || freq == 0) {
         return 0;
     }
-    return (opts->p25_is_tuned == 0 || hold_matches) ? 1 : 0;
+    return (opts->trunk_is_tuned == 0 || hold_matches) ? 1 : 0;
 }
 
 static void
@@ -1649,8 +1605,8 @@ nxdn_vcall_assgn_apply_tune(dsd_opts* opts, dsd_state* state, const struct nxdn_
         if (!nxdn_vcall_assgn_setup_tuned_call(opts, state, info, freq)) {
             return;
         }
-        nxdn_vcall_assgn_load_scrambler_key(state, info);
-    } else if (opts->p25_trunk == 1) {
+        nxdn_vcall_assgn_load_scrambler_key(opts, state, info);
+    } else if (opts->trunk_enable == 1) {
         nxdn_policy_log_block(opts, is_private_call, info->destination_id, info->source_unit_id, &policy_decision);
     }
 }
@@ -1669,16 +1625,6 @@ NXDN_decode_VCALL_ASSGN(dsd_opts* opts, dsd_state* state, const uint8_t* Message
         nxdn_vcall_assgn_apply_tune(opts, state, &info, freq);
     }
     DSD_FPRINTF(stderr, "%s", KNRM);
-}
-
-static void
-NXDN_decode_Alias(const dsd_opts* opts, dsd_state* state, const uint8_t* Message) {
-    nxdn_alias_decode_prop(opts, state, Message, nxdn_alias_crc_ok(state));
-}
-
-static void
-NXDN_decode_ALIAS_ARIB(const dsd_opts* opts, dsd_state* state, const uint8_t* Message) {
-    nxdn_alias_decode_arib(opts, state, Message, nxdn_alias_crc_ok(state));
 }
 
 static void
@@ -1725,16 +1671,16 @@ nxdn_cch_info_dfa_version(dsd_opts* opts, dsd_state* state, const uint8_t* Messa
         return 0;
     }
 
-    const uint8_t bw1 = (uint8_t)ConvertBitIntoBytes(&Message[38], 2);
-    const uint16_t OFN1 = (uint16_t)ConvertBitIntoBytes(&Message[40], 16);
-    const uint16_t IFN1 = (uint16_t)ConvertBitIntoBytes(&Message[56], 16);
+    const uint8_t bw1 = (uint8_t)convert_bits_into_output(&Message[38], 2);
+    const uint16_t OFN1 = (uint16_t)convert_bits_into_output(&Message[40], 16);
+    const uint16_t IFN1 = (uint16_t)convert_bits_into_output(&Message[56], 16);
 
     DSD_FPRINTF(stderr, "  Location ID [%06X] OFN1 [%04X][%05d] IFN1 [%04X][%05d] ", location_id, OFN1, OFN1, IFN1,
                 IFN1);
 
     if (message_bits >= NXDN_CCH_INFO_DFA_SECONDARY_MIN_BITS) {
-        const uint16_t OFN2 = (uint16_t)ConvertBitIntoBytes(&Message[80], 16);
-        const uint16_t IFN2 = (uint16_t)ConvertBitIntoBytes(&Message[96], 16);
+        const uint16_t OFN2 = (uint16_t)convert_bits_into_output(&Message[80], 16);
+        const uint16_t IFN2 = (uint16_t)convert_bits_into_output(&Message[96], 16);
         if (OFN2 && IFN2) {
             DSD_FPRINTF(stderr, "OFN2 [%04X][%05d] IFN2 [%04X][%05d]", OFN2, OFN2, IFN2, IFN2);
         }
@@ -1809,10 +1755,10 @@ NXDN_decode_cch_info(dsd_opts* opts, dsd_state* state, const uint8_t* Message, s
     uint16_t channel1 = 0;
     uint16_t channel2 = 0;
 
-    location_id = (uint32_t)ConvertBitIntoBytes(&Message[8], 24);
-    channel1sts = (uint8_t)ConvertBitIntoBytes(&Message[32], 6);
-    channel1 = (uint16_t)ConvertBitIntoBytes(&Message[38], 10);
-    channel2 = (uint16_t)ConvertBitIntoBytes(&Message[54], 10);
+    location_id = (uint32_t)convert_bits_into_output(&Message[8], 24);
+    channel1sts = (uint8_t)convert_bits_into_output(&Message[32], 6);
+    channel1 = (uint16_t)convert_bits_into_output(&Message[38], 10);
+    channel2 = (uint16_t)convert_bits_into_output(&Message[54], 10);
 
     DSD_FPRINTF(stderr, "%s", KYEL);
     nxdn_location_id_handler(state, location_id, 0);
@@ -1839,9 +1785,9 @@ NXDN_decode_srv_info(const dsd_opts* opts, dsd_state* state, const uint8_t* Mess
     uint16_t svc_info = 0; //service information
     uint32_t rst_info = 0; //restriction information
 
-    location_id = (uint32_t)ConvertBitIntoBytes(&Message[8], 24);
-    svc_info = (uint16_t)ConvertBitIntoBytes(&Message[32], 16);
-    rst_info = (uint32_t)ConvertBitIntoBytes(&Message[48], 24);
+    location_id = (uint32_t)convert_bits_into_output(&Message[8], 24);
+    svc_info = (uint16_t)convert_bits_into_output(&Message[32], 16);
+    rst_info = (uint32_t)convert_bits_into_output(&Message[48], 24);
 
     DSD_FPRINTF(stderr, "%s", KYEL);
     DSD_FPRINTF(stderr, "\n Service Information - ");
@@ -1895,15 +1841,15 @@ NXDN_decode_site_info(dsd_opts* opts, dsd_state* state, const uint8_t* Message, 
     long int freq2 = 0;
     UNUSED2(freq1, freq2);
 
-    location_id = (uint32_t)ConvertBitIntoBytes(&Message[8], 24);
-    cs_info = (uint16_t)ConvertBitIntoBytes(&Message[32], 16);
-    svc_info = (uint16_t)ConvertBitIntoBytes(&Message[48], 16);
-    rst_info = (uint32_t)ConvertBitIntoBytes(&Message[64], 24);
-    ca_info = (uint32_t)ConvertBitIntoBytes(&Message[88], 24);
-    version_num = (uint8_t)ConvertBitIntoBytes(&Message[112], 8);
-    adj_alloc = (uint8_t)ConvertBitIntoBytes(&Message[120], 4);
-    channel1 = (uint16_t)ConvertBitIntoBytes(&Message[124], 10);
-    channel2 = (uint16_t)ConvertBitIntoBytes(&Message[134], 10);
+    location_id = (uint32_t)convert_bits_into_output(&Message[8], 24);
+    cs_info = (uint16_t)convert_bits_into_output(&Message[32], 16);
+    svc_info = (uint16_t)convert_bits_into_output(&Message[48], 16);
+    rst_info = (uint32_t)convert_bits_into_output(&Message[64], 24);
+    ca_info = (uint32_t)convert_bits_into_output(&Message[88], 24);
+    version_num = (uint8_t)convert_bits_into_output(&Message[112], 8);
+    adj_alloc = (uint8_t)convert_bits_into_output(&Message[120], 4);
+    channel1 = (uint16_t)convert_bits_into_output(&Message[124], 10);
+    channel2 = (uint16_t)convert_bits_into_output(&Message[134], 10);
 
     //check the channel access information first
     nxdn_ca_info_handler(state, ca_info);
@@ -1960,17 +1906,17 @@ NXDN_decode_adj_site(dsd_opts* opts, dsd_state* state, const uint8_t* Message, s
             return;
         }
         //1
-        const uint32_t adj1_site = (uint32_t)ConvertBitIntoBytes(&Message[8], 24);
-        const uint8_t adj1_opt = (uint8_t)ConvertBitIntoBytes(&Message[32], 6);
-        const uint16_t adj1_chan = (uint16_t)ConvertBitIntoBytes(&Message[38], 10);
+        const uint32_t adj1_site = (uint32_t)convert_bits_into_output(&Message[8], 24);
+        const uint8_t adj1_opt = (uint8_t)convert_bits_into_output(&Message[32], 6);
+        const uint16_t adj1_chan = (uint16_t)convert_bits_into_output(&Message[38], 10);
         //2
-        const uint32_t adj2_site = (uint32_t)ConvertBitIntoBytes(&Message[48], 24);
-        const uint8_t adj2_opt = (uint8_t)ConvertBitIntoBytes(&Message[72], 6);
-        const uint16_t adj2_chan = (uint16_t)ConvertBitIntoBytes(&Message[78], 10);
+        const uint32_t adj2_site = (uint32_t)convert_bits_into_output(&Message[48], 24);
+        const uint8_t adj2_opt = (uint8_t)convert_bits_into_output(&Message[72], 6);
+        const uint16_t adj2_chan = (uint16_t)convert_bits_into_output(&Message[78], 10);
         //3
-        const uint32_t adj3_site = (uint32_t)ConvertBitIntoBytes(&Message[88], 24);
-        const uint8_t adj3_opt = (uint8_t)ConvertBitIntoBytes(&Message[112], 6);
-        const uint16_t adj3_chan = (uint16_t)ConvertBitIntoBytes(&Message[118], 10);
+        const uint32_t adj3_site = (uint32_t)convert_bits_into_output(&Message[88], 24);
+        const uint8_t adj3_opt = (uint8_t)convert_bits_into_output(&Message[112], 6);
+        const uint16_t adj3_chan = (uint16_t)convert_bits_into_output(&Message[118], 10);
 
         nxdn_adj_site_channel_entry(opts, state, adj1_site, adj1_opt, adj1_chan);
         nxdn_adj_site_channel_entry(opts, state, adj2_site, adj2_opt, adj2_chan);
@@ -1985,15 +1931,15 @@ NXDN_decode_adj_site(dsd_opts* opts, dsd_state* state, const uint8_t* Message, s
             return;
         }
         //1
-        const uint32_t adj1_site = (uint32_t)ConvertBitIntoBytes(&Message[8], 24);
-        const uint8_t adj1_opt = (uint8_t)ConvertBitIntoBytes(&Message[32], 6);
-        const uint8_t adj1_bw = (uint8_t)ConvertBitIntoBytes(&Message[38], 2);
-        const uint16_t adj1_chan = (uint16_t)ConvertBitIntoBytes(&Message[40], 16);
+        const uint32_t adj1_site = (uint32_t)convert_bits_into_output(&Message[8], 24);
+        const uint8_t adj1_opt = (uint8_t)convert_bits_into_output(&Message[32], 6);
+        const uint8_t adj1_bw = (uint8_t)convert_bits_into_output(&Message[38], 2);
+        const uint16_t adj1_chan = (uint16_t)convert_bits_into_output(&Message[40], 16);
         //2
-        const uint32_t adj2_site = (uint32_t)ConvertBitIntoBytes(&Message[56], 24);
-        const uint8_t adj2_opt = (uint8_t)ConvertBitIntoBytes(&Message[80], 6);
-        const uint8_t adj2_bw = (uint8_t)ConvertBitIntoBytes(&Message[86], 2);
-        const uint16_t adj2_chan = (uint16_t)ConvertBitIntoBytes(&Message[88], 16);
+        const uint32_t adj2_site = (uint32_t)convert_bits_into_output(&Message[56], 24);
+        const uint8_t adj2_opt = (uint8_t)convert_bits_into_output(&Message[80], 6);
+        const uint8_t adj2_bw = (uint8_t)convert_bits_into_output(&Message[86], 2);
+        const uint16_t adj2_chan = (uint16_t)convert_bits_into_output(&Message[88], 16);
 
         nxdn_adj_site_dfa_entry(opts, state, adj1_site, adj1_opt, adj1_bw, adj1_chan);
         nxdn_adj_site_dfa_entry(opts, state, adj2_site, adj2_opt, adj2_bw, adj2_chan);
@@ -2022,13 +1968,13 @@ nxdn_vcall_parse_fields(dsd_state* state, const uint8_t* Message, struct nxdn_vc
                         size_t body_offset, int apply_type_d_truncation) {
     DSD_MEMSET(info, 0, sizeof(*info));
     info->message_type = message_type;
-    info->cc_option = (uint8_t)ConvertBitIntoBytes(&Message[body_offset], 8);
-    info->call_type = (uint8_t)ConvertBitIntoBytes(&Message[body_offset + 8U], 3);
-    info->voice_call_option = (uint8_t)ConvertBitIntoBytes(&Message[body_offset + 11U], 5);
-    info->source_unit_id = (uint16_t)ConvertBitIntoBytes(&Message[body_offset + 16U], 16);
-    info->destination_id = (uint16_t)ConvertBitIntoBytes(&Message[body_offset + 32U], 16);
-    info->cipher_type = (uint8_t)ConvertBitIntoBytes(&Message[body_offset + 48U], 2);
-    info->key_id = (uint8_t)ConvertBitIntoBytes(&Message[body_offset + 50U], 6);
+    info->cc_option = (uint8_t)convert_bits_into_output(&Message[body_offset], 8);
+    info->call_type = (uint8_t)convert_bits_into_output(&Message[body_offset + 8U], 3);
+    info->voice_call_option = (uint8_t)convert_bits_into_output(&Message[body_offset + 11U], 5);
+    info->source_unit_id = (uint16_t)convert_bits_into_output(&Message[body_offset + 16U], 16);
+    info->destination_id = (uint16_t)convert_bits_into_output(&Message[body_offset + 32U], 16);
+    info->cipher_type = (uint8_t)convert_bits_into_output(&Message[body_offset + 48U], 2);
+    info->key_id = (uint8_t)convert_bits_into_output(&Message[body_offset + 50U], 6);
 
     state->NxdnElementsContent.CCOption = info->cc_option;
     state->NxdnElementsContent.CallType = info->call_type;
@@ -2066,7 +2012,7 @@ static void
 nxdn_vcall_parse_arib(dsd_state* state, const uint8_t* Message, struct nxdn_vcall_info* info) {
     const uint8_t message_type = nxdn_message_type_from_bits(Message);
     nxdn_vcall_parse_fields(state, Message, info, nxdn_arib_vcall_normalized_message_type(message_type), 16U, 0);
-    info->mfid = (uint8_t)ConvertBitIntoBytes(&Message[8], 8);
+    info->mfid = (uint8_t)convert_bits_into_output(&Message[8], 8);
     info->has_mfid = 1U;
 }
 
@@ -2166,7 +2112,7 @@ nxdn_vcall_load_key(const dsd_opts* opts, dsd_state* state, const struct nxdn_vc
     if (state->keyloader != 1) {
         return;
     }
-    if (info->cipher_type == 1U && opts->frame_nxdn48 == 1 && opts->frame_nxdn96 == 0) {
+    if (info->cipher_type == 1U && dsd_frame_sync_active_nxdn_variant(opts, state) == DSD_NXDN_VARIANT_48) {
         if (state->rkey_array[info->key_id] != 0) {
             state->R = state->rkey_array[info->key_id];
         } else if (state->rkey_array[info->destination_id] != 0) {
@@ -2184,7 +2130,7 @@ nxdn_vcall_load_key(const dsd_opts* opts, dsd_state* state, const struct nxdn_vc
 }
 
 static void
-nxdn_vcall_print_cipher(const dsd_state* state, const struct nxdn_vcall_info* info) {
+nxdn_vcall_print_cipher(const dsd_opts* opts, const dsd_state* state, const struct nxdn_vcall_info* info) {
     if (info->cipher_type != 0U && info->message_type == 0x01U) {
         DSD_FPRINTF(stderr, "\n  %s", KYEL);
         DSD_FPRINTF(stderr, "%s - ", NXDN_Cipher_Type_To_Str(info->cipher_type));
@@ -2193,17 +2139,23 @@ nxdn_vcall_print_cipher(const dsd_state* state, const struct nxdn_vcall_info* in
     }
     if (info->cipher_type == 0x01U && state->R > 0) {
         DSD_FPRINTF(stderr, "%s", KYEL);
-        DSD_FPRINTF(stderr, "Value: %s", DSD_SECRET_REDACTED);
+        char key_text[16];
+        DSD_FPRINTF(stderr, "Value: %s",
+                    dsd_secret_format_decimal(key_text, sizeof key_text, opts->show_keys, state->R, 5U));
         DSD_FPRINTF(stderr, "%s", KNRM);
     }
     if (info->cipher_type == 0x02U && state->R > 0) {
         DSD_FPRINTF(stderr, "%s", KYEL);
-        DSD_FPRINTF(stderr, "Value: %s", DSD_SECRET_REDACTED);
+        char key_text[17];
+        DSD_FPRINTF(stderr, "Value: %s",
+                    dsd_secret_format_hex(key_text, sizeof key_text, opts->show_keys, state->R, 16U, 0));
         DSD_FPRINTF(stderr, "%s", KNRM);
     }
     if (info->cipher_type == 0x03U && state->R > 0) {
         DSD_FPRINTF(stderr, "%s", KYEL);
-        DSD_FPRINTF(stderr, "KS: %s", DSD_SECRET_REDACTED);
+        char key_text[17];
+        DSD_FPRINTF(stderr, "KS: %s",
+                    dsd_secret_format_hex(key_text, sizeof key_text, opts->show_keys, state->R, 16U, 0));
         DSD_FPRINTF(stderr, "%s", KNRM);
     }
 }
@@ -2261,7 +2213,7 @@ nxdn_vcall_lockout_label(dsd_state* state, uint16_t destination_id, char gm[8], 
 
 static void
 nxdn_vcall_run_enc_lockout(dsd_opts* opts, dsd_state* state, const struct nxdn_vcall_info* info) {
-    if (opts->p25_trunk != 1 || opts->trunk_tune_enc_calls != 0 || info->message_type != 0x01U
+    if (opts->trunk_enable != 1 || opts->trunk_tune_enc_calls != 0 || info->message_type != 0x01U
         || state->dmr_encL != 1) {
         return;
     }
@@ -2273,6 +2225,7 @@ nxdn_vcall_run_enc_lockout(dsd_opts* opts, dsd_state* state, const struct nxdn_v
         DSD_SNPRINTF(state->event_history_s[0].Event_History_Items[0].internal_str,
                      sizeof(state->event_history_s[0].Event_History_Items[0].internal_str),
                      "Target: %d; has been locked out; Encryption Lock Out Enabled.", info->destination_id);
+        dsd_event_history_mark_dirty(&state->event_history_s[0]);
         watchdog_event_current(opts, state, 0);
     }
 
@@ -2289,7 +2242,7 @@ static void
 nxdn_vcall_process(dsd_opts* opts, dsd_state* state, const struct nxdn_vcall_info* info) {
     nxdn_vcall_print_summary(state, info);
     nxdn_vcall_load_key(opts, state, info);
-    nxdn_vcall_print_cipher(state, info);
+    nxdn_vcall_print_cipher(opts, state, info);
     nxdn_vcall_apply_state(state, info);
     nxdn_vcall_run_enc_lockout(opts, state, info);
 }
@@ -2311,9 +2264,9 @@ NXDN_decode_VCALL_ARIB(dsd_opts* opts, dsd_state* state, const uint8_t* Message)
 static unsigned long long int
 nxdn_vcall_iv_extract(const dsd_state* state, const uint8_t* Message) {
     if (strcmp(state->nxdn_location_category, "Type-D") == 0) {
-        return (unsigned long long int)ConvertBitIntoBytes(&Message[8], 22);
+        return (unsigned long long int)convert_bits_into_output(&Message[8], 22);
     }
-    return (unsigned long long int)ConvertBitIntoBytes(&Message[8], 64);
+    return (unsigned long long int)convert_bits_into_output(&Message[8], 64);
 }
 
 static void
@@ -2390,21 +2343,21 @@ nxdn_scch_parse(const uint8_t* Message, uint8_t direction, time_t now, struct nx
     DSD_MEMSET(info, 0, sizeof(*info));
     info->now = now;
     info->direction = direction;
-    info->sf = (uint8_t)ConvertBitIntoBytes(&Message[0], 2);
+    info->sf = (uint8_t)convert_bits_into_output(&Message[0], 2);
     info->opcode = (uint8_t)(direction << 2 | info->sf);
     info->area = Message[2];
-    info->rep1 = (uint8_t)ConvertBitIntoBytes(&Message[3], 5);
-    info->rep2 = (uint8_t)ConvertBitIntoBytes(&Message[8], 5);
-    info->id = (uint16_t)ConvertBitIntoBytes(&Message[13], 11);
-    info->sitet = (uint8_t)ConvertBitIntoBytes(&Message[3], 5);
+    info->rep1 = (uint8_t)convert_bits_into_output(&Message[3], 5);
+    info->rep2 = (uint8_t)convert_bits_into_output(&Message[8], 5);
+    info->id = (uint16_t)convert_bits_into_output(&Message[13], 11);
+    info->sitet = (uint8_t)convert_bits_into_output(&Message[3], 5);
     info->gu = Message[24];
-    info->iv_a = (uint64_t)ConvertBitIntoBytes(&Message[13], 12);
-    info->iv_b = (uint64_t)ConvertBitIntoBytes(&Message[18], 6);
-    info->iv_c = (uint64_t)ConvertBitIntoBytes(&Message[8], 5);
+    info->iv_a = (uint64_t)convert_bits_into_output(&Message[13], 12);
+    info->iv_b = (uint64_t)convert_bits_into_output(&Message[18], 6);
+    info->iv_c = (uint64_t)convert_bits_into_output(&Message[8], 5);
     info->iv_type = Message[24];
-    info->call_opt = (uint8_t)ConvertBitIntoBytes(&Message[13], 3);
-    info->key_id = (uint8_t)ConvertBitIntoBytes(&Message[18], 6);
-    info->cipher = (uint8_t)ConvertBitIntoBytes(&Message[16], 2);
+    info->call_opt = (uint8_t)convert_bits_into_output(&Message[13], 3);
+    info->key_id = (uint8_t)convert_bits_into_output(&Message[18], 6);
+    info->cipher = (uint8_t)convert_bits_into_output(&Message[16], 2);
 }
 
 static void
@@ -2504,9 +2457,9 @@ nxdn_scch_apply_busy_tune(dsd_opts* opts, dsd_state* state, const struct nxdn_sc
     const int is_private_call = (info->gu == 1U) ? 1 : 0;
     const int policy_allowed =
         nxdn_policy_tune_allowed(opts, state, info->id, 0, is_private_call, 0, 0, &policy_decision);
-    if (opts->p25_trunk == 1 && policy_allowed && state->p25_cc_freq != 0
+    if (opts->trunk_enable == 1 && policy_allowed && state->p25_cc_freq != 0
         && ((info->now - state->last_vc_sync_time) > 1) && freq != 0) {
-        dsd_trunk_tune_result tune_result = dsd_trunk_tuning_hook_tune_to_freq(opts, state, freq, 0);
+        dsd_trunk_tune_result tune_result = dsd_trunk_tuning_hook_tune_to_freq(opts, state, freq, 0, NULL);
         if (!dsd_trunk_tune_result_is_ok(tune_result)) {
             return;
         }
@@ -2519,7 +2472,7 @@ nxdn_scch_apply_busy_tune(dsd_opts* opts, dsd_state* state, const struct nxdn_sc
         if (state->M == 1) {
             state->nxdn_cipher_type = 0x1;
         }
-    } else if (opts->p25_trunk == 1) {
+    } else if (opts->trunk_enable == 1) {
         nxdn_policy_log_block(opts, is_private_call, info->id, 0, &policy_decision);
     }
 }

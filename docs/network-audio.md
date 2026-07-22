@@ -27,6 +27,11 @@ Notes:
   even byte count (whole `int16_t` samples).
 - If UDP bursts faster than the internal ring can drain, samples may be dropped. Prefer steady packet sizes (e.g., ~20ms
   of audio per datagram).
+- For TCP input, DSD-neo is the client. `tcp:<host>:<port>` must name the computer and port where the PCM producer is
+  listening. `localhost` only reaches a producer on the same computer. To use a LAN address, configure the producer to
+  listen on its LAN interface or `0.0.0.0`, and allow inbound TCP through the host firewall.
+- With rigctl enabled (`-U <port>`), a TCP input host is also used as the rigctl host. For SDR++ on another PC, allow
+  both the TCP audio port, commonly `7355`, and the rigctl port, commonly `4532`.
 
 ## UDP Audio Output (`-o udp`)
 
@@ -39,7 +44,6 @@ The primary UDP output carries decoded digital voice:
 - Sample rate: **8000 Hz**
 - Channels:
   - Often **stereo** (2 channels, interleaved) by default
-  - Use `-nm` (or `-fr` for DMR) to force **mono** in common DMR workflows
 - Sample type:
   - Default: **`s16le`** (signed 16-bit little-endian)
   - With `-y`: **`f32le`** (32-bit float little-endian)
@@ -63,9 +67,6 @@ Digital voice (default port `23456`, 8 kHz):
 ```bash
 # PCM16LE stereo (common default)
 socat -u UDP-RECV:23456,reuseaddr STDOUT | ffplay -nodisp -f s16le -ar 8000 -ac 2 -i -
-
-# PCM16LE mono (if you run DSD-neo with -nm / -fr)
-socat -u UDP-RECV:23456,reuseaddr STDOUT | ffplay -nodisp -f s16le -ar 8000 -ac 1 -i -
 
 # Float32 stereo (if you run DSD-neo with -y)
 socat -u UDP-RECV:23456,reuseaddr STDOUT | ffplay -nodisp -f f32le -ar 8000 -ac 2 -i -
@@ -96,5 +97,7 @@ Do not feed `m17udp` into raw PCM tools such as `ffplay -f s16le`; use the `udp`
 
 ## Troubleshooting
 
+- `tcp:localhost:7355` works but `tcp:<LAN-IP>:7355` fails: the PCM producer is usually listening only on loopback, the
+  LAN IP is not the producer computer's IPv4 address, or the host firewall is blocking the port.
 - Garbled audio usually means the **wrong sample format** (mono vs stereo, `s16le` vs `f32le`, or wrong sample rate).
 - If you need a self-describing file format, prefer WAV output (`-w` / `-P`) rather than UDP/stdout.

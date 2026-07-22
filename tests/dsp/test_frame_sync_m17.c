@@ -7,6 +7,7 @@
 #include <dsd-neo/core/state.h>
 #include <dsd-neo/core/sync_patterns.h>
 #include <dsd-neo/core/synctype_ids.h>
+#include <dsd-neo/core/time_format.h>
 #include <dsd-neo/dsp/frame_sync.h>
 #include <dsd-neo/io/rtl_stream_c.h>
 #include <dsd-neo/platform/sockets.h>
@@ -16,6 +17,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include "dsd-neo/core/dibit.h"
 #include "dsd-neo/core/opts_fwd.h"
 #include "dsd-neo/core/safe_api.h"
@@ -26,7 +28,7 @@
 #pragma GCC diagnostic ignored "-Wmissing-prototypes"
 #endif
 
-static size_t g_symbol_index;
+static size_t g_sample_index;
 static const char* g_sync_pattern = M17_PRE;
 static char g_fill_symbol = '1';
 
@@ -43,8 +45,14 @@ openAudioInput(dsd_opts* opts) { // NOLINT(misc-use-internal-linkage)
     return -1;
 }
 
+int
+dsd_audio_reconfigure_output_for_input_policy(dsd_opts* opts) { // NOLINT(misc-use-internal-linkage)
+    (void)opts;
+    return 0;
+}
+
 void
-cleanupAndExit(dsd_opts* opts, dsd_state* state) { // NOLINT(misc-use-internal-linkage)
+dsd_request_shutdown(dsd_opts* opts, dsd_state* state) { // NOLINT(misc-use-internal-linkage)
     (void)opts;
     (void)state;
 }
@@ -57,11 +65,12 @@ dsd_audio_rescale_symbol_timing(dsd_state* state, int old_rate_hz, int new_rate_
     (void)new_rate_hz;
 }
 
-void
-getTimeC_buf(char out[9]) { // NOLINT(misc-use-internal-linkage)
-    if (out) {
-        DSD_SNPRINTF(out, 9, "%s", "00:00:00");
-    }
+int
+dsd_format_local_datetime(time_t timestamp, dsd_local_datetime_format format, char* out,
+                          size_t out_size) { // NOLINT(misc-use-internal-linkage)
+    (void)timestamp;
+    (void)format;
+    return out ? DSD_SNPRINTF(out, out_size, "%s", "00:00:00") >= 0 : 0;
 }
 
 void
@@ -90,11 +99,12 @@ watchdog_event_current(const dsd_opts* opts, dsd_state* state, uint8_t slot) { /
 }
 
 void
-write_symbol_capture_record(dsd_opts* opts, dsd_state* state, int dibit, float symbol) {
+write_symbol_capture_record(dsd_opts* opts, dsd_state* state, int dibit, float symbol, const dsd_dibit_soft_t* soft) {
     (void)opts;
     (void)state;
     (void)dibit;
     (void)symbol;
+    (void)soft;
 }
 
 uint8_t
@@ -102,14 +112,6 @@ dmr_compute_reliability(const dsd_state* st, float sym) {
     (void)st;
     (void)sym;
     return 255;
-}
-
-double
-raw_pwr_f(const float* samples, int len, int step) { // NOLINT(misc-use-internal-linkage)
-    (void)samples;
-    (void)len;
-    (void)step;
-    return 1.0;
 }
 
 double
@@ -168,10 +170,12 @@ fake_rtl_read(void* rtl_ctx, float* out, size_t count, int* out_got) {
     }
 
     const size_t pattern_len = strlen(g_sync_pattern);
+    const size_t samples_per_symbol = 10U;
     for (size_t i = 0; i < count; i++) {
-        char dibit = (g_symbol_index < pattern_len) ? g_sync_pattern[g_symbol_index] : g_fill_symbol;
+        size_t symbol_index = g_sample_index / samples_per_symbol;
+        char dibit = (symbol_index < pattern_len) ? g_sync_pattern[symbol_index] : g_fill_symbol;
         out[i] = symbol_level_for_m17(dibit);
-        g_symbol_index++;
+        g_sample_index++;
     }
     *out_got = (int)count;
     return 0;
@@ -185,7 +189,7 @@ fake_rtl_pwr(const void* rtl_ctx) {
 
 static int
 fake_output_kind(void) {
-    return RTL_STREAM_OUTPUT_SYMBOL_FSK;
+    return RTL_STREAM_OUTPUT_FSK_DISCRIMINATOR;
 }
 
 static int
@@ -213,15 +217,12 @@ fake_stream_active(void) {
 }
 
 static int
-fake_dsp_get(int* out_cqpsk_enable, int* out_fll_enable, int* out_ted_enable) {
+fake_cqpsk_status(int* out_cqpsk_enable, int* out_cqpsk_timing_active) {
     if (out_cqpsk_enable) {
         *out_cqpsk_enable = 0;
     }
-    if (out_fll_enable) {
-        *out_fll_enable = 0;
-    }
-    if (out_ted_enable) {
-        *out_ted_enable = 0;
+    if (out_cqpsk_timing_active) {
+        *out_cqpsk_timing_active = 0;
     }
     return 0;
 }
@@ -230,7 +231,6 @@ static void
 free_state_buffers(dsd_state* state) {
     free(state->dibit_buf);
     free(state->dmr_payload_buf);
-    free(state->dmr_reliab_buf);
     free(state->dmr_soft_buf);
 }
 
@@ -238,15 +238,13 @@ static int
 init_state_buffers(dsd_state* state) {
     state->dibit_buf = (int*)calloc(1000000U, sizeof(int));
     state->dmr_payload_buf = (int*)calloc(1000000U, sizeof(int));
-    state->dmr_reliab_buf = (uint8_t*)calloc(1000000U, sizeof(uint8_t));
     state->dmr_soft_buf = (dsd_dibit_soft_t*)calloc(1000000U, sizeof(dsd_dibit_soft_t));
-    if (!state->dibit_buf || !state->dmr_payload_buf || !state->dmr_reliab_buf || !state->dmr_soft_buf) {
+    if (!state->dibit_buf || !state->dmr_payload_buf || !state->dmr_soft_buf) {
         free_state_buffers(state);
         return 0;
     }
     state->dibit_buf_p = state->dibit_buf + 200;
     state->dmr_payload_p = state->dmr_payload_buf + 200;
-    state->dmr_reliab_p = state->dmr_reliab_buf + 200;
     state->dmr_soft_p = state->dmr_soft_buf + 200;
     return 1;
 }
@@ -261,7 +259,7 @@ install_hooks(void) {
         .output_kind = fake_output_kind,
         .symbol_profile = fake_symbol_profile,
         .stream_generation = fake_stream_generation,
-        .dsp_get = fake_dsp_get,
+        .cqpsk_status = fake_cqpsk_status,
         .stream_active = fake_stream_active,
     };
     dsd_rtl_stream_metrics_hooks_set(&metrics_hooks);
@@ -285,6 +283,16 @@ init_m17_sync_case(dsd_opts* opts, dsd_state* state, int* fake_rtl_context) {
     }
 
     opts->audio_in_type = AUDIO_IN_RTL;
+    opts->frame_dstar = 1;
+    opts->frame_x2tdma = 1;
+    opts->frame_p25p1 = 1;
+    opts->frame_p25p2 = 1;
+    opts->frame_nxdn48 = 1;
+    opts->frame_nxdn96 = 1;
+    opts->frame_dmr = 1;
+    opts->frame_dpmr = 1;
+    opts->frame_provoice = 1;
+    opts->frame_ysf = 1;
     opts->frame_m17 = 1;
     opts->mod_cli_lock = 1;
     opts->mod_gfsk = 1;
@@ -306,7 +314,7 @@ init_m17_sync_case(dsd_opts* opts, dsd_state* state, int* fake_rtl_context) {
 
 static int
 run_one_on_state(dsd_opts* opts, dsd_state* state, const char* pattern, int expected_sync, const char* label) {
-    g_symbol_index = 0U;
+    g_sample_index = 0U;
     g_sync_pattern = pattern;
     g_fill_symbol = (expected_sync < 0) ? '3' : '1';
     state->rtl_symbol_cache_pos = 0;
@@ -368,17 +376,21 @@ run_m17_two_step_case(const char* first_pattern, int first_expected, const char*
 int
 main(void) {
     int rc = 0;
-    rc |= run_m17_two_step_case(M17_PRE, DSD_SYNC_M17_PRE_POS, M17_LSF, DSD_SYNC_M17_LSF_POS, "M17 preamble to LSF");
+    rc |= run_m17_two_step_case(M17_PRE M17_PRE, DSD_SYNC_M17_PRE_POS, M17_LSF, DSD_SYNC_M17_LSF_POS,
+                                "M17 preamble to LSF");
     rc |= run_m17_sync_case(DSD_SYNC_M17_LSF_POS, 1U, M17_STR, DSD_SYNC_M17_STR_POS, "M17 LSF to stream");
     rc |= run_m17_sync_case(DSD_SYNC_M17_LSF_POS, 1U, M17_PKT, DSD_SYNC_M17_PKT_POS, "M17 LSF to packet");
-    rc |= run_m17_two_step_case(M17_PRE, DSD_SYNC_M17_PRE_POS, M17_BRT, DSD_SYNC_M17_BRT_POS, "M17 preamble to BERT");
+    rc |= run_m17_two_step_case(M17_PRE M17_PRE, DSD_SYNC_M17_PRE_POS, M17_BRT, DSD_SYNC_M17_BRT_POS,
+                                "M17 preamble to BERT");
     rc |= run_m17_sync_case(DSD_SYNC_M17_BRT_POS, 1U, M17_BRT, DSD_SYNC_M17_BRT_POS, "M17 BERT to BERT");
     rc |= run_m17_sync_case(DSD_SYNC_M17_STR_POS, 1U, M17_STR, DSD_SYNC_M17_STR_POS, "M17 stream to stream");
     rc |= run_m17_sync_case(DSD_SYNC_M17_PKT_POS, 1U, M17_PKT, DSD_SYNC_M17_PKT_POS, "M17 packet to packet");
     rc |= run_m17_sync_case(DSD_SYNC_M17_STR_POS, 1U, M17_EOT, DSD_SYNC_M17_EOT_POS, "M17 stream to EOT");
     rc |= run_m17_sync_case(DSD_SYNC_NONE, 0U, M17_EOT, -1, "M17 rejects cold EOT");
-    rc |= run_m17_two_step_case(M17_PRE, DSD_SYNC_M17_PRE_POS, M17_STR, -1, "M17 rejects stream after preamble");
-    rc |= run_m17_two_step_case(M17_PRE, DSD_SYNC_M17_PRE_POS, M17_PKT, -1, "M17 rejects packet after preamble");
+    rc |=
+        run_m17_two_step_case(M17_PRE M17_PRE, DSD_SYNC_M17_PRE_POS, M17_STR, -1, "M17 rejects stream after preamble");
+    rc |=
+        run_m17_two_step_case(M17_PRE M17_PRE, DSD_SYNC_M17_PRE_POS, M17_PKT, -1, "M17 rejects packet after preamble");
     return rc;
 }
 

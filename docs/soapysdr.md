@@ -43,7 +43,7 @@ During configure, confirm Soapy availability from the status line:
 - `SoapySDR backend enabled: ON (available: ON)`
 
 If availability is `OFF`, install SoapySDR 0.8.1 or newer development packages and the module for your radio, then
-reconfigure. Older 0.7.x CMake package compatibility is intentionally not supported.
+reconfigure.
 
 ## 2) Discover device arguments
 
@@ -66,7 +66,8 @@ In Soapy mode, you can either:
 Trailing Soapy tuning fields map to the same shared controls used by RTL/RTL-TCP (`rtl_*` keys).
 If your Soapy args string itself contains `:`, prefer config (`soapy_args` + `rtl_*`) to avoid ambiguity.
 `--print-config` normalizes this shorthand before rendering, so effective output shows `soapy_args` plus `rtl_*` fields.
-For digital decode, SoapySDR uses the same normalized symbol-domain stream as RTL USB, RTL-TCP, and IQ replay.
+For digital decode, SoapySDR uses the same FSK discriminator and CQPSK symbol contracts as RTL USB, RTL-TCP, and IQ
+replay.
 
 Minimal config (recommended):
 
@@ -94,9 +95,11 @@ Optional Soapy-specific keys:
   format when it is `CF32` or `CS16`, then falls back to supported formats.
 - `soapy_antenna = "<name>"` selects a listed RX antenna.
 - `soapy_clock = "<source>"` selects a listed clock source.
-- `soapy_settings = "key=value[,key=value...]"` writes generic Soapy device settings before stream setup. Use
+- `soapy_settings = "key=value[,key=value...]"` writes generic Soapy device settings before stream setup. Items may be
+  separated with commas or semicolons. Use
   `rx:key=value` or `rx0:key=value` for RX channel 0 settings.
-- `soapy_gains = "NAME:dB[,NAME:dB...]"` applies named Soapy gain stages and suppresses aggregate gain changes.
+- `soapy_gains = "NAME:dB[,NAME:dB...]"` applies named Soapy gain stages and suppresses aggregate gain changes. Items
+  may be separated with commas, semicolons, or spaces.
 - `soapy_bandwidth_hz = -1|0|<Hz>` uses profile/default behavior for `-1`, driver automatic/no explicit request for
   `0`, or validates and applies an explicit hardware bandwidth in Hz.
 
@@ -140,13 +143,13 @@ Examples:
 
 ```bash
 # Use saved config
-dsd-neo --config ~/.config/dsd-neo/config.ini -N
+dsd-neo --config ~/.config/dsd-neo/config.ini --frontend terminal
 
 # One-shot trunking with explicit Soapy args
-dsd-neo -fs -i soapy:driver=airspy -T -C connect_plus_chan.csv -G group.csv -N
+dsd-neo -fs -i soapy:driver=airspy -T -C connect_plus_chan.csv -G group.csv --frontend terminal
 
 # One-shot Soapy args + startup tuning
-dsd-neo -fs -i soapy:driver=airspy:851.375M:22:-2:24:0:2 -T -C connect_plus_chan.csv -G group.csv -N
+dsd-neo -fs -i soapy:driver=airspy:851.375M:22:-2:24:0:2 -T -C connect_plus_chan.csv -G group.csv --frontend terminal
 ```
 
 ## Behavior and limits vs RTL/RTL-TCP
@@ -161,8 +164,9 @@ dsd-neo -fs -i soapy:driver=airspy:851.375M:22:-2:24:0:2 -T -C connect_plus_chan
 - Requested sample rate/gain may be quantized or clamped by the driver.
 - The current backend expects Soapy RX stream format support for `CF32` or `CS16`; `auto` chooses the native format
   first when it is supported.
-- IQ capture from Soapy requires an active `CF32` stream. Devices that only expose `CS16` can still be used for live
-  decode, but `--iq-capture` is rejected for that stream format.
+- IQ capture from Soapy requires an active `CF32` stream and `--iq-capture-format cf32`; the CLI default is `cu8`, so a
+  Soapy CF32 capture must request the matching format explicitly. Devices that only expose `CS16` can still be used for
+  live decode, but `--iq-capture` is rejected for that stream format.
 
 ## Troubleshooting
 
@@ -187,5 +191,5 @@ Manual driver-setting check:
 
 ```bash
 SoapySDRUtil --probe="driver=sdrplay"
-dsd-neo --config ~/.config/dsd-neo/config.ini -N
+dsd-neo --config ~/.config/dsd-neo/config.ini --frontend terminal
 ```

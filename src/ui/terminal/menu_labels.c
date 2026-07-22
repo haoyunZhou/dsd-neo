@@ -9,28 +9,23 @@
  */
 
 #include "menu_labels.h"
-#include <dsd-neo/core/constants.h>
+#include <dsd-neo/app_control/frontend.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/state.h>
 #include <dsd-neo/io/tcp_input.h>
 #include <dsd-neo/platform/file_compat.h>
 #include <dsd-neo/runtime/config.h>
-#include <math.h>
 #include <stdint.h>
 #include <string.h>
 #include "dsd-neo/core/opts_fwd.h"
 #include "dsd-neo/core/safe_api.h"
 #include "dsd-neo/core/state_fwd.h"
+#include "dsd-neo/platform/sockets.h"
 #include "dsd-neo/runtime/call_alert.h"
 #include "menu_env.h"
 #include "menu_internal.h"
 #include "menu_items.h"
-
-#ifdef USE_RADIO
-#include <dsd-neo/io/rtl_stream_c.h>
-#else
-extern int rtl_stream_get_auto_ppm(void);
-#endif
+#include "ui_key_status.h"
 
 // ---- Visibility/predicate functions ----
 
@@ -59,25 +54,18 @@ io_rtl_active(const void* ctx) {
 }
 
 #ifdef USE_RADIO
-static bool
-rtl_symbol_output_active_for_ui(void) {
-    int kind = rtl_stream_get_output_kind();
-    int cq = 0;
-    rtl_stream_dsp_get(&cq, NULL, NULL);
-    return kind == RTL_STREAM_OUTPUT_SYMBOL_FSK || kind == RTL_STREAM_OUTPUT_SYMBOL_CQPSK || cq != 0;
+static dsd_frontend_metrics
+menu_frontend_metrics(const void* v) {
+    (void)v;
+    dsd_frontend_metrics metrics;
+    (void)dsd_app_frontend_get_metrics(&metrics);
+    return metrics;
 }
 
 static bool
-rtl_fsk_symbol_output_active_for_ui(void) {
-    return rtl_stream_get_output_kind() == RTL_STREAM_OUTPUT_SYMBOL_FSK;
-}
-
-bool
-dsp_cq_on(const void* v) {
-    UNUSED(v);
-    int cq = 0, f = 0, t = 0;
-    rtl_stream_dsp_get(&cq, &f, &t);
-    return cq != 0;
+rtl_fsk_symbol_output_active_for_ui(const void* v) {
+    dsd_frontend_metrics metrics = menu_frontend_metrics(v);
+    return metrics.output_kind == DSD_FRONTEND_RTL_OUTPUT_FSK_DISCRIMINATOR;
 }
 
 int
@@ -85,7 +73,7 @@ ui_current_mod(const void* v) {
     UiCtx* c = (UiCtx*)v;
     int mod = -1;
 
-    // Honor CLI-locked demod selection when present
+    // Honor an explicitly locked demod selection when present
     if (c && c->opts && c->opts->mod_cli_lock) {
         if (c->opts->mod_qpsk) {
             mod = 1;
@@ -105,13 +93,12 @@ ui_current_mod(const void* v) {
     }
 
     // Snap to the active DSP path: CQPSK toggle always means QPSK path
-    int cq = 0;
-    rtl_stream_dsp_get(&cq, NULL, NULL);
-    if (cq) {
+    dsd_frontend_metrics metrics = menu_frontend_metrics(v);
+    if (metrics.cqpsk_enable) {
         mod = 1;
     }
 
-    // Fallback: default to FM/C4FM family (or GFSK when hinted)
+    // Fallback: default to the 4-level FSK family (or GFSK when hinted)
     if (mod < 0) {
         mod = 0;
     }
@@ -124,52 +111,16 @@ is_mod_qpsk(const void* v) {
 }
 
 bool
-is_mod_c4fm(const void* v) {
-    return ui_current_mod(v) == 0;
-}
-
-bool
-is_mod_gfsk(const void* v) {
-    return ui_current_mod(v) == 2;
-}
-
-bool
-is_mod_fm(const void* v) {
-    int m = ui_current_mod(v);
-    return m == 0 || m == 2;
-}
-
-bool
-is_non_symbol_mod_fm(const void* v) {
-    return is_mod_fm(v) && !rtl_symbol_output_active_for_ui();
-}
-
-bool
-is_sample_window_c4fm(const void* v) {
-    return is_mod_c4fm(v) && !rtl_fsk_symbol_output_active_for_ui();
-}
-
-bool
 is_not_qpsk(const void* v) {
     return !is_mod_qpsk(v);
 }
 
 bool
-is_fll_allowed(const void* v) {
-    return !rtl_symbol_output_active_for_ui() && (is_mod_qpsk(v) || is_mod_fm(v));
-}
-
-bool
 is_ted_allowed(const void* v) {
-    return !rtl_fsk_symbol_output_active_for_ui() && (is_mod_qpsk(v) || is_mod_fm(v));
+    return !rtl_fsk_symbol_output_active_for_ui(v) && is_mod_qpsk(v);
 }
 
 // DSP submenu arrays declared in menu_items.h
-
-bool
-dsp_agc_any(const void* v) {
-    return ui_submenu_has_visible(DSP_AGC_ITEMS, DSP_AGC_ITEMS_LEN, v) ? true : false;
-}
 
 bool
 dsp_ted_any(const void* v) {
@@ -196,7 +147,7 @@ lbl_toggle_payload(const void* v, char* b, size_t n) {
 const char*
 lbl_trunk(const void* v, char* b, size_t n) {
     UiCtx* c = (UiCtx*)v;
-    DSD_SNPRINTF(b, n, "Toggle Trunking [%s]", c->opts->p25_trunk ? "Active" : "Inactive");
+    DSD_SNPRINTF(b, n, "Toggle Trunking [%s]", c->opts->trunk_enable ? "Active" : "Inactive");
     return b;
 }
 
@@ -477,7 +428,7 @@ lbl_tcp(const void* vctx, char* b, size_t n) {
 const char*
 lbl_rigctl(const void* vctx, char* b, size_t n) {
     UiCtx* c = (UiCtx*)vctx;
-    int connected = (c->opts->use_rigctl && c->opts->rigctl_sockfd != 0);
+    int connected = (c->opts->use_rigctl && c->opts->rigctl_sockfd != DSD_INVALID_SOCKET);
     if (c->opts->rigctlhostname[0] != '\0' && c->opts->rigctlportno > 0) {
         int m = (n > 24) ? (int)(n - 24) : 0;
         if (connected) {
@@ -779,12 +730,6 @@ lbl_p25_grant_voice(const void* v, char* b, size_t n) {
 }
 
 const char*
-lbl_p25_retune_backoff(const void* v, char* b, size_t n) {
-    DSD_SNPRINTF(b, n, "P25: Retune backoff (s): %.3f", lbl_p25_num(v, "DSD_NEO_P25_RETUNE_BACKOFF", 0.0));
-    return b;
-}
-
-const char*
 lbl_p25_cc_grace(const void* v, char* b, size_t n) {
     DSD_SNPRINTF(b, n, "P25: CC hunt grace (s): %.3f", lbl_p25_num(v, "DSD_NEO_P25_CC_GRACE", 0.0));
     return b;
@@ -819,14 +764,16 @@ lbl_p25_p1_err_sec(const void* v, char* b, size_t n) {
 const char*
 lbl_ui_p25_metrics(const void* v, char* b, size_t n) {
     UiCtx* c = (UiCtx*)v;
-    DSD_SNPRINTF(b, n, "Show P25 Metrics [%s]", (c && c->opts && c->opts->show_p25_metrics) ? "On" : "Off");
+    DSD_SNPRINTF(b, n, "Show P25 Metrics [%s]",
+                 (c && c->opts && c->opts->frontend_display.show_p25_metrics) ? "On" : "Off");
     return b;
 }
 
 const char*
 lbl_ui_p25_affil(const void* v, char* b, size_t n) {
     UiCtx* c = (UiCtx*)v;
-    DSD_SNPRINTF(b, n, "Show P25 Affiliations [%s]", (c && c->opts && c->opts->show_p25_affiliations) ? "On" : "Off");
+    DSD_SNPRINTF(b, n, "Show P25 Affiliations [%s]",
+                 (c && c->opts && c->opts->frontend_display.show_p25_affiliations) ? "On" : "Off");
     return b;
 }
 
@@ -834,35 +781,38 @@ const char*
 lbl_ui_p25_ga(const void* v, char* b, size_t n) {
     UiCtx* c = (UiCtx*)v;
     DSD_SNPRINTF(b, n, "Show P25 Group Affiliation [%s]",
-                 (c && c->opts && c->opts->show_p25_group_affiliations) ? "On" : "Off");
+                 (c && c->opts && c->opts->frontend_display.show_p25_group_affiliations) ? "On" : "Off");
     return b;
 }
 
 const char*
 lbl_ui_p25_neighbors(const void* v, char* b, size_t n) {
     UiCtx* c = (UiCtx*)v;
-    DSD_SNPRINTF(b, n, "Show P25 Neighbors [%s]", (c && c->opts && c->opts->show_p25_neighbors) ? "On" : "Off");
+    DSD_SNPRINTF(b, n, "Show P25 Neighbors [%s]",
+                 (c && c->opts && c->opts->frontend_display.show_p25_neighbors) ? "On" : "Off");
     return b;
 }
 
 const char*
 lbl_ui_p25_iden(const void* v, char* b, size_t n) {
     UiCtx* c = (UiCtx*)v;
-    DSD_SNPRINTF(b, n, "Show P25 IDEN Plan [%s]", (c && c->opts && c->opts->show_p25_iden_plan) ? "On" : "Off");
+    DSD_SNPRINTF(b, n, "Show P25 IDEN Plan [%s]",
+                 (c && c->opts && c->opts->frontend_display.show_p25_iden_plan) ? "On" : "Off");
     return b;
 }
 
 const char*
 lbl_ui_p25_ccc(const void* v, char* b, size_t n) {
     UiCtx* c = (UiCtx*)v;
-    DSD_SNPRINTF(b, n, "Show P25 CC Candidates [%s]", (c && c->opts && c->opts->show_p25_cc_candidates) ? "On" : "Off");
+    DSD_SNPRINTF(b, n, "Show P25 CC Candidates [%s]",
+                 (c && c->opts && c->opts->frontend_display.show_p25_cc_candidates) ? "On" : "Off");
     return b;
 }
 
 const char*
 lbl_ui_channels(const void* v, char* b, size_t n) {
     UiCtx* c = (UiCtx*)v;
-    DSD_SNPRINTF(b, n, "Show Channels [%s]", (c && c->opts && c->opts->show_channels) ? "On" : "Off");
+    DSD_SNPRINTF(b, n, "Show Channels [%s]", (c && c->opts && c->opts->frontend_display.show_channels) ? "On" : "Off");
     return b;
 }
 
@@ -870,7 +820,7 @@ const char*
 lbl_ui_p25_callsign(const void* v, char* b, size_t n) {
     UiCtx* c = (UiCtx*)v;
     DSD_SNPRINTF(b, n, "Show P25 Callsign Decode [%s]",
-                 (c && c->opts && c->opts->show_p25_callsign_decode) ? "On" : "Off");
+                 (c && c->opts && c->opts->frontend_display.show_p25_callsign_decode) ? "On" : "Off");
     return b;
 }
 
@@ -910,14 +860,8 @@ lbl_key_hytera(const void* v, char* b, size_t n) {
         DSD_SNPRINTF(b, n, "Hytera Privacy (HEX)");
         return b;
     }
-    const char* kind;
-    if (s->K2 == 0ULL && s->K3 == 0ULL && s->K4 == 0ULL) {
-        kind = "40-bit";
-    } else if (s->K3 == 0ULL && s->K4 == 0ULL) {
-        kind = "128-bit";
-    } else {
-        kind = "256-bit";
-    }
+    const unsigned int segment_count = ui_hytera_key_segment_count(s);
+    const char* kind = (segment_count == 1U) ? "40-bit" : ((segment_count == 2U) ? "128-bit" : "256-bit");
     DSD_SNPRINTF(b, n, "Hytera Privacy (HEX) [%s]", kind);
     return b;
 }
@@ -940,157 +884,53 @@ lbl_m17_user_data(const void* v, char* b, size_t n) {
 
 const char*
 lbl_onoff_cq(const void* v, char* b, size_t n) {
-    UNUSED(v);
-    int cq = 0, f = 0, t = 0;
-    rtl_stream_dsp_get(&cq, &f, &t);
-    DSD_SNPRINTF(b, n, "Toggle CQPSK [%s]", cq ? "Active" : "Inactive");
-    return b;
-}
-
-const char*
-lbl_onoff_fll(const void* v, char* b, size_t n) {
-    UNUSED(v);
-    int cq = 0, f = 0, t = 0;
-    rtl_stream_dsp_get(&cq, &f, &t);
-    DSD_SNPRINTF(b, n, "Toggle FLL [%s]", f ? "Active" : "Inactive");
-    return b;
-}
-
-const char*
-lbl_onoff_ted(const void* v, char* b, size_t n) {
-    UNUSED(v);
-    int cq = 0, f = 0, t = 0;
-    rtl_stream_dsp_get(&cq, &f, &t);
-    DSD_SNPRINTF(b, n, "Toggle TED [%s]", t ? "Active" : "Inactive");
+    dsd_frontend_metrics metrics = menu_frontend_metrics(v);
+    DSD_SNPRINTF(b, n, "Toggle CQPSK [%s]", metrics.cqpsk_enable ? "Active" : "Inactive");
     return b;
 }
 
 const char*
 lbl_onoff_iqbal(const void* v, char* b, size_t n) {
-    UNUSED(v);
-    int on = rtl_stream_get_iq_balance();
-    DSD_SNPRINTF(b, n, "Toggle IQ Balance [%s]", on ? "Active" : "Inactive");
-    return b;
-}
-
-const char*
-lbl_fm_agc(const void* v, char* b, size_t n) {
-    UNUSED(v);
-    int on = rtl_stream_get_fm_agc();
-    DSD_SNPRINTF(b, n, "FM AGC [%s]", on ? "On" : "Off");
-    return b;
-}
-
-const char*
-lbl_fm_limiter(const void* v, char* b, size_t n) {
-    UNUSED(v);
-    int on = rtl_stream_get_fm_limiter();
-    DSD_SNPRINTF(b, n, "FM Limiter [%s]", on ? "On" : "Off");
-    return b;
-}
-
-const char*
-lbl_fm_agc_target(const void* v, char* b, size_t n) {
-    UNUSED(v);
-    float tgt = 0.0f;
-    rtl_stream_get_fm_agc_params(&tgt, NULL, NULL, NULL);
-    DSD_SNPRINTF(b, n, "AGC Target: %.3f (+/-)", tgt);
-    return b;
-}
-
-const char*
-lbl_fm_agc_min(const void* v, char* b, size_t n) {
-    UNUSED(v);
-    float mn = 0.0f;
-    rtl_stream_get_fm_agc_params(NULL, &mn, NULL, NULL);
-    DSD_SNPRINTF(b, n, "AGC Min: %.3f (+/-)", mn);
-    return b;
-}
-
-const char*
-lbl_fm_agc_alpha_up(const void* v, char* b, size_t n) {
-    UNUSED(v);
-    float au = 0.0f;
-    rtl_stream_get_fm_agc_params(NULL, NULL, &au, NULL);
-    int pct = (int)lrintf(au * 100.0f);
-    DSD_SNPRINTF(b, n, "AGC Alpha Up: %.3f (~%d%%)", au, pct);
-    return b;
-}
-
-const char*
-lbl_fm_agc_alpha_down(const void* v, char* b, size_t n) {
-    UNUSED(v);
-    float ad = 0.0f;
-    rtl_stream_get_fm_agc_params(NULL, NULL, NULL, &ad);
-    int pct = (int)lrintf(ad * 100.0f);
-    DSD_SNPRINTF(b, n, "AGC Alpha Down: %.3f (~%d%%)", ad, pct);
+    dsd_frontend_metrics metrics = menu_frontend_metrics(v);
+    DSD_SNPRINTF(b, n, "Toggle IQ Balance [%s]", metrics.iq_balance ? "Active" : "Inactive");
     return b;
 }
 
 const char*
 lbl_iq_dc(const void* v, char* b, size_t n) {
-    UNUSED(v);
-    int k = 0;
-    int on = rtl_stream_get_iq_dc(&k);
-    DSD_SNPRINTF(b, n, "IQ DC Block [%s]", on ? "On" : "Off");
+    dsd_frontend_metrics metrics = menu_frontend_metrics(v);
+    DSD_SNPRINTF(b, n, "IQ DC Block [%s]", metrics.iq_dc_enabled ? "On" : "Off");
     return b;
 }
 
 const char*
 lbl_iq_dc_k(const void* v, char* b, size_t n) {
-    UNUSED(v);
-    int k = 0;
-    rtl_stream_get_iq_dc(&k);
-    DSD_SNPRINTF(b, n, "IQ DC Shift k: %d (+/-)", k);
+    dsd_frontend_metrics metrics = menu_frontend_metrics(v);
+    DSD_SNPRINTF(b, n, "IQ DC Shift k: %d (+/-)", metrics.iq_dc_shift_k);
     return b;
 }
 
 const char*
 lbl_ted_gain(const void* v, char* b, size_t n) {
-    UNUSED(v);
-    float g = rtl_stream_get_ted_gain();
+    dsd_frontend_metrics metrics = menu_frontend_metrics(v);
+    float g = metrics.ted_gain;
     int g_milli = (int)(g * 1000.0f + 0.5f);
-    DSD_SNPRINTF(b, n, "TED Gain: %d (x0.001, +/-)", g_milli);
+    DSD_SNPRINTF(b, n, "CQPSK Timing Gain: %d (x0.001, +/-)", g_milli);
     return b;
 }
 
 const char*
-lbl_ted_force(const void* v, char* b, size_t n) {
-    UNUSED(v);
-    int f = rtl_stream_get_ted_force();
-    DSD_SNPRINTF(b, n, "TED Force [%s]", f ? "Active" : "Inactive");
-    return b;
-}
-
-const char*
-lbl_ted_bias(const void* v, char* b, size_t n) {
-    UNUSED(v);
-    int eb = rtl_stream_ted_bias(NULL);
-    DSD_SNPRINTF(b, n, "TED Bias (EMA): %d", eb);
+lbl_cqpsk_timing_bias(const void* v, char* b, size_t n) {
+    dsd_frontend_metrics metrics = menu_frontend_metrics(v);
+    DSD_SNPRINTF(b, n, "CQPSK Timing Bias (EMA): %d", metrics.cqpsk_timing_bias);
     return b;
 }
 
 const char*
 lbl_dsp_panel(const void* v, char* b, size_t n) {
     UiCtx* c = (UiCtx*)v;
-    DSD_SNPRINTF(b, n, "Show DSP Panel [%s]", (c && c->opts && c->opts->show_dsp_panel) ? "On" : "Off");
-    return b;
-}
-
-const char*
-lbl_c4fm_clk(const void* v, char* b, size_t n) {
-    UNUSED(v);
-    int mode = rtl_stream_get_c4fm_clk();
-    const char* s = (mode == 1) ? "EL" : (mode == 2) ? "MM" : "Off";
-    DSD_SNPRINTF(b, n, "C4FM Clock: %s (cycle)", s);
-    return b;
-}
-
-const char*
-lbl_c4fm_clk_sync(const void* v, char* b, size_t n) {
-    UNUSED(v);
-    int en = rtl_stream_get_c4fm_clk_sync();
-    DSD_SNPRINTF(b, n, "C4FM Clock While Synced [%s]", en ? "Active" : "Inactive");
+    DSD_SNPRINTF(b, n, "Show DSP Panel [%s]",
+                 (c && c->opts && c->opts->frontend_display.show_dsp_panel) ? "On" : "Off");
     return b;
 }
 
@@ -1110,11 +950,11 @@ lbl_rtl_rtltcp_autotune(const void* v, char* b, size_t n) {
 
 const char*
 lbl_rtl_auto_ppm(const void* v, char* b, size_t n) {
-    UiCtx* c = (UiCtx*)v;
-    int on = c->opts->rtl_auto_ppm ? 1 : 0;
-    /* If stream active, reflect runtime state */
-    if (c->state && c->state->rtl_ctx) {
-        on = rtl_stream_get_auto_ppm();
+    const UiCtx* c = (const UiCtx*)v;
+    int on = (c && c->opts && c->opts->rtl_auto_ppm) ? 1 : 0;
+    if (c && c->state && c->state->rtl_ctx) {
+        dsd_frontend_metrics metrics = menu_frontend_metrics(v);
+        on = metrics.auto_ppm_enabled;
     }
     DSD_SNPRINTF(b, n, "Auto-PPM (Spectrum): %s", on ? "On" : "Off");
     return b;
@@ -1123,12 +963,11 @@ lbl_rtl_auto_ppm(const void* v, char* b, size_t n) {
 const char*
 lbl_rtl_tuner_autogain(const void* v, char* b, size_t n) {
     const UiCtx* c = (const UiCtx*)v;
-    int on = 0;
-    if (c->state && c->state->rtl_ctx) {
-        on = rtl_stream_get_tuner_autogain();
-    } else {
-        const dsdneoRuntimeConfig* cfg = dsd_neo_get_config();
-        on = (cfg && cfg->tuner_autogain_enable) ? 1 : 0;
+    const dsdneoRuntimeConfig* cfg = dsd_neo_get_config();
+    int on = (cfg && cfg->tuner_autogain_enable) ? 1 : 0;
+    if (c && c->state && c->state->rtl_ctx) {
+        dsd_frontend_metrics metrics = menu_frontend_metrics(v);
+        on = metrics.tuner_autogain;
     }
     DSD_SNPRINTF(b, n, "Tuner Autogain: %s", on ? "On" : "Off");
     return b;

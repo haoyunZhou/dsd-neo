@@ -7,9 +7,11 @@
 #include <dsd-neo/core/file_io.h>
 #include <dsd-neo/core/init.h>
 #include <dsd-neo/core/opts.h>
+#include <dsd-neo/core/secret_redaction.h>
 #include <dsd-neo/core/state.h>
+#include <dsd-neo/crypto/dmr_keystream.h>
 #include <dsd-neo/crypto/ecdsa.h>
-#include <dsd-neo/crypto/pc5.h>
+#include <dsd-neo/dsp/frame_sync.h>
 #include <dsd-neo/io/iq_types.h>
 #include <dsd-neo/platform/file_compat.h>
 #include <dsd-neo/platform/posix_compat.h>
@@ -17,11 +19,13 @@
 #include <dsd-neo/runtime/call_alert.h>
 #include <dsd-neo/runtime/cli.h>
 #include <dsd-neo/runtime/rdio_export.h>
+#include <inttypes.h>
 #include <sndfile.h>
-#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#include "dsd-neo/core/frontend_types.h"
 #include "dsd-neo/core/opts_fwd.h"
 #include "dsd-neo/core/safe_api.h"
 #include "dsd-neo/core/state_fwd.h"
@@ -62,6 +66,49 @@ test_redirect_stdout_to_null(void) {
 #else
     (void)freopen("/dev/null", "w", stdout);
 #endif
+}
+
+static int
+read_file_to_buffer(const char* path, char* out, size_t out_size) {
+    if (path == NULL || out == NULL || out_size == 0U) {
+        return -1;
+    }
+    out[0] = '\0';
+
+    FILE* fp = fopen(path, "rb");
+    if (fp == NULL) {
+        return -1;
+    }
+    size_t nread = fread(out, 1, out_size - 1U, fp);
+    if (ferror(fp)) {
+        fclose(fp);
+        return -1;
+    }
+    out[nread] = '\0';
+    fclose(fp);
+    return 0;
+}
+
+static int
+parse_args_capture_stderr(int argc, char** argv, dsd_opts* opts, dsd_state* state, int* argc_effective, int* exit_rc,
+                          char* out, size_t out_size) {
+    dsd_test_capture_stderr cap;
+    if (dsd_test_capture_stderr_begin(&cap, "runtime_cli_parse") != 0) {
+        return DSD_PARSE_ERROR;
+    }
+
+    int rc = dsd_parse_args(argc, argv, opts, state, argc_effective, exit_rc);
+
+    if (dsd_test_capture_stderr_end(&cap) != 0) {
+        (void)remove(cap.path);
+        return DSD_PARSE_ERROR;
+    }
+    if (read_file_to_buffer(cap.path, out, out_size) != 0) {
+        (void)remove(cap.path);
+        return DSD_PARSE_ERROR;
+    }
+    (void)remove(cap.path);
+    return rc;
 }
 
 static int
@@ -191,6 +238,168 @@ test_unknown_option_returns_error_and_does_not_exit(void) {
 }
 
 static int
+test_frontend_terminal_option_sets_terminal_kind(void) {
+    dsd_opts* opts = (dsd_opts*)calloc(1, sizeof(dsd_opts));
+    dsd_state* state = (dsd_state*)calloc(1, sizeof(dsd_state));
+    if (!opts || !state) {
+        free(opts);
+        free(state);
+        DSD_FPRINTF(stderr, "out of memory\n");
+        return 1;
+    }
+    initOpts(opts);
+    initState(state);
+
+    char arg0[] = "dsd-neo";
+    char arg1[] = "--frontend";
+    char arg2[] = "terminal";
+    char* argv[] = {arg0, arg1, arg2, NULL};
+
+    int argc_effective = 0;
+    int exit_rc = 0;
+
+    int rc = dsd_parse_args(3, argv, opts, state, &argc_effective, &exit_rc);
+    int test_rc = 0;
+    if (rc != DSD_PARSE_CONTINUE) {
+        DSD_FPRINTF(stderr, "expected rc=%d, got %d (exit_rc=%d)\n", DSD_PARSE_CONTINUE, rc, exit_rc);
+        test_rc = 1;
+    }
+    if (opts->frontend_kind != DSD_FRONTEND_TERMINAL) {
+        DSD_FPRINTF(stderr, "expected --frontend terminal to set terminal kind, got frontend_kind=%d\n",
+                    opts->frontend_kind);
+        test_rc = 1;
+    }
+    freeState(state);
+    free(opts);
+    free(state);
+    return test_rc;
+}
+
+static int
+test_N_short_option_enables_terminal_frontend(void) {
+    dsd_opts* opts = (dsd_opts*)calloc(1, sizeof(dsd_opts));
+    dsd_state* state = (dsd_state*)calloc(1, sizeof(dsd_state));
+    if (!opts || !state) {
+        free(opts);
+        free(state);
+        DSD_FPRINTF(stderr, "out of memory\n");
+        return 1;
+    }
+    initOpts(opts);
+    initState(state);
+
+    char arg0[] = "dsd-neo";
+    char arg1[] = "-N";
+    char* argv[] = {arg0, arg1, NULL};
+
+    int argc_effective = 0;
+    int exit_rc = 0;
+    int rc = dsd_parse_args(2, argv, opts, state, &argc_effective, &exit_rc);
+
+    int test_rc = 0;
+    if (rc != DSD_PARSE_CONTINUE) {
+        DSD_FPRINTF(stderr, "expected rc=%d, got %d (exit_rc=%d)\n", DSD_PARSE_CONTINUE, rc, exit_rc);
+        test_rc = 1;
+    }
+    if (opts->frontend_kind != DSD_FRONTEND_TERMINAL) {
+        DSD_FPRINTF(stderr, "expected -N to enable terminal frontend, got frontend_kind=%d\n", opts->frontend_kind);
+        test_rc = 1;
+    }
+
+    freeState(state);
+    free(opts);
+    free(state);
+    return test_rc;
+}
+
+static int
+test_frontend_native_alias_selects_equivalent_headless_frontend(void) {
+    dsd_opts* opts = (dsd_opts*)calloc(1, sizeof(dsd_opts));
+    dsd_state* state = (dsd_state*)calloc(1, sizeof(dsd_state));
+    if (!opts || !state) {
+        free(opts);
+        free(state);
+        DSD_FPRINTF(stderr, "out of memory\n");
+        return 1;
+    }
+    initOpts(opts);
+    initState(state);
+    opts->frontend_kind = DSD_FRONTEND_TERMINAL;
+
+    char arg0[] = "dsd-neo";
+    char arg1[] = "--frontend";
+    char arg2[] = "native";
+    char* argv[] = {arg0, arg1, arg2, NULL};
+
+    int argc_effective = 0;
+    int exit_rc = -1;
+    int rc = dsd_parse_args(3, argv, opts, state, &argc_effective, &exit_rc);
+    int test_rc = 0;
+    if (rc != DSD_PARSE_CONTINUE || argc_effective != 1) {
+        DSD_FPRINTF(stderr, "expected native alias parse success, got rc=%d argc=%d exit_rc=%d\n", rc, argc_effective,
+                    exit_rc);
+        test_rc = 1;
+    }
+    if (opts->frontend_kind != DSD_FRONTEND_NONE) {
+        DSD_FPRINTF(stderr, "expected native scaffold alias to select headless frontend, got frontend_kind=%d\n",
+                    opts->frontend_kind);
+        test_rc = 1;
+    }
+
+    freeState(state);
+    free(opts);
+    free(state);
+    return test_rc;
+}
+
+static int
+test_compatibility_short_options_use_current_facilities(void) {
+    dsd_opts* opts = (dsd_opts*)calloc(1, sizeof(dsd_opts));
+    dsd_state* state = (dsd_state*)calloc(1, sizeof(dsd_state));
+    if (!opts || !state) {
+        free(opts);
+        free(state);
+        DSD_FPRINTF(stderr, "out of memory\n");
+        return 1;
+    }
+    initOpts(opts);
+    initState(state);
+    opts->p25_lcw_retune = 0;
+    opts->dmr_stereo = 0;
+    opts->pulse_digi_rate_out = 48000;
+    opts->pulse_digi_out_channels = 1;
+
+    char arg0[] = "dsd-neo";
+    char arg_j[] = "-j";
+    char* argv_j[] = {arg0, arg_j, NULL};
+    int argc_effective = 0;
+    int exit_rc = -1;
+    int rc = dsd_parse_args(2, argv_j, opts, state, &argc_effective, &exit_rc);
+    int test_rc = 0;
+    if (rc != DSD_PARSE_CONTINUE || opts->p25_lcw_retune != 1) {
+        DSD_FPRINTF(stderr, "expected -j to enable current LCW retune policy, got rc=%d retune=%u\n", rc,
+                    (unsigned)opts->p25_lcw_retune);
+        test_rc = 1;
+    }
+
+    char arg_nm[] = "-nm";
+    char* argv_nm[] = {arg0, arg_nm, NULL};
+    exit_rc = -1;
+    rc = dsd_parse_args(2, argv_nm, opts, state, &argc_effective, &exit_rc);
+    if (rc != DSD_PARSE_CONTINUE || opts->dmr_stereo != 0 || opts->pulse_digi_rate_out != 48000
+        || opts->pulse_digi_out_channels != 1) {
+        DSD_FPRINTF(stderr, "expected -nm to preserve the active preset, got rc=%d stereo=%d rate=%d channels=%d\n", rc,
+                    opts->dmr_stereo, opts->pulse_digi_rate_out, opts->pulse_digi_out_channels);
+        test_rc = 1;
+    }
+
+    freeState(state);
+    free(opts);
+    free(state);
+    return test_rc;
+}
+
+static int
 expect_numeric_parse_error(const char* option, const char* value) {
     dsd_opts* opts = (dsd_opts*)calloc(1, sizeof(dsd_opts));
     dsd_state* state = (dsd_state*)calloc(1, sizeof(dsd_state));
@@ -235,6 +444,7 @@ test_numeric_options_reject_trailing_junk(void) {
     rc |= expect_numeric_parse_error("-D", "4junk");
     rc |= expect_numeric_parse_error("-R", "12junk");
     rc |= expect_numeric_parse_error("-_", "12junk");
+    rc |= expect_numeric_parse_error("-g", "-1");
     return rc;
 }
 
@@ -384,6 +594,68 @@ test_H_zero_key_keeps_dmr_encrypted_audio_muted(void) {
     free(opts);
     free(state);
     return 0;
+}
+
+static int
+expect_H_log_key_material(const char* key_arg, int show_keys, const char* expected, const char* unexpected) {
+    dsd_opts* opts = (dsd_opts*)calloc(1, sizeof(dsd_opts));
+    dsd_state* state = (dsd_state*)calloc(1, sizeof(dsd_state));
+    if (!opts || !state) {
+        free(opts);
+        free(state);
+        DSD_FPRINTF(stderr, "out of memory\n");
+        return 1;
+    }
+    initOpts(opts);
+    initState(state);
+
+    char arg0[] = "dsd-neo";
+    char arg_show[] = "--show-keys";
+    char arg_h[] = "-H";
+    char key_buf[128];
+    DSD_SNPRINTF(key_buf, sizeof key_buf, "%s", key_arg);
+    key_buf[sizeof key_buf - 1U] = '\0';
+    char* argv_show[] = {arg0, arg_show, arg_h, key_buf, NULL};
+    char* argv_hidden[] = {arg0, arg_h, key_buf, NULL};
+    char** argv = show_keys ? argv_show : argv_hidden;
+    int argc = show_keys ? 4 : 3;
+
+    char output[2048];
+    int argc_effective = 0;
+    int exit_rc = -1;
+    int rc = parse_args_capture_stderr(argc, argv, opts, state, &argc_effective, &exit_rc, output, sizeof(output));
+
+    int test_rc = 0;
+    if (rc != DSD_PARSE_CONTINUE) {
+        DSD_FPRINTF(stderr, "expected rc=%d for -H %s, got %d (exit_rc=%d)\n", DSD_PARSE_CONTINUE, key_buf, rc,
+                    exit_rc);
+        test_rc = 1;
+    }
+    if (expected != NULL && strstr(output, expected) == NULL) {
+        DSD_FPRINTF(stderr, "expected -H log to contain \"%s\", got \"%s\"\n", expected, output);
+        test_rc = 1;
+    }
+    if (unexpected != NULL && strstr(output, unexpected) != NULL) {
+        DSD_FPRINTF(stderr, "expected -H log to hide \"%s\", got \"%s\"\n", unexpected, output);
+        test_rc = 1;
+    }
+
+    freeState(state);
+    free(opts);
+    free(state);
+    return test_rc;
+}
+
+static int
+test_H_show_keys_log_reveals_key_material(void) {
+    int rc = 0;
+    rc |= expect_H_log_key_material("0123456789", 1, "0123456789", DSD_SECRET_REDACTED);
+    rc |= expect_H_log_key_material("736B9A9C5645288B 243AD5CB8701EF8A", 1, "736B9A9C5645288B 243AD5CB8701EF8A",
+                                    DSD_SECRET_REDACTED);
+    rc |= expect_H_log_key_material("20029736A5D91042 C923EB0697484433 005EFC58A1905195 E28E9C7836AA2DB8", 1,
+                                    "E28E9C7836AA2DB8", DSD_SECRET_REDACTED);
+    rc |= expect_H_log_key_material("0123456789", 0, DSD_SECRET_REDACTED, "0123456789");
+    return rc;
 }
 
 static int
@@ -849,9 +1121,7 @@ test_create_temp_ini(char* out_path, size_t out_path_size) {
     if (!out_path || out_path_size == 0) {
         return -1;
     }
-    return test_create_temp_ini_with_contents("version = 1\n"
-                                              "\n"
-                                              "[input]\n"
+    return test_create_temp_ini_with_contents("[input]\n"
                                               "source = \"rtl\"\n"
                                               "rtl_device = 0\n"
                                               "rtl_freq = \"100000000\"\n"
@@ -1173,9 +1443,8 @@ test_bootstrap_treats_lone_ini_as_config(void) {
         return 1;
     }
 
-    if (opts->trunk_enable != 1 || opts->p25_trunk != 1) {
-        DSD_FPRINTF(stderr, "expected trunking enabled from config, got trunk_enable=%d p25_trunk=%d\n",
-                    opts->trunk_enable, opts->p25_trunk);
+    if (opts->trunk_enable != 1) {
+        DSD_FPRINTF(stderr, "expected trunking enabled from config, got trunk_enable=%d\n", opts->trunk_enable);
         (void)remove(cfg_path);
         freeState(state);
         free(opts);
@@ -1217,9 +1486,7 @@ test_bootstrap_accepts_explicit_config_path_outside_cwd(void) {
     (void)dsd_setenv("DSD_NEO_NO_BOOTSTRAP", "1", 1);
 
     char cfg_path[1024];
-    if (test_create_temp_ini_in_tmpdir_with_contents("version = 1\n"
-                                                     "\n"
-                                                     "[input]\n"
+    if (test_create_temp_ini_in_tmpdir_with_contents("[input]\n"
                                                      "source = \"rtl\"\n"
                                                      "rtl_device = 0\n"
                                                      "rtl_freq = \"100000000\"\n"
@@ -1256,9 +1523,155 @@ test_bootstrap_accepts_explicit_config_path_outside_cwd(void) {
                     state->config_autosave_path, state->config_autosave_enabled);
         test_rc = 1;
     }
-    if (opts->trunk_enable != 1 || opts->p25_trunk != 1) {
-        DSD_FPRINTF(stderr, "expected trunking from external config, got trunk_enable=%d p25_trunk=%d\n",
-                    opts->trunk_enable, opts->p25_trunk);
+    if (opts->trunk_enable != 1) {
+        DSD_FPRINTF(stderr, "expected trunking from external config, got trunk_enable=%d\n", opts->trunk_enable);
+        test_rc = 1;
+    }
+
+    (void)remove(cfg_path);
+    freeState(state);
+    free(opts);
+    free(state);
+    return test_rc;
+}
+
+static int
+test_bootstrap_config_trunking_preserves_terminal_frontend(void) {
+    dsd_opts* opts = (dsd_opts*)calloc(1, sizeof(dsd_opts));
+    dsd_state* state = (dsd_state*)calloc(1, sizeof(dsd_state));
+    if (!opts || !state) {
+        free(opts);
+        free(state);
+        DSD_FPRINTF(stderr, "out of memory\n");
+        return 1;
+    }
+
+    initOpts(opts);
+    initState(state);
+
+    (void)dsd_unsetenv("DSD_NEO_CONFIG");
+    (void)dsd_setenv("DSD_NEO_NO_BOOTSTRAP", "1", 1);
+
+    char cfg_path[1024];
+    if (test_create_temp_ini_in_tmpdir_with_contents("[input]\n"
+                                                     "source = \"rtl\"\n"
+                                                     "rtl_device = 0\n"
+                                                     "rtl_freq = \"100000000\"\n"
+                                                     "\n"
+                                                     "[trunking]\n"
+                                                     "enabled = true\n",
+                                                     cfg_path, sizeof cfg_path)
+        != 0) {
+        DSD_FPRINTF(stderr, "failed to create external temp ini\n");
+        freeState(state);
+        free(opts);
+        free(state);
+        return 1;
+    }
+
+    char arg0[] = "dsd-neo";
+    char arg1[] = "--config";
+    char arg2[1024];
+    char arg3[] = "--frontend";
+    char arg4[] = "terminal";
+    DSD_SNPRINTF(arg2, sizeof arg2, "%s", cfg_path);
+    char* argv[] = {arg0, arg1, arg2, arg3, arg4, NULL};
+
+    int argc_effective = 0;
+    int exit_rc = -1;
+    int rc = dsd_runtime_bootstrap(5, argv, opts, state, &argc_effective, &exit_rc);
+
+    int test_rc = 0;
+    if (rc != DSD_BOOTSTRAP_CONTINUE || exit_rc != 0) {
+        DSD_FPRINTF(stderr, "expected terminal frontend bootstrap continue, got rc=%d exit_rc=%d\n", rc, exit_rc);
+        test_rc = 1;
+    }
+    if (argc_effective != 1 || !state->cli_argv) {
+        DSD_FPRINTF(stderr, "expected compacted CLI to consume --frontend terminal, argc=%d\n", argc_effective);
+        test_rc = 1;
+    }
+    if (opts->trunk_enable != 1) {
+        DSD_FPRINTF(stderr, "expected config trunking preserved with --frontend terminal, got trunk_enable=%d\n",
+                    opts->trunk_enable);
+        test_rc = 1;
+    }
+    if (opts->frontend_kind != DSD_FRONTEND_TERMINAL) {
+        DSD_FPRINTF(stderr, "expected --frontend terminal to set terminal kind, got frontend_kind=%d\n",
+                    opts->frontend_kind);
+        test_rc = 1;
+    }
+
+    (void)remove(cfg_path);
+    freeState(state);
+    free(opts);
+    free(state);
+    return test_rc;
+}
+
+static int
+test_bootstrap_config_trunking_preserves_N_terminal_alias(void) {
+    dsd_opts* opts = (dsd_opts*)calloc(1, sizeof(dsd_opts));
+    dsd_state* state = (dsd_state*)calloc(1, sizeof(dsd_state));
+    if (!opts || !state) {
+        free(opts);
+        free(state);
+        DSD_FPRINTF(stderr, "out of memory\n");
+        return 1;
+    }
+
+    initOpts(opts);
+    initState(state);
+
+    (void)dsd_unsetenv("DSD_NEO_CONFIG");
+    (void)dsd_setenv("DSD_NEO_NO_BOOTSTRAP", "1", 1);
+
+    static const char* ini = "[input]\n"
+                             "source = \"rtl\"\n"
+                             "rtl_device = 0\n"
+                             "rtl_freq = \"100000000\"\n"
+                             "\n"
+                             "[output]\n"
+                             "frontend = \"none\"\n"
+                             "\n"
+                             "[trunking]\n"
+                             "enabled = true\n";
+
+    char cfg_path[1024];
+    if (test_create_temp_ini_in_tmpdir_with_contents(ini, cfg_path, sizeof cfg_path) != 0) {
+        DSD_FPRINTF(stderr, "failed to create external temp ini\n");
+        freeState(state);
+        free(opts);
+        free(state);
+        return 1;
+    }
+
+    char arg0[] = "dsd-neo";
+    char arg1[] = "--config";
+    char arg2[1024];
+    char arg3[] = "-N";
+    DSD_SNPRINTF(arg2, sizeof arg2, "%s", cfg_path);
+    char* argv[] = {arg0, arg1, arg2, arg3, NULL};
+
+    int argc_effective = 0;
+    int exit_rc = -1;
+    int rc = dsd_runtime_bootstrap(4, argv, opts, state, &argc_effective, &exit_rc);
+
+    int test_rc = 0;
+    if (rc != DSD_BOOTSTRAP_CONTINUE || exit_rc != 0) {
+        DSD_FPRINTF(stderr, "expected -N terminal alias bootstrap continue, got rc=%d exit_rc=%d\n", rc, exit_rc);
+        test_rc = 1;
+    }
+    if (argc_effective != 2 || !state->cli_argv || !state->cli_argv[1] || strcmp(state->cli_argv[1], "-N") != 0) {
+        DSD_FPRINTF(stderr, "expected compacted CLI to retain -N, argc=%d arg1=%s\n", argc_effective,
+                    (argc_effective > 1 && state->cli_argv && state->cli_argv[1]) ? state->cli_argv[1] : "(missing)");
+        test_rc = 1;
+    }
+    if (opts->trunk_enable != 1) {
+        DSD_FPRINTF(stderr, "expected config trunking preserved with -N, got trunk_enable=%d\n", opts->trunk_enable);
+        test_rc = 1;
+    }
+    if (opts->frontend_kind != DSD_FRONTEND_TERMINAL) {
+        DSD_FPRINTF(stderr, "expected -N to override configured frontend, got frontend_kind=%d\n", opts->frontend_kind);
         test_rc = 1;
     }
 
@@ -1287,7 +1700,7 @@ test_bootstrap_missing_explicit_config_keeps_autosave_path(void) {
     (void)dsd_setenv("DSD_NEO_NO_BOOTSTRAP", "1", 1);
 
     char cfg_path[1024];
-    if (test_create_temp_ini_in_tmpdir_with_contents("version = 1\n", cfg_path, sizeof cfg_path) != 0) {
+    if (test_create_temp_ini_in_tmpdir_with_contents("", cfg_path, sizeof cfg_path) != 0) {
         DSD_FPRINTF(stderr, "failed to create temp ini for missing-path test\n");
         freeState(state);
         free(opts);
@@ -1324,6 +1737,104 @@ test_bootstrap_missing_explicit_config_keeps_autosave_path(void) {
 }
 
 static int
+test_bootstrap_rejects_too_long_explicit_config_path(void) {
+    dsd_opts* opts = (dsd_opts*)calloc(1, sizeof(dsd_opts));
+    dsd_state* state = (dsd_state*)calloc(1, sizeof(dsd_state));
+    if (!opts || !state) {
+        free(opts);
+        free(state);
+        DSD_FPRINTF(stderr, "out of memory\n");
+        return 1;
+    }
+
+    initOpts(opts);
+    initState(state);
+
+    (void)dsd_unsetenv("DSD_NEO_CONFIG");
+    (void)dsd_setenv("DSD_NEO_NO_BOOTSTRAP", "1", 1);
+
+    char too_long_path[3072];
+    DSD_MEMSET(too_long_path, 'a', sizeof too_long_path);
+    too_long_path[sizeof too_long_path - 1] = '\0';
+
+    char arg0[] = "dsd-neo";
+    char arg1[] = "--config";
+    char* argv[] = {arg0, arg1, too_long_path, NULL};
+
+    int argc_effective = 99;
+    int exit_rc = -1;
+    int rc = dsd_runtime_bootstrap(3, argv, opts, state, &argc_effective, &exit_rc);
+
+    int test_rc = 0;
+    if (rc != DSD_BOOTSTRAP_ERROR || exit_rc != 1) {
+        DSD_FPRINTF(stderr, "expected too-long config path error, got rc=%d exit_rc=%d\n", rc, exit_rc);
+        test_rc = 1;
+    }
+    if (state->config_autosave_enabled || state->config_autosave_path[0] != '\0') {
+        DSD_FPRINTF(stderr, "expected invalid config path to leave autosave disabled, got enabled=%d path=%s\n",
+                    state->config_autosave_enabled, state->config_autosave_path);
+        test_rc = 1;
+    }
+
+    freeState(state);
+    free(opts);
+    free(state);
+    return test_rc;
+}
+
+static int
+test_bootstrap_guard_rejects_invalid_arguments(void) {
+    dsd_opts* opts = (dsd_opts*)calloc(1, sizeof(dsd_opts));
+    dsd_state* state = (dsd_state*)calloc(1, sizeof(dsd_state));
+    if (!opts || !state) {
+        free(opts);
+        free(state);
+        DSD_FPRINTF(stderr, "out of memory\n");
+        return 1;
+    }
+
+    initOpts(opts);
+    initState(state);
+
+    char arg0[] = "dsd-neo";
+    char* argv[] = {arg0, NULL};
+
+    int exit_rc = -1;
+    int test_rc = 0;
+    int rc = dsd_runtime_bootstrap(1, argv, NULL, state, NULL, &exit_rc);
+    if (rc != DSD_BOOTSTRAP_ERROR || exit_rc != 1) {
+        DSD_FPRINTF(stderr, "expected NULL opts guard error, got rc=%d exit_rc=%d\n", rc, exit_rc);
+        test_rc = 1;
+    }
+
+    exit_rc = -1;
+    rc = dsd_runtime_bootstrap(1, argv, opts, NULL, NULL, &exit_rc);
+    if (rc != DSD_BOOTSTRAP_ERROR || exit_rc != 1) {
+        DSD_FPRINTF(stderr, "expected NULL state guard error, got rc=%d exit_rc=%d\n", rc, exit_rc);
+        test_rc = 1;
+    }
+
+    exit_rc = -1;
+    rc = dsd_runtime_bootstrap(-1, argv, opts, state, NULL, &exit_rc);
+    if (rc != DSD_BOOTSTRAP_ERROR || exit_rc != 1) {
+        DSD_FPRINTF(stderr, "expected negative argc guard error, got rc=%d exit_rc=%d\n", rc, exit_rc);
+        test_rc = 1;
+    }
+
+    exit_rc = -1;
+    rc = dsd_runtime_bootstrap(1, NULL, opts, state, NULL, &exit_rc);
+    if (rc != DSD_BOOTSTRAP_ERROR || exit_rc != 1) {
+        DSD_FPRINTF(stderr, "expected NULL argv guard error, got rc=%d exit_rc=%d\n", rc, exit_rc);
+        test_rc = 1;
+    }
+
+    freeState(state);
+    free(opts);
+    free(state);
+    return test_rc;
+}
+
+static int
 test_bootstrap_validate_config_accepts_external_path(void) {
     dsd_opts* opts = (dsd_opts*)calloc(1, sizeof(dsd_opts));
     dsd_state* state = (dsd_state*)calloc(1, sizeof(dsd_state));
@@ -1338,9 +1849,7 @@ test_bootstrap_validate_config_accepts_external_path(void) {
     initState(state);
 
     char cfg_path[1024];
-    if (test_create_temp_ini_in_tmpdir_with_contents("version = 1\n"
-                                                     "\n"
-                                                     "[input]\n"
+    if (test_create_temp_ini_in_tmpdir_with_contents("[input]\n"
                                                      "source = \"pulse\"\n",
                                                      cfg_path, sizeof cfg_path)
         != 0) {
@@ -1387,9 +1896,7 @@ test_bootstrap_validate_config_reports_trunk_scan_diagnostics(void) {
     initState(state);
 
     char cfg_path[1024];
-    if (test_create_temp_ini_in_tmpdir_with_contents("version = 1\n"
-                                                     "\n"
-                                                     "[trunk_scan]\n"
+    if (test_create_temp_ini_in_tmpdir_with_contents("[trunk_scan]\n"
                                                      "enabled = true\n",
                                                      cfg_path, sizeof cfg_path)
         != 0) {
@@ -1423,6 +1930,117 @@ test_bootstrap_validate_config_reports_trunk_scan_diagnostics(void) {
 }
 
 static int
+test_bootstrap_validate_config_rejects_invalid_included_versions(void) {
+    struct persisted_config_case {
+        const char* label;
+        const char* contents;
+    } cases[] = {
+        {"unsupported included version", "version = 2\n"},
+        {"non-integer included version", "version = old\n"},
+    };
+
+    int test_rc = 0;
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        char included_path[1024];
+        if (test_create_temp_ini_in_tmpdir_with_contents(cases[i].contents, included_path, sizeof included_path) != 0) {
+            return 1;
+        }
+
+        char root_ini[1152];
+        DSD_SNPRINTF(root_ini, sizeof root_ini, "include = \"%s\"\n", included_path);
+        char root_path[1024];
+        if (test_create_temp_ini_in_tmpdir_with_contents(root_ini, root_path, sizeof root_path) != 0) {
+            (void)remove(included_path);
+            return 1;
+        }
+
+        dsd_opts* opts = (dsd_opts*)calloc(1, sizeof(dsd_opts));
+        dsd_state* state = (dsd_state*)calloc(1, sizeof(dsd_state));
+        if (!opts || !state) {
+            free(opts);
+            free(state);
+            (void)remove(root_path);
+            (void)remove(included_path);
+            DSD_FPRINTF(stderr, "out of memory\n");
+            return 1;
+        }
+        initOpts(opts);
+        initState(state);
+
+        char arg0[] = "dsd-neo";
+        char arg1[] = "--validate-config";
+        char arg2[1024];
+        DSD_SNPRINTF(arg2, sizeof arg2, "%s", root_path);
+        char* argv[] = {arg0, arg1, arg2, NULL};
+
+        int argc_effective = 0;
+        int exit_rc = -1;
+        int rc = dsd_runtime_bootstrap(3, argv, opts, state, &argc_effective, &exit_rc);
+        if (rc != DSD_BOOTSTRAP_EXIT || exit_rc != 1) {
+            DSD_FPRINTF(stderr, "%s should exit with validation failure, got rc=%d exit_rc=%d\n", cases[i].label, rc,
+                        exit_rc);
+            test_rc = 1;
+        }
+
+        freeState(state);
+        free(opts);
+        free(state);
+        (void)remove(root_path);
+        (void)remove(included_path);
+    }
+    return test_rc;
+}
+
+static int
+test_bootstrap_validate_config_strict_warning_exits_two(void) {
+    dsd_opts* opts = (dsd_opts*)calloc(1, sizeof(dsd_opts));
+    dsd_state* state = (dsd_state*)calloc(1, sizeof(dsd_state));
+    if (!opts || !state) {
+        free(opts);
+        free(state);
+        DSD_FPRINTF(stderr, "out of memory\n");
+        return 1;
+    }
+
+    initOpts(opts);
+    initState(state);
+
+    char cfg_path[1024];
+    if (test_create_temp_ini_in_tmpdir_with_contents("[input]\n"
+                                                     "source = \"pulse\"\n"
+                                                     "unknown_key = true\n",
+                                                     cfg_path, sizeof cfg_path)
+        != 0) {
+        freeState(state);
+        free(opts);
+        free(state);
+        return 1;
+    }
+
+    char arg0[] = "dsd-neo";
+    char arg1[] = "--validate-config";
+    char arg2[1024];
+    char arg3[] = "--strict-config";
+    DSD_SNPRINTF(arg2, sizeof arg2, "%s", cfg_path);
+    char* argv[] = {arg0, arg1, arg2, arg3, NULL};
+
+    int argc_effective = 0;
+    int exit_rc = -1;
+    int rc = dsd_runtime_bootstrap(4, argv, opts, state, &argc_effective, &exit_rc);
+    int test_rc = 0;
+    if (rc != DSD_BOOTSTRAP_EXIT || exit_rc != 2) {
+        DSD_FPRINTF(stderr, "expected strict warning validate exit 2, got rc=%d exit_rc=%d\n", rc, exit_rc);
+        test_rc = 1;
+    }
+
+    (void)remove(cfg_path);
+    freeState(state);
+    free(opts);
+    free(state);
+    return test_rc;
+}
+
+static int
 test_bootstrap_list_profiles_accepts_external_config_path(void) {
     dsd_opts* opts = (dsd_opts*)calloc(1, sizeof(dsd_opts));
     dsd_state* state = (dsd_state*)calloc(1, sizeof(dsd_state));
@@ -1437,9 +2055,7 @@ test_bootstrap_list_profiles_accepts_external_config_path(void) {
     initState(state);
 
     char cfg_path[1024];
-    if (test_create_temp_ini_in_tmpdir_with_contents("version = 1\n"
-                                                     "\n"
-                                                     "[profile.demo]\n"
+    if (test_create_temp_ini_in_tmpdir_with_contents("[profile.demo]\n"
                                                      "mode.decode = \"dmr\"\n",
                                                      cfg_path, sizeof cfg_path)
         != 0) {
@@ -1462,6 +2078,52 @@ test_bootstrap_list_profiles_accepts_external_config_path(void) {
     int test_rc = 0;
     if (rc != DSD_BOOTSTRAP_EXIT || exit_rc != 0) {
         DSD_FPRINTF(stderr, "expected external list-profiles to exit 0, got rc=%d exit_rc=%d\n", rc, exit_rc);
+        test_rc = 1;
+    }
+
+    (void)remove(cfg_path);
+    freeState(state);
+    free(opts);
+    free(state);
+    return test_rc;
+}
+
+static int
+test_bootstrap_list_profiles_reports_empty_config(void) {
+    dsd_opts* opts = (dsd_opts*)calloc(1, sizeof(dsd_opts));
+    dsd_state* state = (dsd_state*)calloc(1, sizeof(dsd_state));
+    if (!opts || !state) {
+        free(opts);
+        free(state);
+        DSD_FPRINTF(stderr, "out of memory\n");
+        return 1;
+    }
+
+    initOpts(opts);
+    initState(state);
+
+    char cfg_path[1024];
+    if (test_create_temp_ini_in_tmpdir_with_contents("", cfg_path, sizeof cfg_path) != 0) {
+        freeState(state);
+        free(opts);
+        free(state);
+        return 1;
+    }
+
+    char arg0[] = "dsd-neo";
+    char arg1[] = "--config";
+    char arg2[1024];
+    char arg3[] = "--list-profiles";
+    DSD_SNPRINTF(arg2, sizeof arg2, "%s", cfg_path);
+    char* argv[] = {arg0, arg1, arg2, arg3, NULL};
+
+    int argc_effective = 0;
+    int exit_rc = -1;
+    test_redirect_stdout_to_null();
+    int rc = dsd_runtime_bootstrap(4, argv, opts, state, &argc_effective, &exit_rc);
+    int test_rc = 0;
+    if (rc != DSD_BOOTSTRAP_EXIT || exit_rc != 0) {
+        DSD_FPRINTF(stderr, "expected empty profile list to exit 0, got rc=%d exit_rc=%d\n", rc, exit_rc);
         test_rc = 1;
     }
 
@@ -1544,9 +2206,7 @@ test_bootstrap_profile_preserves_trunking_with_ncurses_cli(void) {
     (void)dsd_unsetenv("DSD_NEO_CONFIG");
     (void)dsd_setenv("DSD_NEO_NO_BOOTSTRAP", "1", 1);
 
-    static const char* ini = "version = 1\n"
-                             "\n"
-                             "[input]\n"
+    static const char* ini = "[input]\n"
                              "source = \"pulse\"\n"
                              "\n"
                              "[profile.p25_trunk]\n"
@@ -1572,13 +2232,14 @@ test_bootstrap_profile_preserves_trunking_with_ncurses_cli(void) {
     char arg2[1024];
     char arg3[] = "--profile";
     char arg4[] = "p25_trunk";
-    char arg5[] = "-N";
+    char arg5[] = "--frontend";
+    char arg6[] = "terminal";
     DSD_SNPRINTF(arg2, sizeof arg2, "%s", cfg_path);
-    char* argv[] = {arg0, arg1, arg2, arg3, arg4, arg5, NULL};
+    char* argv[] = {arg0, arg1, arg2, arg3, arg4, arg5, arg6, NULL};
 
     int argc_effective = 0;
     int exit_rc = -1;
-    int rc = dsd_runtime_bootstrap(6, argv, opts, state, &argc_effective, &exit_rc);
+    int rc = dsd_runtime_bootstrap(7, argv, opts, state, &argc_effective, &exit_rc);
     if (rc != DSD_BOOTSTRAP_CONTINUE) {
         DSD_FPRINTF(stderr, "expected rc=%d, got %d (exit_rc=%d)\n", DSD_BOOTSTRAP_CONTINUE, rc, exit_rc);
         (void)remove(cfg_path);
@@ -1589,9 +2250,8 @@ test_bootstrap_profile_preserves_trunking_with_ncurses_cli(void) {
     }
 
     int test_rc = 0;
-    if (opts->trunk_enable != 1 || opts->p25_trunk != 1) {
-        DSD_FPRINTF(stderr, "expected profiled trunking to stay enabled, got trunk_enable=%d p25_trunk=%d\n",
-                    opts->trunk_enable, opts->p25_trunk);
+    if (opts->trunk_enable != 1) {
+        DSD_FPRINTF(stderr, "expected profiled trunking to stay enabled, got trunk_enable=%d\n", opts->trunk_enable);
         test_rc = 1;
     }
     if (opts->trunk_scan_enabled != 1 || strcmp(opts->trunk_scan_targets_csv, "targets.csv") != 0) {
@@ -1599,8 +2259,9 @@ test_bootstrap_profile_preserves_trunking_with_ncurses_cli(void) {
                     opts->trunk_scan_enabled, opts->trunk_scan_targets_csv);
         test_rc = 1;
     }
-    if (opts->use_ncurses_terminal != 1) {
-        DSD_FPRINTF(stderr, "expected -N to remain applied, got use_ncurses_terminal=%d\n", opts->use_ncurses_terminal);
+    if (opts->frontend_kind != DSD_FRONTEND_TERMINAL) {
+        DSD_FPRINTF(stderr, "expected --frontend terminal to remain applied, got frontend_kind=%d\n",
+                    opts->frontend_kind);
         test_rc = 1;
     }
     if (strncmp(opts->audio_in_dev, "rtl:", 4) != 0) {
@@ -1632,9 +2293,7 @@ test_bootstrap_inherited_trunk_scan_preserves_ui_only_short_options(void) {
     (void)dsd_unsetenv("DSD_NEO_CONFIG");
     (void)dsd_setenv("DSD_NEO_NO_BOOTSTRAP", "1", 1);
 
-    static const char* ini = "version = 1\n"
-                             "\n"
-                             "[trunk_scan]\n"
+    static const char* ini = "[trunk_scan]\n"
                              "enabled = true\n"
                              "targets_csv = \"targets.csv\"\n"
                              "idle_dwell_ms = 500\n";
@@ -1651,15 +2310,16 @@ test_bootstrap_inherited_trunk_scan_preserves_ui_only_short_options(void) {
     char arg0[] = "dsd-neo";
     char arg1[] = "--config";
     char arg2[1024];
-    char arg3[] = "-N";
-    char arg4[] = "-v";
-    char arg5[] = "3";
+    char arg3[] = "--frontend";
+    char arg4[] = "terminal";
+    char arg5[] = "-v";
+    char arg6[] = "3";
     DSD_SNPRINTF(arg2, sizeof arg2, "%s", cfg_path);
-    char* argv[] = {arg0, arg1, arg2, arg3, arg4, arg5, NULL};
+    char* argv[] = {arg0, arg1, arg2, arg3, arg4, arg5, arg6, NULL};
 
     int argc_effective = 0;
     int exit_rc = -1;
-    int rc = dsd_runtime_bootstrap(6, argv, opts, state, &argc_effective, &exit_rc);
+    int rc = dsd_runtime_bootstrap(7, argv, opts, state, &argc_effective, &exit_rc);
 
     int test_rc = 0;
     if (rc != DSD_BOOTSTRAP_CONTINUE || exit_rc != 0) {
@@ -1671,8 +2331,9 @@ test_bootstrap_inherited_trunk_scan_preserves_ui_only_short_options(void) {
                     opts->trunk_scan_enabled, opts->trunk_scan_targets_csv);
         test_rc = 1;
     }
-    if (opts->use_ncurses_terminal != 1) {
-        DSD_FPRINTF(stderr, "expected -N to remain applied, got use_ncurses_terminal=%d\n", opts->use_ncurses_terminal);
+    if (opts->frontend_kind != DSD_FRONTEND_TERMINAL) {
+        DSD_FPRINTF(stderr, "expected --frontend terminal to remain applied, got frontend_kind=%d\n",
+                    opts->frontend_kind);
         test_rc = 1;
     }
     if (opts->use_pbf != 1 || opts->use_lpf != 1 || opts->use_hpf != 0 || opts->use_hpf_d != 0) {
@@ -1705,9 +2366,7 @@ test_bootstrap_inherited_trunk_scan_allows_cli_channel_map(void) {
     (void)dsd_unsetenv("DSD_NEO_CONFIG");
     (void)dsd_setenv("DSD_NEO_NO_BOOTSTRAP", "1", 1);
 
-    static const char* ini = "version = 1\n"
-                             "\n"
-                             "[trunk_scan]\n"
+    static const char* ini = "[trunk_scan]\n"
                              "enabled = true\n"
                              "targets_csv = \"targets.csv\"\n"
                              "idle_dwell_ms = 500\n";
@@ -1771,6 +2430,70 @@ test_bootstrap_inherited_trunk_scan_allows_cli_channel_map(void) {
 }
 
 static int
+test_bootstrap_inherited_trunk_scan_disables_for_positional_input(void) {
+    dsd_opts* opts = (dsd_opts*)calloc(1, sizeof(dsd_opts));
+    dsd_state* state = (dsd_state*)calloc(1, sizeof(dsd_state));
+    if (!opts || !state) {
+        free(opts);
+        free(state);
+        DSD_FPRINTF(stderr, "out of memory\n");
+        return 1;
+    }
+
+    initOpts(opts);
+    initState(state);
+
+    (void)dsd_unsetenv("DSD_NEO_CONFIG");
+    (void)dsd_setenv("DSD_NEO_NO_BOOTSTRAP", "1", 1);
+
+    static const char* ini = "[trunk_scan]\n"
+                             "enabled = true\n"
+                             "targets_csv = \"targets.csv\"\n";
+
+    char cfg_path[1024];
+    if (test_create_temp_ini_with_contents(ini, cfg_path, sizeof cfg_path) != 0) {
+        DSD_FPRINTF(stderr, "failed to create temp trunk scan ini\n");
+        freeState(state);
+        free(opts);
+        free(state);
+        return 1;
+    }
+
+    char arg0[] = "dsd-neo";
+    char arg1[] = "--config";
+    char arg2[1024];
+    char arg3[] = "input.amb";
+    DSD_SNPRINTF(arg2, sizeof arg2, "%s", cfg_path);
+    char* argv[] = {arg0, arg1, arg2, arg3, NULL};
+
+    int argc_effective = 0;
+    int exit_rc = -1;
+    int rc = dsd_runtime_bootstrap(4, argv, opts, state, &argc_effective, &exit_rc);
+
+    int test_rc = 0;
+    if (rc != DSD_BOOTSTRAP_CONTINUE || exit_rc != 0) {
+        DSD_FPRINTF(stderr, "expected positional input bootstrap continue, got rc=%d exit_rc=%d\n", rc, exit_rc);
+        test_rc = 1;
+    }
+    if (opts->trunk_scan_enabled != 0) {
+        DSD_FPRINTF(stderr, "expected positional input to disable inherited trunk scan, got %d\n",
+                    opts->trunk_scan_enabled);
+        test_rc = 1;
+    }
+    if (argc_effective != 2 || strcmp(argv[1], "input.amb") != 0) {
+        DSD_FPRINTF(stderr, "expected positional playback arg to survive compaction, argc=%d arg1=%s\n", argc_effective,
+                    argc_effective > 1 ? argv[1] : "(missing)");
+        test_rc = 1;
+    }
+
+    (void)remove(cfg_path);
+    freeState(state);
+    free(opts);
+    free(state);
+    return test_rc;
+}
+
+static int
 test_bootstrap_inherited_trunk_scan_disables_for_long_only_runtime_mode(void) {
     dsd_opts* opts = (dsd_opts*)calloc(1, sizeof(dsd_opts));
     dsd_state* state = (dsd_state*)calloc(1, sizeof(dsd_state));
@@ -1787,9 +2510,7 @@ test_bootstrap_inherited_trunk_scan_disables_for_long_only_runtime_mode(void) {
     (void)dsd_unsetenv("DSD_NEO_CONFIG");
     (void)dsd_setenv("DSD_NEO_NO_BOOTSTRAP", "1", 1);
 
-    static const char* ini = "version = 1\n"
-                             "\n"
-                             "[trunk_scan]\n"
+    static const char* ini = "[trunk_scan]\n"
                              "enabled = true\n"
                              "targets_csv = \"targets.csv\"\n";
 
@@ -1871,9 +2592,7 @@ test_bootstrap_inherited_trunk_scan_preserves_timing_overrides(void) {
     (void)dsd_unsetenv("DSD_NEO_CONFIG");
     (void)dsd_setenv("DSD_NEO_NO_BOOTSTRAP", "1", 1);
 
-    static const char* ini = "version = 1\n"
-                             "\n"
-                             "[trunk_scan]\n"
+    static const char* ini = "[trunk_scan]\n"
                              "enabled = true\n"
                              "targets_csv = \"targets.csv\"\n"
                              "idle_dwell_ms = 3000\n"
@@ -1924,9 +2643,7 @@ test_bootstrap_inherited_trunk_scan_preserves_timing_overrides(void) {
 
 static int
 test_bootstrap_config_one_shots_skip_trunk_scan_runtime_validation(void) {
-    static const char* ini = "version = 1\n"
-                             "\n"
-                             "[trunk_scan]\n"
+    static const char* ini = "[trunk_scan]\n"
                              "enabled = true\n"
                              "\n"
                              "[profile.demo]\n"
@@ -2001,9 +2718,7 @@ test_bootstrap_profile_disables_autosave(void) {
     (void)dsd_unsetenv("DSD_NEO_CONFIG");
     (void)dsd_setenv("DSD_NEO_NO_BOOTSTRAP", "1", 1);
 
-    static const char* ini = "version = 1\n"
-                             "\n"
-                             "[profile.p25_trunk]\n"
+    static const char* ini = "[profile.p25_trunk]\n"
                              "input.source = \"rtl\"\n"
                              "input.rtl_device = 0\n"
                              "input.rtl_freq = \"100000000\"\n"
@@ -2058,6 +2773,110 @@ test_bootstrap_profile_disables_autosave(void) {
 }
 
 static int
+test_bootstrap_missing_profile_errors_without_applying_config_or_cli(void) {
+    dsd_opts* opts = (dsd_opts*)calloc(1, sizeof(dsd_opts));
+    dsd_state* state = (dsd_state*)calloc(1, sizeof(dsd_state));
+    if (!opts || !state) {
+        free(opts);
+        free(state);
+        DSD_FPRINTF(stderr, "out of memory\n");
+        return 1;
+    }
+
+    initOpts(opts);
+    initState(state);
+
+    (void)dsd_unsetenv("DSD_NEO_CONFIG");
+    (void)dsd_setenv("DSD_NEO_NO_BOOTSTRAP", "1", 1);
+
+    static const char* ini = "[input]\n"
+                             "source = \"rtl\"\n"
+                             "rtl_device = 7\n"
+                             "rtl_freq = \"851.0125M\"\n"
+                             "\n"
+                             "[trunking]\n"
+                             "enabled = true\n"
+                             "\n"
+                             "[profile.valid]\n"
+                             "output.frontend = terminal\n";
+
+    char cfg_path[1024];
+    if (test_create_temp_ini_with_contents(ini, cfg_path, sizeof cfg_path) != 0) {
+        DSD_FPRINTF(stderr, "failed to create temp profile ini\n");
+        freeState(state);
+        free(opts);
+        free(state);
+        return 1;
+    }
+
+    char arg0[] = "dsd-neo";
+    char arg1[] = "--config";
+    char arg2[1024];
+    char arg3[] = "--profile";
+    char arg4[] = "missing";
+    char arg5[] = "--frontend";
+    char arg6[] = "terminal";
+    DSD_SNPRINTF(arg2, sizeof arg2, "%s", cfg_path);
+    char* argv[] = {arg0, arg1, arg2, arg3, arg4, arg5, arg6, NULL};
+
+    dsd_test_capture_stderr cap;
+    if (dsd_test_capture_stderr_begin(&cap, "runtime_cli_missing_profile") != 0) {
+        (void)remove(cfg_path);
+        freeState(state);
+        free(opts);
+        free(state);
+        return 1;
+    }
+
+    int argc_effective = 0;
+    int exit_rc = -1;
+    int rc = dsd_runtime_bootstrap(7, argv, opts, state, &argc_effective, &exit_rc);
+
+    int capture_failed = dsd_test_capture_stderr_end(&cap);
+    char stderr_buf[2048];
+    stderr_buf[0] = '\0';
+    if (!capture_failed) {
+        capture_failed = read_file_to_buffer(cap.path, stderr_buf, sizeof stderr_buf);
+    }
+    (void)remove(cap.path);
+
+    int test_rc = 0;
+    if (capture_failed) {
+        DSD_FPRINTF(stderr, "failed to capture missing-profile diagnostics\n");
+        test_rc = 1;
+    }
+    if (rc != DSD_BOOTSTRAP_ERROR || exit_rc != 1) {
+        DSD_FPRINTF(stderr, "expected missing profile bootstrap error, got rc=%d exit_rc=%d\n", rc, exit_rc);
+        test_rc = 1;
+    }
+    if (!strstr(stderr_buf, "Profile 'missing' not found")) {
+        DSD_FPRINTF(stderr, "expected missing profile diagnostic, got:\n%s\n", stderr_buf);
+        test_rc = 1;
+    }
+    if (opts->frontend_kind != DSD_FRONTEND_NONE) {
+        DSD_FPRINTF(stderr, "missing profile should stop before CLI frontend applies, got frontend_kind=%d\n",
+                    opts->frontend_kind);
+        test_rc = 1;
+    }
+    if (strncmp(opts->audio_in_dev, "rtl:", 4) == 0 || opts->trunk_enable != 0) {
+        DSD_FPRINTF(stderr, "missing profile should not apply config: input=%s trunk=%d\n", opts->audio_in_dev,
+                    opts->trunk_enable);
+        test_rc = 1;
+    }
+    if (state->cli_argc_effective != 0) {
+        DSD_FPRINTF(stderr, "missing profile should stop before recording effective CLI args, got %d\n",
+                    state->cli_argc_effective);
+        test_rc = 1;
+    }
+
+    (void)remove(cfg_path);
+    freeState(state);
+    free(opts);
+    free(state);
+    return test_rc;
+}
+
+static int
 test_bootstrap_cli_call_alert_restores_all_config_filtered_events(void) {
     dsd_opts* opts = (dsd_opts*)calloc(1, sizeof(dsd_opts));
     dsd_state* state = (dsd_state*)calloc(1, sizeof(dsd_state));
@@ -2074,9 +2893,7 @@ test_bootstrap_cli_call_alert_restores_all_config_filtered_events(void) {
     (void)dsd_unsetenv("DSD_NEO_CONFIG");
     (void)dsd_setenv("DSD_NEO_NO_BOOTSTRAP", "1", 1);
 
-    static const char* ini = "version = 1\n"
-                             "\n"
-                             "[alerts]\n"
+    static const char* ini = "[alerts]\n"
                              "enabled = false\n"
                              "voice_end = false\n";
 
@@ -2503,6 +3320,52 @@ test_frame_log_long_option_parse(void) {
 }
 
 static int
+test_p25_sm_log_long_option_parse(void) {
+    dsd_opts* opts = (dsd_opts*)calloc(1, sizeof(dsd_opts));
+    dsd_state* state = (dsd_state*)calloc(1, sizeof(dsd_state));
+    if (!opts || !state) {
+        free(opts);
+        free(state);
+        DSD_FPRINTF(stderr, "out of memory\n");
+        return 1;
+    }
+
+    initOpts(opts);
+    initState(state);
+
+    char arg0[] = "dsd-neo";
+    char arg1[] = "--p25-sm-log";
+    char arg2[] = "p25-sm.log";
+    char* argv[] = {arg0, arg1, arg2, NULL};
+
+    int argc_effective = 0;
+    int exit_rc = -1;
+    int rc = dsd_parse_args(3, argv, opts, state, &argc_effective, &exit_rc);
+    if (rc != DSD_PARSE_CONTINUE) {
+        DSD_FPRINTF(stderr, "expected rc=%d, got %d (exit_rc=%d)\n", DSD_PARSE_CONTINUE, rc, exit_rc);
+        freeState(state);
+        free(opts);
+        free(state);
+        return 1;
+    }
+
+    int test_rc = 0;
+    if (strcmp(opts->p25_sm_log_file, "p25-sm.log") != 0) {
+        DSD_FPRINTF(stderr, "unexpected p25_sm_log_file=%s\n", opts->p25_sm_log_file);
+        test_rc = 1;
+    }
+    if (opts->payload != 0) {
+        DSD_FPRINTF(stderr, "expected payload to remain off, got %d\n", opts->payload);
+        test_rc = 1;
+    }
+
+    freeState(state);
+    free(opts);
+    free(state);
+    return test_rc;
+}
+
+static int
 test_dmr_debug_burst_long_option_parse(void) {
     dsd_opts* opts = (dsd_opts*)calloc(1, sizeof(dsd_opts));
     dsd_state* state = (dsd_state*)calloc(1, sizeof(dsd_state));
@@ -2547,6 +3410,101 @@ test_dmr_debug_burst_long_option_parse(void) {
     }
     if (argc_effective != 1) {
         DSD_FPRINTF(stderr, "expected compacted argc=1, got %d\n", argc_effective);
+        test_rc = 1;
+    }
+
+    freeState(state);
+    free(opts);
+    free(state);
+    return test_rc;
+}
+
+static int
+test_show_keys_long_option_parse(void) {
+    dsd_opts* opts = (dsd_opts*)calloc(1, sizeof(dsd_opts));
+    dsd_state* state = (dsd_state*)calloc(1, sizeof(dsd_state));
+    if (!opts || !state) {
+        free(opts);
+        free(state);
+        DSD_FPRINTF(stderr, "out of memory\n");
+        return 1;
+    }
+
+    initOpts(opts);
+    initState(state);
+
+    char arg0[] = "dsd-neo";
+    char arg1[] = "--show-keys";
+    char* argv[] = {arg0, arg1, NULL};
+
+    int argc_effective = 0;
+    int exit_rc = -1;
+    int rc = dsd_parse_args(2, argv, opts, state, &argc_effective, &exit_rc);
+    if (rc != DSD_PARSE_CONTINUE) {
+        DSD_FPRINTF(stderr, "expected rc=%d, got %d (exit_rc=%d)\n", DSD_PARSE_CONTINUE, rc, exit_rc);
+        freeState(state);
+        free(opts);
+        free(state);
+        return 1;
+    }
+
+    int test_rc = 0;
+    if (opts->show_keys != 1U) {
+        DSD_FPRINTF(stderr, "expected show_keys=1, got %u\n", (unsigned int)opts->show_keys);
+        test_rc = 1;
+    }
+    if (argc_effective != 1) {
+        DSD_FPRINTF(stderr, "expected compacted argc=1, got %d\n", argc_effective);
+        test_rc = 1;
+    }
+
+    freeState(state);
+    free(opts);
+    free(state);
+    return test_rc;
+}
+
+static int
+test_show_keys_after_option_terminator_remains_positional(void) {
+    dsd_opts* opts = (dsd_opts*)calloc(1, sizeof(dsd_opts));
+    dsd_state* state = (dsd_state*)calloc(1, sizeof(dsd_state));
+    if (!opts || !state) {
+        free(opts);
+        free(state);
+        DSD_FPRINTF(stderr, "out of memory\n");
+        return 1;
+    }
+
+    initOpts(opts);
+    initState(state);
+
+    char arg0[] = "dsd-neo";
+    char arg1[] = "--";
+    char arg2[] = "--show-keys";
+    char* argv[] = {arg0, arg1, arg2, NULL};
+
+    int argc_effective = 0;
+    int exit_rc = -1;
+    int rc = dsd_parse_args(3, argv, opts, state, &argc_effective, &exit_rc);
+    if (rc != DSD_PARSE_CONTINUE) {
+        DSD_FPRINTF(stderr, "expected rc=%d, got %d (exit_rc=%d)\n", DSD_PARSE_CONTINUE, rc, exit_rc);
+        freeState(state);
+        free(opts);
+        free(state);
+        return 1;
+    }
+
+    int test_rc = 0;
+    if (opts->show_keys != 0U) {
+        DSD_FPRINTF(stderr, "expected show_keys to remain redacted, got %u\n", (unsigned int)opts->show_keys);
+        test_rc = 1;
+    }
+    if (argc_effective != 3) {
+        DSD_FPRINTF(stderr, "expected compacted argc=3, got %d\n", argc_effective);
+        test_rc = 1;
+    }
+    if (argv[1] == NULL || strcmp(argv[1], "--") != 0 || argv[2] == NULL || strcmp(argv[2], "--show-keys") != 0) {
+        DSD_FPRINTF(stderr, "expected terminator and positional --show-keys to remain in argv\n");
         test_rc = 1;
     }
 
@@ -2618,6 +3576,11 @@ test_input_source_rtl_roundtrip(void) {
 static int
 test_input_source_rtltcp_roundtrip(void) {
     return test_input_source_arg_roundtrip("rtltcp:127.0.0.1:1234:851.375M:30:5:16:-50:2");
+}
+
+static int
+test_input_source_tcp_ipv4_roundtrip(void) {
+    return test_input_source_arg_roundtrip("tcp:192.168.1.50:7355");
 }
 
 static int
@@ -2973,6 +3936,129 @@ test_iq_capture_max_mb_missing_value_returns_error(void) {
 }
 
 static int
+test_symbol_capture_format_missing_value_returns_error(void) {
+    return test_missing_required_long_option_value_returns_error("--symbol-capture-format");
+}
+
+static int
+test_symbol_capture_format_aliases_use_canonical_writer(void) {
+    static const char* const options[] = {
+        "--symbol-capture-format=soft",
+        "--symbol-capture-format=legacy",
+    };
+    int test_rc = 0;
+
+    for (size_t i = 0; i < sizeof options / sizeof options[0]; i++) {
+        dsd_opts* opts = (dsd_opts*)calloc(1, sizeof(dsd_opts));
+        dsd_state* state = (dsd_state*)calloc(1, sizeof(dsd_state));
+        if (!opts || !state) {
+            free(opts);
+            free(state);
+            DSD_FPRINTF(stderr, "out of memory\n");
+            return 1;
+        }
+        initOpts(opts);
+        initState(state);
+
+        char arg0[] = "dsd-neo";
+        char arg1[64];
+        DSD_SNPRINTF(arg1, sizeof arg1, "%s", options[i]);
+        char* argv[] = {arg0, arg1, NULL};
+        int argc_effective = 0;
+        int exit_rc = -1;
+        int rc = dsd_parse_args(2, argv, opts, state, &argc_effective, &exit_rc);
+        if (rc != DSD_PARSE_CONTINUE || argc_effective != 1) {
+            DSD_FPRINTF(stderr, "expected %s to select canonical symbol writer, got rc=%d argc=%d exit_rc=%d\n",
+                        options[i], rc, argc_effective, exit_rc);
+            test_rc = 1;
+        }
+
+        freeState(state);
+        free(opts);
+        free(state);
+    }
+
+    return test_rc;
+}
+
+static int
+test_symbol_capture_format_rejects_unknown_value(void) {
+    dsd_opts* opts = (dsd_opts*)calloc(1, sizeof(dsd_opts));
+    dsd_state* state = (dsd_state*)calloc(1, sizeof(dsd_state));
+    if (!opts || !state) {
+        free(opts);
+        free(state);
+        DSD_FPRINTF(stderr, "out of memory\n");
+        return 1;
+    }
+    initOpts(opts);
+    initState(state);
+
+    char arg0[] = "dsd-neo";
+    char arg1[] = "--symbol-capture-format=hard";
+    char* argv[] = {arg0, arg1, NULL};
+    int argc_effective = 0;
+    int exit_rc = -1;
+    int rc = dsd_parse_args(2, argv, opts, state, &argc_effective, &exit_rc);
+    int test_rc = 0;
+    if (rc != DSD_PARSE_ERROR || exit_rc != 1) {
+        DSD_FPRINTF(stderr, "expected unknown symbol capture format error, got rc=%d exit_rc=%d\n", rc, exit_rc);
+        test_rc = 1;
+    }
+
+    freeState(state);
+    free(opts);
+    free(state);
+    return test_rc;
+}
+
+static int
+test_iq_capture_max_mb_rejects_invalid_values(void) {
+    const char* invalid_options[] = {
+        "--iq-capture-max-mb=",
+        "--iq-capture-max-mb=12mb",
+        "--iq-capture-max-mb=18446744073709551616",
+        "--iq-capture-max-mb=17592186044416",
+    };
+    int test_rc = 0;
+
+    for (size_t i = 0; i < sizeof(invalid_options) / sizeof(invalid_options[0]); i++) {
+        dsd_opts* opts = (dsd_opts*)calloc(1, sizeof(dsd_opts));
+        dsd_state* state = (dsd_state*)calloc(1, sizeof(dsd_state));
+        if (!opts || !state) {
+            free(opts);
+            free(state);
+            DSD_FPRINTF(stderr, "out of memory\n");
+            return 1;
+        }
+
+        initOpts(opts);
+        initState(state);
+
+        char arg0[] = "dsd-neo";
+        char arg1[96];
+        DSD_SNPRINTF(arg1, sizeof arg1, "%s", invalid_options[i]);
+        char* argv[] = {arg0, arg1, NULL};
+
+        int argc_effective = 0;
+        int exit_rc = -1;
+        int rc = dsd_parse_args(2, argv, opts, state, &argc_effective, &exit_rc);
+        if (rc != DSD_PARSE_ERROR || exit_rc != 1 || opts->iq_capture_max_bytes != 0U) {
+            DSD_FPRINTF(stderr,
+                        "expected invalid %s to fail without setting max bytes, got rc=%d exit_rc=%d max=%" PRIu64 "\n",
+                        invalid_options[i], rc, exit_rc, opts->iq_capture_max_bytes);
+            test_rc = 1;
+        }
+
+        freeState(state);
+        free(opts);
+        free(state);
+    }
+
+    return test_rc;
+}
+
+static int
 test_iq_replay_missing_value_returns_error(void) {
     return test_missing_required_long_option_value_returns_error("--iq-replay");
 }
@@ -3154,6 +4240,45 @@ test_rtl_udp_control_invalid_bind_returns_error(void) {
 }
 
 static int
+test_rtl_udp_control_rejects_malformed_numeric_binds(void) {
+    const char* invalid_binds[] = {"999.1.1.1", "1.2.3.", "1.2.3"};
+    int test_rc = 0;
+
+    for (size_t i = 0; i < sizeof(invalid_binds) / sizeof(invalid_binds[0]); i++) {
+        dsd_opts* opts = (dsd_opts*)calloc(1, sizeof(dsd_opts));
+        dsd_state* state = (dsd_state*)calloc(1, sizeof(dsd_state));
+        if (!opts || !state) {
+            free(opts);
+            free(state);
+            DSD_FPRINTF(stderr, "out of memory\n");
+            return 1;
+        }
+
+        initOpts(opts);
+        initState(state);
+
+        char arg0[] = "dsd-neo";
+        char arg1[] = "--rtl-udp-control-bind";
+        char* argv[] = {arg0, arg1, (char*)invalid_binds[i], NULL};
+
+        int argc_effective = 0;
+        int exit_rc = -1;
+        int rc = dsd_parse_args(3, argv, opts, state, &argc_effective, &exit_rc);
+        if (rc != DSD_PARSE_ERROR || exit_rc != 1) {
+            DSD_FPRINTF(stderr, "expected invalid bind %s to fail, got rc=%d exit_rc=%d\n", invalid_binds[i], rc,
+                        exit_rc);
+            test_rc = 1;
+        }
+
+        freeState(state);
+        free(opts);
+        free(state);
+    }
+
+    return test_rc;
+}
+
+static int
 test_rtl_udp_control_port_too_large_returns_error(void) {
     dsd_opts* opts = (dsd_opts*)calloc(1, sizeof(dsd_opts));
     dsd_state* state = (dsd_state*)calloc(1, sizeof(dsd_state));
@@ -3249,7 +4374,6 @@ test_dmr_baofeng_pc5_256_long_option_uses_ascii_hex_key(void) {
 
     initOpts(opts);
     initState(state);
-    DSD_MEMSET(&ctxpc5, 0, sizeof(ctxpc5));
 
     char arg0[] = "dsd-neo";
     char arg1[] = "--dmr-baofeng-pc5";
@@ -3274,23 +4398,26 @@ test_dmr_baofeng_pc5_256_long_option_uses_ascii_hex_key(void) {
         return 1;
     }
 
-    PC5Context expected;
-    DSD_MEMSET(&expected, 0, sizeof(expected));
-    const unsigned char key_ascii[] = "000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F";
-    create_keys_pc5(&expected, key_ascii, strlen((const char*)key_ascii));
-    expected.rounds = PC5_NBROUND;
-
-    if (ctxpc5.rounds != expected.rounds || memcmp(ctxpc5.perm, expected.perm, sizeof(expected.perm)) != 0
-        || memcmp(ctxpc5.new1, expected.new1, sizeof(expected.new1)) != 0
-        || memcmp(ctxpc5.decal, expected.decal, sizeof(expected.decal)) != 0
-        || memcmp(ctxpc5.rngxor, expected.rngxor, sizeof(expected.rngxor)) != 0
-        || memcmp(ctxpc5.tab, expected.tab, sizeof(expected.tab)) != 0
-        || memcmp(ctxpc5.inv, expected.inv, sizeof(expected.inv)) != 0) {
-        DSD_FPRINTF(stderr, "expected 64-hex PC5 input to use legacy ASCII hex key schedule\n");
+    static const char expected[] = "1011101110110010100111001011000101011000011001111";
+    char frame[49];
+    for (int i = 0; i < 49; i++) {
+        frame[i] = (char)((i * 7 + 1) & 1);
+    }
+    if (baofeng_pc5_apply_frame49(state, frame) != 1) {
+        DSD_FPRINTF(stderr, "expected 64-hex PC5 input to enable voice-frame application\n");
         freeState(state);
         free(opts);
         free(state);
         return 1;
+    }
+    for (int i = 0; i < 49; i++) {
+        if ((frame[i] & 1) != (expected[i] - '0')) {
+            DSD_FPRINTF(stderr, "expected 64-hex PC5 input to use ASCII hex OTA schedule (bit %d)\n", i);
+            freeState(state);
+            free(opts);
+            free(state);
+            return 1;
+        }
     }
 
     freeState(state);
@@ -3592,6 +4719,58 @@ test_m17_signature_public_key_long_option_parse(void) {
 }
 
 static int
+test_m17_signature_public_key_accepts_lowercase_spaced_hex(void) {
+    dsd_opts* opts = (dsd_opts*)calloc(1, sizeof(dsd_opts));
+    dsd_state* state = (dsd_state*)calloc(1, sizeof(dsd_state));
+    if (!opts || !state) {
+        free(opts);
+        free(state);
+        DSD_FPRINTF(stderr, "out of memory\n");
+        return 1;
+    }
+
+    initOpts(opts);
+    initState(state);
+
+    char arg0[] = "dsd-neo";
+    char arg1[] = "--m17-signature-public-key";
+    char arg2[] = "  0x253dd9ce177042a6056f069c096a68f9937e5ec82f76f49bdcb78ee10b691373a\n"
+                  "48911b59c269eaa33bc428fe598ce87add4ed6d1b4e0efafb2558456dfc35de";
+    char* argv[] = {arg0, arg1, arg2, NULL};
+
+    int argc_effective = 0;
+    int exit_rc = -1;
+    int rc = dsd_parse_args(3, argv, opts, state, &argc_effective, &exit_rc);
+    if (rc != DSD_PARSE_CONTINUE) {
+        DSD_FPRINTF(stderr, "expected rc=%d, got %d (exit_rc=%d)\n", DSD_PARSE_CONTINUE, rc, exit_rc);
+        freeState(state);
+        free(opts);
+        free(state);
+        return 1;
+    }
+
+    static const uint8_t expected[DSD_ECDSA_P256_PUBLIC_KEY_BYTES] = {
+        0x25U, 0x3DU, 0xD9U, 0xCEU, 0x17U, 0x70U, 0x42U, 0xA6U, 0x05U, 0x6FU, 0x06U, 0x9CU, 0x09U, 0x6AU, 0x68U, 0xF9U,
+        0x93U, 0x7EU, 0x5EU, 0xC8U, 0x2FU, 0x76U, 0xF4U, 0x9BU, 0xDCU, 0xB7U, 0x8EU, 0xE1U, 0x0BU, 0x69U, 0x13U, 0x73U,
+        0xA4U, 0x89U, 0x11U, 0xB5U, 0x9CU, 0x26U, 0x9EU, 0xAAU, 0x33U, 0xBCU, 0x42U, 0x8FU, 0xE5U, 0x98U, 0xCEU, 0x87U,
+        0xADU, 0xD4U, 0xEDU, 0x6DU, 0x1BU, 0x4EU, 0x0EU, 0xFAU, 0xFBU, 0x25U, 0x58U, 0x45U, 0x6DU, 0xFCU, 0x35U, 0xDEU,
+    };
+    if (state->m17_signature_public_key_loaded != 1U
+        || memcmp(state->m17_signature_public_key, expected, sizeof(expected)) != 0) {
+        DSD_FPRINTF(stderr, "expected lowercase spaced M17 signature public key bytes to match\n");
+        freeState(state);
+        free(opts);
+        free(state);
+        return 1;
+    }
+
+    freeState(state);
+    free(opts);
+    free(state);
+    return 0;
+}
+
+static int
 test_m17_signature_public_key_long_option_rejects_invalid_value(void) {
     dsd_opts* opts = (dsd_opts*)calloc(1, sizeof(dsd_opts));
     dsd_state* state = (dsd_state*)calloc(1, sizeof(dsd_state));
@@ -3704,9 +4883,9 @@ test_f_auto_preset_applies_cli_profile(void) {
         DSD_FPRINTF(stderr, "expected -fa to enable all digital frame types\n");
         test_rc = 1;
     }
-    if (opts->pulse_digi_out_channels != 2 || opts->dmr_stereo != 1 || opts->dmr_mono != 0) {
-        DSD_FPRINTF(stderr, "unexpected -fa audio settings channels=%d stereo=%d mono=%d\n",
-                    opts->pulse_digi_out_channels, opts->dmr_stereo, opts->dmr_mono);
+    if (opts->pulse_digi_out_channels != 2 || opts->dmr_stereo != 1) {
+        DSD_FPRINTF(stderr, "unexpected -fa audio settings channels=%d stereo=%d\n", opts->pulse_digi_out_channels,
+                    opts->dmr_stereo);
         test_rc = 1;
     }
     if (strcmp(opts->output_name, "AUTO") != 0) {
@@ -3755,9 +4934,9 @@ test_f_ysf_preset_applies_cli_profile(void) {
         DSD_FPRINTF(stderr, "unexpected -fy frame flags\n");
         test_rc = 1;
     }
-    if (opts->pulse_digi_out_channels != 1 || opts->dmr_stereo != 0 || opts->dmr_mono != 0 || state->dmr_stereo != 0) {
-        DSD_FPRINTF(stderr, "unexpected -fy audio settings channels=%d stereo=%d mono=%d state_stereo=%d\n",
-                    opts->pulse_digi_out_channels, opts->dmr_stereo, opts->dmr_mono, state->dmr_stereo);
+    if (opts->pulse_digi_out_channels != 1 || opts->dmr_stereo != 0 || state->dmr_stereo != 0) {
+        DSD_FPRINTF(stderr, "unexpected -fy audio settings channels=%d stereo=%d state_stereo=%d\n",
+                    opts->pulse_digi_out_channels, opts->dmr_stereo, state->dmr_stereo);
         test_rc = 1;
     }
     if (strcmp(opts->output_name, "YSF") != 0) {
@@ -3768,6 +4947,50 @@ test_f_ysf_preset_applies_cli_profile(void) {
     freeState(state);
     free(opts);
     free(state);
+    return test_rc;
+}
+
+static int
+test_f_dpmr_and_m17_presets_match_documented_letters(void) {
+    static const struct {
+        const char* arg;
+        int expect_dpmr;
+        int expect_m17;
+        const char* output_name;
+    } cases[] = {{"-fm", 1, 0, "dPMR"}, {"-fz", 0, 1, "M17"}};
+
+    int test_rc = 0;
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        dsd_opts* opts = (dsd_opts*)calloc(1, sizeof(dsd_opts));
+        dsd_state* state = (dsd_state*)calloc(1, sizeof(dsd_state));
+        if (!opts || !state) {
+            free(opts);
+            free(state);
+            DSD_FPRINTF(stderr, "out of memory\n");
+            return 1;
+        }
+
+        initOpts(opts);
+        initState(state);
+        char arg0[] = "dsd-neo";
+        char arg1[4] = {0};
+        DSD_SNPRINTF(arg1, sizeof arg1, "%s", cases[i].arg);
+        char* argv[] = {arg0, arg1, NULL};
+        int argc_effective = 0;
+        int exit_rc = -1;
+        int rc = dsd_parse_args(2, argv, opts, state, &argc_effective, &exit_rc);
+
+        if (rc != DSD_PARSE_CONTINUE || opts->frame_dpmr != cases[i].expect_dpmr
+            || opts->frame_m17 != cases[i].expect_m17 || strcmp(opts->output_name, cases[i].output_name) != 0) {
+            DSD_FPRINTF(stderr, "unexpected %s preset rc=%d dpmr=%d m17=%d output=%s\n", cases[i].arg, rc,
+                        opts->frame_dpmr, opts->frame_m17, opts->output_name);
+            test_rc = 1;
+        }
+
+        freeState(state);
+        free(opts);
+        free(state);
+    }
     return test_rc;
 }
 
@@ -3847,54 +5070,59 @@ test_f_edacs_presets_match_reference_modes(void) {
 }
 
 static int
-test_f_legacy_fr_mono_still_supported(void) {
-    dsd_opts* opts = (dsd_opts*)calloc(1, sizeof(dsd_opts));
-    dsd_state* state = (dsd_state*)calloc(1, sizeof(dsd_state));
-    if (!opts || !state) {
-        free(opts);
-        free(state);
-        DSD_FPRINTF(stderr, "out of memory\n");
-        return 1;
-    }
+test_f_fr_alias_uses_current_dmr_preset(void) {
+    static const struct {
+        int with_c4fm_lock;
+        int mod_c4fm;
+        int mod_gfsk;
+        int rf_mod;
+    } cases[] = {
+        {0, 0, 1, 2},
+        {1, 1, 0, 0},
+    };
 
-    initOpts(opts);
-    initState(state);
+    int test_rc = 0;
 
-    char arg0[] = "dsd-neo";
-    char arg1[] = "-fr";
-    char* argv[] = {arg0, arg1, NULL};
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        dsd_opts* opts = (dsd_opts*)calloc(1, sizeof(dsd_opts));
+        dsd_state* state = (dsd_state*)calloc(1, sizeof(dsd_state));
+        if (!opts || !state) {
+            free(opts);
+            free(state);
+            DSD_FPRINTF(stderr, "out of memory\n");
+            return 1;
+        }
+        initOpts(opts);
+        initState(state);
 
-    int argc_effective = 0;
-    int exit_rc = -1;
-    int rc = dsd_parse_args(2, argv, opts, state, &argc_effective, &exit_rc);
-    if (rc != DSD_PARSE_CONTINUE) {
-        DSD_FPRINTF(stderr, "expected rc=%d, got %d (exit_rc=%d)\n", DSD_PARSE_CONTINUE, rc, exit_rc);
+        char arg0[] = "dsd-neo";
+        char arg_mc[] = "-mc";
+        char arg_fr[] = "-fr";
+        char* argv[] = {arg0, cases[i].with_c4fm_lock ? arg_mc : arg_fr, cases[i].with_c4fm_lock ? arg_fr : NULL, NULL};
+        int argc = cases[i].with_c4fm_lock ? 3 : 2;
+        int argc_effective = 0;
+        int exit_rc = -1;
+        int rc = dsd_parse_args(argc, argv, opts, state, &argc_effective, &exit_rc);
+
+        if (rc != DSD_PARSE_CONTINUE || opts->frame_dmr != 1 || opts->frame_dstar != 0 || opts->frame_p25p1 != 0
+            || opts->frame_p25p2 != 0 || opts->dmr_stereo != 1 || opts->pulse_digi_rate_out != 8000
+            || opts->pulse_digi_out_channels != 2 || strcmp(opts->output_name, "DMR") != 0
+            || opts->mod_cli_lock != cases[i].with_c4fm_lock || opts->mod_c4fm != cases[i].mod_c4fm
+            || opts->mod_qpsk != 0 || opts->mod_gfsk != cases[i].mod_gfsk || state->rf_mod != cases[i].rf_mod) {
+            DSD_FPRINTF(stderr,
+                        "unexpected -fr canonical mapping rc=%d frame=%d stereo=%d rate=%d channels=%d "
+                        "lock=%d mod=%d/%d/%d rf_mod=%d output=%s\n",
+                        rc, opts->frame_dmr, opts->dmr_stereo, opts->pulse_digi_rate_out, opts->pulse_digi_out_channels,
+                        opts->mod_cli_lock, opts->mod_c4fm, opts->mod_qpsk, opts->mod_gfsk, state->rf_mod,
+                        opts->output_name);
+            test_rc = 1;
+        }
+
         freeState(state);
         free(opts);
         free(state);
-        return 1;
     }
 
-    int test_rc = 0;
-    if (!(opts->frame_dmr == 1 && opts->dmr_mono == 1 && opts->dmr_stereo == 0 && state->dmr_stereo == 0)) {
-        DSD_FPRINTF(stderr, "unexpected -fr mono settings frame_dmr=%d mono=%d stereo=%d state_stereo=%d\n",
-                    opts->frame_dmr, opts->dmr_mono, opts->dmr_stereo, state->dmr_stereo);
-        test_rc = 1;
-    }
-    if (opts->pulse_digi_out_channels != 2 || strcmp(opts->output_name, "DMR-Mono") != 0) {
-        DSD_FPRINTF(stderr, "unexpected -fr output channels/name channels=%d name=%s\n", opts->pulse_digi_out_channels,
-                    opts->output_name);
-        test_rc = 1;
-    }
-    if (!(opts->mod_c4fm == 0 && opts->mod_qpsk == 0 && opts->mod_gfsk == 1 && state->rf_mod == 2)) {
-        DSD_FPRINTF(stderr, "expected -fr to select GFSK demod, got mod=%d/%d/%d rf_mod=%d\n", opts->mod_c4fm,
-                    opts->mod_qpsk, opts->mod_gfsk, state->rf_mod);
-        test_rc = 1;
-    }
-
-    freeState(state);
-    free(opts);
-    free(state);
     return test_rc;
 }
 
@@ -4034,97 +5262,6 @@ test_mc_before_f_dmr_preserves_c4fm_lock(void) {
 }
 
 static int
-test_mc_before_legacy_fr_preserves_c4fm_lock(void) {
-    dsd_opts* opts = (dsd_opts*)calloc(1, sizeof(dsd_opts));
-    dsd_state* state = (dsd_state*)calloc(1, sizeof(dsd_state));
-    if (!opts || !state) {
-        free(opts);
-        free(state);
-        DSD_FPRINTF(stderr, "out of memory\n");
-        return 1;
-    }
-
-    initOpts(opts);
-    initState(state);
-
-    char arg0[] = "dsd-neo";
-    char arg1[] = "-mc";
-    char arg2[] = "-fr";
-    char* argv[] = {arg0, arg1, arg2, NULL};
-
-    int argc_effective = 0;
-    int exit_rc = -1;
-    int rc = dsd_parse_args(3, argv, opts, state, &argc_effective, &exit_rc);
-    if (rc != DSD_PARSE_CONTINUE) {
-        DSD_FPRINTF(stderr, "expected rc=%d, got %d (exit_rc=%d)\n", DSD_PARSE_CONTINUE, rc, exit_rc);
-        freeState(state);
-        free(opts);
-        free(state);
-        return 1;
-    }
-
-    int test_rc = 0;
-    if (!(opts->frame_dmr == 1 && opts->dmr_mono == 1 && opts->mod_cli_lock == 1 && opts->mod_c4fm == 1
-          && opts->mod_qpsk == 0 && opts->mod_gfsk == 0 && state->rf_mod == 0)) {
-        DSD_FPRINTF(
-            stderr,
-            "expected -mc -fr to preserve C4FM lock and mono DMR, got frame_dmr=%d mono=%d lock=%d mod=%d/%d/%d "
-            "rf_mod=%d\n",
-            opts->frame_dmr, opts->dmr_mono, opts->mod_cli_lock, opts->mod_c4fm, opts->mod_qpsk, opts->mod_gfsk,
-            state->rf_mod);
-        test_rc = 1;
-    }
-
-    freeState(state);
-    free(opts);
-    free(state);
-    return test_rc;
-}
-
-static int
-test_f_nxdn48_clears_dmr_mono_after_fr(void) {
-    dsd_opts* opts = (dsd_opts*)calloc(1, sizeof(dsd_opts));
-    dsd_state* state = (dsd_state*)calloc(1, sizeof(dsd_state));
-    if (!opts || !state) {
-        free(opts);
-        free(state);
-        DSD_FPRINTF(stderr, "out of memory\n");
-        return 1;
-    }
-
-    initOpts(opts);
-    initState(state);
-
-    char arg0[] = "dsd-neo";
-    char arg1[] = "-fr";
-    char arg2[] = "-fi";
-    char* argv[] = {arg0, arg1, arg2, NULL};
-
-    int argc_effective = 0;
-    int exit_rc = -1;
-    int rc = dsd_parse_args(3, argv, opts, state, &argc_effective, &exit_rc);
-    if (rc != DSD_PARSE_CONTINUE) {
-        DSD_FPRINTF(stderr, "expected rc=%d, got %d (exit_rc=%d)\n", DSD_PARSE_CONTINUE, rc, exit_rc);
-        freeState(state);
-        free(opts);
-        free(state);
-        return 1;
-    }
-
-    int test_rc = 0;
-    if (!(opts->frame_nxdn48 == 1 && opts->frame_dmr == 0 && opts->dmr_mono == 0)) {
-        DSD_FPRINTF(stderr, "expected -fi to clear -fr mono mode (nxdn48=%d dmr=%d mono=%d)\n", opts->frame_nxdn48,
-                    opts->frame_dmr, opts->dmr_mono);
-        test_rc = 1;
-    }
-
-    freeState(state);
-    free(opts);
-    free(state);
-    return test_rc;
-}
-
-static int
 test_bootstrap_config_file_rate_survives_cli_provoice_preset(void) {
     dsd_opts* opts = (dsd_opts*)calloc(1, sizeof(dsd_opts));
     dsd_state* state = (dsd_state*)calloc(1, sizeof(dsd_state));
@@ -4141,9 +5278,7 @@ test_bootstrap_config_file_rate_survives_cli_provoice_preset(void) {
     (void)dsd_unsetenv("DSD_NEO_CONFIG");
     (void)dsd_setenv("DSD_NEO_NO_BOOTSTRAP", "1", 1);
 
-    static const char* ini = "version = 1\n"
-                             "\n"
-                             "[input]\n"
+    static const char* ini = "[input]\n"
                              "source = \"file\"\n"
                              "file_path = \"/tmp/input.wav\"\n"
                              "file_sample_rate = 96000\n";
@@ -4200,6 +5335,71 @@ test_bootstrap_config_file_rate_survives_cli_provoice_preset(void) {
 }
 
 static int
+test_bootstrap_compact_s_rate_override_clears_config_file_rate(void) {
+    dsd_opts* opts = (dsd_opts*)calloc(1, sizeof(dsd_opts));
+    dsd_state* state = (dsd_state*)calloc(1, sizeof(dsd_state));
+    if (!opts || !state) {
+        free(opts);
+        free(state);
+        DSD_FPRINTF(stderr, "out of memory\n");
+        return 1;
+    }
+
+    initOpts(opts);
+    initState(state);
+
+    (void)dsd_unsetenv("DSD_NEO_CONFIG");
+    (void)dsd_setenv("DSD_NEO_NO_BOOTSTRAP", "1", 1);
+
+    static const char* ini = "[input]\n"
+                             "source = \"file\"\n"
+                             "file_path = \"/tmp/input.wav\"\n"
+                             "file_sample_rate = 96000\n";
+
+    char cfg_path[1024];
+    if (test_create_temp_ini_with_contents(ini, cfg_path, sizeof cfg_path) != 0) {
+        DSD_FPRINTF(stderr, "failed to create temp file-input ini\n");
+        freeState(state);
+        free(opts);
+        free(state);
+        return 1;
+    }
+
+    char arg0[] = "dsd-neo";
+    char arg1[] = "--config";
+    char arg2[1024];
+    char arg3[] = "-s44100";
+    DSD_SNPRINTF(arg2, sizeof arg2, "%s", cfg_path);
+    char* argv[] = {arg0, arg1, arg2, arg3, NULL};
+
+    int argc_effective = 0;
+    int exit_rc = -1;
+    int rc = dsd_runtime_bootstrap(4, argv, opts, state, &argc_effective, &exit_rc);
+
+    int test_rc = 0;
+    if (rc != DSD_BOOTSTRAP_CONTINUE || exit_rc != 0) {
+        DSD_FPRINTF(stderr, "expected compact -s bootstrap continue, got rc=%d exit_rc=%d\n", rc, exit_rc);
+        test_rc = 1;
+    }
+    if (opts->wav_sample_rate != 44100 || dsd_opts_effective_input_rate(opts) != 44100) {
+        DSD_FPRINTF(stderr, "expected compact -s44100 to keep 44100 Hz, got raw=%d effective=%d\n",
+                    opts->wav_sample_rate, dsd_opts_effective_input_rate(opts));
+        test_rc = 1;
+    }
+    if (opts->staged_file_sample_rate != 0) {
+        DSD_FPRINTF(stderr, "expected compact -s44100 to clear staged config rate, got %d\n",
+                    opts->staged_file_sample_rate);
+        test_rc = 1;
+    }
+
+    (void)remove(cfg_path);
+    freeState(state);
+    free(opts);
+    free(state);
+    return test_rc;
+}
+
+static int
 test_s_8000_keeps_valid_symbol_timing_for_provoice(void) {
     dsd_opts* opts = (dsd_opts*)calloc(1, sizeof(dsd_opts));
     dsd_state* state = (dsd_state*)calloc(1, sizeof(dsd_state));
@@ -4242,6 +5442,114 @@ test_s_8000_keeps_valid_symbol_timing_for_provoice(void) {
     if (state->samplesPerSymbol != 5 || state->symbolCenter != 2) {
         DSD_FPRINTF(stderr, "expected ProVoice timing to remain 5/2, got sps=%d center=%d\n", state->samplesPerSymbol,
                     state->symbolCenter);
+        test_rc = 1;
+    }
+
+    freeState(state);
+    free(opts);
+    free(state);
+    return test_rc;
+}
+
+static int
+test_m2_low_rate_preserves_p25p2_profile(void) {
+    dsd_opts* opts = (dsd_opts*)calloc(1, sizeof(dsd_opts));
+    dsd_state* state = (dsd_state*)calloc(1, sizeof(dsd_state));
+    if (!opts || !state) {
+        free(opts);
+        free(state);
+        DSD_FPRINTF(stderr, "out of memory\n");
+        return 1;
+    }
+
+    initOpts(opts);
+    initState(state);
+
+    char arg0[] = "dsd-neo";
+    char arg1[] = "-m2";
+    char arg2[] = "-s";
+    char arg3[] = "11025";
+    char* argv[] = {arg0, arg1, arg2, arg3, NULL};
+
+    int argc_effective = 0;
+    int exit_rc = -1;
+    int rc = dsd_parse_args(4, argv, opts, state, &argc_effective, &exit_rc);
+    if (rc != DSD_PARSE_CONTINUE) {
+        DSD_FPRINTF(stderr, "expected rc=%d, got %d (exit_rc=%d)\n", DSD_PARSE_CONTINUE, rc, exit_rc);
+        freeState(state);
+        free(opts);
+        free(state);
+        return 1;
+    }
+
+    int test_rc = 0;
+    if (!(opts->frame_p25p1 == 1 && opts->frame_p25p2 == 1 && opts->frame_dmr == 1 && opts->frame_ysf == 1)) {
+        DSD_FPRINTF(stderr, "standalone -m2 should preserve the default frame candidates\n");
+        test_rc = 1;
+    }
+    if (!(opts->mod_cli_lock == 1 && opts->mod_p25p2_profile_lock == 1 && opts->mod_qpsk == 1 && opts->mod_c4fm == 0
+          && opts->mod_gfsk == 0 && state->rf_mod == 1)) {
+        DSD_FPRINTF(stderr, "standalone -m2 did not retain the manual P25p2 QPSK mode\n");
+        test_rc = 1;
+    }
+    if (state->samplesPerSymbol != 2 || state->symbolCenter != 0
+        || state->sps_hunt_idx != DSD_FRAME_SYNC_SPS_PROFILE_6000_4) {
+        DSD_FPRINTF(stderr, "expected low-rate -m2 timing/profile 2/0/%d, got %d/%d/%d\n",
+                    DSD_FRAME_SYNC_SPS_PROFILE_6000_4, state->samplesPerSymbol, state->symbolCenter,
+                    state->sps_hunt_idx);
+        test_rc = 1;
+    }
+
+    freeState(state);
+    free(opts);
+    free(state);
+    return test_rc;
+}
+
+static int
+test_standalone_m3_marks_manual_p25p2_c4fm_path(void) {
+    dsd_opts* opts = (dsd_opts*)calloc(1, sizeof(dsd_opts));
+    dsd_state* state = (dsd_state*)calloc(1, sizeof(dsd_state));
+    if (!opts || !state) {
+        free(opts);
+        free(state);
+        DSD_FPRINTF(stderr, "out of memory\n");
+        return 1;
+    }
+
+    initOpts(opts);
+    initState(state);
+
+    char arg0[] = "dsd-neo";
+    char arg1[] = "-m3";
+    char arg2[] = "-s";
+    char arg3[] = "96000";
+    char* argv[] = {arg0, arg1, arg2, arg3, NULL};
+
+    int argc_effective = 0;
+    int exit_rc = -1;
+    int rc = dsd_parse_args(4, argv, opts, state, &argc_effective, &exit_rc);
+    if (rc != DSD_PARSE_CONTINUE) {
+        DSD_FPRINTF(stderr, "expected rc=%d, got %d (exit_rc=%d)\n", DSD_PARSE_CONTINUE, rc, exit_rc);
+        freeState(state);
+        free(opts);
+        free(state);
+        return 1;
+    }
+
+    int test_rc = 0;
+    if (!(opts->frame_p25p1 == 1 && opts->frame_p25p2 == 1 && opts->frame_dmr == 1 && opts->frame_ysf == 1)) {
+        DSD_FPRINTF(stderr, "standalone -m3 should preserve the default frame candidates\n");
+        test_rc = 1;
+    }
+    if (!(opts->mod_p25p2_c4fm == 1 && opts->mod_cli_lock == 1 && opts->mod_c4fm == 1 && opts->mod_qpsk == 0
+          && opts->mod_gfsk == 0 && state->rf_mod == 0)) {
+        DSD_FPRINTF(stderr, "standalone -m3 did not retain the manual P25p2 C4FM mode\n");
+        test_rc = 1;
+    }
+    if (state->samplesPerSymbol != 20 || state->symbolCenter != 8) {
+        DSD_FPRINTF(stderr, "expected standalone -m3 timing to rescale to 20/8 at 96 kHz, got sps=%d center=%d\n",
+                    state->samplesPerSymbol, state->symbolCenter);
         test_rc = 1;
     }
 
@@ -4341,7 +5649,7 @@ test_trunk_scan_long_options_parse(void) {
 }
 
 static int
-test_trunk_scan_conflicts_with_legacy_scanner(void) {
+test_trunk_scan_conflicts_with_scanner_mode(void) {
     dsd_opts* opts = (dsd_opts*)calloc(1, sizeof(dsd_opts));
     dsd_state* state = (dsd_state*)calloc(1, sizeof(dsd_state));
     if (!opts || !state) {
@@ -4438,6 +5746,96 @@ test_trunk_scan_cli_clears_inherited_channel_map(void) {
 }
 
 static int
+test_trunk_scan_inherited_state_rejects_invalid_runtime_combinations(void) {
+    int test_rc = 0;
+
+    for (int scenario = 0; scenario < 3; scenario++) {
+        dsd_opts* opts = (dsd_opts*)calloc(1, sizeof(dsd_opts));
+        dsd_state* state = (dsd_state*)calloc(1, sizeof(dsd_state));
+        if (!opts || !state) {
+            free(opts);
+            free(state);
+            return 1;
+        }
+        initOpts(opts);
+        initState(state);
+
+        opts->trunk_scan_enabled = 1;
+        if (scenario == 0) {
+            opts->scanner_mode = 1;
+            DSD_SNPRINTF(opts->trunk_scan_targets_csv, sizeof opts->trunk_scan_targets_csv, "%s", "targets.csv");
+        } else if (scenario == 1) {
+            DSD_SNPRINTF(opts->trunk_scan_targets_csv, sizeof opts->trunk_scan_targets_csv, "%s", "targets.csv");
+            DSD_SNPRINTF(opts->chan_in_file, sizeof opts->chan_in_file, "%s", "global_channels.csv");
+        }
+
+        char arg0[] = "dsd-neo";
+        char* argv[] = {arg0, NULL};
+        int argc_effective = 0;
+        int exit_rc = -1;
+        int rc = dsd_parse_args(1, argv, opts, state, &argc_effective, &exit_rc);
+        if (rc != DSD_PARSE_ERROR || exit_rc != 1) {
+            DSD_FPRINTF(stderr, "expected inherited trunk-scan scenario %d to fail, got rc=%d exit_rc=%d\n", scenario,
+                        rc, exit_rc);
+            test_rc = 1;
+        }
+
+        freeState(state);
+        free(opts);
+        free(state);
+    }
+
+    return test_rc;
+}
+
+static int
+test_trunk_scan_rejects_ms_values_outside_range(void) {
+    const char* argv_sets[][3] = {
+        {"dsd-neo", "--trunk-scan-dwell-ms", "249"},
+        {"dsd-neo", "--trunk-scan-activity-hold-ms=600001", NULL},
+    };
+    const int argc_values[] = {3, 2};
+    int test_rc = 0;
+
+    for (size_t i = 0; i < sizeof(argc_values) / sizeof(argc_values[0]); i++) {
+        dsd_opts* opts = (dsd_opts*)calloc(1, sizeof(dsd_opts));
+        dsd_state* state = (dsd_state*)calloc(1, sizeof(dsd_state));
+        if (!opts || !state) {
+            free(opts);
+            free(state);
+            return 1;
+        }
+        initOpts(opts);
+        initState(state);
+
+        char arg0[32];
+        char arg1[64];
+        char arg2[32];
+        DSD_SNPRINTF(arg0, sizeof arg0, "%s", argv_sets[i][0]);
+        DSD_SNPRINTF(arg1, sizeof arg1, "%s", argv_sets[i][1]);
+        if (argv_sets[i][2]) {
+            DSD_SNPRINTF(arg2, sizeof arg2, "%s", argv_sets[i][2]);
+        }
+        char* argv[] = {arg0, arg1, argv_sets[i][2] ? arg2 : NULL, NULL};
+
+        int argc_effective = 0;
+        int exit_rc = -1;
+        int rc = dsd_parse_args(argc_values[i], argv, opts, state, &argc_effective, &exit_rc);
+        if (rc != DSD_PARSE_ERROR || exit_rc != 1) {
+            DSD_FPRINTF(stderr, "expected trunk-scan millisecond option %s to fail, got rc=%d exit_rc=%d\n", arg1, rc,
+                        exit_rc);
+            test_rc = 1;
+        }
+
+        freeState(state);
+        free(opts);
+        free(state);
+    }
+
+    return test_rc;
+}
+
+static int
 test_bootstrap_config_file_rate_rescales_manual_m3_override(void) {
     dsd_opts* opts = (dsd_opts*)calloc(1, sizeof(dsd_opts));
     dsd_state* state = (dsd_state*)calloc(1, sizeof(dsd_state));
@@ -4454,9 +5852,7 @@ test_bootstrap_config_file_rate_rescales_manual_m3_override(void) {
     (void)dsd_unsetenv("DSD_NEO_CONFIG");
     (void)dsd_setenv("DSD_NEO_NO_BOOTSTRAP", "1", 1);
 
-    static const char* ini = "version = 1\n"
-                             "\n"
-                             "[input]\n"
+    static const char* ini = "[input]\n"
                              "source = \"file\"\n"
                              "file_path = \"/tmp/input.wav\"\n"
                              "file_sample_rate = 96000\n";
@@ -4529,9 +5925,7 @@ test_bootstrap_cli_pulse_override_ignores_config_file_rate_timing(void) {
     (void)dsd_unsetenv("DSD_NEO_CONFIG");
     (void)dsd_setenv("DSD_NEO_NO_BOOTSTRAP", "1", 1);
 
-    static const char* ini = "version = 1\n"
-                             "\n"
-                             "[input]\n"
+    static const char* ini = "[input]\n"
                              "source = \"file\"\n"
                              "file_path = \"/tmp/input.wav\"\n"
                              "file_sample_rate = 96000\n";
@@ -4605,9 +5999,7 @@ test_bootstrap_cli_file_override_ignores_config_file_rate_timing(void) {
     (void)dsd_unsetenv("DSD_NEO_CONFIG");
     (void)dsd_setenv("DSD_NEO_NO_BOOTSTRAP", "1", 1);
 
-    static const char* ini = "version = 1\n"
-                             "\n"
-                             "[input]\n"
+    static const char* ini = "[input]\n"
                              "source = \"file\"\n"
                              "file_path = \"/tmp/input.wav\"\n"
                              "file_sample_rate = 96000\n";
@@ -4703,9 +6095,7 @@ test_bootstrap_cli_file_override_uses_cli_rate_for_headerless_open(void) {
     (void)dsd_unsetenv("DSD_NEO_CONFIG");
     (void)dsd_setenv("DSD_NEO_NO_BOOTSTRAP", "1", 1);
 
-    static const char* ini = "version = 1\n"
-                             "\n"
-                             "[input]\n"
+    static const char* ini = "[input]\n"
                              "source = \"file\"\n"
                              "file_path = \"/tmp/input.wav\"\n"
                              "file_sample_rate = 96000\n";
@@ -4828,8 +6218,6 @@ test_bootstrap_cli_rate_override_uses_cli_rate_for_headerless_open(void) {
 
     char ini[1536];
     DSD_SNPRINTF(ini, sizeof ini,
-                 "version = 1\n"
-                 "\n"
                  "[input]\n"
                  "source = \"file\"\n"
                  "file_path = \"%s\"\n"
@@ -4928,9 +6316,14 @@ main(void) {
     rc |= test_help_returns_one_shot_and_does_not_exit();
     rc |= test_invalid_option_returns_error_and_does_not_exit();
     rc |= test_unknown_option_returns_error_and_does_not_exit();
+    rc |= test_frontend_terminal_option_sets_terminal_kind();
+    rc |= test_N_short_option_enables_terminal_frontend();
+    rc |= test_frontend_native_alias_selects_equivalent_headless_frontend();
+    rc |= test_compatibility_short_options_use_current_facilities();
     rc |= test_numeric_options_reject_trailing_junk();
     rc |= test_H_loads_aes256_key_for_both_slots();
     rc |= test_H_zero_key_keeps_dmr_encrypted_audio_muted();
+    rc |= test_H_show_keys_log_reveals_key_material();
     rc |= test_b_loads_basic_privacy_key_and_unmutes_dmr();
     rc |= test_b_zero_key_keeps_dmr_encrypted_audio_muted();
     rc |= test_b_clamps_to_basic_privacy_table_max();
@@ -4941,37 +6334,56 @@ main(void) {
     rc |= test_nxdn_pn95_seed_option_matches_reference_bounds();
     rc |= test_bootstrap_treats_lone_ini_as_config();
     rc |= test_bootstrap_accepts_explicit_config_path_outside_cwd();
+    rc |= test_bootstrap_config_trunking_preserves_terminal_frontend();
+    rc |= test_bootstrap_config_trunking_preserves_N_terminal_alias();
     rc |= test_bootstrap_missing_explicit_config_keeps_autosave_path();
+    rc |= test_bootstrap_rejects_too_long_explicit_config_path();
+    rc |= test_bootstrap_guard_rejects_invalid_arguments();
     rc |= test_bootstrap_validate_config_accepts_external_path();
+    rc |= test_bootstrap_validate_config_strict_warning_exits_two();
     rc |= test_bootstrap_validate_config_reports_trunk_scan_diagnostics();
+    rc |= test_bootstrap_validate_config_rejects_invalid_included_versions();
     rc |= test_bootstrap_list_profiles_accepts_external_config_path();
+    rc |= test_bootstrap_list_profiles_reports_empty_config();
     rc |= test_bootstrap_print_config_normalizes_soapy_shorthand();
     rc |= test_bootstrap_profile_preserves_trunking_with_ncurses_cli();
     rc |= test_bootstrap_inherited_trunk_scan_preserves_ui_only_short_options();
     rc |= test_bootstrap_inherited_trunk_scan_allows_cli_channel_map();
+    rc |= test_bootstrap_inherited_trunk_scan_disables_for_positional_input();
     rc |= test_bootstrap_inherited_trunk_scan_disables_for_long_only_runtime_mode();
     rc |= test_bootstrap_inherited_trunk_scan_preserves_timing_overrides();
     rc |= test_bootstrap_config_one_shots_skip_trunk_scan_runtime_validation();
     rc |= test_bootstrap_profile_disables_autosave();
+    rc |= test_bootstrap_missing_profile_errors_without_applying_config_or_cli();
     rc |= test_bootstrap_cli_call_alert_restores_all_config_filtered_events();
     rc |= test_r_playback_optind_is_first_file_regardless_of_option_order();
     rc |= test_open_mbe_missing_file_leaves_stream_null();
     rc |= test_sdrtrunk_json_forced_dmr_algid_uses_talkgroup_key();
     rc |= test_rdio_long_options_parse();
     rc |= test_frame_log_long_option_parse();
+    rc |= test_p25_sm_log_long_option_parse();
     rc |= test_dmr_debug_burst_long_option_parse();
+    rc |= test_show_keys_long_option_parse();
+    rc |= test_show_keys_after_option_terminator_remains_positional();
     rc |= test_input_source_soapy_roundtrip();
     rc |= test_input_source_soapy_args_roundtrip();
     rc |= test_input_source_rtl_roundtrip();
     rc |= test_input_source_rtltcp_roundtrip();
+    rc |= test_input_source_tcp_ipv4_roundtrip();
     rc |= test_trunk_scan_long_options_parse();
-    rc |= test_trunk_scan_conflicts_with_legacy_scanner();
+    rc |= test_trunk_scan_conflicts_with_scanner_mode();
     rc |= test_trunk_scan_rejects_global_channel_map();
     rc |= test_trunk_scan_cli_clears_inherited_channel_map();
+    rc |= test_trunk_scan_inherited_state_rejects_invalid_runtime_combinations();
+    rc |= test_trunk_scan_rejects_ms_values_outside_range();
     rc |= test_iq_capture_long_options_parse();
     rc |= test_iq_capture_missing_value_returns_error();
     rc |= test_iq_capture_format_missing_value_returns_error();
     rc |= test_iq_capture_max_mb_missing_value_returns_error();
+    rc |= test_iq_capture_max_mb_rejects_invalid_values();
+    rc |= test_symbol_capture_format_missing_value_returns_error();
+    rc |= test_symbol_capture_format_aliases_use_canonical_writer();
+    rc |= test_symbol_capture_format_rejects_unknown_value();
     rc |= test_iq_replay_long_options_parse();
     rc |= test_iq_replay_audio_classifier_respects_radio_guard();
     rc |= test_iq_replay_rate_missing_value_returns_error();
@@ -4983,6 +6395,7 @@ main(void) {
     rc |= test_rtl_udp_control_missing_port_returns_error();
     rc |= test_rtl_udp_control_bind_long_option_parse();
     rc |= test_rtl_udp_control_invalid_bind_returns_error();
+    rc |= test_rtl_udp_control_rejects_malformed_numeric_binds();
     rc |= test_rtl_udp_control_port_too_large_returns_error();
     rc |= test_rtl_udp_control_bind_missing_value_returns_error();
     rc |= test_dmr_baofeng_pc5_long_option_parse();
@@ -4993,20 +6406,23 @@ main(void) {
     rc |= test_dmr_force_algid_long_option_parse();
     rc |= test_dmr_force_algid_long_option_rejects_invalid_value();
     rc |= test_m17_signature_public_key_long_option_parse();
+    rc |= test_m17_signature_public_key_accepts_lowercase_spaced_hex();
     rc |= test_m17_signature_public_key_long_option_rejects_invalid_value();
     rc |= test_m17_signature_public_key_missing_value_returns_error();
     rc |= test_dmr_baofeng_pc5_long_option_rejects_invalid_key();
     rc |= test_f_auto_preset_applies_cli_profile();
     rc |= test_f_ysf_preset_applies_cli_profile();
+    rc |= test_f_dpmr_and_m17_presets_match_documented_letters();
     rc |= test_f_edacs_presets_match_reference_modes();
-    rc |= test_f_legacy_fr_mono_still_supported();
+    rc |= test_f_fr_alias_uses_current_dmr_preset();
     rc |= test_f_dmr_preset_selects_gfsk();
     rc |= test_mg_before_f_dmr_keeps_gfsk_lock();
     rc |= test_mc_before_f_dmr_preserves_c4fm_lock();
-    rc |= test_mc_before_legacy_fr_preserves_c4fm_lock();
-    rc |= test_f_nxdn48_clears_dmr_mono_after_fr();
     rc |= test_bootstrap_config_file_rate_survives_cli_provoice_preset();
+    rc |= test_bootstrap_compact_s_rate_override_clears_config_file_rate();
     rc |= test_s_8000_keeps_valid_symbol_timing_for_provoice();
+    rc |= test_m2_low_rate_preserves_p25p2_profile();
+    rc |= test_standalone_m3_marks_manual_p25p2_c4fm_path();
     rc |= test_m3_override_survives_file_rate_rescale_after_f2();
     rc |= test_bootstrap_config_file_rate_rescales_manual_m3_override();
     rc |= test_bootstrap_cli_pulse_override_ignores_config_file_rate_timing();

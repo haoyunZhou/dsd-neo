@@ -27,6 +27,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include "dmr_pdu_internal.h"
+#include "dmr_text.h"
 #include "dsd-neo/core/opts_fwd.h"
 #include "dsd-neo/core/safe_api.h"
 #include "dsd-neo/core/state_fwd.h"
@@ -101,6 +104,9 @@ utf16_to_text(dsd_state* state, uint8_t wr, uint16_t len, const uint8_t* input) 
     //add elipses to indicate this is possibly truncated
 
     //debug
+    if (wr == 1) {
+        dsd_event_history_mark_dirty(&state->event_history_s[slot]);
+    }
 }
 
 void
@@ -137,40 +143,116 @@ utf8_to_text(dsd_state* state, uint8_t wr, uint16_t len, const uint8_t* input) {
     }
 
     //add elipses to indicate this is possibly truncated
+    if (wr == 1) {
+        dsd_event_history_mark_dirty(&state->event_history_s[slot]);
+    }
+}
+
+static void
+dmr_sd_pdu_store_text(dsd_state* state, uint8_t slot, const char* text) {
+    Event_History* item = &state->event_history_s[slot].Event_History_Items[0];
+    DSD_SNPRINTF(item->text_message, sizeof(item->text_message), "%s", text != NULL ? text : "");
+    dsd_event_history_item_set_metadata(item, DSD_EVENT_SEVERITY_INFO, DSD_EVENT_CATEGORY_DATA);
+    dsd_event_history_mark_dirty(&state->event_history_s[slot]);
+}
+
+static void
+dmr_sd_pdu_print_raw(const uint8_t* dmr_pdu, uint16_t len) {
+    DSD_FPRINTF(stderr, "\n Short Data Raw: ");
+    for (uint16_t i = 0; i < len; i++) {
+        DSD_FPRINTF(stderr, "[%02X]", dmr_pdu[i]);
+    }
+}
+
+static void
+dmr_sd_pdu_copy_location(const dsd_opts* opts, dsd_state* state, uint8_t slot, uint16_t len, const uint8_t* dmr_pdu) {
+    dmr_locn(opts, state, len, dmr_pdu);
+    DSD_SNPRINTF(state->event_history_s[slot].Event_History_Items[0].gps_s,
+                 sizeof(state->event_history_s[slot].Event_History_Items[0].gps_s), "%s", state->dmr_lrrp_gps[slot]);
+    dsd_event_history_item_set_metadata(&state->event_history_s[slot].Event_History_Items[0], DSD_EVENT_SEVERITY_INFO,
+                                        DSD_EVENT_CATEGORY_DATA);
+    dsd_event_history_mark_dirty(&state->event_history_s[slot]);
+}
+
+static void
+dmr_sd_pdu_append_result_flags(char* summary, size_t summary_size, const dmr_text_result* result) {
+    if (result->malformed) {
+        dsd_append(summary, summary_size, "malformed input replaced; ");
+    }
+    if (result->truncated) {
+        dsd_append(summary, summary_size, "display truncated; ");
+    }
+}
+
+void
+dmr_sd_pdu_process(dsd_opts* opts, dsd_state* state, uint16_t len, const uint8_t* dmr_pdu, uint8_t packet_crc_valid) {
+    if (opts == NULL || state == NULL || (dmr_pdu == NULL && len != 0U)) {
+        return;
+    }
+
+    uint8_t slot = (uint8_t)(state->currentslot & 1U);
+    uint32_t source = state->dmr_lrrp_source[slot];
+    uint32_t target = state->dmr_lrrp_target[slot];
+    char summary[2300];
+    DSD_MEMSET(summary, 0, sizeof(summary));
+    DSD_SNPRINTF(summary, sizeof(summary), "Short Data SRC: %u; TGT: %u; ", source, target);
+    dmr_sd_pdu_store_text(state, slot, "");
+
+    if (state->data_header_format[slot] == 13U) {
+        uint8_t dd_format = state->data_header_dd_format[slot];
+        if (dd_format >= 0x12U && dd_format <= 0x18U) {
+            size_t payload_len = 0U;
+            dmr_text_result result;
+            if (dmr_short_data_payload_bytes((size_t)len * 8U, state->data_header_bit_padding[slot], &payload_len)
+                != 0) {
+                DSD_FPRINTF(stderr, "\n Short Data Text: invalid bit padding (%u bits)",
+                            state->data_header_bit_padding[slot]);
+                char detail[96];
+                DSD_SNPRINTF(detail, sizeof(detail), "declared %s; invalid/non-byte-aligned padding; ",
+                             dmr_defined_data_encoding_name(dd_format));
+                dsd_append(summary, sizeof(summary), detail);
+            } else {
+                (void)dmr_decode_defined_short_data(dd_format, dmr_pdu, payload_len, packet_crc_valid, &result);
+                if (result.compatibility) {
+                    DSD_FPRINTF(stderr, "\n Short Data Text (declared UTF-32; decoded UTF-16BE compatibility): %s",
+                                result.text);
+                } else {
+                    DSD_FPRINTF(stderr, "\n Short Data Text (declared %s; decoded %s): %s", result.declared_encoding,
+                                result.effective_encoding, result.text);
+                }
+                dmr_sd_pdu_store_text(state, slot, result.text);
+                char detail[160];
+                DSD_SNPRINTF(detail, sizeof(detail), "declared %s; decoded %s; ", result.declared_encoding,
+                             result.effective_encoding);
+                dsd_append(summary, sizeof(summary), detail);
+                dmr_sd_pdu_append_result_flags(summary, sizeof(summary), &result);
+                dsd_append(summary, sizeof(summary), "Text: ");
+                dsd_append(summary, sizeof(summary), result.text);
+                dsd_append(summary, sizeof(summary), "; ");
+            }
+        } else {
+            char detail[96];
+            DSD_SNPRINTF(detail, sizeof(detail), "DD format 0x%02X; raw/unsupported encoding; ", dd_format);
+            dsd_append(summary, sizeof(summary), detail);
+            dmr_sd_pdu_print_raw(dmr_pdu, len);
+            dmr_sd_pdu_copy_location(opts, state, slot, len, dmr_pdu);
+        }
+    } else {
+        uint16_t bounded_len = len;
+        if (bounded_len >= (127U * 18U)) {
+            bounded_len = 127U * 18U;
+        }
+        utf8_to_text(state, 0, bounded_len, dmr_pdu);
+        dsd_append(summary, sizeof(summary), "raw short-data payload; ");
+    }
+
+    watchdog_event_datacall(opts, state, source, target, summary, slot);
 }
 
 void
 dmr_sd_pdu(dsd_opts* opts, dsd_state* state, uint16_t len, const uint8_t* DMR_PDU) {
-
-    uint8_t slot = state->currentslot;
-    uint16_t offset = 0; //sanity check of sorts, prevent extra long line print outs in the console
-    if (len > 23) {
-        offset = 23;
-    }
-
-    if (state->data_header_format[state->currentslot] == 13) //only short data: defined format (testing)
-    {
-        utf8_to_text(state, 0, len - offset, DMR_PDU + offset);
-        dmr_locn(opts, state, len, DMR_PDU);
-        DSD_SNPRINTF(state->event_history_s[slot].Event_History_Items[0].gps_s,
-                     sizeof(state->event_history_s[slot].Event_History_Items[0].gps_s), "%s",
-                     state->dmr_lrrp_gps[slot]);
-        state->event_history_s[slot].Event_History_Items[0].color_pair =
-            4; //Remus, add this line to a decode to change its line color
-    } else {
-        if (len >= (127 * 18)) {
-            len = 127 * 18; //sanity check of sorts, prevent extra long line print outs in the console
-        }
-        utf8_to_text(state, 0, len, DMR_PDU); //generic catch-all to see if anything relevant is there
-    }
-
-    //dump to event history
-    uint32_t source = state->dmr_lrrp_source[slot];
-    uint32_t target = state->dmr_lrrp_target[slot];
-    char comp_string[500];
-    DSD_MEMSET(comp_string, 0, sizeof(comp_string));
-    DSD_SNPRINTF(comp_string, sizeof(comp_string), "Short Data SRC: %d; TGT: %d; ", source, target);
-    watchdog_event_datacall(opts, state, source, target, comp_string, slot);
+    /* Public compatibility entry point: strict decoding only, with no CRC-proven transmitter workaround. */
+    dmr_sd_pdu_process(opts, state, len, DMR_PDU, 0U);
 }
 
 //reading ETSI, seems like these aren't compressed, just that they are preset indexed values on the radio
@@ -523,13 +605,17 @@ decode_ip_pdu_handle_udp_service_core(dsd_opts* opts, dsd_state* state, uint8_t 
         case 4001:
             DSD_FPRINTF(stderr, "LRRP;");
             dmr_lrrp(opts, state, payload_len, src24, dst24, payload, 1);
-            state->event_history_s[slot].Event_History_Items[0].color_pair = 4;
+            dsd_event_history_item_set_metadata(&state->event_history_s[slot].Event_History_Items[0],
+                                                DSD_EVENT_SEVERITY_INFO, DSD_EVENT_CATEGORY_DATA);
+            dsd_event_history_mark_dirty(&state->event_history_s[slot]);
             return 1;
         case 4004:
             DSD_FPRINTF(stderr, "XCMP;");
             DSD_SNPRINTF(state->dmr_lrrp_gps[slot], sizeof(state->dmr_lrrp_gps[slot]), "XCMP SRC: %d; DST: %d;", src24,
                          dst24);
-            state->event_history_s[slot].Event_History_Items[0].color_pair = 4;
+            dsd_event_history_item_set_metadata(&state->event_history_s[slot].Event_History_Items[0],
+                                                DSD_EVENT_SEVERITY_INFO, DSD_EVENT_CATEGORY_DATA);
+            dsd_event_history_mark_dirty(&state->event_history_s[slot]);
             return 1;
         case 4005: {
             DSD_FPRINTF(stderr, "ARS;");
@@ -1218,8 +1304,8 @@ dmr_lrrp_write_file_if_needed(const dsd_opts* opts, const dmr_lrrp_parse_result*
     }
     char timestr[9];
     char datestr[11];
-    getTimeC_buf(timestr);
-    getDateS_buf(datestr);
+    (void)dsd_format_local_datetime(time(NULL), DSD_LOCAL_DATETIME_TIME_COLON, timestr, sizeof timestr);
+    (void)dsd_format_local_datetime(time(NULL), DSD_LOCAL_DATETIME_DATE_SLASH, datestr, sizeof datestr);
     FILE* pFile = dsd_fopen_private(opts->lrrp_out_file, "a");
     if (pFile == NULL) {
         return;
@@ -1454,8 +1540,8 @@ dmr_locn_write_file(const dsd_opts* opts, const dsd_state* state, double latitud
     }
     char timestr[9];
     char datestr[11];
-    getTimeC_buf(timestr);
-    getDateS_buf(datestr);
+    (void)dsd_format_local_datetime(time(NULL), DSD_LOCAL_DATETIME_TIME_COLON, timestr, sizeof timestr);
+    (void)dsd_format_local_datetime(time(NULL), DSD_LOCAL_DATETIME_DATE_SLASH, datestr, sizeof datestr);
     FILE* pFile = dsd_fopen_private(opts->lrrp_out_file, "a");
     if (pFile == NULL) {
         return;

@@ -87,7 +87,7 @@ radio protocols and vendor privacy modes. These helpers include AES, DES/TDEA,
 RC4, RC2, and protocol-specific keystream handling.
 
 Those algorithms are not a general-purpose security boundary for DSD-neo users.
-Legacy algorithms such as DES, RC4, and RC2 are retained only so DSD-neo can
+Weak algorithms such as DES, RC4, and RC2 are retained only so DSD-neo can
 decode interoperable protocol traffic when a user is legally authorized and
 explicitly supplies the required key or keystream material. They should not be
 used as a basis for new systems or new confidentiality designs.
@@ -119,7 +119,8 @@ The project applies the following controls:
   and MSVC targets, with release verification in CI
 - exclusive private sibling temp files for atomic user config, IQ metadata, and
   Rdio sidecar replacement
-- redaction guardrails for key/keystream output paths
+- redaction guardrails for key/keystream output paths, with intentional radio key/keystream reveal limited to the CLI-only
+  `--show-keys` flag and shared redaction formatter helpers
 - sanitizer CI for AddressSanitizer and UndefinedBehaviorSanitizer
 - ThreadSanitizer preset for threading-sensitive local validation
 - libFuzzer smoke targets for selected file, metadata, config, and protocol

@@ -9,7 +9,7 @@ The CTest suite includes focused tests for:
 
 - runtime configuration, CLI parsing, rings, hooks, shutdown, and telemetry
 - platform audio concealment, atomics, files, and timing primitives
-- DSP filters, demodulators, FLL/TED, resamplers, SIMD helpers, and symbol paths
+- DSP filters, demodulators, CQPSK timing/carrier recovery, resamplers, SIMD helpers, and symbol paths
 - IO capture/replay metadata, UDP/TCP metrics, RTL/Soapy controls, and retune
   behavior
 - protocol behavior for DMR, M17, NXDN, P25 Phase 1/2, and trunking state
@@ -29,11 +29,14 @@ ctest --preset dev-debug --output-on-failure
 
 ## Continuous Integration
 
-GitHub Actions runs tests and quality checks on pull requests and pushes to the
-primary branch. Required checks include cross-platform builds, sanitizer tests,
-static analysis, workflow linting, dependency review, secret scanning, OSV
-scanning, repository guardrails for secret redaction and workflow source/download
-pinning, fuzz smoke tests, release tag validation, and install/package validation.
+GitHub Actions runs tests and quality checks on pull requests, primary-branch
+pushes, tags, schedules, and manual dispatches. Coverage varies by event:
+cross-platform builds, sanitizer tests, static analysis, workflow linting,
+secret scanning, OSV scanning, repository guardrails for secret redaction and
+workflow source/download pinning, fuzz smoke tests, and install/package
+validation run where their workflows declare those events. Dependency review is
+PR-only, release tag validation is tag-only, and extended fuzzing is scheduled
+or manually dispatched.
 
 ## Regression Test Requirement
 

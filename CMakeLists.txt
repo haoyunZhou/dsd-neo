@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(dsd-neo VERSION 2.0.1 LANGUAGES C CXX)
+project(dsd-neo VERSION 2.4.0 LANGUAGES C CXX)
 if(POLICY CMP0083)
     cmake_policy(SET CMP0083 NEW)
 endif()
@@ -80,6 +80,7 @@ option(
 )
 option(DSD_ENABLE_RTLSDR "Enable RTL-SDR backend support" ON)
 option(DSD_ENABLE_SOAPYSDR "Enable SoapySDR backend support" ON)
+option(DSD_ENABLE_TERMINAL_UI "Enable ncurses/PDCurses terminal frontend" ON)
 set(DSD_SOAPYSDR_MIN_VERSION "0.8.1")
 option(
     DSD_REQUIRE_RTLSDR
@@ -510,7 +511,7 @@ endif()
 find_package(LibSndFile REQUIRED)
 find_package(OpenSSL 3.0 REQUIRED)
 
-# Require mbelib-neo 2.x (no legacy mbelib fallback). The 2.x ABI provides the
+# Require mbelib-neo 2.x. Its ABI provides the
 # soft-decision frame decode and result-based processing APIs used by dsd-neo.
 set(_DSD_MBE_REQUIRED_VERSION 2.0)
 find_package(mbe-neo ${_DSD_MBE_REQUIRED_VERSION} CONFIG REQUIRED)
@@ -522,37 +523,18 @@ else()
         "mbe-neo package found but exported targets are missing"
     )
 endif()
-# Ensure includes for legacy-style #include <mbelib.h>
-# by adding the directory that directly contains mbelib.h
+# Test and analyzer targets compile some mbe-consuming sources directly, so
+# retain the package include root independently of link propagation.
 get_target_property(
     _MBE_TARGET_INCLUDE_DIRS
     ${MBE_LINK_TARGET}
     INTERFACE_INCLUDE_DIRECTORIES
 )
 if(NOT _MBE_TARGET_INCLUDE_DIRS)
-    set(_MBE_TARGET_INCLUDE_DIRS "")
-endif()
-set(_MBE_INCLUDE_HINTS "")
-foreach(_MBE_TARGET_INCLUDE_DIR IN LISTS _MBE_TARGET_INCLUDE_DIRS)
-    if(
-        IS_ABSOLUTE "${_MBE_TARGET_INCLUDE_DIR}"
-        AND NOT _MBE_TARGET_INCLUDE_DIR MATCHES "^\\$<"
+    message(
+        FATAL_ERROR
+        "mbe-neo package found but its exported target has no include directories"
     )
-        list(
-            APPEND _MBE_INCLUDE_HINTS
-            "${_MBE_TARGET_INCLUDE_DIR}"
-            "${_MBE_TARGET_INCLUDE_DIR}/mbelib-neo"
-        )
-    endif()
-endforeach()
-find_path(
-    MBE_INCLUDE_DIR
-    NAMES mbelib.h
-    HINTS ${_MBE_INCLUDE_HINTS}
-    PATH_SUFFIXES mbelib-neo
-)
-if(NOT MBE_INCLUDE_DIR)
-    message(FATAL_ERROR "mbe-neo 2.x package found, but mbelib.h was not found")
 endif()
 
 include(CheckCSourceCompiles)
@@ -564,7 +546,7 @@ if(DEFINED CMAKE_TRY_COMPILE_TARGET_TYPE)
         "${CMAKE_TRY_COMPILE_TARGET_TYPE}"
     )
 endif()
-set(CMAKE_REQUIRED_INCLUDES "${MBE_INCLUDE_DIR}")
+set(CMAKE_REQUIRED_INCLUDES ${_MBE_TARGET_INCLUDE_DIRS})
 if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
     string(APPEND CMAKE_REQUIRED_FLAGS " -Werror=implicit-function-declaration")
 endif()
@@ -574,7 +556,7 @@ check_c_source_compiles(
     [[
 #include <stddef.h>
 #include <stdint.h>
-#include <mbelib.h>
+#include <mbelib-neo/mbelib.h>
 
 int main(void) {
     const mbe_soft_bit imbe_soft[8][23] = {{{0}}};
@@ -710,62 +692,72 @@ message(STATUS "Radio pipeline available: ${DSD_HAS_RADIO}")
 # Curses library selection:
 # - Windows: PDCurses
 # - POSIX: ncurses via CMake's FindCurses
-if(WIN32)
-    find_package(PDCurses REQUIRED)
-    set(CURSES_LIBRARIES PDCurses::PDCurses)
-    set(CURSES_INCLUDE_DIRS ${PDCURSES_INCLUDE_DIRS})
-    add_compile_definitions(DSD_USE_PDCURSES)
-    include(CheckCSourceCompiles)
-    set(_CMAKE_REQUIRED_DEFINITIONS_SAVE "${CMAKE_REQUIRED_DEFINITIONS}")
-    set(_CMAKE_REQUIRED_INCLUDES_SAVE "${CMAKE_REQUIRED_INCLUDES}")
-    set(_CMAKE_REQUIRED_LIBRARIES_SAVE "${CMAKE_REQUIRED_LIBRARIES}")
-    set(CMAKE_REQUIRED_DEFINITIONS -DPDC_WIDE)
-    set(CMAKE_REQUIRED_INCLUDES ${PDCURSES_INCLUDE_DIRS})
-    set(CMAKE_REQUIRED_LIBRARIES PDCurses::PDCurses)
-    unset(DSD_HAS_PDCURSES_WIDE_API CACHE)
-    check_c_source_compiles(
+if(DSD_ENABLE_TERMINAL_UI)
+    if(WIN32)
+        find_package(PDCurses REQUIRED)
+        set(CURSES_LIBRARIES PDCurses::PDCurses)
+        set(CURSES_INCLUDE_DIRS ${PDCURSES_INCLUDE_DIRS})
+        add_compile_definitions(DSD_USE_PDCURSES)
+        include(CheckCSourceCompiles)
+        set(_CMAKE_REQUIRED_DEFINITIONS_SAVE "${CMAKE_REQUIRED_DEFINITIONS}")
+        set(_CMAKE_REQUIRED_INCLUDES_SAVE "${CMAKE_REQUIRED_INCLUDES}")
+        set(_CMAKE_REQUIRED_LIBRARIES_SAVE "${CMAKE_REQUIRED_LIBRARIES}")
+        set(CMAKE_REQUIRED_DEFINITIONS -DPDC_WIDE)
+        set(CMAKE_REQUIRED_INCLUDES ${PDCURSES_INCLUDE_DIRS})
+        set(CMAKE_REQUIRED_LIBRARIES PDCurses::PDCurses)
+        unset(DSD_HAS_PDCURSES_WIDE_API CACHE)
+        check_c_source_compiles(
+            "
+            #include <wchar.h>
+            #include <curses.h>
+            int main(void) {
+                static const wchar_t glyph[] = {0x2588, 0};
+                return addwstr(glyph);
+            }
         "
-        #include <wchar.h>
-        #include <curses.h>
-        int main(void) {
-            static const wchar_t glyph[] = {0x2588, 0};
-            return addwstr(glyph);
-        }
-    "
-        DSD_HAS_PDCURSES_WIDE_API
-    )
-    set(CMAKE_REQUIRED_DEFINITIONS "${_CMAKE_REQUIRED_DEFINITIONS_SAVE}")
-    set(CMAKE_REQUIRED_INCLUDES "${_CMAKE_REQUIRED_INCLUDES_SAVE}")
-    set(CMAKE_REQUIRED_LIBRARIES "${_CMAKE_REQUIRED_LIBRARIES_SAVE}")
-    unset(_CMAKE_REQUIRED_DEFINITIONS_SAVE)
-    unset(_CMAKE_REQUIRED_INCLUDES_SAVE)
-    unset(_CMAKE_REQUIRED_LIBRARIES_SAVE)
-    if(DSD_HAS_PDCURSES_WIDE_API)
-        add_compile_definitions(DSD_HAS_PDCURSES_WIDE_API=1 PDC_WIDE)
+            DSD_HAS_PDCURSES_WIDE_API
+        )
+        set(CMAKE_REQUIRED_DEFINITIONS "${_CMAKE_REQUIRED_DEFINITIONS_SAVE}")
+        set(CMAKE_REQUIRED_INCLUDES "${_CMAKE_REQUIRED_INCLUDES_SAVE}")
+        set(CMAKE_REQUIRED_LIBRARIES "${_CMAKE_REQUIRED_LIBRARIES_SAVE}")
+        unset(_CMAKE_REQUIRED_DEFINITIONS_SAVE)
+        unset(_CMAKE_REQUIRED_INCLUDES_SAVE)
+        unset(_CMAKE_REQUIRED_LIBRARIES_SAVE)
+        if(DSD_HAS_PDCURSES_WIDE_API)
+            add_compile_definitions(DSD_HAS_PDCURSES_WIDE_API=1 PDC_WIDE)
+        endif()
+        message(STATUS "Curses backend: PDCurses")
+        message(
+            STATUS
+            "PDCurses wide-character API: ${DSD_HAS_PDCURSES_WIDE_API}"
+        )
+    else()
+        find_package(Curses REQUIRED)
+        # Some ncurses installs do not provide a top-level curses.h shim in the
+        # include root. Our code includes <curses.h>, so add the ncursesw subdir
+        # when needed.
+        if(CURSES_NEED_WIDE)
+            foreach(_curses_inc IN LISTS CURSES_INCLUDE_DIRS)
+                if(
+                    EXISTS "${_curses_inc}/ncursesw/curses.h"
+                    AND NOT EXISTS "${_curses_inc}/curses.h"
+                )
+                    list(APPEND CURSES_INCLUDE_DIRS "${_curses_inc}/ncursesw")
+                endif()
+            endforeach()
+            list(REMOVE_DUPLICATES CURSES_INCLUDE_DIRS)
+        endif()
+        message(STATUS "Curses backend: ncurses")
     endif()
-    message(STATUS "Curses backend: PDCurses")
-    message(STATUS "PDCurses wide-character API: ${DSD_HAS_PDCURSES_WIDE_API}")
 else()
-    find_package(Curses REQUIRED)
-    # Some ncurses installs do not provide a top-level curses.h shim in the
-    # include root. Our code includes <curses.h>, so add the ncursesw subdir
-    # when needed.
-    if(CURSES_NEED_WIDE)
-        foreach(_curses_inc IN LISTS CURSES_INCLUDE_DIRS)
-            if(
-                EXISTS "${_curses_inc}/ncursesw/curses.h"
-                AND NOT EXISTS "${_curses_inc}/curses.h"
-            )
-                list(APPEND CURSES_INCLUDE_DIRS "${_curses_inc}/ncursesw")
-            endif()
-        endforeach()
-        list(REMOVE_DUPLICATES CURSES_INCLUDE_DIRS)
-    endif()
-    message(STATUS "Curses backend: ncurses")
+    set(CURSES_INCLUDE_DIRS "")
+    set(CURSES_LIBRARIES "")
+    set(DSD_HAS_PDCURSES_WIDE_API OFF)
+    message(STATUS "Terminal UI disabled: curses discovery skipped")
 endif()
 
 find_package(CODEC2)
-find_package(CURL)
+find_package(CURL 7.56.0)
 
 # Audio backend selection
 option(
@@ -788,12 +780,7 @@ else()
     message(STATUS "Audio backend: PulseAudio")
 endif()
 
-# Aggregate include directories; when using the modern package, we still add
-# the mbelib-neo leaf include directory so #include <mbelib.h> continues to work.
-set(_PUBLIC_INCLUDES ${LIBSNDFILE_INCLUDE_DIR} ${CURSES_INCLUDE_DIRS})
-if(MBE_INCLUDE_DIR)
-    list(APPEND _PUBLIC_INCLUDES ${MBE_INCLUDE_DIR})
-endif()
+set(_PUBLIC_INCLUDES ${LIBSNDFILE_INCLUDE_DIR} ${_MBE_TARGET_INCLUDE_DIRS})
 
 # Audio backend includes and libraries
 set(AUDIO_SYSTEM_LIBS "")
@@ -808,12 +795,7 @@ else()
     set(AUDIO_LIBS ${PULSEAUDIO_SIMPLE_LIBRARY} ${PULSEAUDIO_LIBRARY})
 endif()
 
-set(LIBS
-    ${MBE_LINK_TARGET}
-    ${LIBSNDFILE_LIBRARIES}
-    ${AUDIO_LIBS}
-    ${CURSES_LIBRARIES}
-)
+set(LIBS ${MBE_LINK_TARGET} ${LIBSNDFILE_LIBRARIES} ${AUDIO_LIBS})
 
 # -----------------------------------------------------------------------------
 # Optional feature interface targets
@@ -974,12 +956,13 @@ add_subdirectory(src/core)
 add_subdirectory(src/dsp)
 add_subdirectory(src/io)
 add_subdirectory(src/runtime)
-add_subdirectory(src/ui)
 add_subdirectory(src/protocol)
 add_subdirectory(src/crypto)
 add_subdirectory(src/fec)
 add_subdirectory(src/third_party)
 add_subdirectory(src/engine)
+add_subdirectory(src/app_control)
+add_subdirectory(src/ui)
 add_subdirectory(apps)
 # Unit tests are built when BUILD_TESTING is enabled.
 if(BUILD_TESTING)

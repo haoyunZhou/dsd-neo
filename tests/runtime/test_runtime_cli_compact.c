@@ -87,6 +87,26 @@ test_frame_log_consumes_path_and_leaves_short_opts(void) {
 }
 
 static int
+test_p25_sm_log_consumes_path_and_leaves_short_opts(void) {
+    char arg0[] = "dsd-neo";
+    char arg1[] = "--p25-sm-log";
+    char arg2[] = "p25-sm.log";
+    char arg3[] = "-fi";
+    char* argv[] = {arg0, arg1, arg2, arg3, NULL};
+
+    int new_argc = dsd_cli_compact_args(4, argv);
+    if (new_argc != 2) {
+        DSD_FPRINTF(stderr, "expected new_argc=2, got %d\n", new_argc);
+        return 1;
+    }
+    if (argv[1] == NULL || strcmp(argv[1], "-fi") != 0) {
+        DSD_FPRINTF(stderr, "expected argv[1] to be \"-fi\", got \"%s\"\n", argv[1] ? argv[1] : "(null)");
+        return 1;
+    }
+    return 0;
+}
+
+static int
 test_vendor_privacy_long_opts_are_removed(void) {
     char arg0[] = "dsd-neo";
     char arg1[] = "--dmr-baofeng-pc5";
@@ -126,6 +146,53 @@ test_dmr_debug_burst_long_option_is_removed(void) {
     }
     if (argv[1] == NULL || strcmp(argv[1], "-fi") != 0) {
         DSD_FPRINTF(stderr, "expected argv[1] to be \"-fi\", got \"%s\"\n", argv[1] ? argv[1] : "(null)");
+        return 1;
+    }
+    return 0;
+}
+
+static int
+test_show_keys_long_option_is_removed(void) {
+    char arg0[] = "dsd-neo";
+    char arg1[] = "--show-keys";
+    char arg2[] = "-fi";
+    char* argv[] = {arg0, arg1, arg2, NULL};
+
+    int new_argc = dsd_cli_compact_args(3, argv);
+    if (new_argc != 2) {
+        DSD_FPRINTF(stderr, "expected new_argc=2, got %d\n", new_argc);
+        return 1;
+    }
+    if (argv[1] == NULL || strcmp(argv[1], "-fi") != 0) {
+        DSD_FPRINTF(stderr, "expected argv[1] to be \"-fi\", got \"%s\"\n", argv[1] ? argv[1] : "(null)");
+        return 1;
+    }
+    return 0;
+}
+
+static int
+test_option_terminator_preserves_later_show_keys_argument(void) {
+    char arg0[] = "dsd-neo";
+    char arg1[] = "--";
+    char arg2[] = "--show-keys";
+    char arg3[] = "-fi";
+    char* argv[] = {arg0, arg1, arg2, arg3, NULL};
+
+    int new_argc = dsd_cli_compact_args(4, argv);
+    if (new_argc != 4) {
+        DSD_FPRINTF(stderr, "expected new_argc=4, got %d\n", new_argc);
+        return 1;
+    }
+    if (argv[1] == NULL || strcmp(argv[1], "--") != 0) {
+        DSD_FPRINTF(stderr, "expected argv[1] to be \"--\", got \"%s\"\n", argv[1] ? argv[1] : "(null)");
+        return 1;
+    }
+    if (argv[2] == NULL || strcmp(argv[2], "--show-keys") != 0) {
+        DSD_FPRINTF(stderr, "expected argv[2] to be \"--show-keys\", got \"%s\"\n", argv[2] ? argv[2] : "(null)");
+        return 1;
+    }
+    if (argv[3] == NULL || strcmp(argv[3], "-fi") != 0) {
+        DSD_FPRINTF(stderr, "expected argv[3] to be \"-fi\", got \"%s\"\n", argv[3] ? argv[3] : "(null)");
         return 1;
     }
     return 0;
@@ -301,8 +368,11 @@ main(void) {
     rc |= test_config_with_path_consumes_only_path();
     rc |= test_config_equals_form_is_removed();
     rc |= test_frame_log_consumes_path_and_leaves_short_opts();
+    rc |= test_p25_sm_log_consumes_path_and_leaves_short_opts();
     rc |= test_vendor_privacy_long_opts_are_removed();
     rc |= test_dmr_debug_burst_long_option_is_removed();
+    rc |= test_show_keys_long_option_is_removed();
+    rc |= test_option_terminator_preserves_later_show_keys_argument();
     rc |= test_rtl_udp_control_consumes_port_and_leaves_short_opts();
     rc |= test_rtl_udp_control_missing_port_does_not_consume_next_option();
     rc |= test_rtl_udp_control_bind_consumes_address_and_leaves_short_opts();

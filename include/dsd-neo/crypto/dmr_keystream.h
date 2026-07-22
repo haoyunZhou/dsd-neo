@@ -22,25 +22,27 @@
 extern "C" {
 #endif
 
-void tyt_ep_aes_keystream_creation(dsd_state* state, char* input);
-void tyt_ap_pc4_keystream_creation(dsd_state* state, const char* input);
-void retevis_rc2_keystream_creation(dsd_state* state, const char* input);
+void tyt_ep_aes_keystream_creation(dsd_state* state, const char* input, int show_keys);
+void tyt_ap_pc4_keystream_creation(dsd_state* state, const char* input, int show_keys);
+void retevis_rc2_keystream_creation(dsd_state* state, const char* input, int show_keys);
 int retevis_rc2_apply_frame49(dsd_state* state, char ambe_d[49]);
-int baofeng_ap_pc5_keystream_creation(dsd_state* state, const char* input);
+int baofeng_ap_pc5_keystream_creation(dsd_state* state, const char* input, int show_keys);
 int baofeng_pc5_apply_frame49(const dsd_state* state, char ambe_d[49]);
-int connect_systems_ee72_key_creation(dsd_state* state, const char* input);
-void ken_dmr_scrambler_keystream_creation(dsd_state* state, char* input);
+int connect_systems_ee72_key_creation(dsd_state* state, const char* input, int show_keys);
+void ken_dmr_scrambler_keystream_creation(dsd_state* state, char* input, int show_keys);
 int ken_dmr_scrambler_apply_frame49(dsd_state* state, int slot, char ambe_d[49]);
-void anytone_bp_keystream_creation(dsd_state* state, char* input);
+void anytone_bp_keystream_creation(dsd_state* state, char* input, int show_keys);
 int anytone_bp_apply_frame49(dsd_state* state, int slot, char ambe_d[49]);
 int dmr_parse_static_keystream_spec(const char* input, uint8_t out_bits[882], int* out_mod, int* out_frame_mode,
                                     int* out_frame_off, int* out_frame_step, char* err, size_t err_cap);
-void straight_mod_xor_keystream_creation(dsd_state* state, const char* input);
+void straight_mod_xor_keystream_creation(dsd_state* state, const char* input, int show_keys);
 void straight_mod_xor_apply_frame49(dsd_state* state, int slot, char ambe_d[49]);
 int dmr_ambe49_is_default_silence(const char ambe_d[49]);
 int dmr_ambe49_has_zero_tail(const char ambe_d[49]);
-int dmr_ambe49_should_skip_voice_stream(const char ambe_d[49]);
+int dmr_ambe49_should_skip_crypto(const char ambe_d[49]);
 int dmr_voice_stream_apply_frame49(const uint8_t* ks_bits, long int* bit_counter, int algid, char ambe_d[49]);
+/** Advance the DMR RC4 message indicator by one 32-bit LFSR cycle. */
+uint32_t dmr_mi_advance32(uint32_t mi);
 int dmr_basic_privacy_apply_frame49(unsigned long long key_id, char ambe_d[49]);
 int tyt_ap_pc4_apply_frame49(const dsd_state* state, char ambe_d[49]);
 int tyt_ep_aes_apply_frame49(const dsd_state* state, char ambe_d[49]);

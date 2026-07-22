@@ -10,8 +10,8 @@
  * 2022-12 DSD-FME Florida Man Edition
  *-----------------------------------------------------------------------------*/
 
+#include <dsd-neo/core/ambe_interleave.h>
 #include <dsd-neo/core/audio.h>
-#include <dsd-neo/core/cleanup.h>
 #include <dsd-neo/core/dibit.h>
 #include <dsd-neo/core/dsd_time.h>
 #include <dsd-neo/core/events.h>
@@ -26,15 +26,16 @@
 #include <dsd-neo/platform/file_compat.h>
 #include <dsd-neo/platform/platform.h>
 #include <dsd-neo/protocol/dmr/dmr.h>
-#include <dsd-neo/protocol/dmr/dmr_const.h>
 #include <dsd-neo/protocol/dmr/dmr_trunk_sm.h>
 #include <dsd-neo/runtime/colors.h>
 #include <dsd-neo/runtime/exitflag.h>
+#include <dsd-neo/runtime/shutdown.h>
 #include <dsd-neo/runtime/telemetry.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
+#include "dmr_cach.h"
 #include "dmr_confidence.h"
 #include "dsd-neo/core/opts_fwd.h"
 #include "dsd-neo/core/safe_api.h"
@@ -45,10 +46,6 @@ typedef enum {
     DMR_BS_ACTION_SKIP,
     DMR_BS_ACTION_END,
 } dmr_bs_action;
-
-static const int dmr_bs_cach_interleave[24] = {
-    0, 7, 8, 9, 1, 10, 11, 12, 2, 13, 14, 15, 3, 16, 4, 17, 18, 19, 5, 20, 21, 22, 6, 23,
-};
 
 typedef struct {
     char ambe_fr[4][24];
@@ -119,47 +116,44 @@ reset_dmr_bs_loop_buffers(dmr_bs_ctx* ctx) {
     DSD_MEMSET(ctx->syncdata, 0, sizeof(ctx->syncdata));
 }
 
+static int
+read_dmr_bs_stream_dibit(dsd_opts* opts, dsd_state* state, int payload_index) {
+    dsd_dibit_soft_t soft;
+    int dibit = getDibitSoft(opts, state, &soft);
+    state->dmr_stereo_payload[payload_index] = dibit;
+    state->dmr_stereo_reliab[payload_index] = soft.reliability;
+    return dibit;
+}
+
 static void
 read_dmr_bs_ambe_segment_stream(dsd_opts* opts, dsd_state* state, char frame[4][24], int payload_offset,
                                 int dibit_count, int interleave_offset, char* redundancy_out) {
-    const int *w = dmr_ambe_interleave_w + interleave_offset, *x = dmr_ambe_interleave_x + interleave_offset,
-              *y = dmr_ambe_interleave_y + interleave_offset, *z = dmr_ambe_interleave_z + interleave_offset;
     for (int i = 0; i < dibit_count; i++) {
-        int dibit = getDibit(opts, state);
-        state->dmr_stereo_payload[payload_offset + i] = dibit;
+        const dsd_ambe_2450_dibit_map_entry* map = &dsd_ambe_2450_dibit_map[interleave_offset + i];
+        int dibit = read_dmr_bs_stream_dibit(opts, state, payload_offset + i);
         if (redundancy_out != NULL) {
             redundancy_out[i] = (char)dibit;
         }
-        frame[*w][*x] = (1 & (dibit >> 1));
-        frame[*y][*z] = (1 & dibit);
-        w++;
-        x++;
-        y++;
-        z++;
+        frame[map->high_row][map->high_col] = (1 & (dibit >> 1));
+        frame[map->low_row][map->low_col] = (1 & dibit);
     }
 }
 
 static void
 unpack_dmr_bs_ambe_segment_from_payload(const dsd_state* state, char frame[4][24], int payload_offset, int dibit_count,
                                         int interleave_offset) {
-    const int *w = dmr_ambe_interleave_w + interleave_offset, *x = dmr_ambe_interleave_x + interleave_offset,
-              *y = dmr_ambe_interleave_y + interleave_offset, *z = dmr_ambe_interleave_z + interleave_offset;
     for (int i = 0; i < dibit_count; i++) {
+        const dsd_ambe_2450_dibit_map_entry* map = &dsd_ambe_2450_dibit_map[interleave_offset + i];
         int dibit = state->dmr_stereo_payload[payload_offset + i];
-        frame[*w][*x] = (1 & (dibit >> 1));
-        frame[*y][*z] = (1 & dibit);
-        w++;
-        x++;
-        y++;
-        z++;
+        frame[map->high_row][map->high_col] = (1 & (dibit >> 1));
+        frame[map->low_row][map->low_col] = (1 & dibit);
     }
 }
 
 static void
 read_dmr_bs_sync_segment(dsd_opts* opts, dsd_state* state, dmr_bs_ctx* ctx) {
     for (int i = 0; i < 24; i++) {
-        int dibit = getDibit(opts, state);
-        state->dmr_stereo_payload[i + 66] = dibit;
+        int dibit = read_dmr_bs_stream_dibit(opts, state, i + 66);
         ctx->sync[i] = (dibit | 1) + 48;
         ctx->syncdata[((size_t)2 * i)] = (1 & (dibit >> 1));
         ctx->syncdata[((size_t)2 * i) + 1] = (1 & dibit);
@@ -189,10 +183,9 @@ extract_dmr_bs_sync_from_payload(const dsd_state* state, int payload_offset, cha
 static int
 collect_dmr_bs_cach_and_tact(dsd_opts* opts, dsd_state* state, dmr_bs_ctx* ctx) {
     for (int i = 0; i < 12; i++) {
-        int dibit = getDibit(opts, state);
-        state->dmr_stereo_payload[i] = dibit;
-        ctx->cachdata[dmr_bs_cach_interleave[((size_t)i * 2)]] = (1 & (dibit >> 1));
-        ctx->cachdata[dmr_bs_cach_interleave[((size_t)i * 2) + 1]] = (1 & dibit);
+        int dibit = read_dmr_bs_stream_dibit(opts, state, i);
+        ctx->cachdata[dmr_cach_interleave[((size_t)i * 2)]] = (1 & (dibit >> 1));
+        ctx->cachdata[dmr_cach_interleave[((size_t)i * 2) + 1]] = (1 & dibit);
     }
 
     for (int i = 0; i < 7; i++) {
@@ -431,7 +424,7 @@ handle_dmr_bs_slot_vc6_pre_link(dsd_opts* opts, dsd_state* state, const dmr_bs_c
             hytera_enhanced_alg_refresh(state);
         }
         DSD_FPRINTF(stderr, "\n");
-        dmr_data_burst_handler(opts, state, (uint8_t*)ctx->dummy_bits, 0xEB);
+        dmr_data_burst_handler(opts, state, (uint8_t*)ctx->dummy_bits, 0xEB, NULL);
     }
 
     if (ctx->internalslot == 1 && ctx->vc2 == 6) {
@@ -439,7 +432,7 @@ handle_dmr_bs_slot_vc6_pre_link(dsd_opts* opts, dsd_state* state, const dmr_bs_c
             hytera_enhanced_alg_refresh(state);
         }
         DSD_FPRINTF(stderr, "\n");
-        dmr_data_burst_handler(opts, state, (uint8_t*)ctx->dummy_bits, 0xEB);
+        dmr_data_burst_handler(opts, state, (uint8_t*)ctx->dummy_bits, 0xEB, NULL);
     }
 }
 
@@ -543,7 +536,7 @@ run_dmr_bs_slot_vc6_post_voice(dsd_opts* opts, dsd_state* state, const dmr_bs_ct
 
 static void
 update_dmr_bs_sync_times_if_tuned(const dsd_opts* opts, dsd_state* state) {
-    if (opts->p25_is_tuned == 1 || opts->trunk_is_tuned == 1) {
+    if (opts->trunk_is_tuned == 1) {
         time_t now = time(NULL);
         double nowm = dsd_time_now_monotonic_s();
         state->last_vc_sync_time = now;
@@ -590,12 +583,6 @@ process_dmr_bs_voice_burst(dsd_opts* opts, dsd_state* state, dmr_bs_ctx* ctx) {
     copy_dmr_bs_voice_frames(ctx->m1, ctx->m2, ctx->m3, ctx->ambe_fr, ctx->ambe_fr2, ctx->ambe_fr3);
     apply_dmr_bs_voice_keystream(state, ctx->ambe_fr, ctx->ambe_fr2, ctx->ambe_fr3);
 
-#ifdef PRINT_AMBE72
-    ambe2_codeword_print_i(opts, ctx->ambe_fr);
-    ambe2_codeword_print_i(opts, ctx->ambe_fr2);
-    ambe2_codeword_print_i(opts, ctx->ambe_fr3);
-#endif
-
     process_dmr_bs_three_voice_frames(opts, state, ctx->internalslot, ctx->ambe_fr, ctx->ambe_fr2, ctx->ambe_fr3);
 
     if (opts->use_dsp_output == 1) {
@@ -623,67 +610,6 @@ process_dmr_bs_voice_burst(dsd_opts* opts, dsd_state* state, dmr_bs_ctx* ctx) {
     return DMR_BS_ACTION_SKIP;
 }
 
-#ifdef RC_TESTING
-static dmr_bs_action
-handle_dmr_bs_reverse_channel_testing(dsd_opts* opts, dsd_state* state, dmr_bs_ctx* ctx) {
-    if ((strcmp(ctx->sync, DMR_BS_DATA_SYNC) == 0) || (strcmp(ctx->sync, DMR_BS_VOICE_SYNC) == 0)) {
-        return DMR_BS_ACTION_CONTINUE;
-    }
-
-    unsigned char SlotType[20];
-    DSD_MEMSET(SlotType, 0, sizeof(SlotType));
-
-    uint8_t k = 61;
-    for (uint8_t i = 0; i < 5; i++) {
-        SlotType[(i * 2) + 0] = (state->dmr_stereo_payload[k + 0] >> 1) & 1;
-        SlotType[(i * 2) + 1] = (state->dmr_stereo_payload[k++] >> 0) & 1;
-    }
-
-    k = 90;
-    for (uint8_t i = 0; i < 5; i++) {
-        SlotType[(i * 2) + 10] = (state->dmr_stereo_payload[k + 0] >> 1) & 1;
-        SlotType[(i * 2) + 11] = (state->dmr_stereo_payload[k++] >> 0) & 1;
-    }
-
-    if (!(QR_16_7_6_decode(ctx->emb_pdu) && ctx->emb_pdu[4] && ctx->tact_okay == 1)) {
-        return DMR_BS_ACTION_CONTINUE;
-    }
-
-    int slot_type_ok = Golay_20_8_decode(SlotType);
-    if (slot_type_ok) {
-        DSD_FPRINTF(stderr, "%s ", ctx->timestr);
-        if (opts->inverted_dmr == 0) {
-            DSD_FPRINTF(stderr, "Sync: +RC   ");
-        } else {
-            DSD_FPRINTF(stderr, "Sync: -RC   ");
-        }
-        dmr_data_sync(opts, state);
-    }
-
-    for (int i = 0; i < 48; i++) {
-        state->dmr_embedded_signalling[ctx->internalslot][5][i] = ctx->syncdata[i];
-    }
-
-    dmr_sbrc(opts, state, ctx->emb_pdu[4]);
-    ctx->emb_ok = 1;
-
-    beeper(opts, state, ctx->internalslot, 40, 86, 3);
-    beeper(opts, state, ctx->internalslot, 80, 86, 3);
-
-    state->event_history_s[0].Event_History_Items[ctx->internalslot].color_pair = 4;
-    watchdog_event_datacall(opts, state, 0, 0, "DMR Reverse Channel P/PI Indicator On (FEC Okay);", ctx->internalslot);
-    push_event_history(&state->event_history_s[ctx->internalslot]);
-    init_event_history(&state->event_history_s[ctx->internalslot], 0, 1);
-
-    if (slot_type_ok) {
-        ctx->skipcount++;
-        return DMR_BS_ACTION_SKIP;
-    }
-
-    return DMR_BS_ACTION_CONTINUE;
-}
-#endif
-
 static dmr_bs_action
 run_dmr_bs_post_skip(dsd_opts* opts, dsd_state* state, dmr_bs_ctx* ctx) {
     if (dmr_confidence_any_voice_open(state) && ctx->internalslot == 1 && opts->floating_point == 1
@@ -702,15 +628,15 @@ run_dmr_bs_post_skip(dsd_opts* opts, dsd_state* state, dmr_bs_ctx* ctx) {
         return DMR_BS_ACTION_END;
     }
 
-    if (opts->use_ncurses_terminal == 1) {
-        ui_publish_both_and_redraw(opts, state);
+    if (dsd_opts_frontend_active(opts)) {
+        dsd_telemetry_publish_both_and_redraw(opts, state);
     }
 
     watchdog_event_history(opts, state, 0);
     watchdog_event_current(opts, state, 0);
     watchdog_event_history(opts, state, 1);
     watchdog_event_current(opts, state, 1);
-    dmr_sm_tick(opts, state);
+    dmr_sm_tick_ctx(dmr_sm_get_ctx(), opts, state);
 
     return DMR_BS_ACTION_CONTINUE;
 }
@@ -763,7 +689,7 @@ static void
 init_dmr_bs_bootstrap_ctx(dmr_bs_bootstrap_ctx* ctx) {
     DSD_MEMSET(ctx, 0, sizeof(*ctx));
     ctx->sync_okay = 1;
-    getTimeC_buf(ctx->timestr);
+    (void)dsd_format_local_datetime(time(NULL), DSD_LOCAL_DATETIME_TIME_COLON, ctx->timestr, sizeof ctx->timestr);
 }
 
 static void
@@ -784,8 +710,8 @@ static int
 decode_dmr_bs_bootstrap_cach_and_tact(dsd_state* state, dmr_bs_bootstrap_ctx* ctx) {
     for (int i = 0; i < 12; i++) {
         int dibit = state->dmr_stereo_payload[i];
-        ctx->cachdata[dmr_bs_cach_interleave[((size_t)i * 2)]] = (1 & (dibit >> 1));
-        ctx->cachdata[dmr_bs_cach_interleave[((size_t)i * 2) + 1]] = (1 & dibit);
+        ctx->cachdata[dmr_cach_interleave[((size_t)i * 2)]] = (1 & (dibit >> 1));
+        ctx->cachdata[dmr_cach_interleave[((size_t)i * 2) + 1]] = (1 & dibit);
     }
 
     for (int i = 0; i < 7; i++) {
@@ -864,12 +790,6 @@ process_dmr_bs_bootstrap_voice_if_open(dsd_opts* opts, dsd_state* state, dmr_bs_
     copy_dmr_bs_voice_frames(ctx->m1, ctx->m2, ctx->m3, ctx->ambe_fr, ctx->ambe_fr2, ctx->ambe_fr3);
     apply_dmr_bs_voice_keystream(state, ctx->ambe_fr, ctx->ambe_fr2, ctx->ambe_fr3);
 
-#ifdef PRINT_AMBE72
-    ambe2_codeword_print_i(opts, ctx->ambe_fr);
-    ambe2_codeword_print_i(opts, ctx->ambe_fr2);
-    ambe2_codeword_print_i(opts, ctx->ambe_fr3);
-#endif
-
     if (opts->payload == 1) {
         DSD_FPRINTF(stderr, "\n");
     }
@@ -885,7 +805,7 @@ process_dmr_bs_bootstrap_voice_if_open(dsd_opts* opts, dsd_state* state, dmr_bs_
         DSD_FPRINTF(stderr, "\n");
     }
 
-    if (opts->p25_is_tuned == 1 || opts->trunk_is_tuned == 1) {
+    if (opts->trunk_is_tuned == 1) {
         state->last_vc_sync_time = time(NULL);
         state->last_vc_sync_time_m = dsd_time_now_monotonic_s();
     }
@@ -901,7 +821,7 @@ process_dmr_bs_bootstrap_voice_if_open(dsd_opts* opts, dsd_state* state, dmr_bs_
 
 static dmr_bs_action DSD_ATTR_USED
 process_dmr_bs_iteration(dsd_opts* opts, dsd_state* state, dmr_bs_ctx* ctx) {
-    getTimeC_buf(ctx->timestr);
+    (void)dsd_format_local_datetime(time(NULL), DSD_LOCAL_DATETIME_TIME_COLON, ctx->timestr, sizeof ctx->timestr);
     reset_dmr_bs_loop_buffers(ctx);
 
     if (!collect_dmr_bs_cach_and_tact(opts, state, ctx)) {
@@ -926,13 +846,6 @@ process_dmr_bs_iteration(dsd_opts* opts, dsd_state* state, dmr_bs_ctx* ctx) {
     if (action != DMR_BS_ACTION_CONTINUE) {
         goto HANDLE_ACTION;
     }
-
-#ifdef RC_TESTING
-    action = handle_dmr_bs_reverse_channel_testing(opts, state, ctx);
-    if (action != DMR_BS_ACTION_CONTINUE) {
-        goto HANDLE_ACTION;
-    }
-#endif
 
     action = handle_dmr_bs_frame_sync_miss(ctx, &ctx->vc1, &ctx->vc2);
     if (action != DMR_BS_ACTION_CONTINUE) {
@@ -973,7 +886,7 @@ dmrBS(dsd_opts* opts, dsd_state* state) {
 
     while (1) {
         if (exitflag == 1) {
-            cleanupAndExit(opts, state);
+            dsd_request_shutdown(opts, state);
             break;
         }
         if (process_dmr_bs_iteration(opts, state, &ctx) == DMR_BS_ACTION_END) {

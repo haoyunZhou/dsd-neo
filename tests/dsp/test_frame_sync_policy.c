@@ -8,6 +8,7 @@
 #include <dsd-neo/core/state.h>
 #include <dsd-neo/core/synctype_ids.h>
 #include <dsd-neo/dsp/frame_sync.h>
+#include <stddef.h>
 #include "dsd-neo/core/opts_fwd.h"
 #include "dsd-neo/core/safe_api.h"
 #include "dsd-neo/core/state_fwd.h"
@@ -28,7 +29,7 @@ main(void) {
     state.carrier = 1;
     assert(dsd_frame_sync_suppress_p25_alt_sync(&opts, &state) == 0);
 
-    opts.p25_trunk = 1;
+    opts.trunk_enable = 1;
     assert(dsd_frame_sync_suppress_p25_alt_sync(&opts, &state) == 1);
 
     state.carrier = 0;
@@ -38,20 +39,42 @@ main(void) {
     state.lastsynctype = DSD_SYNC_YSF_POS;
     assert(dsd_frame_sync_suppress_p25_alt_sync(&opts, &state) == 0);
 
+    assert(dsd_frame_sync_suppress_p25_alt_sync(NULL, &state) == 0);
+    assert(dsd_frame_sync_suppress_p25_alt_sync(&opts, NULL) == 0);
+
+    reset(&opts, &state);
+    opts.audio_in_type = AUDIO_IN_TCP;
+    assert(dsd_frame_sync_suppress_tcp_no_signal_console(&opts, &state) == 1);
+
+    opts.audio_in_type = AUDIO_IN_PULSE;
+    assert(dsd_frame_sync_suppress_tcp_no_signal_console(&opts, &state) == 0);
+
+    opts.audio_in_type = AUDIO_IN_UDP;
+    assert(dsd_frame_sync_suppress_tcp_no_signal_console(&opts, &state) == 0);
+
+    opts.audio_in_type = AUDIO_IN_RTL;
+    assert(dsd_frame_sync_suppress_tcp_no_signal_console(&opts, &state) == 0);
+
+    assert(dsd_frame_sync_suppress_tcp_no_signal_console(NULL, &state) == 0);
+    assert(dsd_frame_sync_suppress_tcp_no_signal_console(&opts, NULL) == 0);
+
     reset(&opts, &state);
     opts.frame_p25p1 = 1;
     assert(dsd_frame_sync_sps_hunt_dwell_passes(&opts, &state) == 3);
 
-    opts.p25_trunk = 1;
+    opts.trunk_enable = 1;
     assert(dsd_frame_sync_sps_hunt_dwell_passes(&opts, &state) == 5);
 
-    opts.p25_is_tuned = 1;
+    opts.trunk_is_tuned = 1;
     assert(dsd_frame_sync_sps_hunt_dwell_passes(&opts, &state) == 3);
 
-    opts.p25_is_tuned = 0;
+    opts.trunk_is_tuned = 0;
     opts.frame_p25p1 = 0;
     opts.frame_p25p2 = 0;
     assert(dsd_frame_sync_sps_hunt_dwell_passes(&opts, &state) == 3);
+
+    assert(dsd_frame_sync_sps_hunt_dwell_passes(NULL, &state) == 3);
+    assert(dsd_frame_sync_sps_hunt_dwell_passes(&opts, NULL) == 3);
 
     return 0;
 }

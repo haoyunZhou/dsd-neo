@@ -20,7 +20,10 @@
 extern "C" {
 #endif
 
-void keyring(dsd_opts* opts, dsd_state* state);
+/** Activate imported key material for an explicit decoder slot. */
+void keyring_activate_slot(dsd_opts* opts, dsd_state* state, int slot);
+/** Return whether the first required AES segments exist for an imported key ID. */
+int keyring_aes_segments_complete(const dsd_state* state, int key_id, unsigned int required_segments);
 
 #ifdef __cplusplus
 }

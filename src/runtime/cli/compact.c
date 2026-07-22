@@ -38,17 +38,38 @@ compact_has_next_non_option(int i, int argc, char** argv) {
     return (i + 1 < argc && argv[i + 1] != NULL && argv[i + 1][0] != '-');
 }
 
+static int
+compact_copy_terminator_tail_or_stop(int start, int argc, char** argv, int* out_w) {
+    if (argv[start] == NULL) {
+        return 1;
+    }
+    if (strcmp(argv[start], "--") != 0) {
+        return 0;
+    }
+    for (int i = start; i < argc; ++i) {
+        if (argv[i] == NULL) {
+            break;
+        }
+        argv[(*out_w)++] = argv[i];
+    }
+    return 1;
+}
+
 static const char* const k_skip_exact_no_arg[] = {
-    "--auto-ppm",          "--rtltcp-autotune",      "--iq-loop",       "--rdio-api-delete-after-upload",
-    "--enc-lockout",       "--enc-follow",           "--no-config",     "--print-config",
-    "--interactive-setup", "--dump-config-template", "--strict-config", "--list-profiles",
-    "--dmr-debug-burst",
+    "--auto-ppm",          "--rtltcp-autotune",
+    "--iq-loop",           "--rdio-api-delete-after-upload",
+    "--enc-lockout",       "--enc-follow",
+    "--no-config",         "--print-config",
+    "--interactive-setup", "--dump-config-template",
+    "--strict-config",     "--list-profiles",
+    "--dmr-debug-burst",   "--show-keys",
 };
 
 static const char* const k_skip_exact_next_any[] = {
     "--input-volume",
     "--input-level-warn-db",
     "--frame-log",
+    "--p25-sm-log",
     "--rdio-mode",
     "--rdio-system-id",
     "--rdio-api-url",
@@ -61,11 +82,11 @@ static const char* const k_skip_exact_next_any[] = {
     "--dmr-force-algid",
     "--m17-signature-public-key",
     "--auto-ppm-snr",
+    "--frontend",
     "--profile",
     "--p25-vc-grace",
     "--p25-min-follow-dwell",
     "--p25-grant-voice-timeout",
-    "--p25-retune-backoff",
     "--p25-mac-hold",
     "--p25-ring-hold",
     "--p25-cc-grace",
@@ -114,6 +135,7 @@ static const char* const k_skip_prefix[] = {
     "--trunk-scan=",
     "--trunk-scan-dwell-ms=",
     "--trunk-scan-activity-hold-ms=",
+    "--frontend=",
 };
 
 int
@@ -123,14 +145,14 @@ dsd_cli_compact_args(int argc, char** argv) {
     }
 
     // Remove recognized long options so short-option getopt() sees remaining tokens.
-    // Keep argv[0] as the program name and compact in place for legacy callers.
+    // Keep argv[0] as the program name and compact in place for downstream parsing phases.
     int w = 1;
     for (int i = 1, advance = 1; i < argc; i += advance) {
         advance = 1;
-        const char* arg = argv[i];
-        if (arg == NULL) {
+        if (compact_copy_terminator_tail_or_stop(i, argc, argv, &w)) {
             break;
         }
+        const char* arg = argv[i];
         if (compact_matches_prefix(arg, k_skip_prefix, sizeof(k_skip_prefix) / sizeof(k_skip_prefix[0]))) {
             continue;
         }

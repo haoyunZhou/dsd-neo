@@ -34,6 +34,13 @@ p25_sm_tick_guard_try_enter(void) {
 }
 
 void
+p25_sm_tick_guard_enter(void) {
+    while (!p25_sm_tick_guard_try_enter()) {
+        dsd_sleep_ms(1U);
+    }
+}
+
+void
 p25_sm_tick_guard_leave(void) {
     atomic_store(&g_p25_sm_tick_lock, 0);
 }
@@ -44,11 +51,11 @@ p25_sm_try_tick(dsd_opts* opts, dsd_state* state) {
         return;
     }
     if (p25_sm_tick_guard_try_enter()) {
-        if (opts->p25_trunk == 1) {
+        if (opts->trunk_enable == 1) {
             /* Only one tick runs at a time across all callers. */
             atomic_store(&g_p25_sm_in_tick, 1);
             // Drive the high-level trunk SM tick
-            p25_sm_tick(opts, state);
+            p25_sm_tick_ctx(p25_sm_get_ctx(), opts, state);
             atomic_store(&g_p25_sm_in_tick, 0);
         }
         p25_sm_tick_guard_leave();
@@ -61,7 +68,7 @@ static DSD_THREAD_RETURN_TYPE
 #endif
     p25_sm_watchdog_thread(void* arg) {
     (void)arg;
-    while (atomic_load(&g_p25_sm_wd_running) && !exitflag) {
+    while (atomic_load(&g_p25_sm_wd_running) && !dsd_exitflag_load()) {
         if (g_opts && g_state) {
             p25_sm_try_tick(g_opts, g_state);
         }
@@ -69,7 +76,7 @@ static DSD_THREAD_RETURN_TYPE
         // otherwise, tick faster under ncurses to reduce perceived wedges.
         int ms = g_p25_sm_wd_ms;
         if (ms <= 0) {
-            ms = (g_opts && g_opts->use_ncurses_terminal == 1) ? 200 : 400; // 200ms UI, 400ms headless
+            ms = dsd_opts_frontend_active(g_opts) ? 200 : 400; // 200ms frontend, 400ms headless
         }
         if (ms < 20) {
             ms = 20; // clamp to sane bounds
@@ -90,7 +97,7 @@ p25_sm_watchdog_start(dsd_opts* opts, dsd_state* state) {
     g_opts = opts;
     g_state = state;
     // One-time env override for watchdog cadence (milliseconds)
-    // DSD_NEO_P25_WD_MS=100 .. 2000
+    // DSD_NEO_P25_WD_MS=20 .. 2000
     if (g_p25_sm_wd_ms == 0) {
         const dsdneoRuntimeConfig* cfg = dsd_neo_get_config();
         if (cfg && cfg->p25_wd_ms_is_set) {

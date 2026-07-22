@@ -16,6 +16,7 @@
 
 #include <dsd-neo/platform/platform.h>
 
+#include <dsd-neo/core/input_level.h>
 #include <dsd-neo/core/state_ext.h>
 #include <dsd-neo/core/state_fwd.h>
 
@@ -24,16 +25,82 @@
 
 #include <dsd-neo/core/dibit.h>
 
-#include <dsd-neo/dsp/p25p1_heuristics.h>
 #include <dsd-neo/protocol/p25/p25_cc_candidates.h>
 #include <dsd-neo/protocol/p25/p25_status_symbol.h>
 
 enum DSD_ATTR_PACKED {
     DSD_P25_P2_AUDIO_RING_DEPTH = 4,
+    DSD_P25_ENC_TG_CACHE_DEPTH = 8,
+    DSD_P25_MAC_FRAGMENT_MAX_OCTETS = 256,
     DSD_TRUNK_CHAN_MAP_SIZE = 0xFFFF,
     DSD_VERTEX_KS_MAP_MAX = 64,
     DSD_RTL_SYMBOL_CACHE_CAP = 512,
 };
+
+/** Authoritative per-slot P25 voice crypto classification. */
+typedef enum DSD_ATTR_PACKED {
+    DSD_P25_CRYPTO_UNKNOWN = 0,
+    DSD_P25_CRYPTO_CLEAR = 1,
+    DSD_P25_CRYPTO_ENCRYPTED_PENDING = 2,
+    DSD_P25_CRYPTO_DECRYPTABLE = 3,
+    DSD_P25_CRYPTO_BLOCKED = 4,
+} dsd_p25_crypto_state;
+
+/** Phase 1 traffic crypto tuple awaiting corroboration against clear service options. */
+typedef struct {
+    uint16_t keyid;
+    uint8_t algid;
+    uint8_t active;
+} dsd_p25_p1_crypto_conflict_state;
+
+/** Phase 2 ESS identity change held until boundary voice has drained. */
+typedef struct {
+    uint64_t mi;
+    uint16_t keyid;
+    uint8_t algid;
+    uint8_t pending;
+} dsd_p25_p2_rekey_state;
+
+typedef struct {
+    uint8_t active;
+    uint8_t opcode;
+    uint8_t data_len;
+    uint8_t collected;
+    uint8_t data[DSD_P25_MAC_FRAGMENT_MAX_OCTETS];
+} p25_mac_fragment_state_t;
+
+typedef struct {
+    uint8_t valid;
+    uint8_t sequence;
+    uint8_t block_count;
+    uint8_t next_block;
+} p25_apx_alias_rx_state_t;
+
+typedef struct {
+    uint8_t mask;
+    char last_alias[40];
+    char last_saved_alias[40];
+    uint32_t src;
+    uint32_t tg;
+    uint8_t fragment[4][8];
+} p25_l3h_alias_phase1_state_t;
+
+typedef enum DSD_ATTR_PACKED {
+    DSD_EVENT_SEVERITY_UNKNOWN = 0,
+    DSD_EVENT_SEVERITY_DEBUG = 1,
+    DSD_EVENT_SEVERITY_INFO = 2,
+    DSD_EVENT_SEVERITY_WARNING = 3,
+    DSD_EVENT_SEVERITY_ERROR = 4
+} dsd_event_severity;
+
+typedef enum DSD_ATTR_PACKED {
+    DSD_EVENT_CATEGORY_UNKNOWN = 0,
+    DSD_EVENT_CATEGORY_STATUS = 1,
+    DSD_EVENT_CATEGORY_VOICE = 2,
+    DSD_EVENT_CATEGORY_DATA = 3,
+    DSD_EVENT_CATEGORY_CONTROL = 4,
+    DSD_EVENT_CATEGORY_SYSTEM = 5
+} dsd_event_category;
 
 //event history (each item)
 // NOLINTBEGIN(clang-analyzer-optin.performance.Padding)
@@ -45,6 +112,8 @@ enum DSD_ATTR_PACKED {
 typedef struct {
     uint8_t write;      // If this event needs to be written to a log file
     uint8_t color_pair; //this value corresponds to which color pair the line should be in ncurses
+    uint8_t severity;   // neutral event severity for non-terminal frontends
+    uint8_t category;   // neutral event category for non-terminal frontends
     int8_t systype;     //indentifier of which decoded system type this is from (P25, DMR, etc)
     int8_t subtype;     //subtype of systpe (VLC, TLC, PDU data, System Event, etc)
     uint32_t sys_id1;   //sys_id1 through 5 will be a hierarchy of system identifiers
@@ -81,6 +150,7 @@ typedef struct {
 //event history for number of each items above
 typedef struct Event_History_I {
     Event_History Event_History_Items[255];
+    uint64_t revision;
 } Event_History_I;
 
 //new audio filter stuff from: https://github.com/NedSimao/FilteringLibrary
@@ -208,9 +278,6 @@ struct dsd_state {
     int* dibit_buf_p;
     int* dmr_payload_buf;
     int* dmr_payload_p;
-    // Per-dibit reliability buffer (0..255). Aligned with dmr_payload_buf.
-    uint8_t* dmr_reliab_buf;
-    uint8_t* dmr_reliab_p;
     // Per-dibit signed soft metrics. Aligned with dmr_payload_buf.
     dsd_dibit_soft_t* dmr_soft_buf;
     dsd_dibit_soft_t* dmr_soft_p;
@@ -241,6 +308,7 @@ struct dsd_state {
     unsigned long long int K2;
     unsigned long long int K3;
     unsigned long long int K4;
+    uint8_t hytera_key_segments;
     unsigned long long int R;
     unsigned long long int RR;
     unsigned long long int H;
@@ -253,16 +321,18 @@ struct dsd_state {
     unsigned long long int p2_cc; //p1 NAC
     unsigned long long int p2_siteid;
     unsigned long long int p2_rfssid;
-    long int p25_cc_freq;   //cc freq from net_stat
-    long int trunk_cc_freq; //protocol-agnostic alias (kept in sync with p25_cc_freq)
+    long int p25_cc_freq;   // P25 control-channel frequency from network status
+    long int trunk_cc_freq; // generic trunk-owner control-channel frequency
     unsigned long long int edacs_site_id;
-    time_t last_cc_sync_time; //use this to start hunting for CC after signal lost
-    time_t last_vc_sync_time; //flag for voice activity bursts, tune back on con+ after more than x seconds no voice
+    time_t last_cc_sync_time;    //use this to start hunting for CC after signal lost
+    time_t p25_last_cc_msg_time; //last decoded P25 control-channel message
+    time_t last_vc_sync_time;    //flag for voice activity bursts, tune back on con+ after more than x seconds no voice
     // Timestamp of last tune to a VC (used to provide a short startup grace
     // window so we don't bounce back to CC before MAC_PTT/ACTIVE/audio arrives)
     time_t p25_last_vc_tune_time;
     // Monotonic twins for SM timing (seconds)
     double last_cc_sync_time_m;
+    double p25_last_cc_msg_time_m;
     double last_vc_sync_time_m;
     double p25_last_vc_tune_time_m;
     time_t rtl_fsk_reacquire_last_sync_time;
@@ -295,7 +365,7 @@ struct dsd_state {
     unsigned long long int dmr_lrrp_target[2];
     // P25 trunking freq storage
     long int p25_vc_freq[2];
-    long int trunk_vc_freq[2]; //protocol-agnostic alias (kept in sync with p25_vc_freq)
+    long int trunk_vc_freq[2]; // generic trunk-owner voice-channel frequencies
     // Trunking LCNs and maps
     long int trunk_lcn_freq[26];
     long int trunk_chan_map[DSD_TRUNK_CHAN_MAP_SIZE];
@@ -317,7 +387,7 @@ struct dsd_state {
     float* audio_out_temp_buf_pR;
     //analog/raw signal audio buffers (float path for better SNR, convert to int16 at output)
     float analog_out_f[960]; // float buffer for analog monitor path
-    short analog_out[960];   // int16 buffer for output and legacy paths
+    short analog_out[960];   // int16 buffer for analog monitor output
     int analog_sample_counter;
     //new stereo float sample storage
     float f_l[160];     //single sample left
@@ -372,9 +442,8 @@ struct dsd_state {
     unsigned int symbol_replay_soft_records;
     unsigned int symbol_capture_soft_records;
 
-    /* RTL DSP symbol-output cache. The RTL demod thread already produces
-       symbol-rate floats in blocks; this lets legacy getSymbol() consume them
-       without one ring read per dibit. */
+    /* RTL DSP direct-output cache. The RTL demod thread produces direct FSK/CQPSK
+       blocks; this lets getSymbol() consume them without one ring read per sample. */
     float rtl_symbol_cache[DSD_RTL_SYMBOL_CACHE_CAP];
     int rtl_symbol_cache_pos;
     int rtl_symbol_cache_len;
@@ -384,15 +453,12 @@ struct dsd_state {
     int rtl_symbol_cache_levels;
     uint32_t rtl_symbol_cache_generation;
     int rtl_symbol_cache_published_pending;
+    int rtl_fsk_sps_num;
+    int rtl_fsk_sps_den;
+    int rtl_fsk_sps_accum;
 
     /* C4FM timing assist (clock loop hinting). Lightweight EL/M&M error drives
        occasional ±1 nudges of symbolCenter; disabled by default. */
-    int c4fm_clk_mode;     /* 0=off, 1=Early-Late, 2=M&M */
-    int c4fm_clk_prev_dec; /* last sliced level for M&M (-3,-1,1,3; 0 if unknown) */
-    int c4fm_clk_run_dir;  /* last run direction (-1,0,+1) */
-    int c4fm_clk_run_len;  /* consecutive runs in same direction */
-    int c4fm_clk_cooldown; /* cooldown countdown to avoid rapid flips */
-
     int rf_mod;
     /* M17 polarity auto-detection: 0=unknown, 1=normal, 2=inverted.
      * Set when preamble detected; overridden if user specifies -xz. */
@@ -476,12 +542,7 @@ struct dsd_state {
 
     // Last dibit read
     int last_dibit;
-
-    // Heuristics state data for +P25 signals
-    P25Heuristics p25_heuristics;
-
-    // Heuristics state data for -P25 signals
-    P25Heuristics inv_p25_heuristics;
+    uint8_t p25_cqpsk_dibit_map_idx; // OP25-compatible CQPSK orientation map
 
     //input sample buffer for monitoring Input
     short input_sample_buffer;  //HERE HERE
@@ -537,6 +598,8 @@ struct dsd_state {
     uint8_t data_header_format[2];  //collect format of data header (conf or unconf) per slot
     uint8_t data_header_sap[2];     //collect sap info per slot
     uint8_t data_p_head[2];         //flag for dmr proprietary header to follow
+    uint8_t data_header_dd_format[2];   //transient per-slot DMR Defined Data format
+    uint8_t data_header_bit_padding[2]; //transient per-slot DMR short-data padding in bits
 
     //new stuff below here
     uint8_t data_conf_data[2];   //flag for confirmed data blocks per slot
@@ -631,10 +694,20 @@ struct dsd_state {
     int fourv_counter[2]; //external reference counter for ESS_B fragment collection
     int voice_counter[2]; //external reference counter for 18V x 2 P25p2 Superframe
     int p2_is_lcch;       //flag to tell us when a frame is lcch and not sacch
+    // Authoritative P25 voice crypto classification. Slot 0 is also used by P25 Phase 1.
+    dsd_p25_crypto_state p25_crypto_state[2];
+    // Retained Phase 1 carrier requires the next transmission's LCW identity before media or lockout.
+    int p25_p1_identity_pending;
+    // Definitive Phase 1 HDU crypto arrived after the last authoritative LCW identity.
+    int p25_p1_hdu_crypto_fresh;
+    // One non-clear HDU/LDU2 tuple contradicted explicit-clear Phase 1 service options.
+    dsd_p25_p1_crypto_conflict_state p25_p1_crypto_conflict;
+    // Sticky Phase 2 media rejection, cleared only after the slot receives an accepted assignment/activity.
+    int p25_p2_media_rejected[2];
+    // ESS identity changes staged until the paired-timeslot audio drain completes.
+    dsd_p25_p2_rekey_state p25_p2_rekey[2];
     // P25p2 per-slot audio gating (set on MAC_PTT/ACTIVE, cleared on MAC_END/IDLE/SIGNAL)
     int p25_p2_audio_allowed[2];
-    // P25p2 per-slot encrypted lockout mute marker for mixer suppression after service bits are cleared.
-    uint8_t p25_p2_enc_lockout_muted[2];
     // P25p2 small output jitter buffers (per-slot ring of decoded 20 ms frames)
     // Depth DSD_P25_P2_AUDIO_RING_DEPTH to match drain behavior (~80 ms max at depth=4)
     float p25_p2_audio_ring[2][DSD_P25_P2_AUDIO_RING_DEPTH][160];
@@ -647,12 +720,10 @@ struct dsd_state {
     time_t p25_p2_last_mac_active[2];
     // Monotonic twins for last MAC_ACTIVE/PTT per slot
     double p25_p2_last_mac_active_m[2];
-    // P25p2 recent MAC_END_PTT timestamps per slot (enables early teardown
-    // once per-slot jitter/audio has drained)
+    // P25p2 recent MAC_END_PTT timestamps per slot (transmission boundaries)
     time_t p25_p2_last_end_ptt[2];
-    // P25p1 recent TDU/TDULC timestamps (enables early teardown on Phase 1)
-    time_t p25_p1_last_tdu;   // wall clock (legacy)
-    double p25_p1_last_tdu_m; // monotonic seconds (preferred)
+    // P25p1 recent TDU/TDULC transmission-boundary timestamp
+    double p25_p1_last_tdu_m;
 
     // P25 Phase 2 RS(63,35) metrics (hexbits, t=14)
     unsigned int p25_p2_rs_facch_ok;
@@ -672,12 +743,6 @@ struct dsd_state {
     unsigned int p25_p2_soft_ess_ok;     // soft ESS corrections
     unsigned int p25_p2_soft_ess_max_depth;
     unsigned int p25_p1_soft_combined_ok;
-    // P25p2 early ENC lockout counter (MAC_PTT-driven)
-    unsigned int p25_p2_enc_lo_early;
-    // P25p2 early ENC lockout hardening: require confirmation across two indications
-    uint8_t p25_p2_enc_pending[2];
-    uint32_t p25_p2_enc_pending_ttg[2];
-
     //iden freq storage for frequency calculations
     // Bitmask per IDEN slot indicating which modulation classes have been seen:
     //   bit 0x01 marks an FDMA/non-TDMA entry
@@ -703,7 +768,7 @@ struct dsd_state {
      * - p25_vc_cqpsk_pref: learned preference (-1=unknown/auto,
      *   1=prefer OP25-style CQPSK+TED chain). Value 0 is treated as no learned
      *   TDMA preference so automatic retry logic does not force P25p2 through
-     *   the legacy FM/QPSK slicer.
+     *   the FM/QPSK slicer.
      * - p25_vc_cqpsk_override: one-shot retry override applied on next VC tune (-1=none).
      *
      * These are ignored when the user explicitly forces CQPSK via env/config (DSD_NEO_CQPSK).
@@ -723,11 +788,11 @@ struct dsd_state {
     unsigned int p25_sm_cc_return_count; // number of actual returns to CC via SM
     unsigned int p25_sm_queued_count;    ///< number of Queued Response (QUE_RSP) messages received
     unsigned int p25_sm_deny_count;      ///< number of Deny Response (DENY_RSP) messages received
-    // One-shot flag to force immediate return-to-CC on explicit MAC_END/IDLE
-    // or policy events; cleared by the SM after handling
+    // One-shot flag to force immediate return-to-CC on physical/policy release;
+    // cleared by the SM after handling.
     int p25_sm_force_release;
-    int trunk_sm_force_release; // protocol-agnostic alias (kept in sync with p25_sm_force_release)
-    // Timestamp of last p25_sm_on_release() (0 when none yet)
+    int trunk_sm_force_release; // protocol-agnostic force-release latch
+    // Timestamp of last p25_sm_release() (0 when none yet)
     time_t p25_sm_last_release_time;
     // Last SM status/reason tag (e.g., "after-tune", "release-deferred-gated") and timestamp
     char p25_sm_last_reason[32];
@@ -742,20 +807,20 @@ struct dsd_state {
     // Monotonic twin for post-hang watchdog (seconds)
     double p25_sm_posthang_start_m;
 
-    // High-level SM mode for UI/telemetry (distinct from minimal P25p2 follower)
-    // 0=unknown, 1=on CC, 2=on VC (grant-following or armed), 3=hang, 4=hunting CC
+    // High-level SM mode for UI/telemetry. A retained traffic carrier is ARMED
+    // before first voice, FOLLOW while either slot is active, and HANG between
+    // transmissions until the inactivity timer expires.
     int p25_sm_mode;
 
-    // Retune backoff bookkeeping
-    // Blocks immediate re-tune to same VC/slot after a recent return
-    time_t p25_retune_block_until;
-    long p25_retune_block_freq;
-    int p25_retune_block_slot; // -1 when N/A
-    // Cached P25 SM tunables (seconds), resolved once at p25_sm_init()
+    // Transient encrypted-call cache: blocks encrypted/ambiguous voice grants after proven ENC lockout.
+    time_t p25_enc_tg_cache_until[DSD_P25_ENC_TG_CACHE_DEPTH];
+    uint32_t p25_enc_tg_cache_tg[DSD_P25_ENC_TG_CACHE_DEPTH];
+    uint8_t p25_enc_tg_cache_is_group[DSD_P25_ENC_TG_CACHE_DEPTH]; // 1=group/SG, 0=private destination
+    unsigned int p25_enc_tg_cache_next;
+    // Cached P25 SM tunables (seconds), resolved once at p25_sm_init_ctx()
     double p25_cfg_vc_grace_s;
     double p25_cfg_grant_voice_to_s;
     double p25_cfg_min_follow_dwell_s;
-    double p25_cfg_retune_backoff_s;
     double p25_cfg_mac_hold_s;
     double p25_cfg_cc_grace_s;
     double p25_cfg_ring_hold_s;        // seconds to honor audio ring after recent MAC
@@ -789,6 +854,15 @@ struct dsd_state {
     int p25_p1_voice_err_hist_len;          // window length (<=64), default 50
     int p25_p1_voice_err_hist_pos;          // ring head
     unsigned int p25_p1_voice_err_hist_sum; // sum of values in window
+
+    // P25 Phase 1 session-lifetime voice telemetry (not reset on retune/no-carrier)
+    uint64_t p25_p1_accepted_frames;
+    uint64_t p25_p1_clean_frames;
+    uint64_t p25_p1_corrected_frames;
+    uint64_t p25_p1_concealed_frames;
+    uint64_t p25_p1_accepted_corrections;
+    uint64_t p25_p1_suppressed_tail_frames;
+    uint64_t p25_p1_excluded_tail_corrections;
 
     /*
      * P25 status symbol classification.
@@ -829,6 +903,14 @@ struct dsd_state {
     uint16_t p25_prot_kid;  ///< Active encryption Key ID (0 = none received)
 
     /*
+     * P25 protected-control-channel state (from MBT 0x3E Protection Parameter
+     * Broadcast). This is intentionally separate from voice/call protection
+     * state above.
+     */
+    uint8_t p25_cc_prot_valid; ///< 1 once a protected CC broadcast has been received
+    uint8_t p25_cc_prot_algid; ///< Control-channel protection Algorithm ID
+
+    /*
      * P25 Time and Date Announcement state (TSBK 0x35 bridged as MAC-like 0x75)
      *
      * Stores the most recently decoded system UTC time and local time offset.
@@ -837,6 +919,18 @@ struct dsd_state {
     time_t p25_sys_time;               ///< Decoded UTC time
     uint8_t p25_sys_time_offset_valid; ///< 1 once a local time offset has been received
     int16_t p25_sys_time_offset;       ///< Local time offset in minutes from UTC
+
+    /*
+     * P25 System Service Broadcast and current-site status metadata.
+     */
+    uint8_t p25_sys_services_valid;
+    uint32_t p25_sys_services_available;
+    uint32_t p25_sys_services_supported;
+    uint8_t p25_sys_services_request_priority;
+    uint8_t p25_site_lra_valid;
+    uint8_t p25_site_lra;
+    uint8_t p25_site_network_active_valid;
+    uint8_t p25_site_network_active;
 
     // P25 Phase 2 voice error moving average per slot (errs2 from AMBE decode)
     uint8_t p25_p2_voice_err_hist[2][64];
@@ -883,16 +977,31 @@ struct dsd_state {
     int p25_nb_count;                          // number of active neighbor entries
     p25_nb_entry_t p25_nb_entries[P25_NB_MAX]; // neighbor entries with metadata
 
+    // P25 current-site secondary control channels seen via SCCB.
+    int p25_secondary_cc_count;
+    p25_secondary_cc_entry_t p25_secondary_cc_entries[P25_SECONDARY_CC_MAX];
+
+    // P25 channel announcements that arrived before their IDEN table.
+    int p25_pending_announcement_count;
+    p25_pending_announcement_t p25_pending_announcements[P25_PENDING_ANNOUNCEMENT_MAX];
+
     // P25 source unit WACN from LCW 0x49 (Source ID Extension)
     uint32_t p25_src_nid; // 20-bit WACN from SUID extension
 
+    // P25 Phase 2 standard MAC multi-fragment assembly, one in-flight message per TDMA slot.
+    p25_mac_fragment_state_t p25_mac_frag[2];
+    // P25 OTA alias receive sequencing, kept with decoder state to avoid cross-instance mixing.
+    p25_apx_alias_rx_state_t p25_apx_alias_rx[2];
+    p25_l3h_alias_phase1_state_t p25_l3h_alias_phase1[2];
+
     // P25 current-call flags (per logical slot; FDMA uses slot 0)
-    uint8_t p25_call_emergency[2]; // 1 if current call is emergency
-    uint8_t p25_call_priority[2];  // 0..7 call priority (0 if unknown)
-    uint8_t p25_call_is_packet[2]; // 1 if call/service marked as packet (data), else 0
+    uint8_t p25_call_emergency[2];        // 1 if current call is emergency
+    uint8_t p25_call_priority[2];         // 0..7 call priority (0 if unknown)
+    uint8_t p25_call_is_packet[2];        // 1 if call/service marked as packet (data), else 0
+    uint8_t p25_service_options_valid[2]; // 1 when dmr_so/dmr_soR hold fresh P25 service options
+    uint32_t p25_policy_tg[2];            // matched policy TG for patched SG calls; 0 means use OTA TG
 
     //experimental symbol file capture read throttle
-    int symbol_throttle;                     //throttle speed
     int use_throttle;                        //only use throttle if set to 1
     uint64_t symbol_replay_next_deadline_ns; //0 when uninitialized
 
@@ -1075,7 +1184,7 @@ struct dsd_state {
     //generic ks
     int straight_ks;
     int straight_mod;
-    int straight_frame_mode; //0=legacy continuous bitstream, 1=frame-aligned (offset/step)
+    int straight_frame_mode; // 0=continuous bitstream, 1=frame-aligned (offset/step)
     int straight_frame_off;  //frame-aligned start offset (bits)
     int straight_frame_step; //frame-aligned per-frame step (bits)
 
@@ -1098,7 +1207,7 @@ struct dsd_state {
     uint8_t dmr_emb_err[2];
 
     /* ─────────────────────────────────────────────────────────────────────────
-     * DMR Resample-on-Sync Support
+     * Symbol History and DMR Resample-on-Sync Support
      *
      * Implements SDRTrunk-style threshold calibration and CACH resampling to
      * improve first-frame decode accuracy. See dmr_sync.h for details.
@@ -1106,10 +1215,16 @@ struct dsd_state {
 
     /** Symbol history circular buffer for retrospective resampling.
      *  Stores symbol-rate floats (one per dibit decision), not raw audio samples. */
-    float* dmr_sample_history;
-    int dmr_sample_history_size;  /**< Buffer size (DMR_SAMPLE_HISTORY_SIZE) */
-    int dmr_sample_history_head;  /**< Write index into circular buffer */
-    int dmr_sample_history_count; /**< Symbols written (for underflow check) */
+    float* symbol_history;
+    int symbol_history_size;  /**< Circular-buffer size in symbols */
+    int symbol_history_head;  /**< Write index into circular buffer */
+    int symbol_history_count; /**< Symbols written (for underflow check) */
+
+    // Advisory-only input level health for ncurses/status snapshots.
+    dsd_input_level_snapshot input_level;
+    time_t input_level_last_toast_time;
+    dsd_input_level_status input_level_last_toast_status;
+    dsd_input_level_source input_level_last_toast_source;
 
     // Transient UI message (shown briefly in ncurses printer)
     char ui_msg[128];

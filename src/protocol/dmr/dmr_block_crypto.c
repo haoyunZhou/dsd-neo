@@ -79,7 +79,7 @@ dmr_block_crypto_clamp_window(const dsd_state* state, uint8_t slot, dmr_block_cr
     }
     const int max_end = cap - ctx->start;
     if (ctx->end < 0 || ctx->end > max_end) {
-        /* Preserve legacy malformed-length fallback semantics, bounded to the actual buffer. */
+        /* Malformed lengths consume the remaining bounded buffer window. */
         ctx->end = max_end;
     }
 }
@@ -129,8 +129,36 @@ dmr_block_crypto_load_ctx(const dsd_state* state, uint8_t slot, int blocks, uint
     ctx->rc4_iv[8] = (uint8_t)((ctx->mi & 0xFFULL) >> 0U);
 }
 
+static const char*
+dmr_block_crypto_alg_label(int alg) {
+    switch (alg) {
+        case 0: return "Moto BP";
+        case 1: return "RC4";
+        case 2: return "DES";
+        case 4: return "AES128";
+        case 5: return "AES256";
+        case 7: return "VTX STD";
+        default: return NULL;
+    }
+}
+
+static void
+dmr_block_crypto_print_key(const dmr_block_crypto_ctx* ctx, int show_keys) {
+    if ((ctx->alg == 4 || ctx->alg == 5) && ctx->aes_key_loaded == 1) {
+        char key_text[65];
+        const size_t key_bytes = (ctx->alg == 5) ? 32U : 16U;
+        DSD_FPRINTF(stderr, " Key: %s;",
+                    dsd_secret_format_byte_hex(key_text, sizeof key_text, show_keys, ctx->aes_key, key_bytes));
+    } else if (ctx->rkey != 0ULL && ctx->alg != 0) {
+        char key_text[19];
+        const unsigned width = (ctx->alg == 2) ? 16U : 10U;
+        DSD_FPRINTF(stderr, " Key: %s;",
+                    dsd_secret_format_hex(key_text, sizeof key_text, show_keys, ctx->rkey, width, 0));
+    }
+}
+
 void
-dmr_block_crypto_print_info(const dmr_block_crypto_ctx* ctx) {
+dmr_block_crypto_print_info(const dmr_block_crypto_ctx* ctx, int show_keys) {
     if (ctx == NULL) {
         return;
     }
@@ -139,22 +167,11 @@ dmr_block_crypto_print_info(const dmr_block_crypto_ctx* ctx) {
     if (ctx->alg != 0 && ctx->mi != 0ULL) {
         DSD_FPRINTF(stderr, " MI(32): %08llX;", ctx->mi);
     }
-    if (ctx->alg == 0) {
-        DSD_FPRINTF(stderr, " Moto BP;");
-    } else if (ctx->alg == 1) {
-        DSD_FPRINTF(stderr, " RC4;");
-    } else if (ctx->alg == 2) {
-        DSD_FPRINTF(stderr, " DES;");
-    } else if (ctx->alg == 4) {
-        DSD_FPRINTF(stderr, " AES128;");
-    } else if (ctx->alg == 5) {
-        DSD_FPRINTF(stderr, " AES256;");
-    } else if (ctx->alg == 7) {
-        DSD_FPRINTF(stderr, " VTX STD;");
+    const char* alg_label = dmr_block_crypto_alg_label(ctx->alg);
+    if (alg_label != NULL) {
+        DSD_FPRINTF(stderr, " %s;", alg_label);
     }
-    if (ctx->rkey != 0ULL && ctx->alg != 0) {
-        DSD_FPRINTF(stderr, " Key: %s;", DSD_SECRET_REDACTED);
-    }
+    dmr_block_crypto_print_key(ctx, show_keys);
 }
 
 static void
@@ -195,7 +212,8 @@ dmr_block_crypto_apply_aes_ofb(dsd_state* state, uint8_t slot, const dmr_block_c
     DSD_MEMSET(maes, 0, sizeof(maes));
     DSD_FPRINTF(stderr, "\n");
     dmr_block_crypto_prepare_aes_iv(state, maes);
-    aes_ofb_keystream_output(maes, ctx->aes_key, stream, (ctx->alg == 5) ? 2 : 0, nblocks);
+    const dsd_aes_key_size key_size = (ctx->alg == 5) ? DSD_AES_KEY_256 : DSD_AES_KEY_128;
+    aes_ofb_keystream_output(maes, ctx->aes_key, stream, key_size, nblocks);
     dmr_block_crypto_apply_stream(state, slot, ctx, stream, DMR_AES_OFB_DISCARD_BYTES);
     return 1;
 }
@@ -213,18 +231,20 @@ dmr_block_crypto_apply_aes_ecb(const dsd_state* state, uint8_t* slot_payload, ui
     }
 
     uint8_t* payload = slot_payload + ctx->start;
-    aes_ecb_decrypt_blocks(payload, ctx->aes_key, payload, (ctx->alg == 5) ? 2 : 0, nblocks);
+    const dsd_aes_key_size key_size = (ctx->alg == 5) ? DSD_AES_KEY_256 : DSD_AES_KEY_128;
+    aes_ecb_decrypt_blocks(payload, ctx->aes_key, payload, key_size, nblocks);
     return 1;
 }
 
 static uint8_t
-dmr_block_crypto_apply_bp(dsd_state* state, uint8_t slot, const dmr_block_crypto_ctx* ctx) {
+dmr_block_crypto_apply_bp(dsd_state* state, uint8_t slot, const dmr_block_crypto_ctx* ctx, int show_keys) {
     if (ctx->alg != 0 || state->K == 0 || state->K > 0xFFULL) {
         return 0;
     }
 
     const uint16_t bp_key = BPK[state->K];
-    DSD_FPRINTF(stderr, " Key: %s;", DSD_SECRET_REDACTED);
+    char key_text[16];
+    DSD_FPRINTF(stderr, " Key: %s;", dsd_secret_format_decimal(key_text, sizeof key_text, show_keys, state->K, 0U));
     if (bp_key == 0U) {
         return 0;
     }
@@ -240,7 +260,7 @@ dmr_block_crypto_apply_bp(dsd_state* state, uint8_t slot, const dmr_block_crypto
 }
 
 uint8_t
-dmr_block_crypto_decrypt_payload(dsd_state* state, uint8_t slot, const dmr_block_crypto_ctx* ctx) {
+dmr_block_crypto_decrypt_payload(dsd_state* state, uint8_t slot, const dmr_block_crypto_ctx* ctx, int show_keys) {
     if (state == NULL || ctx == NULL || slot >= 2U) {
         return 0;
     }
@@ -260,7 +280,7 @@ dmr_block_crypto_decrypt_payload(dsd_state* state, uint8_t slot, const dmr_block
         uint8_t stream[DMR_BLOCK_CRYPTO_STREAM_BYTES];
         const int nblocks = (ctx->end / 8) + 1;
         DSD_MEMSET(stream, 0, sizeof(stream));
-        des_multi_keystream_output(ctx->mi, ctx->rkey, stream, 1, nblocks);
+        des_ofb_keystream_output(ctx->mi, ctx->rkey, stream, nblocks);
         dmr_block_crypto_apply_stream(state, slot, ctx, stream, 0);
         return 1;
     }
@@ -280,5 +300,5 @@ dmr_block_crypto_decrypt_payload(dsd_state* state, uint8_t slot, const dmr_block
         return dmr_block_crypto_apply_aes_ofb(state, slot, ctx);
     }
 
-    return dmr_block_crypto_apply_bp(state, slot, ctx);
+    return dmr_block_crypto_apply_bp(state, slot, ctx, show_keys);
 }

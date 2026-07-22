@@ -7,9 +7,7 @@
  * @file
  * @brief Runtime logging implementation for environment-independent logging.
  *
- * Implements the low-level write routine used by logging macros to emit
- * messages. Currently forwards to `stderr`. Future enhancements may include
- * runtime level control, timestamps, and file sinks.
+ * Implements the low-level write routine used by logging macros.
  */
 
 #include <cstdarg>
@@ -18,10 +16,8 @@
 #include <dsd-neo/runtime/unicode.h>
 #include "dsd-neo/core/safe_api.h"
 
-void
+extern "C" void
 dsd_neo_log_write(dsd_neo_log_level_t level, const char* format, ...) {
-    (void)level; /* Currently unused, but available for future runtime gating */
-
     if (format == nullptr) {
         return;
     }
@@ -33,11 +29,13 @@ dsd_neo_log_write(dsd_neo_log_level_t level, const char* format, ...) {
     DSD_VSNPRINTF(buf, sizeof(buf), format, args);
     va_end(args);
 
-    if (dsd_unicode_supported()) {
-        fputs(buf, stderr);
-    } else {
-        char safe[4096];
+    const char* out = buf;
+    char safe[4096];
+    if (!dsd_unicode_supported()) {
         dsd_ascii_fallback(buf, safe, sizeof(safe));
-        fputs(safe, stderr);
+        out = safe;
     }
+
+    (void)level;
+    fputs(out, stderr);
 }

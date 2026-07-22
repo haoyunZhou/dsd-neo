@@ -52,7 +52,7 @@ This project is an active work in progress as we decouple from the upstream fork
 
 - Built‑in trunking workflow
 
-  - Follow P25 and DMR trunked voice automatically using channel maps and group lists (`-C ...csv`, `-G group.csv`, `-T`, `-N`).
+  - Follow P25 and DMR trunked voice automatically using channel maps and group lists (`-C ...csv`, `-G group.csv`, `-T`, `--frontend terminal`; `-N` is the short alias).
   - Rotate one tuner across CSV-defined P25 trunk, DMR trunk, and one-frequency DMR targets with `--trunk-scan targets.csv`.
   - On‑the‑fly retune control via rigctl (`-U`) for external SDR front-ends (e.g., SDR++). For RTL/RTL‑TCP input, DSD-neo retunes directly (optional external UDP retune control can be enabled on loopback with `--rtl-udp-control <port>`; remote exposure requires `--rtl-udp-control-bind <ipv4>`; see `docs/udp-control.md`).
 
@@ -104,11 +104,14 @@ Requirements
 - CMake ≥ 3.20.
 - Dependencies:
   - Required: libsndfile; OpenSSL 3.x libcrypto; a curses backend (ncursesw/PDCurses); and an audio backend (PulseAudio by default, PortAudio on Windows).
-  - Optional: librtlsdr (RTL‑SDR support), SoapySDR >= 0.8.1 (non‑RTL SDR backends), Codec2 (additional vocoder paths), libcurl (rdio API uploads), PortAudio on non-Windows builds, help2man (man page generation).
+  - Optional: librtlsdr (RTL‑SDR support), SoapySDR >= 0.8.1 (non‑RTL SDR backends), Codec2 (additional vocoder paths), libcurl >= 7.56.0 (rdio API uploads), PortAudio on non-Windows builds, help2man (man page generation).
   - Vocoder: mbelib-neo 2.x (`mbe-neo` CMake package) is required.
 
 OS package hints
 
+- Linux bootstrap helper:
+  - `tools/install_linux.sh --yes` installs distro build dependencies, builds pinned `mbelib-neo`, builds this checkout, smoke-tests the CLI, and installs through CMake.
+  - See `docs/linux-installation.md` for distro coverage and Docker validation with `tools/docker_linux_install_matrix.sh`.
 - Ubuntu/Debian (apt):
   - `sudo apt-get update && sudo apt-get install -y build-essential cmake ninja-build libssl-dev libsndfile1-dev libpulse-dev libncurses-dev librtlsdr-dev libsoapysdr-dev`
   - Older distro packages may provide unsupported SoapySDR 0.7.x; install or build SoapySDR 0.8.1 or newer when enabling that backend.
@@ -130,6 +133,11 @@ git clone https://github.com/arancormonk/mbelib-neo
 cmake -S mbelib-neo -B mbelib-neo/build -DCMAKE_BUILD_TYPE=Release
 cmake --build mbelib-neo/build -j
 cmake --install mbelib-neo/build --prefix "$HOME/.local"
+
+# Linux: user-prefix installs need this when running installed binaries.
+export LD_LIBRARY_PATH="$HOME/.local/lib:$HOME/.local/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+# Linux: if you install mbelib-neo to /usr or /usr/local instead, run:
+# sudo ldconfig
 
 # Then configure dsd-neo (point CMake to the install prefix)
 cmake --preset dev-release -DCMAKE_PREFIX_PATH="$HOME/.local"
@@ -210,6 +218,7 @@ Notes
 - The CLI binary outputs to `build/<preset>/apps/dsd-cli/dsd-neo`.
 - `cmake --install <build_dir>` only works if you configured that build directory. If you're inside the build directory, use `cmake --install .`.
 - If `cmake --install build/dev-release` fails and `build/dev-release/` doesn't exist, you likely did a manual build (install from your actual build dir).
+- On Linux, installed binaries must be able to find `libmbe-neo.so.2`. For `/usr` or `/usr/local` installs, run `sudo ldconfig` after installing `mbelib-neo`; for `$HOME/.local`, export `LD_LIBRARY_PATH` as shown above.
 
 ## Install / Uninstall
 
@@ -240,10 +249,12 @@ These are CMake cache options (set at configure time via `-D...`).
   - `-DDSD_WARNINGS_AS_ERRORS=ON|OFF` — Treat warnings as errors (default ON).
   - `-DDSD_ENABLE_FAST_MATH=ON` — Enable fast‑math (`-ffast-math`/`/fp:fast`) across targets.
   - `-DDSD_ENABLE_LTO=ON` — Enable IPO/LTO in Release builds (when supported).
+  - `-DDSD_ENABLE_HARDENING=ON|OFF` — Enable supported Release-like compiler/linker hardening (default ON).
   - `-DDSD_ENABLE_NATIVE=ON` — Enable `-march=native -mtune=native` (non‑portable binaries).
   - `-DDSD_ENABLE_ASAN=ON` — AddressSanitizer in Debug builds.
   - `-DDSD_ENABLE_UBSAN=ON` — UndefinedBehaviorSanitizer in Debug builds.
   - `-DDSD_ENABLE_TSAN=ON` — ThreadSanitizer in Debug builds; use a separate build from ASan/UBSan.
+  - `-DDSD_ENABLE_FUZZING=ON` — Enable libFuzzer instrumentation and fuzz targets (Clang/libFuzzer builds).
 - Audio backend selection:
   - `-DDSD_USE_PORTAUDIO=ON` — Use PortAudio instead of PulseAudio (default on Windows).
 - Radio backend selection:
@@ -252,6 +263,7 @@ These are CMake cache options (set at configure time via `-D...`).
   - `-DDSD_REQUIRE_RTLSDR=ON|OFF` — Fail configure when RTL-SDR is enabled but unavailable.
   - `-DDSD_REQUIRE_SOAPYSDR=ON|OFF` — Fail configure when SoapySDR >= 0.8.1 is enabled but unavailable.
 - UI and behavior toggles:
+  - `-DDSD_ENABLE_TERMINAL_UI=ON|OFF` — Build the ncurses/PDCurses terminal frontend (default ON).
   - `-DCOLORS=OFF` — Disable ncurses color output.
   - `-DCOLORSLOGS=OFF` — Disable colored terminal/log output.
 - Protocol and feature knobs:
@@ -339,18 +351,15 @@ Common options:
 - See the friendly CLI guide: [docs/cli.md](docs/cli.md)
   - Or run `dsd-neo -h` for quick usage in your terminal.
   - Digital/analog output gain: `-g <float>` (digital; `0` = auto, `1` ≈ 2%, `50` = 100%) and `-n <float>` (analog 0–100%).
-  - DMR mono helpers:
-    - Modern form: `-fs -nm` (DMR BS/MS simplex + mono audio).
-    - Legacy alias: `-fr` (kept as a shorthand for the same DMR‑mono profile).
   - Single-tuner trunk scan workflow: `docs/trunk-scan.md`
   - CSV formats (channel maps, trunk scan targets, group lists, key lists): `docs/csv-formats.md` (examples in `examples/`)
 
 Quick examples
 
-- UDP in → Pulse out with UI: `dsd-neo -i udp -o pulse -N`
-- DMR trunking from TCP PCM input (with rigctl): `dsd-neo -fs -i tcp -U 4532 -T -C dmr_t3_chan.csv -G group.csv -N`
-- Single-tuner P25/DMR trunk scan from RTL-SDR: `dsd-neo -ft -i rtl:0:851.0125M:22:0:48:0:2 --trunk-scan examples/trunk_scan_targets.csv -G examples/group.csv -N`
-- IQ capture + inspect + replay: `dsd-neo -i rtl:0:851.375M:22:0:48:0:2 --iq-capture p25-control.iq -N` then `dsd-neo --iq-info p25-control.iq.json` then `dsd-neo --iq-replay p25-control.iq.json -f1 -N`
+- UDP in → Pulse out with UI: `dsd-neo -i udp -o pulse --frontend terminal`
+- DMR trunking from TCP PCM input (with rigctl): `dsd-neo -fs -i tcp -U 4532 -T -C dmr_t3_chan.csv -G group.csv --frontend terminal`
+- Single-tuner P25/DMR trunk scan from RTL-SDR: `dsd-neo -ft -i rtl:0:851.0125M:22:0:48:0:2 --trunk-scan examples/trunk_scan_targets.csv -G examples/group.csv --frontend terminal`
+- IQ capture + inspect + replay: `dsd-neo -i rtl:0:851.375M:22:0:48:0:2 --iq-capture p25-control.iq --frontend terminal` then `dsd-neo --iq-info p25-control.iq.json` then `dsd-neo --iq-replay p25-control.iq.json -f1 --frontend terminal`
 
 ## Configuration
 
@@ -419,13 +428,16 @@ Quick examples
   - `tools/cmake_format_check.sh` (CMake formatting with gersemi; use `--fix` to rewrite).
   - `tools/gitleaks.sh` (secret scanning with SARIF output for GitHub code scanning).
 - Security guardrails:
-  - `tools/check_secret_redaction.sh` (blocks formatted key/keystream output without `DSD_SECRET_REDACTED`).
+  - `tools/check_secret_redaction.sh` (blocks formatted key/keystream output outside the redaction formatter helpers).
   - `tools/check_workflow_git_pins.sh` (blocks floating public GitHub source checkouts in workflows and CI helper scripts).
   - `tools/check_workflow_download_pins.sh` (blocks mutable release helper downloads and digestless AppImage container refs).
   - `tools/check_release_hardening.sh` (verifies Linux ELF PIE/RELRO/BIND_NOW, macOS Mach-O PIE/@rpath, and hardening compile flags).
   - `tools/check_release_hardening.ps1` (verifies Windows PE ASLR, NX, and high-entropy VA hardening).
 - Fuzzing: `tools/fuzz_smoke.sh` configures/builds the `fuzz-asan-debug` preset and runs bounded libFuzzer smoke passes.
-- Git hooks: `tools/install-git-hooks.sh` enables auto‑format on commit and a CI-aligned pre-push analysis pass (security guardrails including workflow source/download pins, clang-format, CMake format, clang-tidy, cppcheck, IWYU, GCC fanalyzer, Semgrep, zizmor, OSV scan, shell/workflow lint) on changed paths.
+- Git hooks: `tools/install-git-hooks.sh` enables auto‑format on commit and a CI-aligned pre-push analysis pass
+  (security guardrails including workflow source/download pins, install-destination checks, clang-format, CMake format,
+  clang-tidy, cppcheck, IWYU, GCC fanalyzer, Lizard, Semgrep, zizmor, OSV scan, and shell/workflow lint) on changed
+  paths.
 - Optional full scan-build pre-push/preflight pass: set `DSD_HOOK_RUN_SCAN_BUILD=1`.
 - Manual preflight runner: `tools/preflight_ci.sh` runs the same CI-aligned checks as `pre-push` without pushing.
 - Full quality preflight: `tools/quality_preflight.sh` enables missing-tool failures, includes scan-build, and runs the full local guardrail set.
@@ -444,5 +456,7 @@ Quick examples
 
 - Project license: GPL‑3.0‑or‑later (see `LICENSE`).
 - Portions remain under ISC per the original DSD author (see `COPYRIGHT`).
-- Third-party notices live in `THIRD_PARTY.md` (installed license texts: `share/doc/dsd-neo/licenses/`).
-- Project-authored source files carry SPDX identifiers reflecting their license; vendored third-party files retain upstream license headers.
+- Third-party and embedded-code notices are summarized in `THIRD_PARTY.md` (installed license texts:
+  `share/doc/dsd-neo/licenses/`).
+- Project-authored source files carry SPDX identifiers reflecting their license; vendored and embedded upstream-derived
+  code retains upstream license/provenance headers, which should be consulted for file-specific details.

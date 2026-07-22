@@ -143,63 +143,6 @@ test_channel_import_missing_file(void) {
 }
 
 static int
-test_lcn_import_caps_frequency_count(void) {
-    dsd_opts* opts = (dsd_opts*)calloc(1, sizeof(*opts));
-    dsd_state* state = (dsd_state*)calloc(1, sizeof(*state));
-    if (!opts || !state) {
-        free(opts);
-        free_test_state(state);
-        return 1;
-    }
-
-    char tmpl[] = "dsd-neo-test-lcn-overflow-XXXXXX";
-    int fd = dsd_mkstemp(tmpl);
-    if (fd < 0) {
-        free(opts);
-        free_test_state(state);
-        return 1;
-    }
-    (void)dsd_close(fd);
-
-    FILE* fp = dsd_fopen_private(tmpl, "w");
-    if (!fp) {
-        (void)remove(tmpl);
-        free(opts);
-        free_test_state(state);
-        return 1;
-    }
-
-    DSD_FPRINTF(fp, "lcn\n");
-    for (int i = 0; i < 30; ++i) {
-        DSD_FPRINTF(fp, "%s%d", i == 0 ? "" : ",", 851000000 + i);
-    }
-    DSD_FPRINTF(fp, "\n");
-    fclose(fp);
-
-    DSD_SNPRINTF(opts->lcn_in_file, sizeof opts->lcn_in_file, "%s", tmpl);
-    int rc = csvLCNImport(opts, state);
-
-    int failed = 0;
-    if (rc != 0) {
-        failed = 1;
-    }
-    if (state->lcn_freq_count != 26) {
-        failed = 1;
-    }
-    for (int i = 0; i < 26; ++i) {
-        if (state->trunk_lcn_freq[i] != 851000000 + i) {
-            failed = 1;
-            break;
-        }
-    }
-
-    (void)remove(tmpl);
-    free(opts);
-    free_test_state(state);
-    return failed;
-}
-
-static int
 test_channel_import_rejects_directory(void) {
     dsd_opts* opts = (dsd_opts*)calloc(1, sizeof(*opts));
     dsd_state* state = (dsd_state*)calloc(1, sizeof(*state));
@@ -336,7 +279,7 @@ test_hex_key_import_preserves_zero_segments_for_keyring(void) {
 
     state->currentslot = 0;
     state->payload_keyid = key_id;
-    keyring(opts, state);
+    keyring_activate_slot(opts, state, state->currentslot);
     if (state->R != 0xA753BC945DE5E0F1ULL || state->A1[0] != 0xA753BC945DE5E0F1ULL || state->A2[0] != 0ULL
         || state->A3[0] != 0xD9DF2FAC6278FA93ULL || state->A4[0] != 0ULL || state->aes_key_segments[0] != 4U
         || state->aes_key_loaded[0] != 1) {
@@ -512,12 +455,12 @@ test_group_import_large_file_policy(void) {
         || strcmp(lookup.entry.name, "Late Allow") != 0) {
         failed = 1;
     }
-    if (dsd_tg_policy_evaluate_group_call(opts, state, 6500U, 1U, 0, 0, DSD_TG_POLICY_HOLD_COMPAT_GRANT, &decision) != 0
+    if (dsd_tg_policy_evaluate_group_call(opts, state, 6500U, 1U, 0, 0, &decision) != 0
         || decision.match != DSD_TG_POLICY_MATCH_EXACT || decision.tune_allowed != 1) {
         failed = 1;
     }
-    if (dsd_tg_policy_evaluate_group_call(opts, state, 7000U, 1U, 0, 0, DSD_TG_POLICY_HOLD_COMPAT_GRANT, &decision) != 0
-        || decision.tune_allowed != 0 || (decision.block_reasons & DSD_TG_POLICY_BLOCK_ALLOWLIST) == 0) {
+    if (dsd_tg_policy_evaluate_group_call(opts, state, 7000U, 1U, 0, 0, &decision) != 0 || decision.tune_allowed != 0
+        || (decision.block_reasons & DSD_TG_POLICY_BLOCK_ALLOWLIST) == 0) {
         failed = 1;
     }
     if (dsd_tg_policy_lookup_id(state, (uint32_t)rows, &lookup) != 0 || lookup.match != DSD_TG_POLICY_MATCH_EXACT
@@ -525,9 +468,7 @@ test_group_import_large_file_policy(void) {
         || strlen(lookup.entry.name) != sizeof(lookup.entry.name) - 1) {
         failed = 1;
     }
-    if (dsd_tg_policy_evaluate_group_call(opts, state, (uint32_t)rows, 1U, 0, 0, DSD_TG_POLICY_HOLD_COMPAT_GRANT,
-                                          &decision)
-            != 0
+    if (dsd_tg_policy_evaluate_group_call(opts, state, (uint32_t)rows, 1U, 0, 0, &decision) != 0
         || decision.tune_allowed != 0 || (decision.block_reasons & DSD_TG_POLICY_BLOCK_MODE) == 0) {
         failed = 1;
     }
@@ -550,6 +491,69 @@ write_text_file(const char* path, const char* text) {
     }
     fclose(fp);
     return 0;
+}
+
+static int
+test_channel_import_rejects_malformed_rows_without_reusing_previous_channel(void) {
+    int failed = 0;
+    dsd_opts* opts = (dsd_opts*)calloc(1, sizeof(*opts));
+    dsd_state* state = (dsd_state*)calloc(1, sizeof(*state));
+    char tmpl[] = "dsd-neo-test-channel-malformed-XXXXXX";
+    int fd = -1;
+
+    if (!opts || !state) {
+        free(opts);
+        free_test_state(state);
+        return 1;
+    }
+
+    fd = dsd_mkstemp(tmpl);
+    if (fd < 0) {
+        free(opts);
+        free_test_state(state);
+        return 1;
+    }
+    (void)dsd_close(fd);
+
+    if (write_text_file(tmpl, "channel,freq\n"
+                              "12,851000000\n"
+                              "bad,852000000\n"
+                              "13,badfreq\n"
+                              "14,853000000\n"
+                              "65535,854000000\n")
+        != 0) {
+        (void)remove(tmpl);
+        free(opts);
+        free_test_state(state);
+        return 1;
+    }
+
+    DSD_SNPRINTF(opts->chan_in_file, sizeof(opts->chan_in_file), "%s", tmpl);
+    if (csvChanImport(opts, state) != 0) {
+        failed = 1;
+    }
+    if (state->trunk_chan_map[12] != 851000000L) {
+        failed = 1;
+    }
+    if (state->trunk_chan_map[13] != 0L) {
+        failed = 1;
+    }
+    if (state->trunk_chan_map[14] != 853000000L) {
+        failed = 1;
+    }
+    if (state->trunk_chan_map_used_count != 2U || state->trunk_chan_map_used[0] != 12U
+        || state->trunk_chan_map_used[1] != 14U) {
+        failed = 1;
+    }
+    if (state->lcn_freq_count != 3 || state->trunk_lcn_freq[0] != 851000000L || state->trunk_lcn_freq[1] != 0L
+        || state->trunk_lcn_freq[2] != 853000000L) {
+        failed = 1;
+    }
+
+    (void)remove(tmpl);
+    free(opts);
+    free_test_state(state);
+    return failed;
 }
 
 static int
@@ -943,9 +947,6 @@ main(void) {
     if (test_channel_import_missing_file() != 0) {
         return 1;
     }
-    if (test_lcn_import_caps_frequency_count() != 0) {
-        return 1;
-    }
     if (test_channel_import_rejects_directory() != 0) {
         return 1;
     }
@@ -970,6 +971,9 @@ main(void) {
         return 1;
     }
     if (test_group_import_invalid_ids_and_required_fields() != 0) {
+        return 1;
+    }
+    if (test_channel_import_rejects_malformed_rows_without_reusing_previous_channel() != 0) {
         return 1;
     }
     if (test_group_import_range_after_many_exact_rows() != 0) {

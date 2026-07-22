@@ -22,6 +22,7 @@
 #include <dsd-neo/core/time_format.h>
 #include <dsd-neo/platform/file_compat.h>
 #include <dsd-neo/protocol/edacs/edacs_afs.h>
+#include <dsd-neo/protocol/p25/p25_crypto.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -32,7 +33,8 @@
 #include "dsd-neo/runtime/call_alert.h"
 
 enum {
-    DSD_EVENT_SUBTYPE_DATA = 6,
+    DSD_EVENT_SUBTYPE_DMR_DATA_BURST = 6,
+    DSD_EVENT_SUBTYPE_EXPLICIT_DATA = INT8_MAX,
 };
 
 // Safe bounded copy helper that tolerates potential overlap
@@ -49,9 +51,15 @@ copy_str_field(char* dst, const char* src, size_t cap) {
 //init each event history struct passed into here
 void
 init_event_history(Event_History_I* event_struct, uint8_t start, uint8_t stop) {
+    if (event_struct == NULL || start >= stop) {
+        return;
+    }
+
     for (uint8_t i = start; i < stop; i++) {
         event_struct->Event_History_Items[i].write = 0;
         event_struct->Event_History_Items[i].color_pair = 4;
+        event_struct->Event_History_Items[i].severity = DSD_EVENT_SEVERITY_UNKNOWN;
+        event_struct->Event_History_Items[i].category = DSD_EVENT_CATEGORY_UNKNOWN;
         event_struct->Event_History_Items[i].systype = -1;
         event_struct->Event_History_Items[i].subtype = -1;
         event_struct->Event_History_Items[i].sys_id1 = 0;
@@ -84,15 +92,21 @@ init_event_history(Event_History_I* event_struct, uint8_t start, uint8_t stop) {
         event_struct->Event_History_Items[i].event_string[0] = '\0';
         event_struct->Event_History_Items[i].internal_str[0] = '\0';
     }
+    dsd_event_history_mark_dirty(event_struct);
 }
 
 void
 push_event_history(Event_History_I* event_struct) {
+    if (event_struct == NULL) {
+        return;
+    }
 
     //Fixed, had it going in the wrong direction first time
     for (uint8_t i = 254; i >= 1; i--) {
         event_struct->Event_History_Items[i].write = event_struct->Event_History_Items[i - 1].write;
         event_struct->Event_History_Items[i].color_pair = event_struct->Event_History_Items[i - 1].color_pair;
+        event_struct->Event_History_Items[i].severity = event_struct->Event_History_Items[i - 1].severity;
+        event_struct->Event_History_Items[i].category = event_struct->Event_History_Items[i - 1].category;
         event_struct->Event_History_Items[i].systype = event_struct->Event_History_Items[i - 1].systype;
         event_struct->Event_History_Items[i].subtype = event_struct->Event_History_Items[i - 1].subtype;
         event_struct->Event_History_Items[i].sys_id1 = event_struct->Event_History_Items[i - 1].sys_id1;
@@ -142,6 +156,7 @@ push_event_history(Event_History_I* event_struct) {
                        event_struct->Event_History_Items[i - 1].internal_str,
                        sizeof event_struct->Event_History_Items[i].internal_str);
     }
+    dsd_event_history_mark_dirty(event_struct);
 }
 
 void
@@ -193,6 +208,24 @@ watchdog_event_item_has_content(const Event_History* item) {
     }
     return item->event_string[0] != '\0' || item->text_message[0] != '\0' || item->alias[0] != '\0'
            || item->gps_s[0] != '\0' || item->internal_str[0] != '\0';
+}
+
+static int
+watchdog_event_is_dmr_data_sync(int systype) {
+    return systype == DSD_SYNC_DMR_BS_DATA_POS || systype == DSD_SYNC_DMR_BS_DATA_NEG || systype == DSD_SYNC_DMR_MS_DATA
+           || systype == DSD_SYNC_DMR_RC_DATA;
+}
+
+static int
+watchdog_event_is_explicit_data_event(const Event_History* item) {
+    return item != NULL && item->subtype == DSD_EVENT_SUBTYPE_EXPLICIT_DATA;
+}
+
+static int
+watchdog_event_is_data_event(const Event_History* item) {
+    return watchdog_event_is_explicit_data_event(item)
+           || (item != NULL && watchdog_event_is_dmr_data_sync(item->systype)
+               && item->subtype == DSD_EVENT_SUBTYPE_DMR_DATA_BURST);
 }
 
 static int
@@ -264,7 +297,7 @@ watchdog_event_source_id(const dsd_opts* opts, const dsd_state* state, uint8_t s
     }
 
     if (DSD_SYNC_IS_EDACS(state->lastsynctype)) {
-        return (opts->p25_is_tuned == 1) ? state->lastsrc : 0;
+        return (opts->trunk_is_tuned == 1) ? state->lastsrc : 0;
     }
 
     return source_id;
@@ -326,10 +359,12 @@ watchdog_event_handle_source_transition(dsd_opts* opts, dsd_state* state, Event_
 void
 watchdog_event_history(dsd_opts* opts, dsd_state* state, uint8_t slot) {
     Event_History_I* event_struct = &state->event_history_s[slot];
+    const Event_History* last_event = &event_struct->Event_History_Items[0];
     uint8_t swrite = watchdog_event_should_write_slot(state);
-    uint32_t last_source_id = event_struct->Event_History_Items[0].source_id;
-    int last_event_is_data = event_struct->Event_History_Items[0].subtype == DSD_EVENT_SUBTYPE_DATA;
-    int last_event_has_content = watchdog_event_item_has_content(&event_struct->Event_History_Items[0]);
+    uint32_t last_source_id = last_event->source_id;
+    int last_event_forces_history = watchdog_event_is_explicit_data_event(last_event);
+    int last_event_is_data = watchdog_event_is_data_event(last_event);
+    int last_event_has_content = watchdog_event_item_has_content(last_event);
     uint32_t source_id = watchdog_event_source_id(opts, state, slot);
 
     //call alert beep when new call detected
@@ -338,7 +373,7 @@ watchdog_event_history(dsd_opts* opts, dsd_state* state, uint8_t slot) {
         beeper(opts, state, slot, 40, 86, 3);
     }
 
-    if (last_event_is_data && last_event_has_content) {
+    if (last_event_forces_history && last_event_has_content) {
         watchdog_event_handle_source_transition(opts, state, event_struct, slot, swrite, last_event_is_data);
         return;
     }
@@ -352,7 +387,8 @@ watchdog_event_history(dsd_opts* opts, dsd_state* state, uint8_t slot) {
 //this will hopefully be more useful when dealing with an ongoing event with
 //features that update over time with embedded signalling, etc
 typedef struct {
-    uint8_t color_pair;
+    dsd_event_severity severity;
+    dsd_event_category category;
     uint32_t source_id;
     uint32_t target_id;
     char src_str[200];
@@ -469,7 +505,7 @@ watchdog_event_build_edacs_sup_str(uint16_t svc_opts, int use_underscore, char* 
 }
 
 static void
-watchdog_event_set_ysf_text_message(dsd_state* state, Event_History_I* event_struct) {
+watchdog_event_set_ysf_text_message(dsd_state* state, Event_History* item) {
     char ysf_emp[21][21];
     DSD_MEMSET(ysf_emp, 0, sizeof(ysf_emp));
 
@@ -478,22 +514,23 @@ watchdog_event_set_ysf_text_message(dsd_state* state, Event_History_I* event_str
         for (uint8_t i = 4; i < 8; i++) {
             for (uint8_t j = 0; j < 20; j++) {
                 if (state->ysf_txt[i][j] != 0x2A) {
-                    event_struct->Event_History_Items[0].text_message[k++] = state->ysf_txt[i][j];
+                    item->text_message[k++] = state->ysf_txt[i][j];
                 } else {
-                    event_struct->Event_History_Items[0].text_message[k++] = 0x20;
+                    item->text_message[k++] = 0x20;
                 }
             }
-            event_struct->Event_History_Items[0].text_message[k] = 0;
+            item->text_message[k] = 0;
         }
     } else {
-        event_struct->Event_History_Items[0].text_message[0] = '\0';
+        item->text_message[0] = '\0';
     }
 }
 
 static void
 watchdog_event_current_init_base(const dsd_state* state, uint8_t slot, watchdog_event_current_ctx* ctx) {
     DSD_MEMSET(ctx, 0, sizeof(*ctx));
-    ctx->color_pair = 4;
+    ctx->severity = DSD_EVENT_SEVERITY_INFO;
+    ctx->category = DSD_EVENT_CATEGORY_VOICE;
 
     if (slot == 0) {
         ctx->source_id = state->lastsrc;
@@ -545,6 +582,55 @@ watchdog_event_current_init_base(const dsd_state* state, uint8_t slot, watchdog_
     }
 }
 
+static int
+watchdog_event_p25_algid_is_encrypted(uint8_t alg_id) {
+    return alg_id != 0U && alg_id != 0x80U;
+}
+
+static int
+watchdog_event_p25_has_current_voice_alg(const dsd_state* state) {
+    if (state == NULL) {
+        return 0;
+    }
+    if (DSD_SYNC_IS_P25P2(state->lastsynctype)) {
+        return 1;
+    }
+    if (!DSD_SYNC_IS_P25P1(state->lastsynctype)) {
+        return 0;
+    }
+    return state->lastp25type == 1 || state->lastp25type == 2;
+}
+
+static int
+watchdog_event_p25_has_current_service_options(const dsd_state* state, uint8_t slot) {
+    if (state == NULL || !DSD_SYNC_IS_P25(state->lastsynctype)) {
+        return 0;
+    }
+    return state->p25_service_options_valid[slot & 1U] != 0 ? 1 : 0;
+}
+
+static void
+watchdog_event_current_normalize_p25_crypto(const dsd_state* state, uint8_t slot, watchdog_event_current_ctx* ctx) {
+    if (state == NULL || ctx == NULL || !DSD_SYNC_IS_P25(state->lastsynctype)) {
+        return;
+    }
+
+    if (!watchdog_event_p25_has_current_service_options(state, slot)) {
+        ctx->svc_opts = 0;
+        ctx->enc = 0;
+    }
+
+    if (watchdog_event_p25_algid_is_encrypted(ctx->alg_id) && watchdog_event_p25_has_current_voice_alg(state)
+        && p25_crypto_metadata_is_confirmed_encrypted(state, slot & 1U)) {
+        ctx->enc = 1;
+        return;
+    }
+
+    ctx->alg_id = 0;
+    ctx->key_id = 0;
+    ctx->mi = 0;
+}
+
 static void
 watchdog_event_current_apply_nxdn(const dsd_state* state, watchdog_event_current_ctx* ctx) {
     ctx->source_id = state->nxdn_last_rid;
@@ -567,9 +653,9 @@ watchdog_event_current_apply_nxdn(const dsd_state* state, watchdog_event_current
 }
 
 static void
-watchdog_event_current_apply_ysf(dsd_state* state, Event_History_I* event_struct, watchdog_event_current_ctx* ctx) {
+watchdog_event_current_apply_ysf(dsd_state* state, Event_History* item, watchdog_event_current_ctx* ctx) {
     ctx->source_id = watchdog_event_source_ysf(state);
-    watchdog_event_set_ysf_text_message(state, event_struct);
+    watchdog_event_set_ysf_text_message(state, item);
 
     DSD_SNPRINTF(ctx->sysid_string, sizeof(ctx->sysid_string), "%s", "YSF");
     watchdog_event_set_sanitized_ascii_id(ctx->src_str, sizeof(ctx->src_str), state->ysf_src, 10);
@@ -607,7 +693,7 @@ watchdog_event_current_apply_dpmr(const dsd_state* state, watchdog_event_current
 static void
 watchdog_event_current_apply_edacs(const dsd_opts* opts, dsd_state* state, watchdog_event_current_ctx* ctx) {
     ctx->source_id = 0;
-    if (opts->p25_is_tuned == 1) {
+    if (opts->trunk_is_tuned == 1) {
         ctx->source_id = state->lastsrc;
         ctx->channel = state->edacs_tuned_lcn;
     }
@@ -639,14 +725,14 @@ watchdog_event_current_apply_edacs(const dsd_opts* opts, dsd_state* state, watch
 }
 
 static void
-watchdog_event_current_apply_slot0_overrides(const dsd_opts* opts, dsd_state* state, Event_History_I* event_struct,
+watchdog_event_current_apply_slot0_overrides(const dsd_opts* opts, dsd_state* state, Event_History* item,
                                              watchdog_event_current_ctx* ctx) {
     if (DSD_SYNC_IS_NXDN(state->lastsynctype)) {
         watchdog_event_current_apply_nxdn(state, ctx);
     }
 
     if (DSD_SYNC_IS_YSF(state->lastsynctype)) {
-        watchdog_event_current_apply_ysf(state, event_struct, ctx);
+        watchdog_event_current_apply_ysf(state, item, ctx);
     }
 
     if (watchdog_event_is_m17_sync(state->lastsynctype)) {
@@ -685,48 +771,41 @@ watchdog_event_current_load_labels(const dsd_state* state, watchdog_event_curren
 }
 
 static void
-watchdog_event_current_update_item(const dsd_opts* opts, dsd_state* state, uint8_t slot, Event_History_I* event_struct,
-                                   const watchdog_event_current_ctx* ctx) {
-    event_struct->Event_History_Items[0].write = 0;
-    state->event_history_s[slot].Event_History_Items[0].color_pair = ctx->color_pair;
+watchdog_event_current_update_item(const dsd_opts* opts, dsd_state* state, uint8_t slot, Event_History* item,
+                                   const watchdog_event_current_ctx* ctx, time_t now) {
+    item->write = 0;
+    dsd_event_history_item_set_metadata(item, ctx->severity, ctx->category);
     if (state->lastsynctype != DSD_SYNC_NONE) {
-        event_struct->Event_History_Items[0].systype = state->lastsynctype;
+        item->systype = state->lastsynctype;
     } else {
-        event_struct->Event_History_Items[0].systype = 39;
+        item->systype = 39;
     }
-    event_struct->Event_History_Items[0].subtype = ctx->subtype;
-    event_struct->Event_History_Items[0].gi = state->gi[slot];
-    event_struct->Event_History_Items[0].sys_id1 = ctx->sys_id1;
-    event_struct->Event_History_Items[0].sys_id2 = ctx->sys_id2;
-    event_struct->Event_History_Items[0].sys_id3 = ctx->sys_id3;
-    event_struct->Event_History_Items[0].sys_id4 = ctx->sys_id4;
-    event_struct->Event_History_Items[0].sys_id5 = ctx->sys_id5;
-    event_struct->Event_History_Items[0].enc = ctx->enc;
-    event_struct->Event_History_Items[0].enc_alg = ctx->alg_id;
-    event_struct->Event_History_Items[0].enc_key = ctx->key_id;
-    event_struct->Event_History_Items[0].mi = ctx->mi;
-    event_struct->Event_History_Items[0].svc = ctx->svc_opts;
-    event_struct->Event_History_Items[0].source_id = ctx->source_id;
-    event_struct->Event_History_Items[0].target_id = ctx->target_id;
-    event_struct->Event_History_Items[0].channel = ctx->channel;
+    item->subtype = ctx->subtype;
+    item->gi = state->gi[slot];
+    item->sys_id1 = ctx->sys_id1;
+    item->sys_id2 = ctx->sys_id2;
+    item->sys_id3 = ctx->sys_id3;
+    item->sys_id4 = ctx->sys_id4;
+    item->sys_id5 = ctx->sys_id5;
+    item->enc = ctx->enc;
+    item->enc_alg = ctx->alg_id;
+    item->enc_key = ctx->key_id;
+    item->mi = ctx->mi;
+    item->svc = ctx->svc_opts;
+    item->source_id = ctx->source_id;
+    item->target_id = ctx->target_id;
+    item->channel = ctx->channel;
     if (opts->playfiles == 0) {
-        event_struct->Event_History_Items[0].event_time = time(NULL);
+        item->event_time = now;
     }
 
-    DSD_SNPRINTF(event_struct->Event_History_Items[0].sysid_string,
-                 sizeof(event_struct->Event_History_Items[0].sysid_string), "%s", ctx->sysid_string);
-    DSD_SNPRINTF(event_struct->Event_History_Items[0].src_str, sizeof(event_struct->Event_History_Items[0].src_str),
-                 "%s", ctx->src_str);
-    DSD_SNPRINTF(event_struct->Event_History_Items[0].tgt_str, sizeof(event_struct->Event_History_Items[0].tgt_str),
-                 "%s", ctx->tgt_str);
-    DSD_SNPRINTF(event_struct->Event_History_Items[0].t_name, sizeof(event_struct->Event_History_Items[0].t_name), "%s",
-                 ctx->t_name);
-    DSD_SNPRINTF(event_struct->Event_History_Items[0].s_name, sizeof(event_struct->Event_History_Items[0].s_name), "%s",
-                 ctx->s_name);
-    DSD_SNPRINTF(event_struct->Event_History_Items[0].t_mode, sizeof(event_struct->Event_History_Items[0].t_mode), "%s",
-                 ctx->t_mode);
-    DSD_SNPRINTF(event_struct->Event_History_Items[0].s_mode, sizeof(event_struct->Event_History_Items[0].s_mode), "%s",
-                 ctx->s_mode);
+    DSD_SNPRINTF(item->sysid_string, sizeof(item->sysid_string), "%s", ctx->sysid_string);
+    DSD_SNPRINTF(item->src_str, sizeof(item->src_str), "%s", ctx->src_str);
+    DSD_SNPRINTF(item->tgt_str, sizeof(item->tgt_str), "%s", ctx->tgt_str);
+    DSD_SNPRINTF(item->t_name, sizeof(item->t_name), "%s", ctx->t_name);
+    DSD_SNPRINTF(item->s_name, sizeof(item->s_name), "%s", ctx->s_name);
+    DSD_SNPRINTF(item->t_mode, sizeof(item->t_mode), "%s", ctx->t_mode);
+    DSD_SNPRINTF(item->s_mode, sizeof(item->s_mode), "%s", ctx->s_mode);
 }
 
 static void
@@ -863,6 +942,8 @@ watchdog_event_current_build_event_p25(const dsd_state* state, uint8_t slot, con
         char ess_str[30];
         DSD_SNPRINTF(ess_str, sizeof(ess_str), "ENC; ALG: %02X; KID: %04X; ", ctx->alg_id, ctx->key_id);
         watchdog_event_str_append(event_string, event_size, ess_str);
+    } else if (ctx->enc) {
+        watchdog_event_str_append(event_string, event_size, "ENC; ");
     }
     if (ctx->svc_opts & 0x80) {
         watchdog_event_str_append(event_string, event_size, "Emergency; ");
@@ -957,15 +1038,22 @@ watchdog_event_current_append_policy_labels(const watchdog_event_current_ctx* ct
 
 void
 watchdog_event_current(const dsd_opts* opts, dsd_state* state, uint8_t slot) {
+    if (!opts || !state || !state->event_history_s || slot > 1U) {
+        return;
+    }
+
     Event_History_I* event_struct = &state->event_history_s[slot];
+    Event_History candidate;
+    DSD_MEMCPY(&candidate, &event_struct->Event_History_Items[0], sizeof(candidate));
 
     watchdog_event_current_ctx ctx;
     watchdog_event_current_init_base(state, slot, &ctx);
 
     if (slot == 0) {
-        watchdog_event_current_apply_slot0_overrides(opts, state, event_struct, &ctx);
+        watchdog_event_current_apply_slot0_overrides(opts, state, &candidate, &ctx);
     }
 
+    watchdog_event_current_normalize_p25_crypto(state, slot, &ctx);
     watchdog_event_current_load_labels(state, &ctx);
 
     const char* sys_string = dsd_synctype_to_string(state->lastsynctype);
@@ -973,10 +1061,10 @@ watchdog_event_current(const dsd_opts* opts, dsd_state* state, uint8_t slot) {
     char timestr[9];
     char datestr[11];
     time_t now = time(NULL);
-    getTimeN_buf(now, timestr);
-    getDateN_buf(now, datestr);
+    (void)dsd_format_local_datetime(now, DSD_LOCAL_DATETIME_TIME_COLON, timestr, sizeof timestr);
+    (void)dsd_format_local_datetime(now, DSD_LOCAL_DATETIME_DATE_HYPHEN, datestr, sizeof datestr);
 
-    watchdog_event_current_update_item(opts, state, slot, event_struct, &ctx);
+    watchdog_event_current_update_item(opts, state, slot, &candidate, &ctx, now);
 
     char event_string[2000];
     DSD_MEMSET(event_string, 0, sizeof(event_string));
@@ -984,18 +1072,54 @@ watchdog_event_current(const dsd_opts* opts, dsd_state* state, uint8_t slot) {
                                               sizeof(event_string));
     watchdog_event_current_append_policy_labels(&ctx, event_string, sizeof(event_string));
 
-    DSD_SNPRINTF(event_struct->Event_History_Items[0].event_string,
-                 sizeof(event_struct->Event_History_Items[0].event_string), "%s", event_string);
+    DSD_SNPRINTF(candidate.event_string, sizeof(candidate.event_string), "%s", event_string);
+
+    // The candidate starts as an exact byte copy of the current row, so padding bytes remain identical.
+    // NOLINTNEXTLINE(bugprone-suspicious-memory-comparison,cert-exp42-c,cert-flp37-c)
+    if (memcmp(&candidate, &event_struct->Event_History_Items[0], sizeof(candidate)) != 0) {
+        DSD_MEMCPY(&event_struct->Event_History_Items[0], &candidate, sizeof(candidate));
+        dsd_event_history_mark_dirty(event_struct);
+    }
 
     /* stack buffers; no free */
 }
 
 void
+watchdog_event_status(dsd_state* state, const char* status_string, uint8_t slot) {
+    if (state == NULL || state->event_history_s == NULL || status_string == NULL || slot >= 2) {
+        return;
+    }
+
+    Event_History_I* event_struct = &state->event_history_s[slot];
+    init_event_history(event_struct, 0, 1);
+
+    Event_History* item = &event_struct->Event_History_Items[0];
+    item->write = 0;
+    dsd_event_history_item_set_metadata(item, DSD_EVENT_SEVERITY_INFO, DSD_EVENT_CATEGORY_STATUS);
+    item->systype = -1;
+    item->subtype = -1;
+    item->source_id = 0;
+    item->target_id = 0;
+
+    time_t now = time(NULL);
+    item->event_time = now;
+
+    char timestr[9];
+    char datestr[11];
+    (void)dsd_format_local_datetime(now, DSD_LOCAL_DATETIME_TIME_COLON, timestr, sizeof timestr);
+    (void)dsd_format_local_datetime(now, DSD_LOCAL_DATETIME_DATE_HYPHEN, datestr, sizeof datestr);
+
+    DSD_SNPRINTF(item->event_string, sizeof item->event_string, "%s %s %s", datestr, timestr, status_string);
+    dsd_event_history_mark_dirty(event_struct);
+}
+
+void
 watchdog_event_datacall(dsd_opts* opts, dsd_state* state, uint32_t src, uint32_t dst, char* data_string, uint8_t slot) {
     state->event_history_s[slot].Event_History_Items[0].write = 0;
-    state->event_history_s[slot].Event_History_Items[0].color_pair = 4; //default data color //you can change this one
+    dsd_event_history_item_set_metadata(&state->event_history_s[slot].Event_History_Items[0], DSD_EVENT_SEVERITY_INFO,
+                                        DSD_EVENT_CATEGORY_DATA);
     state->event_history_s[slot].Event_History_Items[0].systype = state->lastsynctype;
-    state->event_history_s[slot].Event_History_Items[0].subtype = DSD_EVENT_SUBTYPE_DATA;
+    state->event_history_s[slot].Event_History_Items[0].subtype = DSD_EVENT_SUBTYPE_EXPLICIT_DATA;
     state->event_history_s[slot].Event_History_Items[0].gi = state->gi[slot];
     state->event_history_s[slot].Event_History_Items[0].enc = 0;
     state->event_history_s[slot].Event_History_Items[0].enc_alg = 0;
@@ -1009,8 +1133,8 @@ watchdog_event_datacall(dsd_opts* opts, dsd_state* state, uint32_t src, uint32_t
 
     char timestr[9];
     char datestr[11];
-    getTimeN_buf(time(NULL), timestr);
-    getDateN_buf(time(NULL), datestr);
+    (void)dsd_format_local_datetime(time(NULL), DSD_LOCAL_DATETIME_TIME_COLON, timestr, sizeof timestr);
+    (void)dsd_format_local_datetime(time(NULL), DSD_LOCAL_DATETIME_DATE_HYPHEN, datestr, sizeof datestr);
 
     char event_string[2000];
     DSD_MEMSET(event_string, 0, sizeof(event_string));
@@ -1024,6 +1148,7 @@ watchdog_event_datacall(dsd_opts* opts, dsd_state* state, uint32_t src, uint32_t
     DSD_SNPRINTF(state->event_history_s[slot].Event_History_Items[0].event_string,
                  sizeof state->event_history_s[slot].Event_History_Items[0].event_string, "%s",
                  event_string); // could change this to a strncpy to prevent potential overflow
+    dsd_event_history_mark_dirty(&state->event_history_s[slot]);
 
     dsd_frame_logf(opts, "FRAME DATA slot=%d src=%u dst=%u %s", slot + 1, src, dst, data_string ? data_string : "");
 

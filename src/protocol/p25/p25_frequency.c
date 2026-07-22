@@ -29,17 +29,10 @@ enum {
     P25_FREQ_MODE_TDMA = 1,
 };
 
-static const int k_p25_slots_per_carrier[16] = {1, 1, 1, 2, 4, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
-
 int
 p25_channel_type_is_tdma(int chan_type) {
     int type = chan_type & 0xF;
-    return (type == 3 || type == 4 || type == 5) ? 1 : 0;
-}
-
-int
-p25_channel_type_slots_per_carrier(int chan_type) {
-    return k_p25_slots_per_carrier[chan_type & 0xF];
+    return p25_channel_type_slots_per_carrier(type) > 1 ? 1 : 0;
 }
 
 void
@@ -57,6 +50,13 @@ p25_invalidate_chan_map_for_iden(dsd_state* state, int iden) {
 
     for (int ch = start; ch < end; ch++) {
         dsd_state_set_trunk_chan_freq(state, (uint32_t)ch, 0);
+    }
+}
+
+static void
+p25_invalidate_chan_map(dsd_state* state) {
+    for (int iden = 0; iden < 16; iden++) {
+        p25_invalidate_chan_map_for_iden(state, iden);
     }
 }
 
@@ -158,13 +158,96 @@ p25_channel_cached_freq(const dsd_state* state, uint16_t chan16, int ambiguous, 
     return 1;
 }
 
+static void
+p25_freq_trace_init(p25_freq_trace_t* trace, int channel) {
+    if (!trace) {
+        return;
+    }
+    DSD_MEMSET(trace, 0, sizeof(*trace));
+    trace->channel = (uint16_t)channel;
+    trace->iden = -1;
+    trace->chan_type = -1;
+    DSD_SNPRINTF(trace->source, sizeof trace->source, "%s", "unknown");
+}
+
+static void
+p25_freq_trace_set_source(p25_freq_trace_t* trace, const char* source) {
+    if (!trace || !source) {
+        return;
+    }
+    DSD_SNPRINTF(trace->source, sizeof trace->source, "%s", source);
+    trace->source[sizeof trace->source - 1] = '\0';
+}
+
+static void
+p25_freq_trace_set_failure(p25_freq_trace_t* trace, const char* failure) {
+    if (!trace || !failure) {
+        return;
+    }
+    DSD_SNPRINTF(trace->failure, sizeof trace->failure, "%s", failure);
+    trace->failure[sizeof trace->failure - 1] = '\0';
+}
+
 static int
 p25_iden_entry_ready(const p25_iden_entry_t* entry) {
     return entry->populated && entry->base_freq != 0 && entry->chan_spac != 0;
 }
 
+static void
+p25_freq_trace_set_entry(p25_freq_trace_t* trace, int iden, int use_tdma_denom, int type) {
+    if (!trace) {
+        return;
+    }
+    trace->iden = iden;
+    trace->use_tdma = use_tdma_denom;
+    trace->chan_type = type;
+}
+
+static void
+p25_freq_trace_set_math(p25_freq_trace_t* trace, int denom, int step, int ambiguous) {
+    if (!trace) {
+        return;
+    }
+    trace->denom = denom;
+    trace->step = step;
+    trace->ambiguous = ambiguous;
+}
+
+static void
+p25_freq_trace_set_cached(p25_freq_trace_t* trace, long freq) {
+    if (!trace) {
+        return;
+    }
+    trace->cached = 1;
+    trace->freq_hz = freq;
+    p25_freq_trace_set_source(trace, "cached-map");
+}
+
+static void
+p25_freq_trace_set_computed(p25_freq_trace_t* trace, const dsd_state* state, int iden, int mode, int use_tdma_denom,
+                            int denom, long base, long spac, long freq) {
+    if (!trace) {
+        return;
+    }
+    trace->base_hz = base * 5L;
+    trace->spacing_hz = spac * 125L;
+    trace->freq_hz = freq;
+    if (mode == P25_FREQ_MODE_AUTO && state->p25_chan_tdma_explicit[iden] == 0 && state->p25_sys_is_tdma == 1
+        && !use_tdma_denom && denom == 2) {
+        p25_freq_trace_set_source(trace, "iden-fdma-tdma-fallback");
+    } else {
+        p25_freq_trace_set_source(trace, use_tdma_denom ? "iden-tdma" : "iden-fdma");
+    }
+}
+
 static long int
-p25_channel_to_freq_impl(const dsd_opts* opts, dsd_state* state, int channel, int mode) {
+p25_channel_to_freq_impl(const dsd_opts* opts, dsd_state* state, int channel, int mode, p25_freq_trace_t* trace) {
+    p25_freq_trace_init(trace, channel);
+    if (!state) {
+        p25_freq_trace_set_source(trace, "invalid-state");
+        p25_freq_trace_set_failure(trace, "missing-state");
+        return 0;
+    }
 
     //RX and SU TX frequencies.
     //SU RX = (Base Frequency) + (Channel Number) x (Channel Spacing).
@@ -181,6 +264,8 @@ p25_channel_to_freq_impl(const dsd_opts* opts, dsd_state* state, int channel, in
 
     //0x0000 is a valid channel when IDEN 0 exists; 0xFFFF is the sentinel.
     if (!p25_chan16_valid(chan16)) {
+        p25_freq_trace_set_source(trace, "invalid-channel");
+        p25_freq_trace_set_failure(trace, "sentinel-channel");
         return 0;
     }
 
@@ -190,33 +275,43 @@ p25_channel_to_freq_impl(const dsd_opts* opts, dsd_state* state, int channel, in
     int iden = (chan16 >> 12) & 0xF;
     if (!p25_iden_valid(iden)) {
         DSD_FPRINTF(stderr, "\n  P25 FREQ: invalid iden %d", iden);
+        p25_freq_trace_set_source(trace, "invalid-iden");
+        p25_freq_trace_set_failure(trace, "invalid-iden");
         return 0;
     }
 
     int use_tdma_denom = 0;
     const p25_iden_entry_t* entry = p25_select_iden_entry(state, iden, mode, &use_tdma_denom);
     int type = entry->chan_type & 0xF;
+    p25_freq_trace_set_entry(trace, iden, use_tdma_denom, type);
 
     int denom = 1;
     if (!p25_channel_tdma_denom(opts, state, iden, mode, use_tdma_denom, type, &denom)) {
+        p25_freq_trace_set_source(trace, "invalid-denom");
+        p25_freq_trace_set_failure(trace, "invalid-tdma-denom");
         return 0;
     }
     int step = (chan16 & 0xFFF) / denom;
 
     int ambiguous = p25_iden_slot_is_ambiguous(state, iden);
+    p25_freq_trace_set_math(trace, denom, step, ambiguous);
     if (p25_channel_cached_freq(state, chan16, ambiguous, &freq)) {
+        p25_freq_trace_set_cached(trace, freq);
         return freq;
     }
 
     if (!p25_iden_entry_ready(entry)) {
         DSD_FPRINTF(stderr, "\n  P25 FREQ: missing iden %d params (populated=%d, base=%ld, spac=%d); refusing tune",
                     iden, entry->populated, entry->base_freq, entry->chan_spac);
+        p25_freq_trace_set_source(trace, use_tdma_denom ? "missing-iden-tdma" : "missing-iden-fdma");
+        p25_freq_trace_set_failure(trace, "missing-iden-params");
         return 0;
     }
 
     long base = entry->base_freq;
     long spac = entry->chan_spac;
     freq = (base * 5) + (step * spac * 125);
+    p25_freq_trace_set_computed(trace, state, iden, mode, use_tdma_denom, denom, base, spac, freq);
     DSD_FPRINTF(stderr, "\n  P25 FREQ: iden=%d type=%d ch=0x%04X -> %.6lf MHz", iden, type, chan16,
                 (double)freq / 1000000.0);
     if (opts && opts->verbose > 1) {
@@ -249,15 +344,15 @@ p25_promote_iden_if_site_match(const dsd_state* state, p25_iden_entry_t* entry, 
 //     base[iden] is in units of 5 Hz (per IDEN_UP encoding),
 //     spacing[iden] is in units of 125 Hz,
 //     step = channel_number / slots_per_carrier[type]
-// - channel types and slots-per-carrier follow sdrtrunk's ChannelType mapping.
+// - channel types and slots-per-carrier follow the observed TDMA channel type mapping.
 long int
 process_channel_to_freq(const dsd_opts* opts, dsd_state* state, int channel) {
-    return p25_channel_to_freq_impl(opts, state, channel, P25_FREQ_MODE_AUTO);
+    return p25_channel_to_freq_impl(opts, state, channel, P25_FREQ_MODE_AUTO, NULL);
 }
 
 long int
-process_channel_to_freq_with_mode(const dsd_opts* opts, dsd_state* state, int channel, int prefer_tdma) {
-    return p25_channel_to_freq_impl(opts, state, channel, prefer_tdma ? P25_FREQ_MODE_TDMA : P25_FREQ_MODE_FDMA);
+process_channel_to_freq_trace(const dsd_opts* opts, dsd_state* state, int channel, p25_freq_trace_t* trace) {
+    return p25_channel_to_freq_impl(opts, state, channel, P25_FREQ_MODE_AUTO, trace);
 }
 
 // Format a short suffix describing the FDMA-equivalent channel and slot for a
@@ -284,7 +379,7 @@ p25_format_chan_suffix(const dsd_state* state, uint16_t chan, int slot_hint, cha
     int use_tdma_denom = 0;
     const p25_iden_entry_t* entry = p25_select_iden_entry(state, iden, P25_FREQ_MODE_AUTO, &use_tdma_denom);
 
-    // Read chan_type from the selected entry instead of the old flat array
+    // Derive the channel type from the selected FDMA/TDMA identity entry.
     int type = entry->chan_type & 0xF;
     int denom = 1;
     if (use_tdma_denom) {
@@ -325,6 +420,44 @@ p25_reset_iden_tables(dsd_state* state) {
     // Reset the dual-array IDEN storage
     DSD_MEMSET(state->p25_iden_fdma, 0, sizeof(state->p25_iden_fdma));
     DSD_MEMSET(state->p25_iden_tdma, 0, sizeof(state->p25_iden_tdma));
+
+    state->p25_pending_announcement_count = 0;
+    DSD_MEMSET(state->p25_pending_announcements, 0, sizeof(state->p25_pending_announcements));
+
+    state->p25_secondary_cc_count = 0;
+    DSD_MEMSET(state->p25_secondary_cc_entries, 0, sizeof(state->p25_secondary_cc_entries));
+}
+
+static void
+p25_reset_system_metadata(dsd_state* state) {
+    state->p25_cc_prot_valid = 0;
+    state->p25_cc_prot_algid = 0;
+
+    state->p25_sys_services_valid = 0;
+    state->p25_sys_services_available = 0;
+    state->p25_sys_services_supported = 0;
+    state->p25_sys_services_request_priority = 0;
+
+    state->p25_site_lra_valid = 0;
+    state->p25_site_lra = 0;
+    state->p25_site_network_active_valid = 0;
+    state->p25_site_network_active = 0;
+}
+
+int
+p25_update_system_identity(dsd_state* state, unsigned long long wacn, unsigned long long sysid) {
+    if (!state || (wacn == 0 && sysid == 0)) {
+        return 0;
+    }
+
+    if ((state->p2_wacn != 0 || state->p2_sysid != 0) && (state->p2_wacn != wacn || state->p2_sysid != sysid)) {
+        p25_reset_iden_tables(state);
+        p25_reset_system_metadata(state);
+        p25_invalidate_chan_map(state);
+    }
+    state->p2_wacn = wacn;
+    state->p2_sysid = sysid;
+    return 1;
 }
 
 // Promote any IDENs whose provenance matches the current site to trusted
@@ -379,6 +512,15 @@ p25_is_vhf_uhf_base_freq(long int base_freq) {
         return 1;
     }
     return 0;
+}
+
+int
+p25_iden_vu_bandwidth_hz(uint8_t bw_vu) {
+    switch (bw_vu & 0x0FU) {
+        case 0x4U: return 6250;
+        case 0x5U: return 12500;
+        default: return 0;
+    }
 }
 
 long int

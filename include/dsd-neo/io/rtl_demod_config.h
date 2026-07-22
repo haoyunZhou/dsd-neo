@@ -25,8 +25,6 @@ struct demod_state;
 struct output_state;
 
 /* Runtime-config toggles shared with RTL stream/device modules. */
-extern int combine_rotate_enabled;
-extern int upsample_fixedpoint_enabled;
 extern int disable_fs4_shift;
 
 /**
@@ -43,8 +41,7 @@ void rtl_demod_init_for_mode(struct demod_state* demod, struct output_state* out
 
 /**
  * Apply environment- and options-driven DSP configuration to the
- * demodulator (resampler target, FLL/TED and CQPSK path toggles,
- * FM AGC, etc.).
+ * demodulator (resampler target and CQPSK path/timing settings).
  *
  * @param demod Demodulator state.
  * @param opts  Decoder options (CLI/runtime flags).
@@ -53,7 +50,7 @@ void rtl_demod_config_from_env_and_opts(struct demod_state* demod, const dsd_opt
 
 /**
  * Apply sensible defaults for digital vs analog modes when env/CLI
- * overrides are not present (TED/FLL defaults, TED SPS, etc.).
+ * overrides are not present (CQPSK timing defaults, TED SPS, etc.).
  *
  * @param demod  Demodulator state.
  * @param opts   Decoder options (mode flags).

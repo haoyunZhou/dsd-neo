@@ -68,6 +68,16 @@ Install with CMake:
 cmake --install build/dev-release --prefix /usr/local
 ```
 
+On Linux, refresh the dynamic linker cache after installing source-built
+dependencies such as `mbelib-neo` into `/usr` or `/usr/local`:
+
+```sh
+sudo ldconfig
+```
+
+For user prefixes such as `$HOME/.local`, set `LD_LIBRARY_PATH` instead; see
+`docs/linux-installation.md`.
+
 On POSIX systems, staged packaging can use `DESTDIR`:
 
 ```sh
@@ -79,6 +89,26 @@ Uninstall from the same build directory:
 ```sh
 cmake --build build/dev-release --target uninstall
 ```
+
+## Linux Bootstrap Script
+
+Linux source installs can use the distro-aware helper:
+
+```sh
+tools/install_linux.sh --yes
+```
+
+It installs build dependencies for apt, dnf, zypper, apk, or pacman systems,
+builds pinned `mbelib-neo`, builds DSD-neo, smoke-tests the CLI, and installs
+through CMake. Docker validation for the supported distro matrix is available
+with:
+
+```sh
+tools/docker_linux_install_matrix.sh --distro ubuntu-26.04
+```
+
+See `docs/linux-installation.md` for options, distro coverage, and derivative
+mapping.
 
 ## Developer Setup
 
