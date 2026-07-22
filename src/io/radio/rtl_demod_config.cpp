@@ -69,7 +69,7 @@ opts_is_digital_mode(const dsd_opts* opts) {
     }
     return (opts->frame_p25p1 == 1 || opts->frame_p25p2 == 1 || opts->frame_provoice == 1 || opts->frame_dmr == 1
             || opts->frame_nxdn48 == 1 || opts->frame_nxdn96 == 1 || opts->frame_x2tdma == 1 || opts->frame_ysf == 1
-            || opts->frame_dstar == 1 || opts->frame_dpmr == 1 || opts->frame_m17 == 1);
+            || opts->frame_dstar == 1 || opts->frame_dpmr == 1 || opts->frame_m17 == 1 || opts->frame_tetra == 1);
 }
 
 static int
@@ -87,7 +87,7 @@ opts_digital_mode_count(const dsd_opts* opts) {
            + opts_flag_is_set(opts->frame_nxdn48) + opts_flag_is_set(opts->frame_nxdn96)
            + opts_flag_is_set(opts->frame_x2tdma) + opts_flag_is_set(opts->frame_ysf)
            + opts_flag_is_set(opts->frame_dstar) + opts_flag_is_set(opts->frame_dpmr)
-           + opts_flag_is_set(opts->frame_m17);
+           + opts_flag_is_set(opts->frame_m17) + opts_flag_is_set(opts->frame_tetra);
 }
 
 static int
@@ -127,7 +127,7 @@ opts_has_any_four_level_mode(const dsd_opts* opts) {
     }
     return (opts->frame_p25p1 == 1 || opts->frame_p25p2 == 1 || opts->frame_dmr == 1 || opts->frame_nxdn48 == 1
             || opts->frame_nxdn96 == 1 || opts->frame_x2tdma == 1 || opts->frame_ysf == 1 || opts->frame_dpmr == 1
-            || opts->frame_m17 == 1);
+            || opts->frame_m17 == 1 || opts->frame_tetra == 1);
 }
 
 static int
@@ -144,7 +144,8 @@ opts_has_4800_wide_four_level_mode(const dsd_opts* opts) {
     if (!opts) {
         return 0;
     }
-    return (opts->frame_dmr == 1 || opts->frame_nxdn96 == 1 || opts->frame_ysf == 1 || opts->frame_m17 == 1);
+    return (opts->frame_dmr == 1 || opts->frame_nxdn96 == 1 || opts->frame_ysf == 1 || opts->frame_m17 == 1
+            || opts->frame_tetra == 1);
 }
 
 static int
@@ -155,6 +156,9 @@ opts_symbol_rate_hz(const dsd_opts* opts) {
     int digital_count = opts_digital_mode_count(opts);
     if (opts->frame_provoice == 1 && digital_count == 1) {
         return 9600;
+    }
+    if (opts->frame_tetra == 1 && digital_count == 1) {
+        return 18000;
     }
     if ((opts->frame_p25p2 == 1 || opts->frame_x2tdma == 1) && opts->frame_p25p1 == 0
         && digital_count == opts_6000_mode_count(opts)) {
@@ -229,6 +233,11 @@ opts_channel_profile_for_rate(const dsd_opts* opts, const demod_state* demod, in
         case 9600:
             if (opts->frame_provoice == 1) {
                 return DSD_CH_LPF_PROFILE_PROVOICE;
+            }
+            break;
+        case 18000:
+            if (opts->frame_tetra == 1) {
+                return DSD_CH_LPF_PROFILE_WIDE;
             }
             break;
         case 2400:
@@ -577,7 +586,7 @@ demod_apply_channel_lpf_defaults(struct demod_state* demod, const dsd_opts* opts
     demod->channel_lpf_enable = channel_lpf ? 1 : 0;
     demod->channel_lpf_profile = profile;
     if (demod->output_kind == DSD_DEMOD_OUTPUT_SYMBOL_CQPSK) {
-        demod->channel_lpf_profile = DSD_CH_LPF_PROFILE_P25_CQPSK;
+        demod->channel_lpf_profile = opts_channel_profile_for_rate(opts, demod, demod->symbol_rate_hz);
     }
     fsk_modem_apply_config(demod);
 }
@@ -923,7 +932,7 @@ rtl_demod_maybe_refresh_ted_sps_after_rate_change(struct demod_state* demod, con
          * P25P1 rate (4800) since CC is typically encountered first; the trunk
          * state machine will override via ted_sps_override when tuning to P25P2 VC. */
         sym_rate = opts_symbol_rate_hz(opts);
-        if (opts->mod_qpsk == 1 && sym_rate != 6000) {
+        if (opts->mod_qpsk == 1 && opts->frame_tetra != 1 && sym_rate != 6000) {
             sym_rate = 4800;
         }
         if (Fs_cx < (sym_rate * 2)) {
@@ -952,7 +961,7 @@ rtl_demod_maybe_refresh_ted_sps_after_rate_change(struct demod_state* demod, con
         demod->ted_sps = sps;
     }
     if (demod->cqpsk_enable) {
-        demod->channel_lpf_profile = DSD_CH_LPF_PROFILE_P25_CQPSK;
+        demod->channel_lpf_profile = opts_channel_profile_for_rate(opts, demod, demod->symbol_rate_hz);
     }
     fsk_modem_apply_config(demod);
 }

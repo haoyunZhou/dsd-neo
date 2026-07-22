@@ -57,6 +57,10 @@
 #ifdef USE_RADIO
 #include <dsd-neo/core/power.h>
 #include <dsd-neo/runtime/rtl_stream_metrics_hooks.h>
+
+enum {
+    RTL_STREAM_OUTPUT_SYMBOL_CQPSK_LOCAL = 2,
+};
 #endif
 
 static int
@@ -116,7 +120,7 @@ rtl_opts_has_any_four_level_mode(const dsd_opts* opts) {
     }
     return (opts->frame_p25p1 == 1 || opts->frame_p25p2 == 1 || opts->frame_dmr == 1 || opts->frame_nxdn48 == 1
             || opts->frame_nxdn96 == 1 || opts->frame_x2tdma == 1 || opts->frame_ysf == 1 || opts->frame_dpmr == 1
-            || opts->frame_m17 == 1);
+            || opts->frame_m17 == 1 || opts->frame_tetra == 1);
 }
 
 static int
@@ -138,6 +142,9 @@ rtl_fallback_profile_for_symbol_rate(int sym_rate_hz) {
     if (sym_rate_hz == 2400) {
         return DSD_RTL_STREAM_CHANNEL_PROFILE_6K25;
     }
+    if (sym_rate_hz == 18000) {
+        return DSD_RTL_STREAM_CHANNEL_PROFILE_WIDE;
+    }
     if (sym_rate_hz == 9600) {
         return DSD_RTL_STREAM_CHANNEL_PROFILE_PROVOICE;
     }
@@ -151,6 +158,9 @@ rtl_profile_for_explicit_symbol_rate(const dsd_opts* opts, int sym_rate_hz, int 
     }
     if (sym_rate_hz == 9600 && opts->frame_provoice == 1) {
         return DSD_RTL_STREAM_CHANNEL_PROFILE_PROVOICE;
+    }
+    if (sym_rate_hz == 18000 && opts->frame_tetra == 1) {
+        return DSD_RTL_STREAM_CHANNEL_PROFILE_WIDE;
     }
     if (sym_rate_hz == 2400 && (opts->frame_nxdn48 == 1 || opts->frame_dpmr == 1)) {
         return DSD_RTL_STREAM_CHANNEL_PROFILE_6K25;
@@ -621,6 +631,83 @@ frame_sync_try_dpmr(frame_sync_match_ctx* ctx) {
         state->lastsynctype = DSD_SYNC_DPMR_FS2_NEG;
         dsd_sync_warm_start_thresholds_outer_only(opts, state, 12);
         return DSD_SYNC_DPMR_FS2_NEG;
+    }
+
+    return DSD_SYNC_NONE;
+}
+
+static void
+frame_sync_capture_tetra_dibits(const char* src, uint8_t* dst, int count) {
+    for (int i = 0; i < count; i++) {
+        dst[i] = (uint8_t)((src[i] - '0') & 0x3);
+    }
+}
+
+static int
+frame_sync_try_tetra(frame_sync_match_ctx* ctx) {
+    dsd_opts* opts = ctx->opts;
+    dsd_state* state = ctx->state;
+    if (opts->frame_tetra != 1) {
+        return DSD_SYNC_NONE;
+    }
+
+    const char* ndb = ctx->synctest_p - 10;
+    const char* sb = ctx->synctest_p - 18;
+
+    if (ctx->synctest_pos >= 118 && strncmp(ndb, TETRA_NDB_NTS_SYNC, 11) == 0) {
+        frame_sync_set_basic_lock(ctx);
+        DSD_SNPRINTF(state->ftype, sizeof(state->ftype), "TETRA");
+        state->tetra_polarity = 0;
+        frame_sync_capture_tetra_dibits(ndb - 108, state->tetra_b1_dibuf, 108);
+        state->tetra_b1_valid = 1;
+        if (opts->errorbars == 1) {
+            printFrameSync(opts, state, "+TETRA NDB", ctx->synctest_pos + 1, ctx->modulation);
+        }
+        state->lastsynctype = DSD_SYNC_TETRA_NDB_POS;
+        dsd_sync_warm_start_center_outer_only(opts, state, 11);
+        return DSD_SYNC_TETRA_NDB_POS;
+    }
+
+    if (ctx->synctest_pos >= 118 && strncmp(ndb, INV_TETRA_NDB_NTS_SYNC, 11) == 0) {
+        frame_sync_set_basic_lock(ctx);
+        DSD_SNPRINTF(state->ftype, sizeof(state->ftype), "TETRA");
+        state->tetra_polarity = 1;
+        frame_sync_capture_tetra_dibits(ndb - 108, state->tetra_b1_dibuf, 108);
+        state->tetra_b1_valid = 1;
+        if (opts->errorbars == 1) {
+            printFrameSync(opts, state, "-TETRA NDB", ctx->synctest_pos + 1, ctx->modulation);
+        }
+        state->lastsynctype = DSD_SYNC_TETRA_NDB_NEG;
+        dsd_sync_warm_start_center_outer_only(opts, state, 11);
+        return DSD_SYNC_TETRA_NDB_NEG;
+    }
+
+    if (ctx->synctest_pos >= 78 && strncmp(sb, TETRA_SB_SSB_SYNC, 19) == 0) {
+        frame_sync_set_basic_lock(ctx);
+        DSD_SNPRINTF(state->ftype, sizeof(state->ftype), "TETRA");
+        state->tetra_polarity = 0;
+        frame_sync_capture_tetra_dibits(sb - 60, state->tetra_sb1_dibuf, 60);
+        state->tetra_sb1_valid = 1;
+        if (opts->errorbars == 1) {
+            printFrameSync(opts, state, "+TETRA SB", ctx->synctest_pos + 1, ctx->modulation);
+        }
+        state->lastsynctype = DSD_SYNC_TETRA_SB_POS;
+        dsd_sync_warm_start_center_outer_only(opts, state, 19);
+        return DSD_SYNC_TETRA_SB_POS;
+    }
+
+    if (ctx->synctest_pos >= 78 && strncmp(sb, INV_TETRA_SB_SSB_SYNC, 19) == 0) {
+        frame_sync_set_basic_lock(ctx);
+        DSD_SNPRINTF(state->ftype, sizeof(state->ftype), "TETRA");
+        state->tetra_polarity = 1;
+        frame_sync_capture_tetra_dibits(sb - 60, state->tetra_sb1_dibuf, 60);
+        state->tetra_sb1_valid = 1;
+        if (opts->errorbars == 1) {
+            printFrameSync(opts, state, "-TETRA SB", ctx->synctest_pos + 1, ctx->modulation);
+        }
+        state->lastsynctype = DSD_SYNC_TETRA_SB_NEG;
+        dsd_sync_warm_start_center_outer_only(opts, state, 19);
+        return DSD_SYNC_TETRA_SB_NEG;
     }
 
     return DSD_SYNC_NONE;
@@ -1368,6 +1455,11 @@ frame_sync_try_protocol_matches(frame_sync_match_ctx* ctx) {
         return sync_type;
     }
 
+    sync_type = frame_sync_try_tetra(ctx);
+    if (sync_type != DSD_SYNC_NONE) {
+        return sync_type;
+    }
+
     sync_type = frame_sync_try_dmr(ctx);
     if (sync_type != DSD_SYNC_NONE) {
         return sync_type;
@@ -1426,6 +1518,9 @@ frame_sync_select_t_max(const dsd_opts* opts, const dsd_state* state) {
     if (opts->frame_m17 == 1) {
         return 8;
     }
+    if (opts->frame_tetra == 1) {
+        return 19;
+    }
     if (DSD_SYNC_IS_YSF(state->lastsynctype)) {
         return 20;
     }
@@ -1433,6 +1528,33 @@ frame_sync_select_t_max(const dsd_opts* opts, const dsd_state* state) {
         return 19;
     }
     return 24;
+}
+
+static int
+frame_sync_current_demod_rate_hz(const dsd_opts* opts, const dsd_state* state) {
+#ifdef USE_RADIO
+    if (opts && state && opts->audio_in_type == AUDIO_IN_RTL && state->rtl_ctx) {
+        int demod_rate = (int)dsd_rtl_stream_metrics_hook_output_rate_hz();
+        if (demod_rate > 0) {
+            return demod_rate;
+        }
+    }
+#endif
+    return dsd_opts_current_input_timing_rate(opts);
+}
+
+static void
+frame_sync_apply_tetra_timing(const dsd_opts* opts, dsd_state* state) {
+    if (!opts || !state || opts->frame_tetra != 1) {
+        return;
+    }
+    const int demod_rate = frame_sync_current_demod_rate_hz(opts, state);
+    state->samplesPerSymbol = dsd_opts_compute_sps_rate(opts, 18000, demod_rate);
+    state->symbolCenter = dsd_opts_symbol_center(state->samplesPerSymbol);
+    state->rf_mod = 1;
+#ifdef USE_RADIO
+    rtl_maybe_update_symbol_profile_with_hint(opts, state, 18000, 4);
+#endif
 }
 
 static inline void
@@ -1607,6 +1729,11 @@ frame_sync_apply_mod_switch(dsd_state* state, int do_switch) {
 
 static void
 frame_sync_maybe_auto_switch_modulation(const dsd_opts* opts, dsd_state* state, int t_max, int* lastt) {
+    if (opts->frame_tetra == 1) {
+        frame_sync_apply_tetra_timing(opts, state);
+        return;
+    }
+
     if (*lastt != t_max) {
         (*lastt)++;
         return;
@@ -1669,6 +1796,9 @@ frame_sync_debug_symbol_stats(const dsd_opts* opts, float symbol) {
 
 static int
 frame_sync_cqpsk_4level_enabled(const dsd_opts* opts, const dsd_state* state) {
+    if (opts->frame_tetra == 1 && state->rf_mod == 1) {
+        return 1;
+    }
 #ifdef USE_RADIO
     if (state->rf_mod == 1 && opts->audio_in_type == AUDIO_IN_RTL
         && (opts->frame_p25p1 == 1 || opts->frame_p25p2 == 1)) {
@@ -1738,6 +1868,15 @@ frame_sync_slice_cqpsk_dibit(const dsd_opts* opts, const dsd_state* state, float
 
 static int
 frame_sync_symbol_to_dibit(const dsd_opts* opts, dsd_state* state, float symbol, int cqpsk_4level) {
+#ifdef USE_RADIO
+    if (opts && state && opts->audio_in_type == AUDIO_IN_RTL && state->rtl_ctx
+        && dsd_rtl_stream_metrics_hook_output_kind() == RTL_STREAM_OUTPUT_SYMBOL_CQPSK_LOCAL) {
+        int d = ((int)symbol) & 0x3;
+        *state->dibit_buf_p = d;
+        state->dibit_buf_p++;
+        return '0' + d;
+    }
+#endif
     if (cqpsk_4level) {
         int d = frame_sync_slice_cqpsk_dibit(opts, state, symbol);
         *state->dibit_buf_p = d;
@@ -2236,6 +2375,11 @@ frame_sync_apply_sps_hunt_profile(const dsd_opts* opts, dsd_state* state, int ne
 
 static void
 frame_sync_no_sync_sps_hunt(const dsd_opts* opts, dsd_state* state) {
+    if (opts->frame_tetra == 1) {
+        frame_sync_apply_tetra_timing(opts, state);
+        return;
+    }
+
     if (!(state->carrier == 0 && !opts->mod_cli_lock)) {
         return;
     }

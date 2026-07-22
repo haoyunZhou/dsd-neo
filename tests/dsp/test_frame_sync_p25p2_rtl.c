@@ -28,6 +28,7 @@
 
 static size_t g_symbol_index;
 static const char* g_sync_pattern = P25P2_SYNC;
+static int g_symbol_rate_hz = 6000;
 
 dsd_socket_t
 Connect(char* hostname, int portno) { // NOLINT(misc-use-internal-linkage)
@@ -155,15 +156,11 @@ agsm_f(dsd_opts* opts, dsd_state* state, float* input, int len) { // NOLINT(misc
 }
 
 static float
-symbol_level_for_dibit(char dibit) {
-    switch (dibit) {
-        case '0': return 1.0f;
-        case '1': return 3.0f;
-        case '2': return -1.0f;
-        case '3': return -3.0f;
-        default: break;
+symbol_id_for_dibit(char dibit) {
+    if (dibit >= '0' && dibit <= '3') {
+        return (float)(dibit - '0');
     }
-    return 3.0f;
+    return 1.0f;
 }
 
 static int
@@ -176,7 +173,7 @@ fake_rtl_read(void* rtl_ctx, float* out, size_t count, int* out_got) {
     const size_t pattern_len = strlen(g_sync_pattern);
     for (size_t i = 0; i < count; i++) {
         char dibit = (g_symbol_index < pattern_len) ? g_sync_pattern[g_symbol_index] : '1';
-        out[i] = symbol_level_for_dibit(dibit);
+        out[i] = symbol_id_for_dibit(dibit);
         g_symbol_index++;
     }
     *out_got = (int)count;
@@ -197,7 +194,7 @@ fake_output_kind(void) {
 static int
 fake_symbol_profile(int* out_symbol_rate_hz, int* out_levels, int* out_channel_profile) {
     if (out_symbol_rate_hz) {
-        *out_symbol_rate_hz = 6000;
+        *out_symbol_rate_hz = g_symbol_rate_hz;
     }
     if (out_levels) {
         *out_levels = 4;
@@ -265,6 +262,7 @@ run_p25p2_sync_case(const char* pattern, int expected_sync, const char* label) {
 
     g_symbol_index = 0U;
     g_sync_pattern = pattern;
+    g_symbol_rate_hz = 6000;
     dsd_frame_sync_reset_mod_state();
 
     DSD_MEMSET(&opts, 0, sizeof(opts));
@@ -316,11 +314,80 @@ run_p25p2_sync_case(const char* pattern, int expected_sync, const char* label) {
     return rc;
 }
 
+static int
+run_tetra_ndb_sync_case(const char* nts_pattern, int expected_sync, const char* label) {
+    static dsd_opts opts;
+    static dsd_state state;
+    static int fake_rtl_context;
+    static char pattern[120];
+
+    DSD_MEMSET(pattern, '0', 108);
+    DSD_MEMCPY(pattern + 108, nts_pattern, 11);
+    pattern[119] = '\0';
+
+    g_symbol_index = 0U;
+    g_sync_pattern = pattern;
+    g_symbol_rate_hz = 18000;
+    dsd_frame_sync_reset_mod_state();
+
+    DSD_MEMSET(&opts, 0, sizeof(opts));
+    DSD_MEMSET(&state, 0, sizeof(state));
+    if (!init_state_buffers(&state)) {
+        DSD_FPRINTF(stderr, "failed to allocate frame-sync state buffers\n");
+        return 1;
+    }
+
+    opts.audio_in_type = AUDIO_IN_RTL;
+    opts.frame_tetra = 1;
+    opts.mod_cli_lock = 1;
+    opts.mod_qpsk = 1;
+    opts.msize = 1;
+
+    state.rf_mod = 1;
+    state.rtl_ctx = (struct RtlSdrContext*)&fake_rtl_context;
+    state.center = 0.0f;
+    state.min = -3.0f;
+    state.max = 3.0f;
+
+    dsd_rtl_stream_io_hooks_set((dsd_rtl_stream_io_hooks){
+        .read = fake_rtl_read,
+        .return_pwr = fake_rtl_pwr,
+    });
+    dsd_rtl_stream_metrics_hooks metrics_hooks = {
+        .output_kind = fake_output_kind,
+        .symbol_profile = fake_symbol_profile,
+        .stream_generation = fake_stream_generation,
+        .dsp_get = fake_dsp_get,
+        .stream_active = fake_stream_active,
+    };
+    dsd_rtl_stream_metrics_hooks_set(&metrics_hooks);
+    dsd_rtl_stream_metrics_hook_symbol_cache_pending_reset();
+
+    int sync = getFrameSync(&opts, &state);
+    int rc = 0;
+    if (sync != expected_sync) {
+        DSD_FPRINTF(stderr, "%s returned %d, expected %d\n", label, sync, expected_sync);
+        rc = 1;
+    }
+    if (rc == 0 && state.tetra_b1_valid != 1) {
+        DSD_FPRINTF(stderr, "%s did not mark captured TETRA B1 dibits valid\n", label);
+        rc = 1;
+    }
+
+    dsd_rtl_stream_io_hooks_set((dsd_rtl_stream_io_hooks){0});
+    dsd_rtl_stream_metrics_hooks_set(NULL);
+    dsd_rtl_stream_metrics_hook_symbol_cache_pending_reset();
+    free_state_buffers(&state);
+    return rc;
+}
+
 int
 main(void) {
     int rc = 0;
     rc |= run_p25p2_sync_case(P25P2_SYNC, DSD_SYNC_P25P2_POS, "P25P2 RTL positive sync");
     rc |= run_p25p2_sync_case(INV_P25P2_SYNC, DSD_SYNC_P25P2_NEG, "P25P2 RTL inverted sync");
+    rc |= run_tetra_ndb_sync_case(TETRA_NDB_NTS_SYNC, DSD_SYNC_TETRA_NDB_POS, "TETRA RTL NDB positive sync");
+    rc |= run_tetra_ndb_sync_case(INV_TETRA_NDB_NTS_SYNC, DSD_SYNC_TETRA_NDB_NEG, "TETRA RTL NDB inverted sync");
     return rc;
 }
 

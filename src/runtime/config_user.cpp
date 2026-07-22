@@ -1131,6 +1131,10 @@ apply_demod_config(const dsdneoUserConfig* cfg, dsd_opts* opts, dsd_state* state
     if (!cfg || !opts || !state || !cfg->has_demod) {
         return;
     }
+    if (opts->frame_dpmr == 1) {
+        apply_demod_mode(opts, state, 1, 0, 0, 0, 0);
+        return;
+    }
     switch (cfg->demod_path) {
         case DSDCFG_DEMOD_AUTO: apply_demod_mode(opts, state, 1, 1, 1, 0, 0); break;
         case DSDCFG_DEMOD_C4FM: apply_demod_mode(opts, state, 1, 0, 0, 1, 0); break;

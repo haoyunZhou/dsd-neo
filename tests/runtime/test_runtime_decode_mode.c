@@ -187,6 +187,86 @@ test_interactive_x2_and_ysf_behavior(void) {
     return 0;
 }
 
+static int
+test_tetra_preset(void) {
+    static dsd_opts opts = {0};
+    static dsd_state state = {0};
+    dsdneoUserDecodeMode mode = DSDCFG_MODE_UNSET;
+
+    opts.frame_dmr = 1;
+    opts.frame_tetra = 0;
+    opts.mod_gfsk = 1;
+    state.rf_mod = 2;
+
+    if (dsd_decode_mode_from_cli_preset('T', &mode) != 0 || mode != DSDCFG_MODE_TETRA) {
+        DSD_FPRINTF(stderr, "cli TETRA preset mapping failed\n");
+        return 1;
+    }
+
+    if (dsd_apply_decode_mode_preset(DSDCFG_MODE_TETRA, DSD_DECODE_PRESET_PROFILE_INTERACTIVE, &opts, &state) != 0) {
+        DSD_FPRINTF(stderr, "interactive TETRA apply failed\n");
+        return 1;
+    }
+    if (!(opts.frame_tetra == 1 && opts.frame_dmr == 0 && opts.frame_p25p1 == 0 && opts.frame_m17 == 0)) {
+        DSD_FPRINTF(stderr, "interactive TETRA frame flags mismatch tetra=%d dmr=%d p25=%d m17=%d\n",
+                    opts.frame_tetra, opts.frame_dmr, opts.frame_p25p1, opts.frame_m17);
+        return 1;
+    }
+    if (!(opts.mod_qpsk == 1 && opts.mod_c4fm == 0 && opts.mod_gfsk == 0 && state.rf_mod == 1)) {
+        DSD_FPRINTF(stderr, "interactive TETRA demod mismatch mod=%d/%d/%d rf_mod=%d\n",
+                    opts.mod_c4fm, opts.mod_qpsk, opts.mod_gfsk, state.rf_mod);
+        return 1;
+    }
+    if (!(state.samplesPerSymbol == 3 && state.symbolCenter == 1)) {
+        DSD_FPRINTF(stderr, "interactive TETRA symbol timing mismatch sps=%d center=%d\n",
+                    state.samplesPerSymbol, state.symbolCenter);
+        return 1;
+    }
+    if (dsd_infer_decode_mode_preset(&opts) != DSDCFG_MODE_TETRA) {
+        DSD_FPRINTF(stderr, "TETRA mode inference failed\n");
+        return 1;
+    }
+    return 0;
+}
+
+static int
+test_dpmr_clears_tetra_state(void) {
+    static dsd_opts opts = {0};
+    static dsd_state state = {0};
+
+    DSD_MEMSET(&opts, 0, sizeof opts);
+    DSD_MEMSET(&state, 0, sizeof state);
+
+    if (dsd_apply_decode_mode_preset(DSDCFG_MODE_TETRA, DSD_DECODE_PRESET_PROFILE_INTERACTIVE, &opts, &state) != 0) {
+        DSD_FPRINTF(stderr, "interactive TETRA apply failed before dPMR transition\n");
+        return 1;
+    }
+    if (dsd_apply_decode_mode_preset(DSDCFG_MODE_DPMR, DSD_DECODE_PRESET_PROFILE_INTERACTIVE, &opts, &state) != 0) {
+        DSD_FPRINTF(stderr, "interactive dPMR apply failed after TETRA transition\n");
+        return 1;
+    }
+    if (!(opts.frame_dpmr == 1 && opts.frame_tetra == 0 && opts.frame_dmr == 0 && opts.frame_p25p2 == 0)) {
+        DSD_FPRINTF(stderr, "dPMR after TETRA frame flags mismatch dpmr=%d tetra=%d dmr=%d p25p2=%d\n",
+                    opts.frame_dpmr, opts.frame_tetra, opts.frame_dmr, opts.frame_p25p2);
+        return 1;
+    }
+    if (!(opts.mod_c4fm == 1 && opts.mod_qpsk == 0 && opts.mod_gfsk == 0 && state.rf_mod == 0)) {
+        DSD_FPRINTF(stderr, "dPMR after TETRA demod mismatch mod=%d/%d/%d rf_mod=%d\n",
+                    opts.mod_c4fm, opts.mod_qpsk, opts.mod_gfsk, state.rf_mod);
+        return 1;
+    }
+    if (!(state.samplesPerSymbol == 20 && state.symbolCenter == 9)) {
+        DSD_FPRINTF(stderr, "dPMR after TETRA symbol timing mismatch sps=%d center=%d\n",
+                    state.samplesPerSymbol, state.symbolCenter);
+        return 1;
+    }
+    if (dsd_infer_decode_mode_preset(&opts) != DSDCFG_MODE_DPMR) {
+        DSD_FPRINTF(stderr, "dPMR mode inference failed after TETRA transition\n");
+        return 1;
+    }
+    return 0;
+}
+
 int
 main(void) {
     int rc = 0;
@@ -195,5 +275,7 @@ main(void) {
     rc |= test_dmr_prefers_gfsk();
     rc |= test_dmr_preserves_manual_c4fm_lock();
     rc |= test_interactive_x2_and_ysf_behavior();
+    rc |= test_tetra_preset();
+    rc |= test_dpmr_clears_tetra_state();
     return rc;
 }

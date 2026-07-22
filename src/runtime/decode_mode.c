@@ -31,6 +31,7 @@ dsd_decode_mode_from_cli_preset(char preset, dsdneoUserDecodeMode* out_mode) {
         case 'n': *out_mode = DSDCFG_MODE_NXDN96; return 0;
         case 'y': *out_mode = DSDCFG_MODE_YSF; return 0;
         case 'm': *out_mode = DSDCFG_MODE_M17; return 0;
+        case 'T': *out_mode = DSDCFG_MODE_TETRA; return 0;
         default: return -1;
     }
 }
@@ -45,6 +46,7 @@ decode_mode_base_symbol_timing(dsdneoUserDecodeMode mode, int* out_sps, int* out
         case DSDCFG_MODE_NXDN96:
         case DSDCFG_MODE_DPMR: sps = 20; break;
         case DSDCFG_MODE_EDACS_PV: sps = 5; break;
+        case DSDCFG_MODE_TETRA: sps = 3; break;
         default: sps = 10; break;
     }
 
@@ -77,6 +79,7 @@ dsd_apply_decode_mode_symbol_timing(dsdneoUserDecodeMode mode, int effective_inp
 
 static void
 decode_mode_apply_auto(dsdDecodePresetProfile p, dsd_opts* o, dsd_state* s) {
+    o->frame_tetra = 0;
     if (p == DSD_DECODE_PRESET_PROFILE_CLI) {
         o->frame_dstar = 1;
         o->frame_x2tdma = 1;
@@ -103,6 +106,7 @@ decode_mode_apply_auto(dsdDecodePresetProfile p, dsd_opts* o, dsd_state* s) {
 
 static void
 decode_mode_apply_p25p1(dsd_opts* o, dsd_state* s) {
+    o->frame_tetra = 0;
     o->frame_dstar = 0;
     o->frame_x2tdma = 0;
     o->frame_p25p1 = 1;
@@ -130,6 +134,7 @@ decode_mode_apply_p25p1(dsd_opts* o, dsd_state* s) {
 
 static void
 decode_mode_apply_p25p2(dsd_opts* o, dsd_state* s) {
+    o->frame_tetra = 0;
     o->frame_dstar = 0;
     o->frame_x2tdma = 0;
     o->frame_p25p1 = 0;
@@ -155,6 +160,7 @@ decode_mode_apply_p25p2(dsd_opts* o, dsd_state* s) {
 
 static void
 decode_mode_apply_dmr(dsd_opts* o, dsd_state* s) {
+    o->frame_tetra = 0;
     o->frame_dstar = 0;
     o->frame_x2tdma = 0;
     o->frame_p25p1 = 0;
@@ -182,6 +188,7 @@ decode_mode_apply_dmr(dsd_opts* o, dsd_state* s) {
 
 static void
 decode_mode_apply_nxdn48(dsdDecodePresetProfile p, dsd_opts* o, dsd_state* s) {
+    o->frame_tetra = 0;
     o->frame_dstar = 0;
     o->frame_x2tdma = 0;
     o->frame_p25p1 = 0;
@@ -211,6 +218,7 @@ decode_mode_apply_nxdn48(dsdDecodePresetProfile p, dsd_opts* o, dsd_state* s) {
 
 static void
 decode_mode_apply_nxdn96(dsdDecodePresetProfile p, dsd_opts* o, dsd_state* s) {
+    o->frame_tetra = 0;
     o->frame_dstar = 0;
     o->frame_x2tdma = 0;
     o->frame_p25p1 = 0;
@@ -240,6 +248,7 @@ decode_mode_apply_nxdn96(dsdDecodePresetProfile p, dsd_opts* o, dsd_state* s) {
 
 static void
 decode_mode_apply_x2tdma(dsdDecodePresetProfile p, dsd_opts* o, dsd_state* s) {
+    o->frame_tetra = 0;
     o->frame_dstar = 0;
     o->frame_x2tdma = 1;
     o->frame_p25p1 = 0;
@@ -265,6 +274,7 @@ decode_mode_apply_x2tdma(dsdDecodePresetProfile p, dsd_opts* o, dsd_state* s) {
 
 static void
 decode_mode_apply_ysf(dsdDecodePresetProfile p, dsd_opts* o, dsd_state* s) {
+    o->frame_tetra = 0;
     o->frame_dstar = 0;
     o->frame_x2tdma = 0;
     o->frame_p25p1 = 0;
@@ -295,6 +305,7 @@ decode_mode_apply_ysf(dsdDecodePresetProfile p, dsd_opts* o, dsd_state* s) {
 
 static void
 decode_mode_apply_dstar(dsd_opts* o, dsd_state* s) {
+    o->frame_tetra = 0;
     o->frame_dstar = 1;
     o->frame_x2tdma = 0;
     o->frame_p25p1 = 0;
@@ -317,6 +328,7 @@ decode_mode_apply_dstar(dsd_opts* o, dsd_state* s) {
 
 static void
 decode_mode_apply_edacs_pv(dsd_opts* o, dsd_state* s) {
+    o->frame_tetra = 0;
     o->frame_dstar = 0;
     o->frame_x2tdma = 0;
     o->frame_p25p1 = 0;
@@ -346,6 +358,7 @@ decode_mode_apply_edacs_pv(dsd_opts* o, dsd_state* s) {
 
 static void
 decode_mode_apply_dpmr(dsd_opts* o, dsd_state* s) {
+    o->frame_tetra = 0;
     o->frame_dstar = 0;
     o->frame_x2tdma = 0;
     o->frame_p25p1 = 0;
@@ -373,6 +386,7 @@ decode_mode_apply_dpmr(dsd_opts* o, dsd_state* s) {
 
 static void
 decode_mode_apply_m17(dsd_opts* o, dsd_state* s) {
+    o->frame_tetra = 0;
     o->frame_dstar = 0;
     o->frame_x2tdma = 0;
     o->frame_p25p1 = 0;
@@ -399,6 +413,7 @@ decode_mode_apply_m17(dsd_opts* o, dsd_state* s) {
 
 static void
 decode_mode_apply_tdma(dsd_opts* o, dsd_state* s) {
+    o->frame_tetra = 0;
     o->frame_dstar = 0;
     o->frame_x2tdma = 0;
     o->frame_p25p1 = 1;
@@ -423,7 +438,36 @@ decode_mode_apply_tdma(dsd_opts* o, dsd_state* s) {
 }
 
 static void
+decode_mode_apply_tetra(dsd_opts* o, dsd_state* s) {
+    o->frame_dstar = 0;
+    o->frame_x2tdma = 0;
+    o->frame_p25p1 = 0;
+    o->frame_p25p2 = 0;
+    o->frame_nxdn48 = 0;
+    o->frame_nxdn96 = 0;
+    o->frame_dmr = 0;
+    o->frame_dpmr = 0;
+    o->frame_provoice = 0;
+    o->frame_ysf = 0;
+    o->frame_m17 = 0;
+    o->frame_tetra = 1;
+    s->samplesPerSymbol = 3;
+    s->symbolCenter = 1;
+    o->mod_c4fm = 0;
+    o->mod_qpsk = 1;
+    o->mod_gfsk = 0;
+    s->rf_mod = 1;
+    o->dmr_stereo = 0;
+    o->dmr_mono = 0;
+    s->dmr_stereo = 0;
+    o->pulse_digi_rate_out = 8000;
+    o->pulse_digi_out_channels = 1;
+    DSD_SNPRINTF(o->output_name, sizeof o->output_name, "%s", "TETRA");
+}
+
+static void
 decode_mode_apply_analog(dsd_opts* o, dsd_state* s) {
+    o->frame_tetra = 0;
     o->frame_dstar = 0;
     o->frame_x2tdma = 0;
     o->frame_p25p1 = 0;
@@ -497,6 +541,12 @@ decode_mode_apply_tdma_profile(dsdDecodePresetProfile profile, dsd_opts* opts, d
 }
 
 static void
+decode_mode_apply_tetra_profile(dsdDecodePresetProfile profile, dsd_opts* opts, dsd_state* state) {
+    (void)profile;
+    decode_mode_apply_tetra(opts, state);
+}
+
+static void
 decode_mode_apply_analog_profile(dsdDecodePresetProfile profile, dsd_opts* opts, dsd_state* state) {
     (void)profile;
     decode_mode_apply_analog(opts, state);
@@ -526,11 +576,13 @@ dsd_apply_decode_mode_preset(dsdneoUserDecodeMode mode, dsdDecodePresetProfile p
         {DSDCFG_MODE_DPMR, decode_mode_apply_dpmr_profile},
         {DSDCFG_MODE_M17, decode_mode_apply_m17_profile},
         {DSDCFG_MODE_TDMA, decode_mode_apply_tdma_profile},
+        {DSDCFG_MODE_TETRA, decode_mode_apply_tetra_profile},
         {DSDCFG_MODE_ANALOG, decode_mode_apply_analog_profile},
     };
 
     for (size_t i = 0; i < sizeof(mode_map) / sizeof(mode_map[0]); i++) {
         if (mode == mode_map[i].mode) {
+            opts->frame_tetra = 0;
             mode_map[i].apply(profile, opts, state);
             return 0;
         }
@@ -553,6 +605,7 @@ dsd_infer_decode_mode_preset(const dsd_opts* opts) {
         DSD_MODE_BIT_PROVOICE = 1u << 8,
         DSD_MODE_BIT_YSF = 1u << 9,
         DSD_MODE_BIT_M17 = 1u << 10,
+        DSD_MODE_BIT_TETRA = 1u << 11,
     };
 
     if (!opts) {
@@ -575,6 +628,7 @@ dsd_infer_decode_mode_preset(const dsd_opts* opts) {
     mask |= ((unsigned)(opts->frame_provoice != 0) << 8);
     mask |= ((unsigned)(opts->frame_ysf != 0) << 9);
     mask |= ((unsigned)(opts->frame_m17 != 0) << 10);
+    mask |= ((unsigned)(opts->frame_tetra != 0) << 11);
 
     static const struct {
         unsigned mask;
@@ -592,6 +646,7 @@ dsd_infer_decode_mode_preset(const dsd_opts* opts) {
         {DSD_MODE_BIT_PROVOICE, DSDCFG_MODE_EDACS_PV},
         {DSD_MODE_BIT_DPMR, DSDCFG_MODE_DPMR},
         {DSD_MODE_BIT_M17, DSDCFG_MODE_M17},
+        {DSD_MODE_BIT_TETRA, DSDCFG_MODE_TETRA},
     };
 
     for (int i = 0; i < (int)(sizeof(map) / sizeof(map[0])); i++) {

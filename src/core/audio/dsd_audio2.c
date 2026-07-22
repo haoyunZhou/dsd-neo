@@ -276,6 +276,36 @@ dsd_nxdn_can_decrypt(const dsd_state* state) {
 }
 
 static int
+dsd_mono_voice_is_encrypted(const dsd_state* state) {
+    if (!state) {
+        return 0;
+    }
+    return (dsd_p25_algid_is_encrypted(state) || state->nxdn_cipher_type != 0) ? 1 : 0;
+}
+
+static int
+dsd_mono_voice_can_decrypt(const dsd_state* state) {
+    if (!state) {
+        return 0;
+    }
+    if (dsd_p25_algid_can_decrypt(state)) {
+        return 1;
+    }
+    if (state->payload_algid == 0x83 && state->R != 0) {
+        return 1;
+    }
+    return dsd_nxdn_can_decrypt(state);
+}
+
+int
+dsd_audio_mono_voice_enc_gate(const dsd_state* state) {
+    if (!dsd_mono_voice_is_encrypted(state)) {
+        return 0;
+    }
+    return dsd_mono_voice_can_decrypt(state) ? 0 : 1;
+}
+
+static int
 p25p2_s16_frames_have_audio(short frames[18][160]) {
     for (int j = 0; j < 18; j++) {
         for (int i = 0; i < 160; i++) {
@@ -882,16 +912,7 @@ playSynthesizedVoiceFS(dsd_opts* opts, dsd_state* state) {
 void
 playSynthesizedVoiceFM(dsd_opts* opts, dsd_state* state) {
     agf(opts, state, state->f_l, 0);
-    int encL = 0;
-    if (dsd_p25_algid_is_encrypted(state) || state->nxdn_cipher_type != 0) {
-        encL = 1;
-    }
-    if (encL) {
-        int can_p25 = dsd_p25_algid_can_decrypt(state) || (state->payload_algid == 0x83 && state->R != 0);
-        if (can_p25 || dsd_nxdn_can_decrypt(state)) {
-            encL = 0;
-        }
-    }
+    int encL = dsd_audio_mono_voice_enc_gate(state);
 
     unsigned long TGL = (unsigned long)state->lasttg;
     if (opts->frame_nxdn48 == 1 || opts->frame_nxdn96 == 1) {
@@ -912,15 +933,23 @@ playSynthesizedVoiceFM(dsd_opts* opts, dsd_state* state) {
 void
 playSynthesizedVoiceMS(dsd_opts* opts, dsd_state* state) {
     size_t len = state->audio_out_idx;
+    int encL = dsd_audio_mono_voice_enc_gate(state);
+    unsigned long TGL = (unsigned long)state->lasttg;
     if (len > 960) {
         len = 960; // clamp to buffer capacity
     }
+
+    if (opts->frame_nxdn48 == 1 || opts->frame_nxdn96 == 1) {
+        TGL = (unsigned long)state->nxdn_last_tg;
+    }
+
+    (void)dsd_audio_group_gate_mono(opts, state, TGL, encL, &encL);
 
     short mono_samp_buf[960];
     short* mono_samp = mono_samp_buf;
     DSD_MEMSET(mono_samp, 0, len * sizeof(short));
 
-    if (opts->slot1_on != 0) {
+    if (!encL && opts->slot1_on != 0) {
         dsd_load_short_mono_samples(mono_samp, len, state->s_l, &state->audio_out_buf_p);
         if (opts->use_hpf_d == 1) {
             hpf_dL(state, mono_samp, (int)len);
@@ -934,18 +963,18 @@ playSynthesizedVoiceMS(dsd_opts* opts, dsd_state* state) {
 //Stereo Mix - Short (SB16LE) -- When Playing Short FDMA samples when setup for stereo output
 void
 playSynthesizedVoiceSS(dsd_opts* opts, dsd_state* state) {
-    int encL = dsd_p25_algid_is_encrypted(state) ? 1 : 0;
+    int encL = dsd_audio_mono_voice_enc_gate(state);
     short stereo_samp1[320]; //8k 2-channel stereo interleave mix
     DSD_MEMSET(stereo_samp1, 0, sizeof(stereo_samp1));
-    if (encL && (dsd_p25_algid_can_decrypt(state) || (state->payload_algid == 0x83 && state->R != 0))) {
-        encL = 0;
-    }
 
     if (opts->slot1_on == 0) {
         encL = 1;
     }
 
     unsigned long TGL = (unsigned long)state->lasttg;
+    if (opts->frame_nxdn48 == 1 || opts->frame_nxdn96 == 1) {
+        TGL = (unsigned long)state->nxdn_last_tg;
+    }
 
     (void)dsd_audio_group_gate_mono(opts, state, TGL, encL, &encL);
 

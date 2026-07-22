@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <dsd-neo/core/constants.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/power.h>
@@ -768,7 +769,7 @@ opts_is_digital_mode(const dsd_opts* opts) {
     }
     return (opts->frame_p25p1 == 1 || opts->frame_p25p2 == 1 || opts->frame_provoice == 1 || opts->frame_dmr == 1
             || opts->frame_nxdn48 == 1 || opts->frame_nxdn96 == 1 || opts->frame_x2tdma == 1 || opts->frame_ysf == 1
-            || opts->frame_dstar == 1 || opts->frame_dpmr == 1 || opts->frame_m17 == 1);
+            || opts->frame_dstar == 1 || opts->frame_dpmr == 1 || opts->frame_m17 == 1 || opts->frame_tetra == 1);
 }
 
 static int
@@ -776,7 +777,8 @@ opts_has_4800_wide_four_level_mode(const dsd_opts* opts) {
     if (!opts) {
         return 0;
     }
-    return (opts->frame_dmr == 1 || opts->frame_nxdn96 == 1 || opts->frame_ysf == 1 || opts->frame_m17 == 1);
+    return (opts->frame_dmr == 1 || opts->frame_nxdn96 == 1 || opts->frame_ysf == 1 || opts->frame_m17 == 1
+            || opts->frame_tetra == 1);
 }
 
 static int
@@ -796,6 +798,12 @@ rtl_stream_fsk_profile_for_opts_by_sym_rate(const dsd_opts* opts, int sym_rate) 
     }
     if (sym_rate == 9600 && opts->frame_provoice == 1) {
         return DSD_CH_LPF_PROFILE_PROVOICE;
+    }
+    if (sym_rate == 9600 && opts->frame_tetra == 1) {
+        return DSD_CH_LPF_PROFILE_WIDE;
+    }
+    if (sym_rate == 18000 && opts->frame_tetra == 1) {
+        return DSD_CH_LPF_PROFILE_WIDE;
     }
     if (sym_rate == 2400 && (opts->frame_nxdn48 == 1 || opts->frame_dpmr == 1)) {
         return DSD_CH_LPF_PROFILE_6K25;
@@ -836,6 +844,9 @@ rtl_stream_fsk_profile_for_symbol_rate(int sym_rate, int levels) {
     }
     if (sym_rate == 9600) {
         return DSD_CH_LPF_PROFILE_PROVOICE;
+    }
+    if (sym_rate >= 18000) {
+        return DSD_CH_LPF_PROFILE_WIDE;
     }
     if (sym_rate >= 6000) {
         return DSD_CH_LPF_PROFILE_12K5;
@@ -2665,14 +2676,22 @@ demod_snr_compute_quartiles(float* vals, int m, float* q1, float* q2, float* q3)
     if (!vals || m <= 32 || !q1 || !q2 || !q3) {
         return 0;
     }
+    int finite_count = 0;
+    for (int i = 0; i < m; i++) {
+        if (std::isfinite(vals[i])) {
+            vals[finite_count++] = vals[i];
+        }
+    }
+    m = finite_count;
+    if (m <= 32) {
+        return 0;
+    }
     int idx1 = (int)((size_t)m / 4);
     int idx2 = (int)((size_t)m / 2);
     int idx3 = (int)((size_t)(3 * (size_t)m) / 4);
-    std::nth_element(vals, vals + idx2, vals + m);
+    std::sort(vals, vals + m);
     *q2 = vals[idx2];
-    std::nth_element(vals, vals + idx1, vals + idx2);
     *q1 = vals[idx1];
-    std::nth_element(vals + idx2 + 1, vals + idx3, vals + m);
     *q3 = vals[idx3];
     return 1;
 }
@@ -4058,7 +4077,9 @@ snr_eye_downsample_for_quantiles(const float* src, int src_count, float* dst, in
     int step = (src_count > dst_capacity) ? (src_count / dst_capacity) : 1;
     int copied = 0;
     for (int i = 0; i < src_count && copied < dst_capacity; i += step) {
-        dst[copied++] = src[i];
+        if (std::isfinite(src[i])) {
+            dst[copied++] = src[i];
+        }
     }
     return copied;
 }
@@ -4068,14 +4089,22 @@ snr_eye_quartiles(float* vals, int count, float* q1, float* q2, float* q3) {
     if (!vals || count < 8 || !q1 || !q2 || !q3) {
         return 0;
     }
+    int finite_count = 0;
+    for (int i = 0; i < count; i++) {
+        if (std::isfinite(vals[i])) {
+            vals[finite_count++] = vals[i];
+        }
+    }
+    count = finite_count;
+    if (count < 8) {
+        return 0;
+    }
     int idx1 = (int)((size_t)count / 4);
     int idx2 = (int)((size_t)count / 2);
     int idx3 = (int)((size_t)(3 * (size_t)count) / 4);
-    std::nth_element(vals, vals + idx2, vals + count);
+    std::sort(vals, vals + count);
     *q2 = vals[idx2];
-    std::nth_element(vals, vals + idx1, vals + idx2);
     *q1 = vals[idx1];
-    std::nth_element(vals + idx2 + 1, vals + idx3, vals + count);
     *q3 = vals[idx3];
     return 1;
 }
@@ -4085,8 +4114,18 @@ snr_eye_median(float* vals, int count, float* q2) {
     if (!vals || !q2 || count < 8) {
         return 0;
     }
+    int finite_count = 0;
+    for (int i = 0; i < count; i++) {
+        if (std::isfinite(vals[i])) {
+            vals[finite_count++] = vals[i];
+        }
+    }
+    count = finite_count;
+    if (count < 8) {
+        return 0;
+    }
     int idx2 = (int)((size_t)count / 2);
-    std::nth_element(vals, vals + idx2, vals + count);
+    std::sort(vals, vals + count);
     *q2 = vals[idx2];
     return 1;
 }
