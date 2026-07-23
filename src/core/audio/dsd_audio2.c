@@ -19,17 +19,19 @@
 #include <dsd-neo/core/synctype_ids.h>
 #include <dsd-neo/platform/audio.h>
 #include <dsd-neo/platform/file_compat.h>
+#include <dsd-neo/protocol/p25/p25_crypto.h>
 #include <dsd-neo/runtime/p25_p2_audio_ring.h>
 #include <dsd-neo/runtime/udp_audio_hooks.h>
 #include <math.h>
-#include <mbelib.h>
-#include <sndfile.h>
+#include <mbelib-neo/mbelib.h>
 #include <stdint.h>
 #include <string.h>
 #include <sys/types.h>
 #include "dsd-neo/core/opts_fwd.h"
 #include "dsd-neo/core/safe_api.h"
 #include "dsd-neo/core/state_fwd.h"
+#include "dsd_audio2_internal.h"
+#include "dsd_audio_internal.h"
 
 static void
 write_s16_audio(dsd_opts* opts, const int16_t* buf, size_t frames) {
@@ -84,7 +86,7 @@ write_audio_out(int fd, const void* buf, size_t bytes) {
     (void)written;
 }
 
-static int
+DSD_AUDIO2_INTERNAL int
 dsd_is_all_zero_s16(const short* buf, size_t n) {
     if (!buf) {
         return 1;
@@ -97,7 +99,7 @@ dsd_is_all_zero_s16(const short* buf, size_t n) {
     return 1;
 }
 
-static void
+DSD_AUDIO2_INTERNAL void
 dsd_audio_maybe_reset_output_ring_left(dsd_state* state) {
     if (state->audio_out_idx2 >= 800000) {
         state->audio_out_float_buf_p = state->audio_out_float_buf + 100;
@@ -108,7 +110,7 @@ dsd_audio_maybe_reset_output_ring_left(dsd_state* state) {
     }
 }
 
-static void
+DSD_AUDIO2_INTERNAL void
 dsd_audio_maybe_reset_output_ring_right(dsd_state* state) {
     if (state->audio_out_idx2R >= 800000) {
         state->audio_out_float_buf_pR = state->audio_out_float_bufR + 100;
@@ -159,7 +161,7 @@ dsd_audio_reset_short_lr_working_state(dsd_state* state) {
     dsd_audio_maybe_reset_output_ring_right(state);
 }
 
-static void
+DSD_AUDIO2_INTERNAL void
 dsd_output_float_block(dsd_opts* opts, dsd_state* state, const float* samples, size_t frames, int channels) {
     if (opts->audio_out != 1 || !samples || frames == 0) {
         return;
@@ -173,7 +175,7 @@ dsd_output_float_block(dsd_opts* opts, dsd_state* state, const float* samples, s
     }
 }
 
-static void
+DSD_AUDIO2_INTERNAL void
 dsd_output_s16_block(dsd_opts* opts, dsd_state* state, const short* samples, size_t frames, int channels) {
     if (opts->audio_out != 1 || !samples || frames == 0) {
         return;
@@ -187,7 +189,7 @@ dsd_output_s16_block(dsd_opts* opts, dsd_state* state, const short* samples, siz
     }
 }
 
-static void
+DSD_AUDIO2_INTERNAL void
 dsd_output_float_blocks(dsd_opts* opts, dsd_state* state, const float* const* blocks, size_t block_count, size_t frames,
                         int channels, int skip_silent) {
     size_t samples_per_block = frames * (size_t)channels;
@@ -199,7 +201,7 @@ dsd_output_float_blocks(dsd_opts* opts, dsd_state* state, const float* const* bl
     }
 }
 
-static void
+DSD_AUDIO2_INTERNAL void
 dsd_output_s16_blocks(dsd_opts* opts, dsd_state* state, const short* const* blocks, size_t block_count, size_t frames,
                       int channels, int skip_silent) {
     size_t samples_per_block = frames * (size_t)channels;
@@ -244,15 +246,15 @@ dsd_write_static_wav_from_mono(dsd_opts* opts, const short* mono_samp, size_t le
             ss[(i * 2) + 1] = mono_samp[(size_t)i * 6];
         }
     }
-    sf_write_short(opts->wav_out_f, ss, 320);
+    dsd_audio_write_wav_short_block(opts->wav_out_f, ss, 320, "dsd_write_static_wav_from_mono");
 }
 
-static int
+DSD_AUDIO2_INTERNAL int
 dsd_p25_algid_is_encrypted(const dsd_state* state) {
     return DSD_SYNC_IS_P25P1(state->synctype) && state->payload_algid != 0 && state->payload_algid != 0x80;
 }
 
-static int
+DSD_AUDIO2_INTERNAL int
 dsd_p25_algid_can_decrypt(const dsd_state* state) {
     int algid = state->payload_algid;
     if (algid == 0xAA || algid == 0x81 || algid == 0x9F) {
@@ -264,7 +266,7 @@ dsd_p25_algid_can_decrypt(const dsd_state* state) {
     return 0;
 }
 
-static int
+DSD_AUDIO2_INTERNAL int
 dsd_nxdn_can_decrypt(const dsd_state* state) {
     if (state->nxdn_cipher_type == 0x1 || state->nxdn_cipher_type == 0x2) {
         return state->R != 0;
@@ -276,33 +278,40 @@ dsd_nxdn_can_decrypt(const dsd_state* state) {
 }
 
 static int
-dsd_mono_voice_is_encrypted(const dsd_state* state) {
-    if (!state) {
-        return 0;
-    }
-    return (dsd_p25_algid_is_encrypted(state) || state->nxdn_cipher_type != 0) ? 1 : 0;
+dsd_p25p1_live_crypto_gate_applies(const dsd_state* state) {
+    return DSD_SYNC_IS_P25P1(state->synctype) && state->mbe_file_type != 3;
 }
 
 static int
-dsd_mono_voice_can_decrypt(const dsd_state* state) {
-    if (!state) {
+dsd_p25_audio_output_permitted(const dsd_opts* opts, const dsd_state* state, int slot) {
+    if (!p25_crypto_audio_permitted(opts, state, slot)) {
         return 0;
     }
-    if (dsd_p25_algid_can_decrypt(state)) {
-        return 1;
-    }
-    if (state->payload_algid == 0x83 && state->R != 0) {
-        return 1;
-    }
-    return dsd_nxdn_can_decrypt(state);
+    return !opts || opts->reverse_mute != 1 || state->p25_crypto_state[slot] != DSD_P25_CRYPTO_CLEAR;
 }
 
-int
-dsd_audio_mono_voice_enc_gate(const dsd_state* state) {
-    if (!dsd_mono_voice_is_encrypted(state)) {
+static int
+dsd_fdma_crypto_muted(const dsd_opts* opts, const dsd_state* state, int include_nxdn) {
+    if (DSD_SYNC_IS_P25P1(state->synctype)) {
+        return dsd_p25p1_live_crypto_gate_applies(state) && !dsd_p25_audio_output_permitted(opts, state, 0);
+    }
+
+    int muted = dsd_p25_algid_is_encrypted(state) || (include_nxdn && state->nxdn_cipher_type != 0);
+    if (!muted) {
         return 0;
     }
-    return dsd_mono_voice_can_decrypt(state) ? 0 : 1;
+
+    const int can_p25 = dsd_p25_algid_can_decrypt(state) || (state->payload_algid == 0x83 && state->R != 0);
+    return (can_p25 || (include_nxdn && dsd_nxdn_can_decrypt(state))) ? 0 : 1;
+}
+
+static int
+dsd_fdma_apply_group_gate(const dsd_opts* opts, const dsd_state* state, unsigned long tg, int muted) {
+    (void)dsd_audio_group_gate_mono(opts, state, tg, muted, &muted);
+    if (dsd_p25p1_live_crypto_gate_applies(state) && !dsd_p25_audio_output_permitted(opts, state, 0)) {
+        return 1;
+    }
+    return muted;
 }
 
 static int
@@ -322,7 +331,7 @@ dmr_forced_privacy_unmute_enabled(const dsd_state* state) {
     return state && ((state->baofeng_ap == 1) || (state->csi_ee == 1));
 }
 
-static void
+DSD_AUDIO2_INTERNAL void
 dsd_dmr_init_slot_mute_flags(const dsd_opts* opts, const dsd_state* state, int* encL, int* encR) {
     const int forced_dmr_privacy = dmr_forced_privacy_unmute_enabled(state);
     int l_is_enc = state->dmr_encL != 0;
@@ -331,7 +340,7 @@ dsd_dmr_init_slot_mute_flags(const dsd_opts* opts, const dsd_state* state, int* 
     *encR = (forced_dmr_privacy || !r_is_enc || opts->dmr_mute_encR == 0) ? 0 : 1;
 }
 
-static void
+DSD_AUDIO2_INTERNAL void
 dsd_duplicate_active_float_slot_to_stereo(float* a, float* b, float* c, int encL, int encR, int* outL, int* outR) {
     if (!encL && encR) {
         for (int i = 0; i < 320; i += 2) {
@@ -371,51 +380,20 @@ dsd_apply_dual_tg_audio_gate(const dsd_opts* opts, const dsd_state* state, int* 
     unsigned long TGL = (unsigned long)state->lasttg;
     unsigned long TGR = (unsigned long)state->lasttgR;
     (void)dsd_audio_group_gate_dual(opts, state, TGL, TGR, *encL, *encR, encL, encR);
+    if (!dsd_p25_audio_output_permitted(opts, state, 0)) {
+        *encL = 1;
+    }
+    if (!dsd_p25_audio_output_permitted(opts, state, 1)) {
+        *encR = 1;
+    }
 }
 
-static int
-dsd_p25p2_slot_marked_encrypted(const dsd_state* state, int slot) {
-    int algid = (slot == 0) ? state->payload_algid : state->payload_algidR;
-    if (algid == 0x80) {
-        return 0;
-    }
-    if (algid != 0) {
-        return 1;
-    }
-    int svc = (slot == 0) ? state->dmr_so : state->dmr_soR;
-    return (svc & 0x40) != 0;
-}
-
-static int
-dsd_p25p2_slot_has_decrypt_key(const dsd_state* state, int slot) {
-    if (!state || slot < 0 || slot > 1) {
-        return 0;
-    }
-
-    int algid = (slot == 0) ? state->payload_algid : state->payload_algidR;
-    if (algid == 0 || algid == 0x80) {
-        return 0;
-    }
-
-    unsigned long long key = (slot == 0) ? state->R : state->RR;
-    if ((algid == 0xAA || algid == 0x81 || algid == 0x9F) && key != 0ULL) {
-        return 1;
-    }
-    if ((algid == 0x84 || algid == 0x89) && state->aes_key_loaded[slot] == 1) {
-        return 1;
-    }
-    return 0;
-}
-
-static int
+DSD_AUDIO2_INTERNAL int
 dsd_p25p2_encrypted_lockout_slot_muted(const dsd_opts* opts, const dsd_state* state, int slot, int muted) {
-    if (!opts || !state || slot < 0 || slot > 1 || !muted || opts->trunk_tune_enc_calls != 0) {
+    if (!opts || !state || slot < 0 || slot > 1 || !muted) {
         return 0;
     }
-    if (state->p25_p2_enc_lockout_muted[slot] != 0) {
-        return 1;
-    }
-    return dsd_p25p2_slot_marked_encrypted(state, slot) && !dsd_p25p2_slot_has_decrypt_key(state, slot);
+    return p25_crypto_companion_suppressed(state, slot);
 }
 
 static void
@@ -480,7 +458,7 @@ dsd_fs4_mix_interleaved_frames(float lf[4][160], float rf[4][160], int encL, int
     }
 }
 
-static void
+DSD_AUDIO2_INTERNAL void
 dsd_fs4_mix_mono_frames(float lf[4][160], float rf[4][160], int encL, int encR, int l_ok[4], int r_ok[4],
                         float mono[4][160]) {
     for (int j = 0; j < 4; j++) {
@@ -535,11 +513,11 @@ dsd_write_s16_wav_18_blocks(dsd_opts* opts, short stereo_sf[18][320]) {
         return;
     }
     for (int j = 0; j < 18; j++) {
-        sf_write_short(opts->wav_out_f, stereo_sf[j], 320);
+        dsd_audio_write_wav_short_block(opts->wav_out_f, stereo_sf[j], 320, "dsd_write_s16_wav_18_blocks");
     }
 }
 
-static void
+DSD_AUDIO2_INTERNAL void
 dsd_dmr_ss3_init_enc_flags(const dsd_state* state, int* encL, int* encR) {
     *encL = (state->dmr_so >> 6) & 0x1;
     *encR = (state->dmr_soR >> 6) & 0x1;
@@ -565,7 +543,7 @@ dsd_dmr_ss3_init_enc_flags(const dsd_state* state, int* encL, int* encR) {
     }
 }
 
-static void
+DSD_AUDIO2_INTERNAL void
 dsd_dmr_apply_tg_hold_and_slot_preference_ss3(dsd_opts* opts, const dsd_state* state, unsigned long TGL,
                                               unsigned long TGR, int* encL, int* encR) {
     if (state->tg_hold != 0 && state->tg_hold != TGL) {
@@ -621,7 +599,7 @@ dsd_ss3_should_copy_left_to_right(const dsd_opts* opts, const dsd_state* state, 
     return 0;
 }
 
-static void
+DSD_AUDIO2_INTERNAL void
 dsd_dmr_apply_stereo_output_policy_ss3(const dsd_opts* opts, dsd_state* state, int encL, int encR) {
     if (encL) {
         DSD_MEMSET(state->s_l4, 0, sizeof(state->s_l4));
@@ -636,7 +614,7 @@ dsd_dmr_apply_stereo_output_policy_ss3(const dsd_opts* opts, dsd_state* state, i
     }
 }
 
-static void
+DSD_AUDIO2_INTERNAL void
 dsd_p25p2_apply_slot_preference_ss18(dsd_opts* opts, const dsd_state* state, unsigned long TGL, unsigned long TGR) {
     if (state->tg_hold != 0 && state->tg_hold == TGL) {
         opts->slot1_on = 1;
@@ -689,7 +667,7 @@ dsd_ss18_should_copy_left_to_right(const dsd_opts* opts, const dsd_state* state,
     return 0;
 }
 
-static void
+DSD_AUDIO2_INTERNAL void
 dsd_p25p2_apply_stereo_output_policy_ss18(const dsd_opts* opts, dsd_state* state, int encL, int encR) {
     if (encL) {
         DSD_MEMSET(state->s_l4, 0, sizeof(state->s_l4));
@@ -730,6 +708,49 @@ dsd_p25p2_flush_partial_audio(dsd_opts* opts, dsd_state* state) {
     playSynthesizedVoiceSS18(opts, state);
     state->voice_counter[0] = 0;
     state->voice_counter[1] = 0;
+}
+
+void
+dsd_p25p2_flush_partial_audio_slot(dsd_opts* opts, dsd_state* state, int slot) {
+    if (!opts || !state || slot < 0 || slot > 1) {
+        return;
+    }
+    // This helper is specifically for the short/int16 P25p2 SS18 path.
+    if (opts->floating_point != 0 || opts->pulse_digi_rate_out != 8000) {
+        return;
+    }
+
+    const int other = slot ^ 1;
+    int has_slot = (slot == 0) ? p25p2_s16_frames_have_audio(state->s_l4) : p25p2_s16_frames_have_audio(state->s_r4);
+    if (!has_slot) {
+        return;
+    }
+
+    short saved_other[18][160];
+    int saved_other_counter = state->voice_counter[other];
+    int saved_other_allowed = state->p25_p2_audio_allowed[other];
+
+    if (other == 0) {
+        DSD_MEMCPY(saved_other, state->s_l4, sizeof(saved_other));
+        DSD_MEMSET(state->s_l4, 0, sizeof(state->s_l4));
+    } else {
+        DSD_MEMCPY(saved_other, state->s_r4, sizeof(saved_other));
+        DSD_MEMSET(state->s_r4, 0, sizeof(state->s_r4));
+    }
+
+    state->p25_p2_audio_allowed[slot] = 1;
+    state->p25_p2_audio_allowed[other] = 0;
+
+    playSynthesizedVoiceSS18(opts, state);
+
+    state->voice_counter[slot] = 0;
+    state->voice_counter[other] = saved_other_counter;
+    state->p25_p2_audio_allowed[other] = saved_other_allowed;
+    if (other == 0) {
+        DSD_MEMCPY(state->s_l4, saved_other, sizeof(saved_other));
+    } else {
+        DSD_MEMCPY(state->s_r4, saved_other, sizeof(saved_other));
+    }
 }
 
 //NOTE: Tones produce ringing sound when put through the hpf_d, may want to look into tweaking it,
@@ -830,8 +851,7 @@ FS3_END:
 //NOTE: Disabling voice synthesis clears up the delay issue (obviosly since we aren't having to wait on it to play)
 //disabling voice in only one slot will also fix most random stutter from the 4v in one slot, and 2v in the other slot
 
-//NOTE: The same skip may be occurring on the main and v2.1b branches of DSD-neo as well, so that may be due to the 4v/2v and
-//playing back immediately instead of buffering x number of samples or 4v/2v to get a smoother playback
+//NOTE: The skip is consistent with immediate mixed 4v/2v playback instead of buffering enough samples to smooth output.
 
 //NOTE: When using capture bins for playback, this issue is not as observable compared to real time reception due to how fast
 //we can blow through pure data on bin files compared to waiting for the real time reception
@@ -885,11 +905,14 @@ END_FS4:
 //float stereo mix -- when using Float Stereo Output, we need to send P25p1, DMR MS/Simplex, DStar, and YSF here
 void
 playSynthesizedVoiceFS(dsd_opts* opts, dsd_state* state) {
-    int encL = dsd_p25_algid_is_encrypted(state) ? 1 : 0;
+    const int is_p25p1 = DSD_SYNC_IS_P25P1(state->synctype);
+    int encL = is_p25p1 ? (dsd_p25_audio_output_permitted(opts, state, 0) ? 0 : 1)
+                        : (dsd_p25_algid_is_encrypted(state) ? 1 : 0);
     float stereo_samp1[320]; //8k 2-channel stereo interleave mix
 
     DSD_MEMSET(stereo_samp1, 0.0f, sizeof(stereo_samp1));
-    if (encL && (dsd_p25_algid_can_decrypt(state) || (state->payload_algid == 0x83 && state->aes_key_loaded[0] == 1))) {
+    if (!is_p25p1 && encL
+        && (dsd_p25_algid_can_decrypt(state) || (state->payload_algid == 0x83 && state->aes_key_loaded[0] == 1))) {
         encL = 0;
     }
 
@@ -899,6 +922,9 @@ playSynthesizedVoiceFS(dsd_opts* opts, dsd_state* state) {
 
     unsigned long TGL = (unsigned long)state->lasttg;
     (void)dsd_audio_group_gate_mono(opts, state, TGL, encL, &encL);
+    if (is_p25p1 && !dsd_p25_audio_output_permitted(opts, state, 0)) {
+        encL = 1;
+    }
 
     agf(opts, state, state->f_l, 0);
     if (!encL) {
@@ -912,14 +938,14 @@ playSynthesizedVoiceFS(dsd_opts* opts, dsd_state* state) {
 void
 playSynthesizedVoiceFM(dsd_opts* opts, dsd_state* state) {
     agf(opts, state, state->f_l, 0);
-    int encL = dsd_audio_mono_voice_enc_gate(state);
+    int encL = dsd_fdma_crypto_muted(opts, state, 1);
 
     unsigned long TGL = (unsigned long)state->lasttg;
     if (opts->frame_nxdn48 == 1 || opts->frame_nxdn96 == 1) {
         TGL = (unsigned long)state->nxdn_last_tg;
     }
 
-    (void)dsd_audio_group_gate_mono(opts, state, TGL, encL, &encL);
+    encL = dsd_fdma_apply_group_gate(opts, state, TGL, encL);
 
     if (!encL && opts->slot1_on != 0) {
         dsd_output_float_block(opts, state, state->f_l, 160, 1);
@@ -933,23 +959,15 @@ playSynthesizedVoiceFM(dsd_opts* opts, dsd_state* state) {
 void
 playSynthesizedVoiceMS(dsd_opts* opts, dsd_state* state) {
     size_t len = state->audio_out_idx;
-    int encL = dsd_audio_mono_voice_enc_gate(state);
-    unsigned long TGL = (unsigned long)state->lasttg;
     if (len > 960) {
         len = 960; // clamp to buffer capacity
     }
-
-    if (opts->frame_nxdn48 == 1 || opts->frame_nxdn96 == 1) {
-        TGL = (unsigned long)state->nxdn_last_tg;
-    }
-
-    (void)dsd_audio_group_gate_mono(opts, state, TGL, encL, &encL);
 
     short mono_samp_buf[960];
     short* mono_samp = mono_samp_buf;
     DSD_MEMSET(mono_samp, 0, len * sizeof(short));
 
-    if (!encL && opts->slot1_on != 0) {
+    if (opts->slot1_on != 0) {
         dsd_load_short_mono_samples(mono_samp, len, state->s_l, &state->audio_out_buf_p);
         if (opts->use_hpf_d == 1) {
             hpf_dL(state, mono_samp, (int)len);
@@ -963,7 +981,7 @@ playSynthesizedVoiceMS(dsd_opts* opts, dsd_state* state) {
 //Stereo Mix - Short (SB16LE) -- When Playing Short FDMA samples when setup for stereo output
 void
 playSynthesizedVoiceSS(dsd_opts* opts, dsd_state* state) {
-    int encL = dsd_audio_mono_voice_enc_gate(state);
+    int encL = dsd_fdma_crypto_muted(opts, state, 0);
     short stereo_samp1[320]; //8k 2-channel stereo interleave mix
     DSD_MEMSET(stereo_samp1, 0, sizeof(stereo_samp1));
 
@@ -972,11 +990,8 @@ playSynthesizedVoiceSS(dsd_opts* opts, dsd_state* state) {
     }
 
     unsigned long TGL = (unsigned long)state->lasttg;
-    if (opts->frame_nxdn48 == 1 || opts->frame_nxdn96 == 1) {
-        TGL = (unsigned long)state->nxdn_last_tg;
-    }
 
-    (void)dsd_audio_group_gate_mono(opts, state, TGL, encL, &encL);
+    encL = dsd_fdma_apply_group_gate(opts, state, TGL, encL);
 
     if (opts->use_hpf_d == 1) {
         hpf_dL(state, state->s_l, 160);
@@ -985,7 +1000,7 @@ playSynthesizedVoiceSS(dsd_opts* opts, dsd_state* state) {
     if (!encL) {
         dsd_output_s16_block(opts, state, stereo_samp1, 160, 2);
         if (opts->wav_out_f != NULL && opts->static_wav_file == 1) {
-            sf_write_short(opts->wav_out_f, stereo_samp1, 320);
+            dsd_audio_write_wav_short_block(opts->wav_out_f, stereo_samp1, 320, "processAudioDMRslot");
         }
     }
     dsd_audio_reset_short_lr_working_state(state);
@@ -1039,9 +1054,9 @@ playSynthesizedVoiceSS3(dsd_opts* opts, dsd_state* state) {
     dsd_output_s16_blocks(opts, state, stereo_blocks, 3, 160, 2, 0);
 
     if (opts->wav_out_f != NULL && opts->static_wav_file == 1) {
-        sf_write_short(opts->wav_out_f, stereo_samp1, 320);
-        sf_write_short(opts->wav_out_f, stereo_samp2, 320);
-        sf_write_short(opts->wav_out_f, stereo_samp3, 320);
+        dsd_audio_write_wav_short_block(opts->wav_out_f, stereo_samp1, 320, "processAudioDMRstereo3v2 block1");
+        dsd_audio_write_wav_short_block(opts->wav_out_f, stereo_samp2, 320, "processAudioDMRstereo3v2 block2");
+        dsd_audio_write_wav_short_block(opts->wav_out_f, stereo_samp3, 320, "processAudioDMRstereo3v2 block3");
     }
 
 SS3_END:
@@ -1068,6 +1083,12 @@ playSynthesizedVoiceSS18(dsd_opts* opts, dsd_state* state) {
     unsigned long TGR = (unsigned long)state->lasttgR;
 
     (void)dsd_audio_group_gate_dual(opts, state, TGL, TGR, encL, encR, &encL, &encR);
+    if (!dsd_p25_audio_output_permitted(opts, state, 0)) {
+        encL = 1;
+    }
+    if (!dsd_p25_audio_output_permitted(opts, state, 1)) {
+        encR = 1;
+    }
 
     dsd_p25p2_apply_slot_preference_ss18(opts, state, TGL, TGR);
     dsd_hpf_short_18_if_enabled(opts, state);

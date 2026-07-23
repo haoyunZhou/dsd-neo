@@ -69,7 +69,7 @@ static void
 do_release(dsd_opts *opts, dsd_state *state)
 {
     sm_log(opts, "do_release -> ON_CC");
-    dsd_trunk_tuning_hook_return_to_cc(opts, state);
+    dsd_trunk_tuning_hook_return_to_cc(opts, state, NULL);
     g_tetra_sm.state     = TETRA_SM_ON_CC;
     g_tetra_sm.vc_freq_hz = 0;
     g_tetra_sm.vc_slot    = 0;
@@ -114,7 +114,7 @@ tetra_sm_on_cc_sync(dsd_opts *opts, dsd_state *state)
 
     /* Register the CC in the candidate list regardless of state */
     if (state->trunk_cc_freq > 0)
-        dsd_trunk_cc_candidates_add(state, state->trunk_cc_freq, 0);
+        dsd_trunk_cc_candidates_add(state, state->trunk_cc_freq, 0, DSD_TRUNK_CC_CANDIDATE_CURRENT_SITE);
 
     if (g_tetra_sm.state == TETRA_SM_IDLE) {
         if (opts->verbose > 1)
@@ -161,7 +161,7 @@ tetra_sm_on_grant(dsd_opts *opts, dsd_state *state,
 
     /* Tune to VC */
     dsd_trunk_tuning_hook_tune_to_freq(opts, state, vc_freq_hz,
-                                       state->samplesPerSymbol);
+                                       state->samplesPerSymbol, NULL);
 
     g_tetra_sm.state     = TETRA_SM_TUNED;
     g_tetra_sm.vc_freq_hz = vc_freq_hz;

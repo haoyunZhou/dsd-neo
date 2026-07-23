@@ -267,7 +267,7 @@ void processTetraFrame(dsd_opts* opts, dsd_state* state)
      * --------------------------------------------------------------- */
     uint8_t cb_dibuf[TETRA_NDB_CB_DIBITS];
     for (int i = 0; i < TETRA_NDB_CB_DIBITS; i++)
-        cb_dibuf[i] = (uint8_t)getDibit(opts, state);
+        cb_dibuf[i] = (uint8_t)getDibitSoft(opts, state, NULL);
 
     uint8_t cb_bits[10];
     for (int i = 0; i < TETRA_NDB_CB_DIBITS; i++) {
@@ -339,8 +339,8 @@ void processTetraFrame(dsd_opts* opts, dsd_state* state)
      * Phase 8: event watchdog + ncurses UI refresh (same as DMR/D-STAR).
      * --------------------------------------------------------------- */
     tetra_sm_tick(opts, state);
-    if (opts->use_ncurses_terminal == 1)
-        ui_publish_both_and_redraw(opts, state);
+    if (dsd_opts_frontend_active(opts))
+        dsd_telemetry_publish_both_and_redraw(opts, state);
     watchdog_event_history(opts, state, 0);
     watchdog_event_current(opts, state, 0);
 }
@@ -463,8 +463,8 @@ void processTetraSBFrame(dsd_opts *opts, dsd_state *state)
     snprintf(state->ftype,    sizeof(state->ftype),    " TETRA");
 
     tetra_sm_tick(opts, state);
-    if (opts->use_ncurses_terminal == 1)
-        ui_publish_both_and_redraw(opts, state);
+    if (dsd_opts_frontend_active(opts))
+        dsd_telemetry_publish_both_and_redraw(opts, state);
     watchdog_event_history(opts, state, 0);
     watchdog_event_current(opts, state, 0);
 }

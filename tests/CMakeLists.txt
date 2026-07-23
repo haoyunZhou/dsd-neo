@@ -2589,7 +2589,7 @@ target_include_directories(
 )
 target_compile_definitions(
     dsd-neo_test_core_audio2_helpers
-    PRIVATE DSD_AUDIO2_INTERNAL=
+    PRIVATE DSD_AUDIO2_INTERNAL= MBE_API=
 )
 target_compile_options(
     dsd-neo_test_core_audio2_helpers
