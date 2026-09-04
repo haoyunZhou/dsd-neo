@@ -462,6 +462,20 @@ has_trunk_scan_channel_map_conflict_diag(const dsdcfg_diagnostics_t* diags, cons
 }
 
 static int
+has_trunk_scan_p25_bandplan_conflict_diag(const dsdcfg_diagnostics_t* diags, const char* section, const char* key) {
+    if (!diags || !section || !key) {
+        return 0;
+    }
+    for (int i = 0; i < diags->count; i++) {
+        if (diags->items[i].level == DSDCFG_DIAG_ERROR && strcmp(diags->items[i].section, section) == 0
+            && strcmp(diags->items[i].key, key) == 0 && strstr(diags->items[i].message, "trunking.p25_bandplan_csv")) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int
 test_trunk_scan_enabled_requires_targets_csv(void) {
     static const char* ini = "[trunk_scan]\n"
                              "enabled = true\n";
@@ -588,6 +602,74 @@ test_profile_trunk_scan_rejects_inherited_channel_map(void) {
     }
     if (!has_trunk_scan_channel_map_conflict_diag(&diags, "profile.scan", "trunking.chan_csv")) {
         DSD_FPRINTF(stderr, "FAIL: missing profile trunk_scan/global channel map diagnostic\n");
+        result = 1;
+    }
+
+    dsdcfg_diags_free(&diags);
+    (void)remove(path);
+    return result;
+}
+
+static int
+test_trunk_scan_rejects_global_p25_bandplan(void) {
+    static const char* ini = "[trunking]\n"
+                             "p25_bandplan_csv = \"/tmp/plan.csv\"\n"
+                             "\n"
+                             "[trunk_scan]\n"
+                             "enabled = true\n"
+                             "targets_csv = \"/tmp/targets.csv\"\n";
+
+    char path[DSD_TEST_PATH_MAX];
+    if (write_temp_config(ini, path, sizeof path) != 0) {
+        return 1;
+    }
+
+    dsdcfg_diagnostics_t diags;
+    DSD_MEMSET(&diags, 0, sizeof(diags));
+
+    int rc = dsd_user_config_validate(path, &diags);
+
+    int result = 0;
+    if (rc == 0) {
+        DSD_FPRINTF(stderr, "FAIL: trunk_scan with trunking.p25_bandplan_csv should cause error\n");
+        result = 1;
+    }
+    if (!has_trunk_scan_p25_bandplan_conflict_diag(&diags, "trunking", "p25_bandplan_csv")) {
+        DSD_FPRINTF(stderr, "FAIL: missing trunk_scan/global band plan diagnostic\n");
+        result = 1;
+    }
+
+    dsdcfg_diags_free(&diags);
+    (void)remove(path);
+    return result;
+}
+
+static int
+test_profile_trunk_scan_rejects_inherited_p25_bandplan(void) {
+    static const char* ini = "[trunking]\n"
+                             "p25_bandplan_csv = \"/tmp/plan.csv\"\n"
+                             "\n"
+                             "[profile.scan]\n"
+                             "trunk_scan.enabled = true\n"
+                             "trunk_scan.targets_csv = \"/tmp/targets.csv\"\n";
+
+    char path[DSD_TEST_PATH_MAX];
+    if (write_temp_config(ini, path, sizeof path) != 0) {
+        return 1;
+    }
+
+    dsdcfg_diagnostics_t diags;
+    DSD_MEMSET(&diags, 0, sizeof(diags));
+
+    int rc = dsd_user_config_validate(path, &diags);
+
+    int result = 0;
+    if (rc == 0) {
+        DSD_FPRINTF(stderr, "FAIL: profile trunk_scan with inherited trunking.p25_bandplan_csv should cause error\n");
+        result = 1;
+    }
+    if (!has_trunk_scan_p25_bandplan_conflict_diag(&diags, "profile.scan", "trunking.p25_bandplan_csv")) {
+        DSD_FPRINTF(stderr, "FAIL: missing profile trunk_scan/global band plan diagnostic\n");
         result = 1;
     }
 
@@ -1064,6 +1146,141 @@ test_int_out_of_range_negative_max(void) {
     return result;
 }
 
+/* Each scan-voice millisecond key warns below its 100 ms floor; one case per key so a
+ * regression in either key's schema bounds is caught on its own. */
+static int
+run_scan_voice_ms_out_of_range_case(const char* key) {
+    char ini[128];
+    DSD_SNPRINTF(ini, sizeof ini, "[trunking]\n%s = 50\n", key);
+
+    char path[DSD_TEST_PATH_MAX];
+    if (write_temp_config(ini, path, sizeof path) != 0) {
+        return 1;
+    }
+
+    dsdcfg_diagnostics_t diags;
+    DSD_MEMSET(&diags, 0, sizeof(diags));
+
+    int rc = dsd_user_config_validate(path, &diags);
+    (void)rc;
+
+    int result = 0;
+    if (diags.warning_count == 0) {
+        DSD_FPRINTF(stderr, "FAIL: no warning for out-of-range %s=50\n", key);
+        result = 1;
+    }
+
+    int found_warning = 0;
+    for (int i = 0; i < diags.count; i++) {
+        if (diags.items[i].level == DSDCFG_DIAG_WARNING && strstr(diags.items[i].key, key)
+            && strstr(diags.items[i].message, "out of range")) {
+            found_warning = 1;
+            break;
+        }
+    }
+    if (!found_warning) {
+        DSD_FPRINTF(stderr, "FAIL: missing out-of-range warning for %s=50\n", key);
+        result = 1;
+    }
+
+    dsdcfg_diags_free(&diags);
+    (void)remove(path);
+    return result;
+}
+
+static int
+test_scan_voice_ms_out_of_range(void) {
+    int rc = 0;
+    rc |= run_scan_voice_ms_out_of_range_case("scan_voice_qualify_ms");
+    rc |= run_scan_voice_ms_out_of_range_case("scan_voice_hold_ms");
+    return rc;
+}
+
+static int
+test_input_warn_db_double_validation(void) {
+    // In-range double: no diagnostics for the key
+    static const char* valid_ini = "[input]\n"
+                                   "source = \"rtl\"\n"
+                                   "input_warn_db = -60\n";
+
+    char path[DSD_TEST_PATH_MAX];
+    if (write_temp_config(valid_ini, path, sizeof path) != 0) {
+        return 1;
+    }
+
+    int result = 0;
+    dsdcfg_diagnostics_t diags;
+    DSD_MEMSET(&diags, 0, sizeof(diags));
+
+    int rc = dsd_user_config_validate(path, &diags);
+    (void)rc;
+
+    for (int i = 0; i < diags.count; i++) {
+        if (strstr(diags.items[i].key, "input_warn_db")) {
+            DSD_FPRINTF(stderr, "FAIL: valid input_warn_db produced a diagnostic: %s\n", diags.items[i].message);
+            result = 1;
+        }
+    }
+
+    dsdcfg_diags_free(&diags);
+    (void)remove(path);
+
+    // Below the [-200, 0] window: warning mentioning out of range
+    static const char* range_ini = "[input]\n"
+                                   "source = \"rtl\"\n"
+                                   "input_warn_db = -250\n";
+    if (write_temp_config(range_ini, path, sizeof path) != 0) {
+        return 1;
+    }
+    DSD_MEMSET(&diags, 0, sizeof(diags));
+    rc = dsd_user_config_validate(path, &diags);
+    (void)rc;
+
+    int found_range_warning = 0;
+    for (int i = 0; i < diags.count; i++) {
+        if (diags.items[i].level == DSDCFG_DIAG_WARNING && strstr(diags.items[i].key, "input_warn_db")
+            && strstr(diags.items[i].message, "out of range")) {
+            found_range_warning = 1;
+            break;
+        }
+    }
+    if (!found_range_warning) {
+        DSD_FPRINTF(stderr, "FAIL: missing out-of-range warning for input_warn_db=-250\n");
+        result = 1;
+    }
+
+    dsdcfg_diags_free(&diags);
+    (void)remove(path);
+
+    // Non-numeric value: error mentioning the invalid value
+    static const char* junk_ini = "[input]\n"
+                                  "source = \"rtl\"\n"
+                                  "input_warn_db = abc\n";
+    if (write_temp_config(junk_ini, path, sizeof path) != 0) {
+        return 1;
+    }
+    DSD_MEMSET(&diags, 0, sizeof(diags));
+    rc = dsd_user_config_validate(path, &diags);
+    (void)rc;
+
+    int found_invalid_error = 0;
+    for (int i = 0; i < diags.count; i++) {
+        if (diags.items[i].level == DSDCFG_DIAG_ERROR && strstr(diags.items[i].key, "input_warn_db")
+            && strstr(diags.items[i].message, "Invalid numeric value")) {
+            found_invalid_error = 1;
+            break;
+        }
+    }
+    if (!found_invalid_error) {
+        DSD_FPRINTF(stderr, "FAIL: missing invalid-value error for input_warn_db=abc\n");
+        result = 1;
+    }
+
+    dsdcfg_diags_free(&diags);
+    (void)remove(path);
+    return result;
+}
+
 static int
 test_diags_have_line_numbers(void) {
     static const char* ini = "[input]\n"
@@ -1447,6 +1664,58 @@ test_diagnostics_direct_api_and_print_formats(void) {
     return result;
 }
 
+static int
+test_dmr_lrrp_ports_validation(void) {
+    int result = 0;
+
+    // A well-formed list produces no diagnostic for the key.
+    static const char* valid_ini = "[mode]\n"
+                                   "dmr_lrrp_ports = \"5000,5001\"\n";
+    char path[DSD_TEST_PATH_MAX];
+    if (write_temp_config(valid_ini, path, sizeof path) != 0) {
+        return 1;
+    }
+    dsdcfg_diagnostics_t diags;
+    DSD_MEMSET(&diags, 0, sizeof(diags));
+    (void)dsd_user_config_validate(path, &diags);
+    for (int i = 0; i < diags.count; i++) {
+        if (strstr(diags.items[i].key, "dmr_lrrp_ports")) {
+            DSD_FPRINTF(stderr, "FAIL: valid dmr_lrrp_ports produced a diagnostic: %s\n", diags.items[i].message);
+            result = 1;
+        }
+    }
+    dsdcfg_diags_free(&diags);
+    (void)remove(path);
+
+    // Two unusable entries (not a number, out of range) are reported once as a warning, not an error.
+    static const char* bad_ini = "[mode]\n"
+                                 "dmr_lrrp_ports = \"5000,abc,70000\"\n";
+    if (write_temp_config(bad_ini, path, sizeof path) != 0) {
+        return 1;
+    }
+    DSD_MEMSET(&diags, 0, sizeof(diags));
+    (void)dsd_user_config_validate(path, &diags);
+    int found_warning = 0;
+    for (int i = 0; i < diags.count; i++) {
+        if (strstr(diags.items[i].key, "dmr_lrrp_ports")) {
+            if (diags.items[i].level == DSDCFG_DIAG_WARNING && strstr(diags.items[i].message, "ignores 2 entries")) {
+                found_warning++;
+            } else {
+                DSD_FPRINTF(stderr, "FAIL: unexpected dmr_lrrp_ports diagnostic level=%d: %s\n",
+                            (int)diags.items[i].level, diags.items[i].message);
+                result = 1;
+            }
+        }
+    }
+    if (found_warning != 1) {
+        DSD_FPRINTF(stderr, "FAIL: expected one dmr_lrrp_ports warning, found %d\n", found_warning);
+        result = 1;
+    }
+    dsdcfg_diags_free(&diags);
+    (void)remove(path);
+    return result;
+}
+
 int
 main(void) {
     int rc = 0;
@@ -1463,6 +1732,8 @@ main(void) {
     rc |= test_trunk_scan_rejects_global_channel_map();
     rc |= test_trunk_scan_include_composed_targets_csv_is_valid();
     rc |= test_profile_trunk_scan_rejects_inherited_channel_map();
+    rc |= test_trunk_scan_rejects_global_p25_bandplan();
+    rc |= test_profile_trunk_scan_rejects_inherited_p25_bandplan();
     rc |= test_profile_trunk_scan_enabled_requires_targets_csv();
     rc |= test_profile_trunk_scan_inherits_base_targets_csv();
     rc |= test_validate_rejects_null_path();
@@ -1477,6 +1748,9 @@ main(void) {
     rc |= test_invalid_source_rejected_after_soapy_added();
     rc |= test_int_out_of_range();
     rc |= test_int_out_of_range_negative_max();
+    rc |= test_scan_voice_ms_out_of_range();
+    rc |= test_input_warn_db_double_validation();
+    rc |= test_dmr_lrrp_ports_validation();
     rc |= test_diags_have_line_numbers();
     rc |= test_empty_config();
     rc |= test_nonexistent_file();

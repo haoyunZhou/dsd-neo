@@ -9,6 +9,7 @@
  * timestamp should not be printed to stderr.
  */
 
+#include <dsd-neo/core/call_state.h>
 #include <dsd-neo/core/events.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/state.h>
@@ -37,14 +38,16 @@ dsd_degrees_glyph(void) {
     return ""; // no unicode in tests
 }
 
-void
-watchdog_event_datacall(dsd_opts* opts, dsd_state* state, uint32_t src, uint32_t dst, char* data_string, uint8_t slot) {
+int
+dsd_event_emit_data_notice(dsd_opts* opts, dsd_state* state, uint8_t slot, const dsd_call_observation* observation,
+                           const char* notice) {
     (void)opts;
     (void)state;
-    (void)src;
-    (void)dst;
-    (void)data_string;
+    (void)observation->ota_source_id;
+    (void)observation->ota_target_id;
+    (void)notice;
     (void)slot;
+    return 0;
 }
 
 int
@@ -185,7 +188,15 @@ main(void) {
         fclose(ef);
         return 105;
     }
-    fread(ebuf, 1, pesize, ef);
+    // The buffer is calloc'd one byte longer than the file and therefore
+    // already terminated; what the read owes is the count, since
+    // _FORTIFY_SOURCE declares fread __wur and a short read here means the
+    // capture never landed.
+    if (fread(ebuf, 1, pesize, ef) != pesize) {
+        fclose(ef);
+        free(ebuf);
+        return 107;
+    }
     fclose(ef);
 
     // Ensure decoded time was NOT printed (fallback path)
@@ -209,7 +220,11 @@ main(void) {
         fclose(of);
         return 106;
     }
-    fread(obuf, 1, posize, of);
+    if (fread(obuf, 1, posize, of) != posize) {
+        fclose(of);
+        free(obuf);
+        return 108;
+    }
     fclose(of);
 
     // Ensure the file has some content and does not contain the bogus decoded year "2038/"

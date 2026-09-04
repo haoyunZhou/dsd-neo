@@ -302,6 +302,10 @@ rtl_tuner_type_name(int tuner_type) {
 // Internal RTL device structure
 struct rtl_device {
     rtlsdr_dev_t* dev = nullptr;
+    /* Set when this device wrapped the app-supplied USB descriptor, so closing it
+     * knows to hand the descriptor back to its owner. See
+     * rtl_device_preopened_fd_in_use(). */
+    int owns_preopened_fd = 0;
     dsd_thread_t thread{};
     struct input_ring_state* input_ring = nullptr;
     struct dsd_iq_capture_writer* iq_capture_writer = nullptr;
@@ -319,6 +323,11 @@ struct rtl_device {
     uint64_t soapy_last_overflow_log_ns = 0U;
     int soapy_profile_id = 0;
     int soapy_requested_bandwidth_hz = 0;
+    uint32_t soapy_startup_center_freq_hz = 0U;
+    /* Memoized rtl_device_nearest_supported_rate answer; valid while the device configuration
+       (and therefore its rate grid) is unchanged. actual == 0 means empty. */
+    uint32_t soapy_nearest_rate_cache_requested = 0U;
+    uint32_t soapy_nearest_rate_cache_actual = 0U;
     int soapy_named_gain_override = 0;
     int soapy_named_gain_skip_logged = 0;
     char soapy_args_string[1024] = {};
@@ -1345,7 +1354,7 @@ replay_forced_stop_requested(const struct rtl_device* s) {
     if (!s) {
         return 1;
     }
-    if (!s->run.load(std::memory_order_acquire) || exitflag) {
+    if (!s->run.load(std::memory_order_acquire) || dsd_exitflag_load()) {
         return 1;
     }
     if (s->replay_has_eof_state && s->replay_eof.replay_forced_stop
@@ -2341,7 +2350,7 @@ rtlsdr_callback(unsigned char* buf, uint32_t len, void* ctx) {
         }
     }
 
-    if (exitflag) {
+    if (dsd_exitflag_load()) {
         return;
     }
     if (!ctx) {
@@ -2424,7 +2433,7 @@ static DSD_THREAD_RETURN_TYPE
             stderr,
             "ERROR: libusb exception in rtlsdr_read_async (MSVC/Windows). "
             "Check that the bundled libusb/librtlsdr DLLs match the build and the device driver is installed.\n");
-        exitflag = 1;
+        dsd_exitflag_store(1);
     }
 #else
     rtlsdr_read_async(s->dev, rtlsdr_callback, s, 16, s->buf_len);
@@ -2617,17 +2626,34 @@ soapy_log_capability_summary_locked(struct rtl_device* dev) {
 
 static int
 soapy_apply_antenna_locked(struct rtl_device* dev) {
-    if (!dev || !dev->soapy_dev || dev->soapy_requested_antenna[0] == '\0') {
+    if (!dev || !dev->soapy_dev) {
+        return 0;
+    }
+    const dsdneo::SoapyProfile& profile = dsdneo::soapy_profile_by_id((dsdneo::SoapyProfileId)dev->soapy_profile_id);
+    const dsdneo::SoapyAntennaChoice choice = dsdneo::soapy_choose_antenna(
+        profile.default_antenna, dev->soapy_requested_antenna, (double)dev->soapy_startup_center_freq_hz);
+    if (choice.name.empty()) {
         return 0;
     }
     std::vector<std::string> antennas = dev->soapy_dev->listAntennas(SOAPY_SDR_RX, 0);
-    if (!dsdneo::soapy_name_list_contains(antennas, dev->soapy_requested_antenna)) {
-        DSD_FPRINTF(stderr, "SoapySDR: antenna '%s' is unavailable; choices=[%s].\n", dev->soapy_requested_antenna,
+    if (!dsdneo::soapy_name_list_contains(antennas, choice.name)) {
+        if (choice.auto_selected) {
+            /* The profile guessed; leave the driver default rather than failing the open. */
+            DSD_FPRINTF(stderr, "SoapySDR: %s profile antenna '%s' is unavailable; leaving driver default.\n",
+                        profile.name, choice.name.c_str());
+            return 0;
+        }
+        DSD_FPRINTF(stderr, "SoapySDR: antenna '%s' is unavailable; choices=[%s].\n", choice.name.c_str(),
                     dsdneo::soapy_join_names(antennas, 160).c_str());
         return DSD_ERR_NOT_SUPPORTED;
     }
-    dev->soapy_dev->setAntenna(SOAPY_SDR_RX, 0, dev->soapy_requested_antenna);
-    DSD_FPRINTF(stderr, "SoapySDR: selected antenna '%s'.\n", dev->soapy_requested_antenna);
+    dev->soapy_dev->setAntenna(SOAPY_SDR_RX, 0, choice.name);
+    if (choice.auto_selected) {
+        DSD_FPRINTF(stderr, "SoapySDR: selected antenna '%s' for %.4f MHz (%s profile default).\n", choice.name.c_str(),
+                    (double)dev->soapy_startup_center_freq_hz / 1e6, profile.name);
+    } else {
+        DSD_FPRINTF(stderr, "SoapySDR: selected antenna '%s'.\n", choice.name.c_str());
+    }
     return 0;
 }
 
@@ -3197,7 +3223,7 @@ static DSD_THREAD_RETURN_TYPE
     }
 
     int fatal = 0;
-    while (s->run.load() && exitflag == 0) {
+    while (s->run.load() && dsd_exitflag_load() == 0) {
         void* buffs[1] = {NULL};
         if (soapy_prepare_read_buffer(s, &cf32_buf, &cs16_buf, buffs) != 0) {
             fatal = 1;
@@ -3631,7 +3657,7 @@ rtl_tcp_reconnect_after_stall(struct rtl_device* s, struct rtl_tcp_loop_state* s
     rtl_tcp_close_socket_if_open(s);
 
     int attempt = 0;
-    while (s->run.load() && exitflag == 0) {
+    while (s->run.load() && dsd_exitflag_load() == 0) {
         attempt++;
         if (rtl_tcp_try_reconnect_once(s, &snap, st, attempt, out_r)) {
             return 1;
@@ -3658,7 +3684,7 @@ rtl_tcp_handle_recv_failure(struct rtl_device* s, struct rtl_tcp_loop_state* st,
     if (!s || !st || !out_r) {
         return 0;
     }
-    if (!s->run.load() || exitflag) {
+    if (!s->run.load() || dsd_exitflag_load()) {
         return 0;
     }
     if (rtl_tcp_recv_is_timeout(r)) {
@@ -4062,7 +4088,7 @@ static DSD_THREAD_RETURN_TYPE
         DSD_THREAD_RETURN;
     }
 
-    while (s->run.load() && exitflag == 0) {
+    while (s->run.load() && dsd_exitflag_load() == 0) {
         rtl_tcp_apply_backpressure_if_needed(s);
         int r = dsd_socket_recv(s->sockfd, st.u8, st.bufsz, st.waitall ? MSG_WAITALL : 0);
         if (r <= 0) {
@@ -4844,6 +4870,9 @@ rtl_device_init_common_state(struct rtl_device* dev) {
     dev->replay_float_elements_written = 0;
     dev->soapy_profile_id = (int)dsdneo::SoapyProfileId::Generic;
     dev->soapy_requested_bandwidth_hz = -1;
+    dev->soapy_startup_center_freq_hz = 0U;
+    dev->soapy_nearest_rate_cache_requested = 0U;
+    dev->soapy_nearest_rate_cache_actual = 0U;
     dev->soapy_named_gain_override = 0;
     dev->soapy_named_gain_skip_logged = 0;
     dev->soapy_args_string[0] = '\0';
@@ -4870,6 +4899,49 @@ rtl_device_cleanup_common_state(struct rtl_device* dev) {
         (void)dsd_mutex_destroy(&dev->tcp_metrics_lock);
         dev->tcp_metrics_lock_inited = 0;
     }
+}
+
+/*
+ * Descriptor handed down from an Android app (USB-OTG). Written before the engine
+ * starts and read on the engine/open path, so the two threads need it atomic.
+ */
+static std::atomic<int> g_preopened_usb_fd{-1};
+
+/*
+ * Whether the descriptor is currently wrapped by libusb, as opposed to merely
+ * recorded. Its owner (the Android app) has to close the connection eventually and
+ * needs to know when that is safe; "is the engine running" is a poor proxy, because
+ * the descriptor is taken and released well inside a run. Raised before the wrap is
+ * attempted and lowered once the device is closed, so it is never clear while a
+ * transfer could still be in flight.
+ */
+static std::atomic<int> g_preopened_usb_fd_in_use{0};
+
+void
+rtl_device_set_preopened_fd(int sys_fd) {
+    g_preopened_usb_fd.store((sys_fd < 0) ? -1 : sys_fd, std::memory_order_release);
+}
+
+int
+rtl_device_preopened_fd_is_set(void) {
+    return (g_preopened_usb_fd.load(std::memory_order_acquire) >= 0) ? 1 : 0;
+}
+
+int
+rtl_device_preopened_fd_in_use(void) {
+    return g_preopened_usb_fd_in_use.load(std::memory_order_acquire);
+}
+
+int
+rtl_device_preopened_fd_supported(void) {
+    /* Must match the guard on the open path in rtl_device_create() exactly: a build
+     * that records a descriptor it cannot open from advertises a USB source that can
+     * never work. */
+#if defined(__ANDROID__) && defined(USE_RTLSDR) && defined(USE_RTLSDR_OPEN_FD)
+    return 1;
+#else
+    return 0;
+#endif
 }
 
 /**
@@ -4915,6 +4987,27 @@ rtl_device_create(int dev_index, struct input_ring_state* input_ring) {
     dev->if_gain_count = 0;
 
     int r = 0;
+#if defined(__ANDROID__) && defined(USE_RTLSDR) && defined(USE_RTLSDR_OPEN_FD)
+    /* An injected descriptor means the app already picked and opened the device and
+     * libusb discovery is off, so opening by index cannot work. rtlsdr_open_fd() is a
+     * project patch on the vendored tree; the configure step proves it is there. */
+    const int preopened_fd = g_preopened_usb_fd.load(std::memory_order_acquire);
+    if (preopened_fd >= 0) {
+        /* Claimed before the wrap, not after: the owner must not be told the
+         * descriptor is free while libusb is part way through taking it. */
+        g_preopened_usb_fd_in_use.store(1, std::memory_order_release);
+        r = rtlsdr_open_fd(&dev->dev, preopened_fd);
+        if (r < 0) {
+            g_preopened_usb_fd_in_use.store(0, std::memory_order_release);
+            DSD_FPRINTF(stderr, "Failed to open rtlsdr device from descriptor %d.\n", preopened_fd);
+            rtl_device_cleanup_common_state(dev);
+            free(dev);
+            return NULL;
+        }
+        dev->owns_preopened_fd = 1;
+        return dev;
+    }
+#endif
 #if defined(_MSC_VER) && DSD_PLATFORM_WIN_NATIVE
     __try {
         r = rtlsdr_open(&dev->dev, (uint32_t)dev_index);
@@ -5164,6 +5257,10 @@ rtl_device_store_soapy_config_request(struct rtl_device* dev, const struct rtl_s
     rtl_device_copy_cstr(dev->soapy_requested_gains, sizeof(dev->soapy_requested_gains), gains);
     rtl_device_copy_cstr(dev->soapy_requested_stream_format, sizeof(dev->soapy_requested_stream_format), stream_format);
     dev->soapy_requested_bandwidth_hz = cfg ? cfg->bandwidth_hz : -1;
+    dev->soapy_startup_center_freq_hz = cfg ? cfg->center_freq_hz : 0U;
+    /* Driver settings (for example the SDDC ADC clock) can move the rate grid. */
+    dev->soapy_nearest_rate_cache_requested = 0U;
+    dev->soapy_nearest_rate_cache_actual = 0U;
 }
 
 #ifdef USE_SOAPYSDR
@@ -5372,6 +5469,12 @@ rtl_device_close_backend_resources(struct rtl_device* dev) {
     }
     if (dev->backend == RTL_BACKEND_USB && dev->dev) {
         rtlsdr_close(dev->dev);
+        if (dev->owns_preopened_fd) {
+            /* Released only now that libusb is done with it: the owner polls this to
+             * decide when closing the underlying connection is safe. */
+            dev->owns_preopened_fd = 0;
+            g_preopened_usb_fd_in_use.store(0, std::memory_order_release);
+        }
     }
     if (dev->backend == RTL_BACKEND_TCP && dev->sockfd != DSD_INVALID_SOCKET) {
         dsd_socket_close(dev->sockfd);
@@ -5532,6 +5635,58 @@ rtl_device_set_sample_rate(struct rtl_device* dev, uint32_t samp_rate) {
         dev->rate = applied_rate;
     }
     return rc;
+}
+
+/**
+ * @brief Report the rate the backend would deliver for a requested rate.
+ *
+ * Query only: the device is never reconfigured. Backends with a fixed rate grid (many
+ * SoapySDR drivers) answer with the grid entry nearest the request so the rate
+ * chain can pick decimation for the rate that will really arrive. The answer is
+ * cached per request while the device stays configured, so per-retune callers do
+ * not pay a driver round-trip; `rtl_device_store_soapy_config_request` clears the
+ * cache because driver settings (for example the SDDC ADC clock) can move the grid.
+ */
+int
+// cppcheck-suppress constParameterPointer -- The SoapySDR build locks dev and fills the cache; the stub build does not.
+rtl_device_nearest_supported_rate(struct rtl_device* dev, uint32_t requested, uint32_t* out_actual) {
+    if (!dev || requested == 0U || !out_actual) {
+        return -1;
+    }
+    *out_actual = requested;
+    if (dev->backend != RTL_BACKEND_SOAPY) {
+        return 0;
+    }
+#ifdef USE_SOAPYSDR
+    /* The cache is read and refreshed under the Soapy lock so concurrent callers never
+       observe a torn requested/actual pair. */
+    uint32_t actual = 0U;
+    int rc = soapy_call_locked(dev, "listSampleRates", [&]() -> int {
+        if (dev->soapy_nearest_rate_cache_requested == requested && dev->soapy_nearest_rate_cache_actual != 0U) {
+            actual = dev->soapy_nearest_rate_cache_actual;
+            return 0;
+        }
+        bool adjusted = false;
+        std::vector<double> listed = soapy_valid_positive_rates(dev->soapy_dev->listSampleRates(SOAPY_SDR_RX, 0));
+        std::vector<dsdneo::SoapyRange> ranges =
+            soapy_ranges_from_range_list(dev->soapy_dev->getSampleRateRange(SOAPY_SDR_RX, 0));
+        double applied = dsdneo::soapy_nearest_sample_rate((double)requested, listed, ranges, &adjusted);
+        if (!(applied > 0.0) || applied > (double)UINT32_MAX) {
+            return -1;
+        }
+        actual = (uint32_t)std::lround(applied);
+        dev->soapy_nearest_rate_cache_requested = requested;
+        dev->soapy_nearest_rate_cache_actual = actual;
+        return 0;
+    });
+    if (rc != 0 || actual == 0U) {
+        return -1;
+    }
+    *out_actual = actual;
+    return 0;
+#else
+    return -1;
+#endif
 }
 
 /**
@@ -5889,6 +6044,33 @@ rtl_device_set_ppm(struct rtl_device* dev, int ppm_error) {
         dev->ppm_error = ppm_error;
     }
     return rc;
+}
+
+/**
+ * @brief Report whether the backend can apply a frequency (PPM) correction.
+ */
+int
+// cppcheck-suppress constParameterPointer -- The SoapySDR build locks dev; the stub build does not.
+rtl_device_supports_ppm(struct rtl_device* dev) {
+    if (!dev) {
+        return 0;
+    }
+    if (dev->backend == RTL_BACKEND_IQ_REPLAY) {
+        return 0;
+    }
+    if (dev->backend == RTL_BACKEND_SOAPY) {
+#ifdef USE_SOAPYSDR
+        int supported = 0;
+        int rc = soapy_call_locked(dev, "hasFrequencyCorrection", [&]() -> int {
+            supported = dev->soapy_dev->hasFrequencyCorrection(SOAPY_SDR_RX, 0) ? 1 : 0;
+            return 0;
+        });
+        return (rc == 0) ? supported : 0;
+#else
+        return 0;
+#endif
+    }
+    return 1;
 }
 
 /**

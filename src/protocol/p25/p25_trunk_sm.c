@@ -6,7 +6,9 @@
  */
 
 #include <dsd-neo/core/audio.h>
+#include <dsd-neo/core/call_state.h>
 #include <dsd-neo/core/dsd_time.h>
+#include <dsd-neo/core/enc_lockout.h>
 #include <dsd-neo/core/events.h>
 #include <dsd-neo/core/file_io.h>
 #include <dsd-neo/core/opts.h>
@@ -29,6 +31,7 @@
 #include <dsd-neo/runtime/trunk_cc_candidates.h>
 #include <dsd-neo/runtime/trunk_scan_hooks.h>
 #include <dsd-neo/runtime/trunk_tuning_hooks.h>
+#include <limits.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -58,6 +61,23 @@ static void p25_voice_release_or_preserve_companion(p25_sm_ctx_t* ctx, dsd_opts*
                                                     const char* slot_log);
 static void handle_enc(p25_sm_ctx_t* ctx, dsd_opts* opts, dsd_state* state, const p25_sm_event_t* ev);
 static void handle_crypto_pending(p25_sm_ctx_t* ctx, dsd_opts* opts, dsd_state* state, const p25_sm_event_t* ev);
+static double p25_sm_effective_hangtime(const dsd_state* state, double hangtime);
+static int p25_sm_crypto_classification_in_flight(const p25_sm_ctx_t* ctx, const dsd_state* state, double now_m,
+                                                  double grant_timeout);
+
+typedef enum {
+    // Positive per-transmission evidence: MAC_PTT / MAC_ACTIVE or an
+    // identity-bearing voice start seen on the traffic channel.
+    P25_CALL_OBS_VOICE_EVIDENCE = 0,
+    // A control-channel grant repeat. It re-states an assignment and keeps
+    // repeating through hangtime, so it must not resurrect an ended call.
+    P25_CALL_OBS_ASSIGNMENT_REPEAT,
+} p25_call_obs_provenance;
+
+static void p25_call_publish_observation(const p25_sm_ctx_t* ctx, const dsd_opts* opts, dsd_state* state, int slot,
+                                         int new_epoch, int allow_coalesce, int continuous_activity,
+                                         p25_call_obs_provenance provenance, double observed_m);
+static void p25_call_end_slot(dsd_opts* opts, dsd_state* state, int slot, double observed_m);
 #ifdef USE_RADIO
 static int p25_sm_hold_release_for_vc_cqpsk_reacquire(p25_sm_ctx_t* ctx, dsd_opts* opts, const dsd_state* state,
                                                       const char* reason, double now_m);
@@ -67,7 +87,6 @@ static int p25_sm_hold_release_for_vc_cqpsk_reacquire(p25_sm_ctx_t* ctx, dsd_opt
 // threads (watchdog tick + decoder) request release concurrently.
 static atomic_int g_p25_sm_release_lock = 0;
 
-#define P25_ENCRYPTED_CALL_CACHE_TTL_S         10
 #define P25_STALE_REGRANT_QUIET_S              2.0
 #define P25_STALE_REGRANT_PROBE_DELAY_S        2.0
 #define P25_STALE_REGRANT_MAX_AGE_S            10.0
@@ -78,6 +97,22 @@ static atomic_int g_p25_sm_release_lock = 0;
 #define P25_VC_CQPSK_REACQUIRE_MIN_REMAINING_S 1.0
 #define P25_VC_CQPSK_REACQUIRE_HOLD_S          0.75
 #define P25_VC_CQPSK_REACQUIRE_NO_SYNC_PASSES  3U
+#define P25_PTT_RETRANSMIT_WINDOW_S            1.0
+#define P25_POST_END_VOICE_USER_REPEAT_S       1.0
+#define P25_PTT_SIGNATURE_ALGID_INDEX          9
+#define P25_PTT_SIGNATURE_IDENTITY_INDEX       12
+#define P25_CANONICAL_EPOCH_COALESCE_S         1.0
+
+static void
+p25_ptt_marker_invalidate(p25_sm_ctx_t* ctx, int slot) {
+    if (!ctx || slot < 0 || slot > 1) {
+        return;
+    }
+    p25_sm_slot_ctx_t* slot_ctx = &ctx->slots[slot];
+    DSD_MEMSET(slot_ctx->ptt_signature, 0, sizeof(slot_ctx->ptt_signature));
+    slot_ctx->ptt_last_seen_m = 0.0;
+    slot_ctx->ptt_signature_valid = 0;
+}
 
 static const char*
 p25_tune_result_name(dsd_trunk_tune_result result) {
@@ -179,11 +214,8 @@ p25_diag_freq_in_lcn_list(const dsd_state* state, long freq) {
     if (count < 0) {
         count = 0;
     }
-    if (count > 26) {
-        count = 26;
-    }
     for (int i = 0; i < count; i++) {
-        if (state->trunk_lcn_freq[i] == freq) {
+        if (*dsd_state_trunk_lcn_slot_const(state, i) == freq) {
             return 1;
         }
     }
@@ -764,26 +796,25 @@ p25_sm_await_pending_cc_tune(p25_sm_ctx_t* ctx, dsd_opts* opts, dsd_state* state
 
 static const char*
 grant_block_log_tag(int is_indiv, uint32_t block_reasons) {
-    if (block_reasons & DSD_TG_POLICY_BLOCK_HOLD) {
-        return is_indiv ? "indiv-blocked-hold" : "grant-blocked-hold";
-    }
-    if (block_reasons & DSD_TG_POLICY_BLOCK_PRIVATE_DISABLED) {
-        return "indiv-blocked-private";
-    }
-    if (block_reasons & DSD_TG_POLICY_BLOCK_GROUP_DISABLED) {
-        return "grant-blocked-group";
-    }
-    if (block_reasons & DSD_TG_POLICY_BLOCK_DATA_DISABLED) {
-        return is_indiv ? "indiv-blocked-data" : "grant-blocked-data";
-    }
-    if (block_reasons & DSD_TG_POLICY_BLOCK_ENCRYPTED_DISABLED) {
-        return is_indiv ? "indiv-blocked-enc" : "grant-blocked-enc";
-    }
-    if (block_reasons & DSD_TG_POLICY_BLOCK_ALLOWLIST) {
-        return is_indiv ? "indiv-blocked-allowlist" : "grant-blocked-allowlist";
-    }
-    if (block_reasons & DSD_TG_POLICY_BLOCK_MODE) {
-        return is_indiv ? "indiv-blocked-mode" : "grant-blocked-mode";
+    static const struct {
+        uint32_t reason;
+        const char* indiv_tag;
+        const char* group_tag;
+    } k_tags[] = {
+        {DSD_TG_POLICY_BLOCK_HOLD, "indiv-blocked-hold", "grant-blocked-hold"},
+        {DSD_TG_POLICY_BLOCK_PRIVATE_DISABLED, "indiv-blocked-private", "indiv-blocked-private"},
+        {DSD_TG_POLICY_BLOCK_GROUP_DISABLED, "grant-blocked-group", "grant-blocked-group"},
+        {DSD_TG_POLICY_BLOCK_DATA_DISABLED, "indiv-blocked-data", "grant-blocked-data"},
+        {DSD_TG_POLICY_BLOCK_ENCRYPTED_DISABLED, "indiv-blocked-enc", "grant-blocked-enc"},
+        {DSD_TG_POLICY_BLOCK_ENC_LOCKOUT, "indiv-blocked-enc-lo", "grant-blocked-enc-lo"},
+        {DSD_TG_POLICY_BLOCK_ALLOWLIST, "indiv-blocked-allowlist", "grant-blocked-allowlist"},
+        {DSD_TG_POLICY_BLOCK_MODE, "indiv-blocked-mode", "grant-blocked-mode"},
+    };
+
+    for (size_t i = 0; i < sizeof(k_tags) / sizeof(k_tags[0]); i++) {
+        if (block_reasons & k_tags[i].reason) {
+            return is_indiv ? k_tags[i].indiv_tag : k_tags[i].group_tag;
+        }
     }
     return is_indiv ? "indiv-blocked-policy" : "grant-blocked-policy";
 }
@@ -826,6 +857,7 @@ typedef struct {
     int encrypted_call;
     int enc_override_clear;
     int probe_call;
+    int enc_lockout_reprobe;
     int is_indiv;
     int tg;
 } p25_grant_eval_ctx_t;
@@ -857,84 +889,8 @@ p25_grant_eval_ctx_from_event(const p25_sm_event_t* ev) {
     return ctx;
 }
 
-static void
-p25_enc_tg_cache_clear_entry(dsd_state* state, int idx) {
-    if (!state || idx < 0 || idx >= DSD_P25_ENC_TG_CACHE_DEPTH) {
-        return;
-    }
-    state->p25_enc_tg_cache_until[idx] = 0;
-    state->p25_enc_tg_cache_tg[idx] = 0;
-    state->p25_enc_tg_cache_is_group[idx] = 0;
-}
-
-static int
-p25_enc_tg_cache_find_active(dsd_state* state, int target, int is_group, time_t now) {
-    if (!state || target <= 0) {
-        return -1;
-    }
-    is_group = is_group ? 1 : 0;
-    for (int i = 0; i < DSD_P25_ENC_TG_CACHE_DEPTH; i++) {
-        time_t until = state->p25_enc_tg_cache_until[i];
-        if (until <= 0) {
-            continue;
-        }
-        if (now >= until) {
-            p25_enc_tg_cache_clear_entry(state, i);
-            continue;
-        }
-        if (state->p25_enc_tg_cache_tg[i] == (uint32_t)target
-            && state->p25_enc_tg_cache_is_group[i] == (uint8_t)is_group) {
-            return i;
-        }
-    }
-    return -1;
-}
-
-static void
-p25_enc_tg_cache_clear_target(dsd_state* state, int target, int is_group) {
-    if (!state || target <= 0) {
-        return;
-    }
-    is_group = is_group ? 1 : 0;
-    for (int i = 0; i < DSD_P25_ENC_TG_CACHE_DEPTH; i++) {
-        if (state->p25_enc_tg_cache_tg[i] == (uint32_t)target
-            && state->p25_enc_tg_cache_is_group[i] == (uint8_t)is_group) {
-            p25_enc_tg_cache_clear_entry(state, i);
-        }
-    }
-}
-
-static int
-p25_enc_tg_cache_refresh_until(time_t now, time_t* out_until) {
-    if (!out_until) {
-        return 0;
-    }
-    *out_until = now + P25_ENCRYPTED_CALL_CACHE_TTL_S;
-    return 1;
-}
-
-static int
-p25_enc_tg_cache_choose_slot(dsd_state* state, time_t now) {
-    int first_expired = -1;
-    if (!state) {
-        return -1;
-    }
-    for (int i = 0; i < DSD_P25_ENC_TG_CACHE_DEPTH; i++) {
-        if (state->p25_enc_tg_cache_until[i] <= now) {
-            first_expired = i;
-            break;
-        }
-    }
-    if (first_expired >= 0) {
-        return first_expired;
-    }
-    int idx = (int)(state->p25_enc_tg_cache_next % DSD_P25_ENC_TG_CACHE_DEPTH);
-    state->p25_enc_tg_cache_next++;
-    return idx;
-}
-
 void
-p25_sm_note_encrypted_call_typed(dsd_opts* opts, dsd_state* state, int target, int is_group) {
+p25_sm_note_encrypted_call_typed(dsd_opts* opts, dsd_state* state, int target, int is_group, int algid, int keyid) {
     if (!opts || !state || target <= 0 || opts->trunk_tune_enc_calls != 0) {
         return;
     }
@@ -943,38 +899,11 @@ p25_sm_note_encrypted_call_typed(dsd_opts* opts, dsd_state* state, int target, i
         return;
     }
 
-    time_t now = time(NULL);
-    time_t until = 0;
-    if (!p25_enc_tg_cache_refresh_until(now, &until)) {
-        return;
+    if (dsd_enc_lockout_note(state, (uint32_t)target, is_group, algid, keyid)) {
+        p25_sm_diagf(opts, state, p25_sm_get_ctx(), "enc_lockout_arm", "kind=%s target=%d algid=0x%02X keyid=0x%04X",
+                     is_group ? "group" : "private", target, algid & 0xFF, keyid & 0xFFFF);
+        sm_log(opts, state, "enc-lockout-arm");
     }
-
-    int idx = p25_enc_tg_cache_find_active(state, target, is_group, now);
-    if (idx < 0) {
-        idx = p25_enc_tg_cache_choose_slot(state, now);
-    }
-    if (idx < 0) {
-        return;
-    }
-
-    state->p25_enc_tg_cache_tg[idx] = (uint32_t)target;
-    state->p25_enc_tg_cache_is_group[idx] = (uint8_t)is_group;
-    state->p25_enc_tg_cache_until[idx] = until;
-    p25_sm_diagf(opts, state, NULL, "enc_tg_cache_arm", "kind=%s target=%d idx=%d until=%ld",
-                 is_group ? "group" : "private", target, idx, (long)until);
-    sm_log(opts, state, "enc-tg-cache-arm");
-}
-
-void
-p25_sm_clear_encrypted_call_cache(dsd_state* state) {
-    if (!state) {
-        return;
-    }
-    DSD_MEMSET(state->p25_enc_tg_cache_until, 0, sizeof(state->p25_enc_tg_cache_until));
-    DSD_MEMSET(state->p25_enc_tg_cache_tg, 0, sizeof(state->p25_enc_tg_cache_tg));
-    DSD_MEMSET(state->p25_enc_tg_cache_is_group, 0, sizeof(state->p25_enc_tg_cache_is_group));
-    state->p25_enc_tg_cache_next = 0;
-    dsd_trunk_scan_hook_p25_encrypted_call_cache_clear(state);
 }
 
 static void
@@ -1002,18 +931,8 @@ p25_grant_apply_crypto_probe(const dsd_opts* opts, p25_grant_eval_ctx_t* eval_ct
 }
 
 static int
-p25_grant_uses_voice_enc_cache(const p25_grant_eval_ctx_t* eval_ctx) {
+p25_grant_is_voice_call(const p25_grant_eval_ctx_t* eval_ctx) {
     return (eval_ctx && !eval_ctx->data_call) ? 1 : 0;
-}
-
-static void
-p25_grant_clear_transient_cache_if_clear(dsd_state* state, const p25_grant_eval_ctx_t* eval_ctx) {
-    if (!state || !eval_ctx || !p25_grant_uses_voice_enc_cache(eval_ctx) || eval_ctx->tg <= 0) {
-        return;
-    }
-    if ((eval_ctx->svc_valid && !eval_ctx->encrypted_call) || eval_ctx->enc_override_clear) {
-        p25_enc_tg_cache_clear_target(state, eval_ctx->tg, !eval_ctx->is_indiv);
-    }
 }
 
 static int
@@ -1024,40 +943,203 @@ p25_grant_patch_clear_key(const dsd_state* state, const p25_grant_eval_ctx_t* ev
     return (p25_patch_tg_key_is_clear(state, eval_ctx->tg) || p25_patch_sg_key_is_clear(state, eval_ctx->tg)) ? 1 : 0;
 }
 
+// Minimum spacing between two ledger re-admissions of the same target on
+// clear-claiming grants. A site whose grant service bits do not track
+// encryption repeats such an update about once a second for the life of the
+// encrypted call, and each one released the ledger entry and re-admitted the
+// call; with the carrier now released one hangtime after the last followed
+// traffic, that became a tune/classify/release cycle per update. One reprobe
+// per window keeps the designed recovery -- a talkgroup that stopped
+// encrypting still tunes on its very next grant -- without letting a talkgroup
+// that did not stop buy a retune per update.
+#define P25_ENC_REPROBE_COOLDOWN_S 10.0
+
+// The one place the memo key is spelled out, so widening it later cannot leave
+// a lookup behind. Returns an index rather than a pointer so const and mutable
+// callers can share it without laundering constness.
 static int
-p25_grant_transient_enc_cache_blocks(dsd_opts* opts, dsd_state* state, const p25_grant_eval_ctx_t* eval_ctx) {
-    if (!opts || !state || !eval_ctx || eval_ctx->tg <= 0 || opts->trunk_tune_enc_calls != 0) {
-        return 0;
+p25_grant_enc_reprobe_index(const p25_sm_ctx_t* ctx, uint32_t target, int is_group) {
+    if (!ctx) {
+        return -1;
     }
-    if (!p25_grant_uses_voice_enc_cache(eval_ctx)) {
-        return 0;
+    for (int i = 0; i < P25_SM_ENC_REPROBE_MEMO_MAX; i++) {
+        const p25_sm_enc_reprobe_memo_t* memo = &ctx->enc_reprobes[i];
+        if (memo->admitted_m > 0.0 && memo->target == target && memo->is_group == (uint8_t)(is_group ? 1 : 0)) {
+            return i;
+        }
     }
-    if (eval_ctx->svc_valid && !eval_ctx->encrypted_call) {
-        return 0;
-    }
-    if (p25_grant_patch_clear_key(state, eval_ctx)) {
-        p25_enc_tg_cache_clear_target(state, eval_ctx->tg, 1);
-        return 0;
-    }
+    return -1;
+}
 
-    time_t now = time(NULL);
-    int is_group = !eval_ctx->is_indiv;
-    int idx = p25_enc_tg_cache_find_active(state, eval_ctx->tg, is_group, now);
-    if (idx < 0) {
-        return 0;
-    }
+static int
+p25_grant_enc_reprobe_memo_expired(const p25_sm_enc_reprobe_memo_t* memo, double now_m) {
+    // A stamp in the future (a replayed or non-monotonic clock) counts as live:
+    // failing closed costs one delayed reprobe, failing open costs the retune
+    // loop the cooldown exists to damp.
+    return (memo->admitted_m <= 0.0)
+           || (now_m >= memo->admitted_m && (now_m - memo->admitted_m) >= P25_ENC_REPROBE_COOLDOWN_S);
+}
 
-    time_t until = 0;
-    if (p25_enc_tg_cache_refresh_until(now, &until)) {
-        state->p25_enc_tg_cache_until[idx] = until;
-    } else {
-        p25_enc_tg_cache_clear_entry(state, idx);
-        return 0;
+static p25_sm_enc_reprobe_memo_t*
+p25_grant_enc_reprobe_slot(p25_sm_ctx_t* ctx, uint32_t target, int is_group, double now_m) {
+    const int found = p25_grant_enc_reprobe_index(ctx, target, is_group);
+    if (!ctx) {
+        return NULL;
     }
-    p25_sm_diagf(opts, state, NULL, "grant_enc_cache_skip", "kind=%s target=%d idx=%d until=%ld",
-                 is_group ? "group" : "private", eval_ctx->tg, idx, (long)until);
-    sm_log(opts, state, "grant-enc-cache");
-    return 1;
+    if (found >= 0) {
+        return &ctx->enc_reprobes[found];
+    }
+    p25_sm_enc_reprobe_memo_t* victim = NULL;
+    for (int i = 0; i < P25_SM_ENC_REPROBE_MEMO_MAX; i++) {
+        p25_sm_enc_reprobe_memo_t* memo = &ctx->enc_reprobes[i];
+        if (!p25_grant_enc_reprobe_memo_expired(memo, now_m)) {
+            continue;
+        }
+        // Free or expired: reuse the least recently admitted of those.
+        if (!victim || memo->admitted_m < victim->admitted_m) {
+            victim = memo;
+        }
+    }
+    // When every entry holds a live cooldown there is no room. Recording
+    // nothing costs this target its backoff; evicting a live entry would cost
+    // some *other* target the backoff it already earned, which is how a busy
+    // site's targets round-robin the table and disable the damping for all of
+    // them.
+    return victim;
+}
+
+static int
+p25_grant_enc_reprobe_in_cooldown(const p25_sm_ctx_t* ctx, uint32_t target, int is_group, double now_m) {
+    const int found = p25_grant_enc_reprobe_index(ctx, target, is_group);
+    return (found >= 0 && !p25_grant_enc_reprobe_memo_expired(&ctx->enc_reprobes[found], now_m)) ? 1 : 0;
+}
+
+// Drop the backoff for a target whose voice actually classified clear or
+// decryptable, or whose ledger entry went away on stronger evidence: the
+// cooldown was earned against a claim that is no longer standing, so a later
+// re-lock owes a fresh probe rather than serving out someone else's window.
+static void
+p25_grant_enc_reprobe_forget(p25_sm_ctx_t* ctx, uint32_t target, int is_group) {
+    const int found = p25_grant_enc_reprobe_index(ctx, target, is_group);
+    if (found >= 0) {
+        DSD_MEMSET(&ctx->enc_reprobes[found], 0, sizeof(ctx->enc_reprobes[found]));
+    }
+}
+
+static void
+p25_grant_enc_reprobe_record(p25_sm_ctx_t* ctx, uint32_t target, int is_group, double now_m) {
+    if (now_m <= 0.0) {
+        // 0 is the "unused" sentinel, so a memo stamped there could never be
+        // read back. Skip rather than write one the lookups must ignore.
+        return;
+    }
+    p25_sm_enc_reprobe_memo_t* memo = p25_grant_enc_reprobe_slot(ctx, target, is_group, now_m);
+    if (!memo) {
+        return;
+    }
+    memo->target = target;
+    memo->is_group = (uint8_t)(is_group ? 1 : 0);
+    memo->admitted_m = now_m;
+}
+
+typedef enum {
+    P25_ENC_RELEASE_NONE = 0,
+    // The regroup clear-key override or an active patch clear key. p25_lcw.c
+    // treats the same evidence as authoritative enough to reopen the Phase 1
+    // audio gate immediately, so the call is followed traffic from its first
+    // voice frame and owes no reprobe.
+    P25_ENC_RELEASE_CORROBORATED,
+    // Explicit clear service options: one uncorroborated grant bit against a
+    // ledger armed from confirmed undecryptable voice.
+    P25_ENC_RELEASE_GRANT_BIT,
+} p25_enc_release_evidence_e;
+
+static p25_enc_release_evidence_e
+p25_grant_enc_release_evidence(const dsd_state* state, const p25_grant_eval_ctx_t* eval_ctx) {
+    if (eval_ctx->enc_override_clear || p25_grant_patch_clear_key(state, eval_ctx)) {
+        return P25_ENC_RELEASE_CORROBORATED;
+    }
+    return (eval_ctx->svc_valid && !eval_ctx->encrypted_call) ? P25_ENC_RELEASE_GRANT_BIT : P25_ENC_RELEASE_NONE;
+}
+
+static void
+p25_grant_release_enc_lockout_on_grant_bit(p25_sm_ctx_t* ctx, const dsd_opts* opts, dsd_state* state,
+                                           p25_grant_eval_ctx_t* eval_ctx, uint32_t target, int is_group) {
+    if (!dsd_enc_lockout_is_blocked(opts, state, target, is_group)) {
+        // Nothing was blocking -- no entry, or a stale-epoch entry after new key
+        // material. The grant is admitted either way, so drop any residue but do
+        // not treat the call as a reprobe. The backoff goes with the entry it
+        // was earned against, or a target that just had new key material loaded
+        // serves out a cooldown from before the change.
+        (void)dsd_enc_lockout_release(state, target, is_group);
+        p25_grant_enc_reprobe_forget(ctx, target, is_group);
+        return;
+    }
+    // The target re-locked after its last re-admission on this same evidence,
+    // so the grant bit has already been shown wrong once. Let the cooldown run
+    // rather than spending another tune on it.
+    const double now_m = dsd_time_now_monotonic_s();
+    if (p25_grant_enc_reprobe_in_cooldown(ctx, target, is_group, now_m)) {
+        p25_sm_diagf((dsd_opts*)opts, state, ctx, "enc_lockout_reprobe_declined", "kind=%s target=%u reason=cooldown",
+                     is_group ? "group" : "private", target);
+        return;
+    }
+    if (dsd_enc_lockout_release(state, target, is_group)) {
+        // The ledger armed from corroborated undecryptable voice, while this
+        // admission rests on one grant bit, so downstream timing treats the call
+        // as a reprobe rather than followed traffic until its voice classifies.
+        // The cooldown is *not* recorded here: handle_grant still has six ways
+        // to reject this assignment, and a window that prices a probe must not
+        // be spent on one that never ran. p25_grant_note_enc_reprobe_admitted()
+        // records it where the slot is actually taken over.
+        eval_ctx->enc_lockout_reprobe = 1;
+    }
+}
+
+// Charge the backoff for a re-admission that actually claimed the carrier.
+static void
+p25_grant_note_enc_reprobe_admitted(p25_sm_ctx_t* ctx, const p25_grant_eval_ctx_t* eval_ctx, double now_m) {
+    if (!eval_ctx || !eval_ctx->enc_lockout_reprobe || eval_ctx->tg <= 0) {
+        return;
+    }
+    p25_grant_enc_reprobe_record(ctx, (uint32_t)eval_ctx->tg, !eval_ctx->is_indiv, now_m);
+}
+
+// Release a locked target before policy evaluates, so a talkgroup that stopped
+// encrypting tunes again immediately. @p commit marks an assignment actually
+// being processed: the policy-only and voice-start evaluations share this
+// helper and would otherwise consume the one-shot ledger release on the weak
+// evidence without carrying the reprobe marking into grant timing.
+static void
+p25_grant_release_enc_lockout_if_clear(p25_sm_ctx_t* ctx, const dsd_opts* opts, dsd_state* state,
+                                       p25_grant_eval_ctx_t* eval_ctx, int commit) {
+    if (!opts || !state || !eval_ctx || !p25_grant_is_voice_call(eval_ctx) || eval_ctx->tg <= 0) {
+        return;
+    }
+    // In follow mode the ledger is suspended, not erased: entries survive a
+    // temporary toggle to following encrypted calls without owing a fresh
+    // probe. handle_enc's sibling release is gated the same way.
+    if (opts->trunk_tune_enc_calls != 0) {
+        return;
+    }
+    const int is_group = !eval_ctx->is_indiv;
+    const uint32_t target = (uint32_t)eval_ctx->tg;
+
+    switch (p25_grant_enc_release_evidence(state, eval_ctx)) {
+        case P25_ENC_RELEASE_CORROBORATED:
+            // Stronger evidence than the grant bit the backoff was earned
+            // against, so it retires that backoff along with the entry.
+            (void)dsd_enc_lockout_release(state, target, is_group);
+            p25_grant_enc_reprobe_forget(ctx, target, is_group);
+            break;
+        case P25_ENC_RELEASE_GRANT_BIT:
+            if (commit) {
+                p25_grant_release_enc_lockout_on_grant_bit(ctx, opts, state, eval_ctx, target, is_group);
+            }
+            break;
+        case P25_ENC_RELEASE_NONE:
+        default: break;
+    }
 }
 
 static int
@@ -1136,22 +1218,30 @@ p25_grant_eval_policy(const dsd_opts* opts, const dsd_state* state, const p25_sm
     return p25_grant_eval_group_policy(opts, state, ev, &policy_ctx, out_decision);
 }
 
+// A blocked grant never arms the encryption-lockout ledger. Grants only carry
+// the service-options encryption bit, which is one uncorroborated observation
+// and, on a simulcast site, one the demodulator can invent; the ledger's
+// contract is that entries come from confirmed undecryptable *voice*
+// (handle_enc), and an encrypted-looking grant is instead admitted as a single
+// silent classification probe by p25_grant_apply_crypto_probe(). That probe is
+// also why DSD_TG_POLICY_BLOCK_ENCRYPTED_DISABLED cannot reach a group voice
+// call here: the probe clears encrypted_call before policy evaluation, and the
+// only survivor -- a data call -- is not a voice call. The emission that used
+// to live here was therefore dead, and it named slot 0 unconditionally, so if
+// it were ever revived a slot-1 target would write its lockout notice over
+// whatever unrelated call slot 0 was carrying.
 static int
-p25_grant_handle_policy_block(dsd_opts* opts, dsd_state* state, const p25_grant_eval_ctx_t* eval_ctx,
-                              const dsd_tg_policy_decision* decision) {
+p25_grant_handle_policy_block(const p25_sm_ctx_t* ctx, dsd_opts* opts, dsd_state* state,
+                              const p25_grant_eval_ctx_t* eval_ctx, const dsd_tg_policy_decision* decision) {
     if (!opts || !state || !eval_ctx || !decision || decision->tune_allowed) {
         return 0;
     }
-    p25_sm_diagf((dsd_opts*)opts, state, NULL, "grant_block",
+    p25_sm_diagf((dsd_opts*)opts, state, ctx, "grant_block",
                  "reason=%s tg=%d policy_tg=%u svc=0x%02X data=%d enc=%d indiv=%d block=0x%08X",
                  grant_block_log_tag(eval_ctx->is_indiv, decision->block_reasons), eval_ctx->tg, decision->target_id,
                  eval_ctx->svc, eval_ctx->data_call, eval_ctx->encrypted_call, eval_ctx->is_indiv,
                  decision->block_reasons);
     sm_log(opts, state, grant_block_log_tag(eval_ctx->is_indiv, decision->block_reasons));
-    if (p25_grant_uses_voice_enc_cache(eval_ctx) && !eval_ctx->is_indiv && eval_ctx->tg > 0
-        && (decision->block_reasons & DSD_TG_POLICY_BLOCK_ENCRYPTED_DISABLED)) {
-        p25_emit_enc_lockout_once_typed(opts, state, 0, eval_ctx->tg, eval_ctx->svc, 1);
-    }
     return 1;
 }
 
@@ -1166,11 +1256,21 @@ p25_grant_track_src_tg(dsd_state* state, const p25_sm_event_t* ev, const p25_gra
     }
 }
 
+// @p commit distinguishes an assignment actually being processed from the
+// policy-only and voice-start re-evaluations that share this path: only the
+// former may spend the one-shot encryption-lockout ledger release, whose
+// outcome it carries into grant timing through @p out_eval_ctx.
 static int
-grant_allowed(dsd_opts* opts, dsd_state* state, const p25_sm_event_t* ev, dsd_tg_policy_decision* out_decision,
-              p25_grant_eval_ctx_t* out_eval_ctx) {
+grant_allowed(p25_sm_ctx_t* ctx, dsd_opts* opts, dsd_state* state, const p25_sm_event_t* ev,
+              dsd_tg_policy_decision* out_decision, p25_grant_eval_ctx_t* out_eval_ctx, int commit) {
     p25_grant_eval_ctx_t eval_ctx;
     dsd_tg_policy_decision decision;
+    // Filled before every return: the context carries enc_lockout_reprobe into
+    // tuning and timing decisions, so a caller must never read stack residue
+    // off a rejected grant.
+    if (out_eval_ctx) {
+        DSD_MEMSET(out_eval_ctx, 0, sizeof(*out_eval_ctx));
+    }
     if (!opts || !state || !ev) {
         return 0;
     }
@@ -1178,24 +1278,19 @@ grant_allowed(dsd_opts* opts, dsd_state* state, const p25_sm_event_t* ev, dsd_tg
     eval_ctx = p25_grant_eval_ctx_from_event(ev);
     p25_grant_apply_clear_override(opts, state, &eval_ctx);
     p25_grant_apply_crypto_probe(opts, &eval_ctx);
-    p25_grant_clear_transient_cache_if_clear(state, &eval_ctx);
+    p25_grant_release_enc_lockout_if_clear(ctx, opts, state, &eval_ctx, commit);
+    // Nothing below mutates eval_ctx, so this single copy covers every return
+    // that follows.
+    if (out_eval_ctx) {
+        *out_eval_ctx = eval_ctx;
+    }
     if (p25_grant_eval_policy(opts, state, ev, &eval_ctx, &decision) != 0) {
         return 0;
     }
 
-    if (p25_grant_handle_policy_block(opts, state, &eval_ctx, &decision)) {
+    if (p25_grant_handle_policy_block(ctx, opts, state, &eval_ctx, &decision)) {
         if (out_decision) {
             *out_decision = decision;
-        }
-        if (out_eval_ctx) {
-            *out_eval_ctx = eval_ctx;
-        }
-        return 0;
-    }
-
-    if (p25_grant_transient_enc_cache_blocks(opts, state, &eval_ctx)) {
-        if (out_eval_ctx) {
-            *out_eval_ctx = eval_ctx;
         }
         return 0;
     }
@@ -1207,9 +1302,6 @@ grant_allowed(dsd_opts* opts, dsd_state* state, const p25_sm_event_t* ev, dsd_tg
 
     if (out_decision) {
         *out_decision = decision;
-    }
-    if (out_eval_ctx) {
-        *out_eval_ctx = eval_ctx;
     }
     return 1;
 }
@@ -1235,9 +1327,7 @@ p25_grant_ota_target_id(const p25_sm_event_t* ev) {
 
 static int
 p25_source_id_known(int src) {
-    // 0 means unavailable. 0xFFFFFF is commonly emitted by the fixed network
-    // equipment and does not identify a subscriber call epoch.
-    return src > 0 && src != 0xFFFFFF;
+    return src > 0 && p25_source_id_is_subscriber((uint32_t)src);
 }
 
 static void
@@ -1502,6 +1592,7 @@ p25_sm_clear_one_slot_activity(p25_sm_ctx_t* ctx, int slot) {
     if (!ctx || slot < 0 || slot > 1) {
         return;
     }
+    p25_ptt_marker_invalidate(ctx, slot);
     ctx->slots[slot].voice_active = 0;
     ctx->slots[slot].last_active_m = 0.0;
     ctx->slots[slot].last_start_m = 0.0;
@@ -1536,6 +1627,13 @@ p25_grant_clear_one_slot_state(p25_sm_ctx_t* ctx, int slot) {
     ctx->slots[slot].data_call = 0;
     ctx->slots[slot].svc_bits = P25_SM_SVC_UNKNOWN;
     ctx->slots[slot].enc_override_clear = 0;
+    ctx->slots[slot].enc_lockout_reprobe = 0;
+    // last_followed_m is deliberately NOT cleared here. It is carrier history,
+    // not assignment state, and this helper also runs for slots that are merely
+    // being vacated (p25_grant_clear_moved_target_slots) -- wiping the countdown
+    // origin as a side effect of tidying an unrelated slot is how the deadline
+    // silently disappears. The two places that really do end that history reset
+    // it by name: p25_grant_claim_slots() and p25_sm_clear_followed_history().
     ctx->slots[slot].last_grant_m = 0.0;
     ctx->slots[slot].crypto_attempt_m = 0.0;
     ctx->slots[slot].last_end_m = 0.0;
@@ -1544,6 +1642,7 @@ p25_grant_clear_one_slot_state(p25_sm_ctx_t* ctx, int slot) {
     ctx->slots[slot].facch_end_m = 0.0;
     ctx->slots[slot].facch_end_tg = 0;
     ctx->slots[slot].facch_end_src = 0;
+    ctx->slots[slot].last_enc_suppress_m = 0.0;
 }
 
 static void
@@ -1562,7 +1661,6 @@ p25_grant_clear_policy_slot(dsd_state* state, int slot) {
         return;
     }
     (void)dsd_tg_policy_clear_active_call(state, slot);
-    state->p25_policy_tg[slot] = 0;
 }
 
 static int
@@ -1592,8 +1690,8 @@ p25_grant_slot_matches_moved_target(const p25_sm_slot_ctx_t* slot_ctx, const p25
 }
 
 static void
-p25_grant_clear_moved_target_slots(p25_sm_ctx_t* ctx, dsd_state* state, int keep_slot, const p25_sm_event_t* ev,
-                                   int target_id, long freq, int data_call) {
+p25_grant_clear_moved_target_slots(p25_sm_ctx_t* ctx, dsd_opts* opts, dsd_state* state, int keep_slot,
+                                   const p25_sm_event_t* ev, int target_id, long freq, int data_call) {
     if (!ctx || !ev || target_id <= 0) {
         return;
     }
@@ -1605,6 +1703,7 @@ p25_grant_clear_moved_target_slots(p25_sm_ctx_t* ctx, dsd_state* state, int keep
         if (slot_ctx->freq_hz == freq && slot_ctx->channel == ev->channel) {
             continue;
         }
+        p25_call_end_slot(opts, state, s, dsd_time_now_monotonic_s());
         p25_grant_clear_one_slot_state(ctx, s);
         p25_grant_clear_policy_slot(state, s);
         if (state) {
@@ -1633,6 +1732,7 @@ p25_grant_store_slot_context(p25_sm_ctx_t* ctx, const p25_sm_event_t* ev, long f
     slot_ctx->data_call = (eval_ctx && eval_ctx->data_call) ? 1 : 0;
     slot_ctx->svc_bits = ev->svc_bits;
     slot_ctx->enc_override_clear = (eval_ctx && eval_ctx->enc_override_clear) ? 1 : 0;
+    slot_ctx->enc_lockout_reprobe = (eval_ctx && eval_ctx->enc_lockout_reprobe) ? 1 : 0;
     slot_ctx->last_grant_m = now_m;
     slot_ctx->tg = target_id;
 }
@@ -1673,6 +1773,60 @@ p25_grant_commit_decoder_tune(dsd_opts* opts, dsd_state* state, long freq) {
     state->p25_last_vc_tune_time_m = now_m;
 }
 
+/*
+ * The hangtime countdown is one channel-wide deadline -- release this carrier
+ * one hangtime after the last *followed* traffic on it -- but it is not a
+ * channel-wide variable anybody arms. It is derived here from the per-slot
+ * last_followed_m stamps, which are written only where followed traffic exists
+ * or ends. That is what makes the rule enforceable rather than merely agreed:
+ * a locked-out slot's MAC repeats, its ESS repeats, and the clear-claiming
+ * grant updates that re-admit it never touch those stamps, so no amount of
+ * signaling the SM is not following can restart or cancel the countdown, and a
+ * new call site cannot get the rule wrong without first writing a stamp whose
+ * name says what it means.
+ */
+double
+p25_sm_hangtime_started_m(const p25_sm_ctx_t* ctx) {
+    if (!ctx) {
+        return 0.0;
+    }
+    const int slot_count = ctx->vc_is_tdma ? 2 : 1;
+    double started_m = 0.0;
+    for (int slot = 0; slot < slot_count; slot++) {
+        if (ctx->slots[slot].voice_active) {
+            // Followed traffic is on the air: no countdown is running.
+            return 0.0;
+        }
+        if (ctx->slots[slot].last_followed_m > started_m) {
+            started_m = ctx->slots[slot].last_followed_m;
+        }
+    }
+    return started_m;
+}
+
+// Stamp the moment this slot stopped carrying traffic the SM was following.
+// The only writer of the hangtime countdown's origin; callers that are not
+// looking at followed traffic must not call it.
+static void
+p25_sm_note_followed_until(p25_sm_ctx_t* ctx, int slot, double until_m) {
+    if (!ctx || slot < 0 || slot > 1 || until_m <= 0.0) {
+        return;
+    }
+    ctx->slots[slot].last_followed_m = until_m;
+}
+
+// Forget that this carrier ever carried followed traffic. The countdown's only
+// eraser: a physical retune lands on a different carrier, and a release ends
+// the one the history described.
+static void
+p25_sm_clear_followed_history(p25_sm_ctx_t* ctx) {
+    if (!ctx) {
+        return;
+    }
+    ctx->slots[0].last_followed_m = 0.0;
+    ctx->slots[1].last_followed_m = 0.0;
+}
+
 static void
 p25_grant_initialize_timing(p25_sm_ctx_t* ctx, dsd_state* state, double now_m, int reused_carrier, int data_call) {
     // Every accepted assignment owns a fresh acquisition window, even when no
@@ -1680,7 +1834,6 @@ p25_grant_initialize_timing(p25_sm_ctx_t* ctx, dsd_state* state, double now_m, i
     // or activity state suppress the grant timeout for a retained carrier.
     ctx->t_tune_m = now_m;
     ctx->t_voice_m = 0.0;
-    ctx->t_hangtime_m = 0.0;
     ctx->vc_activity_seen = 0;
     if (reused_carrier) {
         p25_grant_refresh_reused_carrier_watchdogs(state, now_m);
@@ -1728,6 +1881,7 @@ p25_grant_store_vc_context(p25_sm_ctx_t* ctx, dsd_state* state, const p25_sm_eve
     ctx->vc_is_tdma = is_tdma_channel(state, ev->channel);
     if (state) {
         state->p25_p1_identity_pending = 0;
+        state->p25_p1_identity_epoch_started = 0;
     }
     const int data_call = (eval_ctx && eval_ctx->data_call) ? 1 : 0;
     ctx->vc_data_call = data_call;
@@ -1963,15 +2117,30 @@ p25_grant_refresh_duplicate_crypto(p25_sm_ctx_t* ctx, dsd_state* state, const p2
     const int previous_svc = slot_ctx->svc_bits;
     const int previous_clear_override = slot_ctx->enc_override_clear;
     const int force_clear = eval_ctx && eval_ctx->enc_override_clear;
-    slot_ctx->svc_bits = ev->svc_bits;
-    slot_ctx->enc_override_clear = force_clear ? 1 : 0;
+    // A duplicate without service options carries no classification evidence.
+    // Control channels interleave explicit and implicit updates for one call;
+    // letting the implicit copies demote the retained service bits toggled the
+    // slot between clear and encryption-pending once per update, purging audio
+    // each time. The regroup clear-key override derives from those same
+    // service options, so an implicit copy may neither grant nor remove it.
+    const int svc_known = p25_sm_svc_bits_valid(ev->svc_bits);
+    const int current_svc = svc_known ? ev->svc_bits : previous_svc;
+    const int current_clear_override = svc_known ? (force_clear ? 1 : 0) : previous_clear_override;
+    if (svc_known) {
+        slot_ctx->svc_bits = ev->svc_bits;
+    }
+    slot_ctx->enc_override_clear = current_clear_override;
     if (data_call) {
         return;
     }
 
-    if (p25_grant_duplicate_crypto_needs_restart(previous_svc, ev->svc_bits, previous_clear_override, force_clear,
-                                                 state->p25_crypto_state[crypto_slot])) {
-        p25_grant_begin_crypto_classification(ctx, state, ev, eval_ctx, route->slot, 0, now_m);
+    if (p25_grant_duplicate_crypto_needs_restart(previous_svc, current_svc, previous_clear_override,
+                                                 current_clear_override, state->p25_crypto_state[crypto_slot])) {
+        p25_sm_event_t crypto_ev = *ev;
+        crypto_ev.svc_bits = current_svc;
+        p25_grant_eval_ctx_t crypto_eval = eval_ctx ? *eval_ctx : p25_grant_eval_ctx_from_event(&crypto_ev);
+        crypto_eval.enc_override_clear = current_clear_override;
+        p25_grant_begin_crypto_classification(ctx, state, &crypto_ev, &crypto_eval, route->slot, 0, now_m);
     }
 }
 
@@ -2018,6 +2187,18 @@ p25_grant_handle_duplicate(p25_sm_ctx_t* ctx, const dsd_opts* opts, dsd_state* s
 
     p25_grant_refresh_duplicate_slot(ctx, state, route, now_m, data_call);
     p25_grant_refresh_duplicate_crypto(ctx, state, ev, route, eval_ctx, data_call, now_m);
+    // A duplicate can still be the update that spent the ledger release, and
+    // this path never reaches p25_grant_store_slot_context(). Carry the marking
+    // in -- only ever setting it, so an ordinary repeat of an already-marked
+    // assignment cannot launder it away.
+    if (eval_ctx && eval_ctx->enc_lockout_reprobe && route->slot >= 0 && route->slot <= 1) {
+        ctx->slots[route->slot].enc_lockout_reprobe = 1;
+    }
+    p25_grant_note_enc_reprobe_admitted(ctx, eval_ctx, now_m);
+    const int call_slot = p25_grant_logical_slot(ctx, route->slot);
+    if (!data_call && call_slot >= 0 && call_slot <= 1 && ctx->slots[call_slot].voice_active) {
+        p25_call_publish_observation(ctx, opts, state, call_slot, 0, 0, 0, P25_CALL_OBS_ASSIGNMENT_REPEAT, now_m);
+    }
     if (data_call) {
         ctx->t_tune_m = now_m;
         ctx->t_voice_m = 0.0;
@@ -2028,36 +2209,6 @@ p25_grant_handle_duplicate(p25_sm_ctx_t* ctx, const dsd_opts* opts, dsd_state* s
                  ctx->vc_tg, target_id, route->slot, data_call);
     sm_log(opts, state, "grant-same-freq");
     return 1;
-}
-
-static void
-p25_grant_store_policy_tg(dsd_state* state, const p25_sm_event_t* ev, int slot,
-                          const dsd_tg_policy_decision* decision) {
-    if (!state || !ev || !decision || !ev->is_group) {
-        return;
-    }
-
-    uint32_t policy_tg =
-        (decision->target_id > 0U && decision->target_id != (uint32_t)ev->tg) ? decision->target_id : 0U;
-    if (slot >= 0 && slot <= 1) {
-        state->p25_policy_tg[slot] = policy_tg;
-        return;
-    }
-    state->p25_policy_tg[0] = policy_tg;
-    state->p25_policy_tg[1] = 0;
-}
-
-static void
-p25_grant_clear_replaced_policy_tg(dsd_state* state, int slot, int slot_only) {
-    if (!state) {
-        return;
-    }
-    if (slot_only && slot >= 0 && slot <= 1) {
-        state->p25_policy_tg[slot] = 0;
-        return;
-    }
-    state->p25_policy_tg[0] = 0;
-    state->p25_policy_tg[1] = 0;
 }
 
 static void
@@ -2192,6 +2343,36 @@ p25_grant_prepare_route(p25_sm_ctx_t* ctx, dsd_opts* opts, dsd_state* state, con
     return 1;
 }
 
+// The TDMA burst descrambler is seeded from WACN/SYSID/NAC, so a Phase 2 voice
+// channel tuned before the Network Status Broadcast has been decoded cannot be
+// descrambled -- the tune just burns the grant-voice timeout. 0 and the
+// all-ones broadcast placeholders are the "not yet known" values.
+static int
+p25_grant_tdma_site_known(const dsd_state* state) {
+    return state->p2_wacn != 0 && state->p2_sysid != 0 && state->p2_cc != 0 && state->p2_wacn != 0xFFFFF
+           && state->p2_sysid != 0xFFF && state->p2_cc != 0xFFF;
+}
+
+// Defer TDMA grants until the site identity needed to seed the descrambler is
+// known. Runs before anything is released or retuned, so a deferred grant
+// leaves the receiver parked on the CC; grants repeat there, and NET_STS_BCST
+// cycles every few seconds, so the deferral self-resolves.
+static int
+p25_grant_deferred_for_tdma_site(const p25_sm_ctx_t* ctx, dsd_opts* opts, dsd_state* state, const p25_sm_event_t* ev,
+                                 const p25_grant_route_ctx_t* grant) {
+    if (!ctx || !state || !ev || !grant) {
+        return 0;
+    }
+    if (!is_tdma_channel(state, ev->channel) || p25_grant_tdma_site_known(state)) {
+        return 0;
+    }
+    p25_sm_diagf(opts, state, ctx, "grant_tdma_site_defer",
+                 "ch=0x%04X freq=%ld slot=%d target=%d wacn=0x%05llX sysid=0x%03llX nac=0x%03llX", ev->channel & 0xFFFF,
+                 grant->freq, grant->slot, grant->target_id, state->p2_wacn, state->p2_sysid, state->p2_cc);
+    sm_log(opts, state, "grant-tdma-site-defer");
+    return 1;
+}
+
 static int
 p25_grant_blocked_by_pending_cc(p25_sm_ctx_t* ctx, dsd_opts* opts, dsd_state* state, const p25_sm_event_t* ev,
                                 const p25_grant_route_ctx_t* grant) {
@@ -2223,6 +2404,37 @@ p25_grant_blocked_by_pending_cc(p25_sm_ctx_t* ctx, dsd_opts* opts, dsd_state* st
     return 1;
 }
 
+// Take the slot(s) over for an accepted assignment. Clearing a slot's state is
+// what resets its followed history -- the "cancel" the hangtime countdown used
+// to be given explicitly -- so a lockout reprobe, which is not followed traffic,
+// keeps its stamp. The site repeats a clear-claiming grant update for the life
+// of the encrypted call, and letting each one pass for followed traffic having
+// resumed held the carrier until that call ended.
+static void
+p25_grant_claim_slots(p25_sm_ctx_t* ctx, dsd_state* state, const p25_sm_event_t* ev, const p25_grant_route_ctx_t* grant,
+                      const p25_grant_eval_ctx_t* eval_ctx) {
+    const int slot = grant->logical_slot;
+    if (grant->clear_policy_slot_only) {
+        p25_grant_clear_one_slot_state(ctx, slot);
+        // Taking the slot over is the cancel the countdown used to be given
+        // explicitly -- but only for an assignment the SM has reason to follow.
+        // A lockout reprobe is not followed traffic, and the site repeats its
+        // clear-claiming grant update for the life of the encrypted call, so
+        // letting each one pass for followed traffic having resumed held the
+        // carrier until that call ended.
+        if (!eval_ctx->enc_lockout_reprobe && slot >= 0 && slot <= 1) {
+            ctx->slots[slot].last_followed_m = 0.0;
+        }
+    } else {
+        // A physical retune: the followed history described the carrier being
+        // left behind.
+        p25_grant_clear_slot_state(ctx);
+        p25_sm_clear_followed_history(ctx);
+    }
+    p25_grant_store_vc_context(ctx, state, ev, grant->freq, grant->target_id, eval_ctx, grant->now_m, grant->slot,
+                               grant->reused_carrier);
+}
+
 static void
 p25_grant_start_stale_regrant_probe(p25_sm_ctx_t* ctx, const p25_grant_route_ctx_t* grant) {
     if (!ctx || !grant) {
@@ -2244,14 +2456,16 @@ handle_grant(p25_sm_ctx_t* ctx, dsd_opts* opts, dsd_state* state, const p25_sm_e
     if (!ctx || !ev || !opts || !state) {
         return;
     }
-    DSD_MEMSET(&eval_ctx, 0, sizeof(eval_ctx));
 
     // Check grant policy
-    if (!grant_allowed(opts, state, ev, &decision, &eval_ctx)) {
+    if (!grant_allowed(ctx, opts, state, ev, &decision, &eval_ctx, 1)) {
         return;
     }
 
     if (!p25_grant_prepare_route(ctx, opts, state, ev, &decision, &eval_ctx, &grant)) {
+        return;
+    }
+    if (p25_grant_deferred_for_tdma_site(ctx, opts, state, ev, &grant)) {
         return;
     }
     if (p25_grant_blocked_by_pending_cc(ctx, opts, state, ev, &grant)) {
@@ -2268,7 +2482,6 @@ handle_grant(p25_sm_ctx_t* ctx, dsd_opts* opts, dsd_state* state, const p25_sm_e
     // still need normal grant handling so the slot context is replaced.
     if (p25_grant_handle_duplicate(ctx, opts, state, ev, &grant.route, &decision, grant.freq, grant.target_id,
                                    &eval_ctx, grant.now_m)) {
-        p25_grant_store_policy_tg(state, ev, grant.slot, &decision);
         return;
     }
 
@@ -2284,17 +2497,11 @@ handle_grant(p25_sm_ctx_t* ctx, dsd_opts* opts, dsd_state* state, const p25_sm_e
         return;
     }
     p25_sm_cancel_pending_cc_acquisition(ctx);
-    p25_grant_clear_moved_target_slots(ctx, state, grant.slot, ev, grant.target_id, grant.freq, eval_ctx.data_call);
-    if (grant.clear_policy_slot_only) {
-        p25_grant_clear_one_slot_state(ctx, grant.logical_slot);
-    } else {
-        p25_grant_clear_slot_state(ctx);
-    }
-    p25_grant_clear_replaced_policy_tg(state, grant.logical_slot, grant.clear_policy_slot_only);
-    p25_grant_store_vc_context(ctx, state, ev, grant.freq, grant.target_id, &eval_ctx, grant.now_m, grant.slot,
-                               grant.reused_carrier);
+    p25_grant_clear_moved_target_slots(ctx, opts, state, grant.slot, ev, grant.target_id, grant.freq,
+                                       eval_ctx.data_call);
+    p25_grant_claim_slots(ctx, state, ev, &grant, &eval_ctx);
+    p25_grant_note_enc_reprobe_admitted(ctx, &eval_ctx, grant.now_m);
     p25_grant_start_stale_regrant_probe(ctx, &grant);
-    p25_grant_store_policy_tg(state, ev, grant.slot, &decision);
     if (!grant.reused_carrier) {
         ctx->tune_count++;
         state->p25_sm_tune_count++;
@@ -2321,8 +2528,9 @@ p25_sm_apply_group_grant_policy(dsd_opts* opts, dsd_state* state, int channel, i
 
     p25_sm_event_t ev = p25_sm_ev_group_grant(channel, 0, tg, src, svc_bits);
     dsd_tg_policy_decision decision;
-    if (grant_allowed(opts, state, &ev, &decision, NULL)) {
-        p25_sm_diagf(opts, state, NULL, "grant_policy_only", "ch=0x%04X tg=%d src=%d svc=0x%02X policy_tg=%u",
+    p25_sm_ctx_t* ctx = p25_sm_get_ctx();
+    if (grant_allowed(ctx, opts, state, &ev, &decision, NULL, 0)) {
+        p25_sm_diagf(opts, state, ctx, "grant_policy_only", "ch=0x%04X tg=%d src=%d svc=0x%02X policy_tg=%u",
                      channel & 0xFFFF, tg, src, svc_bits & 0xFF, decision.target_id);
     }
 }
@@ -2332,7 +2540,12 @@ p25_voice_state_slot_tg(const dsd_state* state, int slot) {
     if (!state || slot < 0 || slot > 1) {
         return 0;
     }
-    return slot == 0 ? (int)state->lasttg : (int)state->lasttgR;
+    dsd_call_snapshot call;
+    if (dsd_call_state_get(state, (uint8_t)slot, &call) <= 0 || call.phase != DSD_CALL_PHASE_ACTIVE
+        || call.ota_target_id > (uint64_t)INT_MAX) {
+        return 0;
+    }
+    return (int)call.ota_target_id;
 }
 
 static int
@@ -2340,7 +2553,12 @@ p25_voice_state_slot_src(const dsd_state* state, int slot) {
     if (!state || slot < 0 || slot > 1) {
         return 0;
     }
-    return slot == 0 ? state->lastsrc : state->lastsrcR;
+    dsd_call_snapshot call;
+    if (dsd_call_state_get(state, (uint8_t)slot, &call) <= 0 || call.phase != DSD_CALL_PHASE_ACTIVE
+        || call.ota_source_id > (uint64_t)INT_MAX) {
+        return 0;
+    }
+    return (int)call.ota_source_id;
 }
 
 static int
@@ -2381,18 +2599,243 @@ p25_voice_set_state_identity(dsd_state* state, int slot, const p25_sm_event_t* e
     if (!state || !ev || slot < 0 || slot > 1) {
         return;
     }
-    const int target = ev->is_group ? ev->tg : ev->dst;
     if (slot == 0) {
-        state->lasttg = target;
-        state->lastsrc = ev->src;
         state->dmr_so = p25_sm_svc_bits_valid(ev->svc_bits) ? (unsigned int)ev->svc_bits : 0U;
     } else {
-        state->lasttgR = target;
-        state->lastsrcR = ev->src;
         state->dmr_soR = p25_sm_svc_bits_valid(ev->svc_bits) ? (unsigned int)ev->svc_bits : 0U;
     }
-    state->gi[slot] = ev->is_group ? 0 : 1;
-    state->p25_service_options_valid[slot] = p25_sm_svc_bits_valid(ev->svc_bits) ? 1 : 0;
+}
+
+static int
+p25_call_protocol(const p25_sm_ctx_t* ctx, const dsd_state* state) {
+    if (state && DSD_SYNC_IS_P25(state->lastsynctype)) {
+        return state->lastsynctype;
+    }
+    return ctx && ctx->vc_is_tdma ? DSD_SYNC_P25P2_POS : DSD_SYNC_P25P1_POS;
+}
+
+static dsd_call_crypto_state
+p25_call_crypto_classification(const dsd_state* state, int slot) {
+    if (!state || slot < 0 || slot > 1) {
+        return DSD_CALL_CRYPTO_UNKNOWN;
+    }
+    switch (state->p25_crypto_state[slot]) {
+        case DSD_P25_CRYPTO_CLEAR: return DSD_CALL_CRYPTO_CLEAR;
+        case DSD_P25_CRYPTO_ENCRYPTED_PENDING: return DSD_CALL_CRYPTO_ENCRYPTED_PENDING;
+        case DSD_P25_CRYPTO_DECRYPTABLE: return DSD_CALL_CRYPTO_DECRYPTABLE;
+        case DSD_P25_CRYPTO_BLOCKED: return DSD_CALL_CRYPTO_ENCRYPTED;
+        default: return DSD_CALL_CRYPTO_UNKNOWN;
+    }
+}
+
+static void
+p25_call_publish_crypto_update(const dsd_opts* opts, dsd_state* state, int slot, double observed_m, int include_ended) {
+    if (!state || slot < 0 || slot > 1) {
+        return;
+    }
+    dsd_call_crypto_update update = {
+        .classification = p25_call_crypto_classification(state, slot),
+        .algid = (uint8_t)(slot == 0 ? state->payload_algid : state->payload_algidR),
+        .kid = (uint16_t)(slot == 0 ? state->payload_keyid : state->payload_keyidR),
+        .mi = slot == 0 ? state->payload_miP : state->payload_miN,
+        .audio_permitted = (uint8_t)(p25_crypto_audio_permitted(opts, state, slot) ? 1 : 0),
+        .observed_m = observed_m,
+    };
+    if (include_ended) {
+        (void)dsd_call_state_update_retained_crypto(state, (uint8_t)slot, &update);
+    } else {
+        (void)dsd_call_state_update_crypto(state, (uint8_t)slot, &update);
+    }
+}
+
+static void
+p25_call_publish_crypto(const dsd_opts* opts, dsd_state* state, int slot, double observed_m) {
+    p25_call_publish_crypto_update(opts, state, slot, observed_m, 0);
+}
+
+static uint32_t
+p25_call_positive_id(int value) {
+    return value > 0 ? (uint32_t)value : 0U;
+}
+
+static dsd_call_kind
+p25_call_kind_from_slot(const p25_sm_slot_ctx_t* slot_ctx) {
+    if (slot_ctx->data_call) {
+        return DSD_CALL_KIND_DATA;
+    }
+    return slot_ctx->is_group ? DSD_CALL_KIND_GROUP_VOICE : DSD_CALL_KIND_PRIVATE_VOICE;
+}
+
+static int
+p25_call_begin_coalesces_into_active_epoch(const dsd_state* state, int slot, const dsd_call_observation* observation,
+                                           double observed_m, int continuous_activity) {
+    // A voice start raised by MAC_ACTIVE follows the traffic-channel GVCU
+    // observation of the same transmission, which already began the canonical
+    // epoch moments earlier. Forcing a second epoch would push the first
+    // epoch's freshly built row as a duplicate event. Coalesce only into a
+    // young matching epoch: an identity reused after the window (missed END
+    // plus a fresh start) still begins its own epoch. Continuously observed
+    // voice extends the window -- a first-seen MAC_PTT can decode several
+    // seconds into a transmission whose GVCU began the epoch, and with no END
+    // between them it names the transmission already on the air, not a fresh
+    // start.
+    dsd_call_snapshot current;
+    if (dsd_call_state_get(state, (uint8_t)slot, &current) <= 0 || current.phase != DSD_CALL_PHASE_ACTIVE) {
+        return 0;
+    }
+    if (current.kind != observation->kind || current.ota_target_id != observation->ota_target_id) {
+        return 0;
+    }
+    // Mirror the store's own family rule. Without it a Phase 1 -> Phase 2
+    // handover on the same talkgroup reports a coalesce that
+    // dsd_call_state_observe() then overrides with a fresh epoch, so the SM
+    // logs both canonical_epoch_coalesce and canonical_epoch_begin for one
+    // observation.
+    if (current.protocol != DSD_SYNC_NONE && observation->protocol != DSD_SYNC_NONE
+        && dsd_call_state_protocol_family(current.protocol) != dsd_call_state_protocol_family(observation->protocol)) {
+        return 0;
+    }
+    if (current.ota_source_id != 0U && observation->ota_source_id != 0U
+        && current.ota_source_id != observation->ota_source_id) {
+        return 0;
+    }
+    const double now_m = observed_m > 0.0 ? observed_m : dsd_time_now_monotonic_s();
+    if (current.started_m <= 0.0 || now_m < current.started_m) {
+        return 0;
+    }
+    return (now_m - current.started_m) <= P25_CANONICAL_EPOCH_COALESCE_S || continuous_activity;
+}
+
+// Whether the slot has decoded voice continuously up to this observation: no
+// END was accepted after the epoch began, and the last voice activity is at
+// most one coalesce window old. A gap means a terminator may have been missed,
+// so an identity reuse past the window must fork its own epoch.
+static int
+p25_call_slot_activity_is_continuous(const p25_sm_slot_ctx_t* slot_ctx, double observed_m) {
+    if (!slot_ctx || !slot_ctx->voice_active || slot_ctx->last_active_m <= 0.0) {
+        return 0;
+    }
+    if (slot_ctx->last_end_m > 0.0 && slot_ctx->last_end_m >= slot_ctx->last_start_m) {
+        return 0;
+    }
+    const double now_m = observed_m > 0.0 ? observed_m : dsd_time_now_monotonic_s();
+    return now_m >= slot_ctx->last_active_m && (now_m - slot_ctx->last_active_m) <= P25_CANONICAL_EPOCH_COALESCE_S;
+}
+
+static dsd_call_boundary
+p25_call_publish_boundary(const p25_sm_ctx_t* ctx, const dsd_opts* opts, const dsd_state* state, int slot,
+                          int new_epoch, int allow_coalesce, int continuous_activity,
+                          const dsd_call_observation* observation, double observed_m) {
+    if (!new_epoch) {
+        return DSD_CALL_BOUNDARY_CONTINUE;
+    }
+    if (allow_coalesce
+        && p25_call_begin_coalesces_into_active_epoch(state, slot, observation, observed_m, continuous_activity)) {
+        p25_sm_diagf((dsd_opts*)opts, state, ctx, "canonical_epoch_coalesce", "path=trunk slot=%d tg=%llu src=%llu",
+                     slot, (unsigned long long)observation->ota_target_id,
+                     (unsigned long long)observation->ota_source_id);
+        return DSD_CALL_BOUNDARY_CONTINUE;
+    }
+    return DSD_CALL_BOUNDARY_BEGIN;
+}
+
+// A source-less grant repeat keeps arriving from the control channel through
+// hangtime. When it re-describes the call that just ended it is retention, not
+// a new transmission, and must not resurrect the ended epoch. Matching on
+// identity rather than phase alone matters twice over: a repeat naming a
+// different call is fresh evidence that must open its own epoch, and only the
+// call the observation describes may take the retained-crypto write, so a
+// finished clear call cannot be relabelled encrypted by the next assignment.
+static int
+p25_call_observation_retains_ended_call(const dsd_state* state, int slot, p25_call_obs_provenance provenance,
+                                        int new_epoch, const dsd_call_observation* observation) {
+    if (provenance != P25_CALL_OBS_ASSIGNMENT_REPEAT || new_epoch || observation->ota_source_id != 0U) {
+        return 0;
+    }
+    dsd_call_snapshot current;
+    return dsd_call_state_get(state, (uint8_t)slot, &current) > 0 && current.phase == DSD_CALL_PHASE_ENDED
+           && current.kind == observation->kind && current.ota_target_id == observation->ota_target_id;
+}
+
+static void
+p25_call_publish_observation(const p25_sm_ctx_t* ctx, const dsd_opts* opts, dsd_state* state, int slot, int new_epoch,
+                             int allow_coalesce, int continuous_activity, p25_call_obs_provenance provenance,
+                             double observed_m) {
+    if (!ctx || !state || slot < 0 || slot > 1) {
+        return;
+    }
+    const p25_sm_slot_ctx_t* slot_ctx = &ctx->slots[slot];
+    const uint32_t ota_target = (uint32_t)(slot_ctx->is_group ? slot_ctx->ota_tg : slot_ctx->dst);
+    if (ota_target == 0U) {
+        return;
+    }
+    const int service_options = p25_sm_svc_bits_valid(slot_ctx->svc_bits) ? slot_ctx->svc_bits : 0;
+    dsd_call_observation observation = {
+        .protocol = p25_call_protocol(ctx, state),
+        .slot = (uint8_t)slot,
+        .kind = p25_call_kind_from_slot(slot_ctx),
+        .ota_target_id = ota_target,
+        .policy_target_id = p25_call_positive_id(slot_ctx->target_id),
+        .ota_source_id = p25_call_positive_id(slot_ctx->src),
+        .channel = p25_call_positive_id(slot_ctx->channel),
+        .frequency_hz = slot_ctx->freq_hz,
+        .service_options = (uint16_t)service_options,
+        .emergency = (uint8_t)((service_options & 0x80) != 0),
+        .priority = (uint8_t)(service_options & 0x07),
+        .has_service_metadata = (uint8_t)p25_sm_svc_bits_valid(slot_ctx->svc_bits),
+        .observed_m = observed_m,
+    };
+    if (p25_call_observation_retains_ended_call(state, slot, provenance, new_epoch, &observation)) {
+        p25_call_publish_crypto_update(opts, state, slot, observed_m, 1);
+        return;
+    }
+    const dsd_call_boundary boundary = p25_call_publish_boundary(ctx, opts, state, slot, new_epoch, allow_coalesce,
+                                                                 continuous_activity, &observation, observed_m);
+    const int began = dsd_call_state_observe(state, &observation, boundary);
+    if (began >= 0) {
+        p25_call_publish_crypto(opts, state, slot, observed_m);
+    }
+    if (began > 0) {
+        p25_sm_diagf((dsd_opts*)opts, state, ctx, "canonical_epoch_begin",
+                     "path=trunk new_epoch=%d slot=%d tg=%llu src=%llu svc=%d", new_epoch, slot,
+                     (unsigned long long)observation.ota_target_id, (unsigned long long)observation.ota_source_id,
+                     service_options);
+    }
+}
+
+static void
+p25_call_end_slot_ex(dsd_opts* opts, dsd_state* state, int slot, double observed_m, dsd_call_end_reason reason) {
+    if (!state || slot < 0 || slot > 1) {
+        return;
+    }
+    if (dsd_call_state_end_ex(state, (uint8_t)slot, observed_m, reason) > 0 && opts) {
+        dsd_event_sync_slot(opts, state, (uint8_t)slot);
+    }
+}
+
+// Teardown/retune wrapper: says nothing about how the transmission ended on the air. Call
+// sites reacting to decoded OTA end signaling (MAC_END_PTT, MAC Release, TDU, FACCH end,
+// LCW termination/EOT) must use p25_call_end_slot_ex with DSD_CALL_END_TERMINATOR so the
+// event layer can keep an audible epoch whose call identity never decoded.
+static void
+p25_call_end_slot(dsd_opts* opts, dsd_state* state, int slot, double observed_m) {
+    p25_call_end_slot_ex(opts, state, slot, observed_m, DSD_CALL_END_EXPLICIT);
+}
+
+static void
+p25_lockout_note_phase1_epoch(dsd_state* state, int slot) {
+    // The post-lockout ESS suppression keys off the epoch the lockout ended.
+    // Record it wherever the call actually reaches ENDED rather than only on
+    // the matching-call emit path: handle_enc() ends the slot unconditionally,
+    // so a non-matching lockout (kind or target differs from the canonical
+    // call) or a build with no event history would otherwise leave the
+    // following LDU2 ESS repeats free to mint a phantom identity-less epoch.
+    dsd_call_snapshot call;
+    if (!state || slot != 0 || dsd_call_state_get(state, (uint8_t)slot, &call) <= 0
+        || call.phase != DSD_CALL_PHASE_ENDED || !DSD_SYNC_IS_P25P1(call.protocol)) {
+        return;
+    }
+    p25_crypto_note_phase1_lockout_epoch(state, call.epoch);
 }
 
 static void
@@ -2401,26 +2844,18 @@ p25_voice_clear_state_source(dsd_state* state, int slot) {
         return;
     }
     if (slot == 0) {
-        state->lastsrc = 0;
         state->payload_miP = 0;
         state->payload_algid = 0;
         state->payload_keyid = 0;
         state->dmr_so = 0;
     } else {
-        state->lastsrcR = 0;
         state->payload_miN = 0;
         state->payload_algidR = 0;
         state->payload_keyidR = 0;
         state->dmr_soR = 0;
     }
     state->generic_talker_alias[slot][0] = '\0';
-    state->generic_talker_alias_src[slot] = 0;
     state->p25_p2_audio_allowed[slot] = 0;
-    state->p25_call_emergency[slot] = 0;
-    state->p25_call_priority[slot] = 0;
-    state->p25_call_is_packet[slot] = 0;
-    state->p25_service_options_valid[slot] = 0;
-    DSD_SNPRINTF(state->call_string[slot], sizeof(state->call_string[slot]), "%s", "                     ");
 }
 
 static void
@@ -2551,8 +2986,160 @@ p25_voice_slot_epoch_active(const p25_sm_slot_ctx_t* slot_ctx) {
 }
 
 static int
+p25_ptt_signature_range_matches(const uint8_t lhs[P25_SM_PTT_SIGNATURE_BYTES],
+                                const uint8_t rhs[P25_SM_PTT_SIGNATURE_BYTES], int first) {
+    for (int i = first; i < P25_SM_PTT_SIGNATURE_BYTES; i++) {
+        if (lhs[i] != rhs[i]) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int
+p25_ptt_signature_algid_is_clear(uint8_t algid) {
+    return algid == 0x00U || algid == 0x80U;
+}
+
+static int
+p25_ptt_signature_matches(const uint8_t lhs[P25_SM_PTT_SIGNATURE_BYTES],
+                          const uint8_t rhs[P25_SM_PTT_SIGNATURE_BYTES]) {
+    const uint8_t lhs_algid = lhs[P25_PTT_SIGNATURE_ALGID_INDEX];
+    const uint8_t rhs_algid = rhs[P25_PTT_SIGNATURE_ALGID_INDEX];
+    const int lhs_clear = p25_ptt_signature_algid_is_clear(lhs_algid);
+    const int rhs_clear = p25_ptt_signature_algid_is_clear(rhs_algid);
+
+    if (lhs_clear || rhs_clear) {
+        // MI and KID do not delimit a clear call. Some systems vary those
+        // fields across redundant MAC_PTT copies, so compare the normalized
+        // clear classification and the authoritative source/target identity.
+        return lhs_clear && rhs_clear && p25_ptt_signature_range_matches(lhs, rhs, P25_PTT_SIGNATURE_IDENTITY_INDEX);
+    }
+    return p25_ptt_signature_range_matches(lhs, rhs, 0);
+}
+
+static int
+p25_ptt_marker_matches(const p25_sm_ctx_t* ctx, int slot, const p25_sm_event_t* ev, double observed_m,
+                       double* out_elapsed_s) {
+    if (out_elapsed_s) {
+        *out_elapsed_s = 0.0;
+    }
+    if (!ctx || !ev || slot < 0 || slot > 1 || ev->type != P25_SM_EV_PTT || !ev->ptt_signature_valid
+        || ev->observed_m <= 0.0) {
+        return 0;
+    }
+
+    const p25_sm_slot_ctx_t* slot_ctx = &ctx->slots[slot];
+    if (!slot_ctx->ptt_signature_valid || slot_ctx->ptt_last_seen_m <= 0.0
+        || !p25_ptt_signature_matches(slot_ctx->ptt_signature, ev->ptt_signature)) {
+        return 0;
+    }
+
+    const double elapsed_s = observed_m - slot_ctx->ptt_last_seen_m;
+    if (elapsed_s < 0.0 || elapsed_s > P25_PTT_RETRANSMIT_WINDOW_S) {
+        return 0;
+    }
+    if (out_elapsed_s) {
+        *out_elapsed_s = elapsed_s;
+    }
+    return 1;
+}
+
+static int
+p25_voice_ptt_is_retransmission(const p25_sm_ctx_t* ctx, int slot, const p25_sm_event_t* ev, double observed_m,
+                                double* out_elapsed_s) {
+    return ctx && ctx->vc_is_tdma && slot >= 0 && slot <= 1 && p25_voice_slot_epoch_active(&ctx->slots[slot])
+           && p25_ptt_marker_matches(ctx, slot, ev, observed_m, out_elapsed_s);
+}
+
+static void
+p25_voice_accept_ptt_marker(p25_sm_ctx_t* ctx, int slot, const p25_sm_event_t* ev, double observed_m) {
+    if (!ctx || !ev || slot < 0 || slot > 1 || ev->type != P25_SM_EV_PTT) {
+        return;
+    }
+    if (!ev->ptt_signature_valid || ev->observed_m <= 0.0) {
+        p25_ptt_marker_invalidate(ctx, slot);
+        return;
+    }
+
+    p25_sm_slot_ctx_t* slot_ctx = &ctx->slots[slot];
+    DSD_MEMCPY(slot_ctx->ptt_signature, ev->ptt_signature, sizeof(slot_ctx->ptt_signature));
+    slot_ctx->ptt_last_seen_m = observed_m;
+    slot_ctx->ptt_signature_valid = 1;
+}
+
+static int
 p25_voice_start_follows_completed_epoch(const p25_sm_slot_ctx_t* slot_ctx) {
     return slot_ctx && slot_ctx->last_start_m > 0.0 && !p25_voice_slot_epoch_active(slot_ctx);
+}
+
+// After an accepted MAC_END_PTT the FNE keeps describing the completed call for a few bursts:
+// END repeats interleave with SACCH voice-user copies whose four-burst assembly began before
+// the END decoded. A voice user naming the completed talker -- or naming no talker -- on the
+// unchanged target inside that tail is retention of the transmission that just ended, and
+// reopening an epoch from it commits a duplicate history row once the phantom epoch dies at
+// hangtime or at the next talker's PTT. The time bound is what the retired identity-only
+// guards lacked: outside the tail, a genuinely ACTIVE-typed voice user re-naming the same
+// talker is the next transmission and still reopens the call. A changed source is fresh
+// evidence and is never suppressed.
+static int
+p25_voice_end_repeat_tail_active(const p25_sm_slot_ctx_t* slot_ctx, double now_m) {
+    return slot_ctx && slot_ctx->last_end_m > 0.0 && now_m >= slot_ctx->last_end_m
+           && (now_m - slot_ctx->last_end_m) <= P25_POST_END_VOICE_USER_REPEAT_S;
+}
+
+static int
+p25_voice_user_repeats_recent_end(const p25_sm_slot_ctx_t* slot_ctx, int target, int src, double now_m) {
+    if (!slot_ctx || target <= 0 || target != slot_ctx->last_end_tg) {
+        return 0;
+    }
+    if (p25_voice_slot_epoch_active(slot_ctx)) {
+        return 0;
+    }
+    if (p25_source_id_known(src) && src != slot_ctx->last_end_src) {
+        return 0;
+    }
+    return p25_voice_end_repeat_tail_active(slot_ctx, now_m);
+}
+
+int
+p25_sm_voice_user_repeats_recent_end(int slot, int target, int src, double now_m) {
+    const p25_sm_ctx_t* ctx = p25_sm_get_ctx();
+    if (slot < 0 || slot > 1 || ctx->state != P25_SM_TUNED || !ctx->vc_is_tdma) {
+        return 0;
+    }
+    return p25_voice_user_repeats_recent_end(&ctx->slots[slot], target, src, now_m);
+}
+
+int
+p25_sm_phase1_crypto_epoch_allowed(const dsd_opts* opts) {
+    // Mirrors the voice-start rule: a trunked receiver with no traffic
+    // assignment is parked on (or hunting) the control channel, where a
+    // Phase 1 ESS observation can only be noise briefly false-syncing as an
+    // LDU. Minting an identity-less epoch for it leaves a stale ACTIVE call
+    // that the next real call's teardown flushes as a phantom TGT 0 row.
+    const p25_sm_ctx_t* ctx = p25_sm_get_ctx();
+    return !(opts && opts->trunk_enable == 1 && ctx->state != P25_SM_TUNED);
+}
+
+int
+p25_sm_phase1_assignment_identity(int* is_group, uint32_t* ota_target, uint32_t* policy_target) {
+    const p25_sm_ctx_t* ctx = p25_sm_get_ctx();
+    if (!is_group || !ota_target || !policy_target || ctx->state != P25_SM_TUNED || ctx->vc_is_tdma) {
+        return 0;
+    }
+    const p25_sm_slot_ctx_t* slot_ctx = &ctx->slots[0];
+    if (!slot_ctx->grant_active || slot_ctx->data_call) {
+        return 0;
+    }
+    const int target = slot_ctx->is_group ? slot_ctx->ota_tg : slot_ctx->dst;
+    if (target <= 0) {
+        return 0;
+    }
+    *is_group = slot_ctx->is_group ? 1 : 0;
+    *ota_target = (uint32_t)target;
+    *policy_target = slot_ctx->target_id > 0 ? (uint32_t)slot_ctx->target_id : 0U;
+    return 1;
 }
 
 static int
@@ -2564,9 +3151,34 @@ p25_voice_start_target_changed(const p25_sm_slot_ctx_t* slot_ctx, const p25_sm_e
 }
 
 static int
+p25_voice_start_assignment_source_is_fresh(const p25_sm_slot_ctx_t* slot_ctx) {
+    // The retained source identifies the current assignment only until a
+    // transmission completes on it. After that, only a newer grant or an
+    // identity-bearing start re-validates it; inheriting it into the next
+    // epoch would attribute a new transmission to the previous talker.
+    if (!slot_ctx) {
+        return 0;
+    }
+    return !p25_voice_start_follows_completed_epoch(slot_ctx) || slot_ctx->last_grant_m > slot_ctx->last_stop_m;
+}
+
+static int
 p25_voice_start_source_changed(const p25_sm_slot_ctx_t* slot_ctx, const p25_sm_event_t* ev) {
     return slot_ctx && ev && p25_source_id_known(slot_ctx->src) && p25_source_id_known(ev->src)
            && slot_ctx->src != ev->src;
+}
+
+static int
+p25_voice_start_assignment_service_is_fresh(const p25_sm_slot_ctx_t* slot_ctx) {
+    // The retained service options follow the same freshness rule as the
+    // retained source: they describe the next transmission only while a grant
+    // re-validates the assignment. Control channels keep repeating the call's
+    // grant (with its clear/enc service bits) through hangtime, so a completed
+    // transmission whose assignment the CC has re-announced since the stop may
+    // classify the next same-identity transmission from those bits instead of
+    // starting every one encryption-pending and muting clear voice until ESS
+    // decodes.
+    return p25_voice_start_assignment_source_is_fresh(slot_ctx);
 }
 
 static int
@@ -2576,14 +3188,14 @@ p25_voice_start_is_p2_ptt(const p25_sm_ctx_t* ctx, const p25_sm_event_t* ev) {
 
 static int
 p25_voice_start_begins_new_epoch(const p25_sm_ctx_t* ctx, const p25_sm_slot_ctx_t* slot_ctx,
-                                 const p25_sm_event_t* input, const p25_sm_event_t* call_ev) {
-    return p25_voice_start_is_p2_ptt(ctx, input) || !p25_voice_slot_epoch_active(slot_ctx)
+                                 const p25_sm_event_t* input, const p25_sm_event_t* call_ev, int ptt_retransmit) {
+    return (p25_voice_start_is_p2_ptt(ctx, input) && !ptt_retransmit) || !p25_voice_slot_epoch_active(slot_ctx)
            || p25_voice_start_target_changed(slot_ctx, call_ev) || p25_voice_start_source_changed(slot_ctx, call_ev);
 }
 
 static int
 p25_voice_start_requires_unknown_service(const p25_sm_slot_ctx_t* slot_ctx, const p25_sm_event_t* ev) {
-    return p25_voice_start_follows_completed_epoch(slot_ctx) || p25_voice_start_target_changed(slot_ctx, ev)
+    return !p25_voice_start_assignment_service_is_fresh(slot_ctx) || p25_voice_start_target_changed(slot_ctx, ev)
            || p25_voice_start_source_changed(slot_ctx, ev);
 }
 
@@ -2594,20 +3206,21 @@ p25_voice_start_fill_anonymous_identity(const dsd_state* state, int slot, const 
     out->tg = slot_ctx->is_group ? slot_ctx->ota_tg : 0;
     out->dst = slot_ctx->is_group ? 0 : slot_ctx->dst;
     out->src = p25_voice_state_slot_src(state, slot);
-    if (!p25_source_id_known(out->src)) {
+    if (!p25_source_id_known(out->src) && p25_voice_start_assignment_source_is_fresh(slot_ctx)) {
         out->src = slot_ctx->src;
     }
 
-    // A source-less PTT/ACTIVE after a completed transmission has no service
-    // options for the new epoch. Keep crypto classification pending until
-    // ESS/LCW proves it clear instead of inheriting the preceding epoch.
-    const int follows_completed_epoch = p25_voice_start_follows_completed_epoch(slot_ctx);
-    out->svc_bits = follows_completed_epoch ? P25_SM_SVC_UNKNOWN : slot_ctx->svc_bits;
+    // A source-less PTT/ACTIVE after a completed transmission inherits no
+    // service options from the preceding epoch. Only a grant that re-validated
+    // the assignment since the stop may classify the new epoch; otherwise keep
+    // crypto classification pending until ESS/LCW proves it clear.
+    out->svc_bits = p25_voice_start_assignment_service_is_fresh(slot_ctx) ? slot_ctx->svc_bits : P25_SM_SVC_UNKNOWN;
 }
 
 static void
 p25_voice_start_preserve_assignment_source(const p25_sm_slot_ctx_t* slot_ctx, p25_sm_event_t* out) {
-    if (slot_ctx && out && !p25_source_id_known(out->src) && !p25_voice_start_target_changed(slot_ctx, out)) {
+    if (slot_ctx && out && !p25_source_id_known(out->src) && !p25_voice_start_target_changed(slot_ctx, out)
+        && p25_voice_start_assignment_source_is_fresh(slot_ctx)) {
         out->src = slot_ctx->src;
     }
 }
@@ -2622,6 +3235,26 @@ p25_voice_start_resolve_service_bits(const p25_sm_ctx_t* ctx, const p25_sm_slot_
         return P25_SM_SVC_UNKNOWN;
     }
     return p25_voice_start_requires_unknown_service(slot_ctx, call_ev) ? P25_SM_SVC_UNKNOWN : slot_ctx->svc_bits;
+}
+
+static void
+p25_voice_start_apply_decoded_identity(const p25_sm_ctx_t* ctx, const p25_sm_slot_ctx_t* slot_ctx,
+                                       const p25_sm_event_t* input, p25_sm_event_t* out) {
+    // Phase 2 MAC_PTT exposes a 16-bit group-address field, but no 24-bit
+    // private destination. Preserve an accepted private assignment instead of
+    // reclassifying that field as an authoritative group.
+    if (input->type == P25_SM_EV_PTT && !slot_ctx->is_group && input->is_group) {
+        out->is_group = 0;
+        out->tg = 0;
+        out->dst = slot_ctx->dst;
+    }
+    if (!input->source_absent) {
+        // Skipped for message types that carry no source field at all
+        // (telephone interconnect): there is no talker to recover, so
+        // inheriting the assignment's source would misattribute the call.
+        p25_voice_start_preserve_assignment_source(slot_ctx, out);
+    }
+    out->svc_bits = p25_voice_start_resolve_service_bits(ctx, slot_ctx, input, out);
 }
 
 static int
@@ -2643,22 +3276,24 @@ p25_voice_start_build_identity(const p25_sm_ctx_t* ctx, const dsd_state* state, 
     out->grant_provenance = P25_SM_GRANT_PROVENANCE_ASSIGNMENT;
     out->data_call_override = -1;
     out->facch = 0;
+    if (!p25_source_id_known(out->src)) {
+        // Normalize the fixed-network placeholders (0xFFFFFD call processing,
+        // 0xFFFFFF all-subscribers) to "no source" up front, before anything
+        // downstream reads out->src. Normalizing only at the end would let a
+        // placeholder look like a present source to the inherit step below and
+        // discard a real talker the grant already named.
+        out->src = 0;
+    }
 
     if (!input->identity_valid) {
         p25_voice_start_fill_anonymous_identity(state, slot, slot_ctx, out);
     } else {
-        // Phase 2 MAC_PTT exposes a 16-bit group-address field, but no
-        // 24-bit private destination. Preserve an accepted private assignment
-        // instead of reclassifying that field as an authoritative group.
-        if (input->type == P25_SM_EV_PTT && !slot_ctx->is_group && input->is_group) {
-            out->is_group = 0;
-            out->tg = 0;
-            out->dst = slot_ctx->dst;
-        }
-        p25_voice_start_preserve_assignment_source(slot_ctx, out);
-        out->svc_bits = p25_voice_start_resolve_service_bits(ctx, slot_ctx, input, out);
+        p25_voice_start_apply_decoded_identity(ctx, slot_ctx, input, out);
     }
     out->identity_valid = 1;
+    if (!p25_source_id_known(out->src)) {
+        out->src = 0;
+    }
     return p25_grant_ota_target_id(out) > 0;
 }
 
@@ -2672,6 +3307,12 @@ typedef struct {
     int service_changed;
     int requires_update;
     int preserve_crypto_classification;
+    int coalesce_canonical_epoch;
+    // Captured before commit closes slot media: whether voice was decoded
+    // continuously right up to this observation. Extends the coalesce window
+    // for a first-seen PTT naming the transmission already on the air.
+    int continuous_activity;
+    int ptt_evidence;
 } p25_voice_start_changes_t;
 
 static int
@@ -2686,6 +3327,7 @@ static void
 p25_p1_identity_clear(dsd_state* state) {
     if (state) {
         state->p25_p1_identity_pending = 0;
+        state->p25_p1_identity_epoch_started = 0;
     }
 }
 
@@ -2696,15 +3338,44 @@ p25_p1_hdu_crypto_consume_identity(const p25_sm_ctx_t* ctx, dsd_state* state, co
     }
 }
 
+// A PTT normally keeps its own canonical epoch: PTT is per-transmission
+// evidence. The exception is the transmission that is already being observed
+// live: a tune that lands so a GVCU/MAC_ACTIVE decodes before one of the
+// transmission-start MAC_PTT repeats begins the canonical epoch from that
+// observation, and letting the first-seen PTT force a second epoch commits
+// the observation epoch's freshly built row as a duplicate event. The PTT may
+// therefore fold into a young matching epoch only while that epoch has not
+// already accepted a PTT of its own -- a second, differently-signed PTT is
+// the next transmission and must begin its own epoch.
+static int
+p25_voice_ptt_start_may_coalesce(const p25_sm_ctx_t* ctx, const dsd_state* state, int slot) {
+    dsd_call_snapshot current;
+    if (dsd_call_state_get(state, (uint8_t)slot, &current) <= 0 || current.phase != DSD_CALL_PHASE_ACTIVE) {
+        return 0;
+    }
+    return ctx->slots[slot].ptt_canonical_epoch != current.epoch;
+}
+
 static p25_voice_start_changes_t
-p25_voice_start_classify_changes(const p25_sm_ctx_t* ctx, const p25_sm_slot_ctx_t* slot_ctx,
-                                 const p25_sm_event_t* input, const p25_sm_event_t* call_ev) {
+p25_voice_start_classify_changes(const p25_sm_ctx_t* ctx, const dsd_state* state, int slot,
+                                 const p25_sm_slot_ctx_t* slot_ctx, const p25_sm_event_t* input,
+                                 const p25_sm_event_t* call_ev, int ptt_retransmit) {
     p25_voice_start_changes_t changes = {0};
     const int learned_source = !p25_source_id_known(slot_ctx->src) && p25_source_id_known(call_ev->src);
 
     changes.service_changed = p25_voice_start_service_changed(slot_ctx, call_ev);
-    changes.new_epoch = p25_voice_start_begins_new_epoch(ctx, slot_ctx, input, call_ev);
+    changes.new_epoch = p25_voice_start_begins_new_epoch(ctx, slot_ctx, input, call_ev, ptt_retransmit);
     changes.requires_update = changes.new_epoch || changes.service_changed || learned_source;
+    changes.ptt_evidence = p25_voice_start_is_p2_ptt(ctx, input);
+    // An ACTIVE-driven start may always fold into the epoch the
+    // traffic-channel observation of the same transmission just began. A PTT
+    // may do the same only for an epoch no PTT has claimed yet; identity and
+    // age matching stay with p25_call_begin_coalesces_into_active_epoch().
+    changes.coalesce_canonical_epoch =
+        input->type == P25_SM_EV_ACTIVE
+        || (changes.new_epoch && changes.ptt_evidence && p25_voice_ptt_start_may_coalesce(ctx, state, slot));
+    changes.continuous_activity =
+        p25_call_slot_activity_is_continuous(slot_ctx, input->observed_m > 0.0 ? input->observed_m : 0.0);
     return changes;
 }
 
@@ -2791,6 +3462,17 @@ p25_voice_start_update_crypto(p25_sm_ctx_t* ctx, dsd_state* state, int slot, int
     }
 }
 
+// A slot that changes hands drops any reprobe marking: it belonged to the
+// identity being replaced, and leaving it on would deny the new call the
+// acquisition deferral it never had reason to lose.
+static void
+p25_voice_start_clear_stale_reprobe(p25_sm_slot_ctx_t* slot_ctx, const p25_sm_event_t* call_ev, int target_id) {
+    const int is_group = call_ev->is_group ? 1 : 0;
+    if (slot_ctx->target_id != target_id || slot_ctx->is_group != is_group) {
+        slot_ctx->enc_lockout_reprobe = 0;
+    }
+}
+
 static void
 p25_voice_start_commit_identity(p25_sm_ctx_t* ctx, dsd_opts* opts, dsd_state* state, int slot,
                                 const p25_sm_event_t* call_ev, const dsd_tg_policy_decision* decision,
@@ -2799,6 +3481,9 @@ p25_voice_start_commit_identity(p25_sm_ctx_t* ctx, dsd_opts* opts, dsd_state* st
     p25_sm_slot_ctx_t* slot_ctx = &ctx->slots[slot];
     const int logical_slot = ctx->vc_is_tdma ? slot : 0;
 
+    if (changes->new_epoch) {
+        p25_ptt_marker_invalidate(ctx, slot);
+    }
     if (changes->new_epoch && slot_ctx->voice_active) {
         (void)dsd_tg_policy_clear_active_call(state, ctx->vc_is_tdma ? slot : -1);
         if (changes->preserve_crypto_classification) {
@@ -2811,6 +3496,7 @@ p25_voice_start_commit_identity(p25_sm_ctx_t* ctx, dsd_opts* opts, dsd_state* st
     const int target_id = p25_grant_target_id(call_ev, decision);
     dsd_tg_policy_call_route route;
     p25_grant_fill_route(&route, call_ev, slot_ctx->freq_hz, ctx->vc_is_tdma ? slot : -1, 0, target_id);
+    p25_voice_start_clear_stale_reprobe(slot_ctx, call_ev, target_id);
     slot_ctx->target_id = target_id;
     slot_ctx->ota_tg = call_ev->is_group ? call_ev->tg : 0;
     slot_ctx->dst = call_ev->is_group ? 0 : call_ev->dst;
@@ -2823,14 +3509,26 @@ p25_voice_start_commit_identity(p25_sm_ctx_t* ctx, dsd_opts* opts, dsd_state* st
     ctx->vc_tg = target_id;
     ctx->vc_src = call_ev->src;
     p25_voice_set_state_identity(state, slot, call_ev);
-    p25_grant_store_policy_tg(state, call_ev, logical_slot, decision);
     (void)dsd_tg_policy_note_active_call(state, &route, decision, now_m);
     p25_voice_start_update_crypto(ctx, state, slot, logical_slot, call_ev, eval_ctx, changes, now_m);
+    p25_call_publish_observation(ctx, opts, state, slot, changes->new_epoch, changes->coalesce_canonical_epoch,
+                                 changes->continuous_activity, P25_CALL_OBS_VOICE_EVIDENCE, now_m);
+    if (changes->ptt_evidence) {
+        // Whether this PTT began the epoch or folded into one an ACTIVE
+        // observation began, the epoch now contains a PTT: the next
+        // differently-signed PTT is the next transmission and must not
+        // coalesce into it. Read back rather than assumed: the publish may
+        // have declined (no assignment target), leaving no epoch to claim.
+        dsd_call_snapshot current;
+        if (dsd_call_state_get(state, (uint8_t)slot, &current) > 0 && current.phase == DSD_CALL_PHASE_ACTIVE) {
+            slot_ctx->ptt_canonical_epoch = current.epoch;
+        }
+    }
 }
 
 static int
 p25_voice_start_apply_identity(p25_sm_ctx_t* ctx, dsd_opts* opts, dsd_state* state, int slot,
-                               const p25_sm_event_t* input, double now_m, int* out_new_epoch) {
+                               const p25_sm_event_t* input, double now_m, int ptt_retransmit, int* out_new_epoch) {
     p25_sm_event_t call_ev;
     if (out_new_epoch) {
         *out_new_epoch = !ctx->slots[slot].voice_active;
@@ -2850,7 +3548,8 @@ p25_voice_start_apply_identity(p25_sm_ctx_t* ctx, dsd_opts* opts, dsd_state* sta
     }
 
     const p25_sm_slot_ctx_t* slot_ctx = &ctx->slots[slot];
-    p25_voice_start_changes_t changes = p25_voice_start_classify_changes(ctx, slot_ctx, input, &call_ev);
+    p25_voice_start_changes_t changes =
+        p25_voice_start_classify_changes(ctx, state, slot, slot_ctx, input, &call_ev, ptt_retransmit);
     if (pending_p1_identity) {
         changes.requires_update = 1;
     }
@@ -2867,7 +3566,8 @@ p25_voice_start_apply_identity(p25_sm_ctx_t* ctx, dsd_opts* opts, dsd_state* sta
 
     dsd_tg_policy_decision decision;
     p25_grant_eval_ctx_t eval_ctx;
-    if (!grant_allowed(opts, state, &call_ev, &decision, &eval_ctx)) {
+    if (!grant_allowed(ctx, opts, state, &call_ev, &decision, &eval_ctx, 0)) {
+        p25_call_end_slot(opts, state, slot, now_m);
         p25_voice_close_slot_media(ctx, opts, state, slot);
         p25_voice_clear_slot_grant(ctx, state, slot);
         p25_voice_clear_slot_burst(state, slot);
@@ -2923,27 +3623,127 @@ static int
 p25_voice_start_wait_for_classification(p25_sm_ctx_t* ctx, dsd_opts* opts, dsd_state* state, int slot, const char* why,
                                         double now_m) {
     const int identity_pending = state && !ctx->vc_is_tdma && slot == 0 && state->p25_p1_identity_pending;
-    if (!identity_pending && !p25_voice_start_crypto_suppressed(opts, state, slot)) {
+    const int crypto_suppressed = p25_voice_start_crypto_suppressed(opts, state, slot);
+    if (!identity_pending && !crypto_suppressed) {
         return 0;
     }
 
     // The lockout policy may have been enabled after follow mode marked this
     // blocked slot active. Clear that stale activity before ignoring subsequent
     // voice indications so the tuned timer can release it.
-    const double inactive_since_m = ctx->t_voice_m > 0.0 ? ctx->t_voice_m : now_m;
+    //
+    // Only two of the starts that land here were followed traffic, and only
+    // those two move this slot's followed stamp:
+    //
+    //   - a slot that *was* active: lockout just took a call the SM had been
+    //     following, so its followed history ends where that activity did;
+    //   - a Phase 1 identity wait: a followed call whose LCW identity has not
+    //     decoded yet. It keeps the stamp current, or an over that keys up late
+    //     in the window is released while its voice is on the air.
+    //
+    // Everything else here is a locked-out slot repeating MAC_PTT/MAC_ACTIVE
+    // for the life of a transmission the SM is not following. Those repeats
+    // leave the stamp alone, so they can neither restart the countdown nor
+    // start one -- no guard needed, because they write nothing.
+    const int was_active = ctx->slots[slot].voice_active;
+    const double followed_until_m =
+        (was_active && ctx->slots[slot].last_active_m > 0.0) ? ctx->slots[slot].last_active_m : now_m;
     ctx->slots[slot].voice_active = 0;
     ctx->slots[slot].last_active_m = 0.0;
     ctx->t_voice_m = 0.0;
     if (state->p25_crypto_state[slot] == DSD_P25_CRYPTO_ENCRYPTED_PENDING) {
+        // Classification owns the wait: p25_sm_tick_tuned() holds the hangtime
+        // release off while this budget runs, so a call that resolves clear is
+        // not torn down mid-classification, and p25_sm_tick_crypto_
+        // classification() releases the carrier when the budget lapses.
         if (ctx->slots[slot].crypto_attempt_m <= 0.0) {
             ctx->slots[slot].crypto_attempt_m = now_m;
         }
-    } else {
-        ctx->t_hangtime_m = inactive_since_m;
+    } else if (was_active || identity_pending) {
+        p25_sm_note_followed_until(ctx, slot, followed_until_m);
+    } else if (!ctx->slots[0].voice_active && !ctx->slots[1].voice_active && p25_sm_hangtime_started_m(ctx) <= 0.0) {
+        // Not followed traffic, so it may not move a countdown that is already
+        // running -- and with no slot active, started_m <= 0 means no slot has
+        // ever carried followed traffic on this carrier. Without a stamp here
+        // that carrier has no release deadline at all: the FDMA fall-through in
+        // p25_sm_tick_tuned() is inert (p25_sm_has_pending_voice_grant() and
+        // p25_sm_has_pending_data_grant() are TDMA-only) and vc_activity_seen
+        // is already set. main armed the countdown unconditionally here; start
+        // one exactly once, so the repeats that follow find it running and
+        // leave it alone.
+        p25_sm_note_followed_until(ctx, slot, now_m);
     }
     p25_sm_diagf(opts, state, ctx, "voice_classification_wait", "kind=%s slot=%d crypto_state=%d identity_pending=%d",
                  why, slot, (int)state->p25_crypto_state[slot], identity_pending);
     p25_sm_update_ui_mode(ctx, state);
+    return 1;
+}
+
+static int
+p25_voice_start_apply_event(p25_sm_ctx_t* ctx, dsd_opts* opts, dsd_state* state, int slot, const p25_sm_event_t* ev,
+                            double now_m, int* out_new_epoch) {
+    double ptt_elapsed_s = 0.0;
+    const int ptt_retransmit = p25_voice_ptt_is_retransmission(ctx, slot, ev, now_m, &ptt_elapsed_s);
+    if (!p25_voice_start_apply_identity(ctx, opts, state, slot, ev, now_m, ptt_retransmit, out_new_epoch)) {
+        if (state && ctx->vc_is_tdma) {
+            state->p25_p2_media_rejected[slot] = 1;
+            state->p25_p2_audio_allowed[slot] = 0;
+        }
+        return 0;
+    }
+
+    p25_voice_accept_ptt_marker(ctx, slot, ev, now_m);
+    if (ptt_retransmit) {
+        p25_sm_diagf(opts, state, ctx, "ptt_retransmit", "slot=%d tg=%d src=%d elapsed=%.3f provenance=%s", slot,
+                     ev->tg, ev->src, ptt_elapsed_s, ev->facch ? "facch" : "sacch");
+    }
+    if (state && ctx->vc_is_tdma) {
+        state->p25_p2_media_rejected[slot] = 0;
+    }
+    return 1;
+}
+
+// Phase 2 only: the post-END retention tail is a TDMA artifact (END repeats
+// interleaving with the four-burst SACCH assembly). Phase 1's post-TDU
+// same-identity signaling drives its own HDU/LCW crypto machinery and must
+// keep flowing. Retention is still channel activity, so the liveness clock
+// advances, but the hangtime timer keeps running and no epoch reopens.
+static int
+p25_voice_start_suppress_post_end_repeat(p25_sm_ctx_t* ctx, dsd_opts* opts, const dsd_state* state, int slot,
+                                         const p25_sm_event_t* ev, const char* why, double now_m) {
+    if (!ctx->vc_is_tdma) {
+        return 0;
+    }
+    const p25_sm_slot_ctx_t* slot_ctx = &ctx->slots[slot];
+    int repeats = 0;
+    if (ev->type == P25_SM_EV_ACTIVE) {
+        int target = ev->is_group ? ev->tg : ev->dst;
+        if (target <= 0) {
+            // An identity-less ACTIVE (a live-typed PDU whose MAC payload is
+            // not a voice-user block) would re-fill the retained assignment
+            // identity with unknown service options, so judge it against the
+            // identity it would reopen -- otherwise it resurrects the ended
+            // call as a crypto-pending phantom.
+            target = slot_ctx->is_group ? slot_ctx->ota_tg : slot_ctx->dst;
+        }
+        repeats = p25_voice_user_repeats_recent_end(slot_ctx, target, ev->src, now_m);
+    } else if (ev->type == P25_SM_EV_PTT) {
+        // A SACCH MAC_PTT repeat whose four-burst assembly straddled the END
+        // arrives after the END was accepted, still signed like the marker
+        // the completed transmission refreshed. The END keeps that marker
+        // precisely so this repeat stays recognizable; the next transmission
+        // carries a fresh signature (new MI) or lands outside the one-second
+        // marker and retention windows.
+        double elapsed_s = 0.0;
+        repeats = !p25_voice_slot_epoch_active(slot_ctx) && p25_voice_end_repeat_tail_active(slot_ctx, now_m)
+                  && p25_ptt_marker_matches(ctx, slot, ev, now_m, &elapsed_s);
+    }
+    if (!repeats) {
+        return 0;
+    }
+    p25_sm_note_vc_decode_activity(ctx, opts, state, why, slot, now_m);
+    p25_sm_diagf(opts, state, ctx, "voice_observation_suppressed", "reason=repeats-recent-end slot=%d tg=%d src=%d",
+                 slot, ev->tg, ev->src);
     return 1;
 }
 
@@ -2956,18 +3756,14 @@ handle_voice_start(p25_sm_ctx_t* ctx, dsd_opts* opts, dsd_state* state, const p2
         return 1;
     }
 
-    double now_m = dsd_time_now_monotonic_s();
+    double now_m = ev->observed_m > 0.0 ? ev->observed_m : dsd_time_now_monotonic_s();
     int s = (ev->slot >= 0 && ev->slot <= 1) ? ev->slot : 0;
-    int new_epoch = !ctx->slots[s].voice_active;
-    if (!p25_voice_start_apply_identity(ctx, opts, state, s, ev, now_m, &new_epoch)) {
-        if (state && ctx->vc_is_tdma) {
-            state->p25_p2_media_rejected[s] = 1;
-            state->p25_p2_audio_allowed[s] = 0;
-        }
-        return 0;
+    if (p25_voice_start_suppress_post_end_repeat(ctx, opts, state, s, ev, why, now_m)) {
+        return 1;
     }
-    if (state && ctx->vc_is_tdma) {
-        state->p25_p2_media_rejected[s] = 0;
+    int new_epoch = !ctx->slots[s].voice_active;
+    if (!p25_voice_start_apply_event(ctx, opts, state, s, ev, now_m, &new_epoch)) {
+        return 0;
     }
     const int reused = ctx->vc_activity_seen && new_epoch;
     if (new_epoch) {
@@ -2977,15 +3773,18 @@ handle_voice_start(p25_sm_ctx_t* ctx, dsd_opts* opts, dsd_state* state, const p2
     p25_sm_note_vc_decode_activity(ctx, opts, state, why, s, now_m);
 
     ctx->vc_activity_seen = 1;
-    ctx->t_hangtime_m = 0.0;
 
     if (p25_voice_start_wait_for_classification(ctx, opts, state, s, why, now_m)) {
+        dsd_event_sync_slot(opts, state, (uint8_t)s);
         return 1;
     }
 
-    // Update slot activity
+    // Update slot activity. Marking the slot active is what stops the hangtime
+    // countdown: a classification-suppressed start never reaches here, so it
+    // cannot stop one it is not entitled to.
     ctx->slots[s].voice_active = 1;
     ctx->slots[s].last_active_m = now_m;
+    (void)dsd_call_state_update_media(state, (uint8_t)s, 1, now_m);
 
     // NOTE: Audio gating is managed by MAC_PTT/MAC_ACTIVE handlers in xcch.c,
     // ENC event handler, and ESS processing in frame.c.
@@ -3003,6 +3802,7 @@ handle_voice_start(p25_sm_ctx_t* ctx, dsd_opts* opts, dsd_state* state, const p2
                  p25_voice_slot_diag_src(ctx, state, s), ctx->slots[s].grant_active);
     sm_log(opts, state, why);
     p25_sm_update_ui_mode(ctx, state);
+    dsd_event_sync_slot(opts, state, (uint8_t)s);
     return 1;
 }
 
@@ -3165,7 +3965,12 @@ p25_voice_end_event_tg(const p25_sm_ctx_t* ctx, const dsd_state* state, int slot
 
 static int
 p25_voice_end_event_src(const p25_sm_ctx_t* ctx, const dsd_state* state, int slot, const p25_sm_event_t* ev) {
-    return ev && ev->src > 0 ? ev->src : p25_voice_slot_diag_src(ctx, state, slot);
+    // MAC_END_PTT often names the fixed-network placeholder (0xFFFFFF) rather
+    // than the completed talker. Recording the placeholder as the ended
+    // source made every post-END voice-user copy naming the real talker look
+    // like a changed source, defeating the retention-tail suppression and
+    // reopening the ended call between END repeats.
+    return ev && p25_source_id_known(ev->src) ? ev->src : p25_voice_slot_diag_src(ctx, state, slot);
 }
 
 static void
@@ -3198,9 +4003,30 @@ p25_voice_end_clear_policy_route(const p25_sm_ctx_t* ctx, dsd_state* state, int 
     (void)dsd_tg_policy_clear_active_call(state, ctx->vc_is_tdma ? slot : -1);
 }
 
+// A suppressed companion's transmission announces its own end here: the
+// explicit MAC END still decodes after lockout erased the assignment, so it
+// arrives only to be rejected as no-assignment. Terminate the suppression
+// stamp anyway -- whatever identity the END names, it ends the transmission
+// occupying this slot -- or the FACCH double-END fast release stays held
+// against a companion that already stopped transmitting, for up to one
+// hangtime of stamp aging. A new encrypted over re-creates the stamp through
+// the full lockout action.
+static void
+p25_voice_end_terminate_enc_suppression(p25_sm_ctx_t* ctx, int slot, int is_explicit_end) {
+    if (!is_explicit_end || ctx->slots[slot].last_enc_suppress_m <= 0.0) {
+        return;
+    }
+    ctx->slots[slot].last_enc_suppress_m = 0.0;
+}
+
+// `end_reason` records what the triggering event actually said about the air:
+// DSD_CALL_END_TERMINATOR for over-the-air end signaling (a MAC_END_PTT, a Phase 1 TDU), so the
+// event layer can keep an audible epoch whose call identity never decoded, and
+// DSD_CALL_END_EXPLICIT for inactivity-driven teardowns (idle, hangtime), which say nothing
+// about how the transmission ended.
 static int
 handle_voice_end(p25_sm_ctx_t* ctx, dsd_opts* opts, dsd_state* state, int slot, const char* why, int is_explicit_end,
-                 int arm_stale_regrant_guard, const p25_sm_event_t* ev) {
+                 int arm_stale_regrant_guard, const p25_sm_event_t* ev, dsd_call_end_reason end_reason) {
     if (!ctx) {
         return 0;
     }
@@ -3211,6 +4037,7 @@ handle_voice_end(p25_sm_ctx_t* ctx, dsd_opts* opts, dsd_state* state, int slot, 
     }
 
     int s = (slot >= 0 && slot <= 1) ? slot : 0;
+    p25_voice_end_terminate_enc_suppression(ctx, s, is_explicit_end);
     const char* reject_reason =
         p25_voice_end_event_reject_reason(ctx, state, s, is_explicit_end, arm_stale_regrant_guard, ev);
     if (reject_reason) {
@@ -3218,6 +4045,15 @@ handle_voice_end(p25_sm_ctx_t* ctx, dsd_opts* opts, dsd_state* state, int slot, 
         return 0;
     }
 
+    // The PTT retransmission marker deliberately survives an explicit END: a
+    // SACCH MAC_PTT repeat whose assembly straddled the END is recognized as
+    // retention only by matching it (p25_voice_start_suppress_post_end_repeat).
+    // Epoch-active gating keeps it inert otherwise, and slot clear/release
+    // still invalidates it. Inactivity teardowns have no straddle to
+    // recognize, so they drop the marker as before.
+    if (!is_explicit_end) {
+        p25_ptt_marker_invalidate(ctx, s);
+    }
     const double now_m = dsd_time_now_monotonic_s();
     const int ended_tg = p25_voice_end_event_tg(ctx, state, s, ev);
     const int ended_src = p25_voice_end_event_src(ctx, state, s, ev);
@@ -3230,15 +4066,27 @@ handle_voice_end(p25_sm_ctx_t* ctx, dsd_opts* opts, dsd_state* state, int slot, 
     p25_voice_end_record(&ctx->slots[s], is_explicit_end, arm_stale_regrant_guard, now_m, ended_tg, ended_src);
     p25_voice_end_clear_policy_route(ctx, state, s, preserve_recent_idle_grant);
     p25_voice_close_slot_media_for_end(ctx, opts, state, s, preserve_recent_idle_grant);
+    p25_call_end_slot_ex(opts, state, s, now_m, end_reason);
     if (state && !ctx->vc_is_tdma && arm_stale_regrant_guard) {
         state->p25_p1_identity_pending = 1;
+        state->p25_p1_identity_epoch_started = 0;
     }
     ctx->slots[s].last_stop_m = now_m;
+    // This slot followed traffic right up to now: an observation, not a
+    // decision about the carrier, and a companion that is still busy keeps the
+    // countdown from running on its own. The one assignment that is not
+    // followed traffic is an encryption-lockout reprobe whose voice has not
+    // classified yet -- the site's END for the call the ledger says is
+    // encrypted must not restart the countdown any more than its grant repeats
+    // may. handle_enc clears the marking the moment that voice proves the grant
+    // bit right, so a reprobe that really did resolve clear still stamps here.
+    if (!ctx->slots[s].enc_lockout_reprobe) {
+        p25_sm_note_followed_until(ctx, s, now_m);
+    }
     ctx->vc_activity_seen = 1;
     const int other_active = p25_voice_end_diag_other_active(ctx, state, s);
     if (!other_active) {
         ctx->t_voice_m = 0.0;
-        ctx->t_hangtime_m = now_m;
     }
     if (arm_stale_regrant_guard) {
         (void)p25_stale_regrant_guard_arm(ctx, opts, state, s);
@@ -3252,7 +4100,7 @@ handle_voice_end(p25_sm_ctx_t* ctx, dsd_opts* opts, dsd_state* state, int slot, 
     if (!other_active) {
         p25_sm_diagf(opts, state, ctx, "traffic_hang",
                      "phase=%s freq=%ld slot=%d tg=%d src=%d reason=%s started_m=%.3f", p25_voice_phase_name(ctx),
-                     ctx->vc_freq_hz, s, ended_tg, ended_src, why, ctx->t_hangtime_m);
+                     ctx->vc_freq_hz, s, ended_tg, ended_src, why, p25_sm_hangtime_started_m(ctx));
     }
     p25_sm_update_ui_mode(ctx, state);
     return 1;
@@ -3264,7 +4112,12 @@ p25_facch_end_identity_matches(const p25_sm_slot_ctx_t* slot_ctx, const p25_sm_e
         return 0;
     }
     const int event_tg = ev->tg > 0 ? ev->tg : slot_ctx->last_end_tg;
-    const int event_src = ev->src > 0 ? ev->src : slot_ctx->last_end_src;
+    // MAC_END_PTT repeats often carry the fixed-network placeholder source
+    // (0xFFFFFF) while the recorded end identity resolved the placeholder to
+    // the completed talker (p25_voice_end_event_src). Resolve the event the
+    // same way, or a placeholder-sourced repeat looks like a different talker
+    // and the double-END fast release never fires.
+    const int event_src = p25_source_id_known(ev->src) ? ev->src : slot_ctx->last_end_src;
     if (event_tg != slot_ctx->facch_end_tg) {
         return 0;
     }
@@ -3300,6 +4153,36 @@ p25_facch_has_newer_grant(const p25_sm_ctx_t* ctx, double first_end_m) {
     return 0;
 }
 
+// Whether the companion slot carries a transmission that encryption lockout is
+// actively suppressing. Lockout tears down the suppressed call's assignment,
+// epoch, and audio gate -- everything p25_facch_all_slots_inactive() reads --
+// so to the double-END fast release the carrier looks like it is closing while
+// the site is in fact still transmitting the locked-out call on it, and the
+// ended conversation's next over gets re-granted on this same channel moments
+// later. The suppression stamp refreshes on every FEC-accepted ESS repeat
+// (via p25_sm_note_enc_suppressed) for as long as that call keeps
+// transmitting, so a stamp fresh within the effective hangtime means
+// "occupied right now" while surviving ESS decode stalls.
+//
+// What the hold buys is the hangtime window, not an indefinite stay: the
+// hangtime-expiry tick owns the release either way, and it now fires one
+// hangtime after the last *followed* traffic whether or not the locked-out call
+// is still transmitting. Declining the fast release here is what leaves that
+// window open, so the ended conversation's next over can still be re-granted on
+// this same channel instead of the carrier closing the instant the double END
+// lands.
+static int
+p25_facch_companion_enc_suppressed(const p25_sm_ctx_t* ctx, const dsd_state* state, int slot, double now_m) {
+    if (!ctx->vc_is_tdma) {
+        return 0;
+    }
+    const p25_sm_slot_ctx_t* other_ctx = &ctx->slots[slot ^ 1];
+    if (other_ctx->last_enc_suppress_m <= 0.0 || now_m < other_ctx->last_enc_suppress_m) {
+        return 0;
+    }
+    return (now_m - other_ctx->last_enc_suppress_m) < p25_sm_effective_hangtime(state, ctx->config.hangtime_s);
+}
+
 static int
 handle_facch_voice_end(p25_sm_ctx_t* ctx, dsd_opts* opts, dsd_state* state, const p25_sm_event_t* ev) {
     if (!ctx || !ev || ev->slot < 0 || ev->slot > 1) {
@@ -3310,12 +4193,20 @@ handle_facch_voice_end(p25_sm_ctx_t* ctx, dsd_opts* opts, dsd_state* state, cons
     const double elapsed = observed_m - slot_ctx->facch_end_m;
     if (elapsed >= 0.0 && elapsed <= 1.0 && !p25_facch_has_newer_grant(ctx, slot_ctx->facch_end_m)
         && p25_facch_end_identity_matches(slot_ctx, ev) && p25_facch_all_slots_inactive(ctx, state)) {
-        p25_sm_diagf(opts, state, ctx, "facch_release_hint", "phase=p2 freq=%ld slot=%d tg=%d src=%d elapsed=%.3f",
-                     ctx->vc_freq_hz, ev->slot, slot_ctx->facch_end_tg, slot_ctx->facch_end_src, elapsed);
-        return do_release(ctx, opts, state, "facch-double-end", 0) ? P25_SM_END_CHANNEL_RELEASED : P25_SM_END_IGNORED;
+        if (p25_facch_companion_enc_suppressed(ctx, state, ev->slot, observed_m)) {
+            p25_sm_diagf(opts, state, ctx, "facch_double_end_enc_hold", "phase=p2 freq=%ld slot=%d other=%d gap=%.3f",
+                         ctx->vc_freq_hz, ev->slot, ev->slot ^ 1,
+                         observed_m - ctx->slots[ev->slot ^ 1].last_enc_suppress_m);
+            sm_log(opts, state, "facch-double-end-enc-hold");
+        } else {
+            p25_sm_diagf(opts, state, ctx, "facch_release_hint", "phase=p2 freq=%ld slot=%d tg=%d src=%d elapsed=%.3f",
+                         ctx->vc_freq_hz, ev->slot, slot_ctx->facch_end_tg, slot_ctx->facch_end_src, elapsed);
+            return do_release(ctx, opts, state, "facch-double-end", 0) ? P25_SM_END_CHANNEL_RELEASED
+                                                                       : P25_SM_END_IGNORED;
+        }
     }
 
-    int applied = handle_voice_end(ctx, opts, state, ev->slot, "end", 1, 1, ev);
+    int applied = handle_voice_end(ctx, opts, state, ev->slot, "end", 1, 1, ev, DSD_CALL_END_TERMINATOR);
     if (!applied) {
         return P25_SM_END_IGNORED;
     }
@@ -3389,10 +4280,10 @@ p25_voice_clear_slot_grant(p25_sm_ctx_t* ctx, dsd_state* state, int slot) {
     if (!ctx || !state || slot < 0 || slot > 1) {
         return;
     }
+    p25_ptt_marker_invalidate(ctx, slot);
     ctx->slots[slot].grant_active = 0;
     ctx->slots[slot].crypto_attempt_m = 0.0;
     (void)dsd_tg_policy_clear_active_call(state, ctx->vc_is_tdma ? slot : -1);
-    state->p25_policy_tg[slot] = 0;
 }
 
 static int
@@ -3431,6 +4322,26 @@ p25_voice_clear_slot_burst(dsd_state* state, int slot) {
     } else {
         state->dmrburstR = 0;
     }
+}
+
+// Whether the companion slot sits inside the hangtime window of a transmission
+// that just ended on it. The retains-carrier check reads exactly that instant
+// as inactive -- MAC_END clears voice_active and the audio gate -- but the
+// window is the SM's promise to bridge a conversation's talker gaps. The
+// companion's own stop timestamp decides it rather than the global hangtime
+// timer, which the locked-out slot's suppressed voice starts re-arm on every
+// repeat and which therefore cannot distinguish the companion's bridged gap
+// from an enc-only carrier that must still release. Once the gap outlives the
+// effective hangtime the caller releases as before, and a companion with no
+// recorded stop (never carried a call, or torn down without an END) never
+// holds at all.
+static int
+p25_voice_companion_gap_within_hangtime(const p25_sm_ctx_t* ctx, const dsd_state* state, int other, double now_m) {
+    const p25_sm_slot_ctx_t* other_ctx = &ctx->slots[other];
+    if (other_ctx->last_stop_m <= 0.0 || now_m < other_ctx->last_stop_m) {
+        return 0;
+    }
+    return (now_m - other_ctx->last_stop_m) < p25_sm_effective_hangtime(state, ctx->config.hangtime_s);
 }
 
 static void
@@ -3495,6 +4406,7 @@ handle_crypto_pending(p25_sm_ctx_t* ctx, dsd_opts* opts, dsd_state* state, const
     if (state->p25_crypto_state[slot] != DSD_P25_CRYPTO_ENCRYPTED_PENDING) {
         return;
     }
+    dsd_event_sync_slot(opts, state, (uint8_t)slot);
 
     if (!ctx->vc_is_tdma && slot == 0 && state->p25_p1_crypto_conflict.active) {
         const p25_sm_slot_ctx_t* slot_ctx = &ctx->slots[0];
@@ -3549,6 +4461,30 @@ p25_enc_lockout_target(const p25_sm_slot_ctx_t* slot_ctx, int fallback, int* is_
     return fallback;
 }
 
+// The lockout action runs on every classification transition -- each
+// locked-out transmission's first BLOCKED resolve, or a key-identity change
+// -- so it still revisits stay-or-release inside the companion conversation's
+// normal talker gaps, where the retains-carrier check reads the companion as
+// inactive and a release here would tear down the channel the hangtime window
+// is bridging, clipping the head of every following clear transmission. Hold
+// through the companion's unexpired gap; once only the locked-out call
+// remains, the gap outlives the hangtime and the next transition (or the
+// hangtime-expired tick) releases the emptied channel.
+static void
+p25_enc_lockout_release_or_hold(p25_sm_ctx_t* ctx, dsd_opts* opts, dsd_state* state, int slot) {
+    const int other = slot ^ 1;
+    const double now_m = dsd_time_now_monotonic_s();
+    if (ctx->vc_is_tdma && !p25_voice_other_slot_active(ctx, state, other)
+        && p25_voice_companion_gap_within_hangtime(ctx, state, other, now_m)) {
+        p25_sm_diagf(opts, state, ctx, "enc_lockout_hangtime_hold", "slot=%d other=%d gap=%.3f", slot, other,
+                     now_m - ctx->slots[other].last_stop_m);
+        sm_log(opts, state, "enc-lockout-hangtime-hold");
+        return;
+    }
+    p25_voice_release_or_preserve_companion(ctx, opts, state, slot, "enc-lockout", "enc_lockout_slot_only",
+                                            "enc-lockout-slot-only");
+}
+
 static void
 handle_enc(p25_sm_ctx_t* ctx, dsd_opts* opts, dsd_state* state, const p25_sm_event_t* ev) {
     if (!ctx || !ev || !opts || !state) {
@@ -3571,6 +4507,27 @@ handle_enc(p25_sm_ctx_t* ctx, dsd_opts* opts, dsd_state* state, const p25_sm_eve
     allow_audio = dsd_p25p2_decode_audio_allowed(opts, state, slot, algid);
 
     if (p25_enc_lockout_precheck(ctx, opts, state, slot, allow_audio, crypto_state)) {
+        // A call that classifies clear or decryptable releases any retained
+        // lockout entry: this is how a stale-epoch probe converges after new
+        // key material, and how mixed clear/encrypted talkgroups recover.
+        // Only while lockout is enabled, though -- in follow mode the ledger
+        // is suspended, not erased, so entries survive a temporary toggle to
+        // following encrypted calls without owing a fresh probe.
+        if (opts->trunk_tune_enc_calls == 0 && p25_crypto_audio_ready(state, slot)) {
+            int rel_is_group = 1;
+            const int rel_target = p25_enc_lockout_target(&ctx->slots[slot], tg, &rel_is_group);
+            if (rel_target > 0) {
+                (void)dsd_enc_lockout_release(state, (uint32_t)rel_target, rel_is_group);
+                p25_grant_enc_reprobe_forget(ctx, (uint32_t)rel_target, rel_is_group);
+            }
+            // The voice settled the question this assignment was admitted to
+            // ask: the grant bit was right. Stop treating it as evidence-free,
+            // or a verified-clear call stays excluded from the acquisition
+            // deferral for the rest of its assignment.
+            ctx->slots[slot].enc_lockout_reprobe = 0;
+        }
+        p25_call_publish_crypto(opts, state, slot, dsd_time_now_monotonic_s());
+        dsd_event_sync_slot(opts, state, (uint8_t)slot);
         return;
     }
 
@@ -3584,19 +4541,42 @@ handle_enc(p25_sm_ctx_t* ctx, dsd_opts* opts, dsd_state* state, const p25_sm_eve
     int is_group = 1;
     const int target = p25_enc_lockout_target(slot_ctx, tg, &is_group);
     if (target > 0) {
-        p25_emit_enc_lockout_once_typed(opts, state, (uint8_t)slot, target, 0x40, is_group);
+        p25_emit_enc_lockout_once_typed(opts, state, (uint8_t)slot, target, 0x40, is_group, algid, ev->keyid);
     }
+
+    p25_call_end_slot(opts, state, slot, dsd_time_now_monotonic_s());
 
     // Gate audio for this slot
     state->p25_p2_audio_allowed[slot] = 0;
 
     // Clear voice activity indicator to prevent audio routing logic from
-    // treating this locked-out slot as having active voice
+    // treating this locked-out slot as having active voice. Lockout just took a
+    // call the SM had been following, so -- exactly as in
+    // p25_voice_start_wait_for_classification() -- its followed history ends
+    // where that activity did, or the countdown falls back to a stale stamp
+    // from an earlier transmission and expires the moment the hold is granted.
+    if (ctx->slots[slot].voice_active) {
+        p25_sm_note_followed_until(ctx, slot,
+                                   ctx->slots[slot].last_active_m > 0.0 ? ctx->slots[slot].last_active_m
+                                                                        : dsd_time_now_monotonic_s());
+    }
     ctx->slots[slot].voice_active = 0;
     p25_voice_clear_slot_grant(ctx, state, slot);
     p25_voice_clear_slot_burst(state, slot);
-    p25_voice_release_or_preserve_companion(ctx, opts, state, slot, "enc-lockout", "enc_lockout_slot_only",
-                                            "enc-lockout-slot-only");
+    // The locked-out transmission still occupies this slot on the carrier even
+    // though the teardown above erased every assignment and audio trace of it.
+    // Stamped before the release decision: a release wipes the slot context
+    // with the channel, while a hold leaves the stamp for release heuristics
+    // that read an otherwise idle companion as "channel closing".
+    ctx->slots[slot].last_enc_suppress_m = dsd_time_now_monotonic_s();
+    p25_enc_lockout_release_or_hold(ctx, opts, state, slot);
+
+    // Record last, after the slot teardown above. The teardown runs
+    // p25_crypto_reset_slot(), which clears the lockout epoch -- recording any
+    // earlier (including inside p25_emit_enc_lockout_once_typed) leaves the
+    // following LDU2 ESS repeats with no suppression context, which is exactly
+    // the phantom identity-less epoch this record exists to prevent.
+    p25_lockout_note_phase1_epoch(state, slot);
 }
 
 /* ============================================================================
@@ -3659,6 +4639,7 @@ p25_release_return_to_cc_accepted(const p25_sm_ctx_t* ctx, dsd_opts* opts, dsd_s
 static void
 p25_release_clear_context(p25_sm_ctx_t* ctx) {
     p25_grant_clear_slot_state(ctx);
+    p25_sm_clear_followed_history(ctx);
     ctx->vc_freq_hz = 0;
     ctx->vc_channel = 0;
     ctx->vc_tg = 0;
@@ -3668,7 +4649,6 @@ p25_release_clear_context(p25_sm_ctx_t* ctx) {
     ctx->vc_stale_regrant_probe_slot = -1;
     ctx->t_tune_m = 0.0;
     ctx->t_voice_m = 0.0;
-    ctx->t_hangtime_m = 0.0;
     ctx->vc_activity_seen = 0;
     p25_sm_reset_vc_reacquire_tracking(ctx);
     ctx->release_count++;
@@ -3684,6 +4664,7 @@ p25_release_clear_decoder_state(dsd_opts* opts, dsd_state* state) {
         state->p25_p2_media_rejected[0] = 0;
         state->p25_p2_media_rejected[1] = 0;
         state->p25_p1_identity_pending = 0;
+        state->p25_p1_identity_epoch_started = 0;
         state->p25_p2_active_slot = -1;
         state->p25_vc_freq[0] = 0;
         state->p25_vc_freq[1] = 0;
@@ -3697,13 +4678,13 @@ p25_release_clear_decoder_state(dsd_opts* opts, dsd_state* state) {
         state->payload_miN = 0;
         state->dmr_so = 0;
         state->dmr_soR = 0;
-        state->p25_service_options_valid[0] = 0;
-        state->p25_service_options_valid[1] = 0;
         p25_crypto_reset_slot(state, 0);
         p25_crypto_reset_slot(state, 1);
-        state->p25_policy_tg[0] = 0;
-        state->p25_policy_tg[1] = 0;
         state->p25_sm_release_count++;
+        // Mirror of ctx->cc_return_count for readers without the ctx (UI, NULL-ctx
+        // diag lines); p25_release_clear_context() bumps the ctx side on the same
+        // two release paths that call this helper.
+        state->p25_sm_cc_return_count++;
     }
     if (opts) {
         opts->trunk_is_tuned = 0;
@@ -3800,6 +4781,10 @@ p25_release_locked(p25_sm_ctx_t* ctx, dsd_opts* opts, dsd_state* state, const ch
 
     p25_release_log_failed_vc(ctx, opts, state, reason, failed_stale_probe);
 
+    const double ended_m = dsd_time_now_monotonic_s();
+    p25_call_end_slot(opts, state, 0, ended_m);
+    p25_call_end_slot(opts, state, 1, ended_m);
+
     p25_release_clear_context(ctx);
     p25_release_clear_decoder_state(opts, state);
     p25_sm_start_cc_acquisition_for_result(ctx, opts, state, tune_result, tune_request_id, tune_start_m, "release",
@@ -3822,6 +4807,10 @@ do_release(p25_sm_ctx_t* ctx, dsd_opts* opts, dsd_state* state, const char* reas
     // nearly the same time (e.g., explicit call termination + watchdog tick).
     int expected = 0;
     if (!atomic_compare_exchange_strong(&g_p25_sm_release_lock, &expected, 1)) {
+        // The trace must show the lost race: the winner logs its own release
+        // under its own reason, and without this line a deadline that fired
+        // here is indistinguishable from one that never fired.
+        p25_sm_diagf(opts, state, ctx, "release_contended", "reason=%s", reason ? reason : "none");
         return 0;
     }
 
@@ -3830,11 +4819,22 @@ do_release(p25_sm_ctx_t* ctx, dsd_opts* opts, dsd_state* state, const char* reas
         const uint32_t tune_count = ctx->tune_count;
         const uint32_t grant_count = ctx->grant_count;
         p25_sm_diagf(opts, state, ctx, "release_stale_reset", "reason=%s", reason ? reason : "none");
+        const double ended_m = dsd_time_now_monotonic_s();
+        p25_call_end_slot(opts, state, 0, ended_m);
+        p25_call_end_slot(opts, state, 1, ended_m);
         p25_release_clear_context(ctx);
         const uint32_t release_count = ctx->release_count;
         const uint32_t cc_return_count = ctx->cc_return_count;
+        // The reprobe backoff is session state, like the counters below: it
+        // exists precisely to outlive the carrier release a failed reprobe ends
+        // in, because the ledger entry it consumed is already gone. Wiping it
+        // here would hand every locked-out target a free reprobe on the site's
+        // next grant repeat.
+        p25_sm_enc_reprobe_memo_t enc_reprobes[P25_SM_ENC_REPROBE_MEMO_MAX];
+        DSD_MEMCPY(enc_reprobes, ctx->enc_reprobes, sizeof(enc_reprobes));
         p25_release_clear_decoder_state(opts, state);
         p25_sm_init_ctx(ctx, opts, state);
+        DSD_MEMCPY(ctx->enc_reprobes, enc_reprobes, sizeof(ctx->enc_reprobes));
         ctx->tune_count = tune_count;
         ctx->release_count = release_count;
         ctx->grant_count = grant_count;
@@ -3872,8 +4872,8 @@ next_lcn_freq(dsd_state* state, long* out_freq) {
     }
     // Skip duplicates
     if (state->lcn_freq_roll > 0) {
-        long prev = state->trunk_lcn_freq[state->lcn_freq_roll - 1];
-        long cur = state->trunk_lcn_freq[state->lcn_freq_roll];
+        long prev = *dsd_state_trunk_lcn_slot(state, state->lcn_freq_roll - 1);
+        long cur = *dsd_state_trunk_lcn_slot(state, state->lcn_freq_roll);
         if (prev == cur) {
             state->lcn_freq_roll++;
             if (state->lcn_freq_roll >= state->lcn_freq_count) {
@@ -3881,7 +4881,8 @@ next_lcn_freq(dsd_state* state, long* out_freq) {
             }
         }
     }
-    long f = (state->lcn_freq_roll < state->lcn_freq_count) ? state->trunk_lcn_freq[state->lcn_freq_roll] : 0;
+    long f =
+        (state->lcn_freq_roll < state->lcn_freq_count) ? *dsd_state_trunk_lcn_slot(state, state->lcn_freq_roll) : 0;
     state->lcn_freq_roll++;
     if (f != 0) {
         *out_freq = f;
@@ -3899,17 +4900,10 @@ next_lcn_freq(dsd_state* state, long* out_freq) {
 
 static int
 p25_has_user_lcn_list(const dsd_opts* opts, const dsd_state* state) {
-    if (opts && opts->chan_in_file[0] != '\0') {
-        return 1;
-    }
-    if (!opts || !state || opts->trunk_scan_enabled != 1) {
-        return 0;
-    }
-
     // Trunk-scan seeds entry 0 with the target CC. Additional entries mean a
     // per-target chan_csv was imported; learned grant caches only populate the
     // sparse channel map and must not disable current-site CC candidate hunts.
-    return (state->lcn_freq_count > 1) ? 1 : 0;
+    return dsd_state_trunk_lcn_user_list_present(opts, state);
 }
 
 static int
@@ -4018,6 +5012,7 @@ p25_sm_init_ctx(p25_sm_ctx_t* ctx, const dsd_opts* opts, dsd_state* state) {
     DSD_MEMSET(ctx, 0, sizeof(*ctx));
     ctx->vc_stale_regrant_probe_slot = -1;
     p25_p1_identity_clear(state);
+    p25_crypto_clear_phase1_lockout_epoch(state);
 
     const dsdneoRuntimeConfig* cfg = dsd_neo_get_config();
 
@@ -4151,23 +5146,23 @@ p25_sm_handle_event_end(p25_sm_ctx_t* ctx, const dsd_opts* opts, dsd_state* stat
         (void)handle_facch_voice_end(ctx, (dsd_opts*)opts, state, ev);
         return;
     }
-    (void)handle_voice_end(ctx, (dsd_opts*)opts, state, ev->slot, "end", 1, 1, ev);
+    (void)handle_voice_end(ctx, (dsd_opts*)opts, state, ev->slot, "end", 1, 1, ev, DSD_CALL_END_TERMINATOR);
 }
 
 static void
 p25_sm_handle_event_idle(p25_sm_ctx_t* ctx, const dsd_opts* opts, dsd_state* state, const p25_sm_event_t* ev) {
     // MAC_IDLE may occur during brief gaps - use hangtime, not immediate release.
-    (void)handle_voice_end(ctx, (dsd_opts*)opts, state, ev->slot, "idle", 0, 0, ev);
+    (void)handle_voice_end(ctx, (dsd_opts*)opts, state, ev->slot, "idle", 0, 0, ev, DSD_CALL_END_EXPLICIT);
 }
 
 static void
 p25_sm_handle_event_tdu(p25_sm_ctx_t* ctx, const dsd_opts* opts, dsd_state* state, const p25_sm_event_t* ev) {
-    (void)handle_voice_end(ctx, (dsd_opts*)opts, state, 0, "tdu", 0, 1, ev);
+    (void)handle_voice_end(ctx, (dsd_opts*)opts, state, 0, "tdu", 0, 1, ev, DSD_CALL_END_TERMINATOR);
 }
 
 static void
 p25_sm_handle_event_hangtime(p25_sm_ctx_t* ctx, const dsd_opts* opts, dsd_state* state, const p25_sm_event_t* ev) {
-    (void)handle_voice_end(ctx, (dsd_opts*)opts, state, ev->slot, "mac-hangtime", 0, 0, ev);
+    (void)handle_voice_end(ctx, (dsd_opts*)opts, state, ev->slot, "mac-hangtime", 0, 0, ev, DSD_CALL_END_EXPLICIT);
 }
 
 static void
@@ -4467,27 +5462,78 @@ p25_sm_effective_hangtime(const dsd_state* state, double hangtime) {
     return hangtime;
 }
 
-static void
-p25_sm_tick_tuned_check_hangtime(p25_sm_ctx_t* ctx, dsd_opts* opts, dsd_state* state, double now_m, double hangtime) {
-    double dt_hang = 0.0;
-    double effective_hangtime = 0.0;
-    if (!ctx || ctx->t_hangtime_m <= 0.0) {
-        return;
+// An accepted assignment the SM has positive reason to follow keeps the carrier
+// until its acquisition window closes: the hangtime deadline bridges a
+// conversation's talker gaps, it does not cut short a call the site has already
+// granted on the other slot. An encryption-lockout reprobe is the exception --
+// it rests on one grant bit the ledger contradicts, so it may acquire but not
+// outlive the countdown the last followed transmission left running.
+static int
+p25_sm_followable_assignment_acquiring(const p25_sm_ctx_t* ctx, const dsd_opts* opts, const dsd_state* state,
+                                       double now_m, double grant_timeout) {
+    if (!ctx || grant_timeout <= 0.0) {
+        return 0;
     }
-    dt_hang = now_m - ctx->t_hangtime_m;
-    effective_hangtime = p25_sm_effective_hangtime(state, hangtime);
-    if (dt_hang >= effective_hangtime) {
-        int slot = ctx->vc_is_tdma && state ? state->p25_p2_active_slot : 0;
-        if (slot < 0 || slot > 1) {
-            slot = 0;
+    const int slot_count = ctx->vc_is_tdma ? 2 : 1;
+    for (int slot = 0; slot < slot_count; slot++) {
+        const p25_sm_slot_ctx_t* slot_ctx = &ctx->slots[slot];
+        const int pending = slot_ctx->data_call ? (slot_ctx->grant_active && ctx->vc_is_tdma)
+                                                : p25_sm_slot_waiting_for_voice(ctx, state, slot);
+        // An assignment whose voice encryption lockout is refusing to follow is
+        // not one the SM is waiting on, however live it looks: its transmission
+        // may outlast several hangtimes and the carrier would never come back.
+        if (slot_ctx->enc_lockout_reprobe || !pending || p25_voice_start_crypto_suppressed(opts, state, slot)) {
+            continue;
         }
-        p25_sm_diagf(opts, state, ctx, "hang_expired",
-                     "phase=%s freq=%ld slot=%d tg=%d src=%d reason=inactivity elapsed=%.3f hangtime=%.3f",
-                     p25_voice_phase_name(ctx), ctx->vc_freq_hz, slot, ctx->slots[slot].target_id,
-                     ctx->slots[slot].src > 0 ? ctx->slots[slot].src : ctx->slots[slot].last_end_src, dt_hang,
-                     effective_hangtime);
-        do_release(ctx, opts, state, "hangtime-expired", 0);
+        // This slot's own acquisition window, never the channel-wide tune
+        // stamp: t_tune_m is refreshed by every accepted assignment, including
+        // the reprobe this loop deliberately skips, so flooring on it would let
+        // a reprobe re-open some other slot's expired window once per repeat
+        // and hold the carrier for the life of the encrypted call.
+        const double started_m = slot_ctx->last_grant_m > 0.0 ? slot_ctx->last_grant_m : ctx->t_tune_m;
+        if (started_m > 0.0 && now_m >= started_m && (now_m - started_m) < grant_timeout) {
+            return 1;
+        }
     }
+    return 0;
+}
+
+static int
+p25_sm_tick_tuned_check_hangtime(p25_sm_ctx_t* ctx, dsd_opts* opts, dsd_state* state, double now_m, double hangtime,
+                                 double grant_timeout) {
+    const double started_m = p25_sm_hangtime_started_m(ctx);
+    if (started_m <= 0.0 || now_m < started_m) {
+        return 0;
+    }
+    const double dt_hang = now_m - started_m;
+    const double effective_hangtime = p25_sm_effective_hangtime(state, hangtime);
+    if (dt_hang < effective_hangtime) {
+        return 0;
+    }
+    // A crypto classification still inside its budget owns the release instead:
+    // the call may yet resolve clear and become followed traffic, and
+    // p25_sm_tick_crypto_classification() gives the carrier up when it lapses.
+    if (p25_sm_crypto_classification_in_flight(ctx, state, now_m, grant_timeout)
+        || p25_sm_followable_assignment_acquiring(ctx, opts, state, now_m, grant_timeout)) {
+        return 0;
+    }
+    int slot = ctx->vc_is_tdma && state ? state->p25_p2_active_slot : 0;
+    if (slot < 0 || slot > 1) {
+        slot = 0;
+    }
+    p25_sm_diagf(opts, state, ctx, "hang_expired",
+                 "phase=%s freq=%ld slot=%d tg=%d src=%d reason=inactivity elapsed=%.3f hangtime=%.3f",
+                 p25_voice_phase_name(ctx), ctx->vc_freq_hz, slot, ctx->slots[slot].target_id,
+                 ctx->slots[slot].src > 0 ? ctx->slots[slot].src : ctx->slots[slot].last_end_src, dt_hang,
+                 effective_hangtime);
+    // The deadline fired and this tick belongs to it, whatever the release
+    // came back with. do_release() returns 0 when another thread already holds
+    // the release lock, and when the tuner defers or refuses the CC return --
+    // and that path latches state->p25_sm_force_release so the next tick
+    // retries. Reporting "not handled" would instead let this same tick fall
+    // through and issue a second, differently-labelled release on top of it.
+    (void)do_release(ctx, opts, state, "hangtime-expired", 0);
+    return 1;
 }
 
 #ifdef USE_RADIO
@@ -4776,6 +5822,13 @@ p25_sm_tick_tuned_wait_voice(p25_sm_ctx_t* ctx, dsd_opts* opts, dsd_state* state
     if (timeout_start_m <= 0.0) {
         return;
     }
+    // Deliberately no companion hold here: the carrier's stay is the shorter
+    // of the companion's hangtime bridge and a pending assignment's own
+    // acquisition window. When that window closes with nothing followed, the
+    // visit ends even inside the companion's gap -- pinned by the
+    // pending-companion and lockout-reprobe grant-timeout tests. The
+    // crypto-classification tick differs: classification is evidence a call
+    // may still resolve clear, so its timeout defers to the companion.
     if ((now_m - timeout_start_m) >= grant_timeout) {
         do_release(ctx, opts, state, "grant-timeout", 0);
     }
@@ -4794,6 +5847,34 @@ p25_sm_crypto_slot_expired(const p25_sm_ctx_t* ctx, const dsd_state* state, int 
     return started_m > 0.0 && (now_m - started_m) >= grant_timeout;
 }
 
+// Whether any slot is still inside its crypto-classification budget. Such a
+// slot owns the release: the call may yet resolve clear and become followed
+// traffic, and p25_sm_tick_crypto_classification() releases the carrier the
+// moment the budget lapses. The hangtime countdown keeps running underneath and
+// takes over then, so a call whose companion armed the countdown is not torn
+// down mid-classification with the countdown's remainder as its whole budget.
+static int
+p25_sm_crypto_classification_in_flight(const p25_sm_ctx_t* ctx, const dsd_state* state, double now_m,
+                                       double grant_timeout) {
+    if (!ctx || !state || grant_timeout <= 0.0) {
+        return 0;
+    }
+    const int slot_count = ctx->vc_is_tdma ? 2 : 1;
+    for (int slot = 0; slot < slot_count; slot++) {
+        if (ctx->slots[slot].data_call || state->p25_crypto_state[slot] != DSD_P25_CRYPTO_ENCRYPTED_PENDING) {
+            continue;
+        }
+        if (ctx->vc_is_tdma && !ctx->slots[slot].grant_active) {
+            continue;
+        }
+        const double started_m = ctx->slots[slot].crypto_attempt_m;
+        if (started_m > 0.0 && now_m >= started_m && (now_m - started_m) < grant_timeout) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static int
 p25_sm_block_expired_crypto_slot(p25_sm_ctx_t* ctx, dsd_opts* opts, dsd_state* state, int slot) {
     if (!ctx->vc_is_tdma && slot == 0 && state->p25_p1_crypto_conflict.active) {
@@ -4803,7 +5884,10 @@ p25_sm_block_expired_crypto_slot(p25_sm_ctx_t* ctx, dsd_opts* opts, dsd_state* s
         sm_log(opts, state, "crypto-conflict-timeout");
         return 1;
     }
-    p25_crypto_block_pending(state, slot);
+    // The window lapsing means no FEC-accepted ESS arrived, not that the call
+    // is encrypted. Return the slot to unclassified before releasing so the
+    // canonical call and UI never claim encryption nothing observed.
+    p25_crypto_expire_pending(state, slot);
     ctx->slots[slot].voice_active = 0;
     if (ctx->vc_is_tdma) {
         p25_voice_clear_slot_grant(ctx, state, slot);
@@ -4814,13 +5898,23 @@ p25_sm_block_expired_crypto_slot(p25_sm_ctx_t* ctx, dsd_opts* opts, dsd_state* s
     return 0;
 }
 
+// The companion holds the carrier while it is active *or* while its own
+// conversation gap is still inside the hangtime window -- the same bridge the
+// enc-lockout release honors. The expired slot's classification is dismantled
+// either way; only the whole-carrier release is deferred to the hangtime tick.
 static int
-p25_sm_expired_slot_has_active_companion(const p25_sm_ctx_t* ctx, const dsd_state* state, const int expired[2]) {
+p25_sm_expired_slot_has_active_companion(const p25_sm_ctx_t* ctx, const dsd_state* state, const int expired[2],
+                                         double now_m) {
     if (!ctx->vc_is_tdma) {
         return 0;
     }
     for (int slot = 0; slot < 2; slot++) {
-        if (expired[slot] && p25_voice_other_slot_active(ctx, state, slot ^ 1)) {
+        if (!expired[slot]) {
+            continue;
+        }
+        const int other = slot ^ 1;
+        if (p25_voice_other_slot_active(ctx, state, other)
+            || p25_voice_companion_gap_within_hangtime(ctx, state, other, now_m)) {
             return 1;
         }
     }
@@ -4830,8 +5924,10 @@ p25_sm_expired_slot_has_active_companion(const p25_sm_ctx_t* ctx, const dsd_stat
 static int
 p25_sm_recover_expired_followed_p1_conflict(p25_sm_ctx_t* ctx, dsd_opts* opts, dsd_state* state, double now_m,
                                             double grant_timeout) {
-    if (!ctx || !opts || !state || opts->trunk_tune_enc_calls == 0 || ctx->vc_is_tdma
-        || !state->p25_p1_crypto_conflict.active
+    // Applies under encryption lockout as well: the quarantined tuple never
+    // corroborated against a call whose service options are explicit clear, so
+    // the presumption of clear resumes the call instead of releasing it.
+    if (!ctx || !opts || !state || ctx->vc_is_tdma || !state->p25_p1_crypto_conflict.active
         || !p25_grant_service_options_are_explicit_clear(ctx->slots[0].svc_bits)
         || !p25_sm_crypto_slot_expired(ctx, state, 0, now_m, grant_timeout)) {
         return 0;
@@ -4846,7 +5942,6 @@ p25_sm_recover_expired_followed_p1_conflict(p25_sm_ctx_t* ctx, dsd_opts* opts, d
         ctx->slots[0].voice_active = 1;
         ctx->slots[0].last_active_m = now_m;
         ctx->t_voice_m = now_m;
-        ctx->t_hangtime_m = 0.0;
     }
     p25_sm_diagf(opts, state, ctx, "crypto_conflict_timeout",
                  "slot=0 algid=0x%02X keyid=0x%04X freq=%ld tg=%d action=resume-clear", algid, keyid, ctx->vc_freq_hz,
@@ -4885,7 +5980,9 @@ p25_sm_tick_crypto_classification(p25_sm_ctx_t* ctx, dsd_opts* opts, dsd_state* 
     if (!expired_any) {
         return 0;
     }
-    if (p25_sm_expired_slot_has_active_companion(ctx, state, expired)) {
+    if (p25_sm_expired_slot_has_active_companion(ctx, state, expired, now_m)) {
+        p25_sm_diagf(opts, state, ctx, "crypto_timeout_companion_hold", "expired=%d/%d", expired[0], expired[1]);
+        sm_log(opts, state, "crypto-timeout-companion-hold");
         return 0;
     }
 
@@ -4908,12 +6005,14 @@ p25_sm_tick_tuned(p25_sm_ctx_t* ctx, dsd_opts* opts, dsd_state* state, double no
         p25_sm_update_ui_mode(ctx, state);
         return;
     }
-    if (ctx->t_hangtime_m > 0.0) {
-        p25_sm_update_ui_mode(ctx, state);
-        p25_sm_tick_tuned_check_hangtime(ctx, opts, state, now_m, hangtime);
+    p25_sm_update_ui_mode(ctx, state);
+    // Two deadlines, both always live. The hangtime countdown is derived, so
+    // there is no longer an "armed" state that could hide the acquisition
+    // watchdog from a carrier that is in hangtime and acquiring at once -- which
+    // is exactly what a lockout reprobe on a retained carrier looks like.
+    if (p25_sm_tick_tuned_check_hangtime(ctx, opts, state, now_m, hangtime, grant_timeout)) {
         return;
     }
-    p25_sm_update_ui_mode(ctx, state);
     if (!ctx->vc_activity_seen || p25_sm_has_pending_voice_grant(ctx, state) || p25_sm_has_pending_data_grant(ctx)) {
         p25_sm_tick_tuned_wait_voice(ctx, opts, state, now_m, grant_timeout);
     }
@@ -5049,12 +6148,261 @@ p25_sm_slot_grant_newer_than(int slot, double observed_m) {
  * ============================================================================ */
 
 static int
+p25_sm_conventional_slot(const p25_sm_event_t* ev) {
+    if (ev->slot < 0 || ev->slot > 1) {
+        return 0;
+    }
+    return ev->slot;
+}
+
+static int
+p25_sm_conventional_is_group(const dsd_state* state, const p25_sm_event_t* ev, int slot) {
+    if (ev->identity_valid) {
+        return ev->is_group ? 1 : 0;
+    }
+    dsd_call_snapshot call;
+    if (dsd_call_state_get(state, (uint8_t)slot, &call) > 0 && call.phase == DSD_CALL_PHASE_ACTIVE) {
+        return call.kind != DSD_CALL_KIND_PRIVATE_VOICE;
+    }
+    return 1;
+}
+
+static uint32_t
+p25_sm_conventional_target(const dsd_state* state, const p25_sm_event_t* ev, int slot, int is_group) {
+    if (ev->identity_valid) {
+        return p25_call_positive_id(is_group ? ev->tg : ev->dst);
+    }
+    dsd_call_snapshot call;
+    if (dsd_call_state_get(state, (uint8_t)slot, &call) <= 0 || call.phase != DSD_CALL_PHASE_ACTIVE
+        || call.ota_target_id > UINT32_MAX) {
+        return 0U;
+    }
+    return (uint32_t)call.ota_target_id;
+}
+
+static int
+p25_sm_conventional_source(const dsd_state* state, const p25_sm_event_t* ev, int slot) {
+    if (ev->identity_valid) {
+        return ev->src;
+    }
+    dsd_call_snapshot call;
+    if (dsd_call_state_get(state, (uint8_t)slot, &call) <= 0 || call.phase != DSD_CALL_PHASE_ACTIVE
+        || call.ota_source_id > (uint64_t)INT_MAX) {
+        return 0;
+    }
+    return (int)call.ota_source_id;
+}
+
+static int
+p25_sm_conventional_protocol(const dsd_state* state) {
+    if (DSD_SYNC_IS_P25(state->lastsynctype)) {
+        return state->lastsynctype;
+    }
+    return DSD_SYNC_IS_P25P2(state->synctype) ? DSD_SYNC_P25P2_POS : DSD_SYNC_P25P1_POS;
+}
+
+static int
+p25_sm_conventional_active_voice(const dsd_state* state, int slot, dsd_call_snapshot* call) {
+    if (!state || !call || slot < 0 || slot > 1 || dsd_call_state_get(state, (uint8_t)slot, call) <= 0) {
+        return 0;
+    }
+    return call->phase == DSD_CALL_PHASE_ACTIVE && DSD_SYNC_IS_P25(call->protocol)
+           && (call->kind == DSD_CALL_KIND_GROUP_VOICE || call->kind == DSD_CALL_KIND_PRIVATE_VOICE);
+}
+
+static uint32_t
+p25_sm_conventional_snapshot_target(const dsd_call_snapshot* call) {
+    if (call->ota_target_id != 0U) {
+        return (uint32_t)call->ota_target_id;
+    }
+    return (uint32_t)call->policy_target_id;
+}
+
+typedef struct {
+    int protocol;
+    int is_group;
+    uint32_t target;
+    uint32_t source;
+    uint32_t group_id;
+    uint32_t private_id;
+    long frequency_hz;
+} p25_sm_conventional_call_t;
+
+static long
+p25_sm_conventional_frequency(const dsd_state* state, int slot, long fallback_hz) {
+    long frequency_hz = state->p25_vc_freq[slot];
+    if (frequency_hz == 0) {
+        frequency_hz = state->trunk_vc_freq[slot];
+    }
+    return frequency_hz != 0 ? frequency_hz : fallback_hz;
+}
+
+static int
+p25_sm_conventional_identified_call(const dsd_state* state, const p25_sm_event_t* ev, int slot,
+                                    p25_sm_conventional_call_t* call) {
+    call->is_group = p25_sm_conventional_is_group(state, ev, slot);
+    call->target = p25_sm_conventional_target(state, ev, slot, call->is_group);
+    if (call->target == 0U) {
+        return 0;
+    }
+    call->source = p25_call_positive_id(p25_sm_conventional_source(state, ev, slot));
+    call->protocol = p25_sm_conventional_protocol(state);
+    call->frequency_hz = p25_sm_conventional_frequency(state, slot, 0);
+    if (call->is_group) {
+        call->group_id = call->target;
+    } else {
+        call->private_id = call->target;
+    }
+    return 1;
+}
+
+static int
+p25_sm_conventional_anonymous_call(const dsd_state* state, int slot, p25_sm_conventional_call_t* call) {
+    dsd_call_snapshot active_call;
+    if (!p25_sm_conventional_active_voice(state, slot, &active_call)) {
+        return 0;
+    }
+    call->target = p25_sm_conventional_snapshot_target(&active_call);
+    if (call->target == 0U) {
+        return 0;
+    }
+    call->is_group = active_call.kind == DSD_CALL_KIND_GROUP_VOICE;
+    call->source = active_call.ota_source_id <= UINT32_MAX ? (uint32_t)active_call.ota_source_id : 0U;
+    call->protocol = active_call.protocol;
+    call->frequency_hz = p25_sm_conventional_frequency(state, slot, active_call.frequency_hz);
+    if (call->is_group) {
+        call->group_id = call->target;
+    } else {
+        call->private_id = call->target;
+    }
+    return 1;
+}
+
+static int
+p25_sm_conventional_resolve_call(const dsd_state* state, const p25_sm_event_t* ev, int slot,
+                                 p25_sm_conventional_call_t* call) {
+    if (ev->identity_valid) {
+        return p25_sm_conventional_identified_call(state, ev, slot, call);
+    }
+    return p25_sm_conventional_anonymous_call(state, slot, call);
+}
+
+static int
+p25_sm_publish_conventional_voice(dsd_opts* opts, dsd_state* state, const p25_sm_event_t* ev, int ptt_retransmit) {
+    if (!state || !ev) {
+        return 0;
+    }
+    const int slot = p25_sm_conventional_slot(ev);
+    p25_sm_conventional_call_t call = {0};
+    if (!p25_sm_conventional_resolve_call(state, ev, slot, &call)) {
+        return 0;
+    }
+    const int has_service_metadata = p25_sm_svc_bits_valid(ev->svc_bits);
+    const int service_options = has_service_metadata ? ev->svc_bits : 0;
+    dsd_call_observation observation = {
+        .protocol = call.protocol,
+        .slot = (uint8_t)slot,
+        .kind = call.is_group ? DSD_CALL_KIND_GROUP_VOICE : DSD_CALL_KIND_PRIVATE_VOICE,
+        .ota_target_id = call.target,
+        .policy_target_id = call.target,
+        .ota_source_id = call.source,
+        .frequency_hz = call.frequency_hz,
+        .service_options = (uint16_t)service_options,
+        .emergency = (uint8_t)((service_options & 0x80) != 0),
+        .priority = (uint8_t)(service_options & 0x07),
+        .has_service_metadata = (uint8_t)has_service_metadata,
+    };
+    dsd_call_boundary boundary = DSD_CALL_BOUNDARY_CONTINUE;
+    if (ev->identity_valid && ev->type == P25_SM_EV_PTT && !ptt_retransmit) {
+        boundary = DSD_CALL_BOUNDARY_BEGIN;
+    }
+    (void)dsd_call_state_observe(state, &observation, boundary);
+    p25_call_publish_crypto(opts, state, slot, 0.0);
+    (void)dsd_call_state_update_media(state, (uint8_t)slot, 1, 0.0);
+    dsd_event_sync_slot(opts, state, (uint8_t)slot);
+    return 1;
+}
+
+static int
+p25_sm_conventional_ptt_is_retransmission(const p25_sm_ctx_t* ctx, const dsd_state* state, const p25_sm_event_t* ev,
+                                          double observed_m, double* out_elapsed_s) {
+    if (!ctx || !state || !ev || ev->type != P25_SM_EV_PTT || !ev->ptt_signature_valid || ev->slot < 0
+        || ev->slot > 1) {
+        return 0;
+    }
+    dsd_call_snapshot call;
+    if (dsd_call_state_get(state, (uint8_t)ev->slot, &call) <= 0 || call.phase != DSD_CALL_PHASE_ACTIVE
+        || !DSD_SYNC_IS_P25P2(call.protocol)) {
+        return 0;
+    }
+    return p25_ptt_marker_matches(ctx, ev->slot, ev, observed_m, out_elapsed_s);
+}
+
+static void
+p25_sm_note_conventional_ptt(p25_sm_ctx_t* ctx, dsd_opts* opts, const dsd_state* state, const p25_sm_event_t* ev,
+                             int slot, double observed_m, int ptt_retransmit, double ptt_elapsed_s) {
+    p25_voice_accept_ptt_marker(ctx, slot, ev, observed_m);
+    if (ptt_retransmit) {
+        p25_sm_diagf(opts, state, ctx, "ptt_retransmit", "slot=%d tg=%d src=%d elapsed=%.3f provenance=%s", slot,
+                     ev->tg, ev->src, ptt_elapsed_s, ev->facch ? "facch" : "sacch");
+    }
+}
+
+static void
+p25_sm_invalidate_conventional_replacement(p25_sm_ctx_t* ctx, const dsd_state* state, int slot,
+                                           const dsd_call_snapshot* call_before, int had_call_before) {
+    dsd_call_snapshot call_after;
+    if (had_call_before && dsd_call_state_get(state, (uint8_t)slot, &call_after) > 0
+        && call_after.epoch != call_before->epoch) {
+        p25_ptt_marker_invalidate(ctx, slot);
+    }
+}
+
+static void
+p25_sm_finish_conventional_voice(p25_sm_ctx_t* ctx, dsd_opts* opts, dsd_state* state, const p25_sm_event_t* ev,
+                                 int slot, double observed_m, int ptt_retransmit, double ptt_elapsed_s,
+                                 const dsd_call_snapshot* call_before, int had_call_before) {
+    if (!p25_sm_publish_conventional_voice(opts, state, ev, ptt_retransmit)) {
+        return;
+    }
+    if (ev->type == P25_SM_EV_PTT) {
+        p25_sm_note_conventional_ptt(ctx, opts, state, ev, slot, observed_m, ptt_retransmit, ptt_elapsed_s);
+        return;
+    }
+    p25_sm_invalidate_conventional_replacement(ctx, state, slot, call_before, had_call_before);
+}
+
+static int
+p25_sm_voice_start_lacks_trunk_assignment(const p25_sm_ctx_t* ctx, const dsd_opts* opts) {
+    return ctx && opts && opts->trunk_enable == 1 && ctx->state != P25_SM_TUNED;
+}
+
+static int
 p25_sm_emit_voice_start_event(dsd_opts* opts, dsd_state* state, const p25_sm_event_t* ev, const char* why) {
     p25_sm_ctx_t* ctx = p25_sm_get_ctx();
     if (!ctx->initialized) {
         p25_sm_init_ctx(ctx, opts, state);
     }
-    return handle_voice_start(ctx, opts, state, ev, why);
+    if (p25_sm_voice_start_lacks_trunk_assignment(ctx, opts)) {
+        p25_sm_diagf(opts, state, ctx, "voice_start_ignored", "reason=no-trunk-assignment kind=%s slot=%d tg=%d src=%d",
+                     why, ev->slot, ev->tg, ev->src);
+        return 0;
+    }
+    const int trunk_assignment_active = ctx->state == P25_SM_TUNED;
+    const double observed_m = ev->observed_m > 0.0 ? ev->observed_m : dsd_time_now_monotonic_s();
+    double ptt_elapsed_s = 0.0;
+    const int ptt_retransmit = !trunk_assignment_active
+                               && p25_sm_conventional_ptt_is_retransmission(ctx, state, ev, observed_m, &ptt_elapsed_s);
+    dsd_call_snapshot call_before = {0};
+    const int conventional_slot = p25_sm_conventional_slot(ev);
+    const int had_call_before =
+        !trunk_assignment_active && state && dsd_call_state_get(state, (uint8_t)conventional_slot, &call_before) > 0;
+    const int accepted = handle_voice_start(ctx, opts, state, ev, why);
+    if (accepted && !trunk_assignment_active) {
+        p25_sm_finish_conventional_voice(ctx, opts, state, ev, conventional_slot, observed_m, ptt_retransmit,
+                                         ptt_elapsed_s, &call_before, had_call_before);
+    }
+    return accepted;
 }
 
 int
@@ -5066,6 +6414,20 @@ p25_sm_emit_ptt(dsd_opts* opts, dsd_state* state, int slot) {
 int
 p25_sm_emit_ptt_call(dsd_opts* opts, dsd_state* state, int slot, int tg, int dst, int src, int is_group, int svc_bits) {
     p25_sm_event_t ev = p25_sm_ev_ptt_call(slot, tg, dst, src, is_group, svc_bits);
+    return p25_sm_emit_voice_start_event(opts, state, &ev, "ptt");
+}
+
+int
+p25_sm_emit_ptt_call_metadata(dsd_opts* opts, dsd_state* state, int slot, int tg, int dst, int src, int is_group,
+                              int svc_bits, const uint8_t signature[P25_SM_PTT_SIGNATURE_BYTES], double observed_m,
+                              int facch) {
+    p25_sm_event_t ev = p25_sm_ev_ptt_call(slot, tg, dst, src, is_group, svc_bits);
+    if (signature && observed_m > 0.0) {
+        DSD_MEMCPY(ev.ptt_signature, signature, sizeof(ev.ptt_signature));
+        ev.ptt_signature_valid = 1;
+    }
+    ev.observed_m = observed_m;
+    ev.facch = facch ? 1 : 0;
     return p25_sm_emit_voice_start_event(opts, state, &ev, "ptt");
 }
 
@@ -5082,10 +6444,23 @@ p25_sm_emit_active_call(dsd_opts* opts, dsd_state* state, int slot, int tg, int 
     return p25_sm_emit_voice_start_event(opts, state, &ev, "active");
 }
 
+int
+p25_sm_emit_active_call_source_absent(dsd_opts* opts, dsd_state* state, int slot, int tg, int dst, int is_group,
+                                      int svc_bits) {
+    p25_sm_event_t ev = p25_sm_ev_active_call_source_absent(slot, tg, dst, is_group, svc_bits);
+    return p25_sm_emit_voice_start_event(opts, state, &ev, "active");
+}
+
 void
 p25_sm_emit_end(dsd_opts* opts, dsd_state* state, int slot) {
+    p25_sm_ctx_t* ctx = p25_sm_get_ctx();
+    const int trunk_assignment_active = ctx->state == P25_SM_TUNED;
     p25_sm_event_t ev = p25_sm_ev_end(slot);
-    p25_sm_event(p25_sm_get_ctx(), opts, state, &ev);
+    p25_sm_event(ctx, opts, state, &ev);
+    if (!trunk_assignment_active) {
+        p25_ptt_marker_invalidate(ctx, slot);
+        p25_call_end_slot_ex(opts, state, slot, 0.0, DSD_CALL_END_TERMINATOR);
+    }
 }
 
 int
@@ -5098,7 +6473,43 @@ p25_sm_emit_end_call_at(dsd_opts* opts, dsd_state* state, int slot, int tg, int 
         p25_sm_init_ctx(ctx, opts, state);
     }
     p25_sm_event_t ev = p25_sm_ev_end_call_at(slot, tg, src, observed_m);
-    return handle_voice_end(ctx, opts, state, slot, "end", 1, 1, &ev);
+    const int trunk_assignment_active = ctx->state == P25_SM_TUNED;
+    const int accepted = handle_voice_end(ctx, opts, state, slot, "end", 1, 1, &ev, DSD_CALL_END_TERMINATOR);
+    if (!trunk_assignment_active && accepted) {
+        p25_ptt_marker_invalidate(ctx, slot);
+        p25_call_end_slot_ex(opts, state, slot, observed_m, DSD_CALL_END_TERMINATOR);
+    }
+    return accepted;
+}
+
+void
+p25_sm_emit_mac_release(dsd_opts* opts, dsd_state* state, int slot, double observed_m) {
+    if (slot < 0 || slot > 1) {
+        return;
+    }
+    p25_sm_ctx_t* ctx = p25_sm_get_ctx();
+    if (!ctx->initialized) {
+        p25_sm_init_ctx(ctx, opts, state);
+    }
+
+    const double ended_m = observed_m > 0.0 ? observed_m : dsd_time_now_monotonic_s();
+    p25_ptt_marker_invalidate(ctx, slot);
+    // A MAC_RELEASE ends a transmission the SM was following just as a
+    // MAC_END_PTT does, so it owes the countdown the same stamp. Without it the
+    // derived origin falls back to whatever an earlier over left behind and the
+    // carrier is dropped the instant this one stops, with no hangtime at all.
+    if (ctx->slots[slot].voice_active) {
+        p25_sm_note_followed_until(ctx, slot,
+                                   ctx->slots[slot].last_active_m > 0.0 ? ctx->slots[slot].last_active_m : ended_m);
+    }
+    ctx->slots[slot].voice_active = 0;
+    ctx->slots[slot].last_active_m = 0.0;
+    ctx->slots[slot].last_stop_m = ended_m;
+    if (state) {
+        (void)dsd_tg_policy_clear_active_call(state, ctx->vc_is_tdma ? slot : -1);
+    }
+    p25_call_end_slot_ex(opts, state, slot, ended_m, DSD_CALL_END_TERMINATOR);
+    p25_sm_update_ui_mode(ctx, state);
 }
 
 int
@@ -5111,37 +6522,85 @@ p25_sm_emit_facch_end_call_at(dsd_opts* opts, dsd_state* state, int slot, int tg
         p25_sm_init_ctx(ctx, opts, state);
     }
     p25_sm_event_t ev = p25_sm_ev_facch_end_call_at(slot, tg, src, observed_m);
-    return handle_facch_voice_end(ctx, opts, state, &ev);
+    const int trunk_assignment_active = ctx->state == P25_SM_TUNED;
+    const int result = handle_facch_voice_end(ctx, opts, state, &ev);
+    if (!trunk_assignment_active && result != P25_SM_END_IGNORED) {
+        p25_ptt_marker_invalidate(ctx, slot);
+        p25_call_end_slot_ex(opts, state, slot, observed_m, DSD_CALL_END_TERMINATOR);
+    }
+    return result;
 }
 
 void
 p25_sm_emit_idle(dsd_opts* opts, dsd_state* state, int slot) {
+    p25_sm_ctx_t* ctx = p25_sm_get_ctx();
+    const int trunk_assignment_active = ctx->state == P25_SM_TUNED;
     p25_sm_event_t ev = p25_sm_ev_idle(slot);
-    p25_sm_event(p25_sm_get_ctx(), opts, state, &ev);
+    p25_sm_event(ctx, opts, state, &ev);
+    if (!trunk_assignment_active) {
+        p25_ptt_marker_invalidate(ctx, slot);
+        p25_call_end_slot(opts, state, slot, 0.0);
+    }
 }
 
 void
 p25_sm_emit_idle_at(dsd_opts* opts, dsd_state* state, int slot, double observed_m) {
+    p25_sm_ctx_t* ctx = p25_sm_get_ctx();
+    const int trunk_assignment_active = ctx->state == P25_SM_TUNED;
     p25_sm_event_t ev = p25_sm_ev_idle_at(slot, observed_m);
-    p25_sm_event(p25_sm_get_ctx(), opts, state, &ev);
+    p25_sm_event(ctx, opts, state, &ev);
+    if (!trunk_assignment_active) {
+        p25_ptt_marker_invalidate(ctx, slot);
+        p25_call_end_slot(opts, state, slot, observed_m);
+    }
 }
 
 void
 p25_sm_emit_hangtime(dsd_opts* opts, dsd_state* state, int slot) {
+    p25_sm_ctx_t* ctx = p25_sm_get_ctx();
+    const int trunk_assignment_active = ctx->state == P25_SM_TUNED;
     p25_sm_event_t ev = p25_sm_ev_hangtime(slot);
-    p25_sm_event(p25_sm_get_ctx(), opts, state, &ev);
+    p25_sm_event(ctx, opts, state, &ev);
+    if (!trunk_assignment_active) {
+        p25_ptt_marker_invalidate(ctx, slot);
+        p25_call_end_slot(opts, state, slot, 0.0);
+    }
 }
 
 void
 p25_sm_emit_tdu(dsd_opts* opts, dsd_state* state) {
+    p25_sm_ctx_t* ctx = p25_sm_get_ctx();
+    const int trunk_assignment_active = ctx->state == P25_SM_TUNED;
     p25_sm_event_t ev = p25_sm_ev_tdu();
-    p25_sm_event(p25_sm_get_ctx(), opts, state, &ev);
+    p25_sm_event(ctx, opts, state, &ev);
+    if (!trunk_assignment_active) {
+        p25_ptt_marker_invalidate(ctx, 0);
+        p25_call_end_slot_ex(opts, state, 0, 0.0, DSD_CALL_END_TERMINATOR);
+    }
 }
 
 void
 p25_sm_emit_enc(dsd_opts* opts, dsd_state* state, int slot, int algid, int keyid, int tg) {
     p25_sm_event_t ev = p25_sm_ev_enc(slot, algid, keyid, tg);
     p25_sm_event(p25_sm_get_ctx(), opts, state, &ev);
+}
+
+void
+p25_sm_note_enc_suppressed(dsd_opts* opts, dsd_state* state, int slot) {
+    (void)opts;
+    if (slot < 0 || slot > 1) {
+        return;
+    }
+    // The gate close matches what the per-repeat lockout action used to
+    // re-assert; it holds even when no suppression context exists.
+    if (state) {
+        state->p25_p2_audio_allowed[slot] = 0;
+    }
+    p25_sm_ctx_t* ctx = p25_sm_get_ctx();
+    if (!ctx->initialized || ctx->slots[slot].last_enc_suppress_m <= 0.0) {
+        return;
+    }
+    ctx->slots[slot].last_enc_suppress_m = dsd_time_now_monotonic_s();
 }
 
 void
@@ -5168,51 +6627,90 @@ p25_sm_release(p25_sm_ctx_t* ctx, dsd_opts* opts, dsd_state* state, const char* 
  * Encryption Lockout Helper
  * ============================================================================ */
 
+static uint32_t
+p25_lockout_call_target(const dsd_call_snapshot* call) {
+    if (call->ota_target_id != 0U && call->ota_target_id <= UINT32_MAX) {
+        return (uint32_t)call->ota_target_id;
+    }
+    if (call->policy_target_id != 0U && call->policy_target_id <= UINT32_MAX) {
+        return (uint32_t)call->policy_target_id;
+    }
+    return 0U;
+}
+
+static uint64_t
+p25_lockout_next_epoch(uint64_t epoch) {
+    epoch++;
+    return epoch == 0U ? 1U : epoch;
+}
+
+static void
+p25_lockout_snapshot_from_observation(const dsd_state* state, uint8_t slot, int target, int svc_bits, int is_group,
+                                      uint64_t epoch, dsd_call_snapshot* call) {
+    DSD_MEMSET(call, 0, sizeof(*call));
+    call->epoch = epoch;
+    call->phase = DSD_CALL_PHASE_ACTIVE;
+    call->protocol = DSD_SYNC_IS_P25(state->lastsynctype) ? state->lastsynctype
+                                                          : (slot == 0U ? DSD_SYNC_P25P1_POS : DSD_SYNC_P25P2_POS);
+    call->slot = slot;
+    call->kind = is_group ? DSD_CALL_KIND_GROUP_VOICE : DSD_CALL_KIND_PRIVATE_VOICE;
+    call->ota_target_id = (uint32_t)target;
+    call->policy_target_id = (uint32_t)target;
+    call->service_options = (uint16_t)svc_bits;
+    call->crypto = DSD_CALL_CRYPTO_ENCRYPTED;
+}
+
+static int
+p25_lockout_get_call_context(const dsd_state* state, uint8_t slot, int target, int svc_bits, int is_group,
+                             dsd_call_snapshot* call) {
+    uint64_t epoch = 1U;
+    if (dsd_call_state_get(state, slot, call) > 0) {
+        const dsd_call_kind kind = is_group ? DSD_CALL_KIND_GROUP_VOICE : DSD_CALL_KIND_PRIVATE_VOICE;
+        if (call->phase == DSD_CALL_PHASE_ACTIVE && DSD_SYNC_IS_P25(call->protocol) && call->kind == kind
+            && p25_lockout_call_target(call) == (uint32_t)target) {
+            return 1;
+        }
+        epoch = p25_lockout_next_epoch(call->epoch);
+    }
+    p25_lockout_snapshot_from_observation(state, slot, target, svc_bits, is_group, epoch, call);
+    return 0;
+}
+
+static int
+p25_lockout_end_matching_call(dsd_state* state, uint8_t slot, dsd_call_snapshot* call) {
+    const uint64_t epoch = call->epoch;
+    if (dsd_call_state_end(state, slot, dsd_time_now_monotonic_s()) <= 0) {
+        return 0;
+    }
+
+    dsd_call_snapshot ended;
+    if (dsd_call_state_get(state, slot, &ended) <= 0 || ended.epoch != epoch || ended.phase != DSD_CALL_PHASE_ENDED) {
+        return 0;
+    }
+    *call = ended;
+    return 1;
+}
+
 void
-p25_emit_enc_lockout_once_typed(dsd_opts* opts, dsd_state* state, uint8_t slot, int target, int svc_bits,
-                                int is_group) {
+p25_emit_enc_lockout_once_typed(dsd_opts* opts, dsd_state* state, uint8_t slot, int target, int svc_bits, int is_group,
+                                int algid, int keyid) {
     if (!opts || !state || target <= 0) {
         return;
     }
     is_group = is_group ? 1 : 0;
 
-    p25_sm_note_encrypted_call_typed(opts, state, target, is_group);
-
-    // Prepare per-slot context. Keep live encryption fields intact: callers may
-    // still need ALG/KID/MI after this helper returns to keep audio gates closed.
-    if ((slot & 1) == 0) {
-        state->lasttg = (uint32_t)target;
-        if (svc_bits != 0) {
-            state->dmr_so = (uint16_t)svc_bits;
-            state->p25_service_options_valid[0] = 1U;
-        }
-    } else {
-        state->lasttgR = (uint32_t)target;
-        if (svc_bits != 0) {
-            state->dmr_soR = (uint16_t)svc_bits;
-            state->p25_service_options_valid[1] = 1U;
-        }
-    }
-    state->p25_policy_tg[slot & 1] = 0;
-    state->gi[slot & 1] = (int8_t)(is_group ? 0 : 1);
-
-    // Compose event text and push
-    Event_History_I* eh = (state->event_history_s != NULL) ? &state->event_history_s[slot & 1] : NULL;
-    if (eh) {
-        DSD_SNPRINTF(eh->Event_History_Items[0].internal_str, sizeof eh->Event_History_Items[0].internal_str,
-                     "Target: %d; has been locked out; Encryption Lock Out Enabled.", target);
-        dsd_event_history_mark_dirty(eh);
-        dsd_p25_optional_hook_watchdog_event_current(opts, state, (uint8_t)(slot & 1));
-        if (strncmp(eh->Event_History_Items[1].internal_str, eh->Event_History_Items[0].internal_str,
-                    sizeof eh->Event_History_Items[0].internal_str)
-            != 0) {
-            if (opts->event_out_file[0] != '\0') {
-                uint8_t swrite = DSD_SYNC_IS_P25P2(state->lastsynctype) ? 1 : 0;
-                dsd_p25_optional_hook_write_event_to_log_file(opts, state, (uint8_t)(slot & 1), swrite,
-                                                              eh->Event_History_Items[0].event_string);
-            }
-            dsd_p25_optional_hook_push_event_history(eh);
-            dsd_p25_optional_hook_init_event_history(eh, 0, 1);
+    p25_sm_note_encrypted_call_typed(opts, state, target, is_group, algid, keyid);
+    slot &= 1U;
+    if (state->event_history_s) {
+        dsd_call_snapshot call;
+        const int finalizes_call = p25_lockout_get_call_context(state, slot, target, svc_bits, is_group, &call);
+        char detail[160];
+        DSD_SNPRINTF(detail, sizeof(detail), "Target: %d; has been locked out; Encryption Lock Out Enabled.", target);
+        if (finalizes_call && p25_lockout_end_matching_call(state, slot, &call)) {
+            p25_lockout_note_phase1_epoch(state, (int)slot);
+            (void)dsd_event_emit_call_notice(opts, state, slot, &call, detail);
+        } else {
+            (void)dsd_event_emit_call_notice_nonfinalizing(opts, state, slot, &call, detail);
         }
     } else if (opts->verbose > 1) {
         p25_sm_log_status(opts, state, "enc-lo-skip-nohist");

@@ -5,15 +5,21 @@
 
 /*
  * Validate P25 Phase 2 stereo mixer gating uses per-slot gates and does not
- * cross-mute the opposite slot.
+ * cross-mute the opposite slot. A muted companion slot (including an
+ * encryption-lockout call) must be transparent: its channel mirrors the
+ * audible slot exactly as when the companion is idle, and its own audio is
+ * never emitted.
  */
 
 #include <dsd-neo/core/audio.h>
+#include <dsd-neo/core/call_state.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/state.h>
+#include <dsd-neo/core/state_ext.h>
 #include <dsd-neo/core/synctype_ids.h>
 #include <dsd-neo/runtime/p25_p2_audio_ring.h>
 #include <dsd-neo/runtime/udp_audio_hooks.h>
+#include <stdint.h>
 #include <stdio.h>
 #include "dsd-neo/core/opts_fwd.h"
 #include "dsd-neo/core/safe_api.h"
@@ -76,11 +82,24 @@ fill_f32_frame(float frame[160], float value) {
     }
 }
 
+static int
+seed_group_call(dsd_state* state, uint8_t slot, uint64_t target) {
+    const dsd_call_observation observation = {
+        .protocol = DSD_SYNC_P25P2_POS,
+        .slot = slot,
+        .kind = DSD_CALL_KIND_GROUP_VOICE,
+        .ota_target_id = target,
+        .policy_target_id = target,
+        .observed_m = 1.0,
+    };
+    return dsd_call_state_observe(state, &observation, DSD_CALL_BOUNDARY_BEGIN) > 0;
+}
+
 static void
-seed_companion_crypto_state(dsd_state* state, int slot, int lockout_enabled, int expect_silent, int algid,
-                            int aes_loaded, unsigned long long scalar_key, int marker) {
+seed_companion_crypto_state(dsd_state* state, int slot, int lockout_enabled, int locked_out, int algid, int aes_loaded,
+                            unsigned long long scalar_key, int marker) {
     dsd_p25_crypto_state crypto_state = DSD_P25_CRYPTO_UNKNOWN;
-    if (marker || (lockout_enabled && expect_silent)) {
+    if (marker || (lockout_enabled && locked_out)) {
         crypto_state = DSD_P25_CRYPTO_ENCRYPTED_PENDING;
     } else if (algid == 0x80) {
         crypto_state = DSD_P25_CRYPTO_CLEAR;
@@ -123,7 +142,7 @@ float_block_is_clear(const float* samples, size_t count) {
 }
 
 static int
-run_fs4_left_active_case_ext(int enc_lockout_enabled, int expect_right_silent, int muted_slot_algid,
+run_fs4_left_active_case_ext(int enc_lockout_enabled, int companion_locked_out, int muted_slot_algid,
                              int muted_slot_aes_loaded, unsigned long long muted_slot_key, int muted_slot_svc,
                              int muted_slot_marker) {
     static dsd_opts opts;
@@ -153,7 +172,7 @@ run_fs4_left_active_case_ext(int enc_lockout_enabled, int expect_right_silent, i
     st.aes_key_loaded[1] = muted_slot_aes_loaded;
     st.aes_key_segments[1] = muted_slot_aes_loaded ? 4U : 0U;
     st.RR = muted_slot_key;
-    seed_companion_crypto_state(&st, 1, enc_lockout_enabled, expect_right_silent, muted_slot_algid,
+    seed_companion_crypto_state(&st, 1, enc_lockout_enabled, companion_locked_out, muted_slot_algid,
                                 muted_slot_aes_loaded, muted_slot_key, muted_slot_marker);
 
     fill_f32_frame(frame, 384.0f);
@@ -167,20 +186,22 @@ run_fs4_left_active_case_ext(int enc_lockout_enabled, int expect_right_silent, i
     rc |= copied;
     if (copied == 0) {
         rc |= expect_true("fs4 left audible", out[0] != 0.0f);
-        rc |= expect_eq("fs4 right state", out[1] == 0.0f, expect_right_silent);
+        // The muted companion channel mirrors the clear slot regardless of why
+        // the companion is muted (idle, group gate, or encryption lockout).
+        rc |= expect_true("fs4 right mirrors clear slot", out[1] != 0.0f);
     }
     return rc;
 }
 
 static int
-run_fs4_left_active_case(int enc_lockout_enabled, int expect_right_silent, int muted_slot_algid,
+run_fs4_left_active_case(int enc_lockout_enabled, int companion_locked_out, int muted_slot_algid,
                          int muted_slot_aes_loaded, unsigned long long muted_slot_key) {
-    return run_fs4_left_active_case_ext(enc_lockout_enabled, expect_right_silent, muted_slot_algid,
+    return run_fs4_left_active_case_ext(enc_lockout_enabled, companion_locked_out, muted_slot_algid,
                                         muted_slot_aes_loaded, muted_slot_key, 0x40, 0);
 }
 
 static int
-run_fs4_right_active_case_ext(int enc_lockout_enabled, int expect_left_silent, int muted_slot_algid,
+run_fs4_right_active_case_ext(int enc_lockout_enabled, int companion_locked_out, int muted_slot_algid,
                               int muted_slot_aes_loaded, unsigned long long muted_slot_key, int muted_slot_svc,
                               int muted_slot_marker) {
     static dsd_opts opts;
@@ -209,7 +230,7 @@ run_fs4_right_active_case_ext(int enc_lockout_enabled, int expect_left_silent, i
     st.aes_key_loaded[0] = muted_slot_aes_loaded;
     st.aes_key_segments[0] = muted_slot_aes_loaded ? 4U : 0U;
     st.R = muted_slot_key;
-    seed_companion_crypto_state(&st, 0, enc_lockout_enabled, expect_left_silent, muted_slot_algid,
+    seed_companion_crypto_state(&st, 0, enc_lockout_enabled, companion_locked_out, muted_slot_algid,
                                 muted_slot_aes_loaded, muted_slot_key, muted_slot_marker);
 
     fill_f32_frame(frame, 384.0f);
@@ -222,16 +243,16 @@ run_fs4_right_active_case_ext(int enc_lockout_enabled, int expect_left_silent, i
     int copied = copy_capture_bytes("fs4 right captured bytes", out, expected_bytes);
     rc |= copied;
     if (copied == 0) {
-        rc |= expect_eq("fs4 left state", out[0] == 0.0f, expect_left_silent);
+        rc |= expect_true("fs4 left mirrors clear slot", out[0] != 0.0f);
         rc |= expect_true("fs4 right audible", out[1] != 0.0f);
     }
     return rc;
 }
 
 static int
-run_fs4_right_active_case(int enc_lockout_enabled, int expect_left_silent, int muted_slot_algid,
+run_fs4_right_active_case(int enc_lockout_enabled, int companion_locked_out, int muted_slot_algid,
                           int muted_slot_aes_loaded, unsigned long long muted_slot_key) {
-    return run_fs4_right_active_case_ext(enc_lockout_enabled, expect_left_silent, muted_slot_algid,
+    return run_fs4_right_active_case_ext(enc_lockout_enabled, companion_locked_out, muted_slot_algid,
                                          muted_slot_aes_loaded, muted_slot_key, 0x40, 0);
 }
 
@@ -261,8 +282,8 @@ run_fs4_clear_plus_blocked_mono_case(int clear_slot, int matching_hold) {
     st.p25_crypto_state[clear_slot] = DSD_P25_CRYPTO_CLEAR;
     st.p25_crypto_state[clear_slot ^ 1] = DSD_P25_CRYPTO_BLOCKED;
     if (matching_hold) {
-        st.lasttg = 100;
-        st.lasttgR = 100;
+        rc |= expect_eq("mono seed left call", seed_group_call(&st, 0U, 100), 1);
+        rc |= expect_eq("mono seed right call", seed_group_call(&st, 1U, 100), 1);
         st.tg_hold = 100;
     }
 
@@ -279,6 +300,7 @@ run_fs4_clear_plus_blocked_mono_case(int clear_slot, int matching_hold) {
     if (copied == 0) {
         rc |= expect_true("mono clear sample audible", out[0] > 0.0f);
     }
+    dsd_state_ext_free_all(&st);
     return rc;
 }
 
@@ -339,8 +361,8 @@ run_ss18_clear_plus_blocked_hold_case(int clear_slot) {
     opts.slot1_on = 1;
     opts.slot2_on = 1;
     opts.trunk_tune_enc_calls = 0;
-    st.lasttg = 100;
-    st.lasttgR = 100;
+    rc |= expect_eq("ss18 seed left call", seed_group_call(&st, 0U, 100), 1);
+    rc |= expect_eq("ss18 seed right call", seed_group_call(&st, 1U, 100), 1);
     st.tg_hold = 100;
     st.dmrburstL = 21;
     st.dmrburstR = 21;
@@ -360,14 +382,17 @@ run_ss18_clear_plus_blocked_hold_case(int clear_slot) {
     int copied = copy_capture_bytes("ss18 hold captured bytes", out, sizeof(out));
     rc |= copied;
     if (copied == 0) {
-        rc |= expect_eq("ss18 hold left output", out[0], (clear_slot == 0) ? 100 : 0);
-        rc |= expect_eq("ss18 hold right output", out[1], (clear_slot == 1) ? 100 : 0);
+        // The blocked companion channel mirrors the clear slot; the blocked
+        // slot's own buffered audio (-3000 sentinel) must never be emitted.
+        rc |= expect_eq("ss18 hold left output", out[0], 100);
+        rc |= expect_eq("ss18 hold right output", out[1], 100);
     }
+    dsd_state_ext_free_all(&st);
     return rc;
 }
 
 static int
-run_ss18_left_active_case_ext(int enc_lockout_enabled, int expect_right_silent, int muted_slot_algid,
+run_ss18_left_active_case_ext(int enc_lockout_enabled, int companion_locked_out, int muted_slot_algid,
                               int muted_slot_aes_loaded, unsigned long long muted_slot_key, int muted_slot_svc,
                               int muted_slot_marker) {
     static dsd_opts opts;
@@ -393,7 +418,7 @@ run_ss18_left_active_case_ext(int enc_lockout_enabled, int expect_right_silent, 
     st.aes_key_loaded[1] = muted_slot_aes_loaded;
     st.aes_key_segments[1] = muted_slot_aes_loaded ? 4U : 0U;
     st.RR = muted_slot_key;
-    seed_companion_crypto_state(&st, 1, enc_lockout_enabled, expect_right_silent, muted_slot_algid,
+    seed_companion_crypto_state(&st, 1, enc_lockout_enabled, companion_locked_out, muted_slot_algid,
                                 muted_slot_aes_loaded, muted_slot_key, muted_slot_marker);
 
     for (int i = 0; i < 160; i++) {
@@ -408,20 +433,20 @@ run_ss18_left_active_case_ext(int enc_lockout_enabled, int expect_right_silent, 
     rc |= copied;
     if (copied == 0) {
         rc |= expect_eq("ss18 left audible", out[0], 100);
-        rc |= expect_eq("ss18 right state", out[1] == 0, expect_right_silent);
+        rc |= expect_eq("ss18 right mirrors clear slot", out[1], 100);
     }
     return rc;
 }
 
 static int
-run_ss18_left_active_case(int enc_lockout_enabled, int expect_right_silent, int muted_slot_algid,
+run_ss18_left_active_case(int enc_lockout_enabled, int companion_locked_out, int muted_slot_algid,
                           int muted_slot_aes_loaded, unsigned long long muted_slot_key) {
-    return run_ss18_left_active_case_ext(enc_lockout_enabled, expect_right_silent, muted_slot_algid,
+    return run_ss18_left_active_case_ext(enc_lockout_enabled, companion_locked_out, muted_slot_algid,
                                          muted_slot_aes_loaded, muted_slot_key, 0x40, 0);
 }
 
 static int
-run_ss18_right_active_case_ext(int enc_lockout_enabled, int expect_left_silent, int muted_slot_algid,
+run_ss18_right_active_case_ext(int enc_lockout_enabled, int companion_locked_out, int muted_slot_algid,
                                int muted_slot_aes_loaded, unsigned long long muted_slot_key, int muted_slot_svc,
                                int muted_slot_marker) {
     static dsd_opts opts;
@@ -447,7 +472,7 @@ run_ss18_right_active_case_ext(int enc_lockout_enabled, int expect_left_silent, 
     st.aes_key_loaded[0] = muted_slot_aes_loaded;
     st.aes_key_segments[0] = muted_slot_aes_loaded ? 4U : 0U;
     st.R = muted_slot_key;
-    seed_companion_crypto_state(&st, 0, enc_lockout_enabled, expect_left_silent, muted_slot_algid,
+    seed_companion_crypto_state(&st, 0, enc_lockout_enabled, companion_locked_out, muted_slot_algid,
                                 muted_slot_aes_loaded, muted_slot_key, muted_slot_marker);
 
     for (int i = 0; i < 160; i++) {
@@ -461,16 +486,16 @@ run_ss18_right_active_case_ext(int enc_lockout_enabled, int expect_left_silent, 
     int copied = copy_capture_bytes("ss18 right captured bytes", out, expected_bytes);
     rc |= copied;
     if (copied == 0) {
-        rc |= expect_eq("ss18 left state", out[0] == 0, expect_left_silent);
+        rc |= expect_eq("ss18 left mirrors clear slot", out[0], 100);
         rc |= expect_eq("ss18 right audible", out[1], 100);
     }
     return rc;
 }
 
 static int
-run_ss18_right_active_case(int enc_lockout_enabled, int expect_left_silent, int muted_slot_algid,
+run_ss18_right_active_case(int enc_lockout_enabled, int companion_locked_out, int muted_slot_algid,
                            int muted_slot_aes_loaded, unsigned long long muted_slot_key) {
-    return run_ss18_right_active_case_ext(enc_lockout_enabled, expect_left_silent, muted_slot_algid,
+    return run_ss18_right_active_case_ext(enc_lockout_enabled, companion_locked_out, muted_slot_algid,
                                           muted_slot_aes_loaded, muted_slot_key, 0x40, 0);
 }
 
@@ -516,6 +541,90 @@ run_ss18_partial_flush_case(void) {
     rc |= expect_eq("partial flush voice counter right", st.voice_counter[1], 0);
     rc |= expect_eq("partial flush clears left frames", short_18_blocks_are_clear(st.s_l4), 1);
     rc |= expect_eq("partial flush clears right frames", short_18_blocks_are_clear(st.s_r4), 1);
+    return rc;
+}
+
+// A muted companion (encryption lockout) must mirror the audible slot in every
+// MAC state that slot can be sitting in, not just MAC_ACTIVE. Burst hint 21
+// only records the last MAC PDU seen for the slot; voice keeps flowing through
+// MAC_PTT (20), MAC_HANGTIME (22), MAC_END (23), MAC_IDLE (24), the LCCH marker
+// (30) and a cleared hint, and gating duplication on 21 dropped the clear call
+// into one ear for those spans.
+static int
+run_ss18_muted_companion_burst_hint_case(int clear_slot, int clear_burst, int companion_burst) {
+    static dsd_opts opts;
+    static dsd_state st;
+    int rc = 0;
+    char tag[96];
+
+    DSD_MEMSET(&opts, 0, sizeof(opts));
+    DSD_MEMSET(&st, 0, sizeof(st));
+    reset_capture();
+
+    opts.audio_out = 1;
+    opts.audio_out_type = 8;
+    opts.floating_point = 0;
+    opts.pulse_digi_rate_out = 8000;
+    opts.slot1_on = 1;
+    opts.slot2_on = 1;
+    opts.trunk_tune_enc_calls = 0;
+    st.synctype = DSD_SYNC_P25P2_POS;
+    st.p25_p2_audio_allowed[clear_slot] = 1;
+    st.p25_p2_audio_allowed[clear_slot ^ 1] = 0;
+    st.p25_crypto_state[clear_slot] = DSD_P25_CRYPTO_CLEAR;
+    st.p25_crypto_state[clear_slot ^ 1] = DSD_P25_CRYPTO_BLOCKED;
+    if (clear_slot == 0) {
+        st.dmrburstL = clear_burst;
+        st.dmrburstR = companion_burst;
+    } else {
+        st.dmrburstR = clear_burst;
+        st.dmrburstL = companion_burst;
+    }
+
+    // Full superframe on the clear slot; the muted slot still holds pre-mute
+    // audio, which must never reach the output.
+    for (int block = 0; block < 18; block++) {
+        for (int i = 0; i < 160; i++) {
+            st.s_l4[block][i] = (clear_slot == 0) ? 100 : -3000;
+            st.s_r4[block][i] = (clear_slot == 1) ? 100 : -3000;
+        }
+    }
+    st.voice_counter[clear_slot] = 18;
+    st.voice_counter[clear_slot ^ 1] = 7; // frozen mid-superframe by the mute
+
+    playSynthesizedVoiceSS18(&opts, &st);
+
+    short out[160 * 2] = {0};
+    const size_t expected_bytes = (size_t)160 * 2U * sizeof(out[0]);
+    DSD_SNPRINTF(tag, sizeof(tag), "ss18 burst hint clear=%d/%d companion=%d captured", clear_slot, clear_burst,
+                 companion_burst);
+    rc |= expect_eq(tag, g_audio_capture_calls, 18);
+    int copied = copy_capture_bytes(tag, out, expected_bytes);
+    rc |= copied;
+    if (copied == 0) {
+        DSD_SNPRINTF(tag, sizeof(tag), "ss18 burst hint clear=%d/%d companion=%d left", clear_slot, clear_burst,
+                     companion_burst);
+        rc |= expect_eq(tag, out[0], 100);
+        DSD_SNPRINTF(tag, sizeof(tag), "ss18 burst hint clear=%d/%d companion=%d right", clear_slot, clear_burst,
+                     companion_burst);
+        rc |= expect_eq(tag, out[1], 100);
+    }
+    return rc;
+}
+
+static int
+run_ss18_muted_companion_burst_hint_matrix(void) {
+    static const int bursts[] = {0, 20, 21, 22, 23, 24, 30};
+    const size_t count = sizeof(bursts) / sizeof(bursts[0]);
+    int rc = 0;
+
+    for (int clear_slot = 0; clear_slot < 2; clear_slot++) {
+        for (size_t clear_idx = 0; clear_idx < count; clear_idx++) {
+            for (size_t companion_idx = 0; companion_idx < count; companion_idx++) {
+                rc |= run_ss18_muted_companion_burst_hint_case(clear_slot, bursts[clear_idx], bursts[companion_idx]);
+            }
+        }
+    }
     return rc;
 }
 
@@ -588,7 +697,9 @@ run_ss18_partial_flush_slot_case(void) {
     rc |= copied;
     if (copied == 0) {
         rc |= expect_eq("partial slot flush left sample", out[0], 321);
-        rc |= expect_eq("partial slot flush masks right sample", out[1], 0);
+        // The masked companion channel mirrors the flushed slot; the masked
+        // slot's own buffered audio (-654) must never be emitted.
+        rc |= expect_eq("partial slot flush right mirrors flushed slot", out[1], 321);
     }
     rc |= expect_eq("partial slot flush allowed left", st.p25_p2_audio_allowed[0], 1);
     rc |= expect_eq("partial slot flush allowed right preserved", st.p25_p2_audio_allowed[1], 1);
@@ -618,7 +729,7 @@ run_ss18_partial_flush_slot_case(void) {
     copied = copy_capture_bytes("partial slot flush right captured bytes", out2, expected_bytes);
     rc |= copied;
     if (copied == 0) {
-        rc |= expect_eq("partial slot flush masks left sample", out2[0], 0);
+        rc |= expect_eq("partial slot flush left mirrors flushed slot", out2[0], -222);
         rc |= expect_eq("partial slot flush right sample", out2[1], -222);
     }
     rc |= expect_eq("partial slot flush left allowed preserved", st.p25_p2_audio_allowed[0], 1);
@@ -887,31 +998,31 @@ main(void) {
     DSD_MEMSET(&st, 0, sizeof(st));
 
     dsd_udp_audio_hooks_set((dsd_udp_audio_hooks){.blast = capture_blast});
-    rc |= run_fs4_left_active_case(/*enc_lockout_enabled*/ 1, /*expect_right_silent*/ 1, /*muted_slot_algid*/ 0,
+    rc |= run_fs4_left_active_case(/*enc_lockout_enabled*/ 1, /*companion_locked_out*/ 1, /*muted_slot_algid*/ 0,
                                    /*muted_slot_aes_loaded*/ 0, /*muted_slot_key*/ 0ULL);
-    rc |= run_fs4_left_active_case_ext(/*enc_lockout_enabled*/ 1, /*expect_right_silent*/ 1,
+    rc |= run_fs4_left_active_case_ext(/*enc_lockout_enabled*/ 1, /*companion_locked_out*/ 1,
                                        /*muted_slot_algid*/ 0, /*muted_slot_aes_loaded*/ 0,
                                        /*muted_slot_key*/ 0ULL, /*muted_slot_svc*/ 0, /*muted_slot_marker*/ 1);
-    rc |= run_fs4_left_active_case(/*enc_lockout_enabled*/ 0, /*expect_right_silent*/ 0, /*muted_slot_algid*/ 0,
+    rc |= run_fs4_left_active_case(/*enc_lockout_enabled*/ 0, /*companion_locked_out*/ 0, /*muted_slot_algid*/ 0,
                                    /*muted_slot_aes_loaded*/ 0, /*muted_slot_key*/ 0ULL);
-    rc |= run_fs4_left_active_case(/*enc_lockout_enabled*/ 1, /*expect_right_silent*/ 0, /*muted_slot_algid*/ 0x80,
+    rc |= run_fs4_left_active_case(/*enc_lockout_enabled*/ 1, /*companion_locked_out*/ 0, /*muted_slot_algid*/ 0x80,
                                    /*muted_slot_aes_loaded*/ 0, /*muted_slot_key*/ 0ULL);
-    rc |= run_fs4_left_active_case(/*enc_lockout_enabled*/ 1, /*expect_right_silent*/ 0, /*muted_slot_algid*/ 0x84,
+    rc |= run_fs4_left_active_case(/*enc_lockout_enabled*/ 1, /*companion_locked_out*/ 0, /*muted_slot_algid*/ 0x84,
                                    /*muted_slot_aes_loaded*/ 1, /*muted_slot_key*/ 0ULL);
-    rc |= run_fs4_left_active_case(/*enc_lockout_enabled*/ 1, /*expect_right_silent*/ 0, /*muted_slot_algid*/ 0x81,
+    rc |= run_fs4_left_active_case(/*enc_lockout_enabled*/ 1, /*companion_locked_out*/ 0, /*muted_slot_algid*/ 0x81,
                                    /*muted_slot_aes_loaded*/ 0, /*muted_slot_key*/ 1ULL);
-    rc |= run_fs4_right_active_case(/*enc_lockout_enabled*/ 1, /*expect_left_silent*/ 1, /*muted_slot_algid*/ 0,
+    rc |= run_fs4_right_active_case(/*enc_lockout_enabled*/ 1, /*companion_locked_out*/ 1, /*muted_slot_algid*/ 0,
                                     /*muted_slot_aes_loaded*/ 0, /*muted_slot_key*/ 0ULL);
-    rc |= run_fs4_right_active_case_ext(/*enc_lockout_enabled*/ 1, /*expect_left_silent*/ 1,
+    rc |= run_fs4_right_active_case_ext(/*enc_lockout_enabled*/ 1, /*companion_locked_out*/ 1,
                                         /*muted_slot_algid*/ 0, /*muted_slot_aes_loaded*/ 0,
                                         /*muted_slot_key*/ 0ULL, /*muted_slot_svc*/ 0, /*muted_slot_marker*/ 1);
-    rc |= run_fs4_right_active_case(/*enc_lockout_enabled*/ 0, /*expect_left_silent*/ 0, /*muted_slot_algid*/ 0,
+    rc |= run_fs4_right_active_case(/*enc_lockout_enabled*/ 0, /*companion_locked_out*/ 0, /*muted_slot_algid*/ 0,
                                     /*muted_slot_aes_loaded*/ 0, /*muted_slot_key*/ 0ULL);
-    rc |= run_fs4_right_active_case(/*enc_lockout_enabled*/ 1, /*expect_left_silent*/ 0, /*muted_slot_algid*/ 0x80,
+    rc |= run_fs4_right_active_case(/*enc_lockout_enabled*/ 1, /*companion_locked_out*/ 0, /*muted_slot_algid*/ 0x80,
                                     /*muted_slot_aes_loaded*/ 0, /*muted_slot_key*/ 0ULL);
-    rc |= run_fs4_right_active_case(/*enc_lockout_enabled*/ 1, /*expect_left_silent*/ 0, /*muted_slot_algid*/ 0x84,
+    rc |= run_fs4_right_active_case(/*enc_lockout_enabled*/ 1, /*companion_locked_out*/ 0, /*muted_slot_algid*/ 0x84,
                                     /*muted_slot_aes_loaded*/ 1, /*muted_slot_key*/ 0ULL);
-    rc |= run_fs4_right_active_case(/*enc_lockout_enabled*/ 1, /*expect_left_silent*/ 0, /*muted_slot_algid*/ 0x81,
+    rc |= run_fs4_right_active_case(/*enc_lockout_enabled*/ 1, /*companion_locked_out*/ 0, /*muted_slot_algid*/ 0x81,
                                     /*muted_slot_aes_loaded*/ 0, /*muted_slot_key*/ 1ULL);
     rc |= run_fs4_clear_plus_blocked_mono_case(/*clear_slot*/ 0, /*matching_hold*/ 0);
     rc |= run_fs4_clear_plus_blocked_mono_case(/*clear_slot*/ 1, /*matching_hold*/ 0);
@@ -919,34 +1030,35 @@ main(void) {
     rc |= run_fs4_clear_plus_blocked_mono_case(/*clear_slot*/ 1, /*matching_hold*/ 1);
     rc |= run_fs4_reverse_mute_case(DSD_P25_CRYPTO_CLEAR, /*expect_audio*/ 0);
     rc |= run_fs4_reverse_mute_case(DSD_P25_CRYPTO_BLOCKED, /*expect_audio*/ 1);
-    rc |= run_ss18_left_active_case(/*enc_lockout_enabled*/ 1, /*expect_right_silent*/ 1, /*muted_slot_algid*/ 0,
+    rc |= run_ss18_left_active_case(/*enc_lockout_enabled*/ 1, /*companion_locked_out*/ 1, /*muted_slot_algid*/ 0,
                                     /*muted_slot_aes_loaded*/ 0, /*muted_slot_key*/ 0ULL);
-    rc |= run_ss18_left_active_case_ext(/*enc_lockout_enabled*/ 1, /*expect_right_silent*/ 1,
+    rc |= run_ss18_left_active_case_ext(/*enc_lockout_enabled*/ 1, /*companion_locked_out*/ 1,
                                         /*muted_slot_algid*/ 0, /*muted_slot_aes_loaded*/ 0,
                                         /*muted_slot_key*/ 0ULL, /*muted_slot_svc*/ 0, /*muted_slot_marker*/ 1);
-    rc |= run_ss18_left_active_case(/*enc_lockout_enabled*/ 0, /*expect_right_silent*/ 0, /*muted_slot_algid*/ 0,
+    rc |= run_ss18_left_active_case(/*enc_lockout_enabled*/ 0, /*companion_locked_out*/ 0, /*muted_slot_algid*/ 0,
                                     /*muted_slot_aes_loaded*/ 0, /*muted_slot_key*/ 0ULL);
-    rc |= run_ss18_left_active_case(/*enc_lockout_enabled*/ 1, /*expect_right_silent*/ 0, /*muted_slot_algid*/ 0x80,
+    rc |= run_ss18_left_active_case(/*enc_lockout_enabled*/ 1, /*companion_locked_out*/ 0, /*muted_slot_algid*/ 0x80,
                                     /*muted_slot_aes_loaded*/ 0, /*muted_slot_key*/ 0ULL);
-    rc |= run_ss18_left_active_case(/*enc_lockout_enabled*/ 1, /*expect_right_silent*/ 0, /*muted_slot_algid*/ 0x84,
+    rc |= run_ss18_left_active_case(/*enc_lockout_enabled*/ 1, /*companion_locked_out*/ 0, /*muted_slot_algid*/ 0x84,
                                     /*muted_slot_aes_loaded*/ 1, /*muted_slot_key*/ 0ULL);
-    rc |= run_ss18_left_active_case(/*enc_lockout_enabled*/ 1, /*expect_right_silent*/ 0, /*muted_slot_algid*/ 0x81,
+    rc |= run_ss18_left_active_case(/*enc_lockout_enabled*/ 1, /*companion_locked_out*/ 0, /*muted_slot_algid*/ 0x81,
                                     /*muted_slot_aes_loaded*/ 0, /*muted_slot_key*/ 1ULL);
-    rc |= run_ss18_right_active_case(/*enc_lockout_enabled*/ 1, /*expect_left_silent*/ 1, /*muted_slot_algid*/ 0,
+    rc |= run_ss18_right_active_case(/*enc_lockout_enabled*/ 1, /*companion_locked_out*/ 1, /*muted_slot_algid*/ 0,
                                      /*muted_slot_aes_loaded*/ 0, /*muted_slot_key*/ 0ULL);
-    rc |= run_ss18_right_active_case_ext(/*enc_lockout_enabled*/ 1, /*expect_left_silent*/ 1,
+    rc |= run_ss18_right_active_case_ext(/*enc_lockout_enabled*/ 1, /*companion_locked_out*/ 1,
                                          /*muted_slot_algid*/ 0, /*muted_slot_aes_loaded*/ 0,
                                          /*muted_slot_key*/ 0ULL, /*muted_slot_svc*/ 0, /*muted_slot_marker*/ 1);
-    rc |= run_ss18_right_active_case(/*enc_lockout_enabled*/ 0, /*expect_left_silent*/ 0, /*muted_slot_algid*/ 0,
+    rc |= run_ss18_right_active_case(/*enc_lockout_enabled*/ 0, /*companion_locked_out*/ 0, /*muted_slot_algid*/ 0,
                                      /*muted_slot_aes_loaded*/ 0, /*muted_slot_key*/ 0ULL);
-    rc |= run_ss18_right_active_case(/*enc_lockout_enabled*/ 1, /*expect_left_silent*/ 0, /*muted_slot_algid*/ 0x80,
+    rc |= run_ss18_right_active_case(/*enc_lockout_enabled*/ 1, /*companion_locked_out*/ 0, /*muted_slot_algid*/ 0x80,
                                      /*muted_slot_aes_loaded*/ 0, /*muted_slot_key*/ 0ULL);
-    rc |= run_ss18_right_active_case(/*enc_lockout_enabled*/ 1, /*expect_left_silent*/ 0, /*muted_slot_algid*/ 0x84,
+    rc |= run_ss18_right_active_case(/*enc_lockout_enabled*/ 1, /*companion_locked_out*/ 0, /*muted_slot_algid*/ 0x84,
                                      /*muted_slot_aes_loaded*/ 1, /*muted_slot_key*/ 0ULL);
-    rc |= run_ss18_right_active_case(/*enc_lockout_enabled*/ 1, /*expect_left_silent*/ 0, /*muted_slot_algid*/ 0x81,
+    rc |= run_ss18_right_active_case(/*enc_lockout_enabled*/ 1, /*companion_locked_out*/ 0, /*muted_slot_algid*/ 0x81,
                                      /*muted_slot_aes_loaded*/ 0, /*muted_slot_key*/ 1ULL);
     rc |= run_ss18_clear_plus_blocked_hold_case(/*clear_slot*/ 0);
     rc |= run_ss18_clear_plus_blocked_hold_case(/*clear_slot*/ 1);
+    rc |= run_ss18_muted_companion_burst_hint_matrix();
     rc |= run_ss18_partial_flush_case();
     rc |= run_ss18_partial_flush_guard_case();
     rc |= run_ss18_partial_flush_slot_case();

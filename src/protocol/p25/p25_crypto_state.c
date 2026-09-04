@@ -19,7 +19,9 @@ p25_crypto_reset_slot(dsd_state* state, int slot) {
         state->payload_algid = 0;
         state->payload_keyid = 0;
         state->payload_miP = 0ULL;
+        state->p25_p1_identity_epoch_started = 0;
         state->p25_p1_hdu_crypto_fresh = 0;
+        p25_crypto_clear_phase1_lockout_epoch(state);
         DSD_MEMSET(&state->p25_p1_crypto_conflict, 0, sizeof(state->p25_p1_crypto_conflict));
     } else {
         state->payload_algidR = 0;
@@ -28,6 +30,7 @@ p25_crypto_reset_slot(dsd_state* state, int slot) {
     }
     state->p25_crypto_state[slot] = DSD_P25_CRYPTO_UNKNOWN;
     DSD_MEMSET(&state->p25_p2_rekey[slot], 0, sizeof(state->p25_p2_rekey[slot]));
+    DSD_MEMSET(&state->p25_p2_crypto_conflict[slot], 0, sizeof(state->p25_p2_crypto_conflict[slot]));
     state->p25_p2_audio_allowed[slot] = 0;
 
     if (slot == 0) {

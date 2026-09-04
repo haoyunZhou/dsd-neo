@@ -40,7 +40,10 @@ p25_crypto_audio_ready(const dsd_state* state, int slot) {
            || state->p25_crypto_state[slot] == DSD_P25_CRYPTO_DECRYPTABLE;
 }
 
-/** Return non-zero when stereo duplication must not fill this companion slot. */
+/** Return non-zero while this slot carries an unresolved/locked-out encrypted
+ *  call; used to suppress voice-activity events for the slot. Audio mixing is
+ *  unaffected: a locked-out companion call stays transparent to the clear
+ *  slot's playback (its own audio is zeroed at decode time). */
 static inline int
 p25_crypto_companion_suppressed(const dsd_state* state, int slot) {
     if (!state || slot < 0 || slot > 1) {
@@ -106,19 +109,31 @@ void p25_crypto_mark_encrypted_pending(dsd_state* state, int slot);
  */
 int p25_crypto_p1_defer_clear_conflict(dsd_state* state, int svc_bits);
 
+/** Record the exact Phase 1 carrier/canonical epoch ended by encryption lockout. */
+void p25_crypto_note_phase1_lockout_epoch(dsd_state* state, uint64_t call_epoch);
+
+/** Invalidate any Phase 1 post-lockout ESS continuation context. */
+void p25_crypto_clear_phase1_lockout_epoch(dsd_state* state);
+
 /**
  * Resolve definitive HDU/LDU2/MAC_PTT/ESS crypto metadata.
  *
  * Imported key material for @p keyid is activated before decryptability is
  * tested. ALGID 0 remains non-definitive; only ALGID 0x80 confirms clear voice.
- * A Phase 1 non-clear tuple that contradicts explicit-clear service options
- * remains pending until another FEC-accepted tuple repeats the ALGID and KID.
+ * A non-clear tuple that contradicts explicit-clear service context remains
+ * pending until another FEC-accepted tuple repeats the ALGID and KID: Phase 1
+ * checks the slot's explicit-clear service options, Phase 2 the canonical
+ * call's explicit-clear service metadata.
  */
 dsd_p25_crypto_state p25_crypto_resolve(dsd_opts* opts, dsd_state* state, dsd_p25_crypto_phase phase, int slot,
                                         int algid, int keyid, uint64_t mi, int talkgroup);
 
-/** Convert a still-pending classification into a silent timeout block. */
-void p25_crypto_block_pending(dsd_state* state, int slot);
+/**
+ * Return a still-pending classification to unclassified after a silent
+ * timeout. The deadline lapsing is absence of evidence, not proof of
+ * encryption, so the slot must not be published as encrypted.
+ */
+void p25_crypto_expire_pending(dsd_state* state, int slot);
 
 /** Reset crypto classification and metadata at a call boundary. */
 void p25_crypto_reset_slot(dsd_state* state, int slot);

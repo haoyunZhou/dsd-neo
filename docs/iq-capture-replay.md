@@ -27,8 +27,15 @@ Path handling:
 
 - If the supplied capture path ends in `.json`, it is treated as metadata path and data path becomes the same name
   without `.json`.
-- Otherwise the supplied capture path is treated as data path and metadata path becomes `<path>.json`.
-- `--iq-replay` and `--iq-info` accept either metadata path or data path.
+- Otherwise the supplied capture path is the data path, and metadata path becomes `<data path>.json`.
+- If the final component of that data path carries no extension, `.iq` is added first: `--iq-capture mycap` writes
+  `mycap.iq` and `mycap.iq.json`. A dot in a directory name does not count as an extension, and a leading dot belongs
+  to the name (`.hidden` gains `.iq`). The suffix is always `.iq` regardless of `--iq-capture-format`; the sample
+  format is recorded in the sidecar.
+- `--iq-replay` and `--iq-info` accept the metadata path, the data path, or the bare name given to `--iq-capture`.
+  A bare name resolves `<name>.json` first and then `<name>.iq.json`, so captures written before `.iq` was added
+  still replay.
+- The `.json` suffix is matched case-insensitively, so `mycap.iq.JSON` is recognised as a sidecar on Windows.
 
 ## Format Notes
 
@@ -46,6 +53,10 @@ The writer records:
 - replay rate-chain fields (`base_decimation`, `post_downsample`, `demod_rate_hz`).
 - source identity (`source_backend`, `source_args`).
 - finalized byte/counter fields (`data_bytes`, `capture_drops`, `capture_drop_blocks`, `input_ring_drops`).
+- `size_limit_reached`: `true` when the capture ended because `--iq-capture-max-mb` was reached rather than being cut
+  short. Reaching the limit is not data loss and is not counted in `capture_drops`, so this is what distinguishes a
+  completed capped capture from one that is still running. Absent from metadata written by older builds, where it reads
+  back as `false`.
 - retune fields (`contains_retunes`, `capture_retune_count`).
 - for v2 captures, an `events` array describing scheduled replay events.
 
@@ -65,17 +76,42 @@ Event objects contain:
 The integrity summary fields remain present. `contains_retunes` and `capture_retune_count` summarize retune activity, while
 the v2 `events` array provides the ordering needed for replay.
 
+`data_bytes` is reconciled against the finished file at close, so it reports what is actually on disk rather than what
+the writer handed to `fwrite`. Anything the file system refused — a full disk, a size-limited file system — shows up in
+`capture_drops` alongside queue overruns, and `notes` says the capture ended early. Because event `byte_offset` is
+stamped from bytes accepted rather than bytes written, offsets past the end of a truncated capture are clamped to
+`data_bytes` so the surviving part of the capture stays replayable.
+
 `--iq-info` reports:
 
 - metadata bytes vs actual file bytes.
 - aligned effective replay bytes and estimated duration.
 - event timeline count.
+- whether the size limit was reached.
 - warnings for interrupted captures (`data_bytes == 0`), metadata/data mismatch, misalignment, and retune-containing
   captures that do not include a replay event timeline.
 
 Replay uses `min(data_bytes, actual_file_size)` rounded down to sample alignment after metadata is finalized. If an
 interrupted capture never finalized metadata (`data_bytes == 0`), replay falls back to the actual file size and still
 rounds down to sample alignment. Zero effective bytes are rejected for `--iq-replay`.
+
+## Replay Pacing And Decode-Time Windows
+
+`--iq-replay-rate realtime` pins the replay thread to `start + samples_written / sample_rate`, so air time and wall
+clock advance together. The default `fast` mode applies no pacing at all: throughput is bounded only by ring
+backpressure and decode speed, so a capture's worth of air time completes in considerably less wall-clock time.
+
+That matters because there is currently **no decode-derived clock** in the decoder. Protocol layers time call state
+against `dsd_time_now_monotonic_s()` (wall-clock monotonic), and any call site that passes `observed_m = 0.0` falls
+back to the same source. Under `fast` replay every wall-clock-measured interval in the canonical call state is
+therefore compressed relative to the air time it is meant to describe:
+
+- Gaps look shorter than they were, so the call reacquisition window (`DSD_CALL_REACQUIRE_GAP_S`, which decides
+  whether a sync-loss-interrupted transmission is one history row or two) coalesces more readily than it would live.
+- Hangtime and staleness timers in the trunking state machines expire later in air-time terms than they would live.
+
+Use `--iq-replay-rate realtime` when reproducing or asserting on any of that timing. The same caveat applies to
+non-`.bin` file input under `-r`/WAV replay, which is likewise unthrottled; only `.bin` symbol-capture replay is paced.
 
 ## Operational Limits
 
@@ -95,6 +131,12 @@ rounds down to sample alignment. Zero effective bytes are rejected for `--iq-rep
   rejected until segment-rate replay is supported.
 - Direct `-i iqreplay:...` is intentionally rejected; use `--iq-replay <path>`.
 - Replay currently feeds the RTL radio path and reuses existing demod processing/state handling.
+- `base_decimation` is capped at 1024 (10 half-band passes); metadata requesting more is rejected.
+- The capture file dictates the replay rate chain, so a capture whose demod rate yields a non-integer
+  samples-per-symbol (for example 62,500 Hz at 4800 sym/s) is resampled to the resampler target (48,000 Hz by
+  default) under the default `digital_resample = "auto"` policy. Decode output for such captures can therefore
+  differ from releases that fed the raw demod rate through; set `digital_resample = "off"` to restore the
+  previous behavior. See `docs/soapysdr.md` for the full policy.
 
 ## Backend Notes
 

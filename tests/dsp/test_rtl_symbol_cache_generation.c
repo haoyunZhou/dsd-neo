@@ -4,25 +4,26 @@
  */
 
 #include <assert.h>
+#include <dsd-neo/core/audio.h>
+#include <dsd-neo/core/audio_filters.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/opts_fwd.h>
+#include <dsd-neo/core/power.h>
 #include <dsd-neo/core/state.h>
 #include <dsd-neo/core/state_fwd.h>
+#include <dsd-neo/dsp/frame_sync.h>
 #include <dsd-neo/dsp/symbol.h>
+#include <dsd-neo/io/rigctl_client.h>
 #include <dsd-neo/io/rtl_stream_c.h>
 #include <dsd-neo/platform/sockets.h>
 #include <dsd-neo/runtime/rtl_stream_io_hooks.h>
 #include <dsd-neo/runtime/rtl_stream_metrics_hooks.h>
+#include <dsd-neo/runtime/shutdown.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include "dsd-neo/core/safe_api.h"
-
-#if defined(__GNUC__) && !defined(__cplusplus)
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wmissing-prototypes"
-#endif
 
 static uint32_t g_stream_generation = 1;
 static int g_output_kind = RTL_STREAM_OUTPUT_FSK_DISCRIMINATOR;
@@ -34,6 +35,7 @@ static float g_read_base = 1000.0f;
 static float g_read_base_step = 0.0f;
 static int g_read_calls = 0;
 static int g_bump_generation_during_read = 0;
+static float g_read_base_after_bump = 0.0f;
 static int g_output_kind_after_bump = -1;
 static int g_symbol_rate_hz_after_bump = 0;
 static int g_symbol_levels_after_bump = 0;
@@ -114,7 +116,7 @@ pbf_f(dsd_state* state, float* input, int len) {
 
 void
 // NOLINTNEXTLINE(misc-use-internal-linkage)
-analog_gain_f(dsd_opts* opts, dsd_state* state, float* input, int len) {
+analog_gain_f(const dsd_opts* opts, dsd_state* state, float* input, int len) {
     (void)opts;
     (void)state;
     (void)input;
@@ -170,6 +172,11 @@ fake_rtl_read(void* rtl_ctx, float* out, size_t count, int* out_got) {
         if (g_channel_profile_after_bump >= 0) {
             g_channel_profile = g_channel_profile_after_bump;
             g_channel_profile_after_bump = -1;
+        }
+        if (g_read_base_after_bump > 0.0f) {
+            g_read_base = g_read_base_after_bump;
+            read_base = g_read_base;
+            g_read_base_after_bump = 0.0f;
         }
         g_bump_generation_during_read = 0;
     }
@@ -228,6 +235,7 @@ reset_stream_fixture(void) {
     g_read_base_step = 0.0f;
     g_read_calls = 0;
     g_bump_generation_during_read = 0;
+    g_read_base_after_bump = 0.0f;
     g_output_kind_after_bump = -1;
     g_symbol_rate_hz_after_bump = 0;
     g_symbol_levels_after_bump = 0;
@@ -244,8 +252,8 @@ reset_decoder_fixture(dsd_opts* opts, dsd_state* state, void* rtl_context) {
     DSD_MEMSET(opts, 0, sizeof(*opts));
     DSD_MEMSET(state, 0, sizeof(*state));
     opts->audio_in_type = AUDIO_IN_RTL;
-    opts->symboltiming = 0;
     state->rf_mod = 2;
+    state->sps_hunt_idx = DSD_FRAME_SYNC_SPS_PROFILE_4800_4;
     state->rtl_ctx = (struct RtlSdrContext*)rtl_context;
 }
 
@@ -258,7 +266,6 @@ main(void) {
     DSD_MEMSET(&opts, 0, sizeof(opts));
     DSD_MEMSET(&state, 0, sizeof(state));
     opts.audio_in_type = AUDIO_IN_RTL;
-    opts.symboltiming = 0;
     state.rf_mod = 1;
     state.rtl_ctx = (struct RtlSdrContext*)&fake_rtl_context;
 
@@ -412,6 +419,7 @@ main(void) {
     g_channel_profile = RTL_STREAM_CHANNEL_PROFILE_6K25;
     g_read_base = 2000.0f;
     g_read_base_step = 4.0f;
+    state.sps_hunt_idx = DSD_FRAME_SYNC_SPS_PROFILE_2400_4;
     float nxdn_symbol = getSymbol(&opts, &state, 1);
     if (fabsf(nxdn_symbol - 2009.7778f) >= 0.01f) {
         DSD_FPRINTF(stderr, "FSK discriminator generation-change symbol %.4f\n", nxdn_symbol);
@@ -424,6 +432,50 @@ main(void) {
     assert(state.rtl_symbol_cache_channel_profile == RTL_STREAM_CHANNEL_PROFILE_6K25);
     assert(state.rtl_symbol_cache_levels == 2);
 
+    /*
+     * The SPS hunt owns discriminator timing, not the front end's published rate.
+     * A hunt step only queues its RTL profile request for the demod thread, so the
+     * published rate lags it -- and under fast I/Q replay of a fixture that fits in
+     * the output ring it never moves at all. Slicing on the lagging rate put timing
+     * back on the old profile after every hunt step, which
+     * frame_sync_ensure_enabled_sps_profile() then read as "the hunt is on the old
+     * profile", cancelling the step and pinning AUTO to 4800/4 (issue #374).
+     */
+    reset_stream_fixture();
+    reset_decoder_fixture(&opts, &state, &fake_rtl_context);
+    g_output_kind = RTL_STREAM_OUTPUT_FSK_DISCRIMINATOR;
+    g_output_rate_hz = 48000U;
+    g_symbol_rate_hz = 4800;
+    g_symbol_levels = 4;
+    g_channel_profile = RTL_STREAM_CHANNEL_PROFILE_12K5;
+    g_read_base = 1000.0f;
+    g_read_base_step = 4.0f;
+
+    (void)getSymbol(&opts, &state, 1);
+    assert(state.samplesPerSymbol == 10);
+
+    /* Hunt steps to 2400/4; the front end has not caught up (same generation, same
+       published 4800/12.5 kHz profile). Timing must follow the hunt regardless. */
+    state.sps_hunt_idx = DSD_FRAME_SYNC_SPS_PROFILE_2400_4;
+    (void)getSymbol(&opts, &state, 1);
+    assert(state.samplesPerSymbol == 20);
+    assert(state.symbolCenter == dsd_opts_symbol_center(20));
+    assert(g_symbol_rate_hz == 4800);
+
+    /* The front end catching up later changes nothing the hunt did not already ask for. */
+    g_stream_generation++;
+    g_symbol_rate_hz = 2400;
+    g_channel_profile = RTL_STREAM_CHANNEL_PROFILE_6K25;
+    (void)getSymbol(&opts, &state, 1);
+    assert(state.samplesPerSymbol == 20);
+
+    /* And the reverse: a published 2400 rate must not hold timing at 2400 once the
+       hunt has rotated on to a 4800 profile. */
+    state.sps_hunt_idx = DSD_FRAME_SYNC_SPS_PROFILE_4800_4;
+    (void)getSymbol(&opts, &state, 1);
+    assert(state.samplesPerSymbol == 10);
+    assert(state.symbolCenter == dsd_opts_symbol_center(10));
+
     reset_stream_fixture();
     reset_decoder_fixture(&opts, &state, &fake_rtl_context);
     g_output_kind = RTL_STREAM_OUTPUT_FSK_DISCRIMINATOR;
@@ -433,6 +485,7 @@ main(void) {
     g_channel_profile = RTL_STREAM_CHANNEL_PROFILE_PROVOICE;
     g_read_base = 5000.0f;
     g_read_base_step = 4.0f;
+    state.sps_hunt_idx = DSD_FRAME_SYNC_SPS_PROFILE_9600_2;
 
     g_max_read_calls = 2;
     assert(getSymbol(&opts, &state, 0) == 5000.0f);
@@ -505,6 +558,46 @@ main(void) {
     assert(g_cleanup_calls == 0);
 
     /*
+     * Every retune and replay RESET bumps the stream generation, which flushes
+     * whatever the decoder had cached. A symbol in flight when that happens must
+     * restart on the new stream instead of averaging samples from both, so what
+     * comes out does not depend on how full the cache happened to be -- the
+     * decoder-side half of the sampling nondeterminism in issue #404.
+     */
+    float restart_symbol = 0.0f;
+    for (int prefill = 0; prefill < 3; prefill++) {
+        reset_stream_fixture();
+        reset_decoder_fixture(&opts, &state, &fake_rtl_context);
+        g_output_kind = RTL_STREAM_OUTPUT_FSK_DISCRIMINATOR;
+        g_output_rate_hz = 48000U;
+        g_symbol_rate_hz = 4800;
+        g_symbol_levels = 4;
+        g_channel_profile = RTL_STREAM_CHANNEL_PROFILE_12K5;
+        state.rf_mod = 0;
+        g_read_base = 4000.0f;
+        g_read_base_step = 100.0f;
+
+        for (int s = 0; s < prefill; s++) {
+            (void)getSymbol(&opts, &state, 1);
+        }
+
+        g_bump_generation_during_read = 1;
+        g_read_base_after_bump = 9000.0f;
+        float symbol = getSymbol(&opts, &state, 1);
+        if (symbol < 9000.0f) {
+            DSD_FPRINTF(stderr, "generation bump at prefill %d mixed streams: symbol %.4f\n", prefill, symbol);
+        }
+        assert(symbol >= 9000.0f);
+        if (prefill == 0) {
+            restart_symbol = symbol;
+        } else if (fabsf(symbol - restart_symbol) >= 0.01f) {
+            DSD_FPRINTF(stderr, "generation bump at prefill %d gave %.4f, prefill 0 gave %.4f\n", prefill, symbol,
+                        restart_symbol);
+            assert(fabsf(symbol - restart_symbol) < 0.01f);
+        }
+    }
+
+    /*
      * Read failures should surface as the existing empty-symbol path, trigger
      * the cleanup hook once, and leave global hooks reset for later tests.
      */
@@ -521,7 +614,3 @@ main(void) {
     dsd_rtl_stream_metrics_hook_symbol_cache_pending_reset();
     return 0;
 }
-
-#if defined(__GNUC__) && !defined(__cplusplus)
-#pragma GCC diagnostic pop
-#endif

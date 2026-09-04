@@ -9,6 +9,7 @@
  * should always use the host system time for consistency.
  */
 
+#include <dsd-neo/core/call_state.h>
 #include <dsd-neo/core/events.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/state.h>
@@ -59,14 +60,16 @@ decode_cellocator(dsd_opts* opts, dsd_state* state, uint8_t* input, int len) {
     (void)len;
 }
 
-void
-watchdog_event_datacall(dsd_opts* opts, dsd_state* state, uint32_t src, uint32_t dst, char* str, uint8_t slot) {
+int
+dsd_event_emit_data_notice(dsd_opts* opts, dsd_state* state, uint8_t slot, const dsd_call_observation* observation,
+                           const char* notice) {
     (void)opts;
     (void)state;
-    (void)src;
-    (void)dst;
-    (void)str;
+    (void)observation->ota_source_id;
+    (void)observation->ota_target_id;
+    (void)notice;
     (void)slot;
+    return 0;
 }
 
 // Provide deterministic system time (should not be used when decoded time is valid)
@@ -177,7 +180,15 @@ main(void) {
         fclose(ef);
         return 105;
     }
-    fread(ebuf, 1, pesz, ef);
+    // The buffer is calloc'd one byte longer than the file and therefore
+    // already terminated; what the read owes is the count, since
+    // _FORTIFY_SOURCE declares fread __wur and a short read here means the
+    // capture never landed.
+    if (fread(ebuf, 1, pesz, ef) != pesz) {
+        fclose(ef);
+        free(ebuf);
+        return 107;
+    }
     fclose(ef);
     rc |= expect_has_substr(ebuf, " Time: 2024.12.01 23:59:58", "stderr has decoded Time");
     free(ebuf);
@@ -199,7 +210,11 @@ main(void) {
         fclose(of);
         return 106;
     }
-    fread(obuf, 1, posz, of);
+    if (fread(obuf, 1, posz, of) != posz) {
+        fclose(of);
+        free(obuf);
+        return 108;
+    }
     fclose(of);
     rc |= expect_has_substr(obuf, "1999/01/02\t11:22:33\t", "LRRP uses system timestamp");
     rc |= expect_no_substr(obuf, "2024/12/01\t23:59:58\t", "LRRP not using decoded timestamp in file");

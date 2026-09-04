@@ -32,6 +32,10 @@ struct dsd_iq_capture_writer;
  * String pointers may be NULL or empty. bandwidth_hz uses -1 for profile/default
  * behavior, 0 for driver automatic/no explicit bandwidth request, and positive
  * values for a requested hardware bandwidth in Hz.
+ *
+ * center_freq_hz is the intended startup center frequency. Configuration runs before the
+ * tuner is programmed, so profiles that pick an antenna per band (for example the SDDC
+ * HF/VHF ports) need it here; 0 disables antenna auto-selection.
  */
 struct rtl_soapy_config {
     const char* profile;
@@ -41,6 +45,7 @@ struct rtl_soapy_config {
     const char* stream_format;
     int bandwidth_hz;
     const char* settings;
+    uint32_t center_freq_hz;
 };
 
 /**
@@ -51,6 +56,63 @@ struct rtl_soapy_config {
  * @return Pointer to rtl_device handle, or NULL on failure.
  */
 struct rtl_device* rtl_device_create(int dev_index, struct input_ring_state* input_ring);
+
+/**
+ * @brief Hand the next USB open an already-open device file descriptor.
+ *
+ * Android applications cannot open `/dev/bus/usb` nodes themselves: the descriptor
+ * comes from `UsbDeviceConnection.getFileDescriptor()` in Java. While one is set,
+ * USB device discovery is bypassed — the engine skips enumeration (which would
+ * report no devices) and rtl_device_create() wraps this descriptor instead of
+ * opening by index. The caller keeps ownership and must keep it open for the
+ * lifetime of the device.
+ *
+ * Recording the descriptor and bypassing enumeration are platform-uniform, which
+ * keeps the engine's decision reachable from a host test. Actually opening from it
+ * is not: only builds where rtl_device_preopened_fd_supported() is true can, and
+ * anywhere else the open falls through to opening by index — which, with
+ * enumeration bypassed, means opening whichever device sits at the configured
+ * index. Callers that can be built either way must check support first.
+ *
+ * @param sys_fd Open USB file descriptor, or -1 to clear.
+ */
+void rtl_device_set_preopened_fd(int sys_fd);
+
+/**
+ * @brief Whether a pre-opened USB descriptor is currently set.
+ *
+ * @return 1 when set, 0 otherwise.
+ */
+int rtl_device_preopened_fd_is_set(void);
+
+/**
+ * @brief Whether the engine currently has the pre-opened descriptor wrapped.
+ *
+ * Distinct from rtl_device_preopened_fd_is_set(), which only reports that one was
+ * recorded. This is what the descriptor's owner must poll before closing the
+ * connection behind it: the engine takes the descriptor part way into a run and
+ * gives it back before the run ends, so neither "a descriptor is set" nor "the
+ * engine is running" brackets the period during which closing it would pull the
+ * file out from under an in-flight USB transfer.
+ *
+ * Raised before the wrap is attempted and lowered only after the device is closed,
+ * so it is never clear while libusb still holds the descriptor. Clearing the slot
+ * with rtl_device_set_preopened_fd(-1) does not lower it -- a device already open
+ * keeps working, by design.
+ *
+ * @return 1 while the descriptor is in use, 0 otherwise.
+ */
+int rtl_device_preopened_fd_in_use(void);
+
+/**
+ * @brief Whether this build can open a device from a pre-opened descriptor.
+ *
+ * Requires Android and a librtlsdr providing `rtlsdr_open_fd()`. Where this is 0,
+ * rtl_device_set_preopened_fd() records a descriptor that nothing will consume.
+ *
+ * @return 1 when supported, 0 otherwise.
+ */
+int rtl_device_preopened_fd_supported(void);
 
 /**
  * @brief Create and initialize a remote RTL-SDR stream via rtl_tcp.
@@ -111,6 +173,20 @@ int rtl_device_set_frequency(struct rtl_device* dev, uint32_t frequency);
 int rtl_device_set_sample_rate(struct rtl_device* dev, uint32_t samp_rate);
 
 /**
+ * @brief Report the sample rate the backend would deliver for a requested rate.
+ *
+ * Pure query; the device is not reconfigured. Backends with a fixed rate grid answer
+ * with the nearest supported entry, so the rate chain can choose decimation for the
+ * rate that will actually arrive instead of the one that was asked for.
+ *
+ * @param dev RTL-SDR device handle.
+ * @param requested Desired rate in Hz.
+ * @param out_actual Receives the deliverable rate in Hz.
+ * @return 0 on success, negative when the backend cannot answer.
+ */
+int rtl_device_nearest_supported_rate(struct rtl_device* dev, uint32_t requested, uint32_t* out_actual);
+
+/**
  * @brief Query the current device sample rate.
  *
  * USB backend returns the actual rate reported by librtlsdr
@@ -166,6 +242,18 @@ int rtl_device_is_auto_gain(const struct rtl_device* dev);
  * @return 0 on success, negative on failure.
  */
 int rtl_device_set_ppm(struct rtl_device* dev, int ppm_error);
+
+/**
+ * @brief Report whether the backend can apply a frequency (PPM) correction.
+ *
+ * RTL USB/TCP always can. SoapySDR devices are asked via `hasFrequencyCorrection`,
+ * and IQ replay never can. Callers use this to skip auto-PPM on hardware where the
+ * correction would be silently discarded.
+ *
+ * @param dev RTL-SDR device handle.
+ * @return 1 when supported, 0 otherwise.
+ */
+int rtl_device_supports_ppm(struct rtl_device* dev);
 
 /**
  * @brief Set direct sampling mode.

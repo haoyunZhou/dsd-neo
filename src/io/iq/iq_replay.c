@@ -16,6 +16,7 @@
 #include "dsd-neo/core/safe_api.h"
 #include "dsd-neo/io/iq_types.h"
 #include "dsd-neo/platform/platform.h"
+#include "dsd-neo/platform/posix_compat.h"
 
 struct dsd_iq_replay_source {
     FILE* fp;
@@ -87,7 +88,9 @@ has_suffix(const char* s, const char* suffix) {
     if (s_len < suf_len) {
         return 0;
     }
-    return strcmp(s + (s_len - suf_len), suffix) == 0;
+    /* Case-insensitive to match Windows, where "capture.iq.JSON" is the same file
+       as "capture.iq.json" and must be recognised as the sidecar. */
+    return dsd_strcasecmp(s + (s_len - suf_len), suffix) == 0;
 }
 
 static int
@@ -176,19 +179,27 @@ resolve_metadata_path(const char* path, char* out_metadata_path, size_t out_meta
     }
 
     size_t n = strlen(path);
-    if (n + 6U > out_metadata_path_size) {
+    if (n + 9U > out_metadata_path_size) {
         set_error(err_buf, err_buf_size, "metadata path too long");
         return DSD_IQ_ERR_INVALID_ARG;
     }
-    DSD_SNPRINTF(out_metadata_path, out_metadata_path_size, "%s.json", path);
 
+    /* Try the sidecar for the path exactly as given first, so captures written before
+       the ".iq" default still resolve and a data path like "mycap.iq" is found. Only
+       then try the name a bare capture now produces. */
     dsd_stat_t st;
-    if (dsd_stat_path(out_metadata_path, &st) != 0) {
-        set_error(err_buf, err_buf_size, "metadata sidecar not found for '%s' (expected '%s')", path,
-                  out_metadata_path);
-        return DSD_IQ_ERR_IO;
+    DSD_SNPRINTF(out_metadata_path, out_metadata_path_size, "%s.json", path);
+    if (dsd_stat_path(out_metadata_path, &st) == 0) {
+        return DSD_IQ_OK;
     }
-    return DSD_IQ_OK;
+    DSD_SNPRINTF(out_metadata_path, out_metadata_path_size, "%s.iq.json", path);
+    if (dsd_stat_path(out_metadata_path, &st) == 0) {
+        return DSD_IQ_OK;
+    }
+
+    set_error(err_buf, err_buf_size, "metadata sidecar not found for '%s' (tried '%s.json' and '%s.iq.json')", path,
+              path, path);
+    return DSD_IQ_ERR_IO;
 }
 
 static int
@@ -687,6 +698,13 @@ validate_replay_semantics(const dsd_iq_replay_config* cfg, char* err_buf, size_t
     }
     if (cfg->base_decimation == 0 || (cfg->base_decimation & (cfg->base_decimation - 1U)) != 0) {
         set_error(err_buf, err_buf_size, "base_decimation must be a power of two");
+        return DSD_IQ_ERR_RATE_CHAIN;
+    }
+    /* The half-band cascade keeps one history buffer per pass, so the replay chain must not
+       ask for more passes than the demodulator state has room for. */
+    if (cfg->base_decimation > DSD_IQ_REPLAY_MAX_BASE_DECIMATION) {
+        set_error(err_buf, err_buf_size, "base_decimation (%u) exceeds the maximum of %u", cfg->base_decimation,
+                  (unsigned)DSD_IQ_REPLAY_MAX_BASE_DECIMATION);
         return DSD_IQ_ERR_RATE_CHAIN;
     }
     if (cfg->post_downsample == 0) {
@@ -1508,6 +1526,11 @@ metadata_parse_field_group_c2(metadata_parse_state* st, const char* key, const j
             st->seen.input_ring_drops = 1;
         }
         *handled = 1;
+    } else if (strcmp(key, "size_limit_reached") == 0) {
+        /* Optional: metadata written before this field existed is still valid,
+         * so it is deliberately absent from the required-field list. */
+        rc = token_to_bool(val_tok, &st->cfg.size_limit_reached, err_buf, err_buf_size, "size_limit_reached");
+        *handled = 1;
     }
     return rc;
 }
@@ -2088,6 +2111,7 @@ dsd_iq_info_print_summary(const dsd_iq_replay_config* cfg, const char* display_p
     DSD_FPRINTF(out, "  Capture drops:       %" PRIu64 " (%" PRIu64 " blocks)\n", cfg->capture_drops,
                 cfg->capture_drop_blocks);
     DSD_FPRINTF(out, "  Input ring drops:    %" PRIu64 "\n", cfg->input_ring_drops);
+    DSD_FPRINTF(out, "  Size limit reached:  %s\n", cfg->size_limit_reached ? "yes" : "no");
     DSD_FPRINTF(out, "  Contains retunes:    %s (%u retune events)\n", cfg->contains_retunes ? "yes" : "no",
                 cfg->capture_retune_count);
     DSD_FPRINTF(out, "  Event timeline:      %u event(s)\n", cfg->event_count);

@@ -9,6 +9,7 @@
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/state.h>
 #include <dsd-neo/core/synctype_ids.h>
+#include <dsd-neo/engine/protocol_dispatch.h>
 #include <dsd-neo/io/control.h>
 #include <dsd-neo/platform/platform.h>
 #include <dsd-neo/protocol/p25/p25.h>
@@ -33,6 +34,15 @@ enum {
     P25P1_DUID_TDULC = 0xF,
     P25P1_DUID_INVALID = 0xFF,
 };
+
+/* How long a decoded NID vouches for the syncs that follow it, in symbols. Two seconds at
+ * 4800 symbols/s: long enough to span the gaps a control channel leaves between the frames
+ * it does decode, short enough that a channel which stops decoding gives the profile up
+ * within a dwell of the last thing it proved. The same span as
+ * DSD_FRAME_SYNC_P25P1_VALIDATED_HOLD_SYMBOLS, deliberately not the same constant -- that
+ * one holds a modulation against the vote heuristics, this one holds a symbol profile
+ * against the hunt's budget, and neither should move because the other did. */
+#define P25P1_NID_EVIDENCE_WINDOW_SYMBOLS 9600U
 
 static int
 p25p1_valid_observed_nac(unsigned long long nac) {
@@ -333,8 +343,6 @@ p25p1_handle_tdu(dsd_opts* opts, dsd_state* state) {
     }
 
     mbe_initMbeParms(state->cur_mp, state->prev_mp, state->prev_mp_enhanced);
-    state->lasttg = 0;
-    state->lastsrc = 0;
     state->lastp25type = 0;
     state->err_str[0] = 0;
     DSD_SNPRINTF(state->fsubtype, sizeof(state->fsubtype), " TDU          ");
@@ -356,8 +364,6 @@ p25p1_handle_tsbk(dsd_opts* opts, dsd_state* state) {
         resumeScan(opts, state);
     }
 
-    state->lasttg = 0;
-    state->lastsrc = 0;
     state->lastp25type = 3;
     DSD_SNPRINTF(state->fsubtype, sizeof(state->fsubtype), " TSBK         ");
     processTSBK(opts, state);
@@ -422,9 +428,51 @@ dsd_dispatch_matches_p25p1(int synctype) {
     return DSD_SYNC_IS_P25P1(synctype);
 }
 
-void
+dsd_frame_verdict
 dsd_dispatch_handle_p25p1(dsd_opts* opts, dsd_state* state) {
     p25_status_accum_reset(state);
     uint8_t duid = p25p1_decode_nid_and_duid(opts, state);
+    /* A decoded NID is the one place that knows which demodulator actually carried a P25p1
+     * frame: the sync pattern is the same on C4FM and CQPSK, so nothing earlier can tell them
+     * apart. Recording it here is what lets the trunking retunes and the SPS hunt restore a
+     * modulation the signal itself has confirmed, and what lets the frame sync stop the
+     * modulation heuristics from second-guessing a demodulator that is visibly working. */
+    if (duid != P25P1_DUID_INVALID && !opts->mod_cli_lock && (state->rf_mod == 0 || state->rf_mod == 1)) {
+        state->p25_p1_validated_rf_mod = state->rf_mod;
+        state->p25_p1_validated_symbolcnt = state->symbolcnt;
+    }
+    /* The same decode, read for what it says about the symbol profile rather than the
+     * demodulator: nothing but P25p1 on this profile produces a NID the BCH accepts. No gate
+     * here -- a locked modulation and a demodulator the pair above will not speak for still
+     * leave that true. */
+    if (duid != P25P1_DUID_INVALID) {
+        state->p25_p1_nid_evidence = 1;
+        state->p25_p1_nid_evidence_symbolcnt = state->symbolcnt;
+    }
     p25p1_dispatch_by_duid(opts, state, duid);
+    /* The 63-bit BCH over the NID is the one verdict this path has that covers every DUID.
+     * When it fails the DUID is invalid, p25p1_handle_unknown_duid() decodes nothing, and
+     * the 33 dibits already read validated nothing. Past that the picture is mixed --
+     * state->p25_p1_fec_ok counts TSBK and MPDU header successes only, and says nothing
+     * about HDU, LDU1/2, TDU or TDULC -- so a decoded NID is taken at its word.
+     *
+     * A decoded NID proves the profile rather than merely paying for the frame: a one-block
+     * TSDU reads 134 symbols of its ~180-symbol slot, so consumption credit alone leaves a
+     * control channel losing ground on every frame it decodes (#400).
+     *
+     * A failure inside the window of one that decoded reports the same. The NID is the first
+     * thing after the sync and the smallest thing this path reads, so it fails first and
+     * fails often on a signal the modulation votes are flapping under -- but a P25p1 sync
+     * arriving where P25p1 was decoding a moment ago is evidence about the profile whatever
+     * the BCH made of those 63 bits. Outside the window it goes back to speaking only for
+     * itself, and only decoded NIDs ever move the window, so this cannot ratchet: a channel
+     * that stops decoding stops being vouched for. */
+    if (duid != P25P1_DUID_INVALID) {
+        return DSD_FRAME_VERDICT_PROFILE_PROVEN;
+    }
+    if (state->p25_p1_nid_evidence != 0
+        && (uint32_t)(state->symbolcnt - state->p25_p1_nid_evidence_symbolcnt) < P25P1_NID_EVIDENCE_WINDOW_SYMBOLS) {
+        return DSD_FRAME_VERDICT_PROFILE_PROVEN;
+    }
+    return DSD_FRAME_VERDICT_UNPRODUCTIVE;
 }

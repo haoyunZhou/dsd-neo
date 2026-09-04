@@ -8,6 +8,7 @@
  * be ignored and system time used instead in the LRRP output file.
  */
 
+#include <dsd-neo/core/call_state.h>
 #include <dsd-neo/core/events.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/state.h>
@@ -57,14 +58,16 @@ decode_cellocator(dsd_opts* opts, dsd_state* state, uint8_t* input, int len) {
     (void)len;
 }
 
-void
-watchdog_event_datacall(dsd_opts* opts, dsd_state* state, uint32_t src, uint32_t dst, char* data_string, uint8_t slot) {
+int
+dsd_event_emit_data_notice(dsd_opts* opts, dsd_state* state, uint8_t slot, const dsd_call_observation* observation,
+                           const char* notice) {
     (void)opts;
     (void)state;
-    (void)src;
-    (void)dst;
-    (void)data_string;
+    (void)observation->ota_source_id;
+    (void)observation->ota_target_id;
+    (void)notice;
     (void)slot;
+    return 0;
 }
 
 // Deterministic system time fallback for file writer
@@ -193,7 +196,16 @@ main(void) {
         remove(outtmpl);
         return 102;
     }
-    fread(buf, 1, psz, f);
+    // The buffer is calloc'd one byte longer than the file and therefore
+    // already terminated; what the read owes is the count, since
+    // _FORTIFY_SOURCE declares fread __wur and a short read here means the
+    // capture never landed.
+    if (fread(buf, 1, psz, f) != psz) {
+        fclose(f);
+        free(buf);
+        remove(outtmpl);
+        return 103;
+    }
     fclose(f);
 
     rc |= expect_nonempty(buf, "LOCN LRRP file non-empty");

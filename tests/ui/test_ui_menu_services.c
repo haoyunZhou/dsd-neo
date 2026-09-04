@@ -10,19 +10,22 @@
 #include <dsd-neo/core/audio.h>
 #include <dsd-neo/core/constants.h>
 #include <dsd-neo/core/csv_import.h>
+#include <dsd-neo/core/csv_validate.h>
 #include <dsd-neo/core/events.h>
 #include <dsd-neo/core/file_io.h>
+#include <dsd-neo/core/key_set.h>
 #include <dsd-neo/core/opts.h>
-#include <dsd-neo/core/power.h>
 #include <dsd-neo/core/safe_api.h>
 #include <dsd-neo/core/state.h>
 #include <dsd-neo/core/talkgroup_policy.h>
+#include <dsd-neo/engine/p25_bandplan_export.h>
 #include <dsd-neo/io/control.h>
 #include <dsd-neo/io/rigctl_client.h>
 #include <dsd-neo/io/rtl_stream_c.h>
 #include <dsd-neo/io/udp_socket_connect.h>
 #include <dsd-neo/platform/file_compat.h>
 #include <dsd-neo/platform/posix_compat.h>
+#include <dsd-neo/protocol/p25/p25_cc_candidates.h>
 #include <dsd-neo/protocol/p25/p25_sm_watchdog.h>
 #include <dsd-neo/runtime/config.h>
 #include <dsd-neo/runtime/log.h>
@@ -30,10 +33,12 @@
 #include <sndfile.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "services.h"
 
 #include "dsd-neo/core/opts_fwd.h"
+#include "dsd-neo/core/state_ext.h"
 #include "dsd-neo/core/state_fwd.h"
 #include "dsd-neo/io/rtl_stream_fwd.h"
 #include "dsd-neo/platform/sockets.h"
@@ -140,25 +145,143 @@ openWavOutFileRaw(dsd_opts* opts, dsd_state* state) {
     (void)state;
 }
 
+/*
+ * Controllable importer stub: fills whichever state it is handed, the way the
+ * real importer does, so the service's replace-vs-append behavior is observable.
+ */
+static int g_chan_import_result = -1;
+static int g_chan_import_count = 0;
+static uint32_t g_chan_import_chan[4];
+static long int g_chan_import_freq[4];
+/* Per-row names, NULL for a row the file leaves unnamed. */
+static const char* g_chan_import_name[4];
+/* Per-row key seed: set entries load a one-slot key set into the row. */
+static int g_chan_import_has_key[4];
+static unsigned long long g_chan_import_key[4];
+/* A name stored with no row to go with it, so the refused-adopt path can be driven with a
+ * name store live in the throwaway import state: the service still owes exactly one free of
+ * it and no change to the live map. */
+static const char* g_chan_import_name_without_row = NULL;
+
 int
 csvChanImport(const dsd_opts* opts, dsd_state* state) {
     (void)opts;
-    (void)state;
-    return -1;
+    if (g_chan_import_result != 0 || !state) {
+        return g_chan_import_result;
+    }
+    if (g_chan_import_name_without_row != NULL) {
+        (void)dsd_state_trunk_lcn_name_set(state, 0U, g_chan_import_name_without_row);
+    }
+    for (int i = 0; i < g_chan_import_count; i++) {
+        dsd_state_set_trunk_chan_freq(state, g_chan_import_chan[i], g_chan_import_freq[i]);
+        // Names are positional: the row index is the slot the frequency just took.
+        const size_t row = (size_t)state->lcn_freq_count;
+        state->trunk_lcn_freq[state->lcn_freq_count++] = g_chan_import_freq[i];
+        if (g_chan_import_name[i] != NULL) {
+            (void)dsd_state_trunk_lcn_name_set(state, row, g_chan_import_name[i]);
+        }
+        if (g_chan_import_has_key[i]) {
+            dsd_key_set ks;
+            DSD_MEMSET(&ks, 0, sizeof(ks));
+            ks.entries = (dsd_key_set_entry*)calloc(1U, sizeof(*ks.entries));
+            if (ks.entries != NULL) {
+                ks.count = 1U;
+                ks.present = 1;
+                ks.keyloader = 1;
+                ks.entries[0].index = 9U;
+                ks.entries[0].value = g_chan_import_key[i];
+                ks.entries[0].loaded = 1U;
+                (void)dsd_state_trunk_lcn_keys_set(state, row, &ks);
+            }
+        }
+    }
+    return 0;
 }
+
+static int g_key_import_result = -1;
 
 int
 csvKeyImportDec(const dsd_opts* opts, dsd_state* state) {
     (void)opts;
     (void)state;
-    return -1;
+    return g_key_import_result;
 }
 
 int
 csvKeyImportHex(const dsd_opts* opts, dsd_state* state) {
     (void)opts;
     (void)state;
-    return -1;
+    return g_key_import_result;
+}
+
+int
+csvKeyImportHexPath(const char* path, int show_keys, dsd_state* state, dsd_csv_validation* stats) {
+    (void)path;
+    (void)show_keys;
+    (void)state;
+    (void)stats;
+    return g_key_import_result;
+}
+
+int
+csvKeyImportDecPath(const char* path, int show_keys, dsd_state* state, dsd_csv_validation* stats) {
+    (void)path;
+    (void)show_keys;
+    (void)state;
+    (void)stats;
+    return g_key_import_result;
+}
+
+/* P25 band plan: the service owes a dry run before the live import, the live
+ * import only when the dry run accepted a row, and the export a pass-through of
+ * the engine's row count. Each stub records what it was handed. */
+static int g_bandplan_validate_result = 0;
+static unsigned int g_bandplan_validate_accepted = 0;
+static int g_bandplan_validate_calls = 0;
+static int g_bandplan_import_result = -1;
+static int g_bandplan_import_calls = 0;
+static char g_bandplan_import_path[1024];
+static int g_bandplan_resolve_calls = 0;
+static int g_bandplan_export_result = -1;
+static int g_bandplan_export_calls = 0;
+static char g_bandplan_export_path[1024];
+
+int
+dsd_csv_validate_p25_bandplan_file(const char* path, dsd_csv_validation* out) {
+    (void)path;
+    g_bandplan_validate_calls++;
+    if (out) {
+        out->accepted = g_bandplan_validate_accepted;
+        out->skipped = 0U;
+        out->total = g_bandplan_validate_accepted;
+    }
+    return g_bandplan_validate_result;
+}
+
+int
+csvP25BandplanImportPath(const char* path, dsd_state* state) {
+    g_bandplan_import_calls++;
+    DSD_SNPRINTF(g_bandplan_import_path, sizeof g_bandplan_import_path, "%s", path ? path : "");
+    if (g_bandplan_import_result == 0 && state) {
+        state->p25_bandplan_row_count = 1;
+    }
+    return g_bandplan_import_result;
+}
+
+void
+p25_resolve_pending_announcements(const dsd_opts* opts, dsd_state* state) {
+    (void)opts;
+    (void)state;
+    g_bandplan_resolve_calls++;
+}
+
+int
+dsd_engine_p25_bandplan_export(const dsd_opts* opts, const dsd_state* state, const char* path) {
+    (void)opts;
+    (void)state;
+    g_bandplan_export_calls++;
+    DSD_SNPRINTF(g_bandplan_export_path, sizeof g_bandplan_export_path, "%s", path ? path : "");
+    return g_bandplan_export_result;
 }
 
 int
@@ -168,9 +291,23 @@ dsd_tg_policy_reload_group_file(const dsd_opts* opts, dsd_state* state) {
     return -1;
 }
 
-double
-dB_to_pwr(double dB) {
-    return dB;
+/* Counts calls rather than returning a canned value: what svc_clear_group_list()
+ * owes the caller is that the policy was asked to empty itself, and the emptying
+ * itself belongs to CORE_TALKGROUP_POLICY. */
+static int g_tg_policy_clear_calls = 0;
+
+int
+dsd_tg_policy_clear(dsd_state* state) {
+    (void)state;
+    g_tg_policy_clear_calls++;
+    return 0;
+}
+
+/* The throwaway import state may carry module extensions; nothing under test
+ * allocates one, so releasing it is a no-op here. */
+void
+dsd_state_ext_free_all(dsd_state* state) {
+    (void)state;
 }
 
 int
@@ -192,6 +329,18 @@ init_event_history(Event_History_I* event_struct, uint8_t start, uint8_t stop) {
         event_struct->Event_History_Items[i].color_pair = 4;
         event_struct->Event_History_Items[i].systype = -1;
         event_struct->Event_History_Items[i].subtype = -1;
+    }
+}
+
+// Stands in for the core implementation, which also clears the per-slot commit bookkeeping
+// (covered by CORE_CALL_ALERT_HISTORY). This test only asserts the service delegates the reset.
+void
+dsd_event_history_reset(dsd_state* state) {
+    if (!state || !state->event_history_s) {
+        return;
+    }
+    for (uint8_t slot = 0; slot < 2U; slot++) {
+        init_event_history(&state->event_history_s[slot], 0, 255);
     }
 }
 
@@ -631,7 +780,15 @@ test_rtl_service_option_contracts(void) {
     rc |= expect_int("rtl bandwidth exact stored", opts.rtl_dsp_bw_khz, 12);
 
     rc |= expect_int("rtl squelch stores converted threshold", svc_rtl_set_sql_db(&opts, -12.5), 0);
-    rc |= expect_double("rtl squelch level stored", opts.rtl_squelch_level, -12.5);
+    rc |= expect_double("rtl squelch level stored", opts.rtl_squelch_level, pow(10.0, -1.25));
+
+    /* 0 dB is full scale: as a threshold it closes the gate forever, so it is the
+     * natural spelling of "off" and matches what 0 means in the CLI and config.
+     * Without it neither UI could switch the squelch off at all. */
+    rc |= expect_int("rtl squelch accepts zero", svc_rtl_set_sql_db(&opts, 0.0), 0);
+    rc |= expect_double("rtl squelch zero switches off", opts.rtl_squelch_level, 0.0);
+    rc |= expect_int("rtl squelch accepts positive", svc_rtl_set_sql_db(&opts, 3.0), 0);
+    rc |= expect_double("rtl squelch positive switches off", opts.rtl_squelch_level, 0.0);
     rc |= expect_int("rtl volume invalid defaults", svc_rtl_set_volume_mult(&opts, -1), 0);
     rc |= expect_int("rtl volume default stored", opts.rtl_volume_multiplier, 1);
     rc |= expect_int("rtl volume valid stored", svc_rtl_set_volume_mult(&opts, 3), 0);
@@ -692,6 +849,7 @@ test_file_network_and_import_failure_contracts(void) {
     rc |= expect_int("rigctl socket invalid after connect failure", opts.rigctl_sockfd, DSD_INVALID_SOCKET);
     rc |= expect_int("rigctl disabled after connect failure", opts.use_rigctl, 0);
 
+    g_chan_import_result = -1;
     rc |= expect_int("channel import failure", svc_import_channel_map(&opts, &state, "channels.csv"), -1);
     rc |= expect_str("channel import path stored", opts.chan_in_file, "channels.csv");
     rc |= expect_int("group import failure", svc_import_group_list(&opts, &state, "groups.csv"), -1);
@@ -701,6 +859,349 @@ test_file_network_and_import_failure_contracts(void) {
     rc |= expect_int("keys hex import failure", svc_import_keys_hex(&opts, &state, "keys.hex"), -1);
     rc |= expect_str("keys hex import path stored", opts.key_in_file, "keys.hex");
 
+    return rc;
+}
+
+static int
+test_channel_map_reimport_replaces_previous_map(void) {
+    int rc = 0;
+    static dsd_opts opts;
+    static dsd_state state;
+    DSD_MEMSET(&opts, 0, sizeof(opts));
+    DSD_MEMSET(&state, 0, sizeof(state));
+
+    g_chan_import_result = 0;
+    g_chan_import_count = 3;
+    g_chan_import_chan[0] = 101;
+    g_chan_import_freq[0] = 851000000L;
+    g_chan_import_chan[1] = 102;
+    g_chan_import_freq[1] = 852000000L;
+    g_chan_import_chan[2] = 103;
+    g_chan_import_freq[2] = 853000000L;
+    g_chan_import_name[0] = "Dispatch";
+    g_chan_import_name[1] = NULL;
+    g_chan_import_name[2] = "Tac 3";
+    rc |= expect_int("chan map first import ok", svc_import_channel_map(&opts, &state, "a.csv"), 0);
+    rc |= expect_int("first import lcn count", state.lcn_freq_count, 3);
+    rc |= expect_int("first import chan applied", (int)state.trunk_chan_map[101], 851000000);
+    rc |= expect_int("first import used count", (int)state.trunk_chan_map_used_count, 3);
+    // The names ride with the map they belong to; dropping them here would leave the
+    // frontends nothing to label the scanned channel with.
+    rc |= expect_str("first import keeps row 0's name", dsd_state_trunk_lcn_name_get(&state, 0U), "Dispatch");
+    rc |= expect_str("first import leaves row 1 unnamed", dsd_state_trunk_lcn_name_get(&state, 1U), "");
+    rc |= expect_str("first import keeps row 2's name", dsd_state_trunk_lcn_name_get(&state, 2U), "Tac 3");
+
+    g_chan_import_count = 2;
+    g_chan_import_chan[0] = 201;
+    g_chan_import_freq[0] = 860000000L;
+    g_chan_import_chan[1] = 202;
+    g_chan_import_freq[1] = 861000000L;
+    g_chan_import_name[0] = NULL;
+    g_chan_import_name[2] = NULL;
+    rc |= expect_int("chan map reimport ok", svc_import_channel_map(&opts, &state, "b.csv"), 0);
+    // A file with no name column replaces the previous file's names with nothing, the same
+    // way it replaces its frequencies: a surviving "Dispatch" would now label row 0 of a
+    // map that never claimed it.
+    rc |= expect_int("nameless reimport drops the name store", (int)(state.trunk_lcn_name == NULL), 1);
+    rc |= expect_str("nameless reimport reads back empty", dsd_state_trunk_lcn_name_get(&state, 0U), "");
+    rc |= expect_int("reimport replaces lcn count", state.lcn_freq_count, 2);
+    rc |= expect_int("reimport clears stale chan", (int)state.trunk_chan_map[101], 0);
+    rc |= expect_int("reimport applies new chan", (int)state.trunk_chan_map[201], 860000000);
+    rc |= expect_int("reimport replaces used count", (int)state.trunk_chan_map_used_count, 2);
+    rc |= expect_int("reimport replaces lcn list", (int)state.trunk_lcn_freq[0], 860000000);
+
+    g_chan_import_result = -1;
+    rc |= expect_int("failed reimport rc", svc_import_channel_map(&opts, &state, "bad.csv"), -1);
+    rc |= expect_int("failed reimport preserves lcn count", state.lcn_freq_count, 2);
+    rc |= expect_int("failed reimport preserves chan", (int)state.trunk_chan_map[201], 860000000);
+    rc |= expect_str("failed reimport still stores path", opts.chan_in_file, "bad.csv");
+
+    // The importer reports success for any file it can open, so a mispicked CSV
+    // parses to an empty map. Adopting that would replace the live map with
+    // zeros; the service has to refuse instead.
+    g_chan_import_result = 0;
+    g_chan_import_count = 0;
+    rc |= expect_int("empty import refused", svc_import_channel_map(&opts, &state, "talkgroups.csv"), -1);
+    rc |= expect_int("empty import preserves chan", (int)state.trunk_chan_map[201], 860000000);
+    rc |= expect_int("empty import preserves lcn count", state.lcn_freq_count, 2);
+
+    // Trunk scan owns per-target maps; a global runtime import would wipe them.
+    opts.trunk_scan_enabled = 1;
+    g_chan_import_count = 1;
+    g_chan_import_chan[0] = 301;
+    g_chan_import_freq[0] = 870000000L;
+    rc |= expect_int("trunk-scan import refused", svc_import_channel_map(&opts, &state, "scan.csv"), -1);
+    rc |= expect_int("trunk-scan import preserves chan", (int)state.trunk_chan_map[201], 860000000);
+    opts.trunk_scan_enabled = 0;
+
+    // dmr_lcn_trust is provenance for the map, not a separate table: a stale
+    // "learned on the CC" byte would authorize an off-CC tune to a frequency
+    // only the new CSV asserts. lcn_freq_roll indexes the replaced LCN list.
+    state.dmr_lcn_trust[201] = 2;
+    state.lcn_freq_roll = 1;
+    // Session avoids and the scan hold index the rows being replaced, so they go too.
+    state.lcn_scan_hold = 1;
+    rc |= expect_int("adopt: seed avoid", dsd_state_trunk_lcn_avoid_set(&state, 0U, 1), 0);
+    g_chan_import_count = 1;
+    g_chan_import_chan[0] = 401;
+    g_chan_import_freq[0] = 880000000L;
+    g_chan_import_name[0] = "Repeater 1";
+    rc |= expect_int("adopt ok", svc_import_channel_map(&opts, &state, "c.csv"), 0);
+    rc |= expect_int("adopt clears stale lcn trust", (int)state.dmr_lcn_trust[201], 0);
+    rc |= expect_int("adopt restarts the lcn roll", state.lcn_freq_roll, 0);
+    rc |= expect_int("adopt releases the scan hold", state.lcn_scan_hold, 0);
+    rc |= expect_int("adopt drops session avoids", (int)state.lcn_avoid_count, 0);
+    rc |= expect_int("adopt releases the avoid store", (int)(state.trunk_lcn_avoid == NULL), 1);
+    // A named file after a nameless one repopulates the store the nameless one released.
+    rc |= expect_str("later named import repopulates", dsd_state_trunk_lcn_name_get(&state, 0U), "Repeater 1");
+    g_chan_import_name[0] = NULL;
+
+    // A refused adopt whose throwaway state carries names of its own: the live store keeps
+    // the names it had, and the imported one is still released exactly once. The count of
+    // frees is what ASan checks; a copy instead of a move would read back freed memory here.
+    g_chan_import_count = 0;
+    g_chan_import_name_without_row = "Orphan";
+    rc |= expect_int("named empty import refused", svc_import_channel_map(&opts, &state, "empty.csv"), -1);
+    rc |= expect_str("refused adopt keeps the live names", dsd_state_trunk_lcn_name_get(&state, 0U), "Repeater 1");
+    g_chan_import_name_without_row = NULL;
+
+    dsd_state_trunk_lcn_free(&state);
+    return rc;
+}
+
+/*
+ * Runtime key import has to arm the keyring the way -k/-K does: every consumer
+ * of rkey_array gates on keyloader, so without this the rows load and nothing
+ * ever uses them while the UI reports success.
+ */
+static int
+test_key_import_arms_keyloader(void) {
+    int rc = 0;
+    static dsd_opts opts;
+    static dsd_state state;
+    DSD_MEMSET(&opts, 0, sizeof(opts));
+    DSD_MEMSET(&state, 0, sizeof(state));
+
+    g_key_import_result = -1;
+    rc |= expect_int("dec key import failure rc", svc_import_keys_dec(&opts, &state, "keys.csv"), -1);
+    rc |= expect_int("failed dec key import leaves keyloader off", state.keyloader, 0);
+
+    g_key_import_result = 0;
+    rc |= expect_int("dec key import ok", svc_import_keys_dec(&opts, &state, "keys.csv"), 0);
+    rc |= expect_int("dec key import arms keyloader", state.keyloader, 1);
+
+    state.keyloader = 0;
+    rc |= expect_int("hex key import ok", svc_import_keys_hex(&opts, &state, "keys.hex"), 0);
+    rc |= expect_int("hex key import arms keyloader", state.keyloader, 1);
+
+    g_key_import_result = -1;
+    return rc;
+}
+
+/*
+ * Unloading. A frontend whose system can deselect a CSV needs a way to say
+ * "none": every importer takes a path and rejects an empty one, so without
+ * these the deselected file stays live for the rest of the session.
+ */
+static int
+test_clear_services_unload_what_the_importers_loaded(void) {
+    int rc = 0;
+    static dsd_opts opts;
+    static dsd_state state;
+    DSD_MEMSET(&opts, 0, sizeof(opts));
+    DSD_MEMSET(&state, 0, sizeof(state));
+
+    g_chan_import_result = 0;
+    g_chan_import_count = 2;
+    g_chan_import_chan[0] = 101;
+    g_chan_import_freq[0] = 851000000L;
+    g_chan_import_chan[1] = 102;
+    g_chan_import_freq[1] = 852000000L;
+    g_chan_import_name[0] = "Dispatch";
+    rc |= expect_int("clear: seed import ok", svc_import_channel_map(&opts, &state, "a.csv"), 0);
+    g_chan_import_name[0] = NULL;
+    rc |= expect_str("clear: seed import stores the name", dsd_state_trunk_lcn_name_get(&state, 0U), "Dispatch");
+    state.dmr_lcn_trust[101] = 2;
+    state.lcn_freq_roll = 1;
+    state.lcn_scan_hold = 1;
+    rc |= expect_int("clear: seed avoid", dsd_state_trunk_lcn_avoid_set(&state, 1U, 1), 0);
+    const unsigned int seq_before = state.trunk_chan_map_seq;
+
+    rc |= expect_int("chan map clear ok", svc_clear_channel_map(&opts, &state), 0);
+    rc |= expect_str("chan map clear forgets the path", opts.chan_in_file, "");
+    rc |= expect_int("chan map clear empties the map", (int)state.trunk_chan_map[101], 0);
+    rc |= expect_int("chan map clear empties used count", (int)state.trunk_chan_map_used_count, 0);
+    rc |= expect_int("chan map clear empties lcn list", state.lcn_freq_count, 0);
+    rc |= expect_int("chan map clear restarts the lcn roll", state.lcn_freq_roll, 0);
+    // The names belong to the rows that just went away, so they go with them.
+    rc |= expect_int("chan map clear releases the name store", (int)(state.trunk_lcn_name == NULL), 1);
+    rc |= expect_int("chan map clear releases the scan hold", state.lcn_scan_hold, 0);
+    rc |= expect_int("chan map clear drops session avoids", (int)state.lcn_avoid_count, 0);
+    rc |= expect_int("chan map clear releases the avoid store", (int)(state.trunk_lcn_avoid == NULL), 1);
+    // Provenance goes with the map for the same reason it does on an adopt: a
+    // surviving trust byte authorizes an off-CC tune to a frequency now gone.
+    rc |= expect_int("chan map clear drops lcn trust", (int)state.dmr_lcn_trust[101], 0);
+    rc |= expect_int("chan map clear advances the map seq", (int)(state.trunk_chan_map_seq != seq_before), 1);
+
+    // Trunk scan owns per-target maps; emptying a global one is not this
+    // frontend's call, exactly as on the import side.
+    opts.trunk_scan_enabled = 1;
+    rc |= expect_int("trunk-scan chan map clear refused", svc_clear_channel_map(&opts, &state), -1);
+    opts.trunk_scan_enabled = 0;
+
+    DSD_SNPRINTF(opts.group_in_file, sizeof opts.group_in_file, "%s", "groups.csv");
+    const int clears_before = g_tg_policy_clear_calls;
+    rc |= expect_int("group list clear ok", svc_clear_group_list(&opts, &state), 0);
+    rc |= expect_str("group list clear forgets the path", opts.group_in_file, "");
+    rc |= expect_int("group list clear empties the policy", g_tg_policy_clear_calls - clears_before, 1);
+
+    g_key_import_result = 0;
+    rc |= expect_int("clear: seed key import ok", svc_import_keys_dec(&opts, &state, "keys.csv"), 0);
+    state.rkey_array[7] = 0x1234ULL;
+    state.rkey_array_loaded[7] = 1U;
+    state.dmr_tg_key_map_tg[0] = 123U;
+    state.dmr_tg_key_map_kid[0] = 0x7B;
+    state.dmr_tg_key_map_count = 1;
+    state.dmr_tg_key_note_epoch[0] = 42U;
+    state.dmr_tg_key_skip_epoch[0] = 43U;
+    rc |= expect_int("keys clear ok", svc_clear_keys(&opts, &state), 0);
+    rc |= expect_str("keys clear forgets the path", opts.key_in_file, "");
+    rc |= expect_int("keys clear empties the keyring", (int)state.rkey_array[7], 0);
+    rc |= expect_int("keys clear marks the slot unloaded", (int)state.rkey_array_loaded[7], 0);
+    // Disarmed, or every consumer keeps treating the zeroed array as loaded keys.
+    rc |= expect_int("keys clear disarms the keyloader", state.keyloader, 0);
+    // The TG->key ID override map indexes into the keyring, so it goes with it.
+    rc |= expect_int("keys clear empties the tg key map", state.dmr_tg_key_map_count, 0);
+    rc |= expect_int("keys clear drops the tg key notice latch", (int)state.dmr_tg_key_note_epoch[0], 0);
+    rc |= expect_int("keys clear drops the tg key skip latch", (int)state.dmr_tg_key_skip_epoch[0], 0);
+
+    g_chan_import_result = -1;
+    g_key_import_result = -1;
+    return rc;
+}
+
+/*
+ * Adopt moves the per-row key store with the map; a keyless reimport drops it.
+ * Clearing the map leaves -Y, so it restores the globals the parked row set
+ * shadowed first.
+ */
+static int
+test_channel_map_keys_adopt_and_clear(void) {
+    int rc = 0;
+    static dsd_opts opts;
+    static dsd_state state;
+    DSD_MEMSET(&opts, 0, sizeof(opts));
+    DSD_MEMSET(&state, 0, sizeof(state));
+
+    g_chan_import_result = 0;
+    g_chan_import_count = 1;
+    g_chan_import_chan[0] = 101;
+    g_chan_import_freq[0] = 851000000L;
+    g_chan_import_name[0] = NULL;
+    g_chan_import_has_key[0] = 1;
+    g_chan_import_key[0] = 0xBEEFULL;
+    rc |= expect_int("keyed map import ok", svc_import_channel_map(&opts, &state, "a.csv"), 0);
+    rc |= expect_int("adopt keeps the row key set", (int)(dsd_state_trunk_lcn_keys_get(&state, 0U) != NULL), 1);
+    rc |= expect_int("adopt reports a keyed store", dsd_state_trunk_lcn_keys_present(&state), 1);
+
+    g_chan_import_has_key[0] = 0;
+    rc |= expect_int("keyless reimport ok", svc_import_channel_map(&opts, &state, "b.csv"), 0);
+    rc |= expect_int("keyless reimport drops the key store", (int)(state.trunk_lcn_keys == NULL), 1);
+    rc |= expect_int("keyless reimport reads back empty", (int)(dsd_state_trunk_lcn_keys_get(&state, 0U) == NULL), 1);
+
+    // Park on a keyed row, then clear: the live keyring must show the globals again.
+    g_chan_import_has_key[0] = 1;
+    rc |= expect_int("keyed map reimport ok", svc_import_channel_map(&opts, &state, "c.csv"), 0);
+    state.keyloader = 0;
+    state.K = 0xBEEFULL;
+    state.rkey_array[3] = 111ULL;
+    state.rkey_array_loaded[3] = 1U;
+    rc |= expect_int("parking on the keyed row installs it",
+                     dsd_scan_keys_enter(&state, dsd_state_trunk_lcn_keys_get(&state, 0U)), 1);
+    rc |= expect_ull("parked row key live", state.rkey_array[9], 0xBEEFULL);
+    rc |= expect_int("clear ok", svc_clear_channel_map(&opts, &state), 0);
+    rc |= expect_int("clear leaves the swap", (int)state.scan_keys_active_set, 0);
+    rc |= expect_int("clear restores keyloader", state.keyloader, 0);
+    rc |= expect_ull("clear restores scalar K", state.K, 0xBEEFULL);
+    rc |= expect_ull("clear restores the global slot", state.rkey_array[3], 111ULL);
+    rc |= expect_ull("clear drops the row slot", state.rkey_array[9], 0ULL);
+    rc |= expect_int("clear releases the key store", (int)(state.trunk_lcn_keys == NULL), 1);
+
+    g_chan_import_result = -1;
+    g_chan_import_has_key[0] = 0;
+    g_chan_import_key[0] = 0ULL;
+    dsd_state_trunk_lcn_free(&state);
+    return rc;
+}
+
+static int
+test_p25_bandplan_import_and_export_services(void) {
+    int rc = 0;
+    static dsd_opts opts;
+    static dsd_state state;
+    DSD_MEMSET(&opts, 0, sizeof(opts));
+    DSD_MEMSET(&state, 0, sizeof(state));
+
+    // Refusals that never reach the importer: no path, and a trunk-scan run,
+    // whose band plans come per target (p25_bandplan_csv).
+    g_bandplan_validate_calls = 0;
+    g_bandplan_import_calls = 0;
+    g_bandplan_resolve_calls = 0;
+    rc |= expect_int("bandplan import null path", svc_import_p25_bandplan(&opts, &state, NULL), -1);
+    rc |= expect_int("bandplan import empty path", svc_import_p25_bandplan(&opts, &state, ""), -1);
+    opts.trunk_scan_enabled = 1;
+    g_bandplan_validate_accepted = 1U;
+    g_bandplan_import_result = 0;
+    rc |=
+        expect_int("bandplan import refused under trunk scan", svc_import_p25_bandplan(&opts, &state, "plan.csv"), -1);
+    rc |= expect_int("trunk scan refusal skips the dry run", g_bandplan_validate_calls, 0);
+    rc |= expect_int("trunk scan refusal skips the importer", g_bandplan_import_calls, 0);
+    rc |= expect_str("trunk scan refusal records no path", opts.p25_bandplan_in_file, "");
+    opts.trunk_scan_enabled = 0;
+
+    // Dry run gate: a file that opens but yields no usable row must not touch the live plan.
+    g_bandplan_validate_accepted = 0U;
+    g_bandplan_validate_result = 0;
+    rc |= expect_int("bandplan import empty dry run refused", svc_import_p25_bandplan(&opts, &state, "empty.csv"), -1);
+    rc |= expect_int("empty dry run consulted the validator", g_bandplan_validate_calls, 1);
+    rc |= expect_int("empty dry run skips the importer", g_bandplan_import_calls, 0);
+    rc |= expect_str("empty dry run records no path", opts.p25_bandplan_in_file, "");
+    g_bandplan_validate_result = -1;
+    g_bandplan_validate_accepted = 3U;
+    rc |= expect_int("bandplan import unreadable file refused", svc_import_p25_bandplan(&opts, &state, "gone.csv"), -1);
+    rc |= expect_int("unreadable file skips the importer", g_bandplan_import_calls, 0);
+    g_bandplan_validate_result = 0;
+
+    // Importer failure: no path recorded, no announcement pass.
+    g_bandplan_import_result = -1;
+    rc |= expect_int("bandplan import importer failure", svc_import_p25_bandplan(&opts, &state, "bad.csv"), -1);
+    rc |= expect_int("importer failure reached the importer", g_bandplan_import_calls, 1);
+    rc |= expect_str("importer failure handed the path through", g_bandplan_import_path, "bad.csv");
+    rc |= expect_str("importer failure records no path", opts.p25_bandplan_in_file, "");
+    rc |= expect_int("importer failure skips announcement resolve", g_bandplan_resolve_calls, 0);
+
+    // Success: imported into the live state, path recorded, pending announcements re-resolved.
+    g_bandplan_import_result = 0;
+    rc |= expect_int("bandplan import ok", svc_import_p25_bandplan(&opts, &state, "plan.csv"), 0);
+    rc |= expect_int("bandplan import loaded the live state", state.p25_bandplan_row_count, 1);
+    rc |= expect_str("bandplan import path recorded", opts.p25_bandplan_in_file, "plan.csv");
+    rc |= expect_int("bandplan import resolves pending announcements", g_bandplan_resolve_calls, 1);
+
+    // Export: an empty path is refused before the engine; otherwise the engine's row count comes back.
+    g_bandplan_export_calls = 0;
+    rc |= expect_int("bandplan export null path", svc_export_p25_bandplan(&opts, &state, NULL), -1);
+    rc |= expect_int("bandplan export empty path", svc_export_p25_bandplan(&opts, &state, ""), -1);
+    rc |= expect_int("empty export path skips the engine", g_bandplan_export_calls, 0);
+    g_bandplan_export_result = -1;
+    rc |= expect_int("bandplan export nothing to write", svc_export_p25_bandplan(&opts, &state, "out.csv"), -1);
+    g_bandplan_export_result = 4;
+    rc |= expect_int("bandplan export row count", svc_export_p25_bandplan(&opts, &state, "out.csv"), 4);
+    rc |= expect_str("bandplan export path handed through", g_bandplan_export_path, "out.csv");
+    rc |= expect_int("bandplan export reached the engine", g_bandplan_export_calls, 2);
+
+    g_bandplan_import_result = -1;
+    g_bandplan_export_result = -1;
+    g_bandplan_validate_accepted = 0U;
     return rc;
 }
 
@@ -716,5 +1217,10 @@ main(void) {
     rc |= test_rtl_service_option_contracts();
 #endif
     rc |= test_file_network_and_import_failure_contracts();
+    rc |= test_channel_map_reimport_replaces_previous_map();
+    rc |= test_channel_map_keys_adopt_and_clear();
+    rc |= test_key_import_arms_keyloader();
+    rc |= test_clear_services_unload_what_the_importers_loaded();
+    rc |= test_p25_bandplan_import_and_export_services();
     return rc ? 1 : 0;
 }

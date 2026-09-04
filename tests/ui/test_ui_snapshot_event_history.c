@@ -4,9 +4,14 @@
  */
 
 #include <assert.h>
+#include <dsd-neo/app_control/notification_status.h>
+#include <dsd-neo/app_control/snapshot.h>
+#include <dsd-neo/core/call_state.h>
+#include <dsd-neo/core/events.h>
 #include <dsd-neo/core/input_level.h>
 #include <dsd-neo/core/state.h>
 #include <dsd-neo/core/state_ext.h>
+#include <dsd-neo/core/synctype_ids.h>
 #include <dsd-neo/core/talkgroup_policy.h>
 #include <dsd-neo/runtime/trunk_cc_candidates.h>
 #include <stdint.h>
@@ -16,6 +21,30 @@
 #include "../../src/app_control/snapshot_internal.h"
 #include "dsd-neo/core/safe_api.h"
 #include "dsd-neo/core/state_fwd.h"
+
+int
+dsd_event_state_copy_snapshot_incremental(dsd_state* dst, const dsd_state* src, Event_History_I event_history[2],
+                                          const uint64_t source_revisions[2], int force_copy, uint8_t copied[2]) {
+    (void)dsd_call_state_copy_to_state(dst, src);
+    copied[0] = 0U;
+    copied[1] = 0U;
+    if (!src || !src->event_history_s) {
+        return 0;
+    }
+    for (size_t slot = 0; slot < 2U; slot++) {
+        if (force_copy || source_revisions == NULL || source_revisions[slot] != src->event_history_s[slot].revision) {
+            DSD_MEMCPY(&event_history[slot], &src->event_history_s[slot], sizeof(Event_History_I));
+            copied[slot] = 1U;
+        }
+    }
+    return 1;
+}
+
+int
+dsd_event_state_copy_snapshot(dsd_state* dst, const dsd_state* src, Event_History_I event_history[2]) {
+    uint8_t copied[2];
+    return dsd_event_state_copy_snapshot_incremental(dst, src, event_history, NULL, 1, copied);
+}
 
 static void
 assert_slot_tail(const dsd_state* snap, uint32_t slot0_src, uint32_t slot1_src) {
@@ -48,7 +77,6 @@ static void
 assert_render_fields(const dsd_state* snap) {
     dsd_tg_policy_lookup lookup;
     assert(snap != NULL);
-    assert(snap->lasttg == 321);
     assert(snap->trunk_chan_map[0x1234] == 769768750L);
     assert(snap->trunk_chan_map_used_count == 1U);
     assert(snap->trunk_chan_map_used[0] == 0x1234U);
@@ -77,6 +105,22 @@ assert_render_fields(const dsd_state* snap) {
     assert(snap->p25_site_network_active_valid == 1U);
     assert(snap->p25_site_network_active == 1U);
     assert(snap->rkey_array[7] == 0ULL);
+    /* The scan-list name store is a second heap allocation beside the LCN tail, so it
+       needs the same explicit deep copy; a byte-range copy would publish nothing. */
+    assert(strcmp(dsd_state_trunk_lcn_name_get(snap, 0U), "Dispatch") == 0);
+    assert(strcmp(dsd_state_trunk_lcn_name_get(snap, 1U), "Fireground") == 0);
+    assert(strcmp(snap->trunk_scan_active_id, "county-p25") == 0);
+    assert(snap->trunk_scan_active_ordinal == 2U);
+    assert(snap->trunk_scan_target_count == 5U);
+    /* The scan-list avoid store is a third heap allocation with the same deep-copy need,
+       and the hold/avoid scalars ride the publication range beside the target id. */
+    assert(dsd_state_trunk_lcn_avoid_get(snap, 1U) == 1);
+    assert(dsd_state_trunk_lcn_avoid_get(snap, 0U) == 0);
+    assert(snap->lcn_scan_hold == 1U);
+    assert(snap->lcn_avoid_count == 1U);
+    assert(snap->trunk_scan_hold == 1U);
+    assert(snap->trunk_scan_active_avoided == 1U);
+    assert(snap->trunk_scan_avoided_count == 3U);
 }
 
 static void
@@ -106,8 +150,28 @@ main(void) {
     }
 
     state->event_history_s = history;
-    state->lasttg = 321;
     dsd_state_set_trunk_chan_freq(state, 0x1234U, 769768750L);
+
+    dsd_call_observation observation = {0};
+    observation.protocol = 35;
+    observation.slot = 0U;
+    observation.kind = DSD_CALL_KIND_GROUP_VOICE;
+    observation.ota_target_id = 321U;
+    observation.policy_target_id = 321U;
+    observation.ota_source_id = 654U;
+    observation.frequency_hz = 769768750L;
+    observation.observed_m = 1.0;
+    assert(dsd_call_state_observe(state, &observation, DSD_CALL_BOUNDARY_BEGIN) == 1);
+    dsd_call_crypto_update crypto = {
+        .classification = DSD_CALL_CRYPTO_DECRYPTABLE,
+        .algid = 0x84U,
+        .kid = 0x1234U,
+        .mi = UINT64_C(0x1122334455667788),
+        .audio_permitted = 1U,
+        .observed_m = 1.1,
+    };
+    assert(dsd_call_state_update_crypto(state, 0U, &crypto) == 1);
+    assert(dsd_recent_activity_publish(state, 0U, &observation, "Active Ch: 1234 TG: 321; ", 1000U) == 1);
 
     dsd_tg_policy_entry entry;
     assert(dsd_tg_policy_make_exact_entry(321U, "A", "DISPATCH", DSD_TG_POLICY_SOURCE_IMPORTED, &entry) == 0);
@@ -135,6 +199,17 @@ main(void) {
     state->p25_site_network_active_valid = 1U;
     state->p25_site_network_active = 1U;
     state->rkey_array[7] = 0x12345678ULL;
+    state->lcn_freq_count = 2;
+    assert(dsd_state_trunk_lcn_name_set(state, 0U, "Dispatch") == 0);
+    assert(dsd_state_trunk_lcn_name_set(state, 1U, "Fireground") == 0);
+    DSD_SNPRINTF(state->trunk_scan_active_id, sizeof state->trunk_scan_active_id, "%s", "county-p25");
+    state->trunk_scan_active_ordinal = 2U;
+    state->trunk_scan_target_count = 5U;
+    assert(dsd_state_trunk_lcn_avoid_set(state, 1U, 1) == 0);
+    state->lcn_scan_hold = 1U;
+    state->trunk_scan_hold = 1U;
+    state->trunk_scan_active_avoided = 1U;
+    state->trunk_scan_avoided_count = 3U;
 
     assert(dsd_trunk_cc_candidates_add(state, 851006250L, 1, DSD_TRUNK_CC_CANDIDATE_CURRENT_SITE) == 1);
     assert(dsd_trunk_cc_candidates_add(state, 852006250L, 1, DSD_TRUNK_CC_CANDIDATE_CURRENT_SITE) == 1);
@@ -153,18 +228,42 @@ main(void) {
 
     dsd_app_snapshot_test_reset_event_history_copy_counts();
     dsd_app_telemetry_publish_snapshot(state);
+    observation.ota_source_id = 999U;
+    observation.observed_m = 2.0;
+    assert(dsd_call_state_observe(state, &observation, DSD_CALL_BOUNDARY_CONTINUE) == 1);
+    crypto.classification = DSD_CALL_CRYPTO_ENCRYPTED;
+    crypto.audio_permitted = 0U;
+    crypto.observed_m = 2.1;
+    assert(dsd_call_state_update_crypto(state, 0U, &crypto) == 1);
+    assert(dsd_recent_activity_publish(state, 0U, &observation, "mutated TG: 999; ", 2000U) == 1);
     history[0].Event_History_Items[1].source_id = 999U;
     DSD_SNPRINTF(history[0].Event_History_Items[1].src_str, sizeof history[0].Event_History_Items[1].src_str, "%s",
                  "MUTATED");
     cc->count = 1;
     cc->candidates[0] = 999999999L;
     cc->added = 99U;
+    assert(dsd_state_trunk_lcn_name_set(state, 0U, "MUTATED") == 0);
+    assert(dsd_state_trunk_lcn_avoid_set(state, 0U, 1) == 0);
 
     const dsd_state* snap = dsd_app_get_latest_snapshot();
     assert_slot_tail(snap, 123U, 456U);
     assert(strcmp(snap->event_history_s[0].Event_History_Items[1].src_str, "RADIO-123") == 0);
+    /* A shared pointer would let the next reserve() on either side realloc the other's
+       buffer, and would republish the live mutation above as if it had been snapshotted. */
+    assert(snap->trunk_lcn_name != NULL);
+    assert(snap->trunk_lcn_name != state->trunk_lcn_name);
+    assert(snap->trunk_lcn_avoid != NULL);
+    assert(snap->trunk_lcn_avoid != state->trunk_lcn_avoid);
     assert_render_fields(snap);
     assert_cc_candidates(snap);
+    dsd_call_snapshot call;
+    assert(dsd_call_state_get(snap, 0U, &call) == 1);
+    assert(call.ota_source_id == 654U);
+    assert(call.crypto == DSD_CALL_CRYPTO_DECRYPTABLE);
+    assert(call.algid == 0x84U);
+    dsd_recent_activity_snapshot recent;
+    assert(dsd_recent_activity_copy_snapshot(snap, &recent) == 1);
+    assert(strcmp(recent.entries[0].notice, "Active Ch: 1234 TG: 321; ") == 0);
     assert_history_copy_counts(1U, 1U, 1U, 1U);
 
     // Repeated publications with unchanged revisions do not copy either history slot.
@@ -237,8 +336,33 @@ main(void) {
     assert(lookup.match == DSD_TG_POLICY_MATCH_EXACT);
     assert(strcmp(lookup.entry.name, "POLICY-ONLY") == 0);
 
+    /* A cleared channel map must not leave the previous map's names in the snapshot. */
+    dsd_state_trunk_lcn_name_free(state);
+    dsd_state_trunk_lcn_avoid_free(state);
+    dsd_app_telemetry_publish_snapshot(state);
+    snap = dsd_app_get_latest_snapshot();
+    assert(strcmp(dsd_state_trunk_lcn_name_get(snap, 0U), "") == 0);
+    assert(strcmp(dsd_state_trunk_lcn_name_get(snap, 1U), "") == 0);
+    assert(snap->trunk_lcn_avoid == NULL);
+    assert(dsd_state_trunk_lcn_avoid_get(snap, 1U) == 0);
+
+    /* This publisher also feeds the notification record the Android foreground service
+       reads with no Qt in the picture. The fan-out sits at the tail of
+       dsd_app_telemetry_publish_snapshot() and had no coverage anywhere: deleting the call
+       left the whole suite green while the notification went permanently blank. The
+       publishers stay dormant until a reader has asked once, so arm them first. */
+    dsd_app_notification_status notification;
+    (void)dsd_app_notification_get(&notification);
+    state->synctype = DSD_SYNC_P25P2_POS;
+    state->trunk_cc_freq = 851006250L;
+    dsd_app_telemetry_publish_snapshot(state);
+    assert(dsd_app_notification_get(&notification) == 1);
+    assert(strcmp(notification.protocol, "P25p2") == 0);
+    assert(notification.cc_freq_hz == 851006250);
+
     puts("UI_SNAPSHOT_EVENT_HISTORY: OK");
     dsd_state_ext_free_all(state);
+    dsd_state_trunk_lcn_free(state);
     free(replacement);
     free(history);
     free(state);

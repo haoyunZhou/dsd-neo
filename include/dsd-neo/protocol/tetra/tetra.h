@@ -4,13 +4,14 @@
 
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/state.h>
+#include <dsd-neo/engine/protocol_dispatch.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 int dsd_dispatch_matches_tetra(int synctype);
-void dsd_dispatch_handle_tetra(dsd_opts* opts, dsd_state* state);
+dsd_frame_verdict dsd_dispatch_handle_tetra(dsd_opts* opts, dsd_state* state);
 void processTetraFrame(dsd_opts* opts, dsd_state* state);
 void processTetraSBFrame(dsd_opts* opts, dsd_state* state);
 

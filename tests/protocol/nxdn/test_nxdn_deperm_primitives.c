@@ -8,8 +8,10 @@
  * SACCH, FACCH, CAC, FACCH2, and FACCH3 soft-decision paths.
  */
 
+#include <dsd-neo/core/call_state.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/state.h>
+#include <dsd-neo/core/state_ext.h>
 #include <dsd-neo/core/synctype_ids.h>
 #include <dsd-neo/protocol/nxdn/nxdn_const.h>
 #include <dsd-neo/protocol/nxdn/nxdn_deperm.h>
@@ -20,6 +22,7 @@
 #include "dsd-neo/core/opts_fwd.h"
 #include "dsd-neo/core/safe_api.h"
 #include "dsd-neo/core/state_fwd.h"
+#include "nxdn_confirm.h"
 #include "nxdn_const_reinclude.h" // IWYU pragma: keep
 #include "nxdn_internal.h"
 
@@ -422,6 +425,18 @@ test_sacch_state_update(void) {
     state.nxdn_part_of_frame = 0;
     make_sacch_trellis(trellis, 2U, 0x15U);
 
+    /* A 6-bit CRC is not on its own evidence that this is a transmission, so an
+     * unconfirmed frame decodes without publishing a RAN (issue #398). */
+    nxdn_handle_sacch(&opts, &state, trellis, m_data, 0x2AU, 0x2AU);
+    rc |= expect_int("sacch-sf-unconfirmed-part", state.nxdn_part_of_frame, 1);
+    rc |= expect_int("sacch-sf-unconfirmed-ran", (int)state.nxdn_ran, 0);
+    rc |= expect_int("sacch-sf-unconfirmed-last-ran", (int)state.nxdn_last_ran, 0);
+
+    /* A second consecutive SACCH confirms the transmission, and the RAN goes out.
+     * nxdn_confirm_begin_frame() is the frame boundary nxdn_frame() supplies around each
+     * call; without it several short CRCs would count as one frame's worth of evidence. */
+    nxdn_confirm_begin_frame(&state);
+    state.nxdn_part_of_frame = 0;
     nxdn_handle_sacch(&opts, &state, trellis, m_data, 0x2AU, 0x2AU);
     rc |= expect_int("sacch-sf-good-part", state.nxdn_part_of_frame, 1);
     rc |= expect_int("sacch-sf-good-ran", (int)state.nxdn_ran, 0x15);
@@ -469,10 +484,27 @@ test_sacch_state_update(void) {
     state.payload_miN = 0x11U;
     make_sacch_trellis(trellis, 3U, 0x3FU);
 
+    /* A failed SACCH CRC must keep the frame out of the element decoder entirely: the caller is
+     * the gate, since the decoder itself carries no CRC verdict (issue #411). The sentinel is
+     * what the decoder would overwrite with the real message type had it run. */
+    state.NxdnElementsContent.MessageType = 0x22U;
+
     nxdn_handle_sacch(&opts, &state, trellis, m_data, 0x01U, 0x00U);
     rc |= expect_int("sacch-nsf-bad-crc-part-reset", state.nxdn_part_of_frame, 0);
     rc |= expect_int("sacch-nsf-bad-crc-forced-seed", (int)state.payload_miN, 0x2468);
+    rc |= expect_u8_at("sacch-nsf-bad-crc-skips-elements", 0U, state.NxdnElementsContent.MessageType, 0x22U);
     rc |= expect_sacch_reset_to_ones(&state);
+
+    /* The same frame with a passing CRC does reach the decoder. IDLE (0x10) sits at bits 2..7 of
+     * the 24-bit NSF payload the handler copies from trellis[8..31]. */
+    DSD_MEMSET(&state, 0, sizeof(state));
+    state.nxdn_sacch_non_superframe = 1;
+    make_sacch_trellis(trellis, 3U, 0x3FU);
+    write_bits_msb(trellis, 10U, 6U, 0x10U);
+    state.NxdnElementsContent.MessageType = 0x22U;
+
+    nxdn_handle_sacch(&opts, &state, trellis, m_data, 0x2AU, 0x2AU);
+    rc |= expect_u8_at("sacch-nsf-good-message-type", 0U, state.NxdnElementsContent.MessageType, 0x10U);
     return rc;
 }
 
@@ -493,6 +525,13 @@ test_sacch2_state_update(void) {
     write_bits_msb(trellis, 8U, 2U, 0x01U);
     write_bits_msb(trellis, 10U, 9U, 0x123U);
 
+    /* First short-CRC frame: decoded, but no RAN and no call row yet (issue #398). */
+    nxdn_handle_sacch2(&opts, &state, trellis, m_data, 0x2AU, 0x2AU);
+    dsd_call_snapshot unconfirmed_call;
+    rc |= expect_int("sacch2-unconfirmed-last-ran", (int)state.nxdn_last_ran, 0);
+    rc |= expect_int("sacch2-unconfirmed-canonical", dsd_call_state_get(&state, 0U, &unconfirmed_call), 0);
+
+    nxdn_confirm_begin_frame(&state);
     nxdn_handle_sacch2(&opts, &state, trellis, m_data, 0x2AU, 0x2AU);
     rc |= expect_u8_at("sacch2-good-message-type", 0U, state.nxdn_dcr_sf_message_type, 0x01U);
     rc |= expect_u8_at("sacch2-good-segcrc", 2U, state.nxdn_sacch_frame_segcrc[2], 0U);
@@ -500,14 +539,37 @@ test_sacch2_state_update(void) {
     rc |= expect_u8_at("sacch2-single-copy-cipher-lsb", 1U, state.dmr_pdu_sf[0][1], 1U);
     rc |= expect_int("sacch2-single-payload-seed-clear", (int)state.payload_miN, 0);
     rc |= expect_int("sacch2-single-last-ran", (int)state.nxdn_last_ran, 7);
-    rc |= expect_int("sacch2-single-last-tg", state.nxdn_last_tg, 777);
-    rc |= expect_int("sacch2-single-last-rid", state.nxdn_last_rid, 777);
+    dsd_call_snapshot call;
+    rc |= expect_int("sacch2-single-canonical", dsd_call_state_get(&state, 0U, &call), 1);
+    rc |= expect_int("sacch2-single-target", (int)call.ota_target_id, 777);
+    rc |= expect_int("sacch2-single-source", (int)call.ota_source_id, 777);
+    rc |= expect_int("sacch2-single-canonical-crypto", call.crypto, DSD_CALL_CRYPTO_ENCRYPTED_PENDING);
+    rc |= expect_int("sacch2-single-canonical-algid", call.algid, 1);
+    rc |= expect_int("sacch2-single-canonical-key", call.kid, 0);
+    rc |= expect_int("sacch2-single-canonical-mi", (int)call.mi, 0);
+    rc |= expect_int("sacch2-single-canonical-audio", call.audio_permitted, 0);
     rc |= expect_str("sacch2-single-alias", state.generic_talker_alias[0], "JPN DCR");
-    rc |= expect_str("sacch2-single-event-alias", histories[0].Event_History_Items[0].alias, "JPN DCR; ");
-    rc |= expect_int("sacch2-single-event-revision", (int)histories[0].revision, 1);
+    rc |= expect_int("sacch2-single-event-protocol", histories[0].Event_History_Items[0].systype, DSD_SYNC_NXDN_POS);
+    rc |= expect_int("sacch2-single-event-target", histories[0].Event_History_Items[0].target_id, 777);
+    rc |= expect_int("sacch2-single-event-source", histories[0].Event_History_Items[0].source_id, 777);
+    rc |= expect_int("sacch2-single-event-encrypted", histories[0].Event_History_Items[0].enc, 1);
+    rc |= expect_int("sacch2-single-event-algid", histories[0].Event_History_Items[0].enc_alg, 1);
+    rc |= expect_int("sacch2-single-event-key", histories[0].Event_History_Items[0].enc_key, 0);
+    rc |= expect_int("sacch2-single-event-mi", (int)histories[0].Event_History_Items[0].mi, 0);
+    rc |= expect_str("sacch2-single-event-alias", histories[0].Event_History_Items[0].alias, "JPN DCR");
+    rc |= expect_int("sacch2-single-event-revision", histories[0].revision > 1U, 1);
     rc |= expect_int("sacch2-single-cipher", state.nxdn_cipher_type, 1);
     rc |= expect_int("sacch2-single-enc-lockout", state.dmr_encL, 1);
 
+    const uint64_t call_epoch = call.epoch;
+    make_sacch2_trellis(trellis, 1U, 2U, 0x1EU);
+    nxdn_handle_sacch2(&opts, &state, trellis, m_data, 0x15U, 0x15U);
+    rc |= expect_u8_at("sacch2-end-message-type", 0U, state.nxdn_dcr_sf_message_type, 0x1EU);
+    rc |= expect_int("sacch2-end-canonical", dsd_call_state_get(&state, 0U, &call), 1);
+    rc |= expect_int("sacch2-end-phase", call.phase, DSD_CALL_PHASE_ENDED);
+    rc |= expect_int("sacch2-end-preserves-epoch", call.epoch == call_epoch, 1);
+
+    dsd_state_ext_free_all(&state);
     init_sacch2_state(&state, histories);
     DSD_MEMSET(state.nxdn_sacch_frame_segment, 0, sizeof(state.nxdn_sacch_frame_segment));
     DSD_MEMSET(state.nxdn_sacch_frame_segcrc, 0, sizeof(state.nxdn_sacch_frame_segcrc));
@@ -520,8 +582,18 @@ test_sacch2_state_update(void) {
     rc |= expect_u8_at("sacch2-complete-message-type", 0U, state.nxdn_dcr_sf_message_type, 0x02U);
     rc |= expect_sacch_reset_to_ones(&state);
     rc |= expect_u8_at("sacch2-complete-clears-pdu", 0U, state.dmr_pdu_sf[0][0], 0U);
-    rc |= expect_str("sacch2-complete-alias", state.generic_talker_alias[0], "JPN DCR");
+    rc |= expect_int("sacch2-pdu-no-call", dsd_call_state_get(&state, 0U, &call), 0);
+    rc |= expect_str("sacch2-pdu-no-alias", state.generic_talker_alias[0], "");
 
+    dsd_state_ext_free_all(&state);
+    init_sacch2_state(&state, histories);
+    make_sacch2_trellis(trellis, 1U, 2U, 0x00U);
+    nxdn_handle_sacch2(&opts, &state, trellis, m_data, 0x0CU, 0x0CU);
+    rc |= expect_u8_at("sacch2-idle-message-type", 0U, state.nxdn_dcr_sf_message_type, 0x00U);
+    rc |= expect_int("sacch2-idle-no-call", dsd_call_state_get(&state, 0U, &call), 0);
+    rc |= expect_str("sacch2-idle-no-alias", state.generic_talker_alias[0], "");
+
+    dsd_state_ext_free_all(&state);
     init_sacch2_state(&state, histories);
     state.M = 1;
     state.payload_miN = 0x55U;
@@ -531,8 +603,9 @@ test_sacch2_state_update(void) {
     rc |= expect_u8_at("sacch2-bad-crc-message-type", 0U, state.nxdn_dcr_sf_message_type, 0xFFU);
     rc |= expect_u8_at("sacch2-bad-crc-segcrc", 2U, state.nxdn_sacch_frame_segcrc[2], 1U);
     rc |= expect_int("sacch2-bad-crc-seed-clear", (int)state.payload_miN, 0);
-    rc |= expect_int("sacch2-bad-crc-no-tg", state.nxdn_last_tg, 0);
+    rc |= expect_int("sacch2-bad-crc-no-call", dsd_call_state_get(&state, 0U, &call), 0);
     rc |= expect_str("sacch2-bad-crc-no-alias", state.generic_talker_alias[0], "");
+    dsd_state_ext_free_all(&state);
     return rc;
 }
 
@@ -568,9 +641,14 @@ test_cac_crc_failure_reset(void) {
     state.payload_mi = 0xCCCCU;
     state.aes_ivR[0] = 0x5AU;
 
+    /* Same caller-gate contract as SACCH above: a non-zero CAC CRC remainder never reaches the
+     * element decoder (issue #411). */
+    state.NxdnElementsContent.MessageType = 0x22U;
+
     for (int i = 0; i < 10; i++) {
         nxdn_handle_cac(&opts, &state, trellis, m_data, 1U);
     }
+    rc |= expect_u8_at("cac-bad-crc-skips-elements", 0U, state.NxdnElementsContent.MessageType, 0x22U);
     rc |= expect_int("cac-before-threshold-carrier", state.carrier, 1);
     rc |= expect_int("cac-before-threshold-format", state.data_header_format[0], 9);
 
@@ -579,7 +657,7 @@ test_cac_crc_failure_reset(void) {
     rc |= expect_int("cac-reset-last-sync", state.lastsynctype, DSD_SYNC_NONE);
     rc |= expect_int("cac-reset-carrier", state.carrier, 0);
     rc |= expect_int("cac-reset-jitter", state.jitter, -1);
-    rc |= expect_int("cac-reset-symbolcnt", state.symbolcnt, 0);
+    rc |= expect_int("cac-reset-symbolcnt", (int)state.symbolcnt, 0);
     rc |= expect_int("cac-reset-offset", state.offset, 0);
     rc |= expect_int("cac-reset-dibit-pointer", (int)(state.dibit_buf_p - state.dibit_buf), 200);
     rc |= expect_int("cac-reset-data-blocks", state.data_header_blocks[0], 1);
@@ -593,6 +671,16 @@ test_cac_crc_failure_reset(void) {
 
     nxdn_handle_cac(&opts, &state, trellis, m_data, 1U);
     rc |= expect_int("cac-counter-cleared-after-reset", state.carrier, 0);
+
+    /* A clean CAC (zero remainder) does reach the decoder: IDLE sits at bits 2..7 of the 147-bit
+     * element buffer the handler copies from trellis[8..154]. */
+    DSD_MEMSET(&state, 0, sizeof(state));
+    DSD_MEMSET(trellis, 0, sizeof(trellis));
+    write_bits_msb(trellis, 10U, 6U, 0x10U);
+    state.NxdnElementsContent.MessageType = 0x22U;
+
+    nxdn_handle_cac(&opts, &state, trellis, m_data, 0U);
+    rc |= expect_u8_at("cac-good-message-type", 0U, state.NxdnElementsContent.MessageType, 0x10U);
     return rc;
 }
 
@@ -629,6 +717,91 @@ test_pich_tch_dcr_csm_alias_state(void) {
     return rc;
 }
 
+/*
+ * Build the 144 soft bits an over-the-air FACCH1 burst would present, by running the decoder's
+ * own transform chain backwards: CRC-12 over the 80-bit payload, rate-1/2 K=5 convolutional
+ * encode, 16/9 puncture, then permute. The decoder has no encoder to borrow -- trellis_encode()
+ * in src/core/util/dsd_misc.c is static and nxdn_convolution.h is decode-only -- so the eight
+ * lines of the rate-1/2 encoder are restated here. nxdn_hard_fallback_decode() runs
+ * trellis_decode() over the very stream nxdn_conv_decode_soft() consumes, so both speak this code.
+ */
+static void
+make_facch1_soft_bits(uint8_t bits[144], const uint8_t payload[80], int corrupt_crc) {
+    static const uint8_t PARITY[32] = {0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0,
+                                       1, 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1, 0, 0, 1};
+    uint8_t trellis[96];
+    uint8_t coded[192];
+    uint8_t deperm[144];
+
+    DSD_MEMSET(trellis, 0, sizeof(trellis));
+    for (size_t i = 0U; i < 80U; i++) {
+        trellis[i] = (uint8_t)(payload[i] & 1U);
+    }
+
+    /* CRC-12 over the payload, MSB first, exactly where the decoder reads its check field. */
+    uint16_t crc = crc12f(trellis, 80);
+    if (corrupt_crc) {
+        crc ^= 1U;
+    }
+    write_bits_msb(trellis, 80U, 12U, crc);
+    /* trellis[92..95] stay zero: the chainback returns 92 data bits and four flush bits. */
+
+    unsigned int reg = 0U;
+    for (size_t i = 0U; i < sizeof(coded); i += 2U) {
+        reg = ((reg << 1U) | trellis[i >> 1U]) & 0x1FU;
+        coded[i] = PARITY[reg & 0x19U];
+        coded[i + 1U] = PARITY[reg & 0x17U];
+    }
+
+    /* Puncture: nxdn_depuncture_16_9_rel() reinserts a zero at each 4k+1, so drop it here. */
+    size_t out = 0U;
+    for (size_t k = 0U; k < 48U; k++) {
+        deperm[out++] = coded[(k * 4U) + 0U];
+        deperm[out++] = coded[(k * 4U) + 2U];
+        deperm[out++] = coded[(k * 4U) + 3U];
+    }
+
+    /* Permute: nxdn_depermute_rel_u8() does deperm[PERM_16_9[i]] = bits[i]. */
+    for (size_t i = 0U; i < 144U; i++) {
+        bits[i] = deperm[PERM_16_9[i]];
+    }
+}
+
+/*
+ * FACCH1 carries call setup, so it is the most consequential of the caller gates: the element
+ * decoder records no CRC verdict of its own, and a frame whose CRC-12 failed must never reach it
+ * (issue #411).
+ */
+static int
+test_facch1_crc_gates_element_decode(void) {
+    static dsd_opts opts;
+    static dsd_state state;
+    uint8_t payload[80];
+    uint8_t bits[144];
+    uint8_t reliab[144];
+    int rc = 0;
+
+    DSD_MEMSET(&opts, 0, sizeof(opts));
+    DSD_MEMSET(payload, 0, sizeof(payload));
+    DSD_MEMSET(reliab, 255, sizeof(reliab));
+    write_bits_msb(payload, 2U, 6U, 0x10U); /* IDLE */
+
+    DSD_MEMSET(&state, 0, sizeof(state));
+    state.NxdnElementsContent.MessageType = 0x22U;
+    make_facch1_soft_bits(bits, payload, 0);
+    nxdn_deperm_facch_soft(&opts, &state, bits, reliab, 1U);
+    rc |= expect_u8_at("facch1-good-message-type", 0U, state.NxdnElementsContent.MessageType, 0x10U);
+    rc |= expect_int("facch1-good-confirmed", nxdn_confirm_is_confirmed(&state), 1);
+
+    DSD_MEMSET(&state, 0, sizeof(state));
+    state.NxdnElementsContent.MessageType = 0x22U;
+    make_facch1_soft_bits(bits, payload, 1);
+    nxdn_deperm_facch_soft(&opts, &state, bits, reliab, 1U);
+    rc |= expect_u8_at("facch1-bad-crc-skips-elements", 0U, state.NxdnElementsContent.MessageType, 0x22U);
+    rc |= expect_int("facch1-bad-crc-unconfirmed", nxdn_confirm_is_confirmed(&state), 0);
+    return rc;
+}
+
 static int
 test_facch2_udch_crc_state_update(void) {
     static const uint8_t m_data[26] = {0};
@@ -646,13 +819,11 @@ test_facch2_udch_crc_state_update(void) {
     rc |= expect_int("facch2-good-part", state.nxdn_part_of_frame, 2);
     rc |= expect_u8_at("facch2-good-format", 0U, state.data_header_format[0], 1U);
     rc |= expect_u8_at("facch2-good-message-type", 0U, state.NxdnElementsContent.MessageType, 0x10U);
-    rc |= expect_u8_at("facch2-good-crc", 0U, state.NxdnElementsContent.VCallCrcIsGood, 1U);
 
     state.nxdn_last_ran = 0x33U;
     state.nxdn_part_of_frame = 7;
     state.data_header_format[0] = 9U;
     state.NxdnElementsContent.MessageType = 0x22U;
-    state.NxdnElementsContent.VCallCrcIsGood = 0U;
 
     nxdn_handle_facch2_udch(&opts, &state, trellis, m_data, 0x456U, 0x457U, 1U);
     rc |= expect_int("facch2-bad-keeps-ran", (int)state.nxdn_last_ran, 0x33);
@@ -683,17 +854,14 @@ test_facch3_udch2_crc_state_update(void) {
     nxdn_handle_facch3_udch2_soft(&opts, &state, &message, 1U);
     rc |= expect_u8_at("facch3-good-format", 0U, state.data_header_format[0], 1U);
     rc |= expect_u8_at("facch3-good-message-type", 0U, state.NxdnElementsContent.MessageType, 0x10U);
-    rc |= expect_u8_at("facch3-good-crc", 0U, state.NxdnElementsContent.VCallCrcIsGood, 1U);
 
     state.data_header_format[0] = 9U;
     state.NxdnElementsContent.MessageType = 0x22U;
-    state.NxdnElementsContent.VCallCrcIsGood = 0U;
 
     message.check[0] = 0x124U;
     nxdn_handle_facch3_udch2_soft(&opts, &state, &message, 0U);
     rc |= expect_u8_at("udch2-bad-keeps-format", 0U, state.data_header_format[0], 9U);
     rc |= expect_u8_at("udch2-bad-skips-elements", 0U, state.NxdnElementsContent.MessageType, 0x22U);
-    rc |= expect_u8_at("udch2-bad-keeps-crc", 0U, state.NxdnElementsContent.VCallCrcIsGood, 0U);
     return rc;
 }
 
@@ -748,16 +916,13 @@ test_facch3_udch2_split_block_storage_and_crc_gate(void) {
     nxdn_handle_facch3_udch2_soft(&opts, &state, &message, 1U);
     rc |= expect_u8_at("facch3-split-good-format", 0U, state.data_header_format[0], 1U);
     rc |= expect_u8_at("facch3-split-good-message-type", 0U, state.NxdnElementsContent.MessageType, 0x10U);
-    rc |= expect_u8_at("facch3-split-good-crc", 0U, state.NxdnElementsContent.VCallCrcIsGood, 1U);
 
     state.data_header_format[0] = 9U;
     state.NxdnElementsContent.MessageType = 0x22U;
-    state.NxdnElementsContent.VCallCrcIsGood = 0U;
     message.check[1] = 0x223U;
     nxdn_handle_facch3_udch2_soft(&opts, &state, &message, 0U);
     rc |= expect_u8_at("udch2-split-bad-keeps-format", 0U, state.data_header_format[0], 9U);
     rc |= expect_u8_at("udch2-split-bad-keeps-message-type", 0U, state.NxdnElementsContent.MessageType, 0x22U);
-    rc |= expect_u8_at("udch2-split-bad-keeps-crc", 0U, state.NxdnElementsContent.VCallCrcIsGood, 0U);
     return rc;
 }
 
@@ -775,6 +940,7 @@ main(void) {
     rc |= test_sacch2_state_update();
     rc |= test_cac_crc_failure_reset();
     rc |= test_pich_tch_dcr_csm_alias_state();
+    rc |= test_facch1_crc_gates_element_decode();
     rc |= test_facch2_udch_crc_state_update();
     rc |= test_facch3_udch2_crc_state_update();
     rc |= test_facch3_udch2_split_block_storage_and_crc_gate();

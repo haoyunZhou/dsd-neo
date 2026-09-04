@@ -17,6 +17,7 @@
 
 #include <dsd-neo/core/opts_fwd.h>
 #include <dsd-neo/core/state_fwd.h>
+#include <dsd-neo/runtime/decode_mode.h>
 
 #ifdef USE_RADIO
 #include <stdint.h>
@@ -105,10 +106,39 @@ int svc_udp_output_config(dsd_opts* opts, dsd_state* state, const char* host, in
 int svc_import_channel_map(dsd_opts* opts, dsd_state* state, const char* path);
 /** @brief Import a group list CSV into runtime state. */
 int svc_import_group_list(dsd_opts* opts, dsd_state* state, const char* path);
+/**
+ * @brief Import a P25 band plan CSV (IDEN table) into the live state.
+ *
+ * Dry-runs the file first and refuses one that yields no usable row, so a
+ * mispicked CSV cannot replace the stored plan. Refused under trunk scan, where
+ * band plans come per target (p25_bandplan_csv). On success the path is
+ * recorded in opts->p25_bandplan_in_file and pending P25 announcements are
+ * re-resolved against the newly seeded tables.
+ * @return 0 on success, -1 otherwise.
+ */
+int svc_import_p25_bandplan(dsd_opts* opts, dsd_state* state, const char* path);
+/**
+ * @brief Export the learned P25 band plan (live and, under trunk scan, parked IDEN tables) to @p path.
+ * @return The number of rows written (>= 1), or -1 when there was nothing to write or the write failed.
+ */
+int svc_export_p25_bandplan(const dsd_opts* opts, const dsd_state* state, const char* path);
 /** @brief Import keys from a decimal CSV. */
 int svc_import_keys_dec(dsd_opts* opts, dsd_state* state, const char* path);
 /** @brief Import keys from a hexadecimal CSV. */
 int svc_import_keys_hex(dsd_opts* opts, dsd_state* state, const char* path);
+
+/*
+ * Unload counterparts. The importers all take a path and reject an empty one,
+ * so a frontend whose system can deselect a CSV has no way to say "none"
+ * without these; the previous file would otherwise stay live for the session.
+ * Each returns 0 when the data is gone afterwards, -1 when it could not be.
+ */
+/** @brief Drop the runtime channel map, its LCN list and its trust bytes. */
+int svc_clear_channel_map(dsd_opts* opts, dsd_state* state);
+/** @brief Drop every loaded talkgroup entry. */
+int svc_clear_group_list(dsd_opts* opts, dsd_state* state);
+/** @brief Drop the keyring and disarm the key loader (covers dec and hex). */
+int svc_clear_keys(dsd_opts* opts, dsd_state* state);
 /** @brief Set the current talkgroup hold value. */
 void svc_set_tg_hold(dsd_state* state, unsigned tg);
 /** @brief Set trunking hang time (seconds, clamped to >=0). */
@@ -125,6 +155,30 @@ void svc_toggle_dmr_le(dsd_opts* opts);
 void svc_set_slot_pref(dsd_opts* opts, int pref);
 /** @brief Enable/disable slots using bitmask (bit0=slot1, bit1=slot2). */
 void svc_set_slots_onoff(dsd_opts* opts, int mask);
+/** @brief Gate trunk scan on voice: leave a signal that carries no voice. */
+void svc_set_scan_voice_only(dsd_opts* opts, int on);
+/** @brief Voice qualify window in ms (clamped to 100..600000). */
+void svc_set_scan_voice_qualify_ms(dsd_opts* opts, int ms);
+/** @brief Voice hold time in ms (clamped to 100..600000). */
+void svc_set_scan_voice_hold_ms(dsd_opts* opts, int ms);
+
+// Symbol profile
+/**
+ * @brief Make the SPS hunt and the front end agree with the decoder's timing.
+ *
+ * The caller has already put @c samplesPerSymbol / @c symbolCenter on the timing
+ * @p profile calls for; this publishes that decision to everything downstream of
+ * it. The hunt is restarted from the profile's index, because left on the
+ * previous mode's it overwrites the freshly computed timing on its next pass, and
+ * on an RTL front end the demodulator family and channel filter are queued to
+ * match — otherwise the decoder is looking for one protocol through the filter of
+ * another.
+ *
+ * For handlers that change the decoder in place. Ones that retune are already
+ * served by the trunk tuning hook, which stages a profile with the retune, and
+ * a second request from here would fight it.
+ */
+void svc_publish_symbol_profile(const dsd_opts* opts, dsd_state* state, dsd_decode_mode_profile profile);
 
 // Per-protocol inversion toggles
 /** @brief Toggle X2-TDMA symbol inversion. */
@@ -150,7 +204,13 @@ int svc_rtl_set_freq(dsd_opts* opts, dsd_state* state, uint32_t hz);
 int svc_rtl_set_gain(dsd_opts* opts, dsd_state* state, int value);
 /** @brief Set RTL DSP baseband bandwidth (kHz: 4,6,8,12,16,24,48), clamping and restarting if needed. */
 int svc_rtl_set_bandwidth(dsd_opts* opts, dsd_state* state, int khz);
-/** @brief Set RTL squelch threshold in dB, converting to power units. */
+/**
+ * @brief Set the RTL squelch threshold from a decibel value.
+ *
+ * Negative values are a threshold in dB. Zero or above switches the squelch off,
+ * the same meaning 0 carries in the `sql` field of an input string and in the
+ * `rtl_sql` config key; a 0 dB threshold is full scale and would never open.
+ */
 int svc_rtl_set_sql_db(dsd_opts* opts, double dB);
 /** @brief Set RTL monitor/non-symbol gain multiplier (clamped to 0–3). */
 int svc_rtl_set_volume_mult(dsd_opts* opts, int mult);

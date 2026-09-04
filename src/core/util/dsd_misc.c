@@ -26,9 +26,11 @@ static const int PARITY[] = {0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0,
 
 // trellis_1_2 encode: source is in bits, result in bits
 static void
-trellis_encode(uint8_t result[], const uint8_t source[], int result_len, int reg) {
+trellis_encode(uint8_t result[], const uint8_t source[], int result_len, unsigned int reg) {
+    /* Only the low 5 bits of the shift register are ever consulted, so mask
+     * each step to keep the value bounded (avoids signed shift overflow). */
     for (int i = 0; i < result_len; i += 2) {
-        reg = (reg << 1) | source[i >> 1];
+        reg = ((reg << 1) | source[i >> 1]) & 0x1FU;
         result[i] = PARITY[reg & 0x19];
         result[i + 1] = PARITY[reg & 0x17];
     }
@@ -40,7 +42,7 @@ trellis_encode(uint8_t result[], const uint8_t source[], int result_len, int reg
 // in the original unencoded message (excl. these trailing bits)
 void
 trellis_decode(uint8_t result[], const uint8_t source[], int result_len) {
-    int reg = 0;
+    unsigned int reg = 0;
     int min_d = 9999;
     int min_bt = 0;
 
@@ -65,7 +67,7 @@ trellis_decode(uint8_t result[], const uint8_t source[], int result_len) {
             }
         }
         result[p] = min_bt;
-        reg = (reg << 1) | min_bt;
+        reg = ((reg << 1) | (unsigned int)min_bt) & 0x1FU;
     }
 
     //debug output
@@ -493,7 +495,7 @@ clamp_float_to_short(float value) {
 
 // HPF short path
 void
-hpf(dsd_state* state, short* input, int len) {
+dsd_hpf(dsd_state* state, short* input, int len) {
     int i;
     for (i = 0; i < len; i++) {
         input[i] = (short)HPFilter_Update(&state->HRCFilter, (float)input[i]);
@@ -612,4 +614,25 @@ dB_to_pwr(double dB) {
         pwr = 1.0;
     }
     return pwr;
+}
+
+/*
+ * Render a squelch threshold for display, saying "off" when it gates nothing.
+ *
+ * Kept next to pwr_to_dB() because it is that function's display counterpart for
+ * the one case pwr_to_dB() cannot express: its -120 dB result means both "a
+ * measurement of zero" and "a threshold that was never applied", and only the
+ * caller's context separates them. For a threshold, this function does.
+ */
+int
+dsd_squelch_format(double mean_power, const char* unit, char* out, size_t out_size) {
+    if (!out || out_size == 0U) {
+        return -1;
+    }
+    if (dsd_squelch_is_off(mean_power)) {
+        DSD_SNPRINTF(out, out_size, "off");
+        return 0;
+    }
+    DSD_SNPRINTF(out, out_size, "%.1f%s", pwr_to_dB(mean_power), unit ? unit : "");
+    return 0;
 }

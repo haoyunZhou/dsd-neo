@@ -19,6 +19,7 @@
 
 #include <dsd-neo/app_control/commands.h>
 #include <dsd-neo/core/audio.h>
+#include <dsd-neo/core/call_state.h>
 #include <dsd-neo/core/frontend_types.h>
 #include <dsd-neo/core/init.h>
 #include <dsd-neo/core/opts.h>
@@ -53,6 +54,7 @@
 
 #include "dsd-neo/core/dibit.h"
 #include "dsd-neo/core/safe_api.h"
+#include "dsd-neo/io/rtl_stream_fwd.h"
 #include "dsd-neo/platform/file_compat.h"
 #include "dsd-neo/platform/posix_compat.h"
 #include "dsd-neo/runtime/call_alert.h"
@@ -439,6 +441,58 @@ test_basic_pulse_config_apply(void) {
 }
 
 static int
+test_input_warn_db_apply_clamps_to_window(void) {
+    test_runtime runtime;
+    if (alloc_test_runtime(&runtime) != 0) {
+        return 1;
+    }
+    dsd_opts* opts = runtime.opts;
+    dsd_state* state = runtime.state;
+
+    int rc = 0;
+
+    /* Omitted key: opts keeps the initOpts default. */
+    dsdneoUserConfig unset_cfg = {0};
+    unset_cfg.has_input = 1;
+    unset_cfg.input_source = DSDCFG_INPUT_PULSE;
+    dsd_apply_user_config_to_opts(&unset_cfg, opts, state);
+    if (opts->input_warn_db != -40.0) {
+        DSD_FPRINTF(stderr, "FAIL: unset input_warn_db should keep the -40.0 default (got %f)\n", opts->input_warn_db);
+        rc |= 1;
+    }
+
+    /* In-range value applies verbatim. */
+    dsdneoUserConfig cfg = {0};
+    cfg.has_input = 1;
+    cfg.input_source = DSDCFG_INPUT_PULSE;
+    cfg.input_warn_db_is_set = 1;
+    cfg.input_warn_db = -60.0;
+    dsd_apply_user_config_to_opts(&cfg, opts, state);
+    if (opts->input_warn_db != -60.0) {
+        DSD_FPRINTF(stderr, "FAIL: input_warn_db not applied (got %f)\n", opts->input_warn_db);
+        rc |= 1;
+    }
+
+    /* Out-of-range values clamp to the universal [-200, 0] window. */
+    cfg.input_warn_db = -250.0;
+    dsd_apply_user_config_to_opts(&cfg, opts, state);
+    if (opts->input_warn_db != -200.0) {
+        DSD_FPRINTF(stderr, "FAIL: input_warn_db below the window not clamped to -200.0 (got %f)\n",
+                    opts->input_warn_db);
+        rc |= 1;
+    }
+    cfg.input_warn_db = 5.0;
+    dsd_apply_user_config_to_opts(&cfg, opts, state);
+    if (opts->input_warn_db != 0.0) {
+        DSD_FPRINTF(stderr, "FAIL: input_warn_db above the window not clamped to 0.0 (got %f)\n", opts->input_warn_db);
+        rc |= 1;
+    }
+
+    free_test_runtime(&runtime);
+    return rc;
+}
+
+static int
 test_output_config_without_frontend_preserves_active_frontend(void) {
     test_runtime runtime;
     if (alloc_test_runtime(&runtime) != 0) {
@@ -487,6 +541,114 @@ test_output_config_without_frontend_preserves_active_frontend(void) {
     (void)remove(path);
     return rc;
 }
+
+#if defined(USE_RADIO) && defined(DSD_NEO_TEST_RTL_WRAP)
+/* The RTL hot restart tears the stream down and builds a new one, so a config
+ * re-apply can only be exercised with the stream calls faked out. */
+/* The fake stands in for a real RtlSdrContext, so nothing may dereference it:
+ * every entry point that would is wrapped below. */
+static int g_wrap_fake_ctx = 0;
+static float g_wrap_last_channel_squelch = -1.0f;
+
+// GNU ld --wrap entry points must keep the reserved __wrap_* symbol names.
+// NOLINTBEGIN(bugprone-reserved-identifier, cert-dcl37-c, cert-dcl51-cpp, misc-use-internal-linkage)
+int
+__wrap_rtl_stream_create(dsd_opts* opts, RtlSdrContext** out_ctx) {
+    (void)opts;
+    if (out_ctx) {
+        *out_ctx = (RtlSdrContext*)&g_wrap_fake_ctx;
+    }
+    return 0;
+}
+
+int
+__wrap_rtl_stream_start(RtlSdrContext* ctx) {
+    (void)ctx;
+    return 0;
+}
+
+int
+__wrap_rtl_stream_stop(RtlSdrContext* ctx) {
+    (void)ctx;
+    return 0;
+}
+
+int
+__wrap_rtl_stream_destroy(RtlSdrContext* ctx) {
+    (void)ctx;
+    return 0;
+}
+
+int
+__wrap_rtl_stream_set_channel_squelch(float level) {
+    g_wrap_last_channel_squelch = level;
+    return 0;
+}
+
+/* Read back off the context after a restart. Wrapped because the real one walks
+ * into the fake context, which is not an RtlSdrContext. */
+uint32_t
+__wrap_rtl_stream_output_rate(const RtlSdrContext* ctx) {
+    (void)ctx;
+    return 48000U;
+}
+
+// NOLINTEND(bugprone-reserved-identifier, cert-dcl37-c, cert-dcl51-cpp, misc-use-internal-linkage)
+
+/*
+ * A config re-applied mid-run carries rtl_sql in decibels, exactly as the CLI
+ * `sql` field and the startup loader do. Stored as the raw integer, a -50 dB
+ * request became a threshold of -50 mean power, which gates nothing: asking for
+ * a squelch through the config switched the squelch off instead.
+ */
+static int
+test_config_reapply_converts_rtl_squelch_from_db(void) {
+    test_runtime runtime;
+    if (alloc_test_runtime(&runtime) != 0) {
+        return 1;
+    }
+    dsd_opts* opts = runtime.opts;
+    dsd_state* state = runtime.state;
+
+    opts->audio_in_type = AUDIO_IN_RTL;
+    opts->rtl_squelch_level = 0.0;
+    DSD_SNPRINTF(opts->audio_in_dev, sizeof opts->audio_in_dev, "%s", "rtl:0:851375000:22:0:24:0:2");
+
+    dsdneoUserConfig cfg;
+    DSD_MEMSET(&cfg, 0, sizeof cfg);
+    cfg.has_input = 1;
+    cfg.input_source = DSDCFG_INPUT_RTL;
+    cfg.rtl_device = 0;
+    DSD_SNPRINTF(cfg.rtl_freq, sizeof cfg.rtl_freq, "%s", "460.125M");
+    cfg.rtl_gain = 22;
+    cfg.rtl_bw_khz = 24;
+    cfg.rtl_sql = -50;
+    cfg.rtl_volume = 2;
+
+    g_wrap_last_channel_squelch = -1.0f;
+    dsd_app_command_submit(DSD_APP_CMD_CONFIG_APPLY, &cfg, sizeof cfg);
+    (void)dsd_app_drain_cmds(opts, state);
+
+    int rc = 0;
+    rc |= expect_true("config re-apply converts rtl_sql from dB",
+                      fabs(opts->rtl_squelch_level - pow(10.0, -5.0)) < 1e-12);
+    rc |= expect_float_near("config re-apply pushes the threshold to the demod", g_wrap_last_channel_squelch,
+                            (float)pow(10.0, -5.0), 1e-9f);
+
+    /* And rtl_sql = 0 still means off, rather than "key omitted". */
+    cfg.rtl_sql = 0;
+    DSD_SNPRINTF(cfg.rtl_freq, sizeof cfg.rtl_freq, "%s", "461.125M");
+    g_wrap_last_channel_squelch = -1.0f;
+    dsd_app_command_submit(DSD_APP_CMD_CONFIG_APPLY, &cfg, sizeof cfg);
+    (void)dsd_app_drain_cmds(opts, state);
+    rc |= expect_true("config re-apply of rtl_sql 0 switches squelch off", opts->rtl_squelch_level == 0.0);
+    rc |= expect_float_near("config re-apply of rtl_sql 0 opens the demod gate", g_wrap_last_channel_squelch, 0.0f,
+                            1e-9f);
+
+    free_test_runtime(&runtime);
+    return rc;
+}
+#endif
 
 static int
 test_ui_command_queue_applies_fifo(void) {
@@ -1610,14 +1772,22 @@ test_ui_protocol_reset_and_mode_toggles(void) {
     state->edacs_site_id = 3;
     state->edacs_lcn_count = 5;
     state->edacs_cc_lcn = 2;
-    state->edacs_vc_lcn = 4;
     state->edacs_tuned_lcn = 6;
-    state->edacs_vc_call_type = 1;
     state->p25_cc_freq = 851000000;
     state->trunk_cc_freq = 852000000;
     opts->trunk_is_tuned = 1;
-    state->lasttg = 123;
-    state->lastsrc = 456;
+    dsd_call_observation provoice_call = {0};
+    provoice_call.protocol = DSD_SYNC_PROVOICE_POS;
+    provoice_call.slot = 0U;
+    provoice_call.kind = DSD_CALL_KIND_GROUP_VOICE;
+    provoice_call.ota_target_id = 123U;
+    provoice_call.policy_target_id = 123U;
+    provoice_call.ota_source_id = 456U;
+    provoice_call.channel = 4U;
+    provoice_call.frequency_hz = 853000000;
+    int rc = 0;
+    rc |= expect_int_eq("seed ProVoice canonical call",
+                        dsd_call_state_observe(state, &provoice_call, DSD_CALL_BOUNDARY_BEGIN), 1);
 
     dsd_app_command_submit(DSD_APP_CMD_DMR_RESET, NULL, 0);
     dsd_app_command_submit(DSD_APP_CMD_M17_TX_TOGGLE, NULL, 0);
@@ -1625,7 +1795,6 @@ test_ui_protocol_reset_and_mode_toggles(void) {
     dsd_app_command_submit(DSD_APP_CMD_PROVOICE_MODE_TOGGLE, NULL, 0);
     int applied = dsd_app_drain_cmds(opts, state);
 
-    int rc = 0;
     rc |= expect_int_eq("protocol reset command drain count", applied, 4);
     rc |= expect_int_eq("DMR rest channel reset", state->dmr_rest_channel, -1);
     rc |= expect_int_eq("DMR MFID reset", state->dmr_mfid, -1);
@@ -1648,8 +1817,11 @@ test_ui_protocol_reset_and_mode_toggles(void) {
     rc |= expect_int_eq("ProVoice P25 CC reset", (int)state->p25_cc_freq, 0);
     rc |= expect_int_eq("ProVoice trunk CC reset", (int)state->trunk_cc_freq, 0);
     rc |= expect_int_eq("ProVoice tuned flag reset", opts->trunk_is_tuned, 0);
-    rc |= expect_int_eq("ProVoice last TG reset", state->lasttg, 0);
-    rc |= expect_int_eq("ProVoice last source reset", state->lastsrc, 0);
+    dsd_call_snapshot ended_call = {0};
+    rc |= expect_int_eq("ProVoice canonical call retained", dsd_call_state_get(state, 0U, &ended_call), 1);
+    rc |= expect_int_eq("ProVoice canonical call ended", ended_call.phase, DSD_CALL_PHASE_ENDED);
+    rc |= expect_true("ProVoice ended identity retained",
+                      ended_call.ota_target_id == 123U && ended_call.ota_source_id == 456U);
 
     free_test_runtime(&runtime);
     return rc;
@@ -1935,6 +2107,20 @@ test_ui_file_capture_commands_manage_handles(void) {
     rc |= expect_int_eq("queued WAV toggles remove temp files", count_directory_entries(wav_dir), 0);
 #endif
 
+    dsd_app_command_submit(DSD_APP_CMD_SYMCAP_SAVE, NULL, 0);
+    applied = dsd_app_drain_cmds(opts, state);
+    rc |= expect_int_eq("symbol capture start command drains", applied, 1);
+    rc |= expect_true("symbol capture start opens handle", opts->symbol_out_f != NULL);
+    rc |= expect_int_eq("symbol capture start event category",
+                        state->event_history_s[0].Event_History_Items[1].category, DSD_EVENT_CATEGORY_SYSTEM);
+    char auto_sym_path[sizeof opts->symbol_out_file] = {0};
+    DSD_SNPRINTF(auto_sym_path, sizeof auto_sym_path, "%s", opts->symbol_out_file);
+    if (opts->symbol_out_f) {
+        fclose(opts->symbol_out_f);
+        opts->symbol_out_f = NULL;
+    }
+    (void)remove(auto_sym_path);
+
     FILE* sym_fp = dsd_fopen_private(sym_path, "wb");
     if (!sym_fp) {
         DSD_FPRINTF(stderr, "FAIL: symbol capture stop setup failed for %s\n", sym_path);
@@ -1949,6 +2135,8 @@ test_ui_file_capture_commands_manage_handles(void) {
         rc |= expect_true("symbol capture stop closes handle", opts->symbol_out_f == NULL);
         rc |= expect_true("symbol capture stop stages replay input path", strcmp(opts->audio_in_dev, sym_path) == 0);
         rc |= expect_int_eq("symbol capture stop clears auto flag", opts->symbol_out_file_is_auto, 0);
+        rc |= expect_int_eq("symbol capture stop event category",
+                            state->event_history_s[0].Event_History_Items[1].category, DSD_EVENT_CATEGORY_SYSTEM);
     }
 
     free_test_runtime(&runtime);
@@ -2045,20 +2233,29 @@ test_ui_malformed_payload_commands_drain_without_mutation(void) {
     opts->slot_preference = 1;
     opts->slot1_on = 1;
     opts->slot2_on = 0;
+    opts->scan_voice_only = 1;
+    opts->scan_voice_qualify_ms = 1500;
+    opts->scan_voice_hold_ms = 2500;
     dsd_app_command_submit(DSD_APP_CMD_RIGCTL_SET_MOD_BW, &short_scalar, sizeof short_scalar);
     dsd_app_command_submit(DSD_APP_CMD_TG_HOLD_SET, &short_scalar, sizeof short_scalar);
     dsd_app_command_submit(DSD_APP_CMD_HANGTIME_SET, &short_scalar, sizeof short_scalar);
     dsd_app_command_submit(DSD_APP_CMD_SLOT_PREF_SET, &short_scalar, sizeof short_scalar);
     dsd_app_command_submit(DSD_APP_CMD_SLOTS_ONOFF_SET, &short_scalar, sizeof short_scalar);
+    dsd_app_command_submit(DSD_APP_CMD_SCAN_VOICE_ONLY_SET, &short_scalar, sizeof short_scalar);
+    dsd_app_command_submit(DSD_APP_CMD_SCAN_VOICE_QUALIFY_MS_SET, &short_scalar, sizeof short_scalar);
+    dsd_app_command_submit(DSD_APP_CMD_SCAN_VOICE_HOLD_MS_SET, &short_scalar, sizeof short_scalar);
     applied = dsd_app_drain_cmds(opts, state);
 
-    rc |= expect_int_eq("short scalar payload commands are drained", applied, 5);
+    rc |= expect_int_eq("short scalar payload commands are drained", applied, 8);
     rc |= expect_int_eq("short rigctl payload preserves bandwidth", opts->setmod_bw, 12500);
     rc |= expect_int_eq("short TG payload preserves hold", (int)state->tg_hold, 4242);
     rc |= expect_true("short hangtime payload preserves value", fabs(opts->trunk_hangtime - 7.25f) <= 1e-6f);
     rc |= expect_int_eq("short slot preference payload preserves value", opts->slot_preference, 1);
     rc |= expect_int_eq("short slot mask payload preserves slot 1", opts->slot1_on, 1);
     rc |= expect_int_eq("short slot mask payload preserves slot 2", opts->slot2_on, 0);
+    rc |= expect_int_eq("short voice-only payload preserves flag", opts->scan_voice_only, 1);
+    rc |= expect_int_eq("short voice qualify payload preserves value", opts->scan_voice_qualify_ms, 1500);
+    rc |= expect_int_eq("short voice hold payload preserves value", opts->scan_voice_hold_ms, 2500);
 
     struct ShortP2Payload {
         uint64_t w;
@@ -2096,23 +2293,32 @@ test_ui_runtime_parameter_commands_clamp_and_update_state(void) {
     double hangtime = -2.5;
     int32_t slot_pref = 9;
     int32_t slot_mask = 2;
+    int32_t voice_only = 7;
+    int32_t voice_qualify = 50;
+    int32_t voice_hold = 700000;
 
     dsd_app_command_submit(DSD_APP_CMD_RIGCTL_SET_MOD_BW, &mod_bw, sizeof mod_bw);
     dsd_app_command_submit(DSD_APP_CMD_TG_HOLD_SET, &tg, sizeof tg);
     dsd_app_command_submit(DSD_APP_CMD_HANGTIME_SET, &hangtime, sizeof hangtime);
     dsd_app_command_submit(DSD_APP_CMD_SLOT_PREF_SET, &slot_pref, sizeof slot_pref);
     dsd_app_command_submit(DSD_APP_CMD_SLOTS_ONOFF_SET, &slot_mask, sizeof slot_mask);
+    dsd_app_command_submit(DSD_APP_CMD_SCAN_VOICE_ONLY_SET, &voice_only, sizeof voice_only);
+    dsd_app_command_submit(DSD_APP_CMD_SCAN_VOICE_QUALIFY_MS_SET, &voice_qualify, sizeof voice_qualify);
+    dsd_app_command_submit(DSD_APP_CMD_SCAN_VOICE_HOLD_MS_SET, &voice_hold, sizeof voice_hold);
     int applied = dsd_app_drain_cmds(opts, state);
 
     int rc = 0;
-    rc |= expect_int_eq("runtime parameter drain count", applied, 5);
+    rc |= expect_int_eq("runtime parameter drain count", applied, 8);
     rc |= expect_int_eq("rigctl bandwidth clamps high", opts->setmod_bw, 25000);
     rc |= expect_int_eq("TG hold updates state", (int)state->tg_hold, (int)tg);
     rc |= expect_true("negative hangtime clamps to zero", fabs(opts->trunk_hangtime) <= 1e-9);
     rc |= expect_int_eq("slot preference clamps high", opts->slot_preference, 2);
     rc |= expect_int_eq("slot mask clears slot 1", opts->slot1_on, 0);
     rc |= expect_int_eq("slot mask enables slot 2", opts->slot2_on, 1);
-    rc |= expect_true("last runtime command writes slot mask toast", strstr(state->ui_msg, "Slot mask -> 2") != NULL);
+    rc |= expect_int_eq("voice-only clamps to on", opts->scan_voice_only, 1);
+    rc |= expect_int_eq("voice qualify clamps low", opts->scan_voice_qualify_ms, 100);
+    rc |= expect_int_eq("voice hold clamps high", opts->scan_voice_hold_ms, 600000);
+    rc |= expect_true("last runtime command writes voice hold toast", strstr(state->ui_msg, "Voice hold") != NULL);
 
     free_test_runtime(&runtime);
     return rc;
@@ -2687,6 +2893,21 @@ test_ui_rtl_setting_commands_stage_without_live_restart(void) {
     rc |= expect_true("RTL setting commands leave restart staged", opts->rtl_needs_restart == 1);
     rc |= expect_true("RTL auto PPM command writes final toast", strstr(state->ui_msg, "Auto PPM -> On") != NULL);
 
+    /* Switching the squelch off has to be reportable as off. The toast echoed the
+     * number it was handed, so switching the squelch off said "-> 0.0 dB", which
+     * reads as a threshold at full scale rather than as no gating at all. */
+    double sql_off = 0.0;
+    dsd_app_command_submit(DSD_APP_CMD_RTL_SET_SQL_DB, &sql_off, sizeof sql_off);
+    (void)dsd_app_drain_cmds(opts, state);
+    rc |= expect_true("RTL squelch command accepts off", opts->rtl_squelch_level == 0.0);
+    rc |= expect_true("RTL squelch off toast names it off", strstr(state->ui_msg, "RTL squelch -> off") != NULL);
+
+    double sql_back = -55.0;
+    dsd_app_command_submit(DSD_APP_CMD_RTL_SET_SQL_DB, &sql_back, sizeof sql_back);
+    (void)dsd_app_drain_cmds(opts, state);
+    rc |= expect_true("RTL squelch toast still states a real threshold",
+                      strstr(state->ui_msg, "RTL squelch -> -55.0 dB") != NULL);
+
     free_test_runtime(&runtime);
     return rc;
 }
@@ -2697,6 +2918,7 @@ int
 main(void) {
     int rc = 0;
     rc |= test_basic_pulse_config_apply();
+    rc |= test_input_warn_db_apply_clamps_to_window();
     rc |= test_output_config_without_frontend_preserves_active_frontend();
     rc |= test_ui_command_queue_applies_fifo();
     rc |= test_ui_command_queue_overflow_drops_oldest();
@@ -2739,6 +2961,9 @@ main(void) {
     rc |= test_zero_rtl_ppm_apply_updates_live_request();
     rc |= test_omitted_rtl_ppm_apply_preserves_live_request();
     rc |= test_ui_rtl_setting_commands_stage_without_live_restart();
+#ifdef DSD_NEO_TEST_RTL_WRAP
+    rc |= test_config_reapply_converts_rtl_squelch_from_db();
+#endif
 #endif
     return rc ? 1 : 0;
 }

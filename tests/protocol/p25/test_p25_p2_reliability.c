@@ -5,9 +5,12 @@
 
 /* Unit tests for P25P2 frame reset and soft-decision recovery paths. */
 
+#include <dsd-neo/core/call_state.h>
 #include <dsd-neo/core/dibit.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/state.h>
+#include <dsd-neo/core/state_ext.h>
+#include <dsd-neo/core/synctype_ids.h>
 #include <dsd-neo/core/time_format.h>
 #include <dsd-neo/core/vocoder.h>
 #include <dsd-neo/platform/posix_compat.h>
@@ -16,7 +19,7 @@
 #include <dsd-neo/runtime/trunk_tuning_hooks.h>
 #include <stdint.h>
 #include <stdio.h>
-#include <string.h>
+#include <stdlib.h>
 #include <time.h>
 
 #include "dsd-neo/core/opts_fwd.h"
@@ -53,6 +56,40 @@ install_trunk_tuning_hooks(void) {
         .tune_to_cc_request = test_tune_request,
         .return_to_cc_request = test_return_request,
     });
+}
+
+static void
+seed_p25p2_call(dsd_state* state, uint8_t slot, uint64_t target, uint64_t source, uint16_t service_options,
+                uint8_t emergency, uint8_t priority) {
+    const dsd_call_observation observation = {
+        .protocol = DSD_SYNC_P25P2_POS,
+        .slot = slot,
+        .kind = DSD_CALL_KIND_GROUP_VOICE,
+        .ota_target_id = target,
+        .policy_target_id = target,
+        .ota_source_id = source,
+        .service_options = service_options,
+        .emergency = emergency,
+        .priority = priority,
+        .has_service_metadata = 1U,
+    };
+    if (dsd_call_state_observe(state, &observation, DSD_CALL_BOUNDARY_BEGIN) <= 0) {
+        DSD_FPRINTF(stderr, "FAIL: could not seed canonical P25 Phase 2 call\n");
+        abort();
+    }
+}
+
+static int
+expect_call_state(const char* tag, const dsd_state* state, uint8_t slot, dsd_call_phase phase, uint64_t target,
+                  uint64_t source, uint8_t emergency, uint8_t priority) {
+    dsd_call_snapshot call;
+    if (dsd_call_state_get(state, slot, &call) <= 0 || call.phase != phase || call.kind != DSD_CALL_KIND_GROUP_VOICE
+        || call.ota_target_id != target || call.policy_target_id != target || call.ota_source_id != source
+        || call.emergency != emergency || call.priority != priority) {
+        DSD_FPRINTF(stderr, "FAIL: %s\n", tag);
+        return 1;
+    }
+    return 0;
 }
 
 /* External declarations matching p25p2_frame.c */
@@ -183,6 +220,38 @@ watchdog_event_current(dsd_opts* opts, dsd_state* state, uint8_t slot) {
     (void)opts;
     (void)state;
     (void)slot;
+}
+
+void
+// NOLINTNEXTLINE(misc-use-internal-linkage)
+dsd_event_sync_slot(dsd_opts* opts, dsd_state* state, uint8_t slot) {
+    (void)opts;
+    (void)state;
+    (void)slot;
+}
+
+int
+// NOLINTNEXTLINE(misc-use-internal-linkage)
+dsd_event_emit_call_notice(dsd_opts* opts, dsd_state* state, uint8_t slot, const dsd_call_snapshot* call,
+                           const char* detail) {
+    (void)opts;
+    (void)state;
+    (void)slot;
+    (void)call;
+    (void)detail;
+    return 0;
+}
+
+int
+// NOLINTNEXTLINE(misc-use-internal-linkage)
+dsd_event_emit_call_notice_nonfinalizing(dsd_opts* opts, dsd_state* state, uint8_t slot, const dsd_call_snapshot* call,
+                                         const char* detail) {
+    (void)opts;
+    (void)state;
+    (void)slot;
+    (void)call;
+    (void)detail;
+    return 0;
 }
 
 void
@@ -332,6 +401,23 @@ set_p25p2_threshold(int threshold) {
     dsd_neo_config_init();
 }
 
+/*
+ * VC grace is resolved from the runtime config only. `seconds` must sit inside
+ * the config's own accepted range (0..10 s) or the knob reads as unset and the
+ * decoder falls back to its 0.75 s default, which would make a test silently
+ * measure the default instead of the value it asked for. Pass NULL to clear it
+ * again so the setting cannot leak into a later case.
+ */
+static void
+set_p25_vc_grace(const char* seconds) {
+    if (seconds) {
+        dsd_setenv("DSD_NEO_P25_VC_GRACE", seconds, 1);
+    } else {
+        (void)dsd_unsetenv("DSD_NEO_P25_VC_GRACE");
+    }
+    dsd_neo_config_init();
+}
+
 static void
 reset_ess_stubs(void) {
     g_ess_hard_rc = 0;
@@ -401,15 +487,6 @@ static int
 expect_int(const char* tag, int got, int want) {
     if (got != want) {
         DSD_FPRINTF(stderr, "%s: got %d want %d\n", tag, got, want);
-        return 1;
-    }
-    return 0;
-}
-
-static int
-expect_str(const char* tag, const char* got, const char* want) {
-    if (strcmp(got, want) != 0) {
-        DSD_FPRINTF(stderr, "%s: got \"%s\" want \"%s\"\n", tag, got, want);
         return 1;
     }
     return 0;
@@ -523,7 +600,7 @@ test_ess_des_manual_key_preserves_audio_gate(void) {
     opts.trunk_enable = 1;
     opts.trunk_is_tuned = 1;
     opts.trunk_tune_enc_calls = 0;
-    state.lasttg = 1234;
+    seed_p25p2_call(&state, 0U, 1234U, 4321U, 0x40U, 0U, 0U);
     state.R = 0x0123456789ABCDEFULL;
     state.dmrburstL = 20;
     set_ess_payload_bits(&state, 0, 0x81, 0x2468, 0x1122334455667788ULL);
@@ -532,12 +609,14 @@ test_ess_des_manual_key_preserves_audio_gate(void) {
 
     if (state.payload_algid == 0x81 && state.payload_keyid == 0x2468 && state.payload_miP == 0x1122334455667788ULL
         && state.p25_p2_audio_allowed[0] == 1 && state.p25_p2_rs_ess_ok == 1) {
+        dsd_state_ext_free_all(&state);
         printf("PASS\n");
         return 0;
     }
 
     printf("FAIL (alg=0x%02X keyid=0x%04X mi=0x%016llX gate=%d ok=%u)\n", state.payload_algid, state.payload_keyid,
            state.payload_miP, state.p25_p2_audio_allowed[0], state.p25_p2_rs_ess_ok);
+    dsd_state_ext_free_all(&state);
     return 1;
 }
 
@@ -555,7 +634,7 @@ test_ess_aes_slot1_loaded_key_preserves_audio_gate(void) {
     opts.trunk_is_tuned = 1;
     opts.trunk_tune_enc_calls = 0;
     state.currentslot = 1;
-    state.lasttgR = 5678;
+    seed_p25p2_call(&state, 1U, 5678U, 8765U, 0x40U, 0U, 0U);
     state.dmrburstR = 21;
     state.aes_key_loaded[1] = 1;
     state.aes_key_segments[1] = 4U;
@@ -566,6 +645,7 @@ test_ess_aes_slot1_loaded_key_preserves_audio_gate(void) {
     if (state.payload_algidR == 0x84 && state.payload_keyidR == 0x1357 && state.payload_miN == 0x0123456789ABCDEFULL
         && state.p25_p2_audio_allowed[1] == 1 && state.p25_p2_rs_ess_ok == 1 && g_lfsr128_calls == 1
         && g_lfsr128_last_slot == 1) {
+        dsd_state_ext_free_all(&state);
         printf("PASS\n");
         return 0;
     }
@@ -573,7 +653,75 @@ test_ess_aes_slot1_loaded_key_preserves_audio_gate(void) {
     printf("FAIL (alg=0x%02X keyid=0x%04X mi=0x%016llX gate=%d ok=%u lfsr128=%d slot=%d)\n", state.payload_algidR,
            state.payload_keyidR, state.payload_miN, state.p25_p2_audio_allowed[1], state.p25_p2_rs_ess_ok,
            g_lfsr128_calls, g_lfsr128_last_slot);
+    dsd_state_ext_free_all(&state);
     return 1;
+}
+
+// The ESS gate must re-open a slot's audio from the canonical call state, not
+// from the slot's burst hint. dmrburstL/R only records the last MAC PDU decoded
+// for the slot, so a slot still mid-call whose hint reads MAC_END (23),
+// MAC_IDLE (24), the LCCH marker (30) or a hint cleared by a teardown could
+// never re-open its gate once its ESS resolved the classification it had been
+// waiting on -- and the old fallback read a file-scope voice flag, letting one
+// slot's burst decide the other slot's gate.
+static int
+run_ess_burst_hint_case(int slot, int burst) {
+    static dsd_opts opts;
+    static dsd_state state;
+
+    DSD_MEMSET(&opts, 0, sizeof(opts));
+    prepare_ess_soft_inputs(&state);
+    reset_ess_stubs();
+    set_p25p2_threshold(64);
+
+    opts.trunk_enable = 1;
+    opts.trunk_is_tuned = 1;
+    opts.trunk_tune_enc_calls = 0;
+    state.currentslot = slot;
+    for (int i = 0; i < 96; i++) {
+        state.ess_b[slot][i] = 0;
+        state.ess_b_llr[slot][i] = 1;
+    }
+    for (int i = 0; i < 168; i++) {
+        ess_a[slot][i] = 0;
+        ess_a_llr[slot][i] = 1;
+    }
+    seed_p25p2_call(&state, (uint8_t)slot, 1234U, 4321U, 0x00U, 0U, 0U);
+    if (slot == 0) {
+        state.dmrburstL = burst;
+    } else {
+        state.dmrburstR = burst;
+    }
+    set_ess_payload_bits(&state, slot, 0x80, 0x0000, 0x0000000000000000ULL);
+
+    p25p2_process_ess(&opts, &state, 0);
+
+    const int gate = state.p25_p2_audio_allowed[slot];
+    const int crypto = (int)state.p25_crypto_state[slot];
+    const unsigned int ess_ok = state.p25_p2_rs_ess_ok;
+    dsd_state_ext_free_all(&state);
+
+    if (gate == 1 && crypto == DSD_P25_CRYPTO_CLEAR && ess_ok == 1) {
+        return 0;
+    }
+    DSD_FPRINTF(stderr, "\n  FAIL slot=%d burst=%d gate=%d crypto=%d ess_ok=%u", slot, burst, gate, crypto, ess_ok);
+    return 1;
+}
+
+static int
+test_ess_opens_audio_gate_for_every_burst_hint(void) {
+    static const int bursts[] = {0, 20, 21, 22, 23, 24, 30};
+    const size_t count = sizeof(bursts) / sizeof(bursts[0]);
+    int rc = 0;
+
+    printf("Test 31: ESS opens the audio gate in every MAC state... ");
+    for (int slot = 0; slot < 2; slot++) {
+        for (size_t i = 0; i < count; i++) {
+            rc |= run_ess_burst_hint_case(slot, bursts[i]);
+        }
+    }
+    printf("%s\n", rc == 0 ? "PASS" : "FAIL");
+    return rc;
 }
 
 static int
@@ -587,7 +735,7 @@ test_ess_allow_list_blocks_clear_audio_gate(void) {
     set_p25p2_threshold(64);
 
     opts.trunk_use_allow_list = 1;
-    state.lasttg = 1234;
+    seed_p25p2_call(&state, 0U, 1234U, 4321U, 0x00U, 0U, 0U);
     state.tg_hold = 9999;
     state.dmrburstL = 20;
     set_ess_payload_bits(&state, 0, 0x80, 0x0000, 0x0000000000000000ULL);
@@ -596,12 +744,14 @@ test_ess_allow_list_blocks_clear_audio_gate(void) {
 
     if (state.payload_algid == 0x80 && state.p25_p2_audio_allowed[0] == 0
         && state.p25_crypto_state[0] == DSD_P25_CRYPTO_CLEAR && state.p25_p2_rs_ess_ok == 1) {
+        dsd_state_ext_free_all(&state);
         printf("PASS\n");
         return 0;
     }
 
     printf("FAIL (alg=0x%02X gate=%d crypto=%d ok=%u)\n", state.payload_algid, state.p25_p2_audio_allowed[0],
            (int)state.p25_crypto_state[0], state.p25_p2_rs_ess_ok);
+    dsd_state_ext_free_all(&state);
     return 1;
 }
 
@@ -875,20 +1025,14 @@ seed_teardown_dirty_state(dsd_state* state) {
     state->p25_p2_last_mac_active[1] = 222;
     state->p25_p2_last_end_ptt[0] = 333;
     state->p25_p2_last_end_ptt[1] = 444;
-    state->p25_call_is_packet[0] = 1;
-    state->p25_call_is_packet[1] = 1;
-    state->p25_call_emergency[0] = 1;
-    state->p25_call_emergency[1] = 1;
-    state->p25_call_priority[0] = 5;
-    state->p25_call_priority[1] = 6;
+    seed_p25p2_call(state, 0U, 4100U, 5100U, 0xC5U, 1U, 5U);
+    seed_p25p2_call(state, 1U, 4200U, 5200U, 0xC6U, 1U, 6U);
     state->payload_algid = 0x81;
     state->payload_keyid = 0x2468;
     state->payload_miP = 0x1122334455667788ULL;
     state->payload_algidR = 0x84;
     state->payload_keyidR = 0x1357;
     state->payload_miN = 0x0123456789ABCDEFULL;
-    DSD_SNPRINTF(state->call_string[0], sizeof state->call_string[0], "%s", "left call");
-    DSD_SNPRINTF(state->call_string[1], sizeof state->call_string[1], "%s", "right call");
 }
 
 static int
@@ -906,20 +1050,12 @@ expect_teardown_common_reset(const dsd_state* state) {
     rc |= expect_int("teardown mac active right", (int)state->p25_p2_last_mac_active[1], 0);
     rc |= expect_int("teardown end ptt left", (int)state->p25_p2_last_end_ptt[0], 0);
     rc |= expect_int("teardown end ptt right", (int)state->p25_p2_last_end_ptt[1], 0);
-    rc |= expect_int("teardown packet left", state->p25_call_is_packet[0], 0);
-    rc |= expect_int("teardown packet right", state->p25_call_is_packet[1], 0);
-    rc |= expect_int("teardown emergency left", state->p25_call_emergency[0], 0);
-    rc |= expect_int("teardown emergency right", state->p25_call_emergency[1], 0);
-    rc |= expect_int("teardown priority left", state->p25_call_priority[0], 0);
-    rc |= expect_int("teardown priority right", state->p25_call_priority[1], 0);
     rc |= expect_int("teardown alg left", state->payload_algid, 0);
     rc |= expect_int("teardown key left", state->payload_keyid, 0);
     rc |= expect_int("teardown mi left", state->payload_miP != 0ULL, 0);
     rc |= expect_int("teardown alg right", state->payload_algidR, 0);
     rc |= expect_int("teardown key right", state->payload_keyidR, 0);
     rc |= expect_int("teardown mi right", state->payload_miN != 0ULL, 0);
-    rc |= expect_str("teardown call string left", state->call_string[0], "                     ");
-    rc |= expect_str("teardown call string right", state->call_string[1], "                     ");
     return rc;
 }
 
@@ -945,6 +1081,10 @@ test_teardown_flushes_partial_int16_audio_and_resets_call_state(void) {
     rc |= expect_int("teardown playback gate left", g_ss18_allowed_l, 1);
     rc |= expect_int("teardown playback gate right", g_ss18_allowed_r, 1);
     rc |= expect_teardown_common_reset(&state);
+    rc |= expect_call_state("teardown retains left call until release", &state, 0U, DSD_CALL_PHASE_ACTIVE, 4100U, 5100U,
+                            1U, 5U);
+    rc |= expect_call_state("teardown retains right call until release", &state, 1U, DSD_CALL_PHASE_ACTIVE, 4200U,
+                            5200U, 1U, 6U);
     rc |= expect_s16_clear("teardown clear left short audio", state.s_l4);
     rc |= expect_s16_clear("teardown clear right short audio", state.s_r4);
 
@@ -953,6 +1093,7 @@ test_teardown_flushes_partial_int16_audio_and_resets_call_state(void) {
     } else {
         printf("FAIL\n");
     }
+    dsd_state_ext_free_all(&state);
     return rc;
 }
 
@@ -976,12 +1117,17 @@ test_teardown_without_partial_int16_audio_skips_playback_but_clears_state(void) 
     rc |= expect_int("teardown no-audio playback left unchanged", g_ss18_allowed_l, -1);
     rc |= expect_int("teardown no-audio playback right unchanged", g_ss18_allowed_r, -1);
     rc |= expect_teardown_common_reset(&state);
+    rc |= expect_call_state("no-audio teardown retains left call until release", &state, 0U, DSD_CALL_PHASE_ACTIVE,
+                            4100U, 5100U, 1U, 5U);
+    rc |= expect_call_state("no-audio teardown retains right call until release", &state, 1U, DSD_CALL_PHASE_ACTIVE,
+                            4200U, 5200U, 1U, 6U);
 
     if (rc == 0) {
         printf("PASS\n");
     } else {
         printf("FAIL\n");
     }
+    dsd_state_ext_free_all(&state);
     return rc;
 }
 
@@ -1072,7 +1218,9 @@ test_duid_abort_resolves_staged_rekey(void) {
     rc |= expect_int("abort rekey partial drain calls", g_ss18_calls, 1);
     rc |= expect_int("abort rekey pending during drain", g_ss18_pending_at_call, 1);
     rc |= expect_int("abort rekey old key during drain", g_ss18_keyid_at_call, 0x2468);
-    rc |= expect_int("abort rekey partial frame count", g_ss18_voice_count_at_call, 2);
+    // The 2V frames here are muted (slot gate closed), and muted frames no
+    // longer advance voice_counter, so the drain sees an empty buffer.
+    rc |= expect_int("abort rekey partial frame count", g_ss18_voice_count_at_call, 0);
     rc |= expect_int("abort rekey transition cleared", state.p25_p2_rekey[0].pending, 0);
     rc |= expect_int("abort rekey alg promoted", state.payload_algid, 0xAA);
     rc |= expect_int("abort rekey key promoted", state.payload_keyid, 0x1357);
@@ -1113,10 +1261,17 @@ test_duid_lcch_release_defers_during_vc_grace(void) {
     opts.trunk_hangtime = 1;
     state.currentslot = 0;
     state.last_vc_sync_time = now - 10;
-    state.p25_last_vc_tune_time = now;
-    state.p25_cfg_vc_grace_s = 60.0;
+    /*
+     * Tuned 5 s ago against a 10 s grace. The offset is deliberately larger than
+     * the 0.75 s built-in default: tuning "now" would defer the release under
+     * any grace at all, so the case would pass even if the configured value
+     * never reached the decoder, which is exactly the bug this wiring can have.
+     */
+    state.p25_last_vc_tune_time = now - 5;
+    set_p25_vc_grace("10.0");
 
     p25p2_process_duid(&opts, &state);
+    set_p25_vc_grace(NULL);
 
     int rc = 0;
     rc |= expect_int("grace release force", state.p25_sm_force_release, 0);
@@ -1151,24 +1306,32 @@ test_duid_lcch_release_tears_down_after_vc_grace(void) {
     state.currentslot = 0;
     state.last_vc_sync_time = now - 10;
     state.p25_last_vc_tune_time = now - 10;
-    state.p25_cfg_vc_grace_s = 0.25;
     seed_teardown_dirty_state(&state);
     state.last_vc_sync_time = now - 10;
     state.p25_last_vc_tune_time = now - 10;
-    state.p25_cfg_vc_grace_s = 0.25;
+    /* Tuned 10 s ago, so a 0.25 s grace has long expired. Set after
+     * seed_teardown_dirty_state() only for symmetry with the case above; the
+     * grace now lives in the runtime config, which that helper does not touch. */
+    set_p25_vc_grace("0.25");
 
     p25p2_process_duid(&opts, &state);
+    set_p25_vc_grace(NULL);
 
     int rc = 0;
     rc |= expect_int("post-grace release consumed", state.p25_sm_force_release, 0);
     rc |= expect_int("post-grace tuned cleared", opts.trunk_is_tuned, 0);
     rc |= expect_teardown_common_reset(&state);
+    rc |=
+        expect_call_state("post-grace release ends left call", &state, 0U, DSD_CALL_PHASE_ENDED, 4100U, 5100U, 1U, 5U);
+    rc |=
+        expect_call_state("post-grace release ends right call", &state, 1U, DSD_CALL_PHASE_ENDED, 4200U, 5200U, 1U, 6U);
     rc |= expect_int("post-grace sacch dispatches", g_sacch_mac_calls >= 1, 1);
     if (rc == 0) {
         printf("PASS\n");
     } else {
         printf("FAIL\n");
     }
+    dsd_state_ext_free_all(&state);
     return rc;
 }
 
@@ -1290,6 +1453,7 @@ main(void) {
     failures += test_ess_soft_failure_counts_once();
     failures += test_ess_des_manual_key_preserves_audio_gate();
     failures += test_ess_aes_slot1_loaded_key_preserves_audio_gate();
+    failures += test_ess_opens_audio_gate_for_every_burst_hint();
     failures += test_ess_allow_list_blocks_clear_audio_gate();
     failures += test_ess_decode_failure_refreshes_existing_crypto_state();
     failures += test_ess_decode_failure_refreshes_existing_aes_state();

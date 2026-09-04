@@ -12,6 +12,7 @@
  * (eg SPEED/HEADING) or fail when IPv4 options are present.
  */
 
+#include <dsd-neo/core/call_state.h>
 #include <dsd-neo/core/events.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/state.h>
@@ -36,7 +37,9 @@ static unsigned int g_datacall_calls;
 static uint32_t g_datacall_src;
 static uint32_t g_datacall_dst;
 static uint8_t g_datacall_slot;
+static dsd_event_category g_datacall_category;
 static char g_datacall_text[512];
+static char g_datacall_gps[256];
 
 static void
 reset_spies(void) {
@@ -45,7 +48,9 @@ reset_spies(void) {
     g_datacall_src = 0;
     g_datacall_dst = 0;
     g_datacall_slot = 0;
+    g_datacall_category = DSD_EVENT_CATEGORY_UNKNOWN;
     DSD_MEMSET(g_datacall_text, 0, sizeof(g_datacall_text));
+    DSD_MEMSET(g_datacall_gps, 0, sizeof(g_datacall_gps));
 }
 
 // Minimal stubs for direct link with dmr_pdu.c
@@ -63,9 +68,11 @@ void
 // NOLINTNEXTLINE(misc-use-internal-linkage)
 lip_protocol_decoder(dsd_opts* opts, dsd_state* state, uint8_t* input) {
     (void)opts;
-    (void)state;
     (void)input;
     g_lip_calls++;
+    uint8_t slot = (state->currentslot == 1) ? 1U : 0U;
+    DSD_SNPRINTF(state->dmr_embedded_gps[slot], sizeof(state->dmr_embedded_gps[slot]), "%s",
+                 "LIP: 41.500000, -87.250000");
 }
 
 void
@@ -77,15 +84,41 @@ decode_cellocator(dsd_opts* opts, dsd_state* state, uint8_t* input, int len) {
     (void)len;
 }
 
-void
-watchdog_event_datacall(dsd_opts* opts, dsd_state* state, uint32_t src, uint32_t dst, char* str, uint8_t slot) {
+int
+dsd_event_emit_data_notice_classified(dsd_opts* opts, dsd_state* state, uint8_t slot,
+                                      const dsd_call_observation* observation, dsd_event_category category,
+                                      const char* notice) {
     (void)opts;
     (void)state;
     g_datacall_calls++;
-    g_datacall_src = src;
-    g_datacall_dst = dst;
+    g_datacall_src = observation->ota_source_id;
+    g_datacall_dst = observation->ota_target_id;
     g_datacall_slot = slot;
-    DSD_SNPRINTF(g_datacall_text, sizeof(g_datacall_text), "%s", str ? str : "");
+    g_datacall_category = category;
+    DSD_SNPRINTF(g_datacall_text, sizeof(g_datacall_text), "%s", notice ? notice : "");
+    return 0;
+}
+
+int
+dsd_event_emit_data_notice(dsd_opts* opts, dsd_state* state, uint8_t slot, const dsd_call_observation* observation,
+                           const char* notice) {
+    return dsd_event_emit_data_notice_classified(opts, state, slot, observation, DSD_EVENT_CATEGORY_DATA, notice);
+}
+
+int
+dsd_event_emit_data_notice_classified_with_gps(dsd_opts* opts, dsd_state* state, uint8_t slot,
+                                               const dsd_call_observation* observation, dsd_event_category category,
+                                               const char* notice, const char* gps) {
+    (void)dsd_event_emit_data_notice_classified(opts, state, slot, observation, category, notice);
+    DSD_SNPRINTF(g_datacall_gps, sizeof(g_datacall_gps), "%s", gps ? gps : "");
+    return 0;
+}
+
+int
+dsd_event_emit_data_notice_with_gps(dsd_opts* opts, dsd_state* state, uint8_t slot,
+                                    const dsd_call_observation* observation, const char* notice, const char* gps) {
+    return dsd_event_emit_data_notice_classified_with_gps(opts, state, slot, observation, DSD_EVENT_CATEGORY_DATA,
+                                                          notice, gps);
 }
 
 int
@@ -97,7 +130,7 @@ dsd_format_local_datetime(time_t timestamp, dsd_local_datetime_format format, ch
 }
 
 // Under test
-void decode_ip_pdu(dsd_opts* opts, dsd_state* state, uint16_t len, uint8_t* input);
+int decode_ip_pdu(dsd_opts* opts, dsd_state* state, uint16_t len, uint8_t* input);
 void dmr_sd_pdu(dsd_opts* opts, dsd_state* state, uint16_t len, const uint8_t* DMR_PDU);
 void dmr_udp_comp_pdu(dsd_opts* opts, dsd_state* state, uint16_t len, const uint8_t* DMR_PDU);
 void utf8_to_text(dsd_state* state, uint8_t wr, uint16_t len, const uint8_t* input);
@@ -112,9 +145,27 @@ expect_has_substr(const char* buf, const char* needle, const char* tag) {
 }
 
 static int
+expect_lacks_substr(const char* buf, const char* needle, const char* tag) {
+    if (buf && strstr(buf, needle)) {
+        DSD_FPRINTF(stderr, "%s: unexpected '%s' in '%s'\n", tag, needle, buf);
+        return 1;
+    }
+    return 0;
+}
+
+static int
 expect_nonempty(const char* buf, const char* tag) {
     if (!buf || buf[0] == '\0') {
         DSD_FPRINTF(stderr, "%s: empty output\n", tag);
+        return 1;
+    }
+    return 0;
+}
+
+static int
+expect_category(dsd_event_category got, dsd_event_category want, const char* tag) {
+    if (got != want) {
+        DSD_FPRINTF(stderr, "%s: category got %d want %d\n", tag, (int)got, (int)want);
         return 1;
     }
     return 0;
@@ -410,10 +461,10 @@ build_compressed_udp_utf16_text(uint8_t* out, size_t cap) {
     }
     DSD_MEMSET(out, 0, cap);
     out[0] = 0x12;
-    out[1] = 0x34;                  // compressed IP ID
-    out[2] = 0x12;                  // SAID=Ethernet, DAID=Group Network
-    out[3] = (uint8_t)(0x80U | 1U); // opcode bit + SPID=UTF-16BE text
-    out[4] = 63U;                   // DPID=reserved 7-bit index
+    out[1] = 0x34; // compressed IP ID
+    out[2] = 0x12; // SAID=Ethernet, DAID=Group Network
+    out[3] = 1U;   // opcode MSB clear (table 7.19 defines 00 only) + SPID=UTF-16BE text
+    out[4] = 63U;  // DPID=reserved 7-bit index
     out[5] = 0x00;
     out[6] = 'O';
     out[7] = 0x00;
@@ -422,22 +473,24 @@ build_compressed_udp_utf16_text(uint8_t* out, size_t cap) {
 }
 
 static size_t
-build_compressed_udp_lip_with_extended_src_port(uint8_t* out, size_t cap) {
-    if (cap < 10U) {
+build_compressed_udp_extended_port(uint8_t* out, size_t cap, uint16_t port, uint8_t extended_source, uint8_t peer_pid,
+                                   uint8_t include_payload) {
+    const size_t len = include_payload ? 8U : 7U;
+    if (cap < len || peer_pid == 0U || peer_pid > 0x7FU) {
         return 0;
     }
     DSD_MEMSET(out, 0, cap);
     out[0] = 0x00;
-    out[1] = 0x7B;
-    out[2] = 0xB0; // SAID=manufacturer-specific, DAID=radio network
-    out[3] = 0x00; // SPID extended at byte 5
-    out[4] = 0x03; // DPID=reserved; SPID extension below selects LIP
-    out[5] = 0x00;
-    out[6] = 0x02; // SPID=Location Interface Protocol
-    out[7] = 0xA5;
-    out[8] = 0x5A;
-    out[9] = 0xC3;
-    return 10U;
+    out[1] = 0x7C;
+    out[2] = 0x10;
+    out[3] = extended_source ? 0U : peer_pid;
+    out[4] = extended_source ? peer_pid : 0U;
+    out[5] = (uint8_t)(port >> 8);
+    out[6] = (uint8_t)(port & 0xFFU);
+    if (include_payload) {
+        out[7] = 0xA5U;
+    }
+    return len;
 }
 
 int
@@ -466,6 +519,7 @@ main(void) {
         decode_ip_pdu(&opts, &st, (uint16_t)plen, pkt);
         rc |= expect_nonempty(st.dmr_lrrp_gps[0], "ihl=5 decoded");
         rc |= expect_has_substr(st.dmr_lrrp_gps[0], " km/h 90", "ihl=5 has speed+heading");
+        rc |= expect_category(g_datacall_category, DSD_EVENT_CATEGORY_DATA, "udp4001 LRRP category");
     }
 
     // Case 2: IPv4 options present (IHL=6). Decoder must honor IHL to locate UDP.
@@ -476,6 +530,7 @@ main(void) {
         decode_ip_pdu(&opts, &st, (uint16_t)plen, pkt);
         rc |= expect_nonempty(st.dmr_lrrp_gps[0], "ihl=6 decoded");
         rc |= expect_has_substr(st.dmr_lrrp_gps[0], " km/h 90", "ihl=6 has speed+heading");
+        rc |= expect_category(g_datacall_category, DSD_EVENT_CATEGORY_DATA, "udp4001 options category");
     }
 
     // Case 3: Vertex TMS on UDP/5007 should not trim valid text when data_block_poc is non-zero.
@@ -497,6 +552,24 @@ main(void) {
         st.dmr_lrrp_gps[0][0] = '\0';
         decode_ip_pdu(&opts, &st, (uint16_t)plen, pkt);
         rc |= expect_has_substr(st.dmr_lrrp_gps[0], "P25 Atlas SRC(IP): 1.2.3.4; DST(IP): 5.6.7.8;", "atlas9361 label");
+        rc |= expect_category(g_datacall_category, DSD_EVENT_CATEGORY_CONTROL, "atlas9361 category");
+
+        reset_spies();
+        plen = build_ipv4_udp_empty_payload(pkt, sizeof pkt, 65000U);
+        pkt[20] = (uint8_t)(9361U >> 8);
+        pkt[21] = (uint8_t)(9361U & 0xFFU);
+        decode_ip_pdu(&opts, &st, (uint16_t)plen, pkt);
+        rc |= expect_category(g_datacall_category, DSD_EVENT_CATEGORY_CONTROL, "atlas9361 source category");
+    }
+
+    // Shared P25 Tier 2 location service remains packet data.
+    {
+        reset_spies();
+        size_t plen = build_ipv4_udp_empty_payload(pkt, sizeof pkt, 49198);
+        st.dmr_lrrp_gps[0][0] = '\0';
+        decode_ip_pdu(&opts, &st, (uint16_t)plen, pkt);
+        rc |= expect_has_substr(st.dmr_lrrp_gps[0], "P25 Tier 2 LOCN SRC(IP):", "location49198 label");
+        rc |= expect_category(g_datacall_category, DSD_EVENT_CATEGORY_DATA, "location49198 category");
     }
 
     // Case 5: Short/empty UDP TMS payload should be reported as truncated, not indexed past the payload.
@@ -531,33 +604,64 @@ main(void) {
         reset_spies();
         size_t plen = build_compressed_udp_utf16_text(pkt, sizeof pkt);
         st.currentslot = 1;
+        st.dmr_lrrp_source[1] = 4321;
+        st.dmr_lrrp_target[1] = 8765;
         st.event_history_s[1].Event_History_Items[0].text_message[0] = '\0';
         dmr_udp_comp_pdu(&opts, &st, (uint16_t)plen, pkt);
         rc |= expect_has_substr(st.event_history_s[1].Event_History_Items[0].text_message, "OK",
                                 "compressed text payload");
-        if (g_datacall_calls != 1U || g_datacall_src != 1U || g_datacall_dst != 2U || g_datacall_slot != 1U) {
+        if (g_datacall_calls != 1U || g_datacall_src != 4321U || g_datacall_dst != 8765U || g_datacall_slot != 1U) {
             DSD_FPRINTF(stderr, "compressed datacall metadata mismatch calls=%u src=%u dst=%u slot=%u\n",
                         g_datacall_calls, g_datacall_src, g_datacall_dst, g_datacall_slot);
             rc |= 1;
         }
         rc |= expect_has_substr(g_datacall_text, "SRC: 1:1", "compressed source summary");
         rc |= expect_has_substr(g_datacall_text, "DST: 2:63", "compressed destination summary");
+        // ETSI TS 102 361-3 Table 7.14 names the leading 16 bits "IPv4 Identification"; the
+        // notice used to call them "IPC", which read like one of the compression index fields.
+        rc |= expect_has_substr(g_datacall_text, "IP ID: 1234;", "compressed IPv4 identification label");
+        rc |= expect_category(g_datacall_category, DSD_EVENT_CATEGORY_DATA, "compressed text category");
     }
 
-    // Case 8: compressed UDP with an extended source port should dispatch bounded LIP bits once.
+    // Case 8 (extended source port selects LIP) moved to test_dmr_udp_comp_header.c, which
+    // pins the ETSI port tables directly (#450).
+
+    // Case 9: compressed UDP classifies supported control services at either endpoint.
+    {
+        static const struct {
+            uint16_t port;
+            dsd_event_category category;
+        } cases[] = {
+            {4004U, DSD_EVENT_CATEGORY_CONTROL}, {4005U, DSD_EVENT_CATEGORY_CONTROL},
+            {4009U, DSD_EVENT_CATEGORY_CONTROL}, {9361U, DSD_EVENT_CATEGORY_CONTROL},
+            {4008U, DSD_EVENT_CATEGORY_DATA},
+        };
+
+        for (size_t i = 0U; i < sizeof(cases) / sizeof(cases[0]); i++) {
+            for (uint8_t extended_source = 0U; extended_source <= 1U; extended_source++) {
+                reset_spies();
+                size_t plen =
+                    build_compressed_udp_extended_port(pkt, sizeof pkt, cases[i].port, extended_source, 63U, 0U);
+                st.currentslot = 0;
+                dmr_udp_comp_pdu(&opts, &st, (uint16_t)plen, pkt);
+                rc |= expect_category(g_datacall_category, cases[i].category,
+                                      extended_source ? "compressed source service category"
+                                                      : "compressed destination service category");
+            }
+        }
+    }
+
+    // Case 10: classified compressed UDP GPS preserves the endpoint-derived category.
     {
         reset_spies();
-        size_t plen = build_compressed_udp_lip_with_extended_src_port(pkt, sizeof pkt);
+        size_t plen = build_compressed_udp_extended_port(pkt, sizeof pkt, 4005U, 1U, 2U, 1U);
         st.currentslot = 0;
         dmr_udp_comp_pdu(&opts, &st, (uint16_t)plen, pkt);
-        if (g_lip_calls != 1U) {
-            DSD_FPRINTF(stderr, "compressed LIP dispatch count mismatch: %u\n", g_lip_calls);
-            rc |= 1;
-        }
-        rc |= expect_has_substr(g_datacall_text, "SRC: 11:2", "compressed extended source summary");
+        rc |= expect_category(g_datacall_category, DSD_EVENT_CATEGORY_CONTROL, "compressed control GPS category");
+        rc |= expect_has_substr(g_datacall_gps, "41.500000", "compressed control GPS payload");
     }
 
-    // Case 9: compressed UDP guards short/null PDUs without emitting datacalls.
+    // Case 11: compressed UDP guards short/null PDUs without emitting datacalls.
     {
         reset_spies();
         dmr_udp_comp_pdu(&opts, &st, 4, pkt);
@@ -568,7 +672,7 @@ main(void) {
         }
     }
 
-    // Case 10: generic short data emits source/target datacall metadata without requiring LOCN parsing.
+    // Case 12: generic short data emits source/target datacall metadata without requiring LOCN parsing.
     {
         reset_spies();
         const uint8_t text[] = {'H', 'E', 'L', 'L', 'O'};
@@ -585,14 +689,17 @@ main(void) {
         rc |= expect_has_substr(g_datacall_text, "Short Data SRC: 1234; TGT: 5678;", "short data summary");
     }
 
-    // Case 11: UDP application service ports update GPS/event summaries by service kind.
+    // Case 13: UDP application service ports classify either endpoint by service kind.
     {
         const struct {
-            uint16_t port;
             const char* tag;
+            uint16_t port;
+            dsd_event_category category;
         } cases[] = {
-            {4005U, "ARS SRC:"},        {4008U, "Telemetry SRC:"}, {4009U, "OTAP SRC:"},
-            {4012U, "Batt. Man. SRC:"}, {4013U, "JTS SRC:"},       {4069U, "SCADA SRC:"},
+            {"XCMP SRC:", 4004U, DSD_EVENT_CATEGORY_CONTROL},    {"ARS SRC:", 4005U, DSD_EVENT_CATEGORY_CONTROL},
+            {"Telemetry SRC:", 4008U, DSD_EVENT_CATEGORY_DATA},  {"OTAP SRC:", 4009U, DSD_EVENT_CATEGORY_CONTROL},
+            {"Batt. Man. SRC:", 4012U, DSD_EVENT_CATEGORY_DATA}, {"JTS SRC:", 4013U, DSD_EVENT_CATEGORY_DATA},
+            {"SCADA SRC:", 4069U, DSD_EVENT_CATEGORY_DATA},
         };
 
         const uint8_t ars_payload[] = {'A', 'R', 'S', 0};
@@ -605,10 +712,33 @@ main(void) {
             st.dmr_lrrp_gps[0][0] = '\0';
             decode_ip_pdu(&opts, &st, (uint16_t)plen, pkt);
             rc |= expect_has_substr(st.dmr_lrrp_gps[0], cases[i].tag, "udp service label");
+            rc |= expect_category(g_datacall_category, cases[i].category, "udp service category");
+
+            reset_spies();
+            plen = build_ipv4_udp_payload(pkt, sizeof pkt, 65000U, NULL, 0U);
+            pkt[20] = (uint8_t)(cases[i].port >> 8);
+            pkt[21] = (uint8_t)(cases[i].port & 0xFFU);
+            st.dmr_lrrp_gps[0][0] = '\0';
+            decode_ip_pdu(&opts, &st, (uint16_t)plen, pkt);
+            rc |= expect_category(g_datacall_category, cases[i].category, "udp source service category");
         }
     }
 
-    // Case 12: UDP/4007 TMS acknowledgment and UTF-16 text take distinct state paths.
+    // Case 13b: UDP/4005 ARS device registration honours the record length and reports the
+    // registered device identifier instead of dumping the record as raw text (issue #337).
+    {
+        reset_spies();
+        // The four octets after the declared 9 byte record stand in for the block trailer the old
+        // fixed window used to run into; the decode must stop at the record length, not payload_len.
+        const uint8_t ars_reg[] = {0x00, 0x09, 0xF0, 0x20, 0x04, '1', '2', '3', '4', 0x00, 0x00, 0x5E, 0x6C, 0xA7};
+        size_t plen = build_ipv4_udp_payload(pkt, sizeof pkt, 4005U, ars_reg, sizeof(ars_reg));
+        st.currentslot = 0;
+        st.dmr_lrrp_gps[0][0] = '\0';
+        decode_ip_pdu(&opts, &st, (uint16_t)plen, pkt);
+        rc |= expect_has_substr(st.dmr_lrrp_gps[0], "ARS Reg: 1234; Initial;", "ars registration device id");
+    }
+
+    // Case 14: UDP/4007 TMS acknowledgment and UTF-16 text take distinct state paths.
     {
         reset_spies();
         const uint8_t ack_payload[] = {0x00, 0x05, 0x01, 0x00, 0x00};
@@ -619,7 +749,9 @@ main(void) {
         rc |= expect_has_substr(st.dmr_lrrp_gps[0], "Acknowledgment;", "tms acknowledgment");
 
         reset_spies();
-        const uint8_t text_payload[] = {0x00, 0x06, 0x00, 0x00, 'O', 0x00, 'K'};
+        // Length, header (extension present), no address, extension 8F 04, then "OK" in UCS-2 LE
+        // as Motorola radios send it (#466).
+        const uint8_t text_payload[] = {0x00, 0x08, 0xA0, 0x00, 0x8F, 0x04, 'O', 0x00, 'K', 0x00};
         plen = build_ipv4_udp_payload(pkt, sizeof pkt, 4007U, text_payload, sizeof(text_payload));
         st.event_history_s[0].Event_History_Items[0].text_message[0] = '\0';
         st.dmr_lrrp_gps[0][0] = '\0';
@@ -628,7 +760,7 @@ main(void) {
         rc |= expect_has_substr(st.event_history_s[0].Event_History_Items[0].text_message, "OK", "tms text payload");
     }
 
-    // Case 13: unknown UDP and truncated UDP headers emit bounded datacall summaries.
+    // Case 15: unknown UDP and truncated UDP headers emit bounded datacall summaries.
     {
         reset_spies();
         size_t plen = build_ipv4_udp_payload(pkt, sizeof pkt, 65000U, NULL, 0U);
@@ -643,9 +775,13 @@ main(void) {
         decode_ip_pdu(&opts, &st, (uint16_t)plen, pkt);
         rc |= expect_has_substr(st.dmr_lrrp_gps[0], "Truncated UDP;", "truncated udp label");
         rc |= expect_has_substr(g_datacall_text, "Truncated UDP;", "truncated udp datacall");
+        if (g_datacall_calls != 1U) {
+            DSD_FPRINTF(stderr, "truncated udp datacall count mismatch: %u\n", g_datacall_calls);
+            rc |= 1;
+        }
     }
 
-    // Case 14: ICMP destination-unreachable with an attached IPv4 message recursively decodes the attachment.
+    // Case 16: ICMP destination-unreachable with an attached IPv4 message recursively decodes the attachment.
     {
         reset_spies();
         size_t plen = build_ipv4_icmp_attached_udp_service(pkt, sizeof pkt, 4008U);
@@ -659,7 +795,7 @@ main(void) {
         }
     }
 
-    // Case 15: malformed TMS address length is bounded and reported as truncated.
+    // Case 17: malformed TMS address length is bounded and reported as truncated.
     {
         reset_spies();
         const uint8_t malformed_addr_payload[] = {0x00, 0x08, 0x00, 0x04, 0x00};
@@ -669,6 +805,63 @@ main(void) {
         decode_ip_pdu(&opts, &st, (uint16_t)plen, pkt);
         rc |= expect_has_substr(st.dmr_lrrp_gps[0], "Truncated;", "tms malformed address truncation");
         rc |= expect_has_substr(g_datacall_text, "Truncated;", "tms malformed address datacall");
+    }
+
+    // Case 16: a site-mapped UDP port reaches the LRRP decoder, and only that port does (#453).
+    // Some systems carry LRRP on a port outside the registered set; without the mapping the
+    // datagram is dropped as an unknown port before dmr_lrrp() ever sees it.
+    {
+        // A conformant document: type 0D, 12 bytes, timestamp plus a 3D position.
+        static const uint8_t lrrp_doc[] = {0x0D, 0x0C, 0x34, 0x00, 0x00, 0x00, 0x00,
+                                           0x00, 0x51, 0x11, 0x11, 0x11, 0x18, 0x2D};
+        const uint16_t mapped_port = 5000U;
+        const uint16_t other_port = 5001U;
+
+        // Unmapped, it is an unknown port.
+        reset_spies();
+        opts.lrrp_extra_port_count = 0;
+        size_t plen = build_ipv4_udp_payload(pkt, sizeof pkt, mapped_port, lrrp_doc, sizeof lrrp_doc);
+        st.dmr_lrrp_gps[0][0] = '\0';
+        decode_ip_pdu(&opts, &st, (uint16_t)plen, pkt);
+        rc |= expect_has_substr(st.dmr_lrrp_gps[0], "Unknown UDP Port;", "extra port unmapped stays unknown");
+
+        // Mapped, the same datagram is decoded as LRRP.
+        reset_spies();
+        opts.lrrp_extra_ports[0] = mapped_port;
+        opts.lrrp_extra_port_count = 1;
+        plen = build_ipv4_udp_payload(pkt, sizeof pkt, mapped_port, lrrp_doc, sizeof lrrp_doc);
+        st.dmr_lrrp_gps[0][0] = '\0';
+        decode_ip_pdu(&opts, &st, (uint16_t)plen, pkt);
+        rc |= expect_lacks_substr(st.dmr_lrrp_gps[0], "Unknown UDP Port;", "extra port mapped is not unknown");
+        rc |= expect_has_substr(st.dmr_lrrp_gps[0], "LRRP SRC:", "extra port mapped reaches dmr_lrrp");
+        rc |= expect_category(g_datacall_category, DSD_EVENT_CATEGORY_DATA, "extra port mapped category");
+
+        // The mapping does not leak to a neighbouring port.
+        reset_spies();
+        plen = build_ipv4_udp_payload(pkt, sizeof pkt, other_port, lrrp_doc, sizeof lrrp_doc);
+        st.dmr_lrrp_gps[0][0] = '\0';
+        decode_ip_pdu(&opts, &st, (uint16_t)plen, pkt);
+        rc |= expect_has_substr(st.dmr_lrrp_gps[0], "Unknown UDP Port;", "extra port does not leak");
+
+        // The registered port keeps working while a mapping is in place.
+        reset_spies();
+        plen = build_ipv4_udp_payload(pkt, sizeof pkt, 4001U, lrrp_doc, sizeof lrrp_doc);
+        st.dmr_lrrp_gps[0][0] = '\0';
+        decode_ip_pdu(&opts, &st, (uint16_t)plen, pkt);
+        rc |= expect_has_substr(st.dmr_lrrp_gps[0], "LRRP SRC:", "registered port unaffected");
+
+        // A mapping on a port the dispatch already owns leaves that service in charge.
+        reset_spies();
+        opts.lrrp_extra_ports[0] = 4007U;
+        opts.lrrp_extra_port_count = 1;
+        const uint8_t tms_ack[] = {0x00, 0x05, 0x01, 0x00, 0x00};
+        plen = build_ipv4_udp_payload(pkt, sizeof pkt, 4007U, tms_ack, sizeof tms_ack);
+        st.dmr_lrrp_gps[0][0] = '\0';
+        decode_ip_pdu(&opts, &st, (uint16_t)plen, pkt);
+        rc |= expect_has_substr(st.dmr_lrrp_gps[0], "Acknowledgment;", "registered service keeps its dispatch");
+        rc |= expect_lacks_substr(st.dmr_lrrp_gps[0], "LRRP SRC:", "registered service is not remapped");
+
+        opts.lrrp_extra_port_count = 0;
     }
 
     free(st.event_history_s);

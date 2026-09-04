@@ -3,6 +3,7 @@
 #ifndef DSD_NEO_SRC_IO_RADIO_RTL_STREAM_TEST_SUPPORT_H_
 #define DSD_NEO_SRC_IO_RADIO_RTL_STREAM_TEST_SUPPORT_H_
 
+#include <dsd-neo/core/opts_fwd.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -11,6 +12,9 @@ extern "C" {
 #endif
 
 int dsd_rtl_stream_test_request_retune(long int frequency, int timeout_ms);
+/* Republish the cross-thread demod profile/TED mirrors after a test mutates
+ * demod fields directly; public getters read the mirrors, not the fields. */
+void rtl_stream_test_publish_demod_snapshot(void);
 int rtl_stream_test_prepare_reconfigure_input(size_t queued_samples, size_t* out_used_after,
                                               uint32_t* out_generation_before, uint32_t* out_generation_after);
 int rtl_stream_test_retune_output_pending(size_t queued_samples, int cached_symbols, size_t* out_ring_pending,
@@ -31,6 +35,8 @@ int dsd_rtl_stream_test_capture_settings_failure_restore(uint32_t* out_full_freq
                                                          int* out_full_rate_out_hz, uint32_t* out_partial_freq_hz,
                                                          uint32_t* out_partial_rate_hz, int* out_partial_rate_out_hz);
 int dsd_rtl_stream_test_ppm_store_if_applied(int ppm_rc, int requested_ppm, int* out_ppm_error);
+int rtl_stream_test_retune_mute_plan(uint32_t sample_rate_hz, int cfg_mute_ms, int cfg_mute_ms_is_set, int post_retune,
+                                     int buffered_backend, uint32_t min_bytes);
 int dsd_rtl_stream_test_retune_completion_result_binding(int* out_first_result, int* out_second_result);
 int rtl_stream_test_clear_output(size_t queued_samples, int cached_symbols, size_t* out_used_after,
                                  int* out_cache_pending_after, uint32_t* out_generation_before,
@@ -57,6 +63,10 @@ int rtl_stream_test_fsk_cfo_snapshot(double dc_rad_per_sample, int rate_out_hz, 
 int rtl_stream_test_fsk_snr_sps(int rate_out_hz, int symbol_rate_hz, int stale_ted_sps);
 int rtl_stream_test_direct_output_rate_after_open_update(int output_kind, int rate_out_hz, int resamp_target_hz,
                                                          unsigned int* out_rate_hz, int* out_resamp_enabled);
+int rtl_stream_test_passes_for_actual_rate(uint32_t actual_rate_hz, int rate_in_hz);
+int rtl_stream_test_digital_resample_chain(int output_kind, int rate_out_hz, int resamp_target_hz, int symbol_rate_hz,
+                                           int digital_resample_mode, int capture_rate_device_forced,
+                                           unsigned int* out_rate_hz, int* out_resamp_enabled);
 int rtl_stream_test_source_policy_matrix(int* out_kind, int* out_rtltcp, int* out_soapy, int* out_replay,
                                          int* out_family, size_t count, char* out_names, size_t names_size,
                                          char* out_soapy_args, size_t args_size);
@@ -136,6 +146,21 @@ int rtl_stream_test_tagged_retune_ownership(uint64_t owner_token, uint64_t conte
 int dsd_rtl_stream_test_retune_without_controller_rejected(void);
 int rtl_stream_test_retune_profile_gain_binding(int* out_gain_is_set, int* out_gain_tenth_db, int* out_gain_is_auto,
                                                 int* out_autogain_is_set, int* out_autogain_on);
+
+typedef struct rtl_stream_test_finalize_profile_result {
+    int symbol_rate_hz;
+    int symbol_levels;
+    int ted_sps;
+    int ted_sps_override;
+    int sps_is_integer;
+    int channel_lpf_profile;
+} rtl_stream_test_finalize_profile_result;
+
+/* Seed the published symbol profile, then run the retune finalize path with the given decoder
+ * options (NULL models a replay RESET) and report the profile the front end ended up on. */
+int rtl_stream_test_finalize_rate_chain_profile(const dsd_opts* opts, int rate_out_hz, int seed_symbol_rate_hz,
+                                                int seed_symbol_levels, int seed_channel_profile,
+                                                rtl_stream_test_finalize_profile_result* out_result);
 
 typedef struct rtl_stream_test_replay_state {
     int replay_input_eof;

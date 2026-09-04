@@ -8,6 +8,7 @@
  */
 
 #include <curses.h>
+#include <dsd-neo/app_control/call_view.h>
 #include <dsd-neo/app_control/frontend.h>
 #include <dsd-neo/core/constants.h>
 #include <dsd-neo/core/dsd_time.h>
@@ -23,15 +24,12 @@
 #include <dsd-neo/ui/ncurses_internal.h>
 #include <dsd-neo/ui/ncurses_p25_display.h>
 #include <dsd-neo/ui/ui_prims.h>
-#include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include <time.h>
 #include "dsd-neo/core/opts_fwd.h"
 #include "dsd-neo/core/safe_api.h"
 #include "dsd-neo/core/state_fwd.h"
-
-#ifdef USE_RTLSDR
-#endif
 
 static int
 ui_is_p25_synctype(int synctype) {
@@ -234,47 +232,6 @@ ui_p25_print_iden_line(int id, const p25_iden_entry_t* entry, int has_other_clas
 }
 
 static int
-ui_extract_channel_token(const char* channel_str, char* tok, size_t tok_len) {
-    const char* p = strstr(channel_str, "Ch:");
-    if (!p || tok_len == 0) {
-        return 0;
-    }
-    p += 3;
-    while (*p == ' ') {
-        p++;
-    }
-    size_t t = 0;
-    while (*p && t + 1 < tok_len) {
-        char c = *p;
-        int is_hex = (c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f');
-        if (!is_hex) {
-            break;
-        }
-        tok[t++] = c;
-        p++;
-    }
-    tok[t] = '\0';
-    return t > 0;
-}
-
-static long int
-ui_lookup_trunk_chan_map(const dsd_state* state, const char* tok) {
-    char* endp = NULL;
-    long ch_hex = strtol(tok, &endp, 16);
-    if (endp && *endp == '\0' && ch_hex > 0 && ch_hex < 65535) {
-        long int freq = state->trunk_chan_map[ch_hex];
-        if (freq != 0) {
-            return freq;
-        }
-    }
-    long ch_dec = strtol(tok, &endp, 10);
-    if (endp && *endp == '\0' && ch_dec > 0 && ch_dec < 65535) {
-        return state->trunk_chan_map[ch_dec];
-    }
-    return 0;
-}
-
-static int
 ui_collect_neighbor_indices(const dsd_state* state, int idxs[], int max_idxs) {
     int n = 0;
     for (int i = 0; i < state->p25_nb_count && i < P25_NB_MAX && n < max_idxs; i++) {
@@ -357,8 +314,12 @@ ui_format_secondary_cc_line(const dsd_state* state, int idx, time_t now, char* o
     if (age < 0) {
         age = 0;
     }
-    return DSD_SNPRINTF(out, out_len, "%.6lf MHz%s CH:%04X R:%03u S:%03u SSC:%02X age:%lds",
-                        (double)entry->freq / 1000000.0, in_cands ? " [C]" : "", entry->channel, entry->rfss,
+    // #403: the <iden>-<chan> key beside the raw hex, the form the band plan and
+    // the Learned list use.
+    char key[32];
+    p25_format_chan_suffix(state, (uint16_t)entry->channel, -1, key, sizeof key);
+    return DSD_SNPRINTF(out, out_len, "%.6lf MHz%s CH:%04X%s R:%03u S:%03u SSC:%02X age:%lds",
+                        (double)entry->freq / 1000000.0, in_cands ? " [C]" : "", entry->channel, key, entry->rfss,
                         entry->site, entry->ssc, age);
 }
 
@@ -491,6 +452,78 @@ ui_print_p1_header_metric(const dsd_state* state, int is_p25p1) {
     return 1;
 }
 
+/*
+ * Soft-decision rescues: frames the hard-decision decoders would have dropped.
+ * Zero is the healthy case and says nothing, so the row appears only once the
+ * soft path has actually saved something.
+ */
+static int
+ui_print_p1_soft_fec_metric(const dsd_state* state, int is_p25p1) {
+    if (!is_p25p1) {
+        return 0;
+    }
+    unsigned int any = state->p25_p1_soft_hamming_ok | state->p25_p1_soft_golay_ok | state->p25_p1_soft_rs_ok
+                       | state->p25_p1_soft_combined_ok;
+    if (any == 0) {
+        return 0;
+    }
+    printw("| P1 Soft FEC: Ham %u Golay %u RS %u Comb %u\n", state->p25_p1_soft_hamming_ok, state->p25_p1_soft_golay_ok,
+           state->p25_p1_soft_rs_ok, state->p25_p1_soft_combined_ok);
+    return 1;
+}
+
+/*
+ * NID BCH health. Parity overrides are reported apart from corrections because
+ * they are accepted final-parity mismatches, not corrected symbol errors.
+ */
+static int
+ui_print_p1_nid_metric(const dsd_state* state, int is_p25p1) {
+    if (!is_p25p1) {
+        return 0;
+    }
+    unsigned int any = state->nid_corrections_total | state->nid_failures_total | state->nid_parity_overrides;
+    if (any == 0) {
+        return 0;
+    }
+    printw("| P1 NID: corr %u fail %u parity %u\n", state->nid_corrections_total, state->nid_failures_total,
+           state->nid_parity_overrides);
+    return 1;
+}
+
+/*
+ * What the vocoder did with each accepted IMBE frame, which the FEC and BER rows
+ * above do not answer: a corrected frame was heard, a concealed one was not.
+ *
+ * Tagged "session" because, unlike every other row in this panel, these counters
+ * survive retune and no-carrier -- they are never reset for the life of the run.
+ */
+static int
+ui_print_p1_voice_frame_metric(const dsd_state* state, int is_p25p1) {
+    if (!is_p25p1 || state->p25_p1_accepted_frames == 0U) {
+        return 0;
+    }
+    printw("| P1 Frames (session): acc %llu (cln %llu cor %llu cnc %llu) fix %llu\n",
+           (unsigned long long)state->p25_p1_accepted_frames, (unsigned long long)state->p25_p1_clean_frames,
+           (unsigned long long)state->p25_p1_corrected_frames, (unsigned long long)state->p25_p1_concealed_frames,
+           (unsigned long long)state->p25_p1_accepted_corrections);
+    return 1;
+}
+
+/*
+ * Tail-erasure suppression is rare enough to earn its own row only when it has
+ * fired; folding it into the frame row above would pad every line for a case
+ * most runs never hit.
+ */
+static int
+ui_print_p1_tail_erasure_metric(const dsd_state* state, int is_p25p1) {
+    if (!is_p25p1 || state->p25_p1_suppressed_tail_frames == 0U) {
+        return 0;
+    }
+    printw("| P1 Tail (session): supp %llu excl %llu\n", (unsigned long long)state->p25_p1_suppressed_tail_frames,
+           (unsigned long long)state->p25_p1_excluded_tail_corrections);
+    return 1;
+}
+
 static int
 ui_print_p1_voice_percentile_metric(const dsd_state* state) {
     int n = state->p25_p1_voice_err_hist_len;
@@ -516,8 +549,12 @@ ui_print_p25_core_metrics(const dsd_state* state, int is_p25p1, int is_p25p2) {
     lines += ui_print_p1_voice_err_metric(state);
     lines += ui_print_p1_cc_fec_metric(state);
     lines += ui_print_p1_voice_fec_metric(state, is_p25p1);
+    lines += ui_print_p1_soft_fec_metric(state, is_p25p1);
+    lines += ui_print_p1_nid_metric(state, is_p25p1);
     lines += ui_print_p1_header_metric(state, is_p25p1);
     lines += ui_print_p1_voice_percentile_metric(state);
+    lines += ui_print_p1_voice_frame_metric(state, is_p25p1);
+    lines += ui_print_p1_tail_erasure_metric(state, is_p25p1);
     return lines;
 }
 
@@ -593,6 +630,22 @@ ui_print_p2_rs_metric(const dsd_state* state) {
     return lines;
 }
 
+/*
+ * Soft-decision recoveries on the Phase 2 side, counted where hard-decision RS
+ * would have failed. Max depth is the deepest erasure set the soft ESS decoder
+ * had to reach for, so it says how hard the channel is working the decoder.
+ */
+static int
+ui_print_p2_soft_fec_metric(const dsd_state* state) {
+    unsigned int any = state->p25_p2_soft_erasure_ok | state->p25_p2_soft_ess_ok;
+    if (any == 0) {
+        return 0;
+    }
+    printw("| P2 Soft FEC: erasure %u ESS %u (max depth %u)\n", state->p25_p2_soft_erasure_ok,
+           state->p25_p2_soft_ess_ok, state->p25_p2_soft_ess_max_depth);
+    return 1;
+}
+
 static int
 ui_print_p25p2_metrics(const dsd_opts* opts, const dsd_state* state, int is_p25p1, int is_p25p2) {
     if (!is_p25p2 && !(is_p25p1 && opts && opts->trunk_enable == 1)) {
@@ -602,6 +655,7 @@ ui_print_p25p2_metrics(const dsd_opts* opts, const dsd_state* state, int is_p25p
     lines += ui_print_p2_voice_avg_metric(state);
     lines += ui_print_p2_voice_percentile_metric(state);
     lines += ui_print_p2_rs_metric(state);
+    lines += ui_print_p2_soft_fec_metric(state);
     return lines;
 }
 
@@ -653,7 +707,7 @@ ui_print_p25_sm_overview(const dsd_state* state) {
 
 static int
 ui_print_p25_cc_vc_metric(const dsd_state* state) {
-    long cc = (state->trunk_cc_freq != 0) ? state->trunk_cc_freq : state->p25_cc_freq;
+    long cc = dsd_app_cc_freq(state);
     long vc = ui_guess_active_vc_freq(state);
     char cc_buf[48];
     char vc_buf[48];
@@ -708,8 +762,11 @@ ui_print_p25_sm_tags(const dsd_state* state) {
 
 static int
 ui_append_sm_path_symbol(char* path, size_t path_len, int wrote, char sym) {
-    int m = (int)strlen(path);
-    if (m + 3 >= (int)path_len) {
+    size_t m = strlen(path);
+    // Three bytes of arrow once something is already there, the symbol, and the
+    // terminator: all of it has to fit, terminator included.
+    size_t need = (wrote > 0 ? 3U : 0U) + 2U;
+    if (m + need > path_len) {
         return wrote;
     }
     if (wrote > 0) {
@@ -1230,28 +1287,7 @@ ui_print_p25_iden_plan(const dsd_opts* opts, const dsd_state* state) {
 
 long int
 ui_guess_active_vc_freq(const dsd_state* state) {
-    if (!state) {
-        return 0;
-    }
-    if (state->trunk_vc_freq[0] != 0) {
-        return state->trunk_vc_freq[0];
-    }
-    if (state->p25_vc_freq[0] != 0) {
-        return state->p25_vc_freq[0];
-    }
-    for (int i = 0; i < 31; i++) {
-        const char* s = state->active_channel[i];
-        if (!s || s[0] == '\0') {
-            continue;
-        }
-        char tok[8] = {0};
-        if (!ui_extract_channel_token(s, tok, sizeof(tok))) {
-            continue;
-        }
-        long int freq = ui_lookup_trunk_chan_map(state, tok);
-        if (freq != 0) {
-            return freq;
-        }
-    }
-    return 0;
+    /* The chain lives in app-control so the terminal, the Qt panel and the Android
+       notification cannot disagree about which frequency a call is on. */
+    return dsd_app_vc_freq(state);
 }

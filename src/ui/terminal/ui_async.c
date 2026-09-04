@@ -6,6 +6,7 @@
 #include <curses.h>
 #include <dsd-neo/app_control/frontend_runtime.h>
 #include <dsd-neo/app_control/history.h>
+#include <dsd-neo/app_control/snapshot.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/platform/atomic_compat.h>
 #include <dsd-neo/platform/curses_compat.h>
@@ -18,10 +19,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "../../app_control/snapshot_internal.h"
 #include "dsd-neo/core/opts_fwd.h"
 #include "dsd-neo/core/state_fwd.h"
 #include "dsd-neo/platform/platform.h"
+#include "rr_panel.h"
 
 // Minimal thread state.
 static dsd_thread_t g_ui_thread;
@@ -223,6 +224,7 @@ static DSD_THREAD_RETURN_TYPE
         dsd_sleep_ms(sleep_ms);
     }
 
+    rr_panel_shutdown();
     ui_close_curses_if_opened(curses_opened);
 
     DSD_THREAD_RETURN;

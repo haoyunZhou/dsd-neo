@@ -12,8 +12,11 @@
  */
 
 #include <assert.h>
+#include <dsd-neo/core/call_state.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/state.h>
+#include <dsd-neo/core/state_ext.h>
+#include <dsd-neo/core/synctype_ids.h>
 #include <dsd-neo/protocol/dmr/dmr_trunk_sm.h>
 #include <dsd-neo/runtime/trunk_cc_candidates.h>
 #include <dsd-neo/runtime/trunk_tuning_hooks.h>
@@ -100,10 +103,14 @@ test_explicit_grant_and_release(void) {
     assert(opts.trunk_is_tuned == 1);
     assert(state.trunk_vc_freq[0] == vc);
     assert(ctx->state == DMR_SM_TUNED);
+    assert(ctx->vc_slot == -1);
+    assert(state.dmr_mono_slot == -1);
 
     // Voice active on slot 0
     dmr_sm_emit_voice_sync(&opts, &state, 0);
     assert(ctx->slots[0].voice_active == 1);
+    assert(ctx->vc_slot == 0);
+    assert(state.dmr_mono_slot == 0);
 
     // Tick while voice active - should stay tuned
     dmr_sm_tick_ctx(ctx, &opts, &state);
@@ -159,6 +166,109 @@ test_lpcn_trust_gating(void) {
     assert(state.trunk_vc_freq[0] == prev); // unchanged (blocked)
 }
 
+static void
+test_grant_identity_seeds_matching_voice_slot(void) {
+    static dsd_opts opts;
+    static dsd_state state;
+    init_env(&opts, &state);
+    state.synctype = DSD_SYNC_DMR_BS_VOICE_POS;
+
+    dmr_sm_init(&opts, &state);
+    dmr_sm_ctx_t* ctx = dmr_sm_get_ctx();
+    dmr_sm_emit_group_grant_slot(&opts, &state, 855012500L, 0x245, 1, 3101, 4202);
+    assert(ctx->state == DMR_SM_TUNED);
+    assert(ctx->vc_slot == 1);
+    assert(state.dmr_mono_slot == 1);
+
+    dsd_call_snapshot call;
+    dmr_sm_emit_voice_sync(&opts, &state, 0);
+    assert(dsd_call_state_get(&state, 0U, &call) == 0);
+    assert(ctx->vc_identity_published == 0);
+    assert(state.dmr_mono_slot == 1);
+
+    dmr_sm_emit_voice_sync(&opts, &state, 1);
+    assert(dsd_call_state_get(&state, 1U, &call) == 1);
+    assert(call.phase == DSD_CALL_PHASE_ACTIVE);
+    assert(call.kind == DSD_CALL_KIND_GROUP_VOICE);
+    assert(call.ota_target_id == 3101U);
+    assert(call.policy_target_id == 3101U);
+    assert(call.ota_source_id == 4202U);
+    assert(call.channel == 0x245U);
+    assert(call.frequency_hz == 855012500L);
+    assert(ctx->vc_identity_published == 1);
+
+    dsd_state_ext_free_all(&state);
+}
+
+static void
+test_slotless_grant_selects_ts2_on_voice_sync(void) {
+    static dsd_opts opts;
+    static dsd_state state;
+    init_env(&opts, &state);
+    state.synctype = DSD_SYNC_DMR_BS_VOICE_POS;
+
+    dmr_sm_init(&opts, &state);
+    dmr_sm_ctx_t* ctx = dmr_sm_get_ctx();
+    dmr_sm_emit_group_grant(&opts, &state, 855037500L, 0x247, 7101, 8202);
+    assert(ctx->state == DMR_SM_TUNED);
+    assert(ctx->vc_slot == -1);
+    assert(state.dmr_mono_slot == -1);
+
+    dmr_sm_emit_voice_sync(&opts, &state, 1);
+    assert(ctx->vc_slot == 1);
+    assert(state.dmr_mono_slot == 1);
+
+    dsd_call_snapshot call;
+    assert(dsd_call_state_get(&state, 1U, &call) == 1);
+    assert(call.ota_target_id == 7101U);
+    assert(call.ota_source_id == 8202U);
+
+    dsd_state_ext_free_all(&state);
+}
+
+static void
+test_voice_header_and_first_sync_share_epoch(void) {
+    static dsd_opts opts;
+    static dsd_state state;
+    init_env(&opts, &state);
+    state.synctype = DSD_SYNC_DMR_BS_VOICE_POS;
+
+    dmr_sm_init(&opts, &state);
+    dmr_sm_ctx_t* ctx = dmr_sm_get_ctx();
+    dmr_sm_emit_group_grant_slot(&opts, &state, 855025000L, 0x246, 0, 5101, 6202);
+    assert(ctx->state == DMR_SM_TUNED);
+
+    const dsd_call_observation voice_header = {
+        .protocol = DSD_SYNC_DMR_BS_VOICE_POS,
+        .slot = 0U,
+        .kind = DSD_CALL_KIND_GROUP_VOICE,
+        .ota_target_id = 5101U,
+        .policy_target_id = 5101U,
+        .ota_source_id = 6202U,
+        .channel = 0x246U,
+        .frequency_hz = 855025000L,
+        .service_options = 0x83U,
+        .emergency = 1U,
+        .priority = 3U,
+        .has_service_metadata = 1U,
+    };
+    assert(dsd_call_state_observe(&state, &voice_header, DSD_CALL_BOUNDARY_BEGIN) == 1);
+    dsd_call_snapshot before;
+    assert(dsd_call_state_get(&state, 0U, &before) == 1);
+
+    dmr_sm_emit_voice_sync(&opts, &state, 0);
+
+    dsd_call_snapshot after;
+    assert(dsd_call_state_get(&state, 0U, &after) == 1);
+    assert(after.epoch == before.epoch);
+    assert(after.service_options == 0x83U);
+    assert(after.emergency == 1U);
+    assert(after.priority == 3U);
+    assert(ctx->vc_identity_published == 1);
+
+    dsd_state_ext_free_all(&state);
+}
+
 int
 main(int argc, char** argv) {
     (void)argc;
@@ -170,6 +280,9 @@ main(int argc, char** argv) {
     test_neighbor_candidates();
     test_explicit_grant_and_release();
     test_lpcn_trust_gating();
+    test_grant_identity_seeds_matching_voice_slot();
+    test_slotless_grant_selects_ts2_on_voice_sync();
+    test_voice_header_and_first_sync_share_epoch();
     dsd_trunk_tuning_hooks_set((dsd_trunk_tuning_hooks){0});
     printf("DMR_T3_SHIM: OK\n");
     return 0;

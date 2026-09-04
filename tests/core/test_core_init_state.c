@@ -11,6 +11,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include "dsd-neo/core/enc_lockout.h"
 #include "dsd-neo/core/opts_fwd.h"
 #include "dsd-neo/core/safe_api.h"
 #include "dsd-neo/core/state_fwd.h"
@@ -64,11 +65,12 @@ main(void) {
     state->trunk_chan_map_used[0] = 0x0123U;
     state->trunk_chan_map_used_count = 1U;
     state->trunk_chan_map_seq = 99U;
-    state->p25_enc_tg_cache_next = 3U;
-    for (int i = 0; i < DSD_P25_ENC_TG_CACHE_DEPTH; i++) {
-        state->p25_enc_tg_cache_until[i] = 1234567890 + i;
-        state->p25_enc_tg_cache_tg[i] = (uint32_t)(2400 + i);
-        state->p25_enc_tg_cache_is_group[i] = (uint8_t)(i % 2);
+    state->enc_lockout_key_epoch = 42U;
+    for (int i = 0; i < DSD_ENC_LOCKOUT_MAX; i++) {
+        state->enc_lockout_entries[i].in_use = 1U;
+        state->enc_lockout_entries[i].target = (uint32_t)(2400 + i);
+        state->enc_lockout_entries[i].is_group = (uint8_t)(i % 2);
+        state->enc_lockout_entries[i].key_epoch = 42U;
     }
     state->rtl_symbol_cache[0] = 1234.0f;
     state->rtl_symbol_cache[DSD_RTL_SYMBOL_CACHE_CAP - 1] = 5678.0f;
@@ -91,6 +93,10 @@ main(void) {
     state->data_header_dd_format[1] = 0x18U;
     state->data_header_bit_padding[0] = 16U;
     state->data_header_bit_padding[1] = 7U;
+    state->dmr_lrrp_target[0] = 1234U;
+    state->dmr_lrrp_target[1] = 5678U;
+    state->dmr_data_target_is_group[0] = 1U;
+    state->dmr_data_target_is_group[1] = 1U;
     state->p25_p1_soft_hamming_ok = 77U;
     state->p25_last_cc_msg_time = 1234567890;
     state->p25_last_cc_msg_time_m = 12345.5;
@@ -117,8 +123,6 @@ main(void) {
     state->p25_p1_crypto_conflict.active = 1U;
     state->p25_p1_crypto_conflict.algid = 0xA0U;
     state->p25_p1_crypto_conflict.keyid = 0x0064U;
-    state->p25_policy_tg[0] = 0x1234U;
-    state->p25_policy_tg[1] = 0x5678U;
     state->p25_mac_frag[0].active = 1U;
     state->p25_mac_frag[0].opcode = 0x89U;
     state->p25_mac_frag[0].data_len = 4U;
@@ -185,8 +189,7 @@ main(void) {
         || state->payload_keyid != 0 || state->payload_keyidR != 0
         || state->p25_crypto_state[0] != DSD_P25_CRYPTO_UNKNOWN || state->p25_crypto_state[1] != DSD_P25_CRYPTO_UNKNOWN
         || state->p25_p1_hdu_crypto_fresh != 0 || state->p25_p1_crypto_conflict.active != 0U
-        || state->p25_p1_crypto_conflict.algid != 0U || state->p25_p1_crypto_conflict.keyid != 0U
-        || state->p25_policy_tg[0] != 0U || state->p25_policy_tg[1] != 0U) {
+        || state->p25_p1_crypto_conflict.algid != 0U || state->p25_p1_crypto_conflict.keyid != 0U) {
         DSD_FPRINTF(stderr, "initState did not clear payload crypto metadata\n");
         freeState(state);
         free(state);
@@ -273,6 +276,18 @@ main(void) {
         free(state);
         return 28;
     }
+    /*
+     * dmr_data_target_is_group[] qualifies dmr_lrrp_target[] for the --dmr-tg-key-csv lookup, so a
+     * stale group flag surviving a target reset would qualify whatever target is written next.
+     * Both slots are seeded above so a slot-0-only reset still fails here.
+     */
+    if (state->dmr_lrrp_target[0] != 0U || state->dmr_lrrp_target[1] != 0U || state->dmr_data_target_is_group[0] != 0U
+        || state->dmr_data_target_is_group[1] != 0U) {
+        DSD_FPRINTF(stderr, "initState did not clear the DMR data target and its group flag\n");
+        freeState(state);
+        free(state);
+        return 29;
+    }
     if (state->p25_last_cc_msg_time != 0 || !isfinite(state->p25_last_cc_msg_time_m)
         || fabs(state->p25_last_cc_msg_time_m) > 1e-12) {
         DSD_FPRINTF(stderr, "initState did not clear P25 decoded control-channel timestamps\n");
@@ -300,16 +315,16 @@ main(void) {
         return 4;
     }
 
-    if (state->p25_enc_tg_cache_next != 0U) {
-        DSD_FPRINTF(stderr, "initState did not reset P25 encrypted TG cache cursor\n");
+    if (state->enc_lockout_key_epoch != 1U) {
+        DSD_FPRINTF(stderr, "initState did not reset the enc lockout key epoch\n");
         freeState(state);
         free(state);
         return 24;
     }
-    for (int i = 0; i < DSD_P25_ENC_TG_CACHE_DEPTH; i++) {
-        if (state->p25_enc_tg_cache_until[i] != 0 || state->p25_enc_tg_cache_tg[i] != 0U
-            || state->p25_enc_tg_cache_is_group[i] != 0U) {
-            DSD_FPRINTF(stderr, "initState did not reset P25 encrypted TG cache\n");
+    for (int i = 0; i < DSD_ENC_LOCKOUT_MAX; i++) {
+        if (state->enc_lockout_entries[i].in_use != 0U || state->enc_lockout_entries[i].target != 0U
+            || state->enc_lockout_entries[i].is_group != 0U) {
+            DSD_FPRINTF(stderr, "initState did not reset the enc lockout ledger\n");
             freeState(state);
             free(state);
             return 25;

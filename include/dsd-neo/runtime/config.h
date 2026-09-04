@@ -113,6 +113,10 @@ extern "C" {
  *
  * Debug/advanced knobs (centralized for maintainability)
  * - DSD_NEO_DEBUG_SYNC, DSD_NEO_DEBUG_CQPSK
+ * - DSD_NEO_DEBUG_SYMBOL_TIMING
+ *     Symbol-timing diagnostics on the decoder's own symbol grid.
+ *     Values: 0 off, 1 one measurement line per accepted frame sync (sub-symbol offset,
+ *     samplesPerSymbol, jitter), 2 additionally the per-sample +/-/O/X trace. Default: 0.
  * - DSD_NEO_CQPSK, DSD_NEO_CQPSK_SYNC_INV, DSD_NEO_CQPSK_SYNC_NEG
  * - DSD_NEO_FTZ_DAZ
  * - DSD_NEO_NO_BOOTSTRAP
@@ -129,6 +133,13 @@ extern "C" {
  * Cache/path knobs
  * - DSD_NEO_CACHE_DIR, DSD_NEO_CC_CACHE
  */
+
+/* Levels for DSD_NEO_DEBUG_SYMBOL_TIMING. */
+enum {
+    DSD_NEO_SYMBOL_TIMING_OFF = 0,
+    DSD_NEO_SYMBOL_TIMING_SYNC_LINE = 1,
+    DSD_NEO_SYMBOL_TIMING_TRACE = 2,
+};
 
 typedef enum DSD_ATTR_PACKED {
     DSD_NEO_DEEMPH_UNSET = 0,
@@ -210,12 +221,18 @@ typedef struct dsdneoRuntimeConfig {
     int ftz_daz_enable;
     int no_bootstrap_is_set;
     int no_bootstrap_enable;
+    int no_signal_handlers_is_set;
+    int no_signal_handlers_enable;
 
     /* Debug/tuning toggles */
     int debug_sync_is_set;
     int debug_sync_enable;
     int debug_cqpsk_is_set;
     int debug_cqpsk_enable;
+    /* Level rather than a toggle: the two things this gates differ by orders of magnitude in
+     * volume. 1 is one line per accepted sync; 2 adds a character per input sample. */
+    int debug_symbol_timing_is_set;
+    int debug_symbol_timing;
 
     /* CQPSK runtime toggles */
     int cqpsk_is_set;
@@ -515,6 +532,7 @@ typedef enum DSD_ATTR_PACKED {
     DSDCFG_MODE_M17,
     DSDCFG_MODE_TDMA,
     DSDCFG_MODE_ANALOG,
+    DSDCFG_MODE_DMR_MONO,
     DSDCFG_MODE_TETRA
 } dsdneoUserDecodeMode;
 
@@ -551,12 +569,15 @@ typedef struct dsdneoUserConfig {
     char soapy_gains[512];
     int soapy_bandwidth_hz;
     int soapy_bandwidth_hz_is_set;
+    char digital_resample[8]; /* auto|on|off */
     char file_path[1024];
     int file_sample_rate;
     char tcp_host[128];
     int tcp_port;
     char udp_addr[64];
     int udp_port;
+    double input_warn_db;     /* low input-level advisory threshold in dBFS */
+    int input_warn_db_is_set; /* distinguish explicit value from default */
 
     /* [output] */
     int has_output;
@@ -568,6 +589,17 @@ typedef struct dsdneoUserConfig {
     /* [mode] */
     int has_mode;
     dsdneoUserDecodeMode decode_mode;
+    int has_dmr_mono;
+    int dmr_mono;
+    /* Comma-separated extra UDP ports decoded as DMR LRRP; empty means not set, so a
+       reload leaves a CLI-supplied list alone. Split by core/lrrp_ports.h at apply time. */
+    char dmr_lrrp_ports[64];
+    /* The EDACS EA/ESK variant. Applied AFTER the decode preset, which resets
+       both: see apply_mode_config(). esk is a boolean over the single 0xA0 mask
+       the four CLI variants and the RadioReference apply handler all use. */
+    int has_edacs_variant;
+    int edacs_ea;
+    int edacs_esk;
     int has_demod;
     dsdneoUserDemodPath demod_path;
 
@@ -576,11 +608,22 @@ typedef struct dsdneoUserConfig {
     int trunk_enabled;
     char trunk_chan_csv[1024];
     char trunk_group_csv[1024];
+    char trunk_p25_bandplan_csv[1024];
     int trunk_use_allow_list;
     int trunk_tune_group_calls;
     int trunk_tune_private_calls;
     int trunk_tune_data_calls;
     int trunk_tune_enc_calls;
+    int trunk_scanner;
+    int trunk_p25_prefer_candidates;
+    int trunk_scan_voice_only;
+    int trunk_scan_voice_qualify_ms;
+    int trunk_scan_voice_hold_ms;
+
+    /* [radioreference] */
+    int has_radioreference;
+    char rr_username[128];
+    char rr_app_key[64];
 
     /* [trunk_scan] */
     int has_trunk_scan;
@@ -629,6 +672,29 @@ typedef struct dsdneoUserConfig {
  * @return Pointer to default path string or NULL when unavailable.
  */
 const char* dsd_user_config_default_path(void);
+
+/**
+ * @brief Resolve "<config dir>/imports" (no I/O).
+ *
+ * Derived by replacing the final component of dsd_user_config_default_path()
+ * with "imports", using the platform separator. Recomputed on every call into
+ * an internal static buffer: the value is not latched, so the pointer is only
+ * valid until the next call.
+ *
+ * @return Pointer to the imports directory path, or NULL when no config path
+ *         resolves (none of XDG_CONFIG_HOME/HOME, or APPDATA on Windows, is set).
+ */
+const char* dsd_user_imports_dir(void);
+
+/**
+ * @brief Create dsd_user_imports_dir() and its parents with mode 0700.
+ *
+ * Existing directories are accepted. The result is verified with stat, because
+ * the underlying component walk reports nothing.
+ *
+ * @return 0 when the directory exists afterwards; -1 otherwise.
+ */
+int dsd_user_imports_dir_create(void);
 
 /**
  * @brief Load a user config from the given path.

@@ -14,8 +14,10 @@
 #include <cmath>
 #include <ctype.h>
 #include <dsd-neo/core/frontend_types.h>
+#include <dsd-neo/core/lrrp_ports.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/parse.h>
+#include <dsd-neo/core/power.h>
 #include <dsd-neo/core/state.h>
 #include <dsd-neo/platform/file_compat.h>
 #include <dsd-neo/platform/posix_compat.h>
@@ -94,6 +96,26 @@ user_config_parse_int_value(const char* val, int* out_value) {
     return 0;
 }
 
+int
+user_config_parse_double_value(const char* val, double* out_value) {
+    if (!val || !*val || !out_value) {
+        return -1;
+    }
+    errno = 0;
+    char* end = NULL;
+    const double parsed = strtod(val, &end);
+    if (errno == ERANGE || end == val || (end && *end != '\0') || !std::isfinite(parsed)) {
+        return -1;
+    }
+    /* strtod() also accepts hex-float spellings ("0x10" == 16.0); the config grammar is
+       decimal, so reject any parse that consumed characters outside decimal float syntax. */
+    if (strspn(val, " \t\n\v\f\r0123456789+-.eE") != strlen(val)) {
+        return -1;
+    }
+    *out_value = parsed;
+    return 0;
+}
+
 char*
 user_config_trim_ascii_whitespace(char* text) {
     if (!text) {
@@ -151,26 +173,6 @@ local_pwr_to_dB(double mean_power) {
     return dB;
 }
 
-// Local helper to convert dB to linear power (avoids dependency on dsd_misc.c)
-static double
-local_dB_to_pwr(double dB) {
-    if (dB >= 0.0) {
-        return 1.0;
-    }
-    if (dB < -200.0) {
-        dB = -200.0;
-    }
-    const double k_ln10_over_10 = 2.302585092994046 / 10.0;
-    double pwr = std::exp(dB * k_ln10_over_10);
-    if (pwr < 0.0) {
-        pwr = 0.0;
-    }
-    if (pwr > 1.0) {
-        pwr = 1.0;
-    }
-    return pwr;
-}
-
 void
 user_cfg_reset(dsdneoUserConfig* cfg) {
     if (!cfg) {
@@ -184,10 +186,14 @@ user_cfg_reset(dsdneoUserConfig* cfg) {
     cfg->trunk_tune_enc_calls = 1;
     cfg->trunk_scan_idle_dwell_ms = 3000;
     cfg->trunk_scan_activity_hold_ms = 1200;
-
+    cfg->trunk_scan_voice_only = 0;
+    cfg->trunk_scan_voice_qualify_ms = 1000;
+    cfg->trunk_scan_voice_hold_ms = 2000;
     cfg->rtl_auto_ppm = 0;
     cfg->soapy_bandwidth_hz = -1;
     cfg->soapy_bandwidth_hz_is_set = 0;
+    cfg->input_warn_db = -40.0;
+    cfg->input_warn_db_is_set = 0;
 
     cfg->call_alert_enabled = 0;
     cfg->call_alert_events = DSD_CALL_ALERT_EVENT_ALL;
@@ -245,11 +251,11 @@ struct decode_mode_alias_map_t {
 } // namespace
 
 static const decode_mode_name_map_t k_decode_mode_names[] = {
-    {DSDCFG_MODE_AUTO, "auto"},         {DSDCFG_MODE_P25P1, "p25p1"},   {DSDCFG_MODE_P25P2, "p25p2"},
-    {DSDCFG_MODE_DMR, "dmr"},           {DSDCFG_MODE_NXDN48, "nxdn48"}, {DSDCFG_MODE_NXDN96, "nxdn96"},
-    {DSDCFG_MODE_X2TDMA, "x2tdma"},     {DSDCFG_MODE_YSF, "ysf"},       {DSDCFG_MODE_DSTAR, "dstar"},
-    {DSDCFG_MODE_EDACS_PV, "edacs_pv"}, {DSDCFG_MODE_DPMR, "dpmr"},     {DSDCFG_MODE_M17, "m17"},
-    {DSDCFG_MODE_TDMA, "tdma"},         {DSDCFG_MODE_ANALOG, "analog"},
+    {DSDCFG_MODE_AUTO, "auto"},     {DSDCFG_MODE_P25P1, "p25p1"},       {DSDCFG_MODE_P25P2, "p25p2"},
+    {DSDCFG_MODE_DMR, "dmr"},       {DSDCFG_MODE_DMR_MONO, "dmr_mono"}, {DSDCFG_MODE_NXDN48, "nxdn48"},
+    {DSDCFG_MODE_NXDN96, "nxdn96"}, {DSDCFG_MODE_X2TDMA, "x2tdma"},     {DSDCFG_MODE_YSF, "ysf"},
+    {DSDCFG_MODE_DSTAR, "dstar"},   {DSDCFG_MODE_EDACS_PV, "edacs_pv"}, {DSDCFG_MODE_DPMR, "dpmr"},
+    {DSDCFG_MODE_M17, "m17"},       {DSDCFG_MODE_TDMA, "tdma"},         {DSDCFG_MODE_ANALOG, "analog"},
 };
 
 /* Read-only compatibility spellings are translated directly to the current decode-mode enum. Canonical config
@@ -389,12 +395,32 @@ apply_shared_radio_tuning_from_config(const dsdneoUserConfig* cfg, dsd_opts* opt
     opts->rtl_gain_value = gain;
     opts->rtlsdr_ppm_error = ppm;
     opts->rtl_dsp_bw_khz = bw;
-    if (sql < 0) {
-        opts->rtl_squelch_level = local_dB_to_pwr((double)sql);
-    } else {
-        opts->rtl_squelch_level = (double)sql;
-    }
+    opts->rtl_squelch_level = dsd_squelch_level_from_sql((double)sql);
     opts->rtl_volume_multiplier = vol;
+}
+
+static int
+digital_resample_mode_from_name(const char* name) {
+    if (!name || !name[0] || dsd_strcasecmp(name, "auto") == 0) {
+        return 0; /* DSD_DIGITAL_RESAMPLE_AUTO */
+    }
+    if (dsd_strcasecmp(name, "on") == 0) {
+        return 1; /* DSD_DIGITAL_RESAMPLE_ON */
+    }
+    if (dsd_strcasecmp(name, "off") == 0) {
+        return 2; /* DSD_DIGITAL_RESAMPLE_OFF */
+    }
+    DSD_FPRINTF(stderr, "Config: unrecognized digital_resample value \"%s\"; using \"auto\".\n", name);
+    return 0;
+}
+
+static const char*
+digital_resample_mode_name(int mode) {
+    switch (mode) {
+        case 1: return "on";
+        case 2: return "off";
+        default: return "auto";
+    }
 }
 
 static void
@@ -435,11 +461,22 @@ snapshot_apply_live_rtl_values(const dsd_opts* opts, dsdneoUserConfig* cfg) {
     cfg->rtl_ppm = opts->rtlsdr_ppm_error;
     cfg->rtl_ppm_is_set = 1;
     cfg->rtl_bw_khz = opts->rtl_dsp_bw_khz;
-    cfg->rtl_sql = (int)local_pwr_to_dB(opts->rtl_squelch_level);
+    /* Off is a setting in its own right, and 0 is how the CLI and the config key
+     * both spell it. Rendering it through pwr_to_dB() saved -120, which reloaded
+     * as a real threshold and is outside the key's own -100..0 range. */
+    cfg->rtl_sql = dsd_squelch_is_off(opts->rtl_squelch_level) ? 0 : (int)local_pwr_to_dB(opts->rtl_squelch_level);
     cfg->rtl_volume = opts->rtl_volume_multiplier;
     if (opts->rtlsdr_center_freq > 0) {
         DSD_SNPRINTF(cfg->rtl_freq, sizeof cfg->rtl_freq, "%u", opts->rtlsdr_center_freq);
         cfg->rtl_freq[sizeof cfg->rtl_freq - 1] = '\0';
+    }
+    if (opts->digital_resample_mode != 0) {
+        copy_token_string(cfg->digital_resample, sizeof cfg->digital_resample,
+                          digital_resample_mode_name(opts->digital_resample_mode));
+    } else {
+        /* Auto is the default; drop any explicit value so a mode returned to auto is not
+           frozen at its previous setting by autosave. */
+        cfg->digital_resample[0] = '\0';
     }
 }
 
@@ -710,6 +747,59 @@ dsd_user_config_save_atomic(const char* path, const dsdneoUserConfig* cfg) {
     return config_replace_temp_file(tmp, save_path);
 }
 
+const char*
+dsd_user_imports_dir(void) {
+    // No `static int inited` latch, unlike dsd_user_config_default_path(): a latch
+    // would cache the failure case forever and would make the pair untestable.
+    static char buf[1024];
+
+    buf[0] = '\0';
+
+    const char* cfg = dsd_user_config_default_path();
+    if (!cfg || !*cfg) {
+        return NULL;
+    }
+
+    // Replace the final component rather than appending to a directory that may
+    // not have one: config_parent_dir() returns 1 only when it stripped a parent.
+    char dir[1024];
+    if (config_parent_dir(cfg, dir, sizeof dir) != 1) {
+        return NULL;
+    }
+
+#if defined(_WIN32)
+    int n = DSD_SNPRINTF(buf, sizeof buf, "%s\\imports", dir);
+#else
+    int n = DSD_SNPRINTF(buf, sizeof buf, "%s/imports", dir);
+#endif
+    if (n < 0 || (size_t)n >= sizeof buf) {
+        buf[0] = '\0';
+        return NULL;
+    }
+    return buf;
+}
+
+int
+dsd_user_imports_dir_create(void) {
+    const char* dir = dsd_user_imports_dir();
+    if (!dir || !*dir) {
+        return -1;
+    }
+
+    // ensure_dir_exists() is `static void` and discards every dsd_mkdir() result;
+    // it is shared with dsd_user_config_save_atomic(), so its signature stays as
+    // it is and the outcome is verified here instead. Its internal char buf[1024]
+    // also truncates pathological paths silently - the stat below is what catches
+    // that.
+    ensure_dir_exists(dir);
+
+    dsd_stat_t st;
+    if (dsd_stat_path(dir, &st) != 0 || dsd_stat_is_regular(&st)) {
+        return -1;
+    }
+    return 0;
+}
+
 static const char*
 ini_bool(int value) {
     return value ? "true" : "false";
@@ -761,6 +851,9 @@ render_input_rtl_common(FILE* out, const dsdneoUserConfig* cfg, int include_auto
     }
     if (include_auto_ppm) {
         DSD_FPRINTF(out, "auto_ppm = %s\n", ini_bool(cfg->rtl_auto_ppm));
+    }
+    if (cfg->digital_resample[0]) {
+        DSD_FPRINTF(out, "digital_resample = \"%s\"\n", cfg->digital_resample);
     }
 }
 
@@ -861,6 +954,7 @@ render_input_section(FILE* out, const dsdneoUserConfig* cfg) {
         case DSDCFG_INPUT_UDP: render_input_udp(out, cfg); break;
         default: break;
     }
+    DSD_FPRINTF(out, "input_warn_db = %.1f\n", cfg->input_warn_db);
     DSD_FPRINTF(out, "\n");
 }
 
@@ -888,6 +982,16 @@ render_mode_section(FILE* out, const dsdneoUserConfig* cfg) {
     if (decode_name) {
         DSD_FPRINTF(out, "decode = \"%s\"\n", decode_name);
     }
+    if (cfg->has_dmr_mono) {
+        DSD_FPRINTF(out, "dmr_mono = %s\n", ini_bool(cfg->dmr_mono));
+    }
+    if (cfg->dmr_lrrp_ports[0]) {
+        DSD_FPRINTF(out, "dmr_lrrp_ports = \"%s\"\n", cfg->dmr_lrrp_ports);
+    }
+    if (cfg->has_edacs_variant) {
+        DSD_FPRINTF(out, "edacs_ea = %s\n", ini_bool(cfg->edacs_ea));
+        DSD_FPRINTF(out, "edacs_esk = %s\n", ini_bool(cfg->edacs_esk));
+    }
     if (cfg->has_demod) {
         switch (cfg->demod_path) {
             case DSDCFG_DEMOD_AUTO: DSD_FPRINTF(out, "demod = \"auto\"\n"); break;
@@ -910,11 +1014,31 @@ render_trunking_section(FILE* out, const dsdneoUserConfig* cfg) {
     if (cfg->trunk_group_csv[0]) {
         DSD_FPRINTF(out, "group_csv = \"%s\"\n", cfg->trunk_group_csv);
     }
+    if (cfg->trunk_p25_bandplan_csv[0]) {
+        DSD_FPRINTF(out, "p25_bandplan_csv = \"%s\"\n", cfg->trunk_p25_bandplan_csv);
+    }
     DSD_FPRINTF(out, "allow_list = %s\n", ini_bool(cfg->trunk_use_allow_list));
     DSD_FPRINTF(out, "tune_group_calls = %s\n", ini_bool(cfg->trunk_tune_group_calls));
     DSD_FPRINTF(out, "tune_private_calls = %s\n", ini_bool(cfg->trunk_tune_private_calls));
     DSD_FPRINTF(out, "tune_data_calls = %s\n", ini_bool(cfg->trunk_tune_data_calls));
     DSD_FPRINTF(out, "tune_enc_calls = %s\n", ini_bool(cfg->trunk_tune_enc_calls));
+    DSD_FPRINTF(out, "scanner = %s\n", ini_bool(cfg->trunk_scanner));
+    DSD_FPRINTF(out, "p25_prefer_candidates = %s\n", ini_bool(cfg->trunk_p25_prefer_candidates));
+    DSD_FPRINTF(out, "scan_voice_only = %s\n", ini_bool(cfg->trunk_scan_voice_only));
+    DSD_FPRINTF(out, "scan_voice_qualify_ms = %d\n", cfg->trunk_scan_voice_qualify_ms);
+    DSD_FPRINTF(out, "scan_voice_hold_ms = %d\n", cfg->trunk_scan_voice_hold_ms);
+    DSD_FPRINTF(out, "\n");
+}
+
+static void
+render_radioreference_section(FILE* out, const dsdneoUserConfig* cfg) {
+    DSD_FPRINTF(out, "[radioreference]\n");
+    if (cfg->rr_username[0]) {
+        DSD_FPRINTF(out, "username = \"%s\"\n", cfg->rr_username);
+    }
+    if (cfg->rr_app_key[0]) {
+        DSD_FPRINTF(out, "app_key = \"%s\"\n", cfg->rr_app_key);
+    }
     DSD_FPRINTF(out, "\n");
 }
 
@@ -1014,6 +1138,9 @@ dsd_user_config_render_ini(const dsdneoUserConfig* cfg, FILE* stream) {
     }
     if (cfg->has_trunking) {
         render_trunking_section(stream, cfg);
+    }
+    if (cfg->has_radioreference) {
+        render_radioreference_section(stream, cfg);
     }
     if (cfg->has_trunk_scan) {
         render_trunk_scan_section(stream, cfg);
@@ -1164,6 +1291,21 @@ apply_input_config(const dsdneoUserConfig* cfg, dsd_opts* opts, int apply_file_i
         default: break;
     }
     apply_input_rtl_auto_ppm(cfg, opts);
+    /* Source-independent advisory threshold; clamp to the same [-200, 0] window
+       the CLI, env, and runtime menu command enforce. */
+    if (cfg->input_warn_db_is_set) {
+        double warn_db = cfg->input_warn_db;
+        if (warn_db < -200.0) {
+            warn_db = -200.0;
+        }
+        if (warn_db > 0.0) {
+            warn_db = 0.0;
+        }
+        opts->input_warn_db = warn_db;
+    }
+    /* The digital resample policy governs the whole rtl-family demod chain, including IQ
+       replay, which can run under any configured input source — apply it unconditionally. */
+    opts->digital_resample_mode = digital_resample_mode_from_name(cfg->digital_resample);
 }
 
 static void
@@ -1191,6 +1333,23 @@ static void
 apply_mode_config(const dsdneoUserConfig* cfg, dsd_opts* opts, dsd_state* state) {
     if (cfg->has_mode) {
         (void)dsd_apply_decode_mode_preset(cfg->decode_mode, DSD_DECODE_PRESET_PROFILE_CONFIG, opts, state);
+    }
+    if (cfg->has_dmr_mono && !(cfg->has_mode && cfg->decode_mode == DSDCFG_MODE_DMR_MONO)) {
+        opts->dmr_mono = cfg->dmr_mono ? 1 : 0;
+    }
+    /* The parse rebuilds the table, so a runtime reload replaces the list instead of
+       accumulating; entries the validator already warned about are simply left out. */
+    if (cfg->dmr_lrrp_ports[0]) {
+        (void)dsd_lrrp_port_list_parse(cfg->dmr_lrrp_ports, opts->lrrp_extra_ports, DSD_LRRP_EXTRA_PORT_MAX,
+                                       &opts->lrrp_extra_port_count);
+    }
+    /* Must follow dsd_apply_decode_mode_preset() above: decode_mode_apply_edacs_pv()
+       zeroes both fields unconditionally, so applying these first would silently
+       lose them. Unlike dmr_mono there is no preset that carries the variant
+       itself - one edacs_pv preset covers all four CLI forms - so no guard. */
+    if (cfg->has_edacs_variant) {
+        state->ea_mode = cfg->edacs_ea ? 1 : 0;
+        state->esk_mask = cfg->edacs_esk ? (unsigned short)0xA0 : (unsigned short)0;
     }
 }
 
@@ -1228,6 +1387,14 @@ apply_demod_config(const dsdneoUserConfig* cfg, dsd_opts* opts, dsd_state* state
 }
 
 static void
+apply_trunking_path(char* dst, size_t dst_size, const char* src) {
+    if (src[0]) {
+        DSD_SNPRINTF(dst, dst_size, "%s", src);
+        dst[dst_size - 1] = '\0';
+    }
+}
+
+static void
 apply_trunking_config(const dsdneoUserConfig* cfg, dsd_opts* opts) {
     if (!cfg || !opts || !cfg->has_trunking) {
         return;
@@ -1235,19 +1402,49 @@ apply_trunking_config(const dsdneoUserConfig* cfg, dsd_opts* opts) {
     if (cfg->trunk_enabled) {
         opts->trunk_enable = 1;
     }
-    if (cfg->trunk_chan_csv[0]) {
-        DSD_SNPRINTF(opts->chan_in_file, sizeof opts->chan_in_file, "%s", cfg->trunk_chan_csv);
-        opts->chan_in_file[sizeof opts->chan_in_file - 1] = '\0';
-    }
-    if (cfg->trunk_group_csv[0]) {
-        DSD_SNPRINTF(opts->group_in_file, sizeof opts->group_in_file, "%s", cfg->trunk_group_csv);
-        opts->group_in_file[sizeof opts->group_in_file - 1] = '\0';
-    }
+    apply_trunking_path(opts->chan_in_file, sizeof opts->chan_in_file, cfg->trunk_chan_csv);
+    apply_trunking_path(opts->group_in_file, sizeof opts->group_in_file, cfg->trunk_group_csv);
+    /* Path only: the engine imports the band plan at start, once the CLI has had its say. */
+    apply_trunking_path(opts->p25_bandplan_in_file, sizeof opts->p25_bandplan_in_file, cfg->trunk_p25_bandplan_csv);
     opts->trunk_use_allow_list = cfg->trunk_use_allow_list ? 1 : 0;
     opts->trunk_tune_group_calls = cfg->trunk_tune_group_calls ? 1 : 0;
     opts->trunk_tune_private_calls = cfg->trunk_tune_private_calls ? 1 : 0;
     opts->trunk_tune_data_calls = cfg->trunk_tune_data_calls ? 1 : 0;
     opts->trunk_tune_enc_calls = cfg->trunk_tune_enc_calls ? 1 : 0;
+    /* Exactly one automatic tuner owner, the invariant ui_handle_trunk_set/
+       ui_handle_scanner_toggle (src/app_control/actions/actions_trunk.c) and
+       rr_apply_tuner_owner (src/app_control/app_command_queue.c) both enforce.
+       A bare assignment here would leave trunking AND the scanner live together -
+       the trunking SM following a control channel while
+       no_carrier_step_scanner_mode_if_needed() retunes off it every hangtime -
+       because the trunk_enabled branch above is deliberately one-way and never
+       clears. trunk_enabled wins when a config asks for both, matching
+       rr_apply_tuner_owner. */
+    if (cfg->trunk_scanner && !cfg->trunk_enabled) {
+        opts->scanner_mode = 1;
+        opts->trunk_enable = 0;
+    } else {
+        opts->scanner_mode = 0;
+    }
+    opts->p25_prefer_candidates = cfg->trunk_p25_prefer_candidates ? (uint8_t)1 : (uint8_t)0;
+    opts->scan_voice_only = cfg->trunk_scan_voice_only ? 1 : 0;
+    opts->scan_voice_qualify_ms = cfg->trunk_scan_voice_qualify_ms;
+    opts->scan_voice_hold_ms = cfg->trunk_scan_voice_hold_ms;
+}
+
+static void
+apply_radioreference_config(const dsdneoUserConfig* cfg, dsd_opts* opts) {
+    if (!cfg || !opts || !cfg->has_radioreference) {
+        return;
+    }
+    if (cfg->rr_username[0]) {
+        DSD_SNPRINTF(opts->rr_username, sizeof opts->rr_username, "%s", cfg->rr_username);
+        opts->rr_username[sizeof opts->rr_username - 1] = '\0';
+    }
+    if (cfg->rr_app_key[0]) {
+        DSD_SNPRINTF(opts->rr_app_key, sizeof opts->rr_app_key, "%s", cfg->rr_app_key);
+        opts->rr_app_key[sizeof opts->rr_app_key - 1] = '\0';
+    }
 }
 
 static void
@@ -1396,6 +1593,7 @@ dsd_apply_user_config_to_opts_impl(const dsdneoUserConfig* cfg, dsd_opts* opts, 
     apply_mode_config(cfg, opts, state);
     apply_demod_config(cfg, opts, state);
     apply_trunking_config(cfg, opts);
+    apply_radioreference_config(cfg, opts);
     apply_trunk_scan_config(cfg, opts);
     apply_logging_config(cfg, opts);
     apply_alerts_config(cfg, opts);
@@ -1483,6 +1681,10 @@ snapshot_input_config(const dsd_opts* opts, dsdneoUserConfig* cfg) {
     if (cfg->input_source == DSDCFG_INPUT_RTL || cfg->input_source == DSDCFG_INPUT_RTLTCP) {
         cfg->rtl_auto_ppm = opts->rtl_auto_ppm ? 1 : 0;
     }
+
+    /* LOW advisories exist for every input source, so the threshold snapshots unconditionally. */
+    cfg->input_warn_db = opts->input_warn_db;
+    cfg->input_warn_db_is_set = 1;
 }
 
 static void
@@ -1508,9 +1710,33 @@ snapshot_output_config(const dsd_opts* opts, dsdneoUserConfig* cfg) {
 }
 
 static void
-snapshot_mode_config(const dsd_opts* opts, dsdneoUserConfig* cfg) {
+snapshot_mode_config(const dsd_opts* opts, const dsd_state* state, dsdneoUserConfig* cfg) {
     cfg->has_mode = 1;
-    cfg->decode_mode = dsd_infer_decode_mode_preset(opts);
+    /* Exact, not the AUTO-falling-back spelling: a decoder set no preset reproduces must render
+       no `decode` key at all. Saving it as "auto" would reload as every decoder enabled, so a
+       session that never chose a mode would come back wider than it was saved. */
+    cfg->decode_mode = dsd_infer_decode_mode_preset_exact(opts);
+    cfg->has_dmr_mono = 1;
+    cfg->dmr_mono = opts->dmr_mono ? 1 : 0;
+    cfg->dmr_lrrp_ports[0] = '\0';
+    for (int i = 0; i < opts->lrrp_extra_port_count && i < DSD_LRRP_EXTRA_PORT_MAX; i++) {
+        size_t used = strlen(cfg->dmr_lrrp_ports);
+        DSD_SNPRINTF(cfg->dmr_lrrp_ports + used, sizeof cfg->dmr_lrrp_ports - used, "%s%u", used ? "," : "",
+                     (unsigned)opts->lrrp_extra_ports[i]);
+    }
+    /* The only snapshotter that reads dsd_state. NOT unconditional, unlike
+       dmr_mono: ea_mode is TRI-state - dsd_init.c seeds it at -1 ("no EDACS
+       addressing mode chosen yet"), which edacs-fme.c, provoice.c, dsd_events.c
+       and the ncurses EDACS rows all distinguish from 0 (standard). Writing -1
+       through a truthiness test would save it as "extended addressing" and there
+       is no way back: the in-session toggle only ever produces 0 or 1. Omitting
+       the keys until the answer exists is what keeps -1 reachable, and
+       apply_mode_config() leaves ea_mode alone when they are absent.
+       esk_mask can only be non-zero once one of -fh/-fH/-fe/-fE has run, so it is
+       never stranded by the same gate. */
+    cfg->has_edacs_variant = (state->ea_mode >= 0) ? 1 : 0;
+    cfg->edacs_ea = (state->ea_mode > 0) ? 1 : 0;
+    cfg->edacs_esk = (state->esk_mask != 0) ? 1 : 0;
 }
 
 static void
@@ -1538,11 +1764,27 @@ snapshot_trunking_config(const dsd_opts* opts, dsdneoUserConfig* cfg) {
     cfg->trunk_chan_csv[sizeof cfg->trunk_chan_csv - 1] = '\0';
     DSD_SNPRINTF(cfg->trunk_group_csv, sizeof cfg->trunk_group_csv, "%s", opts->group_in_file);
     cfg->trunk_group_csv[sizeof cfg->trunk_group_csv - 1] = '\0';
+    DSD_SNPRINTF(cfg->trunk_p25_bandplan_csv, sizeof cfg->trunk_p25_bandplan_csv, "%s", opts->p25_bandplan_in_file);
+    cfg->trunk_p25_bandplan_csv[sizeof cfg->trunk_p25_bandplan_csv - 1] = '\0';
     cfg->trunk_use_allow_list = opts->trunk_use_allow_list ? 1 : 0;
     cfg->trunk_tune_group_calls = opts->trunk_tune_group_calls ? 1 : 0;
     cfg->trunk_tune_private_calls = opts->trunk_tune_private_calls ? 1 : 0;
     cfg->trunk_tune_data_calls = opts->trunk_tune_data_calls ? 1 : 0;
     cfg->trunk_tune_enc_calls = opts->trunk_tune_enc_calls ? 1 : 0;
+    cfg->trunk_scanner = opts->scanner_mode ? 1 : 0;
+    cfg->trunk_p25_prefer_candidates = opts->p25_prefer_candidates ? 1 : 0;
+    cfg->trunk_scan_voice_only = opts->scan_voice_only ? 1 : 0;
+    cfg->trunk_scan_voice_qualify_ms = opts->scan_voice_qualify_ms;
+    cfg->trunk_scan_voice_hold_ms = opts->scan_voice_hold_ms;
+}
+
+static void
+snapshot_radioreference_config(const dsd_opts* opts, dsdneoUserConfig* cfg) {
+    cfg->has_radioreference = (opts->rr_username[0] || opts->rr_app_key[0]) ? 1 : 0;
+    DSD_SNPRINTF(cfg->rr_username, sizeof cfg->rr_username, "%s", opts->rr_username);
+    cfg->rr_username[sizeof cfg->rr_username - 1] = '\0';
+    DSD_SNPRINTF(cfg->rr_app_key, sizeof cfg->rr_app_key, "%s", opts->rr_app_key);
+    cfg->rr_app_key[sizeof cfg->rr_app_key - 1] = '\0';
 }
 
 static void
@@ -1619,9 +1861,10 @@ dsd_snapshot_opts_to_user_config(const dsd_opts* opts, const dsd_state* state, d
     user_cfg_reset(cfg);
     snapshot_input_config(opts, cfg);
     snapshot_output_config(opts, cfg);
-    snapshot_mode_config(opts, cfg);
+    snapshot_mode_config(opts, state, cfg);
     snapshot_demod_config(opts, cfg);
     snapshot_trunking_config(opts, cfg);
+    snapshot_radioreference_config(opts, cfg);
     snapshot_trunk_scan_config(opts, cfg);
     snapshot_logging_config(opts, cfg);
     snapshot_alerts_config(opts, cfg);
@@ -1660,6 +1903,14 @@ render_template_type_hint(FILE* stream, const dsdcfg_schema_entry_t* e) {
                 DSD_FPRINTF(stream, "# Range: %d to %d\n", e->min_val, e->max_val);
             } else if (e->min_val != 0) {
                 DSD_FPRINTF(stream, "# Minimum: %d\n", e->min_val);
+            }
+            break;
+        case DSDCFG_TYPE_DOUBLE:
+            /* DOUBLE bounds mirror the validation guard: max_val is literal (0 is a real
+               ceiling, e.g. the 0 dBFS input_warn_db bound), so a bounded entry always
+               states its full window. */
+            if (e->min_val != 0 || e->max_val != 0) {
+                DSD_FPRINTF(stream, "# Range: %d to %d\n", e->min_val, e->max_val);
             }
             break;
         case DSDCFG_TYPE_BOOL: DSD_FPRINTF(stream, "# Values: true, false\n"); break;

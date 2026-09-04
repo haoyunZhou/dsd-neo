@@ -30,6 +30,10 @@
 #include <string.h>
 #include <time.h>
 
+/* Extra UDP ports a site can route onto the LRRP decoder with --lrrp-extra-port or the
+   mode.dmr_lrrp_ports config key; see core/lrrp_ports.h for the shared helpers. */
+#define DSD_LRRP_EXTRA_PORT_MAX 8
+
 /**
  * @brief Audio input source types.
  *
@@ -97,7 +101,6 @@ struct dsd_opts {
     int onesymbol;
     int errorbars;
     int datascope;
-    int symboltiming;
     int verbose;
     int p25enc;
     int p25lc;
@@ -172,6 +175,9 @@ struct dsd_opts {
     int rtl_dsp_bw_khz;
     int rtl_bias_tee;       /* 1 to enable RTL-SDR bias tee (if supported) */
     int soapy_bandwidth_hz; /* -1=profile/default, 0=driver automatic, >0 explicit Soapy hardware bandwidth */
+    /* Digital FSK stream resampling: 0=auto (only for non-integer SPS), 1=on, 2=off.
+       Values match enum dsd_digital_resample_mode. */
+    int digital_resample_mode;
     int rtl_started;
     /* Mark when RTL-SDR stream must be destroyed/recreated to apply changes
        that cannot be updated live (e.g., device index, bandwidth, manual gain). */
@@ -210,6 +216,7 @@ struct dsd_opts {
        Off by default; enabled via -F like other protocols. */
     uint8_t dmr_crc_relaxed_default;
     uint8_t dmr_debug_burst;
+    uint8_t dmr_debug_unsynced;
     uint8_t call_alert_events;
     int frame_ysf;
     int inverted_ysf;
@@ -251,6 +258,9 @@ struct dsd_opts {
     int trunk_scan_enabled;
     int trunk_scan_idle_dwell_ms;
     int trunk_scan_activity_hold_ms;
+    int scan_voice_only;
+    int scan_voice_qualify_ms;
+    int scan_voice_hold_ms;
     int setmod_bw;
     int slot_preference;
     int slot1_on;
@@ -268,8 +278,10 @@ struct dsd_opts {
     dsd_frontend_terminal_display_opts frontend_terminal_display;
     short int mbe_out;  //flag for mbe out, don't attempt fclose more than once
     short int mbe_outR; //flag for mbe out, don't attempt fclose more than once
+    short int dmr_mono; //select the DMR single-slot decoder and mono audio path
     short int dmr_stereo;
     short int lrrp_file_output;
+    int lrrp_extra_port_count; //number of entries used in lrrp_extra_ports
     short int dmr_mute_encL;
     short int dmr_mute_encR;
     short int aggressive_framesync;
@@ -306,6 +318,8 @@ struct dsd_opts {
     char pa_output_idx[100];
     char wav_out_dir[512];
     char rdio_api_key[256];
+    char rr_username[128]; // RadioReference account; mirrored from config, never the password
+    char rr_app_key[64];   // RadioReference application key; empty when the build bakes one in
     char mbe_in_file[1024];
     char audio_out_dev[1024];
     char mbe_out_dir[1024];
@@ -316,6 +330,7 @@ struct dsd_opts {
     char wav_out_file_raw[1024];
     char symbol_out_file[1024];
     char lrrp_out_file[1024];
+    uint16_t lrrp_extra_ports[DSD_LRRP_EXTRA_PORT_MAX]; //site-mapped UDP ports decoded as LRRP
     char event_out_file[1024];
     char frame_log_file[1024];
     char p25_sm_log_file[1024];
@@ -333,6 +348,8 @@ struct dsd_opts {
     char group_in_file[1024];
     char chan_in_file[1024];
     char trunk_scan_targets_csv[1024];
+    char p25_bandplan_in_file[1024];     // --p25-bandplan / [trunking] p25_bandplan_csv
+    char p25_bandplan_export_file[1024]; // --p25-bandplan-export: written once at clean shutdown
     char key_in_file[1024];
     char soapy_profile[32];
     char soapy_stream_format[16];
@@ -366,6 +383,34 @@ dsd_opts_has_digital_decode_mode(const dsd_opts* opts) {
     return opts->frame_p25p1 == 1 || opts->frame_p25p2 == 1 || opts->frame_provoice == 1 || opts->frame_dmr == 1
            || opts->frame_nxdn48 == 1 || opts->frame_nxdn96 == 1 || opts->frame_x2tdma == 1 || opts->frame_ysf == 1
            || opts->frame_dstar == 1 || opts->frame_dpmr == 1 || opts->frame_m17 == 1;
+}
+
+/**
+ * @brief The modulation the `mod_*` flags select: 0 C4FM, 1 QPSK, 2 GFSK.
+ *
+ * Same encoding as @c dsd_state::rf_mod and @c DSD_APP_CMD_MOD_SET's payload, so
+ * a control's request and its readback are the same number.
+ *
+ * One copy of the mapping because two readers already need it -- the reading a
+ * segmented control binds to, and the skip test that decides whether a request
+ * is a no-op -- and if those two disagree the control shows one modulation while
+ * the engine drops the tap that would resynchronise them.
+ *
+ * More than one flag set is not a modulation: `-ma` and `demod = auto` turn all
+ * three on to mean "let the hunt choose", and the demodulator starts that on
+ * C4FM. Reporting the first flag found would answer QPSK for a session running
+ * as C4FM.
+ */
+static inline int
+dsd_opts_modulation(const dsd_opts* opts) {
+    if (!opts) {
+        return 0;
+    }
+    const int selected = (opts->mod_c4fm != 0) + (opts->mod_qpsk != 0) + (opts->mod_gfsk != 0);
+    if (selected != 1) {
+        return 0;
+    }
+    return (opts->mod_qpsk != 0) ? 1 : ((opts->mod_gfsk != 0) ? 2 : 0);
 }
 
 /** @brief Return 1 when an enabled 4800-symbol four-level mode uses the 12.5 kHz channel profile. */
@@ -588,6 +633,28 @@ dsd_opts_input_upsample_factor(const dsd_opts* opts) {
         return 1;
     }
     return factor;
+}
+
+/**
+ * @brief Return 1 when a tuner sits behind this session, 0 otherwise.
+ *
+ * The question every surface that renders a tuner reading has to ask first. On a WAV,
+ * stdin, UDP, TCP or symbol-file session the centre frequency, gain, squelch and PPM are
+ * options the front end never applied, and rendering them puts plausible readings on
+ * screen for a run that has no radio; the RTL stream state is process-global and outlives
+ * its session, so the readings themselves cannot be trusted to say so. The input type is
+ * re-parsed per session and can, which is why it is the authority.
+ *
+ * One predicate rather than an open-coded comparison per call site: the moment a second
+ * RTL-family input type appears, whichever site is updated first would otherwise start
+ * disagreeing with the others about whether the same session has a tuner.
+ *
+ * @param opts Decoder options containing the configured input source.
+ * @return 1 for RTL-family input, 0 for everything else and for NULL.
+ */
+static inline int
+dsd_opts_input_is_radio(const dsd_opts* opts) {
+    return (opts != NULL && opts->audio_in_type == AUDIO_IN_RTL) ? 1 : 0;
 }
 
 /**

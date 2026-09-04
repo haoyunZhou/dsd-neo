@@ -21,6 +21,9 @@ You need three pieces:
 - `SoapySDRUtil` (device discovery/probe tool)
 - A SoapySDR module/plugin for your radio (Airspy/SDRplay/HackRF/LimeSDR/etc.)
 
+Using the prebuilt Windows release zip? The runtime library is already bundled — skip to section 0a for how to add
+driver modules.
+
 Sanity-check that the tool is installed and Soapy can see your plugins/devices:
 
 ```bash
@@ -30,6 +33,35 @@ SoapySDRUtil --find
 
 If `--find` shows no devices, you likely do not have the right module installed, or Soapy cannot find it.
 If you installed modules into a non-standard location, set `SOAPY_SDR_PLUGIN_PATH` and re-run `SoapySDRUtil --info`.
+
+## 0a) Windows release zip: installing driver modules
+
+The Windows release zip ships `SoapySDR.dll` (version 0.8.1, the core library only) in `bin\`. It does **not**
+include any radio driver modules or the `SoapySDRUtil.exe` tool, so out of the box `-i soapy` always reports
+`SoapySDR: enumerate found no devices`. To use a Soapy radio you must install a module for it yourself.
+
+**Where modules are loaded from.** `SoapySDR.dll` resolves its install root from its own location (one level above
+`bin\`), so with the zip extracted to `C:\dsd-neo` it searches:
+
+- `C:\dsd-neo\lib\SoapySDR\modules0.8\` — create this folder and drop module DLLs into it, or
+- every directory listed in the `SOAPY_SDR_PLUGIN_PATH` environment variable (semicolon-separated), or
+- `%SOAPY_SDR_ROOT%\lib\SoapySDR\modules0.8\` if you set `SOAPY_SDR_ROOT` (it overrides the DLL-relative root).
+
+**The `modules0.8` name is the module ABI version, and it must match.** DSD-neo bundles the SoapySDR 0.8.1
+*release*, whose ABI string is plain `0.8`. Module DLLs built against a different ABI are skipped at startup with
+an ABI-mismatch warning. In particular, bundles built from SoapySDR git master (for example PothosSDR installers)
+use suffixed ABIs such as `0.8-3` — modules taken from those bundles will not load against the shipped
+`SoapySDR.dll`. Use modules built against a SoapySDR 0.8.x release, or build the module yourself against the
+0.8.1 headers/library from the zip's ecosystem.
+
+**Module dependencies still apply.** A module DLL loads its own backend libraries, which must be findable next to
+the module or on `PATH` — for example SDRplay's `sdrplay_api.dll` (install the official SDRplay API/service first)
+or `airspy.dll` for Airspy.
+
+**Verifying without `SoapySDRUtil.exe`.** Watch dsd-neo's startup log: a wrong or missing module shows
+`SoapySDR: enumerate found no devices`, and ABI mismatches are logged when modules are scanned. If you want the
+full `--find`/`--probe` workflow from section 2, install a matching-ABI SoapySDR build separately and point its
+`SOAPY_SDR_PLUGIN_PATH` at the same module directory.
 
 ## 1) Build with Soapy enabled
 
@@ -89,8 +121,8 @@ Optional tuning keys (also shared with RTL/RTL-TCP):
 
 Optional Soapy-specific keys:
 
-- `soapy_profile = "auto|generic|airspy|sdrplay|hackrf|lime|pluto|rtlsdr|uhd"` selects a capability profile. `auto`
-  detects from the Soapy driver/hardware strings.
+- `soapy_profile = "auto|generic|airspy|sdrplay|hackrf|lime|pluto|rtlsdr|uhd|sddc"` selects a capability profile.
+  `auto` detects from the Soapy driver/hardware strings.
 - `soapy_stream_format = "auto|cf32|cs16"` controls RX stream format selection. `auto` prefers the device native
   format when it is `CF32` or `CS16`, then falls back to supported formats.
 - `soapy_antenna = "<name>"` selects a listed RX antenna.
@@ -102,6 +134,12 @@ Optional Soapy-specific keys:
   may be separated with commas, semicolons, or spaces.
 - `soapy_bandwidth_hz = -1|0|<Hz>` uses profile/default behavior for `-1`, driver automatic/no explicit request for
   `0`, or validates and applies an explicit hardware bandwidth in Hz.
+- `digital_resample = "auto|on|off"` controls whether the digital FSK stream is resampled to the resampler target
+  (48000 Hz by default). `auto` engages only when the device forces a sample rate that yields a non-integer
+  samples-per-symbol; `off` always keeps the raw demod rate; `on` resamples whenever it would help, that is
+  whenever the target rate differs from the demod rate and is a multiple of the symbol rate (a target that cannot
+  produce an integer samples-per-symbol is bypassed even in `on` mode). CQPSK symbol output is never resampled
+  because its timing loop already tracks a fractional SPS.
 
 `soapy_settings` is a strict passthrough to the installed Soapy driver. DSD-neo checks reported setting keys and
 option lists when the driver provides metadata, then calls Soapy `writeSetting`. Startup fails for malformed items,
@@ -136,6 +174,63 @@ rtl_volume = 2
 
 Set `rtl_freq` explicitly for predictable startup frequency. `rtl_volume` is a monitor/non-symbol gain field and does not
 scale SoapySDR or other RTL-family digital symbols.
+
+## 3a) RX-888 and other SDDC devices
+
+The RX-888 family (RX-888, RX-888 mk2, RX-999, RX-666, BBRF103) is used through the **SoapySDDC** module from
+[`ik1xpv/ExtIO_sddc`](https://github.com/ik1xpv/ExtIO_sddc). DSD-neo has no native FX3 driver: the SDDC library is
+what uploads the FX3 firmware, reads the raw ADC stream, and downconverts it on the host.
+
+Build the module (Linux needs `libfftw3-dev`), then confirm Soapy sees the radio:
+
+```bash
+SoapySDRUtil --find
+SoapySDRUtil --probe="driver=SDDC"
+```
+
+The device enumerates only when your user can claim the Cypress FX3 USB interface, so install a udev rule for it
+if `--find` comes up empty while `lsusb` shows the device.
+
+Working configuration:
+
+```ini
+[input]
+source = "soapy"
+soapy_args = "driver=SDDC"
+soapy_profile = "sddc"          # or auto; detected from the SDDC driver/RX888 hardware key
+soapy_antenna = "VHF"           # required above 32 MHz (see below)
+soapy_gains = "RF:0,IF:24"
+soapy_settings = "adc_frequency=98304000"
+soapy_bandwidth_hz = 0
+rtl_freq = "851.375M"
+rtl_bw_khz = 48
+```
+
+**Antenna.** SDDC exposes two RX ports: `HF` (direct sampling) and `VHF` (the R828D tuner). It starts on `HF`, and
+every DSD-neo protocol lives above 32 MHz, so the tuner port must be selected or the receiver hears nothing. The
+`sddc` profile selects `VHF` automatically when no `soapy_antenna` is configured and the startup frequency is above
+32 MHz, and logs the choice. An explicit `soapy_antenna` always wins.
+
+**`adc_frequency` and the sample-rate grid.** SoapySDDC derives its rate list from the ADC clock, offering
+`{2, 4, 8, 16, 32, 64} MSPS` at the stock 128 MHz clock. DSD-neo asks for 1,536,000 Hz with the default 48 kHz DSP
+bandwidth, so the driver would supply 2 MSPS instead, and no power-of-two decimation of 2 MSPS is divisible by
+4800 or 6000. Setting `adc_frequency = 98304000` moves the grid to `{1.536, 3.072, 6.144, ...} MSPS`, so the device
+delivers exactly the requested rate. `soapy_settings` is applied when the device is opened, before the rate is
+programmed, so it takes effect for the first tune.
+
+Without that setting DSD-neo still works: it re-picks decimation for the rate the device actually delivers, and
+`digital_resample = "auto"` normalizes the resulting 62,500 Hz stream to 48,000 Hz for an integer SPS. That path
+costs extra CPU, so prefer the ADC clock when your SoapySDDC build exposes `adc_frequency` (check
+`SoapySDRUtil --probe`).
+
+**Throughput.** SDDC streams raw ADC samples over USB 3.0 and downconverts them on the host, so USB and CPU load
+follow `adc_frequency` (roughly 196 MB/s at 98.304 MHz) no matter which output rate DSD-neo requests. A USB 3.0
+port and a modern multi-core CPU are required; a USB 2.0 port will not work.
+
+**Limits.** The driver reports no frequency correction, so `rtl_ppm` and auto-PPM are unavailable and DSD-neo
+disables auto-PPM with a notice at startup. It has no AGC/gain mode and no hardware bandwidth control: set the `RF`
+(attenuator) and `IF` (VGA) stages through `soapy_gains`, and leave `soapy_bandwidth_hz = 0`. The RX stream is
+CF32-only, so `--iq-capture` requires `--iq-capture-format cf32`.
 
 ## 4) Run
 
@@ -185,7 +280,8 @@ dsd-neo -fs -i soapy:driver=airspy:851.375M:22:-2:24:0:2 -T -C connect_plus_chan
   Host or USB bus is falling behind. Try reducing throughput by lowering `rtl_bw_khz` (config key; for example 48 -> 16)
   and/or overriding tuner bandwidth (env `DSD_NEO_TUNER_BW_HZ=<Hz|auto>`), then reduce system load or adjust driver settings.
 - Discovery/plugin issues:
-  Confirm `SOAPY_SDR_PLUGIN_PATH` includes the module directory for your Soapy drivers.
+  Confirm `SOAPY_SDR_PLUGIN_PATH` includes the module directory for your Soapy drivers. On Windows release-zip
+  installs no modules ship at all — see section 0a for where to put them and the ABI-match requirement.
 
 Manual driver-setting check:
 

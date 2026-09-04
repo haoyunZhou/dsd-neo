@@ -12,6 +12,7 @@
  * driven DSP toggles, and rate-dependent helpers.
  */
 
+#include <atomic>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/parse.h>
 #include <dsd-neo/dsp/demod_pipeline.h>
@@ -33,6 +34,7 @@
 #include "dsd-neo/dsp/costas.h"
 #include "dsd-neo/dsp/fsk_modem.h"
 #include "dsd-neo/platform/threading.h"
+#include "rtl_stream_mirrors.hpp"
 
 /* Allow disabling the fs/4 capture frequency shift via env for trunking/exact-center use cases. */
 int disable_fs4_shift = 0; /* Set by env DSD_NEO_DISABLE_FS4_SHIFT=1 */
@@ -280,6 +282,7 @@ demod_init_common_defaults(struct demod_state* s, int rtl_dsp_bw_hz, struct outp
         s->channel_lpf_hist_q[k] = 0;
     }
     s->channel_pwr = 0.0f;
+    g_channel_pwr.store(0.0f, std::memory_order_relaxed);
     s->channel_squelch_level = 0.0f;
     s->channel_squelched = 0;
     s->audio_lpf_enable = 0;
@@ -289,6 +292,8 @@ demod_init_common_defaults(struct demod_state* s, int rtl_dsp_bw_hz, struct outp
     s->dc_block = 1;
     s->dc_avg = 0.0f;
     s->resamp_enabled = 0;
+    s->digital_resample_mode = DSD_DIGITAL_RESAMPLE_AUTO;
+    s->capture_rate_device_forced = 0;
     s->resamp_target_hz = 0;
     s->resamp_L = 1;
     s->resamp_M = 1;
@@ -570,6 +575,7 @@ rtl_demod_config_from_env_and_opts(struct demod_state* demod, const dsd_opts* op
 
     demod_apply_runtime_global_flags(opts, cfg);
     demod_apply_resampler_target_defaults(demod, cfg);
+    demod->digital_resample_mode = opts->digital_resample_mode;
     demod_apply_costas_defaults(demod, cfg);
     demod_apply_ted_defaults(demod, cfg);
     demod_apply_cqpsk_defaults(demod, opts, cfg);
@@ -658,10 +664,48 @@ rtl_demod_disable_resampler(struct demod_state* demod, int reset_ratio) {
     demod->resamp_hist_head = 0;
 }
 
+int
+rtl_demod_digital_resample_target_hz(const struct demod_state* demod) {
+    /* Only the FSK discriminator stream is at sample rate. CQPSK output is already one value
+       per symbol from the Gardner loop, which absorbs a fractional SPS on its own. */
+    if (!demod || demod->output_kind != DSD_DEMOD_OUTPUT_FSK_DISCRIMINATOR) {
+        return 0;
+    }
+    if (demod->digital_resample_mode == DSD_DIGITAL_RESAMPLE_OFF) {
+        return 0;
+    }
+    const int target = demod->resamp_target_hz;
+    const int sym_rate = demod->symbol_rate_hz > 0 ? demod->symbol_rate_hz : 4800;
+    const int in_rate = demod->rate_out;
+    if (target <= 0 || in_rate <= 0 || target == in_rate) {
+        return 0;
+    }
+    if ((target % sym_rate) != 0) {
+        /* Resampling here would not buy an integer SPS. */
+        return 0;
+    }
+    if (demod->digital_resample_mode == DSD_DIGITAL_RESAMPLE_AUTO) {
+        if ((in_rate % sym_rate) == 0) {
+            return 0;
+        }
+        if (!demod->capture_rate_device_forced) {
+            /* The rate follows the requested DSP bandwidth, so leave the existing chain alone
+               and let the non-integer SPS warning point the user at a better bandwidth. */
+            return 0;
+        }
+    }
+    return target;
+}
+
 static int
 rtl_demod_should_skip_resampler(const struct demod_state* demod) {
-    return (demod->output_kind == DSD_DEMOD_OUTPUT_FSK_DISCRIMINATOR
-            || demod->output_kind == DSD_DEMOD_OUTPUT_SYMBOL_CQPSK);
+    if (demod->output_kind == DSD_DEMOD_OUTPUT_SYMBOL_CQPSK) {
+        return 1;
+    }
+    if (demod->output_kind == DSD_DEMOD_OUTPUT_FSK_DISCRIMINATOR) {
+        return rtl_demod_digital_resample_target_hz(demod) <= 0;
+    }
+    return 0;
 }
 
 static void
@@ -783,55 +827,64 @@ rtl_demod_maybe_update_resampler_after_rate_change(struct demod_state* demod, st
 }
 
 /**
- * @brief Refresh CQPSK timing SPS after capture/output rate changes.
+ * @brief Refresh timing SPS after capture/output rate changes.
  *
- * Recompute the nominal samples-per-symbol from the current output rate and
- * mode unless an explicit CQPSK timing SPS override is active.
+ * Recompute the nominal samples-per-symbol for the current output rate unless an explicit timing
+ * SPS override is active. The symbol rate and level count come either from the profile the front
+ * end is already on or from the decoder options, per @p preserve_active_profile.
  *
- * @param demod  Demodulator state.
- * @param opts   Decoder options (mode flags).
- * @param output Output ring (for sink rate).
+ * @param demod                   Demodulator state.
+ * @param opts                    Decoder options (mode flags); may be NULL.
+ * @param output                  Output ring (for sink rate).
+ * @param preserve_active_profile Non-zero keeps the active symbol rate and level count (retunes);
+ *                                zero derives them from @p opts (stream open).
  */
 void
 rtl_demod_maybe_refresh_ted_sps_after_rate_change(struct demod_state* demod, const dsd_opts* opts,
-                                                  const struct output_state* output) {
+                                                  const struct output_state* output, int preserve_active_profile) {
     if (!demod || !output) {
         return;
     }
 
     int Fs_cx = rtl_demod_resolve_complex_rate(demod, output);
-    int sps = 0;
-    int sym_rate = demod->symbol_rate_hz > 0 ? demod->symbol_rate_hz : 4800;
-    if (opts) {
+    int sym_rate;
+    int sym_levels;
+    if (preserve_active_profile) {
+        /* Retunes keep whatever the SPS hunt, the trunking engine, or the operator last published
+         * through rtl_stream_set_symbol_profile(); only the timing SPS follows the new rate. The
+         * option flags cannot answer this: with more than one rate class enabled they always say
+         * 4800/4, which would drag a run parked on 2400/4 (NXDN48, dPMR) or 9600/2 (ProVoice) off
+         * its profile on every hop. Fall back to the option-derived default only when no profile
+         * has been established yet. */
+        sym_rate = demod->symbol_rate_hz > 0 ? demod->symbol_rate_hz : opts_symbol_rate_hz(opts);
+        sym_levels = (demod->symbol_levels == 2 || demod->symbol_levels == 4)
+                         ? demod->symbol_levels
+                         : opts_symbol_levels_for_rate(opts, sym_rate);
+    } else {
         /* When only P25P2/X2-TDMA is enabled (without P25P1), use 6000 sym/s.
          * When mod_qpsk is set for P25P1 CQPSK/LSM, use 4800 sym/s.
          * When both P25P1 and P25P2 are enabled (trunking mode), default to
          * P25P1 rate (4800) since CC is typically encountered first; the trunk
          * state machine will override via ted_sps_override when tuning to P25P2 VC. */
         sym_rate = opts_symbol_rate_hz(opts);
-        if (opts->mod_qpsk == 1 && sym_rate != 6000) {
+        if (opts && opts->mod_qpsk == 1 && sym_rate != 6000) {
             sym_rate = 4800;
         }
-        if (Fs_cx < (sym_rate * 2)) {
-            LOG_WARN("WARNING: CQPSK timing SPS: demod rate %d Hz is low for ~%d sym/s; clamping to minimum SPS.\n",
-                     Fs_cx, sym_rate);
-        }
-        sps = (Fs_cx + (sym_rate / 2)) / sym_rate;
-        if ((Fs_cx % sym_rate) == 0) {
-            demod->sps_is_integer = 1;
-        } else {
-            demod->sps_is_integer = 0;
-            rtl_demod_log_non_integer_after_rate_change(demod, Fs_cx, sym_rate);
-        }
+        sym_levels = opts_symbol_levels_for_rate(opts, sym_rate);
+    }
+    if (Fs_cx < (sym_rate * 2)) {
+        LOG_WARN("WARNING: CQPSK timing SPS: demod rate %d Hz is low for ~%d sym/s; clamping to minimum SPS.\n", Fs_cx,
+                 sym_rate);
+    }
+    int sps = (Fs_cx + (sym_rate / 2)) / sym_rate;
+    if ((Fs_cx % sym_rate) == 0) {
+        demod->sps_is_integer = 1;
     } else {
-        sps = (Fs_cx + 2400) / 4800;
-        demod->sps_is_integer = ((Fs_cx % 4800) == 0) ? 1 : 0;
-        if (!demod->sps_is_integer) {
-            rtl_demod_log_non_integer_after_rate_change(demod, Fs_cx, 4800);
-        }
+        demod->sps_is_integer = 0;
+        rtl_demod_log_non_integer_after_rate_change(demod, Fs_cx, sym_rate);
     }
     demod->symbol_rate_hz = sym_rate;
-    demod->symbol_levels = opts_symbol_levels_for_rate(opts, sym_rate);
+    demod->symbol_levels = sym_levels;
     sps = rtl_demod_clamp_sps(sps);
     if (demod->ted_sps_override > 0) {
         demod->ted_sps = demod->ted_sps_override;

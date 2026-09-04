@@ -5,15 +5,21 @@
 
 /* Frontend → decoder app-command queue (bounded). */
 
+#include <dsd-neo/app_control/call_view.h>
 #include <dsd-neo/app_control/commands.h>
 #include <dsd-neo/app_control/history.h>
+#include <dsd-neo/app_control/rr_import_apply.h>
 #include <dsd-neo/core/audio.h>
+#include <dsd-neo/core/call_state.h>
 #include <dsd-neo/core/constants.h>
+#include <dsd-neo/core/csv_validate.h>
 #include <dsd-neo/core/dsd_time.h>
+#include <dsd-neo/core/enc_lockout.h>
 #include <dsd-neo/core/events.h>
 #include <dsd-neo/core/file_io.h>
 #include <dsd-neo/core/frontend_types.h>
 #include <dsd-neo/core/opts.h>
+#include <dsd-neo/core/power.h>
 #include <dsd-neo/core/state.h>
 #include <dsd-neo/core/synctype_ids.h>
 #include <dsd-neo/core/talkgroup_policy.h>
@@ -31,14 +37,16 @@
 #include <dsd-neo/platform/threading.h>
 #include <dsd-neo/protocol/dmr/dmr.h>
 #include <dsd-neo/protocol/p25/p25_cc_candidates.h>
-#include <dsd-neo/protocol/p25/p25_trunk_sm.h>
 #include <dsd-neo/runtime/config.h>
 #include <dsd-neo/runtime/decode_mode.h>
 #include <dsd-neo/runtime/exitflag.h>
 #include <dsd-neo/runtime/freq_parse.h>
 #include <dsd-neo/runtime/log.h>
 #include <dsd-neo/runtime/telemetry.h>
+#include <dsd-neo/runtime/trunk_cc_candidates.h>
+#include <dsd-neo/runtime/trunk_scan_hooks.h>
 #include <dsd-neo/runtime/trunk_tuning_hooks.h>
+#include <limits.h>
 #include <sndfile.h>
 #include <stdarg.h>
 #include <stddef.h>
@@ -50,6 +58,7 @@
 #include "command_dispatch.h"
 #include "commands_internal.h"
 #include "dsd-neo/core/dibit.h"
+#include "dsd-neo/core/key_set.h"
 #include "dsd-neo/core/opts_fwd.h"
 #include "dsd-neo/core/safe_api.h"
 #include "dsd-neo/core/state_fwd.h"
@@ -58,13 +67,12 @@
 #include "dsd-neo/runtime/call_alert.h"
 #include "services.h"
 
-#ifdef USE_RADIO
-#endif
-
 #define DSD_APP_CMD_Q_CAP 128
 
 _Static_assert(sizeof(dsdneoUserConfig) <= sizeof(((struct dsd_app_command*)0)->data),
                "dsd_app_command payload too small for dsdneoUserConfig");
+_Static_assert(sizeof(dsd_app_rr_apply_payload) <= sizeof(((struct dsd_app_command*)0)->data),
+               "dsd_app_command payload too small for dsd_app_rr_apply_payload");
 
 enum {
     UI_CMD_APPLY_UNHANDLED = 0,
@@ -83,11 +91,22 @@ static atomic_int g_mu_init = 0;
 static atomic_int g_overflow = 0;
 static atomic_int g_overflow_warn_gate = 0;
 
+/* 0 = uninitialized, 1 = initialization in flight, 2 = ready. The loser of the
+ * first-call race must wait: taking a mutex another thread has not finished
+ * initializing is undefined behavior. */
 static void
 ensure_mu_init(void) {
+    if (atomic_load(&g_mu_init) == 2) {
+        return;
+    }
     int expected = 0;
     if (atomic_compare_exchange_strong(&g_mu_init, &expected, 1)) {
-        dsd_mutex_init(&g_mu);
+        (void)dsd_mutex_init(&g_mu);
+        atomic_store(&g_mu_init, 2);
+        return;
+    }
+    while (atomic_load(&g_mu_init) != 2) {
+        dsd_thread_yield();
     }
 }
 
@@ -124,25 +143,46 @@ static const int k_ui_cmd_string_ids[] = {
     DSD_APP_CMD_IMPORT_GROUP_LIST, DSD_APP_CMD_IMPORT_KEYS_DEC,      DSD_APP_CMD_IMPORT_KEYS_HEX,
     DSD_APP_CMD_KEY_TYT_AP_SET,    DSD_APP_CMD_KEY_RETEVIS_RC2_SET,  DSD_APP_CMD_KEY_TYT_EP_SET,
     DSD_APP_CMD_KEY_KEN_SCR_SET,   DSD_APP_CMD_KEY_ANYTONE_BP_SET,   DSD_APP_CMD_KEY_XOR_SET,
-    DSD_APP_CMD_M17_USER_DATA_SET,
+    DSD_APP_CMD_M17_USER_DATA_SET, DSD_APP_CMD_IMPORT_P25_BANDPLAN,  DSD_APP_CMD_EXPORT_P25_BANDPLAN,
+};
+
+/* Setters where only the newest value matters, so a queued one may be overwritten
+   in place rather than walked through. A list rather than a switch for the same
+   reason k_ui_cmd_string_ids above is one: each entry costs a branch in a switch,
+   and this set only grows.
+
+   The last four are discrete choices rather than swept values, and are here on a
+   narrower argument: a segmented control taken twice in a second should land on
+   the second answer without the decoder rebuilding timing for the first one on
+   the way. */
+static const int k_ui_cmd_coalescible_setter_ids[] = {
+    DSD_APP_CMD_GAIN_SET,
+    DSD_APP_CMD_AGAIN_SET,
+    DSD_APP_CMD_INPUT_VOL_SET,
+    DSD_APP_CMD_RTL_SET_FREQ,
+    DSD_APP_CMD_MANUAL_TUNE,
+    DSD_APP_CMD_RTL_SET_GAIN,
+    DSD_APP_CMD_RTL_SET_PPM,
+    DSD_APP_CMD_RTL_SET_BW,
+    DSD_APP_CMD_RTL_SET_SQL_DB,
+    DSD_APP_CMD_RTL_SET_VOL_MULT,
+    DSD_APP_CMD_HANGTIME_SET,
+    DSD_APP_CMD_MOD_SET,
+    DSD_APP_CMD_DECODE_MODE_SET,
+    DSD_APP_CMD_TRUNK_SET,
+    DSD_APP_CMD_SLOT_PREF_SET,
+    DSD_APP_CMD_SCAN_VOICE_QUALIFY_MS_SET,
+    DSD_APP_CMD_SCAN_VOICE_HOLD_MS_SET,
 };
 
 static int
 ui_cmd_is_coalescible_setter(int cmd_id) {
-    switch (cmd_id) {
-        case DSD_APP_CMD_GAIN_SET:
-        case DSD_APP_CMD_AGAIN_SET:
-        case DSD_APP_CMD_INPUT_VOL_SET:
-        case DSD_APP_CMD_RTL_SET_FREQ:
-        case DSD_APP_CMD_RTL_SET_GAIN:
-        case DSD_APP_CMD_RTL_SET_PPM:
-        case DSD_APP_CMD_RTL_SET_BW:
-        case DSD_APP_CMD_RTL_SET_SQL_DB:
-        case DSD_APP_CMD_RTL_SET_VOL_MULT:
-        case DSD_APP_CMD_HANGTIME_SET:
-        case DSD_APP_CMD_SLOT_PREF_SET: return 1;
-        default: return 0;
+    for (size_t i = 0; i < sizeof k_ui_cmd_coalescible_setter_ids / sizeof k_ui_cmd_coalescible_setter_ids[0]; i++) {
+        if (k_ui_cmd_coalescible_setter_ids[i] == cmd_id) {
+            return 1;
+        }
     }
+    return 0;
 }
 
 static int
@@ -322,6 +362,10 @@ ui_cmd_reset_key_mute_state(dsd_opts* opts, dsd_state* state) {
     state->keyloader = 0;
     state->payload_keyid = state->payload_keyidR = 0;
     opts->dmr_mute_encL = opts->dmr_mute_encR = 0;
+    // Every direct key mutation funnels through here: invalidate the
+    // encrypted-target lockout ledger so each locked target re-verifies once
+    // against the new key material.
+    dsd_enc_lockout_bump_key_epoch(state);
 }
 
 static int
@@ -355,7 +399,6 @@ apply_cmd_key_management_basic(dsd_opts* opts, dsd_state* state, const struct ds
                 state->R = v;
                 state->RR = v;
                 ui_cmd_reset_key_mute_state(opts, state);
-                p25_sm_clear_encrypted_call_cache(state);
             }
             return 1;
         }
@@ -426,7 +469,6 @@ apply_cmd_key_aes_set(dsd_opts* opts, dsd_state* state, const struct dsd_app_com
     state->K4 = 0ULL;
     state->hytera_key_segments = 0U;
     ui_cmd_reset_key_mute_state(opts, state);
-    p25_sm_clear_encrypted_call_cache(state);
     return 1;
 }
 
@@ -480,6 +522,7 @@ apply_cmd_key_management_stream_keys(const dsd_opts* opts, dsd_state* state, con
             char s[256];
             if (ui_cmd_copy_payload_string(c, s, entries[i].payload_cap)) {
                 entries[i].fn(state, s, opts->show_keys);
+                dsd_enc_lockout_bump_key_epoch(state);
             }
             return 1;
         }
@@ -525,7 +568,9 @@ apply_dsp_op_cqpsk_toggle(const dsd_app_dsp_payload* p) {
     }
     int cq = 0;
     rtl_stream_get_cqpsk_status(&cq, NULL);
-    rtl_stream_toggle_cqpsk(cq ? 0 : 1);
+    /* Queue the family flip for the demod thread; leave the symbol profile
+     * (rate<=0) and timing (ted_sps<0) untouched. */
+    (void)rtl_stream_request_demod_profile(cq ? 0 : 1, 0, 0, -1, -1, 0);
     return 1;
 }
 
@@ -989,6 +1034,69 @@ ui_cmd_handle_rtl_set_freq(dsd_opts* opts, dsd_state* state, const struct dsd_ap
     return result;
 }
 
+/* Defined further down with the manual-tuning helpers; tap-to-tune needs the
+ * same call-state teardown the manual return-to-CC path uses. */
+static void reset_call_tracking(dsd_opts* opts, dsd_state* state, int clear_trunk_vc);
+
+/*
+ * Live retune from a spectrum tap.
+ *
+ * Kept separate from ui_cmd_handle_rtl_set_freq() on purpose. That one is the
+ * settings-menu tune and documents a no-bookkeeping contract; here the tune is
+ * a navigation gesture, so it (a) evaluates the tuner-ownership gate at drain
+ * time on the authoritative live opts rather than trusting the frontend's
+ * affordance, and (b) drops the stale auto-modulation votes and per-slot call
+ * state that would otherwise slow or corrupt re-acquisition in decode mode
+ * "auto".
+ */
+static int
+ui_cmd_handle_manual_tune(dsd_opts* opts, dsd_state* state, const struct dsd_app_command* c) {
+    uint32_t v = 0;
+    int result = UI_CMD_APPLY_COMPLETED;
+    if (!state || !ui_cmd_parse_u32_payload(c, &v)) {
+        return result;
+    }
+    /* Either automatic controller owns the tuner. Trunking parks on a control
+     * channel; conventional scanner mode steps the channel map on its own once
+     * trunk_hangtime expires (no_carrier_step_scanner_mode_if_needed()), so a
+     * tap accepted under it would be silently undone seconds later — worse than
+     * a refusal, because the toast would have claimed it worked. */
+    if (opts->trunk_enable) {
+        ui_set_toast(state, 3, "Trunking active: tap-to-tune disabled");
+        return result;
+    }
+    if (opts->scanner_mode) {
+        ui_set_toast(state, 3, "Scanner active: tap-to-tune disabled");
+        return result;
+    }
+    /* The third owner, and the one a release cannot clear (see apply_tuner_release):
+     * dsd_trunk_scan_hook_tick() runs on every engine iteration and steps targets on
+     * its own, so a tap accepted under it is undone within a dwell -- and it is the
+     * owner engine_trunk_tuning_owner_active() actually gates dispatch on. */
+    if (opts->trunk_scan_enabled) {
+        ui_set_toast(state, 3, "Trunk scan active: tap-to-tune disabled");
+        return result;
+    }
+    int rc = svc_rtl_set_freq(opts, state, v);
+    result = ui_cmd_apply_status_from_tune_rc(rc);
+    if (rc == 0 || rc == RTL_STREAM_TUNE_TIMEOUT) {
+        /* Only after the tune is accepted, matching how trunk_tuning.c and the
+         * manual return-to-CC path order this — never on the failure path. */
+        dsd_frame_sync_reset_mod_state();
+        reset_call_tracking(opts, state, 1);
+        if (rc == 0) {
+            ui_set_toast(state, 3, "Applied: tuned -> %u Hz", v);
+        } else {
+            ui_set_toast(state, 3, "Accepted: tuned -> %u Hz (pending)", v);
+        }
+    } else if (ui_rc_is_not_supported(rc)) {
+        ui_set_toast(state, 3, "Unsupported: frequency control not available on active backend");
+    } else {
+        ui_set_toast(state, 4, "Failed: tune -> %u Hz", v);
+    }
+    return result;
+}
+
 static int
 ui_cmd_handle_rtl_set_gain(dsd_opts* opts, dsd_state* state, const struct dsd_app_command* c) {
     int32_t v = 0;
@@ -1029,6 +1137,7 @@ static int
 apply_cmd_io_and_import_rtl_b(dsd_opts* opts, dsd_state* state, const struct dsd_app_command* c) {
     static const struct dsd_app_command_handler_entry k_handlers[] = {
         {DSD_APP_CMD_RTL_SET_FREQ, ui_cmd_handle_rtl_set_freq},
+        {DSD_APP_CMD_MANUAL_TUNE, ui_cmd_handle_manual_tune},
         {DSD_APP_CMD_RTL_SET_GAIN, ui_cmd_handle_rtl_set_gain},
         {DSD_APP_CMD_RTL_SET_PPM, ui_cmd_handle_rtl_set_ppm},
     };
@@ -1064,7 +1173,12 @@ ui_cmd_handle_rtl_set_sql_db(dsd_opts* opts, dsd_state* state, const struct dsd_
         int rc = svc_rtl_set_sql_db(opts, d);
         result = ui_cmd_apply_status_from_service_rc(rc);
         if (rc == 0) {
-            ui_set_toast(state, 3, "Applied: RTL squelch -> %.1f dB", d);
+            /* Report the threshold that was stored rather than the number that was
+             * asked for: a request of 0 dB switches the squelch off, and echoing
+             * "0.0 dB" would describe a gate at full scale instead. */
+            char sql[24];
+            (void)dsd_squelch_format(opts->rtl_squelch_level, " dB", sql, sizeof sql);
+            ui_set_toast(state, 3, "Applied: RTL squelch -> %s", sql);
         } else if (ui_rc_is_not_supported(rc)) {
             ui_set_toast(state, 3, "Unsupported: squelch control not available on active backend");
         } else {
@@ -1226,6 +1340,36 @@ ui_cmd_handle_slots_onoff_set(dsd_opts* opts, dsd_state* state, const struct dsd
 }
 
 static int
+ui_cmd_handle_scan_voice_only_set(dsd_opts* opts, dsd_state* state, const struct dsd_app_command* c) {
+    int32_t on = 0;
+    if (state && ui_cmd_parse_i32_payload(c, &on)) {
+        svc_set_scan_voice_only(opts, on);
+        ui_set_toast(state, 3, "Applied: Voice-only scan -> %s", opts->scan_voice_only ? "On" : "Off");
+    }
+    return 1;
+}
+
+static int
+ui_cmd_handle_scan_voice_qualify_ms_set(dsd_opts* opts, dsd_state* state, const struct dsd_app_command* c) {
+    int32_t ms = 0;
+    if (state && ui_cmd_parse_i32_payload(c, &ms)) {
+        svc_set_scan_voice_qualify_ms(opts, ms);
+        ui_set_toast(state, 3, "Applied: Voice qualify -> %d ms", opts->scan_voice_qualify_ms);
+    }
+    return 1;
+}
+
+static int
+ui_cmd_handle_scan_voice_hold_ms_set(dsd_opts* opts, dsd_state* state, const struct dsd_app_command* c) {
+    int32_t ms = 0;
+    if (state && ui_cmd_parse_i32_payload(c, &ms)) {
+        svc_set_scan_voice_hold_ms(opts, ms);
+        ui_set_toast(state, 3, "Applied: Voice hold -> %d ms", opts->scan_voice_hold_ms);
+    }
+    return 1;
+}
+
+static int
 apply_cmd_io_and_import_runtime_a(dsd_opts* opts, dsd_state* state, const struct dsd_app_command* c) {
     static const struct dsd_app_command_handler_entry k_handlers[] = {
         {DSD_APP_CMD_RIGCTL_SET_MOD_BW, ui_cmd_handle_rigctl_set_mod_bw},
@@ -1233,6 +1377,9 @@ apply_cmd_io_and_import_runtime_a(dsd_opts* opts, dsd_state* state, const struct
         {DSD_APP_CMD_HANGTIME_SET, ui_cmd_handle_hangtime_set},
         {DSD_APP_CMD_SLOT_PREF_SET, ui_cmd_handle_slot_pref_set},
         {DSD_APP_CMD_SLOTS_ONOFF_SET, ui_cmd_handle_slots_onoff_set},
+        {DSD_APP_CMD_SCAN_VOICE_ONLY_SET, ui_cmd_handle_scan_voice_only_set},
+        {DSD_APP_CMD_SCAN_VOICE_QUALIFY_MS_SET, ui_cmd_handle_scan_voice_qualify_ms_set},
+        {DSD_APP_CMD_SCAN_VOICE_HOLD_MS_SET, ui_cmd_handle_scan_voice_hold_ms_set},
     };
     if (!opts || !c) {
         return 0;
@@ -1400,6 +1547,43 @@ ui_cmd_handle_import_channel_map(dsd_opts* opts, dsd_state* state, const struct 
 }
 
 static int
+ui_cmd_handle_import_p25_bandplan(dsd_opts* opts, dsd_state* state, const struct dsd_app_command* c) {
+    int result = UI_CMD_APPLY_COMPLETED;
+    if (state && c->n > 0) {
+        char path[1024] = {0};
+        if (ui_cmd_copy_payload_string(c, path, sizeof path)) {
+            int rc = svc_import_p25_bandplan(opts, state, path);
+            result = ui_cmd_apply_status_from_service_rc(rc);
+            if (rc == 0) {
+                ui_set_toast(state, 3, "Applied: P25 band plan imported -> %s", path);
+            } else {
+                ui_set_toast(state, 4, "Failed: P25 band plan import -> %s", path);
+            }
+        }
+    }
+    return result;
+}
+
+static int
+// cppcheck-suppress constParameterCallback -- signature is fixed by the command handler table.
+ui_cmd_handle_export_p25_bandplan(dsd_opts* opts, dsd_state* state, const struct dsd_app_command* c) {
+    int result = UI_CMD_APPLY_COMPLETED;
+    if (state && c->n > 0) {
+        char path[1024] = {0};
+        if (ui_cmd_copy_payload_string(c, path, sizeof path)) {
+            int rows = svc_export_p25_bandplan(opts, state, path);
+            result = ui_cmd_apply_status_from_service_rc(rows > 0 ? 0 : -1);
+            if (rows > 0) {
+                ui_set_toast(state, 3, "Applied: %d P25 band plan row(s) exported -> %s", rows, path);
+            } else {
+                ui_set_toast(state, 4, "Failed: P25 band plan export -> %s", path);
+            }
+        }
+    }
+    return result;
+}
+
+static int
 ui_cmd_handle_import_group_list(dsd_opts* opts, dsd_state* state, const struct dsd_app_command* c) {
     int result = UI_CMD_APPLY_COMPLETED;
     if (state && c->n > 0) {
@@ -1423,10 +1607,14 @@ ui_cmd_handle_import_keys_dec(dsd_opts* opts, dsd_state* state, const struct dsd
     if (state && c->n > 0) {
         char path[1024] = {0};
         if (ui_cmd_copy_payload_string(c, path, sizeof path)) {
+            // A parked keyed row holds the foreground keyring: edit the globals
+            // underneath it so the import survives the next hop.
+            dsd_scan_keys_suspend(state);
             int rc = svc_import_keys_dec(opts, state, path);
+            dsd_scan_keys_resume(state);
             result = ui_cmd_apply_status_from_service_rc(rc);
             if (rc == 0) {
-                p25_sm_clear_encrypted_call_cache(state);
+                dsd_enc_lockout_bump_key_epoch(state);
                 ui_set_toast(state, 3, "Applied: Keys (DEC) imported -> %s", path);
             } else {
                 ui_set_toast(state, 4, "Failed: Keys (DEC) import -> %s", path);
@@ -1442,10 +1630,12 @@ ui_cmd_handle_import_keys_hex(dsd_opts* opts, dsd_state* state, const struct dsd
     if (state && c->n > 0) {
         char path[1024] = {0};
         if (ui_cmd_copy_payload_string(c, path, sizeof path)) {
+            dsd_scan_keys_suspend(state);
             int rc = svc_import_keys_hex(opts, state, path);
+            dsd_scan_keys_resume(state);
             result = ui_cmd_apply_status_from_service_rc(rc);
             if (rc == 0) {
-                p25_sm_clear_encrypted_call_cache(state);
+                dsd_enc_lockout_bump_key_epoch(state);
                 ui_set_toast(state, 3, "Applied: Keys (HEX) imported -> %s", path);
             } else {
                 ui_set_toast(state, 4, "Failed: Keys (HEX) import -> %s", path);
@@ -1456,12 +1646,68 @@ ui_cmd_handle_import_keys_hex(dsd_opts* opts, dsd_state* state, const struct dsd
 }
 
 static int
+ui_cmd_handle_import_channel_map_clear(dsd_opts* opts, dsd_state* state, const struct dsd_app_command* c) {
+    (void)c;
+    if (!state) {
+        return UI_CMD_APPLY_COMPLETED;
+    }
+    const int rc = svc_clear_channel_map(opts, state);
+    if (rc == 0) {
+        ui_set_toast(state, 3, "Applied: Channel map cleared");
+    } else {
+        ui_set_toast(state, 4, "Failed: Channel map clear");
+    }
+    return ui_cmd_apply_status_from_service_rc(rc);
+}
+
+static int
+ui_cmd_handle_import_group_list_clear(dsd_opts* opts, dsd_state* state, const struct dsd_app_command* c) {
+    (void)c;
+    if (!state) {
+        return UI_CMD_APPLY_COMPLETED;
+    }
+    const int rc = svc_clear_group_list(opts, state);
+    if (rc == 0) {
+        ui_set_toast(state, 3, "Applied: Group list cleared");
+    } else {
+        ui_set_toast(state, 4, "Failed: Group list clear");
+    }
+    return ui_cmd_apply_status_from_service_rc(rc);
+}
+
+static int
+ui_cmd_handle_import_keys_clear(dsd_opts* opts, dsd_state* state, const struct dsd_app_command* c) {
+    (void)c;
+    if (!state) {
+        return UI_CMD_APPLY_COMPLETED;
+    }
+    dsd_scan_keys_suspend(state);
+    const int rc = svc_clear_keys(opts, state);
+    dsd_scan_keys_resume(state);
+    if (rc == 0) {
+        // The lockout ledger is keyed on the key epoch, so targets skipped for
+        // want of a key have to be reconsidered against the empty keyring the
+        // same way they are against a newly imported one.
+        dsd_enc_lockout_bump_key_epoch(state);
+        ui_set_toast(state, 3, "Applied: Keys cleared");
+    } else {
+        ui_set_toast(state, 4, "Failed: Keys clear");
+    }
+    return ui_cmd_apply_status_from_service_rc(rc);
+}
+
+static int
 apply_cmd_io_and_import_imports(dsd_opts* opts, dsd_state* state, const struct dsd_app_command* c) {
     static const struct dsd_app_command_handler_entry k_handlers[] = {
         {DSD_APP_CMD_IMPORT_CHANNEL_MAP, ui_cmd_handle_import_channel_map},
         {DSD_APP_CMD_IMPORT_GROUP_LIST, ui_cmd_handle_import_group_list},
         {DSD_APP_CMD_IMPORT_KEYS_DEC, ui_cmd_handle_import_keys_dec},
         {DSD_APP_CMD_IMPORT_KEYS_HEX, ui_cmd_handle_import_keys_hex},
+        {DSD_APP_CMD_IMPORT_CHANNEL_MAP_CLEAR, ui_cmd_handle_import_channel_map_clear},
+        {DSD_APP_CMD_IMPORT_GROUP_LIST_CLEAR, ui_cmd_handle_import_group_list_clear},
+        {DSD_APP_CMD_IMPORT_KEYS_CLEAR, ui_cmd_handle_import_keys_clear},
+        {DSD_APP_CMD_IMPORT_P25_BANDPLAN, ui_cmd_handle_import_p25_bandplan},
+        {DSD_APP_CMD_EXPORT_P25_BANDPLAN, ui_cmd_handle_export_p25_bandplan},
     };
     if (!opts || !c) {
         return 0;
@@ -1538,19 +1784,25 @@ apply_cmd_dsp(const struct dsd_app_command* c) {
 }
 #endif
 
+/* Through the shared chain rather than a fourth copy of the same ternary: the retune and
+   tune commands here have to name the control channel the status surfaces name. */
 static long
 current_cc_freq(const dsd_state* state) {
-    return (state->trunk_cc_freq != 0) ? state->trunk_cc_freq : state->p25_cc_freq;
+    return dsd_app_cc_freq(state);
 }
 
 static void
 reset_call_tracking(dsd_opts* opts, dsd_state* state, int clear_trunk_vc) {
+    const double ended_m = dsd_time_now_monotonic_s();
+    for (int slot = 0; slot < DSD_CALL_STATE_SLOT_COUNT; slot++) {
+        if (dsd_call_state_end(state, (uint8_t)slot, ended_m) > 0) {
+            dsd_event_sync_slot(opts, state, (uint8_t)slot);
+        }
+    }
     DSD_MEMSET(state->nxdn_sacch_frame_segment, 1, sizeof(state->nxdn_sacch_frame_segment));
     DSD_MEMSET(state->nxdn_sacch_frame_segcrc, 1, sizeof(state->nxdn_sacch_frame_segcrc));
-    DSD_MEMSET(state->active_channel, 0, sizeof(state->active_channel));
+    (void)dsd_recent_activity_clear_all(state);
     dmr_reset_blocks(opts, state);
-    state->lasttg = state->lasttgR = 0;
-    state->lastsrc = state->lastsrcR = 0;
     state->payload_algid = state->payload_algidR = 0;
     state->payload_keyid = state->payload_keyidR = 0;
     state->payload_mi = state->payload_miR = state->payload_miP = state->payload_miN = 0;
@@ -1709,13 +1961,9 @@ try_manual_candidate_cycle(dsd_opts* opts, dsd_state* state) {
 
 static int
 apply_manual_lcn_cycle(dsd_opts* opts, dsd_state* state) {
-    const int lcn_capacity = (int)(sizeof(state->trunk_lcn_freq) / sizeof(state->trunk_lcn_freq[0]));
     int count = state->lcn_freq_count;
     if (count <= 0) {
         return UI_CMD_APPLY_COMPLETED;
-    }
-    if (count > lcn_capacity) {
-        count = lcn_capacity;
     }
 
     int next = state->lcn_freq_roll;
@@ -1725,8 +1973,9 @@ apply_manual_lcn_cycle(dsd_opts* opts, dsd_state* state) {
     const int start = next;
     long freq = 0;
     for (int examined = 0; examined < count; examined++) {
-        freq = state->trunk_lcn_freq[next];
-        if (freq != 0 && (next == 0 || state->trunk_lcn_freq[next - 1] != freq)) {
+        freq = *dsd_state_trunk_lcn_slot(state, next);
+        if (freq != 0 && !dsd_state_trunk_lcn_avoid_get(state, (size_t)next)
+            && (next == 0 || *dsd_state_trunk_lcn_slot(state, next - 1) != freq)) {
             break;
         }
         next++;
@@ -1750,6 +1999,7 @@ apply_manual_lcn_cycle(dsd_opts* opts, dsd_state* state) {
     reset_call_tracking(opts, state, 0);
     LOG_INFO("Channel Cycle: tuning to %.06lf MHz\n", (double)freq / 1000000);
     state->lcn_freq_roll = next + 1;
+    dsd_scan_row_keys_apply(state, next);
     mark_cc_sync(state, 1);
     return UI_CMD_APPLY_COMPLETED;
 }
@@ -1798,14 +2048,13 @@ apply_cfg_rtl_common(dsd_opts* opts, const dsdneoUserConfig* cfg) {
     if (cfg->rtl_bw_khz) {
         opts->rtl_dsp_bw_khz = cfg->rtl_bw_khz;
     }
-    if (cfg->rtl_sql) {
-        double sql = (double)cfg->rtl_sql;
-        if (sql > 1.0) {
-            sql /= (32768.0 * 32768.0);
-        }
-        opts->rtl_squelch_level = sql;
-        rtl_stream_set_channel_squelch((float)sql);
-    }
+    /* rtl_sql is the same setting the CLI `sql` field carries, so it converts the
+     * same way: negative is decibels, 0 is off. Storing the raw integer put a
+     * -50 dB request in as a power of -50, which switches the squelch off.
+     * Unlike the sibling keys below, 0 is a real value here rather than "key
+     * omitted", so this applies unconditionally — as the startup loader does. */
+    opts->rtl_squelch_level = dsd_squelch_level_from_sql((double)cfg->rtl_sql);
+    rtl_stream_set_channel_squelch((float)opts->rtl_squelch_level);
     if (cfg->rtl_gain) {
         opts->rtl_gain_value = cfg->rtl_gain;
     }
@@ -2169,6 +2418,10 @@ static const int k_ui_cmd_action_ids[] = {
     DSD_APP_CMD_SLOT_PREF_CYCLE,
     DSD_APP_CMD_TRUNK_TOGGLE,
     DSD_APP_CMD_SCANNER_TOGGLE,
+    DSD_APP_CMD_TUNER_RELEASE,
+    DSD_APP_CMD_SCAN_HOLD_TOGGLE,
+    DSD_APP_CMD_SCAN_AVOID,
+    DSD_APP_CMD_SCAN_AVOID_CLEAR,
     DSD_APP_CMD_PAYLOAD_TOGGLE,
     DSD_APP_CMD_P25_GA_TOGGLE,
     DSD_APP_CMD_LPF_TOGGLE,
@@ -2208,6 +2461,7 @@ static const int k_ui_cmd_action_ids[] = {
     DSD_APP_CMD_TRUNK_PRIV_TOGGLE,
     DSD_APP_CMD_TRUNK_DATA_TOGGLE,
     DSD_APP_CMD_TRUNK_ENC_TOGGLE,
+    DSD_APP_CMD_ENC_LOCKOUT_CLEAR,
     DSD_APP_CMD_QUIT,
     DSD_APP_CMD_FORCE_PRIV_TOGGLE,
     DSD_APP_CMD_FORCE_RC4_TOGGLE,
@@ -2246,12 +2500,30 @@ static const int k_ui_cmd_action_ids[] = {
 };
 
 static const int k_ui_cmd_i32_ids[] = {
-    DSD_APP_CMD_GAIN_DELTA,          DSD_APP_CMD_AGAIN_DELTA,      DSD_APP_CMD_SPEC_SIZE_DELTA,
-    DSD_APP_CMD_PPM_DELTA,           DSD_APP_CMD_GAIN_SET,         DSD_APP_CMD_AGAIN_SET,
-    DSD_APP_CMD_RTL_SET_DEV,         DSD_APP_CMD_RTL_SET_GAIN,     DSD_APP_CMD_RTL_SET_PPM,
-    DSD_APP_CMD_RTL_SET_BW,          DSD_APP_CMD_RTL_SET_VOL_MULT, DSD_APP_CMD_RTL_SET_BIAS_TEE,
-    DSD_APP_CMD_RTLTCP_SET_AUTOTUNE, DSD_APP_CMD_RTL_SET_AUTO_PPM, DSD_APP_CMD_RIGCTL_SET_MOD_BW,
-    DSD_APP_CMD_SLOT_PREF_SET,       DSD_APP_CMD_SLOTS_ONOFF_SET,  DSD_APP_CMD_INPUT_VOL_SET,
+    DSD_APP_CMD_GAIN_DELTA,
+    DSD_APP_CMD_AGAIN_DELTA,
+    DSD_APP_CMD_SPEC_SIZE_DELTA,
+    DSD_APP_CMD_PPM_DELTA,
+    DSD_APP_CMD_GAIN_SET,
+    DSD_APP_CMD_AGAIN_SET,
+    DSD_APP_CMD_RTL_SET_DEV,
+    DSD_APP_CMD_RTL_SET_GAIN,
+    DSD_APP_CMD_RTL_SET_PPM,
+    DSD_APP_CMD_RTL_SET_BW,
+    DSD_APP_CMD_RTL_SET_VOL_MULT,
+    DSD_APP_CMD_RTL_SET_BIAS_TEE,
+    DSD_APP_CMD_RTLTCP_SET_AUTOTUNE,
+    DSD_APP_CMD_RTL_SET_AUTO_PPM,
+    DSD_APP_CMD_RIGCTL_SET_MOD_BW,
+    DSD_APP_CMD_SLOT_PREF_SET,
+    DSD_APP_CMD_SLOTS_ONOFF_SET,
+    DSD_APP_CMD_SCAN_VOICE_ONLY_SET,
+    DSD_APP_CMD_SCAN_VOICE_QUALIFY_MS_SET,
+    DSD_APP_CMD_SCAN_VOICE_HOLD_MS_SET,
+    DSD_APP_CMD_INPUT_VOL_SET,
+    DSD_APP_CMD_MOD_SET,
+    DSD_APP_CMD_DECODE_MODE_SET,
+    DSD_APP_CMD_TRUNK_SET,
 };
 
 static int
@@ -2295,6 +2567,7 @@ int
 dsd_app_command_set_u32(int cmd_id, uint32_t value) {
     switch (cmd_id) {
         case DSD_APP_CMD_RTL_SET_FREQ:
+        case DSD_APP_CMD_MANUAL_TUNE:
         case DSD_APP_CMD_TG_HOLD_SET:
         case DSD_APP_CMD_KEY_BASIC_SET:
         case DSD_APP_CMD_KEY_SCRAMBLER_SET: return dsd_app_command_submit(cmd_id, &value, sizeof value);
@@ -2398,6 +2671,18 @@ dsd_app_command_set_config_metadata(const dsd_app_config_metadata_payload* paylo
                    : DSD_APP_COMMAND_SUBMIT_REJECTED;
 }
 
+int
+dsd_app_command_set_rr_apply(const dsd_app_rr_apply_payload* payload) {
+    return payload ? dsd_app_command_submit(DSD_APP_CMD_RR_APPLY_IMPORT, payload, sizeof *payload)
+                   : DSD_APP_COMMAND_SUBMIT_REJECTED;
+}
+
+int
+dsd_app_command_set_rr_account(const dsd_app_rr_account_payload* payload) {
+    return payload ? dsd_app_command_submit(DSD_APP_CMD_RR_ACCOUNT_SET, payload, sizeof *payload)
+                   : DSD_APP_COMMAND_SUBMIT_REJECTED;
+}
+
 static int
 ui_cmd_payload_has_min_size(const struct dsd_app_command* c, size_t want) {
     return c != NULL && c->n >= want;
@@ -2413,6 +2698,13 @@ static const struct ui_cmd_payload_min_size_rule k_ui_cmd_payload_min_size_rules
     {DSD_APP_CMD_CALL_ALERT_EVENTS_SET, sizeof(uint8_t)},
     {DSD_APP_CMD_LOCKOUT_SLOT, sizeof(uint8_t)},
     {DSD_APP_CMD_RTL_SET_FREQ, sizeof(uint32_t)},
+    {DSD_APP_CMD_MOD_SET, sizeof(int32_t)},
+    {DSD_APP_CMD_DECODE_MODE_SET, sizeof(int32_t)},
+    {DSD_APP_CMD_TRUNK_SET, sizeof(int32_t)},
+    {DSD_APP_CMD_SCAN_VOICE_ONLY_SET, sizeof(int32_t)},
+    {DSD_APP_CMD_SCAN_VOICE_QUALIFY_MS_SET, sizeof(int32_t)},
+    {DSD_APP_CMD_SCAN_VOICE_HOLD_MS_SET, sizeof(int32_t)},
+    {DSD_APP_CMD_MANUAL_TUNE, sizeof(uint32_t)},
     {DSD_APP_CMD_TG_HOLD_SET, sizeof(uint32_t)},
     {DSD_APP_CMD_KEY_BASIC_SET, sizeof(uint32_t)},
     {DSD_APP_CMD_KEY_SCRAMBLER_SET, sizeof(uint32_t)},
@@ -2431,6 +2723,8 @@ static const struct ui_cmd_payload_min_size_rule k_ui_cmd_payload_min_size_rules
     {DSD_APP_CMD_DSP_OP, sizeof(dsd_app_dsp_payload)},
     {DSD_APP_CMD_CONFIG_APPLY, sizeof(dsdneoUserConfig)},
     {DSD_APP_CMD_CONFIG_METADATA_SET, sizeof(dsd_app_config_metadata_payload)},
+    {DSD_APP_CMD_RR_APPLY_IMPORT, sizeof(dsd_app_rr_apply_payload)},
+    {DSD_APP_CMD_RR_ACCOUNT_SET, sizeof(dsd_app_rr_account_payload)},
 };
 
 static size_t
@@ -2467,7 +2761,7 @@ ui_cmd_payload_is_valid(const struct dsd_app_command* c) {
 static int
 apply_cmd_basic_a(dsd_opts* opts, dsd_state* state, const struct dsd_app_command* c) {
     switch (c->id) {
-        case DSD_APP_CMD_QUIT: exitflag = 1; return 1;
+        case DSD_APP_CMD_QUIT: dsd_exitflag_store(1); return 1;
         case DSD_APP_CMD_FORCE_PRIV_TOGGLE:
             if (!state) {
                 return 1;
@@ -2477,6 +2771,7 @@ apply_cmd_basic_a(dsd_opts* opts, dsd_state* state, const struct dsd_app_command
             } else {
                 state->M = 1;
             }
+            dsd_enc_lockout_bump_key_epoch(state);
             return 1;
         case DSD_APP_CMD_FORCE_RC4_TOGGLE:
             if (!state) {
@@ -2487,9 +2782,11 @@ apply_cmd_basic_a(dsd_opts* opts, dsd_state* state, const struct dsd_app_command
             } else {
                 state->M = 0x21;
             }
+            dsd_enc_lockout_bump_key_epoch(state);
             return 1;
         case DSD_APP_CMD_TOGGLE_COMPACT:
             opts->frontend_terminal_display.terminal_compact = opts->frontend_terminal_display.terminal_compact ? 0 : 1;
+            dsd_telemetry_request_redraw();
             return 1;
         case DSD_APP_CMD_HISTORY_CYCLE:
             (void)dsd_app_frontend_history_cycle_mode();
@@ -2648,13 +2945,22 @@ apply_cmd_payload_filters(dsd_opts* opts, dsd_state* state, const struct dsd_app
     return ui_cmd_apply_handler_table(k_handlers, sizeof k_handlers / sizeof k_handlers[0], opts, state, c);
 }
 
+/* Visual aids are suppressed while compact view is active; surface a hint when
+   a visualizer is switched on there so the key does not look dead. */
+static void
+ui_toast_visualizer_hidden_if_compact(const dsd_opts* opts, dsd_state* state, uint8_t view_on) {
+    if (view_on && opts->frontend_terminal_display.terminal_compact == 1) {
+        ui_set_toast(state, 3, "Visualizer hidden in compact view (c to exit)");
+    }
+}
+
 static int
 apply_cmd_constellation(dsd_opts* opts, dsd_state* state, const struct dsd_app_command* c) {
-    (void)state;
     switch (c->id) {
         case DSD_APP_CMD_CONST_TOGGLE:
             if (opts->audio_in_type == AUDIO_IN_RTL) {
                 opts->frontend_display.constellation = opts->frontend_display.constellation ? 0 : 1;
+                ui_toast_visualizer_hidden_if_compact(opts, state, opts->frontend_display.constellation);
             }
             return 1;
         case DSD_APP_CMD_CONST_NORM_TOGGLE:
@@ -2685,10 +2991,10 @@ apply_cmd_constellation(dsd_opts* opts, dsd_state* state, const struct dsd_app_c
 
 static int
 ui_cmd_handle_eye_toggle(dsd_opts* opts, dsd_state* state, const struct dsd_app_command* c) {
-    (void)state;
     (void)c;
     if (opts->audio_in_type == AUDIO_IN_RTL) {
         opts->frontend_display.eye_view = opts->frontend_display.eye_view ? 0 : 1;
+        ui_toast_visualizer_hidden_if_compact(opts, state, opts->frontend_display.eye_view);
     }
     return 1;
 }
@@ -2715,20 +3021,20 @@ ui_cmd_handle_eye_color_toggle(dsd_opts* opts, dsd_state* state, const struct ds
 
 static int
 ui_cmd_handle_fsk_hist_toggle(dsd_opts* opts, dsd_state* state, const struct dsd_app_command* c) {
-    (void)state;
     (void)c;
     if (opts->audio_in_type == AUDIO_IN_RTL) {
         opts->frontend_display.fsk_hist_view = opts->frontend_display.fsk_hist_view ? 0 : 1;
+        ui_toast_visualizer_hidden_if_compact(opts, state, opts->frontend_display.fsk_hist_view);
     }
     return 1;
 }
 
 static int
 ui_cmd_handle_spectrum_toggle(dsd_opts* opts, dsd_state* state, const struct dsd_app_command* c) {
-    (void)state;
     (void)c;
     if (opts->audio_in_type == AUDIO_IN_RTL) {
         opts->frontend_display.spectrum_view = opts->frontend_display.spectrum_view ? 0 : 1;
+        ui_toast_visualizer_hidden_if_compact(opts, state, opts->frontend_display.spectrum_view);
     }
     return 1;
 }
@@ -2773,6 +3079,437 @@ apply_cmd_eye_spectrum(dsd_opts* opts, dsd_state* state, const struct dsd_app_co
         {DSD_APP_CMD_SPEC_SIZE_DELTA, ui_cmd_handle_spec_size_delta},
     };
     return ui_cmd_apply_handler_table(k_handlers, sizeof k_handlers / sizeof k_handlers[0], opts, state, c);
+}
+
+/**
+ * @brief Hand the tuner back to the operator: trunking and scanner mode both off.
+ *
+ * Idempotent. A frontend only learns that *something* owns the tuner, not which,
+ * so TRUNK_TOGGLE/SCANNER_TOGGLE cannot express "off" from there without guessing.
+ *
+ * The call-state teardown is not optional and is not left to a following
+ * MANUAL_TUNE: a release is frequently the whole request -- look around from
+ * where we already are -- and then no tune ever runs it. Left set,
+ * opts->trunk_is_tuned keeps update_dmr_bs_sync_times_if_tuned() stamping sync
+ * times, which in turn suppresses the engine's stale-follow-state cleanup, and it
+ * is also the flag whose zero state lets the decoder learn a control channel.
+ *
+ * No dsd_frame_sync_reset_mod_state() here: nothing retuned, so the modulation
+ * votes still describe the signal actually being received.
+ *
+ * opts->trunk_scan_enabled is a third tuner owner (see
+ * engine_trunk_tuning_owner_active()) and is deliberately untouched: it owns live
+ * scan hooks that clearing a flag would not tear down, and it is only reachable
+ * from a frontend that passes --trunk-scan.
+ */
+static int
+apply_tuner_release(dsd_opts* opts, dsd_state* state) {
+    if (!state) {
+        return UI_CMD_APPLY_COMPLETED;
+    }
+    opts->trunk_enable = 0;
+    opts->scanner_mode = 0;
+    // Leaving -Y hands the foreground keyring back to the globals.
+    dsd_scan_keys_leave(state);
+    reset_call_tracking(opts, state, 1);
+    ui_set_toast(state, 3, "Automatic tuning stopped");
+    return UI_CMD_APPLY_COMPLETED;
+}
+
+/**
+ * @brief Answer a decode-mode request that needs no preset run, or decline to.
+ *
+ * Range-checked before the cast, not after. dsdneoUserDecodeMode is a packed enum
+ * -- one byte -- so a value outside it does not stay outside it: 260 casts to 4,
+ * which is DSDCFG_MODE_DMR, and the whole DMR preset would then run for a command
+ * nobody could have meant. The payload is a plain int32 on the wire and
+ * CommandBridge::setDecodeMode() passes it through unvalidated, so this is the only
+ * place the two widths are reconciled.
+ *
+ * Idempotent for the reason ui_handle_mod_set() is: a chip re-asserts its own state
+ * after a frame it did not cause, and DecodeChip taps whether or not it is already
+ * selected. Applying a preset ends both call epochs, drops the auto-modulation
+ * votes and releases the modulation locks -- so re-applying the mode already in
+ * effect would cut a live call and revert an operator's QPSK pick on a tap that
+ * asked for nothing to change. Compared through dsd_infer_decode_mode_preset(),
+ * which is the same reading the control binds to, so the skip and the selection
+ * cannot answer differently.
+ *
+ * AUTO is excluded because there the reading is not an identification: AUTO is that
+ * helper's catch-all for any frame set matching no single preset, so a session with
+ * one protocol switched off answers AUTO without being it, and "listen for
+ * everything" has to stay able to widen such a set back out.
+ *
+ * @param c        Command whose payload is already known to be wide enough.
+ * @param out_mode Receives the requested mode whenever one could be read.
+ * @return The verdict to answer with, its toast already posted, or
+ *         UI_CMD_APPLY_UNHANDLED when @p out_mode is a mode still to apply.
+ */
+static int
+decode_mode_set_early_verdict(const dsd_opts* opts, dsd_state* state, const struct dsd_app_command* c,
+                              dsdneoUserDecodeMode* out_mode) {
+    int32_t requested = 0;
+    DSD_MEMCPY(&requested, c->data, sizeof requested);
+    if (requested < 0 || requested > (int32_t)DSDCFG_MODE_DMR_MONO) {
+        ui_set_toast(state, 4, "Decode mode not available");
+        return UI_CMD_APPLY_UNSUPPORTED;
+    }
+    *out_mode = (dsdneoUserDecodeMode)requested;
+    if (*out_mode != DSDCFG_MODE_AUTO && dsd_infer_decode_mode_preset(opts) == *out_mode) {
+        ui_set_toast(state, 3, "Decoding %s", dsd_decode_mode_display_name(*out_mode));
+        return UI_CMD_APPLY_COMPLETED;
+    }
+    return UI_CMD_APPLY_UNHANDLED;
+}
+
+/**
+ * @brief Recompute symbol timing for @p mode at the live demod rate and publish it.
+ *
+ * Split out of apply_decode_mode_set() so the RadioReference apply can run it
+ * again after it overrides the modulation: svc_publish_symbol_profile() reads
+ * state->rf_mod, so a QPSK override applied after the preset needs a second
+ * publish or the front end keeps the preset's demodulator and channel filter.
+ */
+static void
+decode_mode_republish(const dsd_opts* opts, dsd_state* state, dsdneoUserDecodeMode mode) {
+    const dsd_decode_mode_profile profile = dsd_decode_mode_profile_for(mode);
+    state->samplesPerSymbol = dsd_opts_compute_sps_rate(opts, profile.symbol_rate_hz, current_demod_rate(opts, state));
+    state->symbolCenter = dsd_opts_symbol_center(state->samplesPerSymbol);
+    /* The SPS hunt resumes from wherever the previous mode left it, and its next
+       pass overwrites the timing just computed; the RTL front end likewise keeps
+       the old mode's demodulator family and channel filter until told otherwise. */
+    svc_publish_symbol_profile(opts, state, profile);
+}
+
+/**
+ * @brief Switch which protocols are decoded, mid-session.
+ *
+ * Goes through the same preset helper the CLI uses, so a mode chosen here means
+ * exactly what the same mode means at startup rather than a second opinion about
+ * which frame_* flags it implies.
+ *
+ * The CLI profile specifically, not the interactive one: only its AUTO re-enables
+ * the whole frame set. The other profiles leave AUTO as a label because they run
+ * against freshly defaulted options where everything is already on -- but this
+ * command runs against options a previous single-protocol choice has already
+ * narrowed, so "listen for everything" has to actually widen them again.
+ *
+ * Every preset also settles the modulation, which is why a panel offering both
+ * reads modulation back from the engine rather than remembering what it asked for.
+ *
+ * Callers that already hold a dsdneoUserDecodeMode use this directly; it does no
+ * payload decoding, so nothing has to synthesize a struct dsd_app_command to
+ * reach it.
+ */
+static int
+decode_mode_apply_value(dsd_opts* opts, dsd_state* state, dsdneoUserDecodeMode mode) {
+    /* The presets also carry an audio layout, but the output stream was opened
+       once at session start with the layout in force then (openAudioOutput()
+       reads pulse_digi_out_channels/pulse_digi_rate_out and the backend fixes
+       them for the life of the stream). Letting a preset change them here would
+       have dsd_play_synthesized_voice() dispatch mono writes into a stereo
+       stream for the rest of the session, so the session's own layout is kept.
+
+       dmr_stereo is deliberately not in this pair, though the presets set it
+       next to them. It selects two-slot decoding, not a stream shape: the DMR
+       playback paths take the channel count separately and mix both slots down
+       when it is 1 (playSynthesizedVoiceSS3/FS3), so a mono session that switches
+       to DMR still hears both slots. Putting it back with the channel count would
+       instead leave a DMR session on dmr_stereo == 0 with dmr_mono == 0, which no
+       preset produces and which dmr_handle_voice() answers by running the MS
+       bootstrap against BS voice and nothing at all against MS voice. */
+    const int audio_channels = opts->pulse_digi_out_channels;
+    const int audio_rate = opts->pulse_digi_rate_out;
+    /* Released before the preset runs, not after. The presets skip their whole
+       modulation block under mod_cli_lock (decode_mode_apply_dmr() and siblings),
+       so on a session started with `-mq`/`-mg` the new protocol would keep the old
+       modulation -- and svc_publish_symbol_profile() below reads state->rf_mod, so
+       it would then ask the front end for that modulation's demodulator and channel
+       filter at the new protocol's symbol rate, with the lock still on to stop the
+       SPS hunt correcting it. Choosing a protocol here is a fresh answer to what is
+       on this channel and outranks a `-m` flag from session start; this is the same
+       release ui_apply_modulation() performs for the modulation control.
+
+       Restored if the mode turns out to be unsupported, so a refused command
+       changes nothing -- which is the contract the preset helper itself keeps. */
+    const int mod_locks[3] = {opts->mod_cli_lock, opts->mod_p25p2_c4fm, opts->mod_p25p2_profile_lock};
+    opts->mod_p25p2_c4fm = 0;
+    opts->mod_p25p2_profile_lock = 0;
+    opts->mod_cli_lock = 0;
+    if (dsd_apply_decode_mode_preset(mode, DSD_DECODE_PRESET_PROFILE_CLI, opts, state) != 0) {
+        opts->mod_cli_lock = mod_locks[0];
+        opts->mod_p25p2_c4fm = mod_locks[1];
+        opts->mod_p25p2_profile_lock = mod_locks[2];
+        ui_set_toast(state, 4, "Decode mode not available");
+        return UI_CMD_APPLY_UNSUPPORTED;
+    }
+    opts->pulse_digi_out_channels = audio_channels;
+    opts->pulse_digi_rate_out = audio_rate;
+    /* The presets write symbol timing for a 48 kHz input, and on an RTL front end
+       the demod output rate is whatever the capture rate decimates to, so the
+       timing has to be recomputed at the live rate or the decoder is put on the
+       wrong symbol clock for the protocol it was just told to look for.
+
+       Taken from the mode's steady-state profile rather than from the preset's
+       starting timing, because the same profile decides the SPS hunt index and
+       the channel filter published just below, and a mode running on one symbol
+       clock with a hunt profile and a filter built for another is exactly what
+       that costs. */
+    decode_mode_republish(opts, state, mode);
+    /* The decoder was hunting for a different protocol a moment ago: its
+       modulation votes describe frames of the old kind, and any call open on the
+       old protocol will never be closed by the new one. */
+    dsd_frame_sync_reset_mod_state();
+    reset_call_tracking(opts, state, 1);
+    ui_set_toast(state, 3, "Decoding %s", dsd_decode_mode_display_name(mode));
+    return UI_CMD_APPLY_COMPLETED;
+}
+
+static int
+apply_decode_mode_set(dsd_opts* opts, dsd_state* state, const struct dsd_app_command* c) {
+    if (!state || c->n < (int)sizeof(int32_t)) {
+        return UI_CMD_APPLY_INVALID_PAYLOAD;
+    }
+    dsdneoUserDecodeMode mode = DSDCFG_MODE_AUTO;
+    const int early = decode_mode_set_early_verdict(opts, state, c, &mode);
+    if (early != UI_CMD_APPLY_UNHANDLED) {
+        return early;
+    }
+    return decode_mode_apply_value(opts, state, mode);
+}
+
+/**
+ * @brief Everything that can refuse a RadioReference apply before it mutates anything.
+ *
+ * After this returns COMPLETED the sequence is best-effort and cannot roll back;
+ * svc_import_channel_map() in particular writes opts->chan_in_file before it
+ * validates and never restores it.
+ */
+static int
+rr_apply_preflight(const dsd_opts* opts, dsd_state* state, const dsd_app_rr_apply_payload* p) {
+    // Same invariant svc_import_channel_map() enforces for -C: a trunk-scan run
+    // gets its channel maps per target. Refusing the whole apply (rather than
+    // just the channel-map half, which is all svc_import_group_list would leave)
+    // is what keeps a half-applied import off a live session.
+    if (opts->trunk_scan_enabled == 1) {
+        ui_set_toast(state, 4, "Failed: RR import -> trunk scan owns the channel map");
+        return UI_CMD_APPLY_FAILED;
+    }
+    /* <=, not <: DSDCFG_MODE_UNSET is 0 and is not a preset, so letting it through
+       would run dsd_apply_decode_mode_preset() and republish a symbol profile for
+       "no mode". Neither producer can emit it today; the guard is what keeps that
+       true. */
+    if (p->decode_mode <= (int32_t)DSDCFG_MODE_UNSET || p->decode_mode > (int32_t)DSDCFG_MODE_DMR_MONO) {
+        ui_set_toast(state, 4, "Failed: RR import -> decode mode");
+        return UI_CMD_APPLY_FAILED;
+    }
+    dsd_csv_validation counts;
+    DSD_MEMSET(&counts, 0, sizeof counts);
+    if (p->has_chan && (dsd_csv_validate_chan_file(p->chan_path, &counts) != 0 || counts.accepted == 0U)) {
+        ui_set_toast(state, 4, "Failed: RR import -> channel map unreadable");
+        return UI_CMD_APPLY_FAILED;
+    }
+    DSD_MEMSET(&counts, 0, sizeof counts);
+    if (p->has_group && (dsd_csv_validate_group_file(p->group_path, &counts) != 0 || counts.accepted == 0U)) {
+        ui_set_toast(state, 4, "Failed: RR import -> group list unreadable");
+        return UI_CMD_APPLY_FAILED;
+    }
+    return UI_CMD_APPLY_COMPLETED;
+}
+
+/* decode_mode_apply_edacs_pv() resets both fields to 0, so the variant has to be
+   restated after the preset. Values verified against the optarg[0] == 'h'/'H'/
+   'e'/'E' branches of case 'f': in the args macro (grep state->esk_mask in
+   src/runtime/cli/args.c): -fh/-fe leave 0, -fH/-fE set 0xA0. */
+static void
+rr_apply_edacs_variants(dsd_state* state, const dsd_app_rr_apply_payload* p, dsdneoUserDecodeMode mode) {
+    if (mode != DSDCFG_MODE_EDACS_PV) {
+        return;
+    }
+    state->ea_mode = p->edacs_ea ? 1 : 0;
+    state->esk_mask = p->edacs_esk ? (unsigned short)0xA0 : (unsigned short)0;
+}
+
+/* The `-mq` block, including the two case 'm': prologue lines. mod_cli_lock is
+   load-bearing: snapshot_demod_config() in src/runtime/config_user.cpp returns
+   early without it, so Config->Save would emit no [demod] section at all. */
+static void
+rr_apply_simulcast(dsd_opts* opts, dsd_state* state, const dsd_app_rr_apply_payload* p) {
+    if (!p->simulcast_qpsk) {
+        return;
+    }
+    opts->mod_p25p2_c4fm = 0;
+    opts->mod_p25p2_profile_lock = 0;
+    opts->mod_c4fm = 0;
+    opts->mod_qpsk = 1;
+    opts->mod_gfsk = 0;
+    state->rf_mod = 1;
+    opts->mod_cli_lock = 1;
+}
+
+/* One automatic tuner owner at a time, mirroring ui_handle_trunk_set and
+   ui_handle_scanner_toggle in src/app_control/actions/actions_trunk.c.
+   opts->trunk_cli_seen is CLI provenance and is deliberately not touched -- the
+   in-session action handlers do not touch it either. */
+static void
+rr_apply_tuner_owner(dsd_opts* opts, dsd_state* state, const dsd_app_rr_apply_payload* p) {
+    if (!p) {
+        return;
+    }
+    if (p->trunking) {
+        opts->trunk_enable = 1;
+        opts->scanner_mode = 0;
+    } else if (p->scanner) {
+        opts->scanner_mode = 1;
+        opts->trunk_enable = 0;
+    } else {
+        opts->trunk_enable = 0;
+        opts->scanner_mode = 0;
+    }
+    if (!p->scanner) {
+        dsd_scan_keys_leave(state);
+    }
+}
+
+/* A half the import did not write CLEARS the live one rather than leaving it:
+   this command re-points the session at a different system, and a stale channel
+   map is not merely out of date, it resolves the new system's voice grants
+   against the old system's frequencies and tunes off-system. chan_need == 2
+   protocols (DMR Cap+/Con+/TIII) legitimately produce no channel map at all, so
+   this is an ordinary outcome, not an edge case. services.h says the same thing
+   about why the clear counterparts exist: "the previous file would otherwise
+   stay live for the session". */
+static int
+rr_apply_files(dsd_opts* opts, dsd_state* state, const dsd_app_rr_apply_payload* p) {
+    int rc = UI_CMD_APPLY_COMPLETED;
+    if (p->has_chan) {
+        if (svc_import_channel_map(opts, state, p->chan_path) != 0) {
+            rc = UI_CMD_APPLY_FAILED;
+        }
+    } else {
+        (void)svc_clear_channel_map(opts, state);
+    }
+    if (p->has_group) {
+        if (svc_import_group_list(opts, state, p->group_path) != 0) {
+            rc = UI_CMD_APPLY_FAILED;
+        }
+    } else {
+        (void)svc_clear_group_list(opts, state);
+    }
+    return rc;
+}
+
+/* io_control_set_freq() is compiled unconditionally and dispatches rigctl
+   (opts->use_rigctl == 1) and RTL (opts->audio_in_type == AUDIO_IN_RTL) itself,
+   returning -1 when neither owns the tuner. 0 is applied and
+   RTL_STREAM_TUNE_TIMEOUT is accepted-pending; anything else is a session that
+   cannot retune (WAV, stdin, UDP, symbol file), which the preview already warned
+   about and which must not fail the whole apply. */
+static void
+rr_apply_tune(dsd_opts* opts, dsd_state* state, const dsd_app_rr_apply_payload* p) {
+    if (p->tune_hz == 0U) {
+        return;
+    }
+    /* io_control_set_freq() takes a long, which is 32-bit signed under the
+       win-msvc-* presets while the payload carries a full uint32_t (and
+       rr_generate.c accepts sites up to 6 GHz). Casting a value above LONG_MAX
+       there would hand the tuner a NEGATIVE frequency, so the retune is skipped
+       instead - the same outcome as a session that cannot retune at all, which
+       the import preview already warns about. Guarded by the preprocessor because
+       where long is 64-bit the test is provably false and -Werror=type-limits
+       rejects it. */
+#if LONG_MAX < UINT32_MAX
+    if (p->tune_hz > (uint32_t)LONG_MAX) {
+        return;
+    }
+#endif
+    (void)io_control_set_freq(opts, state, (long int)p->tune_hz);
+}
+
+/* The session was just re-pointed at a different system, so the old system's CC
+   candidates and sync timestamps are wrong rather than merely stale. This is the
+   DSD_APP_CMD_SIM_NOCAR field set WITHOUT noCarrier(): the call state is already
+   ended by reset_call_tracking below, and noCarrier() would additionally unwind
+   the audio path for a tune that was requested, not lost. */
+static void
+rr_apply_reacquire(dsd_opts* opts, dsd_state* state) {
+    dsd_trunk_cc_candidates_reset(state);
+    state->last_cc_sync_time = 0;
+    state->last_vc_sync_time = 0;
+    state->last_vc_sync_time_m = 0.0;
+    dsd_frame_sync_reset_mod_state();
+    reset_call_tracking(opts, state, 1);
+}
+
+/**
+ * @brief Apply a finished RadioReference import to the live session.
+ *
+ * Runs decode_mode_apply_value() rather than apply_decode_mode_set(): the latter
+ * short-circuits through decode_mode_set_early_verdict() whenever the session is
+ * already in the target mode, which skips the preset, the SPS recompute and the
+ * symbol-profile publish -- exactly what a refresh re-applying the same mode
+ * needs to happen. It also avoids putting a second ~16 KB struct dsd_app_command
+ * on the decoder thread's frame; the drain already holds one.
+ */
+static int
+apply_rr_import(dsd_opts* opts, dsd_state* state, const struct dsd_app_command* c) {
+    if (!opts || !state || c->n < sizeof(dsd_app_rr_apply_payload)) {
+        return UI_CMD_APPLY_INVALID_PAYLOAD;
+    }
+    dsd_app_rr_apply_payload p;
+    DSD_MEMCPY(&p, c->data, sizeof p);
+    p.chan_path[sizeof p.chan_path - 1] = '\0';
+    p.group_path[sizeof p.group_path - 1] = '\0';
+
+    const int pre = rr_apply_preflight(opts, state, &p);
+    if (pre != UI_CMD_APPLY_COMPLETED) {
+        return pre;
+    }
+    const dsdneoUserDecodeMode mode = (dsdneoUserDecodeMode)p.decode_mode;
+    if (decode_mode_apply_value(opts, state, mode) != UI_CMD_APPLY_COMPLETED) {
+        ui_set_toast(state, 4, "Failed: RR import -> decode mode");
+        return UI_CMD_APPLY_FAILED;
+    }
+    rr_apply_edacs_variants(state, &p, mode);
+    rr_apply_simulcast(opts, state, &p);
+    opts->p25_prefer_candidates = p.p25_prefer_candidates ? (uint8_t)1 : (uint8_t)0;
+    rr_apply_tuner_owner(opts, state, &p);
+    const int files_rc = rr_apply_files(opts, state, &p);
+    /* Unconditional, and after every write to state->rf_mod: svc_publish_symbol_profile()
+       reads it, so the simulcast override needs a second publish, and a re-apply
+       onto an already-matching mode needs the first one. */
+    decode_mode_republish(opts, state, mode);
+    rr_apply_tune(opts, state, &p);
+    rr_apply_reacquire(opts, state);
+
+    if (files_rc != UI_CMD_APPLY_COMPLETED) {
+        ui_set_toast(state, 4, "Failed: RR import -> CSV import");
+        return UI_CMD_APPLY_FAILED;
+    }
+    ui_set_toast(state, 4, "Applied: RR import (%s)%s; save via Config menu", dsd_decode_mode_display_name(mode),
+                 p.trunking ? " +trunking" : (p.scanner ? " +scanner" : ""));
+    return UI_CMD_APPLY_COMPLETED;
+}
+
+/* The UI thread never writes dsd_opts: the opts pointer a menu action receives
+   alternates between the live struct and the read-only published snapshot, and
+   the decoder thread republishes opts by whole-struct copy after every drained
+   command. */
+static int
+apply_rr_account_set(dsd_opts* opts, dsd_state* state, const struct dsd_app_command* c) {
+    if (!opts || !state || c->n < sizeof(dsd_app_rr_account_payload)) {
+        return UI_CMD_APPLY_INVALID_PAYLOAD;
+    }
+    dsd_app_rr_account_payload account;
+    DSD_MEMCPY(&account, c->data, sizeof account);
+    account.username[sizeof account.username - 1] = '\0';
+    account.app_key[sizeof account.app_key - 1] = '\0';
+    DSD_SNPRINTF(opts->rr_username, sizeof opts->rr_username, "%s", account.username);
+    DSD_SNPRINTF(opts->rr_app_key, sizeof opts->rr_app_key, "%s", account.app_key);
+    /* Never echo either field: tools/check_secret_redaction.sh runs on every push
+       and the credential policy in radioreference.h forbids it outright. */
+    ui_set_toast(state, 3, "Applied: RadioReference account");
+    return UI_CMD_APPLY_COMPLETED;
 }
 
 static int
@@ -2821,6 +3558,10 @@ apply_cmd_trunk_controls(dsd_opts* opts, dsd_state* state, const struct dsd_app_
             }
             return 1;
         case DSD_APP_CMD_RETURN_CC: return apply_manual_return_to_cc(opts, state);
+        case DSD_APP_CMD_TUNER_RELEASE: return apply_tuner_release(opts, state);
+        case DSD_APP_CMD_DECODE_MODE_SET: return apply_decode_mode_set(opts, state, c);
+        case DSD_APP_CMD_RR_APPLY_IMPORT: return apply_rr_import(opts, state, c);
+        case DSD_APP_CMD_RR_ACCOUNT_SET: return apply_rr_account_set(opts, state, c);
         case DSD_APP_CMD_SIM_NOCAR:
             if (!state) {
                 return 1;
@@ -2835,6 +3576,26 @@ apply_cmd_trunk_controls(dsd_opts* opts, dsd_state* state, const struct dsd_app_
 }
 
 static int
+apply_cmd_lockout_resolve_target(const dsd_state* state, const struct dsd_app_command* c, uint8_t* slot_out,
+                                 uint32_t* target_out) {
+    uint8_t slot = 0U;
+    if (c->n >= 1) {
+        DSD_MEMCPY(&slot, c->data, 1U);
+    }
+    dsd_call_snapshot call;
+    if (dsd_call_state_get(state, slot & 1U, &call) <= 0 || call.phase != DSD_CALL_PHASE_ACTIVE) {
+        return 0;
+    }
+    const uint64_t target = call.policy_target_id != 0U ? call.policy_target_id : call.ota_target_id;
+    if (target == 0U || target > UINT32_MAX) {
+        return 0;
+    }
+    *slot_out = slot;
+    *target_out = (uint32_t)target;
+    return 1;
+}
+
+static int
 apply_cmd_lockout_slot(dsd_opts* opts, dsd_state* state, const struct dsd_app_command* c) {
     if (!state) {
         return (c && c->id == DSD_APP_CMD_LOCKOUT_SLOT) ? 1 : 0;
@@ -2842,21 +3603,19 @@ apply_cmd_lockout_slot(dsd_opts* opts, dsd_state* state, const struct dsd_app_co
     if (c->id != DSD_APP_CMD_LOCKOUT_SLOT) {
         return 0;
     }
-    uint8_t slot = 0;
+    uint8_t slot = 0U;
+    uint32_t target = 0U;
     dsd_tg_policy_entry lockout_entry;
     char metadata[16];
     int upsert_rc = 0;
-    if (c->n >= 1) {
-        DSD_MEMCPY(&slot, c->data, 1);
-    }
     if (opts->frame_provoice == 1) {
         return 1;
     }
-    int tg = (slot == 0) ? state->lasttg : state->lasttgR;
-    if (tg == 0) {
+    if (!apply_cmd_lockout_resolve_target(state, c, &slot, &target)) {
         return 1;
     }
-    if (dsd_tg_policy_make_exact_entry((uint32_t)tg, "B", "LOCKOUT", DSD_TG_POLICY_SOURCE_USER_LOCKOUT, &lockout_entry)
+    int tg = (int)target;
+    if (dsd_tg_policy_make_exact_entry(target, "B", "LOCKOUT", DSD_TG_POLICY_SOURCE_USER_LOCKOUT, &lockout_entry)
         != 0) {
         return 1;
     }
@@ -2868,13 +3627,14 @@ apply_cmd_lockout_slot(dsd_opts* opts, dsd_state* state, const struct dsd_app_co
     }
 
     int eh_slot = (slot == 0) ? 0 : 1;
+    dsd_event_history_transaction transaction;
+    dsd_event_history_transaction_begin(state, &transaction);
     DSD_SNPRINTF(state->event_history_s[eh_slot].Event_History_Items[0].internal_str,
                  sizeof state->event_history_s[eh_slot].Event_History_Items[0].internal_str,
                  "Target: %d; has been locked out; User Lock Out.", tg);
     dsd_event_history_mark_dirty(&state->event_history_s[eh_slot]);
+    dsd_event_history_transaction_end(&transaction);
     watchdog_event_current(opts, state, eh_slot);
-    DSD_SNPRINTF(state->call_string[eh_slot], sizeof state->call_string[eh_slot], "%s",
-                 "                     "); // 21 spaces
 
     DSD_SNPRINTF(metadata, sizeof(metadata), "%02X",
                  (unsigned int)((slot == 0) ? state->payload_algid : state->payload_algidR));
@@ -2892,6 +3652,38 @@ apply_cmd_lockout_slot(dsd_opts* opts, dsd_state* state, const struct dsd_app_co
     return UI_CMD_APPLY_COMPLETED;
 }
 
+static void
+apply_cmd_m17_tx_toggle(const dsd_opts* opts, dsd_state* state) {
+    if (opts->m17encoder != 1) {
+        return;
+    }
+    state->m17encoder_tx = (state->m17encoder_tx == 0) ? 1 : 0;
+    if (state->m17encoder_tx == 0) {
+        state->m17encoder_eot = 1;
+    }
+}
+
+static void
+apply_cmd_provoice_mode_toggle(dsd_opts* opts, dsd_state* state) {
+    if (opts->frame_provoice != 1) {
+        return;
+    }
+    state->ea_mode = (state->ea_mode == 0) ? 1 : 0;
+    state->edacs_site_id = 0;
+    state->edacs_lcn_count = 0;
+    state->edacs_cc_lcn = 0;
+    state->edacs_tuned_lcn = -1;
+    state->p25_cc_freq = 0;
+    state->trunk_cc_freq = 0;
+    opts->trunk_is_tuned = 0;
+    const double ended_m = dsd_time_now_monotonic_s();
+    for (int slot = 0; slot < DSD_CALL_STATE_SLOT_COUNT; slot++) {
+        if (dsd_call_state_end(state, (uint8_t)slot, ended_m) > 0) {
+            dsd_event_sync_slot(opts, state, (uint8_t)slot);
+        }
+    }
+}
+
 static int
 apply_cmd_provoice_m17(dsd_opts* opts, dsd_state* state, const struct dsd_app_command* c) {
     switch (c->id) {
@@ -2899,12 +3691,7 @@ apply_cmd_provoice_m17(dsd_opts* opts, dsd_state* state, const struct dsd_app_co
             if (!state) {
                 return 1;
             }
-            if (opts->m17encoder == 1) {
-                state->m17encoder_tx = (state->m17encoder_tx == 0) ? 1 : 0;
-                if (state->m17encoder_tx == 0) {
-                    state->m17encoder_eot = 1;
-                }
-            }
+            apply_cmd_m17_tx_toggle(opts, state);
             return 1;
         case DSD_APP_CMD_PROVOICE_ESK_TOGGLE:
             if (!state) {
@@ -2918,23 +3705,130 @@ apply_cmd_provoice_m17(dsd_opts* opts, dsd_state* state, const struct dsd_app_co
             if (!state) {
                 return 1;
             }
-            if (opts->frame_provoice == 1) {
-                state->ea_mode = (state->ea_mode == 0) ? 1 : 0;
-                state->edacs_site_id = 0;
-                state->edacs_lcn_count = 0;
-                state->edacs_cc_lcn = 0;
-                state->edacs_vc_lcn = 0;
-                state->edacs_tuned_lcn = -1;
-                state->edacs_vc_call_type = 0;
-                state->p25_cc_freq = 0;
-                state->trunk_cc_freq = 0;
-                opts->trunk_is_tuned = 0;
-                state->lasttg = 0;
-                state->lastsrc = 0;
-            }
+            apply_cmd_provoice_mode_toggle(opts, state);
             return 1;
         default: return 0;
     }
+}
+
+/*
+ * On-the-fly scan controls (#380). Whichever scanner owns the tuner gets the command:
+ * --trunk-scan hands it to the coordinator through the control hook, -Y acts on the
+ * scan list here, and with neither running the command is accepted and declined with
+ * a status message rather than left unhandled.
+ */
+static int
+scan_control_tuner_present(const dsd_opts* opts) {
+    return opts->use_rigctl == 1 || opts->audio_in_type == AUDIO_IN_RTL;
+}
+
+static void
+apply_manual_scan_hold_toggle(dsd_state* state) {
+    state->lcn_scan_hold = state->lcn_scan_hold ? 0U : 1U;
+    if (!state->lcn_scan_hold) {
+        // The rotation left the dwell timer alone while held; give the row a full hangtime
+        // now rather than hopping on the very next no-carrier pass.
+        mark_cc_sync(state, 1);
+    }
+    ui_set_toast(state, 3, "Scan hold %s", state->lcn_scan_hold ? "on" : "off");
+}
+
+static void
+apply_manual_scan_avoid(dsd_opts* opts, dsd_state* state) {
+    const int count = state->lcn_freq_count;
+    const int roll = state->lcn_freq_roll;
+    if (count <= 0 || roll < 1 || roll > count) {
+        ui_set_toast(state, 3, "No scan channel on air to avoid");
+        return;
+    }
+    if (dsd_state_trunk_lcn_usable_count(state) <= 1) {
+        ui_set_toast(state, 3, "Cannot avoid the last usable scan channel");
+        return;
+    }
+    const int row = roll - 1;
+    const long freq = *dsd_state_trunk_lcn_slot(state, row);
+    if (dsd_state_trunk_lcn_avoid_set(state, (size_t)row, 1) != 0) {
+        ui_set_toast(state, 3, "Failed: scan avoid out of memory");
+        return;
+    }
+    ui_set_toast(state, 3, "Avoiding %.4f MHz (%u avoided)", (double)freq / 1000000.0,
+                 (unsigned)state->lcn_avoid_count);
+    if (scan_control_tuner_present(opts)) {
+        (void)apply_manual_lcn_cycle(opts, state);
+    }
+}
+
+static void
+apply_manual_scan_avoid_clear(dsd_state* state) {
+    const int cleared = dsd_state_trunk_lcn_avoid_clear(state);
+    ui_set_toast(state, 3, "Cleared %d scan avoid%s", cleared, cleared == 1 ? "" : "s");
+}
+
+static void
+apply_trunk_scan_control(dsd_opts* opts, dsd_state* state, int op) {
+    const int rc = dsd_trunk_scan_hook_control(opts, state, op);
+    if (rc == DSD_TRUNK_SCAN_CONTROL_BUSY) {
+        ui_set_toast(state, 3, "Trunk scan busy; try again");
+        return;
+    }
+    if (rc == DSD_TRUNK_SCAN_CONTROL_UNAVAILABLE) {
+        ui_set_toast(state, 3, "Trunk scan is not running");
+        return;
+    }
+    switch (op) {
+        case DSD_TRUNK_SCAN_CONTROL_HOLD_TOGGLE:
+            if (rc >= 0) {
+                ui_set_toast(state, 3, "Trunk scan hold %s", rc ? "on" : "off");
+            }
+            break;
+        case DSD_TRUNK_SCAN_CONTROL_AVOID_ACTIVE:
+            if (rc == DSD_TRUNK_SCAN_CONTROL_REFUSED) {
+                ui_set_toast(state, 3, "Cannot avoid the last usable trunk scan target");
+            } else {
+                ui_set_toast(state, 3, "Avoiding target %s (%u avoided)", state->trunk_scan_active_id,
+                             (unsigned)state->trunk_scan_avoided_count);
+            }
+            break;
+        case DSD_TRUNK_SCAN_CONTROL_AVOID_CLEAR:
+            if (rc >= 0) {
+                ui_set_toast(state, 3, "Cleared %d trunk scan avoid%s", rc, rc == 1 ? "" : "s");
+            }
+            break;
+        case DSD_TRUNK_SCAN_CONTROL_ADVANCE:
+            if (rc == DSD_TRUNK_SCAN_CONTROL_REFUSED) {
+                ui_set_toast(state, 3, "Trunk scan has only one target");
+            }
+            break;
+        default: break;
+    }
+}
+
+static int
+apply_cmd_scan_controls(dsd_opts* opts, dsd_state* state, const struct dsd_app_command* c) {
+    int op;
+    switch (c->id) {
+        case DSD_APP_CMD_SCAN_HOLD_TOGGLE: op = DSD_TRUNK_SCAN_CONTROL_HOLD_TOGGLE; break;
+        case DSD_APP_CMD_SCAN_AVOID: op = DSD_TRUNK_SCAN_CONTROL_AVOID_ACTIVE; break;
+        case DSD_APP_CMD_SCAN_AVOID_CLEAR: op = DSD_TRUNK_SCAN_CONTROL_AVOID_CLEAR; break;
+        default: return 0;
+    }
+    if (!state) {
+        return 1;
+    }
+    if (opts->trunk_scan_enabled == 1) {
+        apply_trunk_scan_control(opts, state, op);
+        return 1;
+    }
+    if (opts->scanner_mode != 1) {
+        ui_set_toast(state, 3, "Not scanning: hold/avoid need -Y or --trunk-scan");
+        return 1;
+    }
+    switch (op) {
+        case DSD_TRUNK_SCAN_CONTROL_HOLD_TOGGLE: apply_manual_scan_hold_toggle(state); break;
+        case DSD_TRUNK_SCAN_CONTROL_AVOID_ACTIVE: apply_manual_scan_avoid(opts, state); break;
+        default: apply_manual_scan_avoid_clear(state); break;
+    }
+    return 1;
 }
 
 static int
@@ -2945,7 +3839,14 @@ apply_cmd_channel_cycle(dsd_opts* opts, dsd_state* state, const struct dsd_app_c
     if (!state) {
         return 1;
     }
-    if (opts->use_rigctl == 1 || opts->audio_in_type == AUDIO_IN_RTL) {
+    // Under --trunk-scan "next" means the next target. Walking the parked target's own
+    // LCN list here would retune under the coordinator's feet and be snapshotted as if
+    // the target had moved itself.
+    if (opts->trunk_scan_enabled == 1) {
+        apply_trunk_scan_control(opts, state, DSD_TRUNK_SCAN_CONTROL_ADVANCE);
+        return 1;
+    }
+    if (scan_control_tuner_present(opts)) {
         return apply_manual_channel_cycle(opts, state);
     }
     return 1;
@@ -2963,13 +3864,8 @@ ui_cmd_handle_symcap_save(dsd_opts* opts, dsd_state* state, const struct dsd_app
     if (state && state->event_history_s) {
         char event_str[2000] = {0};
         DSD_SNPRINTF(event_str, sizeof event_str, "DSD-neo Dibit Capture File Started: %s;", opts->symbol_out_file);
-        watchdog_event_datacall(opts, state, 0xFFFFFF, 0xFFFFFF, event_str, 0);
-        dsd_event_history_item_set_metadata(&state->event_history_s[0].Event_History_Items[0], DSD_EVENT_SEVERITY_INFO,
-                                            DSD_EVENT_CATEGORY_SYSTEM);
-        dsd_event_history_mark_dirty(&state->event_history_s[0]);
-        state->lastsrc = 0;
-        watchdog_event_history(opts, state, 0);
-        watchdog_event_current(opts, state, 0);
+        (void)dsd_event_emit_system_notice(opts, state, 0U, event_str);
+        dsd_event_sync_slot(opts, state, 0);
     }
     opts->symbol_out_file_creation_time = time(NULL);
     opts->symbol_out_file_is_auto = 1;
@@ -2985,13 +3881,8 @@ ui_cmd_handle_symcap_stop(dsd_opts* opts, dsd_state* state, const struct dsd_app
         if (state && state->event_history_s) {
             char event_str[2000] = {0};
             DSD_SNPRINTF(event_str, sizeof event_str, "DSD-neo Dibit Capture File  Closed: %s;", opts->symbol_out_file);
-            watchdog_event_datacall(opts, state, 0xFFFFFF, 0xFFFFFF, event_str, 0);
-            dsd_event_history_item_set_metadata(&state->event_history_s[0].Event_History_Items[0],
-                                                DSD_EVENT_SEVERITY_INFO, DSD_EVENT_CATEGORY_SYSTEM);
-            dsd_event_history_mark_dirty(&state->event_history_s[0]);
-            state->lastsrc = 0;
-            watchdog_event_history(opts, state, 0);
-            watchdog_event_current(opts, state, 0);
+            (void)dsd_event_emit_system_notice(opts, state, 0U, event_str);
+            dsd_event_sync_slot(opts, state, 0);
         }
     }
     opts->symbol_out_file_is_auto = 0;
@@ -3188,16 +4079,16 @@ apply_cmd_misc_config(dsd_opts* opts, dsd_state* state, const struct dsd_app_com
 static int
 apply_cmd(dsd_opts* opts, dsd_state* state, const struct dsd_app_command* c) {
     static const dsd_app_command_handler_fn k_command_groups[] = {
-        apply_cmd_basic_a,       apply_cmd_slot_controls,    apply_cmd_payload_filters, apply_cmd_constellation,
-        apply_cmd_eye_spectrum,  apply_cmd_trunk_controls,   apply_cmd_lockout_slot,    apply_cmd_provoice_m17,
-        apply_cmd_channel_cycle, apply_cmd_capture_playback, apply_cmd_misc_config,
+        apply_cmd_basic_a,       apply_cmd_slot_controls,  apply_cmd_payload_filters,  apply_cmd_constellation,
+        apply_cmd_eye_spectrum,  apply_cmd_trunk_controls, apply_cmd_lockout_slot,     apply_cmd_provoice_m17,
+        apply_cmd_scan_controls, apply_cmd_channel_cycle,  apply_cmd_capture_playback, apply_cmd_misc_config,
     };
     if (!c) {
         return UI_CMD_APPLY_INVALID_PAYLOAD;
     }
     if (!opts) {
         if (c->id == DSD_APP_CMD_QUIT) {
-            exitflag = 1;
+            dsd_exitflag_store(1);
             return UI_CMD_APPLY_COMPLETED;
         }
         return UI_CMD_APPLY_UNSUPPORTED;

@@ -8,10 +8,13 @@
  */
 
 #include <dsd-neo/core/bit_packing.h>
+#include <dsd-neo/core/call_state.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/opts_fwd.h>
 #include <dsd-neo/core/state.h>
+#include <dsd-neo/core/state_ext.h>
 #include <dsd-neo/core/state_fwd.h>
+#include <dsd-neo/core/synctype_ids.h>
 #include <dsd-neo/protocol/nxdn/nxdn_deperm.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -57,11 +60,9 @@ CNXDNConvolution_chainback(unsigned char* out, unsigned int nBits) {
 }
 
 void
-NXDN_Elements_Content_decode(dsd_opts* opts, dsd_state* state, uint8_t CrcCorrect, const uint8_t* ElementsContent,
-                             size_t elements_bits) {
+NXDN_Elements_Content_decode(dsd_opts* opts, dsd_state* state, const uint8_t* ElementsContent, size_t elements_bits) {
     (void)opts;
     (void)state;
-    (void)CrcCorrect;
     (void)ElementsContent;
     (void)elements_bits;
 }
@@ -170,12 +171,18 @@ seed_call_state(dsd_opts* opts, dsd_state* state) {
     opts->floating_point = 1;
     opts->audio_gain = 2.5f;
     state->aout_gain = 9.0f;
-    state->nxdn_last_rid = 1234;
-    state->nxdn_last_tg = 5678;
+    const dsd_call_observation observation = {
+        .protocol = DSD_SYNC_NXDN_POS,
+        .slot = 0U,
+        .kind = DSD_CALL_KIND_GROUP_VOICE,
+        .ota_target_id = 5678U,
+        .policy_target_id = 5678U,
+        .ota_source_id = 1234U,
+    };
+    (void)dsd_call_state_observe(state, &observation, DSD_CALL_BOUNDARY_BEGIN);
     state->nxdn_cipher_type = 1;
     state->keyloader = 1;
     state->R = 42;
-    DSD_SNPRINTF(state->nxdn_call_type, sizeof(state->nxdn_call_type), "%s", "voice");
     DSD_MEMSET(state->nxdn_sacch_frame_segcrc, 0, sizeof(state->nxdn_sacch_frame_segcrc));
     DSD_MEMSET(state->nxdn_sacch_frame_segment, 0, sizeof(state->nxdn_sacch_frame_segment));
 }
@@ -183,12 +190,12 @@ seed_call_state(dsd_opts* opts, dsd_state* state) {
 static int
 expect_call_reset(const char* label, const dsd_opts* opts, const dsd_state* state, int alias_calls, int key_cleared) {
     int rc = 0;
+    dsd_call_snapshot call;
     rc |= expect_int(label, alias_calls, 1);
-    rc |= expect_int("call-reset-rid-reset", state->nxdn_last_rid, 0);
-    rc |= expect_int("call-reset-tg-reset", state->nxdn_last_tg, 0);
+    rc |= expect_int("call-reset-canonical-present", dsd_call_state_get(state, 0U, &call), 1);
+    rc |= expect_int("call-reset-canonical-ended", call.phase, DSD_CALL_PHASE_ENDED);
     rc |= expect_int("call-reset-cipher-reset", state->nxdn_cipher_type, 0);
     rc |= expect_int("call-reset-r-state", state->R, key_cleared ? 0 : 42);
-    rc |= expect_int("call-reset-call-type-cleared", state->nxdn_call_type[0], '\0');
     rc |= expect_int("call-reset-sacch-reset", all_sacch_segments_are(1U, state), 1);
     rc |= expect_float_close("call-reset-gain-reset", state->aout_gain, opts->audio_gain, 1e-6f);
     return rc;
@@ -216,12 +223,12 @@ test_message_type_reset_contract(void) {
     g_alias_reset_calls = 0;
     opts.floating_point = 0;
     nxdn_message_type(&opts, &state, 0xE8U);
+    dsd_call_snapshot call;
     rc |= expect_int("b54-tx-rel-alias-reset", g_alias_reset_calls, 1);
-    rc |= expect_int("b54-tx-rel-rid-reset", state.nxdn_last_rid, 0);
-    rc |= expect_int("b54-tx-rel-tg-reset", state.nxdn_last_tg, 0);
+    rc |= expect_int("b54-tx-rel-call-present", dsd_call_state_get(&state, 0U, &call), 1);
+    rc |= expect_int("b54-tx-rel-call-ended", call.phase, DSD_CALL_PHASE_ENDED);
     rc |= expect_int("b54-tx-rel-cipher-reset", state.nxdn_cipher_type, 0);
     rc |= expect_int("b54-tx-rel-keyloader-r-reset", state.R, 0);
-    rc |= expect_int("b54-tx-rel-call-type-cleared", state.nxdn_call_type[0], '\0');
     rc |= expect_int("b54-tx-rel-sacch-reset", all_sacch_segments_are(1U, &state), 1);
     rc |= expect_float_close("b54-tx-rel-floating-point-off-keeps-gain", state.aout_gain, 9.0f, 1e-6f);
 
@@ -230,15 +237,24 @@ test_message_type_reset_contract(void) {
 
     nxdn_message_type(&opts, &state, 0x07U);
     rc |= expect_int("tx-rel-ex-no-alias-reset", g_alias_reset_calls, 0);
-    rc |= expect_int("tx-rel-ex-rid-kept", state.nxdn_last_rid, 1234);
-    rc |= expect_int("tx-rel-ex-tg-kept", state.nxdn_last_tg, 5678);
+    rc |= expect_int("tx-rel-ex-call-present", dsd_call_state_get(&state, 0U, &call), 1);
+    rc |= expect_int("tx-rel-ex-call-active", call.phase, DSD_CALL_PHASE_ACTIVE);
+    rc |= expect_u32("tx-rel-ex-target-kept", (uint32_t)call.ota_target_id, 5678U);
     rc |= expect_int("tx-rel-ex-r-kept", state.R, 42);
     rc |= expect_float_close("tx-rel-ex-gain-reset", state.aout_gain, opts.audio_gain, 1e-6f);
 
     state.aout_gain = 7.0f;
     nxdn_message_type(&opts, &state, 0x10U);
     rc |= expect_float_close("idle-gain-kept", state.aout_gain, 7.0f, 1e-6f);
-    rc |= expect_int("idle-rid-kept", state.nxdn_last_rid, 1234);
+    rc |= expect_int("idle-no-alias-reset", g_alias_reset_calls, 0);
+    rc |= expect_int("idle-call-present", dsd_call_state_get(&state, 0U, &call), 1);
+    rc |= expect_int("idle-call-active", call.phase, DSD_CALL_PHASE_ACTIVE);
+    rc |= expect_u32("idle-target-kept", (uint32_t)call.ota_target_id, 5678U);
+    rc |= expect_int("idle-cipher-kept", state.nxdn_cipher_type, 1);
+    rc |= expect_int("idle-r-kept", state.R, 42);
+    rc |= expect_int("idle-sacch-kept", all_sacch_segments_are(0U, &state), 1);
+
+    dsd_state_ext_free_all(&state);
     return rc;
 }
 
@@ -249,7 +265,7 @@ main(void) {
     {
         static const uint8_t msg[] = {'1', '2', '3', '4', '5', '6', '7', '8', '9'};
         uint8_t bits[sizeof(msg) * 8];
-        unpack_byte_array_into_bit_array(msg, bits, (int)sizeof(msg));
+        DSD_UNPACK_ARRAY_TO_BITS(msg, bits, (int)sizeof(msg));
         uint32_t crc = nxdn_crc32_bits(bits, sizeof(bits));
         rc |= expect_u32("crc-123456789", crc, 0x0376E6E7U);
     }
@@ -257,7 +273,7 @@ main(void) {
     {
         static const uint8_t msg[] = {'A', 'R', 'I', 'B', 'T', 'E', 'S', 'T'};
         uint8_t bits[sizeof(msg) * 8];
-        unpack_byte_array_into_bit_array(msg, bits, (int)sizeof(msg));
+        DSD_UNPACK_ARRAY_TO_BITS(msg, bits, (int)sizeof(msg));
         uint32_t crc = nxdn_crc32_bits(bits, sizeof(bits));
         rc |= expect_u32("crc-aribtest", crc, 0x84201F67U);
     }

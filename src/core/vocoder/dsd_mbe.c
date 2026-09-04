@@ -21,6 +21,8 @@
 
 #include <dsd-neo/core/audio.h>
 #include <dsd-neo/core/bit_packing.h>
+#include <dsd-neo/core/call_state.h>
+#include <dsd-neo/core/events.h>
 #include <dsd-neo/core/file_io.h>
 #include <dsd-neo/core/keyring.h>
 #include <dsd-neo/core/opts.h>
@@ -323,22 +325,28 @@ typedef struct {
 } mbe_frame_ctx_t;
 
 static void
-mbe_prepare_frame_state(dsd_opts* opts, dsd_state* state, mbe_frame_ctx_t* frame_ctx,
-                        dsd_vocoder_soft_bit imbe7100_soft_fr[7][24]) {
+mbe_prepare_frame_state(dsd_state* state, mbe_frame_ctx_t* frame_ctx, dsd_vocoder_soft_bit imbe7100_soft_fr[7][24],
+                        const dsd_call_snapshot* call) {
     (void)imbe7100_soft_fr;
     frame_ctx->vertex_ks_applied_l = 0;
     frame_ctx->vertex_ks_applied_r = 0;
 
     (void)dsd_dmr_apply_forced_algid(state);
 
-    //these conditions should ensure no clashing with the BP/HBP/Scrambler key loading machanisms already coded in
-    if (state->currentslot == 0 && state->payload_algid != 0 && state->payload_algid != 0x80 && state->keyloader == 1) {
-        keyring_activate_slot(opts, state, state->currentslot);
-    }
+    const int slot = (state->currentslot == 1) ? 1 : 0;
+    const int algid = (slot == 0) ? state->payload_algid : state->payload_algidR;
 
-    if (state->currentslot == 1 && state->payload_algidR != 0 && state->payload_algidR != 0x80
-        && state->keyloader == 1) {
-        keyring_activate_slot(opts, state, state->currentslot);
+    // Unchanged gate: no ALG ID means the BP/HBP TG autoload owns the slot, and 0x80 stays with
+    // the scrambler path.
+    if (state->keyloader == 1 && algid != 0 && algid != 0x80) {
+        const int signaled = (slot == 0) ? state->payload_keyid : state->payload_keyidR;
+        // A --dmr-tg-key-csv row for the slot's active talkgroup selects its key id in place of
+        // the signaled one. The resolver hands back `signaled` whenever the map does not apply --
+        // including for every non-DMR protocol, whose snapshots are never mappable, and for a
+        // 16-bit P25 KID, which it refuses by width -- so there is one activation here rather
+        // than two paths to keep in sync.
+        const int kid = keyring_dmr_slot_kid_for_call(state, slot, call, dsd_dmr_alg_key_need(algid), signaled);
+        keyring_activate_slot_with_kid(state, slot, kid);
     }
 
     DSD_MEMSET(frame_ctx->imbe_d, 0, sizeof(frame_ctx->imbe_d));
@@ -708,7 +716,8 @@ mbe_init_nxdn_cipher23_keystream(dsd_state* state) {
         DSD_MEMSET(state->ks_bitstreamL, 0, sizeof(state->ks_bitstreamL));
         des_ofb_keystream_output(state->payload_miN, state->R, state->ks_octetL, 26);
         state->bit_counterL = 0;
-        unpack_byte_array_into_bit_array(state->ks_octetL + 8, state->ks_bitstreamL, 26 * 8);
+        dsd_unpack_bytes_to_bits(state->ks_octetL + 8, sizeof(state->ks_octetL) - 8U, state->ks_bitstreamL,
+                                 sizeof(state->ks_bitstreamL), (size_t)26U * 8U);
         state->nxdn_new_iv = 0;
     }
 
@@ -717,7 +726,8 @@ mbe_init_nxdn_cipher23_keystream(dsd_state* state) {
         DSD_MEMSET(state->ks_bitstreamL, 0, sizeof(state->ks_bitstreamL));
         aes_ofb_keystream_output(state->aes_iv, state->aes_key, state->ks_octetL, DSD_AES_KEY_256, 15);
         state->bit_counterL = 0;
-        unpack_byte_array_into_bit_array(state->ks_octetL + 16, state->ks_bitstreamL, 14 * 16);
+        dsd_unpack_bytes_to_bits(state->ks_octetL + 16, sizeof(state->ks_octetL) - 16U, state->ks_bitstreamL,
+                                 sizeof(state->ks_bitstreamL), (size_t)14U * 16U);
         state->nxdn_new_iv = 0;
     }
 }
@@ -791,7 +801,6 @@ static void
 mbe_slot_apply_straight_ks_left(dsd_state* state, char ambe_d[49]) {
     if (state->straight_ks == 1 && state->straight_mod > 0) {
         state->dmr_so = 0;
-        state->p25_service_options_valid[0] = 0;
         state->payload_algid = 0;
         straight_mod_xor_apply_frame49(state, state->currentslot, ambe_d);
     }
@@ -801,10 +810,22 @@ static void
 mbe_slot_apply_straight_ks_right(dsd_state* state, char ambe_d[49]) {
     if (state->straight_ks == 1 && state->straight_mod > 0) {
         state->dmr_soR = 0;
-        state->p25_service_options_valid[1] = 0;
         state->payload_algidR = 0;
         straight_mod_xor_apply_frame49(state, state->currentslot, ambe_d);
     }
+}
+
+static int
+mbe_post_dmr_mono_active(const dsd_opts* opts, const dsd_state* state) {
+    return opts->dmr_mono == 1 && DSD_SYNC_IS_DMR(state->synctype);
+}
+
+static int
+mbe_dmr_output_slot_enabled(const dsd_opts* opts, const dsd_state* state, int slot) {
+    if (!mbe_post_dmr_mono_active(opts, state)) {
+        return 1;
+    }
+    return state->dmr_mono_slot == slot;
 }
 
 static void
@@ -817,7 +838,8 @@ mbe_finalize_slot_left(dsd_opts* opts, dsd_state* state, char ambe_d[49], mbe_pr
     if (dsd_frame_detail_enabled(opts)) {
         PrintAMBEData(opts, state, ambe_d);
     }
-    if (opts->mbe_out_f != NULL && (state->dmr_encL == 0 || opts->dmr_mute_encL == 0)) {
+    if (mbe_dmr_output_slot_enabled(opts, state, 0) && opts->mbe_out_f != NULL
+        && (state->dmr_encL == 0 || opts->dmr_mute_encL == 0)) {
         saveAmbe2450Data(opts, state, ambe_d);
     }
 }
@@ -832,7 +854,8 @@ mbe_finalize_slot_right(dsd_opts* opts, dsd_state* state, char ambe_d[49], mbe_p
     if (dsd_frame_detail_enabled(opts)) {
         PrintAMBEData(opts, state, ambe_d);
     }
-    if (opts->mbe_out_fR != NULL && (state->dmr_encR == 0 || opts->dmr_mute_encR == 0)) {
+    if (mbe_dmr_output_slot_enabled(opts, state, 1) && opts->mbe_out_fR != NULL
+        && (state->dmr_encR == 0 || opts->dmr_mute_encR == 0)) {
         saveAmbe2450DataR(opts, state, ambe_d);
     }
 }
@@ -882,7 +905,11 @@ mbe_process_nxdn(dsd_opts* opts, dsd_state* state, char ambe_fr[4][24], dsd_voco
 static void
 mbeslot_left_autoload_keys(dsd_opts* opts, dsd_state* state) {
     if (state->M == 0 && state->payload_algid == 0) {
-        uint32_t hash = mbe_hash_tg_for_key((uint32_t)state->lasttg);
+        dsd_call_snapshot call;
+        uint32_t target = dsd_call_state_get(state, 0U, &call) > 0 && call.ota_target_id <= UINT32_MAX
+                              ? (uint32_t)call.ota_target_id
+                              : 0U;
+        uint32_t hash = mbe_hash_tg_for_key(target);
         if (state->rkey_array[hash] != 0) {
             state->K = state->rkey_array[hash] & 0xFF;                     //doesn't exceed 255
             state->K1 = state->H = state->rkey_array[hash] & 0xFFFFFFFFFF; //doesn't exceed 40-bit limit
@@ -896,7 +923,11 @@ mbeslot_left_autoload_keys(dsd_opts* opts, dsd_state* state) {
 static void
 mbeslot_right_autoload_keys(dsd_opts* opts, dsd_state* state) {
     if (state->M == 0 && state->payload_algidR == 0) {
-        uint32_t hash = mbe_hash_tg_for_key((uint32_t)state->lasttgR);
+        dsd_call_snapshot call;
+        uint32_t target = dsd_call_state_get(state, 1U, &call) > 0 && call.ota_target_id <= UINT32_MAX
+                              ? (uint32_t)call.ota_target_id
+                              : 0U;
+        uint32_t hash = mbe_hash_tg_for_key(target);
         if (state->rkey_array[hash] != 0) {
             state->K = state->rkey_array[hash] & 0xFF;
             state->K1 = state->H = state->rkey_array[hash] & 0xFFFFFFFFFF;
@@ -1489,9 +1520,19 @@ mbe_post_left_apply_decryptability(dsd_state* state, const mbe_frame_ctx_t* fram
     }
 }
 
+static int
+mbe_post_stereo_active(const dsd_opts* opts, const dsd_state* state) {
+    return opts->dmr_stereo == 1 || (DSD_SYNC_IS_DMR(state->synctype) && state->dmr_stereo == 1);
+}
+
 static void
 mbe_post_left_audio(dsd_opts* opts, dsd_state* state, const mbe_frame_ctx_t* frame_ctx) {
-    if (opts->dmr_stereo != 1 || state->currentslot != 0) {
+    const int dmr_mono_active = mbe_post_dmr_mono_active(opts, state);
+    if (dmr_mono_active && !mbe_dmr_output_slot_enabled(opts, state, 0)) {
+        state->dmr_encL = 1;
+        return;
+    }
+    if ((!dmr_mono_active && !mbe_post_stereo_active(opts, state)) || state->currentslot != 0) {
         return;
     }
 
@@ -1527,7 +1568,12 @@ mbe_post_right_apply_decryptability(dsd_state* state, const mbe_frame_ctx_t* fra
 
 static void
 mbe_post_right_audio(dsd_opts* opts, dsd_state* state, const mbe_frame_ctx_t* frame_ctx) {
-    if (opts->dmr_stereo != 1 || state->currentslot != 1) {
+    const int dmr_mono_active = mbe_post_dmr_mono_active(opts, state);
+    if (dmr_mono_active && !mbe_dmr_output_slot_enabled(opts, state, 1)) {
+        state->dmr_encR = 1;
+        return;
+    }
+    if ((!dmr_mono_active && !mbe_post_stereo_active(opts, state)) || state->currentslot != 1) {
         return;
     }
 
@@ -1589,7 +1635,7 @@ mbe_post_other_copy_float_buffer(dsd_state* state, int is_p25p2) {
 
 static void
 mbe_post_other_audio(const dsd_opts* opts, dsd_state* state) {
-    if (opts->dmr_stereo != 0) {
+    if (mbe_post_dmr_mono_active(opts, state) || mbe_post_stereo_active(opts, state)) {
         return;
     }
 
@@ -1623,7 +1669,19 @@ mbe_post_mono_left_audio(const dsd_opts* opts, dsd_state* state) {
 
 static int
 mbe_post_allow_mono_wav(const dsd_opts* opts, const dsd_state* state) {
-    if (opts->static_wav_file != 0 || opts->wav_out_f == NULL || opts->dmr_stereo != 0) {
+    const int dmr_mono_active = mbe_post_dmr_mono_active(opts, state);
+    const int slot = (dmr_mono_active && state->currentslot == 1) ? 1 : 0;
+    if (opts->static_wav_file != 0) {
+        return 0;
+    }
+    if (dmr_mono_active) {
+        if (!mbe_dmr_output_slot_enabled(opts, state, slot)) {
+            return 0;
+        }
+    } else if (mbe_post_stereo_active(opts, state)) {
+        return 0;
+    }
+    if ((slot == 0 ? opts->wav_out_f : opts->wav_out_fR) == NULL) {
         return 0;
     }
     int allow_wav = 0;
@@ -1632,7 +1690,8 @@ mbe_post_allow_mono_wav(const dsd_opts* opts, const dsd_state* state) {
 
 static int
 mbe_post_allow_stereo_slot_wav(const dsd_opts* opts, const dsd_state* state, int slot) {
-    if (opts->dmr_stereo_wav != 1 || opts->dmr_stereo != 1 || state->currentslot != slot) {
+    if (opts->dmr_stereo_wav != 1 || !mbe_post_stereo_active(opts, state) || mbe_post_dmr_mono_active(opts, state)
+        || state->currentslot != slot) {
         return 0;
     }
     int allow_wav = 0;
@@ -1655,7 +1714,11 @@ mbe_post_wav_outputs(dsd_opts* opts, dsd_state* state) {
     }
 
     if (mbe_post_allow_mono_wav(opts, state)) {
-        writeSynthesizedVoice(opts, state);
+        if (mbe_post_dmr_mono_active(opts, state) && state->dmr_mono_slot == 1) {
+            writeSynthesizedVoiceR(opts, state);
+        } else {
+            writeSynthesizedVoice(opts, state);
+        }
     }
     if (mbe_post_allow_stereo_slot_wav(opts, state, 0)) {
         writeSynthesizedVoice(opts, state);
@@ -1711,7 +1774,7 @@ playMbeFiles(dsd_opts* opts, dsd_state* state, int argc, char** argv) {
                     break;
                 }
             }
-            if (exitflag == 1) {
+            if (dsd_exitflag_load() == 1) {
                 dsd_request_shutdown(opts, state);
                 break;
             }
@@ -1720,10 +1783,125 @@ playMbeFiles(dsd_opts* opts, dsd_state* state, int argc, char** argv) {
             fclose(opts->mbe_in_f); //close file after playing it
             opts->mbe_in_f = NULL;
         }
-        if (exitflag == 1) {
+        if (dsd_exitflag_load() == 1) {
             return;
         }
     }
+}
+
+static int
+mark_vocoder_call_media_sync_supported(int protocol) {
+    return DSD_SYNC_IS_P25P1(protocol) || protocol == DSD_SYNC_X2TDMA_VOICE_POS || protocol == DSD_SYNC_X2TDMA_VOICE_NEG
+           || DSD_SYNC_IS_DSTAR(protocol) || protocol == DSD_SYNC_DMR_BS_VOICE_POS
+           || protocol == DSD_SYNC_DMR_BS_VOICE_NEG || protocol == DSD_SYNC_DMR_MS_VOICE
+           || DSD_SYNC_IS_PROVOICE(protocol) || DSD_SYNC_IS_NXDN(protocol) || DSD_SYNC_IS_YSF(protocol)
+           || DSD_SYNC_IS_DPMR(protocol);
+}
+
+typedef enum {
+    MBE_MEDIA_FAMILY_NONE,
+    MBE_MEDIA_FAMILY_P25P1,
+    MBE_MEDIA_FAMILY_X2TDMA,
+    MBE_MEDIA_FAMILY_DSTAR,
+    MBE_MEDIA_FAMILY_DMR,
+    MBE_MEDIA_FAMILY_PROVOICE,
+    MBE_MEDIA_FAMILY_NXDN,
+    MBE_MEDIA_FAMILY_YSF,
+    MBE_MEDIA_FAMILY_DPMR,
+} mbe_media_protocol_family;
+
+static int
+mark_vocoder_call_media_protocol_family(int protocol) {
+    if (DSD_SYNC_IS_P25P1(protocol)) {
+        return MBE_MEDIA_FAMILY_P25P1;
+    }
+    if (DSD_SYNC_IS_X2TDMA(protocol)) {
+        return MBE_MEDIA_FAMILY_X2TDMA;
+    }
+    if (DSD_SYNC_IS_DSTAR(protocol)) {
+        return MBE_MEDIA_FAMILY_DSTAR;
+    }
+    if (DSD_SYNC_IS_DMR(protocol)) {
+        return MBE_MEDIA_FAMILY_DMR;
+    }
+    if (DSD_SYNC_IS_PROVOICE(protocol)) {
+        return MBE_MEDIA_FAMILY_PROVOICE;
+    }
+    if (DSD_SYNC_IS_NXDN(protocol)) {
+        return MBE_MEDIA_FAMILY_NXDN;
+    }
+    if (DSD_SYNC_IS_YSF(protocol)) {
+        return MBE_MEDIA_FAMILY_YSF;
+    }
+    return DSD_SYNC_IS_DPMR(protocol) ? MBE_MEDIA_FAMILY_DPMR : MBE_MEDIA_FAMILY_NONE;
+}
+
+static int
+mark_vocoder_call_media_protocol_compatible(int decoder_protocol, int call_protocol) {
+    const int decoder_family = mark_vocoder_call_media_protocol_family(decoder_protocol);
+    const int call_family = mark_vocoder_call_media_protocol_family(call_protocol);
+    if (decoder_family != MBE_MEDIA_FAMILY_NONE && decoder_family == call_family) {
+        return 1;
+    }
+
+    /* YSF and scrambled dPMR temporarily select another synctype to reuse an MBE decoder. */
+    if (call_family == MBE_MEDIA_FAMILY_YSF
+        && (decoder_family == MBE_MEDIA_FAMILY_NXDN || decoder_family == MBE_MEDIA_FAMILY_P25P1)) {
+        return 1;
+    }
+    return call_family == MBE_MEDIA_FAMILY_DPMR && decoder_family == MBE_MEDIA_FAMILY_NXDN;
+}
+
+static uint8_t
+mark_vocoder_call_media_slot(int protocol, int current_slot) {
+    if ((DSD_SYNC_IS_X2TDMA(protocol) || DSD_SYNC_IS_DMR(protocol)) && current_slot == 1) {
+        return 1U;
+    }
+    return 0U;
+}
+
+// Returns 1 and fills *out_call when the slot carries a matching active call, so the caller can
+// reuse this snapshot instead of taking the lock a second time. dsd_call_state_update_media()
+// below touches only media_active, which no reader here reads.
+//
+// A BEGIN taken here can still hand back an immediately-mappable snapshot: dsd_call_state_observe()
+// specializes a provisional (identity-less) epoch rather than forking, and reacquires a
+// recoverably-ended one, seeding it with the ending epoch's kind/target/etc. -- e.g. a brief
+// sync loss mid-call, or late entry that lands between the previous epoch's end and this
+// transmission's own header. Either way the just-observed epoch may already carry real identity,
+// so the snapshot taken before the observe() is stale and this re-fetches after it rather than
+// handing back NULL for that frame. The extra lock+copy only happens on this rare BEGIN frame,
+// not the ~50 Hz steady state, which is what the reuse path above still avoids.
+static int
+mark_vocoder_call_media(dsd_opts* opts, dsd_state* state, dsd_call_snapshot* out_call) {
+    int protocol = state->synctype;
+    const int voice_sync = mark_vocoder_call_media_sync_supported(protocol);
+    if (!voice_sync) {
+        return 0;
+    }
+    const uint8_t slot = mark_vocoder_call_media_slot(protocol, state->currentslot);
+    dsd_call_snapshot call;
+    int has_active = dsd_call_state_get(state, slot, &call) > 0 && call.phase == DSD_CALL_PHASE_ACTIVE
+                     && mark_vocoder_call_media_protocol_compatible(protocol, call.protocol);
+    if (!has_active) {
+        const dsd_call_observation observation = {
+            .protocol = protocol,
+            .slot = slot,
+            .kind = DSD_CALL_KIND_VOICE,
+        };
+        if (dsd_call_state_observe(state, &observation, DSD_CALL_BOUNDARY_BEGIN) > 0) {
+            dsd_event_sync_slot(opts, state, slot);
+            has_active = dsd_call_state_get(state, slot, &call) > 0 && call.phase == DSD_CALL_PHASE_ACTIVE
+                         && mark_vocoder_call_media_protocol_compatible(protocol, call.protocol);
+        }
+    }
+    (void)dsd_call_state_update_media(state, slot, 1, 0.0);
+
+    if (has_active && out_call != NULL) {
+        *out_call = call;
+        return 1;
+    }
+    return 0;
 }
 
 static void
@@ -1731,8 +1909,10 @@ processMbeFrameInternal(dsd_opts* opts, dsd_state* state, char imbe_fr[8][23], c
                         char imbe7100_fr[7][24], dsd_vocoder_soft_bit imbe_soft_fr[8][23],
                         dsd_vocoder_soft_bit ambe_soft_fr[4][24], dsd_vocoder_soft_bit imbe7100_soft_fr[7][24]) {
     mbe_frame_ctx_t frame_ctx;
+    dsd_call_snapshot call;
 
-    mbe_prepare_frame_state(opts, state, &frame_ctx, imbe7100_soft_fr);
+    const int have_call = mark_vocoder_call_media(opts, state, &call);
+    mbe_prepare_frame_state(state, &frame_ctx, imbe7100_soft_fr, have_call ? &call : NULL);
 
     if (DSD_SYNC_IS_P25P1(state->synctype)) {
         mbe_process_p25p1(opts, state, imbe_fr, imbe_soft_fr, &frame_ctx);

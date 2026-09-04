@@ -12,6 +12,7 @@
 
 #include <assert.h>
 #include <dsd-neo/app_control/commands.h>
+#include <dsd-neo/app_control/rr_import_apply.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/safe_api.h>
 #include <dsd-neo/core/state.h>
@@ -170,6 +171,11 @@ dsd_app_command_set_config_metadata(const dsd_app_config_metadata_payload* paylo
     }
     g_config_metadata_calls++;
     return capture_command(DSD_APP_CMD_CONFIG_METADATA_SET, payload, payload ? sizeof *payload : 0U);
+}
+
+int
+dsd_app_command_set_rr_account(const dsd_app_rr_account_payload* payload) {
+    return capture_command(DSD_APP_CMD_RR_ACCOUNT_SET, payload, payload ? sizeof *payload : 0U);
 }
 
 void ui_statusf(const char* fmt, ...) DSD_ATTR_FORMAT(printf, 1, 2);
@@ -491,10 +497,6 @@ test_path_and_file_callbacks(void) {
     rc |= expect_cmd_string("symbol capture command", DSD_APP_CMD_SYMCAP_OPEN, "symbols.bin");
 
     reset_capture();
-    cb_io_read_symbol_bin(&ctx, "replay.bin");
-    rc |= expect_cmd_string("symbol input read command", DSD_APP_CMD_SYMBOL_IN_OPEN, "replay.bin");
-
-    reset_capture();
     cb_switch_to_wav(&ctx, "input.wav");
     rc |= expect_cmd_string("wav input command", DSD_APP_CMD_INPUT_WAV_SET, "input.wav");
 
@@ -505,6 +507,16 @@ test_path_and_file_callbacks(void) {
     reset_capture();
     cb_switch_to_symbol(&ctx, "stream.raw");
     rc |= expect_cmd_string("symbol stream route", DSD_APP_CMD_INPUT_SYM_STREAM_SET, "stream.raw");
+
+    reset_capture();
+    cb_switch_to_symbol(&ctx, "stream.sym");
+    rc |= expect_cmd_string("symbol sym stream route", DSD_APP_CMD_INPUT_SYM_STREAM_SET, "stream.sym");
+
+    /* Nothing appends ".bin" to a capture the operator named, so an unsuffixed path
+       is a capture, not a stream. */
+    reset_capture();
+    cb_switch_to_symbol(&ctx, "site-769");
+    rc |= expect_cmd_string("unsuffixed capture route", DSD_APP_CMD_SYMBOL_IN_OPEN, "site-769");
 
     return rc;
 }
@@ -621,9 +633,48 @@ test_typed_callbacks_clamp_and_cancel(void) {
     rc |= expect_int("slot pref clamped zero-based", cmd_i32(), 1);
 
     reset_capture();
-    cb_slots_on(&ctx, 1, -9);
-    rc |= expect_int("slot mask command", g_cmd.id, DSD_APP_CMD_SLOTS_ONOFF_SET);
-    rc |= expect_int("slot mask clamped", cmd_i32(), 0);
+    cb_scan_voice_qualify(&ctx, 0, 1500);
+    rc |= expect_int("canceled voice qualify no command", g_cmd.calls, 0);
+
+    reset_capture();
+    cb_scan_voice_qualify(&ctx, 1, 50);
+    rc |= expect_int("voice qualify command", g_cmd.id, DSD_APP_CMD_SCAN_VOICE_QUALIFY_MS_SET);
+    rc |= expect_int("voice qualify clamped low", cmd_i32(), 100);
+    rc |= expect_int("voice qualify adjusted status", strstr(g_status, "adjusted") != NULL, 1);
+
+    reset_capture();
+    cb_scan_voice_qualify(&ctx, 1, 9999999);
+    rc |= expect_int("voice qualify high command", g_cmd.id, DSD_APP_CMD_SCAN_VOICE_QUALIFY_MS_SET);
+    rc |= expect_int("voice qualify clamped high", cmd_i32(), 600000);
+    rc |= expect_int("voice qualify high adjusted status", strstr(g_status, "adjusted") != NULL, 1);
+
+    reset_capture();
+    cb_scan_voice_qualify(&ctx, 1, 1500);
+    rc |= expect_int("voice qualify kept command", g_cmd.id, DSD_APP_CMD_SCAN_VOICE_QUALIFY_MS_SET);
+    rc |= expect_int("voice qualify kept", cmd_i32(), 1500);
+    rc |= expect_int("voice qualify applying status", strstr(g_status, "Applying voice qualify") != NULL, 1);
+
+    reset_capture();
+    cb_scan_voice_hold(&ctx, 0, 2500);
+    rc |= expect_int("canceled voice hold no command", g_cmd.calls, 0);
+
+    reset_capture();
+    cb_scan_voice_hold(&ctx, 1, 50);
+    rc |= expect_int("voice hold command", g_cmd.id, DSD_APP_CMD_SCAN_VOICE_HOLD_MS_SET);
+    rc |= expect_int("voice hold clamped low", cmd_i32(), 100);
+    rc |= expect_int("voice hold adjusted status", strstr(g_status, "adjusted") != NULL, 1);
+
+    reset_capture();
+    cb_scan_voice_hold(&ctx, 1, 9999999);
+    rc |= expect_int("voice hold high command", g_cmd.id, DSD_APP_CMD_SCAN_VOICE_HOLD_MS_SET);
+    rc |= expect_int("voice hold clamped high", cmd_i32(), 600000);
+    rc |= expect_int("voice hold high adjusted status", strstr(g_status, "adjusted") != NULL, 1);
+
+    reset_capture();
+    cb_scan_voice_hold(&ctx, 1, 2500);
+    rc |= expect_int("voice hold kept command", g_cmd.id, DSD_APP_CMD_SCAN_VOICE_HOLD_MS_SET);
+    rc |= expect_int("voice hold kept", cmd_i32(), 2500);
+    rc |= expect_int("voice hold applying status", strstr(g_status, "Applying voice hold") != NULL, 1);
 
     return rc;
 }

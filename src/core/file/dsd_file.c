@@ -23,6 +23,7 @@
 #include <dsd-neo/core/audio.h>
 #include <dsd-neo/core/bit_packing.h>
 #include <dsd-neo/core/bp.h>
+#include <dsd-neo/core/call_state.h>
 #include <dsd-neo/core/constants.h>
 #include <dsd-neo/core/events.h>
 #include <dsd-neo/core/file_io.h>
@@ -292,15 +293,17 @@ PrintAMBEData(dsd_opts* opts, const dsd_state* state, const char* ambe_d) {
     }
 
     if (opts->payload == 1) {
+        int dmr_mono_active = opts->dmr_mono == 1 && DSD_SYNC_IS_DMR(state->synctype);
+
         //preceeding line break, if required
-        if (opts->dmr_stereo == 0) {
+        if (opts->dmr_stereo == 0 && !dmr_mono_active) {
             DSD_FPRINTF(stderr, "\n");
         }
 
         DSD_FPRINTF(stderr, " AMBE %014llX err = [%X] [%X] ", ambe, errs, errs2);
 
         //trailing line break, if required
-        if (opts->dmr_stereo == 1) {
+        if (opts->dmr_stereo == 1 || dmr_mono_active) {
             DSD_FPRINTF(stderr, "\n");
         }
     }
@@ -785,8 +788,8 @@ wav_file_get_size_or_negative(const char* filename) {
 }
 
 SNDFILE*
-close_and_rename_wav_file(SNDFILE* wav_file, const dsd_opts* opts, const char* wav_out_filename, const char* dir,
-                          const Event_History_I* event_struct) {
+close_and_rename_wav_file_ex(SNDFILE* wav_file, const dsd_opts* opts, const char* wav_out_filename, const char* dir,
+                             const Event_History_I* event_struct, int export_call) {
     if (wav_file != NULL) {
         sf_close(wav_file);
     }
@@ -823,7 +826,7 @@ close_and_rename_wav_file(SNDFILE* wav_file, const dsd_opts* opts, const char* w
         return wav_file;
     }
 
-    if (opts && final_size > 44) {
+    if (export_call && opts && final_size > 44) {
         if (dsd_rdio_export_call(opts, event_struct, new_filename) != 0) {
             LOG_WARN("Rdio export failed for %s\n", new_filename);
         }
@@ -831,6 +834,12 @@ close_and_rename_wav_file(SNDFILE* wav_file, const dsd_opts* opts, const char* w
 
     wav_file = NULL;
     return wav_file;
+}
+
+SNDFILE*
+close_and_rename_wav_file(SNDFILE* wav_file, const dsd_opts* opts, const char* wav_out_filename, const char* dir,
+                          const Event_History_I* event_struct) {
+    return close_and_rename_wav_file_ex(wav_file, opts, wav_out_filename, dir, event_struct, 1);
 }
 
 void
@@ -908,14 +917,7 @@ rotate_symbol_out_file(dsd_opts* opts, dsd_state* state) {
             DSD_MEMSET(event_str, 0, sizeof(event_str));
             DSD_SNPRINTF(event_str, sizeof(event_str), "DSD-neo Dibit Capture File Rotated: %s;",
                          opts->symbol_out_file);
-            watchdog_event_datacall(opts, state, 0xFFFFFF, 0xFFFFFF, event_str, 0);
-            dsd_event_history_item_set_metadata(&state->event_history_s[0].Event_History_Items[0],
-                                                DSD_EVENT_SEVERITY_INFO, DSD_EVENT_CATEGORY_SYSTEM);
-            dsd_event_history_mark_dirty(&state->event_history_s[0]);
-            state->lastsrc =
-                0; //this could wipe a call, but usually on TDMA cc's, slot 1 is the control channel, so may never be set when this is run
-            watchdog_event_history(opts, state, 0);
-            watchdog_event_current(opts, state, 0);
+            (void)dsd_event_emit_system_notice(opts, state, 0U, event_str);
 
             opts->symbol_out_file_creation_time = time(NULL);
         }
@@ -940,7 +942,8 @@ pack_ambe(const char* input, uint8_t* output, int len) {
 //unpack byte array with ambe data into a 49-bit bitwise array
 void
 unpack_ambe(const uint8_t* input, char* ambe) {
-    unpack_byte_array_into_bit_array(input, (uint8_t*)ambe, 6);
+    // Contract: input spans at least 7 octets, ambe at least 49 bit elements.
+    dsd_unpack_bytes_to_bits(input, 7U, (uint8_t*)ambe, 49U, 6U);
     ambe[48] = input[6] >> 7;
 }
 
@@ -1216,12 +1219,10 @@ sdrtrunk_build_voice_keystream_bits(const dsd_state* state, uint8_t alg_id, uint
     }
 
     DSD_MEMSET(out_bits, 0, out_bits_cap);
-    size_t unpack_bytes = SDRTRUNK_KS_BYTES - skip_bytes;
-    size_t max_unpack = out_bits_cap / 8;
-    if (unpack_bytes > max_unpack) {
-        unpack_bytes = max_unpack;
-    }
-    unpack_byte_array_into_bit_array(ks_bytes + skip_bytes, out_bits, (int)unpack_bytes);
+    // Filling whatever of the keystream fits the caller's buffer is the intent here.
+    const size_t unpack_bytes = SDRTRUNK_KS_BYTES - skip_bytes;
+    dsd_unpack_bytes_to_bits_truncating(ks_bytes + skip_bytes, sizeof(ks_bytes) - skip_bytes, out_bits, out_bits_cap,
+                                        unpack_bytes);
     return 1;
 }
 
@@ -1478,12 +1479,27 @@ typedef struct {
     uint16_t key_id;
     int rc4_db;
     int rc4_mod;
+    // Raw IV bytes of the last "encryption_mi", kept so a keystream can be rebuilt from the same
+    // IV once a later token resolves a different key id (see sdrtrunk_json_apply_dmr_tg_key_map()).
+    uint8_t mi_iv[8];
+    uint8_t mi_seen;
+    // Key id ctx->ks was last built from -- not necessarily ctx->key_id, which is the signaled one.
+    // ks_built qualifies it: 0x00 is a legal key id, so ks_key_id alone cannot say "never built".
+    uint16_t ks_key_id;
+    uint8_t ks_built;
+    // Key id the --dmr-tg-key-csv map last installed, and whether one is installed at all. The
+    // map applies on partially-parsed records, so it has to be able to take itself back out.
+    uint16_t map_kid;
+    uint8_t map_applied;
     uint8_t ks[3000];
     uint16_t ks_idx;
     uint8_t ks_i[3000];
     uint16_t ks_idx_i;
     int imbe_counter;
     int ambe2_counter;
+    dsd_call_kind kind;
+    uint32_t source_id;
+    uint32_t target_id;
 } sdrtrunk_json_context;
 
 static char*
@@ -1504,20 +1520,27 @@ sdrtrunk_json_context_init(sdrtrunk_json_context* ctx) {
     ctx->key_id = 0;
     ctx->rc4_db = 256;
     ctx->rc4_mod = 13;
+    DSD_MEMSET(ctx->mi_iv, 0, sizeof(ctx->mi_iv));
+    ctx->mi_seen = 0;
+    ctx->ks_key_id = 0;
+    ctx->ks_built = 0;
+    ctx->map_kid = 0;
+    ctx->map_applied = 0;
     DSD_MEMSET(ctx->ks, 0, sizeof(ctx->ks));
     ctx->ks_idx = 0;
     DSD_MEMSET(ctx->ks_i, 0, sizeof(ctx->ks_i));
     ctx->ks_idx_i = 808;
     ctx->imbe_counter = 0;
     ctx->ambe2_counter = 0;
+    ctx->kind = DSD_CALL_KIND_VOICE;
+    ctx->source_id = 0U;
+    ctx->target_id = 0U;
 }
 
 static void
 sdrtrunk_json_reset_event_state(dsd_state* state) {
     state->dmr_color_code = 0;
-    state->lastsrc = 0;
-    state->lasttg = 0;
-    state->gi[0] = -1;
+    (void)dsd_call_state_end(state, 0U, 0.0);
     state->synctype = DSD_SYNC_NONE;
     state->lastsynctype = DSD_SYNC_NONE;
 }
@@ -1550,6 +1573,14 @@ sdrtrunk_json_apply_forced_basic_privacy(const dsd_state* state, sdrtrunk_json_c
     ctx->ks_available = 1;
 }
 
+// ctx->kind stays DSD_CALL_KIND_VOICE until a call_type token is seen, and apply_forced_algid()
+// runs on tokens that precede it. Only an explicit PRIVATE reading suppresses the map, so the
+// not-yet-known default behaves like the implicit target-keyed lookup it sits beside.
+static int
+sdrtrunk_json_target_is_group(const sdrtrunk_json_context* ctx) {
+    return ctx->kind != DSD_CALL_KIND_PRIVATE_VOICE;
+}
+
 static void
 sdrtrunk_json_apply_forced_algid(dsd_state* state, sdrtrunk_json_context* ctx) {
     if (state->M >= 0x21 && state->M <= 0x25) {
@@ -1560,19 +1591,56 @@ sdrtrunk_json_apply_forced_algid(dsd_state* state, sdrtrunk_json_context* ctx) {
         state->payload_algid = ctx->alg_id;
         ctx->rc4_db = 256;
         ctx->rc4_mod = 9;
-        if (state->keyloader == 1 && state->lasttg != 0 && state->lasttg < 0x1FFFF
-            && state->rkey_array[state->lasttg] != 0) {
-            state->R = state->rkey_array[state->lasttg];
+        // The keystream below is built from a key id, not from state->R, so the resolved id has to
+        // survive past the activation: state->R is only a fallback inside the RC4 builder and is
+        // ignored outright by the AES one.
+        uint16_t effective_kid = ctx->key_id;
+        if (state->keyloader == 1) {
+            int mapped = 0;
+            // Gated the same way the file's other two resolutions are: state->M is a
+            // --dmr-force-algid value, not a protocol, so without the DMR test a P25 replay run
+            // with that flag would let a colliding DMR map row key its audio. The resolver's own
+            // width guard keeps a 16-bit P25 KID from being resolved as its low byte. The
+            // target-indexed fallback below keeps its original gating either way.
+            if (DSD_SYNC_IS_DMR(state->synctype)) {
+                const int kid =
+                    keyring_dmr_effective_kid(state, ctx->target_id, sdrtrunk_json_target_is_group(ctx),
+                                              dsd_dmr_alg_key_need((int)ctx->alg_id), (int)ctx->key_id, &mapped);
+                if (mapped) {
+                    keyring_activate_slot_with_kid(state, 0, kid);
+                    effective_kid = (uint16_t)kid;
+                }
+            }
+            if (!mapped && ctx->target_id != 0U && ctx->target_id < 0x1FFFFU
+                && state->rkey_array[ctx->target_id] != 0) {
+                // Pre-existing implicit "key indexed by talkgroup" replay convention. Kept as the
+                // fallback so replay workflows that depend on it are unchanged when no row matches.
+                state->R = state->rkey_array[ctx->target_id];
+            }
         }
-        if (ctx->alg_id == 0x21 && state->R != 0 && state->payload_mi != 0) {
-            uint8_t iv64[8] = {0};
-            iv64[4] = (uint8_t)((state->payload_mi >> 24ULL) & 0xFFULL);
-            iv64[5] = (uint8_t)((state->payload_mi >> 16ULL) & 0xFFULL);
-            iv64[6] = (uint8_t)((state->payload_mi >> 8ULL) & 0xFFULL);
-            iv64[7] = (uint8_t)((state->payload_mi >> 0ULL) & 0xFFULL);
-            ctx->ks_available =
-                (uint8_t)sdrtrunk_build_voice_keystream_bits(state, ctx->alg_id, ctx->key_id, iv64, ctx->rc4_db,
-                                                             ctx->rc4_mod, ctx->protocol, ctx->ks, sizeof(ctx->ks));
+        if (ctx->alg_id == 0x21) {
+            if (state->R != 0 && state->payload_mi != 0) {
+                uint8_t iv64[8] = {0};
+                iv64[4] = (uint8_t)((state->payload_mi >> 24ULL) & 0xFFULL);
+                iv64[5] = (uint8_t)((state->payload_mi >> 16ULL) & 0xFFULL);
+                iv64[6] = (uint8_t)((state->payload_mi >> 8ULL) & 0xFFULL);
+                iv64[7] = (uint8_t)((state->payload_mi >> 0ULL) & 0xFFULL);
+                ctx->ks_available =
+                    (uint8_t)sdrtrunk_build_voice_keystream_bits(state, ctx->alg_id, effective_kid, iv64, ctx->rc4_db,
+                                                                 ctx->rc4_mod, ctx->protocol, ctx->ks, sizeof(ctx->ks));
+                // This path owns ctx->ks on every token once an MI is known, and it uses its own
+                // payload_mi-derived IV. Recording the id it used keeps the map's rebuild below
+                // from overwriting this keystream with one built from the raw "encryption_mi"
+                // bytes.
+                ctx->ks_key_id = effective_kid;
+                ctx->ks_built = 1;
+            } else {
+                // No key or no IV yet: we have no keystream. Leaving the previous token's in place
+                // kept the decoder XORing against an earlier key while still reporting the record
+                // decryptable. Self-corrects on the next token once the MI lands, like everything
+                // else in this file.
+                ctx->ks_available = 0;
+            }
         }
         return;
     }
@@ -1647,7 +1715,7 @@ sdrtrunk_json_handle_protocol(dsd_opts* opts, dsd_state* state, const char* toke
 }
 
 static int
-sdrtrunk_json_handle_call_type(dsd_state* state, const char* token, char** str_saveptr) {
+sdrtrunk_json_handle_call_type(const char* token, char** str_saveptr, sdrtrunk_json_context* ctx) {
     if (strncmp("call_type", token, 9) != 0) {
         return 0;
     }
@@ -1656,7 +1724,7 @@ sdrtrunk_json_handle_call_type(dsd_state* state, const char* token, char** str_s
     if (!value) {
         return 1;
     }
-    state->gi[0] = (strncmp("GROUP", value, 5) == 0) ? 0 : 1;
+    ctx->kind = (strncmp("GROUP", value, 5) == 0) ? DSD_CALL_KIND_GROUP_VOICE : DSD_CALL_KIND_PRIVATE_VOICE;
     DSD_FPRINTF(stderr, "\n Call Type: %s", value);
     return 1;
 }
@@ -1679,12 +1747,12 @@ sdrtrunk_json_handle_encrypted(const char* token, char** str_saveptr, sdrtrunk_j
 }
 
 static int
-sdrtrunk_json_handle_to_from(dsd_state* state, const char* token, char** str_saveptr) {
+sdrtrunk_json_handle_to_from(sdrtrunk_json_context* ctx, const char* token, char** str_saveptr) {
     if (strncmp("to", token, 2) == 0) {
         char* value = sdrtrunk_json_next_value(str_saveptr);
         if (value) {
             uint32_t parsed = 0;
-            state->lasttg = (dsd_parse_uint32_strict(value, 10, UINT32_MAX, &parsed) == 0) ? parsed : 0U;
+            ctx->target_id = (dsd_parse_uint32_strict(value, 10, UINT32_MAX, &parsed) == 0) ? parsed : 0U;
             DSD_FPRINTF(stderr, "\n To: %s", value);
         }
         return 1;
@@ -1693,7 +1761,7 @@ sdrtrunk_json_handle_to_from(dsd_state* state, const char* token, char** str_sav
         char* value = sdrtrunk_json_next_value(str_saveptr);
         if (value) {
             uint32_t parsed = 0;
-            state->lastsrc = (dsd_parse_uint32_strict(value, 10, UINT32_MAX, &parsed) == 0) ? parsed : 0U;
+            ctx->source_id = (dsd_parse_uint32_strict(value, 10, UINT32_MAX, &parsed) == 0) ? parsed : 0U;
             DSD_FPRINTF(stderr, "\n From: %s", value);
         }
         return 1;
@@ -1757,28 +1825,96 @@ sdrtrunk_json_extract_iv(const char* value, char iv_str[20]) {
     dsd_strncpy_s(iv_str, 20U, value, iv_len);
 }
 
+// key_id is the id that will actually decrypt, which is not always the signaled ctx->key_id: the
+// builders index rkey_array by key id and only consult state->R as a fallback, and the AES builder
+// never reads state->R at all -- so activating a mapped key without threading its id through here
+// leaves replay audio decrypting with the signaled key.
 static uint8_t
 sdrtrunk_json_build_keystreams(const dsd_opts* opts, const dsd_state* state, sdrtrunk_json_context* ctx,
-                               const char* iv_str) {
-    uint8_t iv64[8];
-    DSD_MEMSET(iv64, 0, sizeof(iv64));
-    (void)parse_raw_user_string(iv_str, iv64, sizeof(iv64));
+                               uint16_t key_id) {
     if (ctx->is_enc != 1) {
         return 0;
     }
 
+    // ks_built is the latch the map's rebuild guard reads. It is set here, not before the bail
+    // above: a record whose "encrypted"/"encryption_algorithm" token follows "encryption_mi"
+    // reaches this with is_enc still 0, and latching then would suppress the rebuild that has to
+    // happen once is_enc flips. Callers that must not re-enter on a non-encrypted record test
+    // ctx->is_enc themselves.
+    ctx->ks_built = 1;
+    ctx->ks_key_id = key_id;
     uint8_t ks_available = (uint8_t)sdrtrunk_build_voice_keystream_bits(
-        state, ctx->alg_id, ctx->key_id, iv64, ctx->rc4_db, ctx->rc4_mod, ctx->protocol, ctx->ks, sizeof(ctx->ks));
+        state, ctx->alg_id, key_id, ctx->mi_iv, ctx->rc4_db, ctx->rc4_mod, ctx->protocol, ctx->ks, sizeof(ctx->ks));
     if (ctx->protocol == 1 && ctx->version == 1 && ks_available) {
         uint8_t iv_prev[8];
-        DSD_MEMCPY(iv_prev, iv64, sizeof(iv_prev));
+        DSD_MEMCPY(iv_prev, ctx->mi_iv, sizeof(iv_prev));
         reverse_lfsr_64_to_len(opts, iv_prev, 64);
-        if (!sdrtrunk_build_voice_keystream_bits(state, ctx->alg_id, ctx->key_id, iv_prev, ctx->rc4_db, ctx->rc4_mod,
+        if (!sdrtrunk_build_voice_keystream_bits(state, ctx->alg_id, key_id, iv_prev, ctx->rc4_db, ctx->rc4_mod,
                                                  ctx->protocol, ctx->ks_i, sizeof(ctx->ks_i))) {
             DSD_MEMCPY(ctx->ks_i, ctx->ks, sizeof(ctx->ks_i));
         }
     }
     return ks_available;
+}
+
+// Install @p kid into slot 0 and, when a keystream already exists for a different key id, rebuild
+// it from the recorded MI. Activation alone decrypts nothing: the voice path XORs ctx->ks, which is
+// built from a key id. ctx->ks_idx is deliberately left alone -- frames already consumed are
+// unrecoverable, and the keystream position stays continuous for the ones that follow.
+//
+// The (ks_built, ks_key_id) test makes the rebuild purely a correction: it is false when
+// handle_mi() (or the forced-ALGID build, which owns ctx->ks and its own IV on that path) already
+// used this key id, so the common ordering never rebuilds and this never fights either of them.
+// ks_built is a separate flag because 0x00 is a legal key id and so cannot double as "never built".
+static void
+sdrtrunk_json_rekey_slot0(const dsd_opts* opts, dsd_state* state, sdrtrunk_json_context* ctx, uint16_t kid) {
+    keyring_activate_slot_with_kid(state, 0, (int)kid);
+    // is_enc is tested here rather than inside the builder: the builder bails on a non-encrypted
+    // record before latching, so calling it anyway would re-enter on every remaining token and
+    // re-zero the ctx->ks_available that sdrtrunk_json_apply_forced_basic_privacy() just set.
+    if (ctx->is_enc == 1 && ctx->mi_seen != 0U && (ctx->ks_built == 0U || ctx->ks_key_id != kid)) {
+        ctx->ks_available = sdrtrunk_json_build_keystreams(opts, state, ctx, kid);
+    }
+}
+
+// JSON object field order is not a contract: ctx->target_id, ctx->kind and ctx->key_id are each set
+// by their own token, and sdrtrunk_json_context_init() runs once per FILE, so on any given token
+// they may still describe the previous record. Like sdrtrunk_json_apply_forced_algid()'s own
+// fallback, this runs on every token and self-corrects as those fields land.
+//
+// The correction runs in BOTH directions. Applying the map on a partially-parsed record can key a
+// call the map must not touch -- a private call whose destination radio id collides with a row
+// (DMR radio ids share the talkgroup's 24-bit space) before "call_type" is read, or the previous
+// record's talkgroup before this record's "to" is read. So a map application is remembered, and
+// when the map stops applying the signaled key id is put back. Only the map's own writes are ever
+// undone: with no application on record, an unmapped target leaves whatever the OTA-signaled
+// activation set alone -- in particular apply_forced_algid()'s target-indexed replay fallback.
+static void
+sdrtrunk_json_apply_dmr_tg_key_map(const dsd_opts* opts, dsd_state* state, sdrtrunk_json_context* ctx) {
+    if (state->keyloader != 1 || !DSD_SYNC_IS_DMR(state->synctype)) {
+        return;
+    }
+    int mapped = 0;
+    // A 16-bit ctx->key_id comes back unmapped from the resolver's width guard and takes the same
+    // "row no longer applies" branch below as an ordinary unmapped token, so the undo path still
+    // rekeys from the full-width ctx->key_id.
+    const int kid = keyring_dmr_effective_kid(state, ctx->target_id, sdrtrunk_json_target_is_group(ctx),
+                                              dsd_dmr_alg_key_need((int)ctx->alg_id), (int)ctx->key_id, &mapped);
+    if (!mapped) {
+        if (ctx->map_applied != 0U) {
+            // A row applied on an earlier token no longer does. Undo it rather than leaving a key
+            // the resolver has just refused installed for the rest of the record.
+            ctx->map_applied = 0U;
+            sdrtrunk_json_rekey_slot0(opts, state, ctx, ctx->key_id);
+        }
+        return;
+    }
+    if (ctx->map_applied != 0U && ctx->map_kid == kid) {
+        return;
+    }
+    ctx->map_applied = 1U;
+    ctx->map_kid = (uint16_t)kid;
+    sdrtrunk_json_rekey_slot0(opts, state, ctx, (uint16_t)kid);
 }
 
 static void
@@ -1807,8 +1943,10 @@ sdrtrunk_json_classify_p25_crypto(dsd_state* state, const sdrtrunk_json_context*
     state->p25_crypto_state[0] = ctx->ks_available ? DSD_P25_CRYPTO_DECRYPTABLE : DSD_P25_CRYPTO_BLOCKED;
 }
 
+// opts is read-only here: the key activation moved to keyring_activate_slot_with_kid(), which
+// takes no opts, leaving only the payload-verbosity read and two const-taking helpers.
 static int
-sdrtrunk_json_handle_mi(dsd_opts* opts, dsd_state* state, const char* token, char** str_saveptr,
+sdrtrunk_json_handle_mi(const dsd_opts* opts, dsd_state* state, const char* token, char** str_saveptr,
                         sdrtrunk_json_context* ctx) {
     if (strncmp("encryption_mi", token, 13) != 0) {
         return 0;
@@ -1828,15 +1966,30 @@ sdrtrunk_json_handle_mi(dsd_opts* opts, dsd_state* state, const char* token, cha
         DSD_FPRINTF(stderr, "\n IV: %016llX;", iv_hex);
     }
 
+    DSD_MEMSET(ctx->mi_iv, 0, sizeof(ctx->mi_iv));
+    (void)parse_raw_user_string(iv_str, ctx->mi_iv, sizeof(ctx->mi_iv));
+    ctx->mi_seen = 1;
+
     state->currentslot = 0;
     state->payload_algid = ctx->alg_id;
     state->payload_mi = iv_hex;
-    state->payload_keyid = ctx->key_id;
+    state->payload_keyid = ctx->key_id; /* OTA truth, never the override */
+    // ctx->key_id is a uint16_t and P25 signals a full 16-bit KID (this handler also serves
+    // P25 replay; its own fixtures use 4660 and 8738). The resolver hands such an id back at
+    // full width, so a P25 record keeps activating its real rkey_array index, and it is a no-op
+    // when the keyring is not loaded, so the result can feed the keystream even when nothing
+    // activates.
+    uint16_t effective_kid = ctx->key_id;
+    if (DSD_SYNC_IS_DMR(state->synctype)) {
+        effective_kid =
+            (uint16_t)keyring_dmr_effective_kid(state, ctx->target_id, sdrtrunk_json_target_is_group(ctx),
+                                                dsd_dmr_alg_key_need((int)ctx->alg_id), (int)ctx->key_id, NULL);
+    }
     if (state->keyloader == 1) {
-        keyring_activate_slot(opts, state, state->currentslot);
+        keyring_activate_slot_with_kid(state, 0, (int)effective_kid);
     }
 
-    ctx->ks_available = sdrtrunk_json_build_keystreams(opts, state, ctx, iv_str);
+    ctx->ks_available = sdrtrunk_json_build_keystreams(opts, state, ctx, effective_kid);
     sdrtrunk_json_classify_p25_crypto(state, ctx);
     sdrtrunk_json_log_keystream_ready(opts, ctx->ks_available, ctx->alg_id);
     ctx->ks_idx = 0;
@@ -1913,8 +2066,11 @@ sdrtrunk_json_handle_time(const char* token, char** str_saveptr, dsd_state* stat
     long event_seconds = 0;
     (void)dsd_parse_long_strict(time_str, 10, 0L, LONG_MAX, &event_seconds);
     time_t event_time = (time_t)event_seconds;
+    dsd_event_history_transaction transaction;
+    dsd_event_history_transaction_begin(state, &transaction);
     state->event_history_s[0].Event_History_Items[0].event_time = event_time;
     dsd_event_history_mark_dirty(&state->event_history_s[0]);
+    dsd_event_history_transaction_end(&transaction);
 
     char timestr[9];
     char datestr[11];
@@ -1928,19 +2084,47 @@ sdrtrunk_json_handle_time(const char* token, char** str_saveptr, dsd_state* stat
 }
 
 static void
+sdrtrunk_json_publish_call(dsd_state* state, const sdrtrunk_json_context* ctx) {
+    if (!state || !ctx || state->synctype == DSD_SYNC_NONE) {
+        return;
+    }
+    const dsd_call_observation observation = {
+        .protocol = state->synctype,
+        .slot = 0U,
+        .kind = ctx->kind,
+        .ota_target_id = ctx->target_id,
+        .policy_target_id = ctx->target_id,
+        .ota_source_id = ctx->source_id,
+    };
+    (void)dsd_call_state_observe(state, &observation, DSD_CALL_BOUNDARY_CONTINUE);
+    const dsd_call_crypto_update crypto = {
+        .classification = ctx->is_enc == 0U         ? DSD_CALL_CRYPTO_CLEAR
+                          : ctx->ks_available != 0U ? DSD_CALL_CRYPTO_DECRYPTABLE
+                                                    : DSD_CALL_CRYPTO_ENCRYPTED_PENDING,
+        .algid = ctx->alg_id,
+        .kid = ctx->key_id,
+        .mi = state->payload_mi,
+        .audio_permitted = (uint8_t)(ctx->is_enc == 0U || ctx->ks_available != 0U),
+    };
+    (void)dsd_call_state_update_crypto(state, 0U, &crypto);
+}
+
+static void
 sdrtrunk_json_process_token(dsd_opts* opts, dsd_state* state, sdrtrunk_json_context* ctx, const char* token,
                             char** str_saveptr) {
     (void)sdrtrunk_json_handle_version(opts, token, str_saveptr, ctx);
     (void)sdrtrunk_json_handle_protocol(opts, state, token, str_saveptr, ctx);
-    (void)sdrtrunk_json_handle_call_type(state, token, str_saveptr);
+    (void)sdrtrunk_json_handle_call_type(token, str_saveptr, ctx);
     (void)sdrtrunk_json_handle_encrypted(token, str_saveptr, ctx);
     sdrtrunk_json_apply_forced_algid(state, ctx);
-    (void)sdrtrunk_json_handle_to_from(state, token, str_saveptr);
+    sdrtrunk_json_apply_dmr_tg_key_map(opts, state, ctx);
+    (void)sdrtrunk_json_handle_to_from(ctx, token, str_saveptr);
     (void)sdrtrunk_json_handle_alg(opts, token, str_saveptr, ctx);
     (void)sdrtrunk_json_handle_key_id(opts, token, str_saveptr, ctx);
     (void)sdrtrunk_json_handle_mi(opts, state, token, str_saveptr, ctx);
     (void)sdrtrunk_json_handle_hex(opts, state, token, str_saveptr, ctx);
     (void)sdrtrunk_json_handle_time(token, str_saveptr, state, ctx);
+    sdrtrunk_json_publish_call(state, ctx);
 }
 
 void
@@ -1955,8 +2139,7 @@ read_sdrtrunk_json_format(dsd_opts* opts, dsd_state* state) {
     sdrtrunk_json_context_init(&ctx);
     sdrtrunk_json_reset_event_state(state);
     sdrtrunk_json_reset_crypto_state(state);
-    watchdog_event_history(opts, state, 0);
-    watchdog_event_current(opts, state, 0);
+    dsd_event_sync_slot(opts, state, 0);
 
     size_t source_size = fread(source_str, 1, 0x100000, opts->mbe_in_f);
     source_str[source_size] = '\0';
@@ -1974,15 +2157,14 @@ read_sdrtrunk_json_format(dsd_opts* opts, dsd_state* state) {
         }
 
         str_buffer = sdrtrunk_json_next_value(&str_saveptr);
-        if (str_buffer == NULL || exitflag == 1) {
+        if (str_buffer == NULL || dsd_exitflag_load() == 1) {
             break;
         }
     }
 
     free(source_str);
     source_str = NULL;
-    watchdog_event_history(opts, state, 0);
-    watchdog_event_current(opts, state, 0);
+    dsd_event_sync_slot(opts, state, 0);
     if (opts->mbe_out_f != NULL) {
         closeMbeOutFile(opts, state);
     }

@@ -68,6 +68,7 @@ static uint8_t g_late_entry_last_vc;
 static unsigned int g_sbrc_calls;
 static uint8_t g_sbrc_last_power;
 static unsigned int g_sm_voice_sync_calls;
+static unsigned int g_sm_voice_sync_calls_at_first_mbe;
 static int g_sm_voice_sync_last_slot;
 static unsigned int g_sm_tick_calls;
 static unsigned int g_confidence_reset_calls;
@@ -112,6 +113,7 @@ reset_spies(void) {
     g_sbrc_calls = 0;
     g_sbrc_last_power = 0;
     g_sm_voice_sync_calls = 0;
+    g_sm_voice_sync_calls_at_first_mbe = 0;
     g_sm_voice_sync_last_slot = -1;
     g_sm_tick_calls = 0;
     g_confidence_reset_calls = 0;
@@ -281,6 +283,9 @@ processMbeFrame(dsd_opts* opts, dsd_state* state, char imbe_fr[8][23], char ambe
     (void)imbe_fr;
     (void)ambe_fr;
     (void)imbe7100_fr;
+    if (g_process_mbe_calls == 0U) {
+        g_sm_voice_sync_calls_at_first_mbe = g_sm_voice_sync_calls;
+    }
     g_process_mbe_calls++;
 }
 
@@ -298,6 +303,11 @@ playSynthesizedVoiceSS3(dsd_opts* opts, dsd_state* state) {
     g_play_ss3_calls++;
 }
 
+int
+dsd_telemetry_is_active(void) {
+    return 1;
+}
+
 void
 dsd_telemetry_publish_both_and_redraw(const dsd_opts* opts, const dsd_state* state) {
     (void)opts;
@@ -306,16 +316,10 @@ dsd_telemetry_publish_both_and_redraw(const dsd_opts* opts, const dsd_state* sta
 }
 
 void
-watchdog_event_history(dsd_opts* opts, dsd_state* state, uint8_t slot) {
+dsd_event_sync_slot(dsd_opts* opts, dsd_state* state, uint8_t slot) {
     (void)opts;
     (void)state;
     g_history_calls[slot & 1U]++;
-}
-
-void
-watchdog_event_current(const dsd_opts* opts, dsd_state* state, uint8_t slot) {
-    (void)opts;
-    (void)state;
     g_current_calls[slot & 1U]++;
 }
 
@@ -416,7 +420,7 @@ dmr_late_entry_mi_fragment(dsd_opts* opts, dsd_state* state, uint8_t vc, uint8_t
 }
 
 void
-dmr_sbrc(const dsd_opts* opts, dsd_state* state, uint8_t power) {
+dmr_sbrc(dsd_opts* opts, dsd_state* state, uint8_t power) {
     (void)opts;
     (void)state;
     g_sbrc_calls++;
@@ -676,6 +680,9 @@ test_bs_bootstrap_prefetched_voice_runs_first_frame_path(void) {
     assert(g_debug_dump_calls >= 1U);
     assert(g_alg_reset_calls == 1U);
     assert(g_process_mbe_calls >= 3U);
+    assert(g_sm_voice_sync_calls == 1U);
+    assert(g_sm_voice_sync_calls_at_first_mbe == 1U);
+    assert(g_sm_voice_sync_last_slot == 1);
     assert(g_cach_calls >= 1U);
     assert(g_late_entry_calls >= 1U);
     assert(g_open_right_calls == 1U);

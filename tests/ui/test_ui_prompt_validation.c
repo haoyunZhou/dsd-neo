@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <time.h>
 #include "menu_prompts.h"
 
 static int g_string_done_called = 0;
@@ -36,6 +37,23 @@ ui_make_window(int h, int w, int y, int x) { // NOLINT(misc-use-internal-linkage
     (void)y;
     (void)x;
     return NULL;
+}
+
+int ui_status_peek(char* buf, size_t n, time_t now); // NOLINT(misc-use-internal-linkage)
+void ui_status_clear_if_expired(time_t now);         // NOLINT(misc-use-internal-linkage)
+
+/* The widgets now draw the live toast; these tests raise none. */
+int
+ui_status_peek(char* buf, size_t n, time_t now) { // NOLINT(misc-use-internal-linkage)
+    (void)buf;
+    (void)n;
+    (void)now;
+    return 0;
+}
+
+void
+ui_status_clear_if_expired(time_t now) { // NOLINT(misc-use-internal-linkage)
+    (void)now;
 }
 
 void
@@ -309,6 +327,22 @@ test_chooser_edge_paths(void) {
     assert(selected == -1);
     assert(ui_chooser_active() == 0);
 
+    /* An empty list cancels through the same path a selection takes, so the
+       chooser state is torn down before the callback runs: a callback that
+       opens its own chooser from the cancel keeps it. */
+    static ChooserCapture empty_reentry;
+    empty_reentry = (ChooserCapture){0, -2, -2};
+    ui_chooser_start("Empty reentry", NULL, 0, capture_chooser_reentry, &empty_reentry);
+    assert(empty_reentry.calls == 1);
+    assert(empty_reentry.first_sel == -1);
+    assert(ui_chooser_active() == 1);
+    UiChooserTestSnapshot reentered = ui_chooser_test_snapshot();
+    assert(reentered.count == 2);
+    assert(ui_chooser_handle_key(27) == 1);
+    assert(empty_reentry.calls == 2);
+    assert(empty_reentry.second_sel == -1);
+    assert(ui_chooser_active() == 0);
+
     selected = -2;
     ui_chooser_start("Single", CHOOSER_ONE, 1, capture_chooser_selected, &selected);
     assert(ui_chooser_handle_key(KEY_RESIZE) == 1);
@@ -332,6 +366,9 @@ test_chooser_edge_paths(void) {
     assert(snapshot.count == 2);
     assert(snapshot.sel == 0);
     assert(ui_chooser_handle_key('q') == 1);
+    assert(capture.calls == 1);
+    assert(ui_chooser_active() == 1);
+    assert(ui_chooser_handle_key(27) == 1);
     assert(capture.calls == 2);
     assert(capture.second_sel == -1);
     assert(ui_chooser_active() == 0);
@@ -482,6 +519,8 @@ test_help_scroll_navigation_clamps_to_content(void) {
     assert(ui_help_handle_key('x') == 1);
     assert(ui_help_active() == 1);
     assert(ui_help_handle_key('Q') == 1);
+    assert(ui_help_active() == 1);
+    assert(ui_help_handle_key(27) == 1);
     assert(ui_help_active() == 0);
 }
 

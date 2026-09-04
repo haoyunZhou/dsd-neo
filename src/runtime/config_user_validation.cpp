@@ -7,11 +7,14 @@
  * Validation and diagnostics for INI-based user configuration.
  */
 
+#include <dsd-neo/core/lrrp_ports.h>
+#include <dsd-neo/core/opts.h>
 #include <dsd-neo/platform/posix_compat.h>
 #include <dsd-neo/runtime/config.h>
 #include <dsd-neo/runtime/config_schema.h>
 #include <dsd-neo/runtime/path_policy.h>
 #include <errno.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <string>
@@ -84,6 +87,23 @@ is_compatible_enum_value(const dsdcfg_schema_entry_t* entry, const char* val) {
            && dsd_strcasecmp(val, "native") == 0;
 }
 
+/* Factored out of validate_entry_value() so the switch stays under the CCN 15 gate tools/lizard.sh --strict enforces. */
+static void
+validate_double_entry_value(const dsdcfg_schema_entry_t* entry, const char* val, dsdcfg_diagnostics_t* diags,
+                            int line_num, const char* diag_section, const char* diag_key) {
+    double dbl_val = 0.0;
+    if (user_config_parse_double_value(val, &dbl_val) != 0) {
+        char msg[128];
+        DSD_SNPRINTF(msg, sizeof msg, "Invalid numeric value '%s'", val);
+        dsdcfg_diags_add(diags, DSDCFG_DIAG_ERROR, line_num, diag_section, diag_key, msg);
+    } else if ((entry->min_val != 0 || entry->max_val != 0)
+               && (dbl_val < (double)entry->min_val || dbl_val > (double)entry->max_val)) {
+        char msg[128];
+        DSD_SNPRINTF(msg, sizeof msg, "Value %g is out of range [%d, %d]", dbl_val, entry->min_val, entry->max_val);
+        dsdcfg_diags_add(diags, DSDCFG_DIAG_WARNING, line_num, diag_section, diag_key, msg);
+    }
+}
+
 static void
 validate_entry_value(const dsdcfg_schema_entry_t* entry, const char* val, dsdcfg_diagnostics_t* diags, int line_num,
                      const char* diag_section, const char* diag_key) {
@@ -115,6 +135,10 @@ validate_entry_value(const dsdcfg_schema_entry_t* entry, const char* val, dsdcfg
             }
             break;
         }
+
+        case DSDCFG_TYPE_DOUBLE:
+            validate_double_entry_value(entry, val, diags, line_num, diag_section, diag_key);
+            break;
 
         case DSDCFG_TYPE_ENUM:
             if (!is_compatible_enum_value(entry, val)) {
@@ -295,9 +319,44 @@ validate_composed_trunk_scan_channel_map_conflict(const dsdneoUserConfig* cfg, c
 }
 
 static void
+validate_composed_trunk_scan_p25_bandplan_conflict(const dsdneoUserConfig* cfg, const char* section, const char* key,
+                                                   dsdcfg_diagnostics_t* diags) {
+    if (!cfg || !diags || !cfg->trunk_scan_enabled || cfg->trunk_p25_bandplan_csv[0] == '\0') {
+        return;
+    }
+    dsdcfg_diags_add(
+        diags, DSDCFG_DIAG_ERROR, 0, section ? section : "trunking", key ? key : "p25_bandplan_csv",
+        "trunking.p25_bandplan_csv cannot be combined with trunk_scan.enabled; use per-target p25_bandplan_csv values");
+}
+
+/* STRING keys get no format check from the schema walk, so the port list is checked here
+   with the same parser the apply step uses. A bad entry is a warning: the good entries still
+   load, matching how an unknown key is treated. */
+static void
+validate_composed_lrrp_ports(const dsdneoUserConfig* cfg, const char* section, const char* key,
+                             dsdcfg_diagnostics_t* diags) {
+    if (!cfg || !diags || cfg->dmr_lrrp_ports[0] == '\0') {
+        return;
+    }
+    uint16_t ports[DSD_LRRP_EXTRA_PORT_MAX];
+    int count = 0;
+    int rejected = dsd_lrrp_port_list_parse(cfg->dmr_lrrp_ports, ports, DSD_LRRP_EXTRA_PORT_MAX, &count);
+    if (rejected > 0) {
+        char msg[192];
+        DSD_SNPRINTF(msg, sizeof msg,
+                     "dmr_lrrp_ports ignores %d entr%s: expected decimal ports 1..65535, at most %d, "
+                     "comma-separated",
+                     rejected, rejected == 1 ? "y" : "ies", DSD_LRRP_EXTRA_PORT_MAX);
+        dsdcfg_diags_add(diags, DSDCFG_DIAG_WARNING, 0, section ? section : "mode", key ? key : "dmr_lrrp_ports", msg);
+    }
+}
+
+static void
 validate_composed_config_base(const dsdneoUserConfig* cfg, dsdcfg_diagnostics_t* diags) {
     validate_composed_trunk_scan_requirements(cfg, "trunk_scan", "targets_csv", diags);
     validate_composed_trunk_scan_channel_map_conflict(cfg, "trunking", "chan_csv", diags);
+    validate_composed_trunk_scan_p25_bandplan_conflict(cfg, "trunking", "p25_bandplan_csv", diags);
+    validate_composed_lrrp_ports(cfg, "mode", "dmr_lrrp_ports", diags);
 }
 
 static void
@@ -307,6 +366,8 @@ validate_composed_profile_config(const char* profile_name, const dsdneoUserConfi
     section[sizeof section - 1] = '\0';
     validate_composed_trunk_scan_requirements(cfg, section, "trunk_scan.targets_csv", diags);
     validate_composed_trunk_scan_channel_map_conflict(cfg, section, "trunking.chan_csv", diags);
+    validate_composed_trunk_scan_p25_bandplan_conflict(cfg, section, "trunking.p25_bandplan_csv", diags);
+    validate_composed_lrrp_ports(cfg, section, "mode.dmr_lrrp_ports", diags);
 }
 
 static void

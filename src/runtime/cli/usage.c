@@ -8,6 +8,7 @@
  * @brief CLI usage/help text implementation.
  */
 
+#include <dsd-neo/core/opts.h>
 #include <dsd-neo/runtime/cli.h>
 
 #include <stdio.h>
@@ -99,7 +100,7 @@ dsd_cli_usage_section_io(void) {
     printf("  -g <float>    Audio Digital Output Gain  (Default: 0 = Auto;        )\n");
     printf("                                           (Manual:  1 = 2%%; 50 = 100%%)\n");
     printf("  -n <float>    Audio Analog  Output Gain  (Default: 0 = Auto; 0-100%%  )\n");
-    printf("  -nm           Accept the retired DMR mono override; current preset mixing remains active\n");
+    printf("  -nm           Enable the DMR single-slot mono decoder\n");
     printf("  -6 <file>     Output raw audio .wav file (48K/1). (WARNING! Large File Sizes 1 Hour ~= 360 MB)\n");
     printf("  -7 <dir>      Create/Use Custom directory for Per Call decoded .wav file saving.\n");
     printf("                 (Use ./folder for Nested Directory!)\n");
@@ -123,6 +124,8 @@ dsd_cli_usage_section_io(void) {
     printf("                 (Warning! Might be annoying.)\n");
     printf("  -J <file>     Specify Filename for Event Log Output.\n");
     printf("  -L <file>     Specify Filename for LRRP Data Output.\n");
+    printf("      --lrrp-extra-port <n>  Also decode UDP port <n> as LRRP (repeatable, max %d).\n",
+           DSD_LRRP_EXTRA_PORT_MAX);
     printf("  -Q <file>     Specify Filename for OK-DMRlib Structured File Output. (placed in DSP folder)\n");
     printf("  -Q <file>     Specify Filename for M17 Float Stream Output. (placed in DSP folder)\n");
     printf("  -c <file>     Output symbol capture to .bin file\n");
@@ -149,7 +152,7 @@ dsd_cli_usage_section_radio_and_encoder(void) {
     printf("                   Note: This is the DSP baseband used to derive capture rate;\n");
     printf("                         it is NOT the tuner IF filter.\n");
     printf("  sq   <val>    RTL-SDR Squelch Threshold (Optional)\n");
-    printf("                 (Negative = dB; Positive/Zero = linear mean power)\n");
+    printf("                 (Negative = dB; 0 = off; Positive = linear mean power)\n");
     printf("  vol  <num>    RTL-SDR Sample 'Volume' Multiplier (default = 2)(1,2,3)\n");
     printf("  bias [on|off] Enable 5V bias tee on compatible dongles (default off)\n");
     printf(" Example: dsd-neo -fs -i rtl -C cap_plus_channel.csv -T\n");
@@ -183,6 +186,7 @@ dsd_cli_usage_section_radio_and_encoder(void) {
     printf("      --rtl-udp-control <port>  Enable external RTL retune control on 127.0.0.1:<port>\n");
     printf("      --rtl-udp-control-bind <ipv4>  Bind RTL retune control to this numeric IPv4 address\n");
     printf("      --iq-capture <path>    Write I/Q capture data + metadata sidecar\n");
+    printf("                             (.iq is added when <path> has no extension)\n");
     printf("      --iq-capture-format <fmt>  Capture format (cu8|cf32)\n");
     printf("      --iq-capture-max-mb <n>  Capture size limit in MiB (0 = unlimited)\n");
     printf("      --iq-replay <path>     Replay I/Q capture metadata/data through RTL path (requires radio)\n");
@@ -221,7 +225,7 @@ dsd_cli_usage_section_decode(void) {
     printf("  -fA           Passive Analog Audio Monitor\n");
     printf("  -ft           TDMA Trunking P25p1 Control and Voice, P25p2 Trunked Channels, and DMR\n");
     printf("  -fs           DMR TDMA BS and MS Simplex\n");
-    printf("  -fr           DMR TDMA BS and MS Simplex (compatibility alias for the current -fs path)\n");
+    printf("  -fr           DMR TDMA BS and MS Simplex using the single-slot mono decoder\n");
     printf("  -f1           Decode only P25 Phase 1\n");
     printf("  -f2           Decode only P25 Phase 2 (6000 sps) **\n");
     printf("  -fd           Decode only DSTAR\n");
@@ -276,11 +280,15 @@ dsd_cli_usage_section_advanced_decoder_options(void) {
     printf("  -F            Relax DMR RAS/CRC CSBK/DATA Pass/Fail\n");
     printf("                 Enabling on some systems could lead to bad channel assignments/site data decoding if bad "
            "or marginal signal\n");
-    printf("  -F            Relax NXDN SACCH/FACCH/CAC/F2U CRC Pass/Fail\n");
     printf("  -F            Relax M17 LSF/PKT CRC Error Checking\n");
     printf("\n");
     printf("      --show-keys  Reveal radio keys and keystream material in CLI/status output for this run.\n");
     printf("                   Default output remains redacted.\n");
+    printf("\n");
+    printf("      --dmr-debug-burst     Dump each synced DMR burst payload to stderr as hex\n");
+    printf("                            ('Debug Demod +Sync' lines; RC bursts dump all 12 bytes incl. sync).\n");
+    printf("      --dmr-debug-unsynced  While hunting for sync with DMR enabled, dump raw demod output\n");
+    printf("                            to stderr in 36-byte chunks ('Debug Demod -Sync' lines).\n");
     printf("\n");
 }
 
@@ -328,6 +336,8 @@ dsd_cli_usage_section_advanced_key_options(void) {
     printf("      --dmr-csi-ee72 <hex>     Force Connect Systems EE72 key (18 hex chars).\n");
     printf("      --dmr-vertex-ks-csv <file>  Vertex ALG 0x07 key->keystream map CSV (key_hex, "
            "bits:hex[:offset[:step]]).\n");
+    printf("      --dmr-tg-key-csv <file>  DMR talkgroup->key ID map CSV (tg_dec, keyid_hex); a mapped talkgroup\n");
+    printf("                               selects that key ID from -K/-k instead of the signaled one.\n");
     printf("\n");
     printf("  -9 <dec>      Manually Enter and Enforce Kenwood 15-bit Scrambler Key Value (DMR) (Dec Value)\n");
     printf("\n");
@@ -378,6 +388,9 @@ dsd_cli_usage_section_trunking_and_tools(void) {
     printf("                 (See channel_map.csv for example)\n");
     printf("  -G <file>     Import Group List Allow/Block and Label from csv file.\n");
     printf("                 (See group.csv for example)\n");
+    printf("      --p25-bandplan <file>   P25 band plan CSV (IDEN table) for sites that never send IDEN_UP.\n");
+    printf("                 Cannot be combined with --trunk-scan; use per-target p25_bandplan_csv.\n");
+    printf("      --p25-bandplan-export <file>  Write the learned P25 band plan CSV once at clean shutdown.\n");
     printf("  -T            Enable Trunking Features (NXDN/P25/EDACS/DMR) with RIGCTL/TCP or RTL Input\n");
     printf("  -Y            Enable Scanning Mode with RIGCTL/TCP or RTL Input\n");
     printf(
@@ -386,8 +399,12 @@ dsd_cli_usage_section_trunking_and_tools(void) {
     printf("      --trunk-scan <targets.csv>  Enable single-tuner trunk scan target rotation.\n");
     printf("                 Uses per-target chan_csv values; cannot be combined with global -C or IQ replay.\n");
     printf("      --trunk-scan-dwell-ms <ms>  Set default idle dwell per target (250..600000, default 3000).\n");
-    printf(
-        "      --trunk-scan-activity-hold-ms <ms>  Set conventional DMR activity hold (250..600000, default 1200).\n");
+    printf("      --trunk-scan-activity-hold-ms <ms>  Set conventional DMR/NXDN activity hold (250..600000, default "
+           "1200).\n");
+    printf("      --scan-voice-only  Only stop scan on channels carrying voice.\n");
+    printf("      --scan-voice-qualify-ms <ms>  Window after sync in which voice must appear or the scan moves on "
+           "(100..600000, default 1000).\n");
+    printf("      --scan-voice-hold-ms <ms>  Time to stay after the last voice frame (100..600000, default 2000).\n");
     printf("  -W            Use Imported Group List as a Trunking Allow/White List -- Only Tune with Mode A\n");
     printf("  -p            Disable Tune to Private Calls (DMR TIII, P25, NXDN Type-C and Type-D)\n");
     printf("  -E            Disable Tune to Group Calls (DMR TIII, Con+, Cap+, P25, NXDN Type-C, and Type-D)\n");

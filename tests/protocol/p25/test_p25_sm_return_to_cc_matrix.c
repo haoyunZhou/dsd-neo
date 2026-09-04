@@ -291,12 +291,17 @@ matrix_setup_fixture(matrix_fixture* fixture, const matrix_mode_case* mode) {
     fixture->state->p25_last_cc_msg_time_m = now_m;
     fixture->state->nac = 0x293;
     fixture->state->p2_cc = 0x293;
+    // The SM defers TDMA grants until the descrambler seed (WACN/SYSID/NAC)
+    // has been decoded from the control channel.
+    fixture->state->p2_wacn = 0xBEE00;
+    fixture->state->p2_sysid = 0x1A2;
     fixture->state->synctype = mode->synctype;
     fixture->state->lastsynctype = mode->synctype;
     fixture->state->p25_cc_is_tdma = mode->cc_is_tdma;
     fixture->state->p25_sys_is_tdma = mode->sys_is_tdma;
     fixture->state->p25_chan_tdma_explicit[mode->iden] = mode->tdma_hint;
     fixture->state->p25_vc_cqpsk_pref = -1;
+    fixture->state->p25_p1_validated_rf_mod = -1;
     fixture->state->p25_vc_cqpsk_override = -1;
     fixture->state->rf_mod = mode->initial_rf_mod;
     fixture->state->p25_p2_active_slot = -1;
@@ -357,14 +362,25 @@ matrix_send_initial_grant(matrix_fixture* fixture, const matrix_mode_case* mode,
     return rc;
 }
 
+/*
+ * Force the derived hangtime countdown to have started at @p started_m. The
+ * deadline is the most recent moment any slot carried followed traffic, so one
+ * slot carries the forced value and the other is cleared.
+ */
+static void
+set_hangtime_started(p25_sm_ctx_t* ctx, double started_m) {
+    ctx->slots[0].last_followed_m = started_m;
+    ctx->slots[1].last_followed_m = 0.0;
+}
+
 static void
 matrix_age_tuned_timers(matrix_fixture* fixture) {
     double now_m = dsd_time_now_monotonic_s();
     double stale_m = now_m - 1.0;
     fixture->ctx.t_tune_m = stale_m;
     fixture->ctx.t_voice_m = stale_m;
-    if (fixture->ctx.t_hangtime_m > 0.0) {
-        fixture->ctx.t_hangtime_m = stale_m;
+    if (p25_sm_hangtime_started_m(&fixture->ctx) > 0.0) {
+        set_hangtime_started(&fixture->ctx, stale_m);
     }
     fixture->state->last_vc_sync_time = time(NULL) - 1;
     fixture->state->last_vc_sync_time_m = stale_m;

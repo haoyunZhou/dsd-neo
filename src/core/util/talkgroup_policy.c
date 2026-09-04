@@ -5,6 +5,7 @@
 
 #include <ctype.h>
 #include <dsd-neo/core/csv_import.h>
+#include <dsd-neo/core/enc_lockout.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/state.h>
 #include <dsd-neo/core/state_ext.h>
@@ -44,6 +45,9 @@ dsd_tg_policy_block_reason_label(uint32_t block_reasons) {
     }
     if (block_reasons & DSD_TG_POLICY_BLOCK_ENCRYPTED_DISABLED) {
         return "enc-disabled";
+    }
+    if (block_reasons & DSD_TG_POLICY_BLOCK_ENC_LOCKOUT) {
+        return "enc-lockout";
     }
     if (block_reasons & DSD_TG_POLICY_BLOCK_ALLOWLIST) {
         return "allowlist";
@@ -893,6 +897,21 @@ tg_policy_apply_private_tune_blocks(const dsd_opts* opts, int encrypted, int dat
     }
 }
 
+// Encrypted-target lockout: a ledger entry confirmed at the current key
+// epoch blocks voice tuning for the session. Data calls are exempt, and the
+// ledger itself is inert while encrypted-call tuning is enabled.
+static void
+tg_policy_apply_enc_lockout_block(const dsd_opts* opts, const dsd_state* state, uint32_t target, int is_group,
+                                  int data_call, dsd_tg_policy_decision* out) {
+    if (!out || data_call) {
+        return;
+    }
+    if (dsd_enc_lockout_is_blocked(opts, state, target, is_group)) {
+        out->tune_allowed = 0;
+        out->block_reasons |= DSD_TG_POLICY_BLOCK_ENC_LOCKOUT;
+    }
+}
+
 static const dsd_tg_policy_entry*
 tg_policy_choose_private_entry(const dsd_tg_policy_entry* src_entry, int src_match,
                                const dsd_tg_policy_entry* dst_entry, int dst_match) {
@@ -930,6 +949,7 @@ dsd_tg_policy_evaluate_group_call(const dsd_opts* opts, const dsd_state* state, 
                                  &explicit_stream_block);
     tg_policy_group_set_hold_state(state, tg, out, &hold_mismatch);
     tg_policy_apply_group_tune_blocks(opts, encrypted, data_call, out);
+    tg_policy_apply_enc_lockout_block(opts, state, tg, 1, data_call, out);
 
     if (mode_blocking) {
         tg_policy_block_decision_tune_and_media(out, DSD_TG_POLICY_BLOCK_MODE);
@@ -971,6 +991,7 @@ tg_policy_evaluate_private_call(const dsd_opts* opts, const dsd_state* state, ui
     mode_blocking = tg_policy_private_mode_is_blocking(src_match, &src_entry, dst_match, &dst_entry);
     tg_policy_private_set_hold_state(state, src, dst, out, &hold_mismatch);
     tg_policy_apply_private_tune_blocks(opts, encrypted, data_call, src_match, dst_match, allow_unlisted, out);
+    tg_policy_apply_enc_lockout_block(opts, state, dst, 0, data_call, out);
     if (mode_blocking) {
         tg_policy_block_decision_tune_and_media(out, DSD_TG_POLICY_BLOCK_MODE);
     }
@@ -1570,5 +1591,41 @@ dsd_tg_policy_reload_group_file(const dsd_opts* opts, dsd_state* state) {
     }
     dsd_state_ext_free_all(imported);
     free(imported);
+    return 0;
+}
+
+int
+dsd_tg_policy_clear(dsd_state* state) {
+    const dsd_tg_policy_context* current_ctx = NULL;
+    dsd_tg_policy_context* empty_ctx = NULL;
+    unsigned int next_table_generation = 1u;
+    unsigned int next_active_generation = 1u;
+
+    if (!state) {
+        return -1;
+    }
+
+    current_ctx = tg_policy_ctx_get_const(state);
+    if (!current_ctx) {
+        return 0; // nothing loaded; already the state the caller asked for
+    }
+    next_table_generation = current_ctx->table.generation + 1u;
+    next_active_generation = current_ctx->active.generation + 1u;
+
+    /* An empty context rather than no context: readers that hold a generation
+     * need to see it move, and dropping the extension slot outright would leave
+     * them comparing against a context id that never existed. This is the same
+     * swap dsd_tg_policy_reload_group_file() performs, with nothing imported. */
+    empty_ctx = tg_policy_context_alloc();
+    if (!empty_ctx) {
+        return -1;
+    }
+    empty_ctx->table.generation = next_table_generation;
+    empty_ctx->active.generation = next_active_generation;
+
+    if (dsd_state_ext_set(state, DSD_STATE_EXT_CORE_TG_POLICY, empty_ctx, tg_policy_context_free) != 0) {
+        tg_policy_context_free(empty_ctx);
+        return -1;
+    }
     return 0;
 }

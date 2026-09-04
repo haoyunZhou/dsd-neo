@@ -124,18 +124,6 @@ static void parse_cmce_d_setup(const uint8_t *bits, int nbits,
             state->tetra_calling_ssi = calling_ssi;
         if (called_ssi != 0)
             state->tetra_gssi = called_ssi;
-        /* Populate shared UI fields so watchdog_event_current() can display
-         * active TETRA calls alongside DMR/P25/EDACS channels. */
-        state->lasttg  = (int)(state->tetra_gssi ? state->tetra_gssi
-                                                  : called_ssi);
-        state->lastsrc = (int)(calling_ssi ? calling_ssi
-                                           : state->tetra_calling_ssi);
-        snprintf(state->active_channel[0], sizeof(state->active_channel[0]),
-                 "TETRA TG:%u SRC:%u type=%u",
-                 (unsigned)state->tetra_gssi,
-                 (unsigned)state->tetra_calling_ssi,
-                 (unsigned)call_type);
-        state->last_active_time = time(NULL);
     }
 }
 
@@ -278,14 +266,6 @@ static void parse_cmce_d_tx_granted(const uint8_t *bits, int nbits,
 
         if (got_ssi) {
             state->tetra_tx_granted_ssi = granted_ssi;
-            /* Phase 45: propagate floor grant to shared UI fields so the
-             * active_channel display reflects the current speaker. */
-            state->lastsrc = (int)granted_ssi;
-            snprintf(state->active_channel[0], sizeof(state->active_channel[0]),
-                     "TETRA TG:%u SRC:%u (TX-GRANTED)",
-                     (unsigned)state->lasttg,
-                     (unsigned)granted_ssi);
-            state->last_active_time = time(NULL);
         }
         if (got_ac) {
             state->tetra_vc_assignment_type = (uint8_t)ac_type;

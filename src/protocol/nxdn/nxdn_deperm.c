@@ -24,12 +24,14 @@
  */
 
 #include <dsd-neo/core/bit_packing.h>
+#include <dsd-neo/core/call_state.h>
 #include <dsd-neo/core/events.h>
 #include <dsd-neo/core/file_io.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/state.h>
 #include <dsd-neo/core/synctype_ids.h>
 #include <dsd-neo/fec/trellis.h>
+#include <dsd-neo/protocol/nxdn/nxdn.h>
 #include <dsd-neo/protocol/nxdn/nxdn_alias_decode.h>
 #include <dsd-neo/protocol/nxdn/nxdn_const.h>
 #include <dsd-neo/protocol/nxdn/nxdn_convolution.h>
@@ -44,6 +46,7 @@
 #include "dsd-neo/core/safe_api.h"
 #include "dsd-neo/core/secret_redaction.h"
 #include "dsd-neo/core/state_fwd.h"
+#include "nxdn_confirm.h"
 #include "nxdn_internal.h"
 
 uint8_t crc6(const uint8_t buf[], int len);
@@ -199,7 +202,7 @@ nxdn_hard_fallback_decode(uint8_t* trellis_buf, size_t trellis_size, uint8_t* m_
     DSD_MEMSET(trellis_buf, 0, trellis_size);
     DSD_MEMSET(m_data, 0, m_data_bytes);
     trellis_decode(trellis_buf, depunc, chainback_bits);
-    pack_bit_array_into_byte_array(trellis_buf, m_data, (int)m_data_bytes);
+    dsd_pack_bits_to_bytes(trellis_buf, trellis_size, m_data, m_data_bytes, m_data_bytes);
 }
 
 static void
@@ -257,11 +260,14 @@ nxdn_handle_sacch_non_superframe(dsd_opts* opts, dsd_state* state, const uint8_t
 
     const int sacch_crc_ok = (crc == check);
     if (sacch_crc_ok) {
-        state->nxdn_last_ran = nxdn_ran_from_trellis(trellis_buf);
+        nxdn_confirm_note_evidence(state, NXDN_EVIDENCE_WEAK);
+        if (nxdn_confirm_is_confirmed(state)) {
+            state->nxdn_last_ran = nxdn_ran_from_trellis(trellis_buf);
+        }
         state->nxdn_part_of_frame = 3;
         DSD_FPRINTF(stderr, "PF 1/1");
         nxdn_reset_payload_seed_if_forced(state);
-        NXDN_Elements_Content_decode(opts, state, 1, nsf_sacch, sizeof(nsf_sacch));
+        NXDN_Elements_Content_decode(opts, state, nsf_sacch, sizeof(nsf_sacch));
     } else {
         state->nxdn_part_of_frame = 0;
         DSD_FPRINTF(stderr, "PF X/1");
@@ -295,8 +301,11 @@ nxdn_handle_sacch_superframe(dsd_opts* opts, dsd_state* state, const uint8_t* tr
     nxdn_prepare_sacch_payload_seed(state, part_of_frame);
 
     if (crc == check) {
-        const int ran = nxdn_ran_from_trellis(trellis_buf);
-        state->nxdn_ran = state->nxdn_last_ran = ran;
+        nxdn_confirm_note_evidence(state, NXDN_EVIDENCE_WEAK);
+        if (nxdn_confirm_is_confirmed(state)) {
+            const int ran = nxdn_ran_from_trellis(trellis_buf);
+            state->nxdn_ran = state->nxdn_last_ran = ran;
+        }
         state->nxdn_sf = sf;
         state->nxdn_part_of_frame = part_of_frame;
         state->nxdn_sacch_frame_segcrc[part_of_frame] = 0;
@@ -362,9 +371,12 @@ nxdn_handle_dcr_csm_alias(const dsd_opts* opts, dsd_state* state, const uint8_t*
         DSD_FPRINTF(stderr, "\n Call Sign Memory: %s; ", csm_alias + 4);
         DSD_SNPRINTF(state->generic_talker_alias[0], sizeof(state->generic_talker_alias[0]), "%s", csm_alias);
         if (state->event_history_s != NULL) {
+            dsd_event_history_transaction transaction;
+            dsd_event_history_transaction_begin(state, &transaction);
             DSD_SNPRINTF(state->event_history_s[0].Event_History_Items[0].alias,
                          sizeof(state->event_history_s[0].Event_History_Items[0].alias), "%s; ", csm_alias);
             dsd_event_history_mark_dirty(&state->event_history_s[0]);
+            dsd_event_history_transaction_end(&transaction);
         }
     } else if (opts->payload == 1) {
         DSD_FPRINTF(stderr, "\n Call Sign Memory: decode error; ");
@@ -432,6 +444,7 @@ void
 nxdn_handle_pich_tch(const dsd_opts* opts, dsd_state* state, const uint8_t* trellis_buf, const uint8_t* m_data,
                      uint16_t crc, uint16_t check, uint8_t lich) {
     if (crc == check) {
+        nxdn_confirm_note_evidence(state, NXDN_EVIDENCE_STRONG);
         nxdn_handle_pich_tch_crc_ok(opts, state, trellis_buf, lich);
     } else if (opts->payload == 0) {
         nxdn_print_pich_tch_crc_error(lich);
@@ -495,6 +508,7 @@ nxdn_handle_facch2_udch(dsd_opts* opts, dsd_state* state, const uint8_t* trellis
     const int ran = nxdn_ran_from_trellis(trellis_buf);
 
     if (crc == check) {
+        nxdn_confirm_note_evidence(state, NXDN_EVIDENCE_STRONG);
         state->nxdn_last_ran = (unsigned int)ran;
         nxdn_print_last_ran(state);
         state->nxdn_part_of_frame = 3 - sf;
@@ -515,7 +529,7 @@ nxdn_handle_facch2_udch(dsd_opts* opts, dsd_state* state, const uint8_t* trellis
 
     if (crc == check) {
         state->data_header_format[0] = 1;
-        NXDN_Elements_Content_decode(opts, state, 1, f2u_message_buffer, (size_t)(199 - 8 - 15));
+        NXDN_Elements_Content_decode(opts, state, f2u_message_buffer, (size_t)(199 - 8 - 15));
     }
     if (type == 0 && crc == check) {
         nxdn_print_udch_data(m_data);
@@ -612,6 +626,7 @@ nxdn_handle_cac(dsd_opts* opts, dsd_state* state, const uint8_t* trellis_buf, co
 
     nxdn_print_last_ran(state);
     if (crc == 0) {
+        nxdn_confirm_note_evidence(state, NXDN_EVIDENCE_STRONG);
         state->data_header_format[0] = 2;
         state->nxdn_last_ran = nxdn_ran_from_trellis(trellis_buf);
     }
@@ -622,7 +637,7 @@ nxdn_handle_cac(dsd_opts* opts, dsd_state* state, const uint8_t* trellis_buf, co
     nxdn_update_cac_fail_state(state, crc);
 
     if (crc == 0) {
-        NXDN_Elements_Content_decode(opts, state, 1, cac_message_buffer, sizeof(cac_message_buffer));
+        NXDN_Elements_Content_decode(opts, state, cac_message_buffer, sizeof(cac_message_buffer));
     }
     nxdn_print_cac_payload(opts, m_data);
     rotate_symbol_out_file(opts, state);
@@ -713,24 +728,61 @@ nxdn_store_sacch2_frame(dsd_state* state, const uint8_t* trellis_buf, const stru
 }
 
 static void
-nxdn_update_sacch2_identity_state(dsd_state* state, const struct nxdn_sacch2_fields* fields) {
+nxdn_update_sacch2_identity_state(const dsd_opts* opts, dsd_state* state, const struct nxdn_sacch2_fields* fields) {
     if (fields->sf_fb && state->M == 1) {
         state->payload_miN = 0;
     }
     if (!nxdn_sacch2_crc_ok(fields)) {
         return;
     }
+    nxdn_confirm_note_evidence(state, NXDN_EVIDENCE_WEAK);
+    if (!nxdn_confirm_is_confirmed(state)) {
+        return;
+    }
 
-    state->gi[0] = 0;
     state->nxdn_last_ran = 7;
-    state->nxdn_last_tg = 777;
-    state->nxdn_last_rid = 777;
-    DSD_SNPRINTF(state->generic_talker_alias[0], sizeof(state->generic_talker_alias[0]), "%s", "JPN DCR");
-    DSD_SNPRINTF(state->event_history_s[0].Event_History_Items[0].alias,
-                 sizeof(state->event_history_s[0].Event_History_Items[0].alias), "%s; ", "JPN DCR");
-    dsd_event_history_mark_dirty(&state->event_history_s[0]);
+    if (nxdn_dcr_is_sb0_message_type(fields->sf_mes)) {
+        const dsd_call_observation observation = {
+            .protocol = DSD_SYNC_NXDN_POS,
+            .slot = 0U,
+            .kind = DSD_CALL_KIND_GROUP_VOICE,
+            .ota_target_id = 777U,
+            .policy_target_id = 777U,
+            .ota_source_id = 777U,
+        };
+        (void)dsd_call_state_observe(state, &observation, DSD_CALL_BOUNDARY_CONTINUE);
+        dsd_event_sync_slot((dsd_opts*)opts, state, 0U);
+        dsd_call_snapshot call;
+        if (dsd_call_state_get(state, 0U, &call) > 0 && call.phase == DSD_CALL_PHASE_ACTIVE) {
+            (void)dsd_event_enrich_alias(state, 0U, call.epoch, "JPN DCR");
+        }
+    } else if (fields->sf_mes == 0x1EU && dsd_call_state_end_ex(state, 0U, 0.0, DSD_CALL_END_TERMINATOR) > 0) {
+        // Release signaling decoded over the air: positive end evidence, distinguishable from an
+        // engine retune, so the event layer can keep an audible identity-less epoch it closed.
+        dsd_event_sync_slot((dsd_opts*)opts, state, 0U);
+    }
     if (fields->sf_fb) {
         state->payload_miN = 0;
+    }
+}
+
+static void
+nxdn_publish_sacch2_crypto(const dsd_opts* opts, dsd_state* state, uint8_t message_type, uint8_t cipher) {
+    if (!nxdn_dcr_is_sb0_message_type(message_type)) {
+        return;
+    }
+    const int has_key = cipher == 1U && state->R != 0;
+    const dsd_call_crypto_update crypto = {
+        .classification = cipher == 0U   ? DSD_CALL_CRYPTO_CLEAR
+                          : cipher == 1U ? (has_key ? DSD_CALL_CRYPTO_DECRYPTABLE : DSD_CALL_CRYPTO_ENCRYPTED_PENDING)
+                                         : DSD_CALL_CRYPTO_UNKNOWN,
+        .algid = cipher,
+        .kid = 0U,
+        .mi = state->payload_miN,
+        .audio_permitted = (uint8_t)(cipher == 0U || has_key),
+    };
+    if (dsd_call_state_update_crypto(state, 0U, &crypto) > 0) {
+        dsd_event_sync_slot((dsd_opts*)opts, state, 0U);
     }
 }
 
@@ -748,7 +800,9 @@ nxdn_print_sacch2_complete_message(const dsd_opts* opts, dsd_state* state, const
     DSD_FPRINTF(stderr, "UC: %03d; ", user_code);
     if (cipher == 0x01) {
         DSD_FPRINTF(stderr, "Scrambler; ");
-        state->nxdn_cipher_type = 1;
+        // A single CRC-accepted SACCH-2 must not flip the classification the VCALLs
+        // established: hold a contradicting observation until it repeats.
+        state->nxdn_cipher_type = nxdn_cipher_observe(state, 1U, 0);
         if (state->R != 0) {
             char key_text[24];
             DSD_FPRINTF(stderr, "Key: %s; ",
@@ -759,6 +813,7 @@ nxdn_print_sacch2_complete_message(const dsd_opts* opts, dsd_state* state, const
     }
 
     state->dmr_encL = (state->nxdn_cipher_type != 0 && state->R == 0) ? 1 : 0;
+    nxdn_publish_sacch2_crypto(opts, state, fields->sf_mes, cipher == 0x01 ? (uint8_t)state->nxdn_cipher_type : cipher);
     const uint8_t mfid = (uint8_t)convert_bits_into_output(state->dmr_pdu_sf[0] + 11, 7U);
     if (mfid != 0) {
         DSD_FPRINTF(stderr, "MFID: %02X; ", mfid);
@@ -808,7 +863,7 @@ nxdn_handle_sacch2(const dsd_opts* opts, dsd_state* state, const uint8_t* trelli
     nxdn_print_sacch2_header(state, &fields);
     const uint8_t crc_sf_check = nxdn_update_sacch2_segment_crc(state, &fields);
     nxdn_store_sacch2_frame(state, trellis_buf, &fields);
-    nxdn_update_sacch2_identity_state(state, &fields);
+    nxdn_update_sacch2_identity_state(opts, state, &fields);
     nxdn_print_sacch2_complete_message(opts, state, &fields, crc_sf_check);
     nxdn_print_sacch2_payload(opts, state, &fields, m_data);
     nxdn_reset_sacch2_if_done(state, &fields);
@@ -856,7 +911,7 @@ nxdn_decode_facch3_udch2_block_soft(const uint8_t* bits, const uint8_t* reliab, 
     nxdn_depermute_rel_u8(bits + offset, reliab + offset, 144U, PERM_16_9, deperm, deperm_rel);
     nxdn_depuncture_16_9_rel(deperm, deperm_rel, depunc, depunc_rel);
     nxdn_conv_decode_soft(depunc, depunc_rel, sizeof(depunc), m_data, 92);
-    unpack_byte_array_into_bit_array(m_data, trellis_buf, 12);
+    DSD_UNPACK_ARRAY_TO_BITS(m_data, trellis_buf, 12);
 
     message->crc[block] = nxdn_facch_crc12_payload_from_trellis(trellis_buf);
     message->check[block] = nxdn_facch_crc12_check_from_trellis(trellis_buf);
@@ -887,9 +942,10 @@ nxdn_decode_facch3_udch2_content(dsd_opts* opts, dsd_state* state, const struct 
     if (!nxdn_facch3_udch2_crc_ok(message)) {
         return;
     }
+    nxdn_confirm_note_evidence(state, NXDN_EVIDENCE_STRONG);
 
     state->data_header_format[0] = 1;
-    NXDN_Elements_Content_decode(opts, state, 1, message->bits, 160U);
+    NXDN_Elements_Content_decode(opts, state, message->bits, 160U);
 }
 
 static void
@@ -1079,7 +1135,7 @@ nxdn_deperm_facch_soft(dsd_opts* opts, dsd_state* state, uint8_t bits[144], cons
     DSD_MEMSET(trellis_buf, 0, sizeof(trellis_buf));
 
     nxdn_conv_decode_soft(depunc, depunc_rel, sizeof(depunc), m_data, 92);
-    unpack_byte_array_into_bit_array(m_data, trellis_buf, 12);
+    DSD_UNPACK_ARRAY_TO_BITS(m_data, trellis_buf, 12);
 
     crc = nxdn_facch_crc12_payload_from_trellis(trellis_buf);
     check = nxdn_facch_crc12_check_from_trellis(trellis_buf);
@@ -1098,8 +1154,11 @@ nxdn_deperm_facch_soft(dsd_opts* opts, dsd_state* state, uint8_t bits[144], cons
     }
 
     state->data_header_format[0] = 3;
+    if (crc == check) {
+        nxdn_confirm_note_evidence(state, NXDN_EVIDENCE_STRONG);
+    }
     if (crc == check && !duplicate) {
-        NXDN_Elements_Content_decode(opts, state, 1, trellis_buf, sizeof(trellis_buf));
+        NXDN_Elements_Content_decode(opts, state, trellis_buf, sizeof(trellis_buf));
     }
 
     if (opts->payload == 1) {
@@ -1146,7 +1205,7 @@ nxdn_deperm_sacch_soft(dsd_opts* opts, dsd_state* state, uint8_t bits[60], const
     DSD_MEMSET(m_data, 0, sizeof(m_data));
 
     nxdn_conv_decode_soft(depunc, depunc_rel, sizeof(depunc), m_data, 32);
-    unpack_byte_array_into_bit_array(m_data, trellis_buf, 4);
+    DSD_UNPACK_ARRAY_TO_BITS(m_data, trellis_buf, 4);
 
     crc = crc6(trellis_buf, 26);
     check = (uint8_t)convert_bits_into_output(trellis_buf + 26, 6U);
@@ -1176,18 +1235,23 @@ nxdn_message_type(const dsd_opts* opts, dsd_state* state, uint8_t MessageType) {
     }
     DSD_FPRINTF(stderr, "%s", KNRM);
 
-    //Zero out stale values on DISC or TX_REL only (IDLE messaages occur often on NXDN96 VCH, and randomly on Type-C FACCH1 steals for some reason)
+    //End the canonical call on explicit release or disconnect signaling. A release or disconnect
+    //reaches here only through NXDN_Elements_Content_decode(), which the channel decoders hand
+    //CRC-verified content alone, so this is positive end evidence decoded over the air -- the
+    //terminator reason lets the event layer keep an audible epoch whose call identity never
+    //decoded, where EXPLICIT reads as a retune.
     if (nxdn_message_type_resets_call(MessageType)) {
+        if (dsd_call_state_end_ex(state, 0U, 0.0, DSD_CALL_END_TERMINATOR) > 0) {
+            dsd_event_sync_slot((dsd_opts*)opts, state, 0U);
+        }
         nxdn_alias_reset(state);
-        state->nxdn_last_rid = 0;
-        state->nxdn_last_tg = 0;
         state->nxdn_cipher_type = 0; // Force will reactivate it if needed during voice tx
+        nxdn_cipher_class_reset(state);
         if (state->keyloader == 1) {
             state->R = 0;
         }
         DSD_MEMSET(state->nxdn_sacch_frame_segcrc, 1, sizeof(state->nxdn_sacch_frame_segcrc));
         DSD_MEMSET(state->nxdn_sacch_frame_segment, 1, sizeof(state->nxdn_sacch_frame_segment));
-        DSD_SNPRINTF(state->nxdn_call_type, sizeof(state->nxdn_call_type), "%s", "");
     }
 
     if (nxdn_message_type_resets_gain(MessageType)) {
@@ -1274,7 +1338,7 @@ nxdn_deperm_cac_soft(dsd_opts* opts, dsd_state* state, uint8_t bits[300], const 
     DSD_MEMSET(m_data, 0, sizeof(m_data));
 
     nxdn_conv_decode_soft(depunc, depunc_rel, sizeof(depunc), m_data, 171);
-    unpack_byte_array_into_bit_array(m_data, trellis_buf, 22);
+    DSD_UNPACK_ARRAY_TO_BITS(m_data, trellis_buf, 22);
 
     crc = crc16cac(trellis_buf, 171);
 
@@ -1313,7 +1377,7 @@ nxdn_deperm_facch2_udch_soft(dsd_opts* opts, dsd_state* state, uint8_t bits[348]
     DSD_MEMSET(m_data, 0, sizeof(m_data));
 
     nxdn_conv_decode_soft(depunc, depunc_rel, sizeof(depunc), m_data, 199);
-    unpack_byte_array_into_bit_array(m_data, trellis_buf, 26);
+    DSD_UNPACK_ARRAY_TO_BITS(m_data, trellis_buf, 26);
 
     crc = nxdn_facch2_udch_crc15_payload_from_trellis(trellis_buf);
     check = nxdn_facch2_udch_crc15_check_from_trellis(trellis_buf);
@@ -1358,7 +1422,7 @@ nxdn_deperm_scch_soft(dsd_opts* opts, dsd_state* state, uint8_t bits[60], const 
     DSD_MEMSET(m_data, 0, sizeof(m_data));
 
     nxdn_conv_decode_soft(depunc, depunc_rel, sizeof(depunc), m_data, 32);
-    unpack_byte_array_into_bit_array(m_data, trellis_buf, 4);
+    DSD_UNPACK_ARRAY_TO_BITS(m_data, trellis_buf, 4);
 
     crc = crc7_scch(trellis_buf, 25);
     check = nxdn_scch_crc7_check_from_trellis(trellis_buf);
@@ -1377,6 +1441,7 @@ nxdn_deperm_scch_soft(dsd_opts* opts, dsd_state* state, uint8_t bits[60], const 
     }
 
     if (crc == check) {
+        nxdn_confirm_note_evidence(state, NXDN_EVIDENCE_WEAK);
         NXDN_decode_scch(opts, state, trellis_buf, direction);
     }
 
@@ -1423,7 +1488,7 @@ nxdn_deperm_sacch2_soft(const dsd_opts* opts, dsd_state* state, uint8_t bits[60]
     DSD_MEMSET(m_data, 0, sizeof(m_data));
 
     nxdn_conv_decode_soft(depunc, depunc_rel, sizeof(depunc), m_data, 32);
-    unpack_byte_array_into_bit_array(m_data, trellis_buf, 4);
+    DSD_UNPACK_ARRAY_TO_BITS(m_data, trellis_buf, 4);
 
     crc = crc6(trellis_buf, 26);
     check = (uint8_t)convert_bits_into_output(trellis_buf + 26, 6U);
@@ -1464,7 +1529,7 @@ nxdn_deperm_pich_tch_soft(const dsd_opts* opts, dsd_state* state, uint8_t bits[1
     DSD_MEMSET(trellis_buf, 0, sizeof(trellis_buf));
 
     nxdn_conv_decode_soft(depunc, depunc_rel, sizeof(depunc), m_data, 92);
-    unpack_byte_array_into_bit_array(m_data, trellis_buf, 12);
+    DSD_UNPACK_ARRAY_TO_BITS(m_data, trellis_buf, 12);
 
     crc = nxdn_facch_crc12_payload_from_trellis(trellis_buf);
     check = nxdn_facch_crc12_check_from_trellis(trellis_buf);

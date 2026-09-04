@@ -32,7 +32,7 @@ jobs:
       HOMEBREW_NO_ANALYTICS: "1"
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
       - name: Compute dependency SHAs (for cache key)
@@ -235,12 +235,26 @@ jobs:
       - name: Configure (Release preset)
         shell: bash
         run: |
+          # No curses overrides on purpose: this is the discovery path a user
+          # gets, and pinning it here is what kept issue #339 out of CI.
           cmake --preset dev-release -G Ninja \
             -DDSD_ENABLE_LTO=OFF -DCMAKE_OSX_ARCHITECTURES=arm64 \
             -DDSD_REQUIRE_RTLSDR=ON -DDSD_REQUIRE_SOAPYSDR=ON \
-            -DBUILD_TESTING=OFF \
-            -DCURSES_LIBRARY="$HB_PREFIX/opt/ncurses/lib/libncursesw.dylib" \
-            -DCURSES_INCLUDE_PATH="$HB_PREFIX/opt/ncurses/include"
+            -DBUILD_TESTING=OFF
+
+      - name: Verify curses selection
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Discovery is unpinned here on purpose, so assert the outcome: the
+          # portable DMG is built against Homebrew's wide ncurses, and a silent
+          # downgrade to the SDK's narrow curses must not pass unnoticed.
+          lib=$(sed -n 's/^CURSES_NCURSES_LIBRARY:[A-Z]*=//p' build/dev-release/CMakeCache.txt)
+          echo "CURSES_NCURSES_LIBRARY=$lib"
+          case "$lib" in
+            *ncursesw*) ;;
+            *) echo "ERROR: expected a wide ncurses, got '$lib'" >&2; exit 1 ;;
+          esac
 
       - name: Build
         shell: bash
@@ -273,7 +287,7 @@ jobs:
       HOMEBREW_NO_ANALYTICS: "1"
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
       - name: Validate release tag
@@ -484,12 +498,26 @@ jobs:
       - name: Configure (Release preset)
         shell: bash
         run: |
+          # No curses overrides on purpose: this is the discovery path a user
+          # gets, and pinning it here is what kept issue #339 out of CI.
           cmake --preset dev-release -G Ninja \
             -DDSD_ENABLE_LTO=OFF -DCMAKE_OSX_ARCHITECTURES=arm64 \
             -DDSD_REQUIRE_RTLSDR=ON -DDSD_REQUIRE_SOAPYSDR=ON \
-            -DBUILD_TESTING=OFF \
-            -DCURSES_LIBRARY="$HB_PREFIX/opt/ncurses/lib/libncursesw.dylib" \
-            -DCURSES_INCLUDE_PATH="$HB_PREFIX/opt/ncurses/include"
+            -DBUILD_TESTING=OFF
+
+      - name: Verify curses selection
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Discovery is unpinned here on purpose, so assert the outcome: the
+          # portable DMG is built against Homebrew's wide ncurses, and a silent
+          # downgrade to the SDK's narrow curses must not pass unnoticed.
+          lib=$(sed -n 's/^CURSES_NCURSES_LIBRARY:[A-Z]*=//p' build/dev-release/CMakeCache.txt)
+          echo "CURSES_NCURSES_LIBRARY=$lib"
+          case "$lib" in
+            *ncursesw*) ;;
+            *) echo "ERROR: expected a wide ncurses, got '$lib'" >&2; exit 1 ;;
+          esac
 
       - name: Build
         shell: bash
@@ -831,13 +859,13 @@ jobs:
 
       - name: Attest artifact provenance
         if: startsWith(github.ref, 'refs/tags/')
-        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-path: ${{ steps.dmg.outputs.DMG_PATH }}
 
       - name: Attest artifact SBOM
         if: startsWith(github.ref, 'refs/tags/')
-        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-path: ${{ steps.dmg.outputs.DMG_PATH }}
           sbom-path: ${{ steps.dmg.outputs.DMG_PATH }}.spdx.json
@@ -857,7 +885,7 @@ jobs:
     steps:
       - name: Checkout release helpers
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1
           persist-credentials: false

@@ -6,26 +6,33 @@
 #include <dsd-neo/core/audio.h>
 #include <dsd-neo/core/constants.h>
 #include <dsd-neo/core/csv_import.h>
+#include <dsd-neo/core/csv_validate.h>
 #include <dsd-neo/core/events.h>
 #include <dsd-neo/core/file_io.h>
+#include <dsd-neo/core/keyring.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/power.h>
 #include <dsd-neo/core/state.h>
+#include <dsd-neo/core/state_ext.h>
 #include <dsd-neo/core/string_utils.h>
 #include <dsd-neo/core/talkgroup_policy.h>
+#include <dsd-neo/engine/p25_bandplan_export.h>
 #include <dsd-neo/io/control.h>
 #include <dsd-neo/io/rigctl_client.h>
 #include <dsd-neo/io/rtl_stream_c.h>
 #include <dsd-neo/io/udp_socket_connect.h>
 #include <dsd-neo/platform/file_compat.h>
 #include <dsd-neo/platform/posix_compat.h>
+#include <dsd-neo/protocol/p25/p25_cc_candidates.h>
 #include <dsd-neo/protocol/p25/p25_sm_watchdog.h>
 #include <dsd-neo/runtime/config.h>
 #include <dsd-neo/runtime/log.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "dsd-neo/core/dibit.h"
+#include "dsd-neo/core/key_set.h"
 #include "dsd-neo/core/opts_fwd.h"
 #include "dsd-neo/core/safe_api.h"
 #include "dsd-neo/core/state_fwd.h"
@@ -184,12 +191,7 @@ svc_lrrp_disable(dsd_opts* opts) {
 
 void
 svc_reset_event_history(dsd_state* state) {
-    if (!state || !state->event_history_s) {
-        return;
-    }
-    for (uint8_t i = 0; i < 2; i++) {
-        init_event_history(&state->event_history_s[i], 0, 255);
-    }
+    dsd_event_history_reset(state);
 }
 
 void
@@ -312,14 +314,216 @@ svc_udp_output_config(dsd_opts* opts, dsd_state* state, const char* host, int po
 }
 
 // Trunking & control --------------------------------------------------------
+
+/*
+ * Adopt an imported channel map wholesale. The importer is additive
+ * (lcn_freq_count only grows, stale trunk_chan_map slots survive), so a
+ * runtime re-import must replace the previous map rather than append to it.
+ *
+ * Replace, deliberately, and not a merge: what the protocol layer learned on
+ * the air (dmr_csbk, p25_frequency, edacs-fme) is discarded along with the old
+ * CSV's entries, so a grant for an LCN the new file omits resolves to 0 Hz
+ * until the site re-announces it. A merge was considered and rejected -- "apply
+ * this file" would stop meaning the map is what the file says, a re-import
+ * could no longer shrink a map, and correcting a wrong frequency in the CSV
+ * would not take on a site that had already announced it. Emptying the map is
+ * svc_clear_channel_map()'s job, so nothing needs the merge to express it.
+ *
+ * dmr_lcn_trust is provenance for the map, not a separate table: leaving it
+ * behind would let a stale "learned on the control channel" byte authorize an
+ * off-CC tune to a frequency that only the new CSV asserts. Clearing it matches
+ * what -C produces at startup, and dmr_learn_chan_map() re-earns trust for any
+ * LCN the new map leaves empty. lcn_freq_roll indexes trunk_lcn_freq, so a
+ * shorter list has to restart the hunt rather than resume mid-way.
+ *
+ * The per-row name store is part of the map for the same reason: names are
+ * positional, so keeping the old file's names beside the new file's frequencies
+ * would label a row with a channel it no longer holds. It is moved rather than
+ * copied -- src is the caller's throwaway import state, about to be freed -- so
+ * the adopt cannot fail for want of memory after it has already replaced the
+ * live map, and the caller's dsd_state_trunk_lcn_free(src) then has nothing left
+ * to release. A refused adopt returns before the move, leaving the live store
+ * untouched and the imported one for that same call to free exactly once.
+ */
+static int
+chan_map_adopt(dsd_state* dst, dsd_state* src) {
+    // src is an arbitrary dsd_state*, so the sign and the tail are checked here rather
+    // than inherited from the importer: a negative count would become a huge size_t.
+    const int src_count = src->lcn_freq_count > 0 ? src->lcn_freq_count : 0;
+    if (src_count > DSD_TRUNK_LCN_EMBEDDED && src->trunk_lcn_freq_ext == NULL) {
+        LOG_ERROR("channel map adopt has no scan-list tail for %d entries\n", src_count);
+        return -1;
+    }
+    if (dsd_state_trunk_lcn_reserve(dst, (size_t)src_count) != 0) {
+        LOG_ERROR("channel map adopt out of memory\n");
+        return -1;
+    }
+    DSD_MEMCPY(dst->trunk_chan_map, src->trunk_chan_map, sizeof dst->trunk_chan_map);
+    DSD_MEMCPY(dst->trunk_chan_map_used, src->trunk_chan_map_used, sizeof dst->trunk_chan_map_used);
+    dst->trunk_chan_map_used_count = src->trunk_chan_map_used_count;
+    DSD_MEMCPY(dst->trunk_lcn_freq, src->trunk_lcn_freq, sizeof dst->trunk_lcn_freq);
+    if (src_count > DSD_TRUNK_LCN_EMBEDDED) {
+        DSD_MEMCPY(dst->trunk_lcn_freq_ext, src->trunk_lcn_freq_ext,
+                   (size_t)(src_count - DSD_TRUNK_LCN_EMBEDDED) * sizeof(dst->trunk_lcn_freq_ext[0]));
+    }
+    dsd_state_trunk_lcn_name_free(dst);
+    dst->trunk_lcn_name = src->trunk_lcn_name;
+    dst->trunk_lcn_name_capacity = src->trunk_lcn_name_capacity;
+    src->trunk_lcn_name = NULL;
+    src->trunk_lcn_name_capacity = 0;
+    // The per-row key store moves with the map the same way: the next hop
+    // re-applies from the new store, so no leave is needed here.
+    dsd_state_trunk_lcn_keys_free(dst);
+    dst->trunk_lcn_keys = src->trunk_lcn_keys;
+    dst->trunk_lcn_keys_capacity = src->trunk_lcn_keys_capacity;
+    src->trunk_lcn_keys = NULL;
+    src->trunk_lcn_keys_capacity = 0;
+    dst->lcn_freq_count = src_count;
+    dst->lcn_freq_roll = 0;
+    // Session avoids and the scan hold index rows that no longer exist.
+    dsd_state_trunk_lcn_avoid_free(dst);
+    dst->lcn_avoid_count = 0;
+    dst->lcn_scan_hold = 0;
+    DSD_MEMSET(dst->dmr_lcn_trust, 0, sizeof dst->dmr_lcn_trust);
+    dst->trunk_chan_map_seq++;
+    return 0;
+}
+
 int
 svc_import_channel_map(dsd_opts* opts, dsd_state* state, const char* path) {
     if (!opts || !state || !path || !*path) {
         return -1;
     }
+    // Same invariant the CLI enforces for -C: a trunk-scan run gets its channel
+    // maps per target, and adopting a global one here would wipe the target's.
+    if (opts->trunk_scan_enabled == 1) {
+        return -1;
+    }
     DSD_STRNCPY(opts->chan_in_file, path, sizeof opts->chan_in_file - 1);
     opts->chan_in_file[sizeof opts->chan_in_file - 1] = '\0';
-    return csvChanImport(opts, state);
+
+    // Import into throwaway heap state (dsd_state is multi-megabyte) so a
+    // failed import leaves the live map untouched. The allocation is large and
+    // this runs on the decoder thread, but it happens once per user import
+    // rather than per frame, and it is the same validate-then-swap shape
+    // dsd_tg_policy_reload_group_file() uses for the same reason.
+    dsd_state* imported = (dsd_state*)calloc(1, sizeof(*imported));
+    if (!imported) {
+        return -1;
+    }
+    const int import_rc = csvChanImport(opts, imported);
+    // The importer reports success for any file it could open, so a mispicked
+    // CSV (a talkgroup list, a header-only file) parses to an empty map. Adopting
+    // that would replace the live map with zeros; refuse instead, which is what
+    // the additive import used to do by doing nothing.
+    const int mapped_any = (imported->trunk_chan_map_used_count > 0);
+    int adopt_rc = -1;
+    if (import_rc == 0 && mapped_any) {
+        adopt_rc = chan_map_adopt(state, imported);
+    }
+    if (import_rc == 0 && mapped_any && adopt_rc == 0) {
+        dsd_scan_row_keys_warn_if_unused(state, opts->scanner_mode);
+    }
+    dsd_state_ext_free_all(imported);
+    dsd_state_trunk_lcn_free(imported);
+    free(imported);
+    return (import_rc == 0 && mapped_any && adopt_rc == 0) ? 0 : -1;
+}
+
+int
+svc_import_p25_bandplan(dsd_opts* opts, dsd_state* state, const char* path) {
+    if (!opts || !state || !path || !*path) {
+        return -1;
+    }
+    // Same invariant the CLI enforces for --p25-bandplan: a trunk-scan run gets
+    // its band plans per target (p25_bandplan_csv), and a global one adopted
+    // here would be overwritten by the next target's anyway.
+    if (opts->trunk_scan_enabled == 1) {
+        LOG_WARN("P25 band plan import refused under trunk scan; set p25_bandplan_csv on the target instead.\n");
+        return -1;
+    }
+    // Dry run before touching the live plan: the importer replaces the stored
+    // rows wholesale, so a file that opens but carries no usable row (a
+    // talkgroup list, a header-only file) would otherwise empty it.
+    dsd_csv_validation stats = {0, 0, 0};
+    if (dsd_csv_validate_p25_bandplan_file(path, &stats) != 0 || stats.accepted == 0U) {
+        LOG_WARN("P25 band plan import refused: %s has no usable row.\n", path);
+        return -1;
+    }
+    if (csvP25BandplanImportPath(path, state) != 0) {
+        return -1;
+    }
+    DSD_SNPRINTF(opts->p25_bandplan_in_file, sizeof opts->p25_bandplan_in_file, "%s", path);
+    // Announcements parked for want of an IDEN can resolve against the seeded tables now.
+    p25_resolve_pending_announcements(opts, state);
+    return 0;
+}
+
+int
+svc_export_p25_bandplan(const dsd_opts* opts, const dsd_state* state, const char* path) {
+    if (!opts || !state || !path || !*path) {
+        return -1;
+    }
+    return dsd_engine_p25_bandplan_export(opts, state, path);
+}
+
+int
+svc_clear_channel_map(dsd_opts* opts, dsd_state* state) {
+    if (!opts || !state) {
+        return -1;
+    }
+    // The same invariant svc_import_channel_map() enforces: under trunk scan the
+    // per-target maps are not this frontend's to empty.
+    if (opts->trunk_scan_enabled == 1) {
+        return -1;
+    }
+    opts->chan_in_file[0] = '\0';
+    DSD_MEMSET(state->trunk_chan_map, 0, sizeof state->trunk_chan_map);
+    DSD_MEMSET(state->trunk_chan_map_used, 0, sizeof state->trunk_chan_map_used);
+    state->trunk_chan_map_used_count = 0;
+    DSD_MEMSET(state->trunk_lcn_freq, 0, sizeof state->trunk_lcn_freq);
+    // Releases the per-row name, avoid and key stores along with the scan-list heap tail.
+    // Clearing the map leaves -Y: hand the foreground keyring back to the globals first.
+    dsd_scan_keys_leave(state);
+    dsd_state_trunk_lcn_free(state);
+    state->lcn_freq_count = 0;
+    state->lcn_freq_roll = 0;
+    state->lcn_avoid_count = 0;
+    state->lcn_scan_hold = 0;
+    // Provenance goes with the map, exactly as in chan_map_adopt(): a surviving
+    // "learned on the control channel" byte would authorize an off-CC tune to a
+    // frequency no longer in the map.
+    DSD_MEMSET(state->dmr_lcn_trust, 0, sizeof state->dmr_lcn_trust);
+    state->trunk_chan_map_seq++;
+    return 0;
+}
+
+int
+svc_clear_group_list(dsd_opts* opts, dsd_state* state) {
+    if (!opts || !state) {
+        return -1;
+    }
+    opts->group_in_file[0] = '\0';
+    return dsd_tg_policy_clear(state);
+}
+
+int
+svc_clear_keys(dsd_opts* opts, dsd_state* state) {
+    if (!opts || !state) {
+        return -1;
+    }
+    // One keyring behind both CSV kinds, so one clear covers dec and hex.
+    opts->key_in_file[0] = '\0';
+    DSD_MEMSET(state->rkey_array, 0, sizeof state->rkey_array);
+    DSD_MEMSET(state->rkey_array_loaded, 0, sizeof state->rkey_array_loaded);
+    // The TG->key ID override map indexes into the keyring, so it goes with it. One
+    // implementation, not a copy: tests/ui/test_ui_menu_services.c compiles this TU standalone and
+    // links src/core/vocoder/keyring.c alongside it.
+    keyring_dmr_tg_map_reset(state);
+    // Disarm the keyring the way svc_import_keys_dec() arms it. Leaving it set
+    // would keep every consumer treating the now-zeroed array as loaded keys.
+    state->keyloader = 0;
+    return 0;
 }
 
 int
@@ -339,7 +543,15 @@ svc_import_keys_dec(dsd_opts* opts, dsd_state* state, const char* path) {
     }
     DSD_STRNCPY(opts->key_in_file, path, sizeof opts->key_in_file - 1);
     opts->key_in_file[sizeof opts->key_in_file - 1] = '\0';
-    return csvKeyImportDec(opts, state);
+    const int rc = csvKeyImportDec(opts, state);
+    if (rc == 0) {
+        // Arm the keyring, exactly as -k does. Without this the rows land in
+        // rkey_array but every consumer (dsd_mbe, P25/NXDN crypto) gates on
+        // keyloader, so a session that started without a key file would report
+        // the import as applied and keep failing to decrypt.
+        state->keyloader = 1;
+    }
+    return rc;
 }
 
 int
@@ -349,7 +561,11 @@ svc_import_keys_hex(dsd_opts* opts, dsd_state* state, const char* path) {
     }
     DSD_STRNCPY(opts->key_in_file, path, sizeof opts->key_in_file - 1);
     opts->key_in_file[sizeof opts->key_in_file - 1] = '\0';
-    return csvKeyImportHex(opts, state);
+    const int rc = csvKeyImportHex(opts, state);
+    if (rc == 0) {
+        state->keyloader = 1; // see svc_import_keys_dec
+    }
+    return rc;
 }
 
 void
@@ -430,6 +646,44 @@ svc_set_slots_onoff(dsd_opts* opts, int mask) {
     }
     opts->slot1_on = (mask & 1) ? 1 : 0;
     opts->slot2_on = (mask & 2) ? 1 : 0;
+}
+
+void
+svc_set_scan_voice_only(dsd_opts* opts, int on) {
+    if (!opts) {
+        return;
+    }
+    // Turning the gate off leaves phase cleanup to the engine tick, which
+    // notices the flag and resets the gate on its next pass.
+    opts->scan_voice_only = on ? 1 : 0;
+}
+
+void
+svc_set_scan_voice_qualify_ms(dsd_opts* opts, int ms) {
+    if (!opts) {
+        return;
+    }
+    if (ms < 100) {
+        ms = 100;
+    }
+    if (ms > 600000) {
+        ms = 600000;
+    }
+    opts->scan_voice_qualify_ms = ms;
+}
+
+void
+svc_set_scan_voice_hold_ms(dsd_opts* opts, int ms) {
+    if (!opts) {
+        return;
+    }
+    if (ms < 100) {
+        ms = 100;
+    }
+    if (ms > 600000) {
+        ms = 600000;
+    }
+    opts->scan_voice_hold_ms = ms;
 }
 
 // Inversion toggles ---------------------------------------------------------
@@ -587,7 +841,11 @@ svc_rtl_set_sql_db(dsd_opts* opts, double dB) {
     if (!opts) {
         return -1;
     }
-    opts->rtl_squelch_level = dB_to_pwr(dB);
+    /* 0 dB is full scale, so as a threshold it would close the gate on every
+     * signal there is. Spending that value on "off" instead gives both UIs a way
+     * to switch the squelch off, and matches what 0 already means in the `sql`
+     * CLI field and the rtl_sql config key. */
+    opts->rtl_squelch_level = (dB >= 0.0) ? 0.0 : dsd_squelch_level_from_sql(dB);
     /* Sync the demod state for channel-based squelching */
     rtl_stream_set_channel_squelch((float)opts->rtl_squelch_level);
     return 0;

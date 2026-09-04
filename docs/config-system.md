@@ -76,10 +76,12 @@ data = true
 enabled = true
 chan_csv = "~/dsd-neo/dmr_t3_chan.csv"   # path expansion supported
 group_csv = "$HOME/dsd-neo/group.csv"
+p25_bandplan_csv = "~/dsd-neo/p25_bandplan.csv"
 allow_list = true
 
 [mode]
 decode = "auto"             # auto / p25p1 / p25p2 / dmr / nxdn48 / ...
+dmr_mono = false             # true enables the single-slot DMR decoder
 ```
 
 ---
@@ -100,6 +102,7 @@ Path expansion is applied to:
 - `[input] file_path`
 - `[trunking] chan_csv`
 - `[trunking] group_csv`
+- `[trunking] p25_bandplan_csv`
 - `[trunk_scan] targets_csv`
 - `[logging] event_log`
 - `[logging] frame_log`
@@ -161,7 +164,7 @@ dsd-neo --config config.ini --profile p25_trunk
 dsd-neo --config config.ini --list-profiles
 ```
 
-The terminal Config menu also supports `Load Profile...`, which lists profiles from
+The terminal Config menu also supports `Load profile...`, which lists profiles from
 the active config path and applies the selected overlay to the running session.
 
 ### Behavior
@@ -282,26 +285,28 @@ small subset is exposed as config keys for convenience (for example
 | `rtl_gain` | INT (0-49) | RTL-SDR gain in dB | `0` |
 | `rtl_ppm` | INT (-1000-1000) | Frequency correction | `0` |
 | `rtl_bw_khz` | INT (4-48) | DSP bandwidth | `48` |
-| `rtl_sql` | INT (-100-0) | Squelch level | `0` |
+| `rtl_sql` | INT (-100-0) | Squelch threshold in dB; `0` switches squelch off (a disabled squelch is saved as `0`) | `0` |
 | `rtl_volume` | INT (1-3) | RTL monitor/non-symbol gain multiplier | `2` |
 | `auto_ppm` | BOOL | Enable carrier/error-based RTL auto-PPM correction | `false` |
 | `rtl_auto_ppm` | BOOL | Deprecated read alias for `auto_ppm` | `false` |
 | `rtltcp_host` | STRING | RTL-TCP hostname | `127.0.0.1` |
 | `rtltcp_port` | INT (1-65535) | RTL-TCP port | `1234` |
 | `soapy_args` | STRING | SoapySDR device selection args (from SoapySDRUtil `--find`/`--probe`) | (empty) |
-| `soapy_profile` | ENUM | SoapySDR capability profile (`auto|generic|airspy|sdrplay|hackrf|lime|pluto|rtlsdr|uhd`) | `auto` |
+| `soapy_profile` | ENUM | SoapySDR capability profile (`auto|generic|airspy|sdrplay|hackrf|lime|pluto|rtlsdr|uhd|sddc`) | `auto` |
 | `soapy_stream_format` | ENUM | SoapySDR RX stream format (`auto|cf32|cs16`) | `auto` |
 | `soapy_antenna` | STRING | SoapySDR RX antenna name | (empty) |
 | `soapy_clock` | STRING | SoapySDR clock source name | (empty) |
 | `soapy_settings` | STRING | SoapySDR driver settings (`key=value`, `rx:key=value`) | (empty) |
 | `soapy_gains` | STRING | Named SoapySDR gain stages (`NAME:dB`) | (empty) |
 | `soapy_bandwidth_hz` | INT (-1-20000000) | SoapySDR hardware bandwidth (`-1` profile/default, `0` driver auto) | `-1` |
+| `digital_resample` | ENUM | Resample the digital FSK stream to the resampler target (`auto|on|off`) | `auto` |
 | `file_path` | PATH | Input file path (WAV/BIN/RAW/SYM) | (empty) |
 | `file_sample_rate` | INT (8000-192000) | File sample rate (WAV/RAW) | `48000` |
 | `tcp_host` | STRING | TCP PCM input host | `127.0.0.1` |
 | `tcp_port` | INT (1-65535) | TCP PCM input port | `7355` |
 | `udp_addr` | STRING | UDP bind address | `127.0.0.1` |
 | `udp_port` | INT (1-65535) | UDP port | `7355` |
+| `input_warn_db` | DOUBLE (-200-0) | Low input-level advisory threshold in dBFS | `-40.0` |
 
 **[output] section:**
 | Key | Type | Description | Default |
@@ -316,6 +321,10 @@ small subset is exposed as config keys for convenience (for example
 | Key | Type | Description | Default |
 |-----|------|-------------|---------|
 | `decode` | ENUM | Decode mode preset | `auto` |
+| `dmr_mono` | BOOL | Enable the single-slot DMR decoder without changing `decode` | `false` |
+| `dmr_lrrp_ports` | STRING | Extra UDP ports decoded as DMR LRRP, comma-separated, at most 8 (same as `--lrrp-extra-port`; a CLI list replaces this one) | (empty) |
+| `edacs_ea` | BOOL | Decode EDACS with extended addressing, without changing `decode` | `false` |
+| `edacs_esk` | BOOL | Apply the EDACS ESK `0xA0` scrambling mask, without changing `decode` | `false` |
 | `demod` | ENUM | Demodulator path | `auto` |
 
 **[trunking] section:**
@@ -324,19 +333,33 @@ small subset is exposed as config keys for convenience (for example
 | `enabled` | BOOL | Enable trunking | `false` |
 | `chan_csv` | PATH | Channel map CSV | (empty) |
 | `group_csv` | PATH | Group list CSV | (empty) |
+| `p25_bandplan_csv` | PATH | P25 band plan CSV (`--p25-bandplan`; see `docs/csv-formats.md`) | (empty) |
 | `allow_list` | BOOL | Use as allow list | `false` |
 | `tune_group_calls` | BOOL | Follow group calls | `true` |
 | `tune_private_calls` | BOOL | Follow private calls | `true` |
 | `tune_data_calls` | BOOL | Follow data calls | `false` |
 | `tune_enc_calls` | BOOL | Follow P25 encrypted grants without key-aware lockout; `false` silently classifies and follows only usable matching keys | `true` |
-
+| `scanner` | BOOL | Use the channel map as a conventional scanner (`-Y`) instead of following a control channel | `false` |
+| `scan_voice_only` | BOOL | Step `-Y`/conventional scan on unless decoded voice holds the row | `false` |
+| `scan_voice_qualify_ms` | INT (100-600000) | Window after sync in which voice must appear or the scan moves on | `1000` |
+| `scan_voice_hold_ms` | INT (100-600000) | Time to stay after the last voice frame | `2000` |
+| `p25_prefer_candidates` | BOOL | Prefer learned P25 control-channel candidates when hunting (`-^`) | `false` |
 **[trunk_scan] section:**
 | Key | Type | Description | Default |
 |-----|------|-------------|---------|
 | `enabled` | BOOL | Enable single-tuner trunk scan | `false` |
 | `targets_csv` | PATH | Scan target list CSV | (empty) |
 | `idle_dwell_ms` | INT (250-600000) | Default idle dwell per target | `3000` |
-| `activity_hold_ms` | INT (250-600000) | Conventional DMR activity hold | `1200` |
+| `activity_hold_ms` | INT (250-600000) | Conventional DMR/NXDN activity hold | `1200` |
+
+**[radioreference] section:**
+| Key | Type | Description | Default |
+|-----|------|-------------|---------|
+| `username` | STRING | RadioReference account username | (empty) |
+| `app_key` | STRING | RadioReference application key (ignored when a key is baked into the build) | (empty) |
+
+The password has no key here and never will: it is asked once per program run and held in memory
+only. See `docs/radioreference-import.md`.
 
 **[logging] section:**
 | Key | Type | Description | Default |
@@ -356,6 +379,10 @@ small subset is exposed as config keys for convenience (for example
 | `voice_end` | BOOL | Beep when a voice call ends | `true` |
 | `end` | BOOL | Deprecated read alias for `voice_end` | `true` |
 | `data` | BOOL | Beep when a data call is logged | `true` |
+
+A transmission the decoder loses and regains is one call, so it beeps `voice_start` once at the
+start and `voice_end` once at the end. The end alert is held for roughly half a second after sync
+is lost, since the call may still resume; a terminator alerts immediately.
 
 **[recording] section:**
 | Key | Type | Description | Default |
@@ -505,17 +532,24 @@ Output format:
 ### Decode Modes
 
 The `decode` key in `[mode]` configures the frame types and modulation.
-Supported values: `auto`, `p25p1`, `p25p2`, `dmr`, `nxdn48`, `nxdn96`,
-`x2tdma`, `ysf`, `dstar`, `edacs_pv`, `dpmr`, `m17`, `tdma`, `analog`.
+Supported values: `auto`, `p25p1`, `p25p2`, `dmr`, `dmr_mono`, `nxdn48`,
+`nxdn96`, `x2tdma`, `ysf`, `dstar`, `edacs_pv`, `dpmr`, `m17`, `tdma`,
+`analog`. `dmr_mono` selects the same single-slot decoder as CLI `-fr`.
 Persisted compatibility values `p25p1_only`, `p25p2_only`, `edacs`,
 `provoice`, and `analog_monitor` are translated to their canonical modes when
 read. Generated configurations always use the canonical values above.
 
-`decode = "auto"` preserves the protocol candidates already established by
-initialization and any active configuration/profile overlay; it does not replace
-them with the CLI full-search preset. Interactive Auto has the same preservation
-semantics. In contrast, CLI `-fa` explicitly enables every digital candidate in
-the five-profile hunt matrix:
+The independent `dmr_mono = true` key preserves the CLI `-nm` override without
+changing the selected frame mask. This allows shared presets such as `auto` and
+`tdma` to use the single-slot DMR decoder while retaining their non-DMR
+candidates.
+
+`decode = "auto"` enables every digital candidate in the five-profile hunt
+matrix below, exactly as CLI `-fa` and the interactive Auto choice do. All three
+entry points select the same decoder set; only `-fa` additionally resets the
+demodulator to C4FM and the audio layout to stereo, because on the config path
+those belong to the `demod` and `dmr_mono` keys, which are applied after the
+preset and therefore win. The hunt matrix:
 
 | Hunt profile | Symbol rate | Levels | Candidates |
 | --- | ---: | ---: | --- |
@@ -527,6 +561,12 @@ the five-profile hunt matrix:
 
 Profiles without an enabled candidate are skipped. A successful sync retains
 the active rate, level count, symbol timing, and RTL-family channel profile.
+
+Autosave records the decoder set only when a preset reproduces it exactly: an
+`-fa` session saves `decode = "auto"` and reloads with every decoder enabled,
+while a session whose decoder set matches no preset saves no `decode` key at
+all and reloads with the initialization defaults left alone. Independent keys
+such as `dmr_mono` are still saved either way.
 Passive analog monitoring and already-framed M17 UDP input are outside this
 frame-sync hunt.
 
@@ -587,9 +627,9 @@ is rejected by Soapy metadata, or the driver rejects `writeSetting`.
 When `[trunking] enabled = true`:
 
 - Trunking is activated for the selected mode.
-- CSV paths (`chan_csv`, `group_csv`) are passed to the decoder.
-- CSV paths in the config are applied the same as passing `-C`/`-G` and are
-  loaded when trunking is enabled.
+- CSV paths (`chan_csv`, `group_csv`, `p25_bandplan_csv`) are passed to the decoder.
+- CSV paths in the config are applied the same as passing `-C`/`-G`/`--p25-bandplan` and are
+  loaded when trunking is enabled (`p25_bandplan_csv` loads whenever P25 can be decoded).
 - CSV formats and examples are documented in `docs/csv-formats.md` and `examples/`.
 - If you start DSD-neo with any CLI args and you do not explicitly set trunking
   or scan mode (`-T`/`-Y`), trunking inherited from the config is disabled for
@@ -598,7 +638,8 @@ When `[trunking] enabled = true`:
 When `[trunk_scan] enabled = true`:
 
 - `targets_csv` is required and must use the target format in `docs/csv-formats.md`.
-- Global `[trunking] chan_csv` is rejected; each trunk target must name its own `chan_csv` if it needs a channel map.
+- Global `[trunking] chan_csv` and `[trunking] p25_bandplan_csv` are rejected; each trunk target must name its own
+  `chan_csv` / `p25_bandplan_csv` if it needs a channel map or a band plan.
 - The group policy remains global, so `[trunking] group_csv`, `allow_list`, and tune controls apply uniformly across all
   scan targets.
 - One tuner is rotated across targets. Calls on systems that are not currently parked can be missed.
@@ -682,7 +723,9 @@ through selecting input, mode, trunking, and UI options.
 - A no-arg run only loads a config if you enable it via `DSD_NEO_CONFIG`.
 - If config is enabled and loads successfully and no other CLI args are provided:
   skip the wizard, use config settings.
-- If CLI args are provided: config is loaded first, then CLI overrides it.
+- If CLI args are provided: config is loaded first, then CLI overrides it. This holds for
+  list-valued keys too: the first `--lrrp-extra-port` empties the `mode.dmr_lrrp_ports` list
+  before adding its own port.
 - CLI:
   - `--interactive-setup` forces running the wizard even if a config
     exists; the resulting setup is automatically saved to the current
@@ -744,6 +787,14 @@ Older releases also wrote per-system P25 control-channel candidate files under
 loader and both environment variables after the cache support window ends or a
 migration imports the saved frequencies into current channel-map inputs.
 
+The RadioReference import (`docs/radioreference-import.md`) persists exactly two
+keys, `[radioreference] username` and `[radioreference] app_key`, shared by the
+terminal wizard and the Qt frontend. The **password is never persisted**: it is
+held in wizard memory for one program run, and there is no schema row, no
+`dsdneoUserConfig` field and no `dsd_opts` field for it. A build that bakes in an
+application key (`DSD_RR_APP_KEY`) ignores a stored `app_key` outright, and the
+key row is not offered.
+
 Separately, normal loading ignores unknown keys and sections so configuration
 introduced during a staged deployment can survive rollback to an older binary;
 `--validate-config` recursively checks included files and reports each unknown
@@ -756,10 +807,11 @@ entry as a warning.
 When running with the terminal UI (`frontend = "terminal"` or `--frontend terminal`), the
 **Config** menu provides:
 
-- **Save Config (Current)**: Save current settings to the active config path (loaded via `--config` or **Load Config...**).
-- **Save Config (Default)**: Save current settings to the default config path.
-- **Save Config As...**: Save to a custom path.
-- **Load Config...**: Load a config file and apply it to the running session.
+- **Load config...**: Load a config file and apply it to the running session.
+- **Load profile...**: Load a named profile from the active config without enabling autosave.
+- **Save config**: Save current settings to the active config path (loaded via `--config` or **Load config...**).
+- **Save config as...**: Save to a custom path.
+- **Save as default config**: Save current settings to the default config path and enable autosave.
 
 ### Live Reload
 

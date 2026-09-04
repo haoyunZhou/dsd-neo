@@ -18,12 +18,14 @@
 #include <dsd-neo/platform/audio.h>
 #include <dsd-neo/platform/posix_compat.h>
 #include <dsd-neo/runtime/config.h>
+#include <dsd-neo/runtime/decode_mode.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #if defined(__SSE__) || defined(__SSE2__)
 #include <xmmintrin.h>
 #endif
+#include "csv_picker.h"
 #include "dsd-neo/core/safe_api.h"
 #include "dsd-neo/core/state_fwd.h"
 #include "dsd-neo/runtime/call_alert.h"
@@ -32,12 +34,7 @@
 #include "menu_env.h"
 #include "menu_internal.h"
 #include "menu_prompts.h"
-
-#ifdef USE_RADIO
-#endif
-
-#if defined(__SSE__) || defined(__SSE2__)
-#endif
+#include "rr_panel.h"
 
 // ---- Main menu actions ----
 
@@ -327,6 +324,12 @@ act_p25_enc_lockout(void* v) {
 }
 
 void
+act_enc_lockout_clear(void* v) {
+    UNUSED(v);
+    (void)dsd_app_command_action(DSD_APP_CMD_ENC_LOCKOUT_CLEAR);
+}
+
+void
 act_setmod_bw(void* v) {
     UiCtx* c = (UiCtx*)v;
     ui_prompt_open_int_async("Setmod BW (Hz)", c->opts->setmod_bw, cb_setmod_bw, c);
@@ -335,13 +338,45 @@ act_setmod_bw(void* v) {
 void
 act_import_chan(void* v) {
     UiCtx* c = (UiCtx*)v;
-    ui_prompt_open_string_async("Channel map CSV", NULL, 1024, cb_import_chan, c);
+    ui_csv_import_picker_open("chan", "Channel map CSV", 1024, cb_import_chan, c);
+}
+
+void
+act_import_p25_bandplan(void* v) {
+    UiCtx* c = (UiCtx*)v;
+    // No sidecar kind carries a band plan yet, so the picker falls straight to the path prompt.
+    ui_csv_import_picker_open("iden", "P25 band plan CSV", 1024, cb_import_p25_bandplan, c);
+}
+
+void
+act_export_p25_bandplan(void* v) {
+    UiCtx* c = (UiCtx*)v;
+    // Name the file after the system it was learned on when there is exactly
+    // one: under trunk scan the export merges every target's tables, so the
+    // identity of the one on air would mislabel it.
+    char name[64];
+    const dsd_state* st = c ? c->state : NULL;
+    const int single_system = (c && c->opts && c->opts->trunk_scan_enabled != 1);
+    if (single_system && st && st->p2_wacn != 0ULL && st->p2_sysid != 0ULL) {
+        DSD_SNPRINTF(name, sizeof name, "p25_bandplan_%05llX_%03llX.csv", (unsigned long long)st->p2_wacn,
+                     (unsigned long long)st->p2_sysid);
+    } else {
+        DSD_SNPRINTF(name, sizeof name, "%s", "p25_bandplan.csv");
+    }
+    char def[1024];
+    const char* dir = dsd_user_imports_dir();
+    if (dir && *dir) {
+        DSD_SNPRINTF(def, sizeof def, "%s/%s", dir, name);
+    } else {
+        DSD_SNPRINTF(def, sizeof def, "%s", name);
+    }
+    ui_prompt_open_string_async("Export P25 band plan to path", def, sizeof def, cb_export_p25_bandplan, c);
 }
 
 void
 act_import_group(void* v) {
     UiCtx* c = (UiCtx*)v;
-    ui_prompt_open_string_async("Group list CSV", NULL, 1024, cb_import_group, c);
+    ui_csv_import_picker_open("group", "Group list CSV", 1024, cb_import_group, c);
 }
 
 void
@@ -380,6 +415,63 @@ act_hangtime(void* v) {
     ui_prompt_open_double_async("Hangtime seconds", c->opts->trunk_hangtime, cb_hangtime, c);
 }
 
+void
+act_scan_voice_only(void* v) {
+    UiCtx* c = (UiCtx*)v;
+    int32_t on = (c && c->opts && c->opts->scan_voice_only) ? 0 : 1;
+    (void)dsd_app_command_set_i32(DSD_APP_CMD_SCAN_VOICE_ONLY_SET, on);
+}
+
+void
+act_scan_voice_qualify(void* v) {
+    UiCtx* c = (UiCtx*)v;
+    ui_prompt_open_int_async("Voice qualify (ms)", c->opts->scan_voice_qualify_ms, cb_scan_voice_qualify, c);
+}
+
+void
+act_scan_voice_hold(void* v) {
+    UiCtx* c = (UiCtx*)v;
+    ui_prompt_open_int_async("Voice hold (ms)", c->opts->scan_voice_hold_ms, cb_scan_voice_hold, c);
+}
+
+void
+act_rr_import(void* v) {
+    UiCtx* c = (UiCtx*)v;
+    if (!c || !c->opts) {
+        return;
+    }
+    rr_panel_open_import(c->opts, c->state);
+}
+
+void
+act_rr_library(void* v) {
+    UiCtx* c = (UiCtx*)v;
+    if (!c || !c->opts) {
+        return;
+    }
+    rr_panel_open_library(c->opts, c->state);
+}
+
+void
+act_rr_account_user(void* v) {
+    UiCtx* c = (UiCtx*)v;
+    if (!c || !c->opts) {
+        return;
+    }
+    ui_prompt_open_string_async("RadioReference username", c->opts->rr_username, sizeof c->opts->rr_username,
+                                cb_rr_account_user, c);
+}
+
+void
+act_rr_account_key(void* v) {
+    UiCtx* c = (UiCtx*)v;
+    if (!c || !c->opts) {
+        return;
+    }
+    ui_prompt_open_string_async("RadioReference application key", c->opts->rr_app_key, sizeof c->opts->rr_app_key,
+                                cb_rr_account_key, c);
+}
+
 // ---- DMR/TDMA actions ----
 
 void
@@ -398,13 +490,6 @@ void
 act_slot_pref(void* v) {
     UiCtx* c = (UiCtx*)v;
     ui_prompt_open_int_async("Slot 1 or 2", c->opts->slot_preference + 1, cb_slot_pref, c);
-}
-
-void
-act_slots_on(void* v) {
-    UiCtx* c = (UiCtx*)v;
-    int m = (c->opts->slot1_on ? 1 : 0) | (c->opts->slot2_on ? 2 : 0);
-    ui_prompt_open_int_async("Slots mask (0..3)", m, cb_slots_on, c);
 }
 
 // ---- Key import actions ----
@@ -766,12 +851,6 @@ io_save_symbol_capture(void* vctx) {
 }
 
 void
-io_read_symbol_bin(void* vctx) {
-    UiCtx* c = (UiCtx*)vctx;
-    ui_prompt_open_string_async("Enter Symbol Capture Filename", NULL, 1024, cb_io_read_symbol_bin, c);
-}
-
-void
 io_replay_last_symbol_bin(void* vctx) {
     UNUSED(vctx);
     (void)dsd_app_command_action(DSD_APP_CMD_REPLAY_LAST);
@@ -938,30 +1017,6 @@ io_set_input_volume(void* vctx) {
         m = 16;
     }
     ui_prompt_open_int_async("Input Volume Multiplier (1..16)", m, cb_input_vol, c);
-}
-
-void
-io_input_vol_up(void* vctx) {
-    UiCtx* c = (UiCtx*)vctx;
-    int m = c->opts->input_volume_multiplier;
-    if (m < 16) {
-        m++;
-    }
-    int32_t v = m;
-    (void)dsd_app_command_set_i32(DSD_APP_CMD_INPUT_VOL_SET, v);
-    ui_statusf("Input Volume requested: %dX", m);
-}
-
-void
-io_input_vol_dn(void* vctx) {
-    UiCtx* c = (UiCtx*)vctx;
-    int m = c->opts->input_volume_multiplier;
-    if (m > 1) {
-        m--;
-    }
-    int32_t v = m;
-    (void)dsd_app_command_set_i32(DSD_APP_CMD_INPUT_VOL_SET, v);
-    ui_statusf("Input Volume requested: %dX", m);
 }
 
 void
@@ -1189,6 +1244,12 @@ act_toggle_ui_channels(void* v) {
 }
 
 void
+act_toggle_ui_compact(void* v) {
+    UNUSED(v);
+    (void)dsd_app_command_action(DSD_APP_CMD_TOGGLE_COMPACT);
+}
+
+void
 act_toggle_ui_p25_callsign(void* v) {
     UNUSED(v);
     (void)dsd_app_command_action(DSD_APP_CMD_UI_SHOW_P25_CALLSIGN_TOGGLE);
@@ -1197,12 +1258,6 @@ act_toggle_ui_p25_callsign(void* v) {
 // ---- RTL-SDR actions ----
 
 #ifdef USE_RADIO
-
-void
-rtl_enable(void* v) {
-    UNUSED(v);
-    (void)dsd_app_command_action(DSD_APP_CMD_RTL_ENABLE_INPUT);
-}
 
 void
 rtl_restart(void* v) {
@@ -1245,7 +1300,11 @@ rtl_set_bw(void* v) {
 void
 rtl_set_sql(void* v) {
     UiCtx* c = (UiCtx*)v;
-    ui_prompt_open_double_async("Squelch (dB, negative)", pwr_to_dB(c->opts->rtl_squelch_level), cb_rtl_sql, c);
+    /* Offer 0 for a squelch that is off rather than pwr_to_dB()'s -120 floor:
+     * accepting the value shown must not turn a disabled squelch into a real
+     * threshold. 0 is also how the `sql` CLI field and rtl_sql spell "off". */
+    const double shown = dsd_squelch_is_off(c->opts->rtl_squelch_level) ? 0.0 : pwr_to_dB(c->opts->rtl_squelch_level);
+    ui_prompt_open_double_async("Squelch (dB; 0 = off)", shown, cb_rtl_sql, c);
 }
 
 void
@@ -1319,51 +1378,185 @@ act_toggle_iq_dc(void* v) {
 }
 
 void
-act_iq_dc_k_up(void* v) {
-    UNUSED(v);
-    dsd_app_dsp_payload p = {.op = DSD_APP_DSP_OP_IQ_DC_K_DELTA, .a = +1};
-    (void)dsd_app_command_dsp_op(&p);
-}
-
-void
-act_iq_dc_k_dn(void* v) {
-    UNUSED(v);
-    dsd_app_dsp_payload p = {.op = DSD_APP_DSP_OP_IQ_DC_K_DELTA, .a = -1};
-    (void)dsd_app_command_dsp_op(&p);
-}
-
-void
-act_ted_gain_up(void* v) {
-    UNUSED(v);
-    dsd_frontend_metrics metrics;
-    (void)dsd_app_frontend_get_metrics(&metrics);
-    float g = metrics.ted_gain;
-    int g_milli = (int)(g * 1000.0f + 0.5f);
-    if (g_milli < 500) {
-        g_milli += 5;
-    }
-    dsd_app_dsp_payload p = {.op = DSD_APP_DSP_OP_TED_GAIN_SET, .a = g_milli};
-    (void)dsd_app_command_dsp_op(&p);
-}
-
-void
-act_ted_gain_dn(void* v) {
-    UNUSED(v);
-    dsd_frontend_metrics metrics;
-    (void)dsd_app_frontend_get_metrics(&metrics);
-    float g = metrics.ted_gain;
-    int g_milli = (int)(g * 1000.0f + 0.5f);
-    if (g_milli > 10) {
-        g_milli -= 5;
-    }
-    dsd_app_dsp_payload p = {.op = DSD_APP_DSP_OP_TED_GAIN_SET, .a = g_milli};
-    (void)dsd_app_command_dsp_op(&p);
-}
-
-void
 act_toggle_dsp_panel(void* v) {
     UNUSED(v);
     (void)dsd_app_command_action(DSD_APP_CMD_UI_SHOW_DSP_PANEL_TOGGLE);
 }
 
+#endif /* USE_RADIO */
+
+// ---- Rows the signal-chain menu added: every hotkey-only command gets a row ----
+
+#define DSD_SIMPLE_ACTION(name, cmd)                                                                                   \
+    void name(void* v) {                                                                                               \
+        UNUSED(v);                                                                                                     \
+        (void)dsd_app_command_action(cmd);                                                                             \
+    }
+
+DSD_SIMPLE_ACTION(act_mod_cycle, DSD_APP_CMD_MOD_TOGGLE)
+DSD_SIMPLE_ACTION(act_mod_p2_toggle, DSD_APP_CMD_MOD_P2_TOGGLE)
+DSD_SIMPLE_ACTION(act_lpf_toggle, DSD_APP_CMD_LPF_TOGGLE)
+DSD_SIMPLE_ACTION(act_hpf_toggle, DSD_APP_CMD_HPF_TOGGLE)
+DSD_SIMPLE_ACTION(act_pbf_toggle, DSD_APP_CMD_PBF_TOGGLE)
+DSD_SIMPLE_ACTION(act_hpf_d_toggle, DSD_APP_CMD_HPF_D_TOGGLE)
+DSD_SIMPLE_ACTION(act_slot1_toggle, DSD_APP_CMD_SLOT1_TOGGLE)
+DSD_SIMPLE_ACTION(act_slot2_toggle, DSD_APP_CMD_SLOT2_TOGGLE)
+DSD_SIMPLE_ACTION(act_dmr_reset, DSD_APP_CMD_DMR_RESET)
+DSD_SIMPLE_ACTION(act_provoice_esk, DSD_APP_CMD_PROVOICE_ESK_TOGGLE)
+DSD_SIMPLE_ACTION(act_provoice_mode, DSD_APP_CMD_PROVOICE_MODE_TOGGLE)
+DSD_SIMPLE_ACTION(act_return_cc, DSD_APP_CMD_RETURN_CC)
+DSD_SIMPLE_ACTION(act_channel_cycle, DSD_APP_CMD_CHANNEL_CYCLE)
+DSD_SIMPLE_ACTION(act_scan_hold_toggle, DSD_APP_CMD_SCAN_HOLD_TOGGLE)
+DSD_SIMPLE_ACTION(act_scan_avoid, DSD_APP_CMD_SCAN_AVOID)
+DSD_SIMPLE_ACTION(act_scan_avoid_clear, DSD_APP_CMD_SCAN_AVOID_CLEAR)
+DSD_SIMPLE_ACTION(act_force_rc4, DSD_APP_CMD_FORCE_RC4_TOGGLE)
+DSD_SIMPLE_ACTION(act_history_cycle, DSD_APP_CMD_HISTORY_CYCLE)
+DSD_SIMPLE_ACTION(act_eh_toggle_slot, DSD_APP_CMD_EH_TOGGLE_SLOT)
+DSD_SIMPLE_ACTION(act_eh_prev, DSD_APP_CMD_EH_PREV)
+DSD_SIMPLE_ACTION(act_eh_next, DSD_APP_CMD_EH_NEXT)
+DSD_SIMPLE_ACTION(act_sim_nocar, DSD_APP_CMD_SIM_NOCAR)
+DSD_SIMPLE_ACTION(act_vis_const, DSD_APP_CMD_CONST_TOGGLE)
+DSD_SIMPLE_ACTION(act_vis_const_norm, DSD_APP_CMD_CONST_NORM_TOGGLE)
+DSD_SIMPLE_ACTION(act_vis_eye, DSD_APP_CMD_EYE_TOGGLE)
+DSD_SIMPLE_ACTION(act_vis_eye_unicode, DSD_APP_CMD_EYE_UNICODE_TOGGLE)
+DSD_SIMPLE_ACTION(act_vis_eye_color, DSD_APP_CMD_EYE_COLOR_TOGGLE)
+DSD_SIMPLE_ACTION(act_vis_fsk, DSD_APP_CMD_FSK_HIST_TOGGLE)
+DSD_SIMPLE_ACTION(act_vis_spectrum, DSD_APP_CMD_SPECTRUM_TOGGLE)
+
+#undef DSD_SIMPLE_ACTION
+
+void
+act_lockout_slot1(void* v) {
+    UNUSED(v);
+    (void)dsd_app_command_set_u8(DSD_APP_CMD_LOCKOUT_SLOT, 0U);
+}
+
+void
+act_lockout_slot2(void* v) {
+    UNUSED(v);
+    (void)dsd_app_command_set_u8(DSD_APP_CMD_LOCKOUT_SLOT, 1U);
+}
+
+// ---- Decoder mode ----
+
+/* Picker order: the catch-all first, then the P25 family, DMR, and the rest
+   roughly by how often they are asked for. The names come from the runtime so
+   the picker and the label that reads the mode back cannot disagree. */
+static const dsdneoUserDecodeMode k_decode_mode_choices[] = {
+    DSDCFG_MODE_AUTO,     DSDCFG_MODE_TDMA,     DSDCFG_MODE_P25P1,  DSDCFG_MODE_P25P2,  DSDCFG_MODE_DMR,
+    DSDCFG_MODE_DMR_MONO, DSDCFG_MODE_NXDN48,   DSDCFG_MODE_NXDN96, DSDCFG_MODE_X2TDMA, DSDCFG_MODE_YSF,
+    DSDCFG_MODE_DSTAR,    DSDCFG_MODE_EDACS_PV, DSDCFG_MODE_DPMR,   DSDCFG_MODE_M17,    DSDCFG_MODE_ANALOG,
+};
+#define DECODE_MODE_CHOICE_COUNT (sizeof k_decode_mode_choices / sizeof k_decode_mode_choices[0])
+/* Filled once: every entry is a pointer into the runtime's own static name table,
+   so there is nothing to refresh between opens. */
+static const char* g_decode_mode_labels[DECODE_MODE_CHOICE_COUNT];
+static int g_decode_mode_labels_ready;
+
+static int
+decode_mode_choice_index(dsdneoUserDecodeMode mode) {
+    for (size_t i = 0; i < DECODE_MODE_CHOICE_COUNT; i++) {
+        if (k_decode_mode_choices[i] == mode) {
+            return (int)i;
+        }
+    }
+    return 0;
+}
+
+static void
+chooser_done_decode_mode(void* u, int sel) {
+    UNUSED(u);
+    if (sel < 0 || sel >= (int)DECODE_MODE_CHOICE_COUNT) {
+        return;
+    }
+    /* The command toasts "Decoding <mode>" itself once it has applied. */
+    (void)dsd_app_command_set_i32(DSD_APP_CMD_DECODE_MODE_SET, (int32_t)k_decode_mode_choices[sel]);
+}
+
+// cppcheck-suppress-begin constParameterPointer
+void
+act_decode_mode(void* v) {
+    const UiCtx* c = (const UiCtx*)v;
+    if (!g_decode_mode_labels_ready) {
+        for (size_t i = 0; i < DECODE_MODE_CHOICE_COUNT; i++) {
+            g_decode_mode_labels[i] = dsd_decode_mode_display_name(k_decode_mode_choices[i]);
+        }
+        g_decode_mode_labels_ready = 1;
+    }
+    /* Opened on the mode in effect, not on the first row. The first row is Auto,
+       and Auto is the one choice the command layer never treats as a no-op: it
+       re-enables every protocol and resets the modulation, so a stray second Enter
+       would drag a settled QPSK session back to C4FM. */
+    const dsdneoUserDecodeMode now = (c && c->opts) ? dsd_infer_decode_mode_preset(c->opts) : DSDCFG_MODE_AUTO;
+    ui_chooser_start_at("Decoder mode", g_decode_mode_labels, (int)DECODE_MODE_CHOICE_COUNT,
+                        decode_mode_choice_index(now), chooser_done_decode_mode, NULL);
+}
+
+// cppcheck-suppress-end constParameterPointer
+
+#ifdef USE_RADIO
+// ---- RTL DSP values entered as a number rather than stepped ----
+
+/* The DSP layer only offers a DELTA op for k, so an absolute value typed into the
+   prompt has to be turned into one. The baseline is read here, in the callback,
+   rather than snapshotted when the prompt opened: the prompt is modeless, and the
+   queue handler applies the delta to whatever k is live by the time it runs, so a
+   stale baseline (a stream restart or a config apply in between) lands on a k the
+   operator never typed. */
+static void
+cb_iq_dc_k(void* u, int ok, int k) {
+    UNUSED(u);
+    if (!ok) {
+        return;
+    }
+    if (k < 6) {
+        k = 6;
+    }
+    if (k > 15) {
+        k = 15;
+    }
+    dsd_frontend_metrics metrics;
+    (void)dsd_app_frontend_get_metrics(&metrics);
+    const int delta = k - metrics.iq_dc_shift_k;
+    if (delta == 0) {
+        return;
+    }
+    dsd_app_dsp_payload p = {.op = DSD_APP_DSP_OP_IQ_DC_K_DELTA, .a = delta};
+    (void)dsd_app_command_dsp_op(&p);
+}
+
+void
+act_iq_dc_k_prompt(void* v) {
+    UNUSED(v);
+    dsd_frontend_metrics metrics;
+    (void)dsd_app_frontend_get_metrics(&metrics);
+    ui_prompt_open_int_async("IQ DC shift k (6..15)", metrics.iq_dc_shift_k, cb_iq_dc_k, NULL);
+}
+
+/* 10, not 1: DSD_APP_DSP_OP_TED_GAIN_SET clamps there, so a lower bound of 1 in
+   the prompt title accepted 1..9 and then silently applied 10. */
+static void
+cb_ted_gain(void* u, int ok, int milli) {
+    UNUSED(u);
+    if (!ok) {
+        return;
+    }
+    if (milli < 10) {
+        milli = 10;
+    }
+    if (milli > 500) {
+        milli = 500;
+    }
+    dsd_app_dsp_payload p = {.op = DSD_APP_DSP_OP_TED_GAIN_SET, .a = milli};
+    (void)dsd_app_command_dsp_op(&p);
+}
+
+void
+act_ted_gain_prompt(void* v) {
+    UNUSED(v);
+    dsd_frontend_metrics metrics;
+    (void)dsd_app_frontend_get_metrics(&metrics);
+    const int milli = (int)(metrics.ted_gain * 1000.0f + 0.5f);
+    ui_prompt_open_int_async("CQPSK timing gain (x0.001, 10..500)", milli, cb_ted_gain, NULL);
+}
 #endif /* USE_RADIO */

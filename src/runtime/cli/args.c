@@ -6,6 +6,8 @@
 #include <ctype.h>
 #include <dsd-neo/core/csv_import.h>
 #include <dsd-neo/core/file_io.h>
+#include <dsd-neo/core/key_set.h>
+#include <dsd-neo/core/lrrp_ports.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/parse.h>
 #include <dsd-neo/core/state.h>
@@ -167,6 +169,41 @@ cli_parse_decimal_u64(const char* in, uint64_t* out) {
     return 1;
 }
 
+/*
+ * Record one extra UDP port to route onto the LRRP decoder. The option repeats, so a site with
+ * more than one location port lists them all; the table is small and fixed so a typo cannot grow
+ * it without bound. The first occurrence on the command line empties the table, so a CLI list
+ * replaces whatever mode.dmr_lrrp_ports put there rather than extending it. Returns 0 and reports
+ * the reason when the value cannot be accepted.
+ */
+static int
+cli_add_lrrp_extra_port(dsd_opts* opts, const char* value, int* seen_on_cli, int* out_exit_rc) {
+    unsigned long parsed_port = 0;
+    if (!cli_parse_decimal_u32(value, &parsed_port)) {
+        LOG_ERROR("Invalid --lrrp-extra-port value \"%s\" (expected decimal port)\n", value);
+        cli_set_exit_rc(out_exit_rc, 1);
+        return 0;
+    }
+    if (seen_on_cli && !*seen_on_cli) {
+        opts->lrrp_extra_port_count = 0;
+        *seen_on_cli = 1;
+    }
+    switch (dsd_lrrp_port_list_add(opts->lrrp_extra_ports, &opts->lrrp_extra_port_count, DSD_LRRP_EXTRA_PORT_MAX,
+                                   parsed_port)) {
+        case DSD_LRRP_PORT_RANGE:
+            LOG_ERROR("Invalid --lrrp-extra-port value \"%s\" (expected port 1..65535)\n", value);
+            cli_set_exit_rc(out_exit_rc, 1);
+            return 0;
+        case DSD_LRRP_PORT_FULL:
+            LOG_ERROR("Too many --lrrp-extra-port values (at most %d)\n", DSD_LRRP_EXTRA_PORT_MAX);
+            cli_set_exit_rc(out_exit_rc, 1);
+            return 0;
+        case DSD_LRRP_PORT_ADDED:
+        case DSD_LRRP_PORT_DUPLICATE:
+        default: return 1;
+    }
+}
+
 static int
 cli_has_config_one_shot_arg(int argc, char** argv) {
     if (argc <= 1 || !argv) {
@@ -191,7 +228,7 @@ cli_has_config_one_shot_arg(int argc, char** argv) {
 
 static int
 cli_validate_trunk_scan_runtime_args(dsd_opts* opts, int trunk_scan_cli_seen, int chan_csv_cli_seen,
-                                     int config_one_shot_cli_seen, int* out_exit_rc) {
+                                     int p25_bandplan_cli_seen, int config_one_shot_cli_seen, int* out_exit_rc) {
     if (!opts || !opts->trunk_scan_enabled || config_one_shot_cli_seen) {
         return DSD_PARSE_CONTINUE;
     }
@@ -205,6 +242,16 @@ cli_validate_trunk_scan_runtime_args(dsd_opts* opts, int trunk_scan_cli_seen, in
     }
     if (opts->chan_in_file[0] != '\0') {
         LOG_ERROR("--trunk-scan cannot be combined with global -C/channel-map config; use per-target chan_csv\n");
+        cli_set_exit_rc(out_exit_rc, 1);
+        return DSD_PARSE_ERROR;
+    }
+    /* Same rule for a config-file [trunking] p25_bandplan_csv: an explicit CLI --trunk-scan
+       disowns the inherited plan (targets carry their own), an inherited one is a conflict. */
+    if (trunk_scan_cli_seen && !p25_bandplan_cli_seen) {
+        opts->p25_bandplan_in_file[0] = '\0';
+    }
+    if (opts->p25_bandplan_in_file[0] != '\0') {
+        LOG_ERROR("--p25-bandplan cannot be combined with --trunk-scan; use per-target p25_bandplan_csv\n");
         cli_set_exit_rc(out_exit_rc, 1);
         return DSD_PARSE_ERROR;
     }
@@ -357,13 +404,13 @@ cli_parse_double_option(const char* option_name, const char* in, double* out, in
 }
 
 static int
-cli_parse_trunk_scan_ms_option(const char* option_name, const char* in, int* out, int* out_exit_rc) {
+cli_parse_ms_range_option(const char* option_name, const char* in, int min_ms, int max_ms, int* out, int* out_exit_rc) {
     long parsed = 0;
     if (!cli_parse_long_option(option_name, in, 10, &parsed, out_exit_rc)) {
         return 0;
     }
-    if (parsed < 250 || parsed > 600000) {
-        LOG_ERROR("Invalid %s value \"%s\" (expected 250..600000)\n", option_name, in ? in : "");
+    if (parsed < min_ms || parsed > max_ms) {
+        LOG_ERROR("Invalid %s value \"%s\" (expected %d..%d)\n", option_name, in ? in : "", min_ms, max_ms);
         cli_set_exit_rc(out_exit_rc, 1);
         return 0;
     }
@@ -454,6 +501,25 @@ cli_next_arg(char** argv, int i, int* arg_advance) {
         }                                                                                                              \
         if (strcmp(argv[i], "--") == 0) {                                                                              \
             break;                                                                                                     \
+        }                                                                                                              \
+        if (strcmp(argv[i], "--lrrp-extra-port") == 0) {                                                               \
+            if (i + 1 >= argc) {                                                                                       \
+                LOG_ERROR("--lrrp-extra-port requires a port value\n");                                                \
+                cli_set_exit_rc(out_exit_rc, 1);                                                                       \
+                return DSD_PARSE_ERROR;                                                                                \
+            }                                                                                                          \
+            const char* lrrp_extra_port_arg = DSD_PARSE_ARGS_NEXT_ARG();                                               \
+            if (!cli_add_lrrp_extra_port(opts, lrrp_extra_port_arg, &lrrp_extra_ports_cli_seen, out_exit_rc)) {        \
+                return DSD_PARSE_ERROR;                                                                                \
+            }                                                                                                          \
+            arg_advance = 2;                                                                                           \
+            continue;                                                                                                  \
+        }                                                                                                              \
+        if (strncmp(argv[i], "--lrrp-extra-port=", 18) == 0) {                                                         \
+            if (!cli_add_lrrp_extra_port(opts, argv[i] + 18, &lrrp_extra_ports_cli_seen, out_exit_rc)) {               \
+                return DSD_PARSE_ERROR;                                                                                \
+            }                                                                                                          \
+            continue;                                                                                                  \
         }                                                                                                              \
         if (strcmp(argv[i], "--rtltcp-autotune") == 0) {                                                               \
             opts->rtltcp_autotune = 1;                                                                                 \
@@ -764,15 +830,15 @@ cli_next_arg(char** argv, int i, int* arg_advance) {
                 cli_set_exit_rc(out_exit_rc, 1);                                                                       \
                 return DSD_PARSE_ERROR;                                                                                \
             }                                                                                                          \
-            if (!cli_parse_trunk_scan_ms_option("--trunk-scan-dwell-ms", DSD_PARSE_ARGS_NEXT_ARG(),                    \
-                                                &opts->trunk_scan_idle_dwell_ms, out_exit_rc)) {                       \
+            if (!cli_parse_ms_range_option("--trunk-scan-dwell-ms", DSD_PARSE_ARGS_NEXT_ARG(), 250, 600000,            \
+                                           &opts->trunk_scan_idle_dwell_ms, out_exit_rc)) {                            \
                 return DSD_PARSE_ERROR;                                                                                \
             }                                                                                                          \
             continue;                                                                                                  \
         }                                                                                                              \
         if (strncmp(argv[i], "--trunk-scan-dwell-ms=", 22) == 0) {                                                     \
-            if (!cli_parse_trunk_scan_ms_option("--trunk-scan-dwell-ms", argv[i] + 22,                                 \
-                                                &opts->trunk_scan_idle_dwell_ms, out_exit_rc)) {                       \
+            if (!cli_parse_ms_range_option("--trunk-scan-dwell-ms", argv[i] + 22, 250, 600000,                         \
+                                           &opts->trunk_scan_idle_dwell_ms, out_exit_rc)) {                            \
                 return DSD_PARSE_ERROR;                                                                                \
             }                                                                                                          \
             continue;                                                                                                  \
@@ -783,15 +849,57 @@ cli_next_arg(char** argv, int i, int* arg_advance) {
                 cli_set_exit_rc(out_exit_rc, 1);                                                                       \
                 return DSD_PARSE_ERROR;                                                                                \
             }                                                                                                          \
-            if (!cli_parse_trunk_scan_ms_option("--trunk-scan-activity-hold-ms", DSD_PARSE_ARGS_NEXT_ARG(),            \
-                                                &opts->trunk_scan_activity_hold_ms, out_exit_rc)) {                    \
+            if (!cli_parse_ms_range_option("--trunk-scan-activity-hold-ms", DSD_PARSE_ARGS_NEXT_ARG(), 250, 600000,    \
+                                           &opts->trunk_scan_activity_hold_ms, out_exit_rc)) {                         \
                 return DSD_PARSE_ERROR;                                                                                \
             }                                                                                                          \
             continue;                                                                                                  \
         }                                                                                                              \
         if (strncmp(argv[i], "--trunk-scan-activity-hold-ms=", 30) == 0) {                                             \
-            if (!cli_parse_trunk_scan_ms_option("--trunk-scan-activity-hold-ms", argv[i] + 30,                         \
-                                                &opts->trunk_scan_activity_hold_ms, out_exit_rc)) {                    \
+            if (!cli_parse_ms_range_option("--trunk-scan-activity-hold-ms", argv[i] + 30, 250, 600000,                 \
+                                           &opts->trunk_scan_activity_hold_ms, out_exit_rc)) {                         \
+                return DSD_PARSE_ERROR;                                                                                \
+            }                                                                                                          \
+            continue;                                                                                                  \
+        }                                                                                                              \
+        if (strcmp(argv[i], "--scan-voice-only") == 0) {                                                               \
+            opts->scan_voice_only = 1;                                                                                 \
+            continue;                                                                                                  \
+        }                                                                                                              \
+        if (strcmp(argv[i], "--scan-voice-qualify-ms") == 0) {                                                         \
+            if (i + 1 >= argc) {                                                                                       \
+                LOG_ERROR("--scan-voice-qualify-ms requires a millisecond value\n");                                   \
+                cli_set_exit_rc(out_exit_rc, 1);                                                                       \
+                return DSD_PARSE_ERROR;                                                                                \
+            }                                                                                                          \
+            if (!cli_parse_ms_range_option("--scan-voice-qualify-ms", DSD_PARSE_ARGS_NEXT_ARG(), 100, 600000,          \
+                                           &opts->scan_voice_qualify_ms, out_exit_rc)) {                               \
+                return DSD_PARSE_ERROR;                                                                                \
+            }                                                                                                          \
+            continue;                                                                                                  \
+        }                                                                                                              \
+        if (strncmp(argv[i], "--scan-voice-qualify-ms=", 24) == 0) {                                                   \
+            if (!cli_parse_ms_range_option("--scan-voice-qualify-ms", argv[i] + 24, 100, 600000,                       \
+                                           &opts->scan_voice_qualify_ms, out_exit_rc)) {                               \
+                return DSD_PARSE_ERROR;                                                                                \
+            }                                                                                                          \
+            continue;                                                                                                  \
+        }                                                                                                              \
+        if (strcmp(argv[i], "--scan-voice-hold-ms") == 0) {                                                            \
+            if (i + 1 >= argc) {                                                                                       \
+                LOG_ERROR("--scan-voice-hold-ms requires a millisecond value\n");                                      \
+                cli_set_exit_rc(out_exit_rc, 1);                                                                       \
+                return DSD_PARSE_ERROR;                                                                                \
+            }                                                                                                          \
+            if (!cli_parse_ms_range_option("--scan-voice-hold-ms", DSD_PARSE_ARGS_NEXT_ARG(), 100, 600000,             \
+                                           &opts->scan_voice_hold_ms, out_exit_rc)) {                                  \
+                return DSD_PARSE_ERROR;                                                                                \
+            }                                                                                                          \
+            continue;                                                                                                  \
+        }                                                                                                              \
+        if (strncmp(argv[i], "--scan-voice-hold-ms=", 21) == 0) {                                                      \
+            if (!cli_parse_ms_range_option("--scan-voice-hold-ms", argv[i] + 21, 100, 600000,                          \
+                                           &opts->scan_voice_hold_ms, out_exit_rc)) {                                  \
                 return DSD_PARSE_ERROR;                                                                                \
             }                                                                                                          \
             continue;                                                                                                  \
@@ -862,6 +970,10 @@ cli_next_arg(char** argv, int i, int* arg_advance) {
             opts->dmr_debug_burst = 1;                                                                                 \
             continue;                                                                                                  \
         }                                                                                                              \
+        if (strcmp(argv[i], "--dmr-debug-unsynced") == 0) {                                                            \
+            opts->dmr_debug_unsynced = 1;                                                                              \
+            continue;                                                                                                  \
+        }                                                                                                              \
         if (strcmp(argv[i], "--show-keys") == 0) {                                                                     \
             opts->show_keys = 1;                                                                                       \
             continue;                                                                                                  \
@@ -903,6 +1015,45 @@ cli_next_arg(char** argv, int i, int* arg_advance) {
         }                                                                                                              \
         if (strncmp(argv[i], "--dmr-vertex-ks-csv=", 20) == 0) {                                                       \
             dmr_vertex_ks_csv_cli = argv[i] + 20;                                                                      \
+            continue;                                                                                                  \
+        }                                                                                                              \
+        if (strcmp(argv[i], "--dmr-tg-key-csv") == 0) {                                                                \
+            if (i + 1 >= argc) {                                                                                       \
+                LOG_ERROR("--dmr-tg-key-csv requires a CSV path\n");                                                   \
+                cli_set_exit_rc(out_exit_rc, 1);                                                                       \
+                return DSD_PARSE_ERROR;                                                                                \
+            }                                                                                                          \
+            dmr_tg_key_csv_cli = DSD_PARSE_ARGS_NEXT_ARG();                                                            \
+            continue;                                                                                                  \
+        }                                                                                                              \
+        if (strncmp(argv[i], "--dmr-tg-key-csv=", 17) == 0) {                                                          \
+            dmr_tg_key_csv_cli = argv[i] + 17;                                                                         \
+            continue;                                                                                                  \
+        }                                                                                                              \
+        if (strcmp(argv[i], "--p25-bandplan") == 0) {                                                                  \
+            if (i + 1 >= argc) {                                                                                       \
+                LOG_ERROR("--p25-bandplan requires a CSV path\n");                                                     \
+                cli_set_exit_rc(out_exit_rc, 1);                                                                       \
+                return DSD_PARSE_ERROR;                                                                                \
+            }                                                                                                          \
+            p25_bandplan_cli = DSD_PARSE_ARGS_NEXT_ARG();                                                              \
+            continue;                                                                                                  \
+        }                                                                                                              \
+        if (strncmp(argv[i], "--p25-bandplan=", 15) == 0) {                                                            \
+            p25_bandplan_cli = argv[i] + 15;                                                                           \
+            continue;                                                                                                  \
+        }                                                                                                              \
+        if (strcmp(argv[i], "--p25-bandplan-export") == 0) {                                                           \
+            if (i + 1 >= argc) {                                                                                       \
+                LOG_ERROR("--p25-bandplan-export requires an output CSV path\n");                                      \
+                cli_set_exit_rc(out_exit_rc, 1);                                                                       \
+                return DSD_PARSE_ERROR;                                                                                \
+            }                                                                                                          \
+            p25_bandplan_export_cli = DSD_PARSE_ARGS_NEXT_ARG();                                                       \
+            continue;                                                                                                  \
+        }                                                                                                              \
+        if (strncmp(argv[i], "--p25-bandplan-export=", 22) == 0) {                                                     \
+            p25_bandplan_export_cli = argv[i] + 22;                                                                    \
             continue;                                                                                                  \
         }                                                                                                              \
         if (strcmp(argv[i], "--dmr-force-algid") == 0) {                                                               \
@@ -1365,6 +1516,60 @@ cli_next_arg(char** argv, int i, int* arg_advance) {
             return DSD_PARSE_ERROR;                                                                                    \
         }                                                                                                              \
     }                                                                                                                  \
+    if (dmr_tg_key_csv_cli) {                                                                                          \
+        char tg_key_path[DSD_CLI_LOCAL_PATH_MAX];                                                                      \
+        if (!cli_resolve_existing_local_file_option("--dmr-tg-key-csv", dmr_tg_key_csv_cli, tg_key_path,               \
+                                                    sizeof tg_key_path, out_exit_rc)) {                                \
+            return DSD_PARSE_ERROR;                                                                                    \
+        }                                                                                                              \
+        if (csvDmrTgKeyImport(state, tg_key_path) != 0) {                                                              \
+            LOG_ERROR("Invalid --dmr-tg-key-csv value\n");                                                             \
+            cli_set_exit_rc(out_exit_rc, 1);                                                                           \
+            return DSD_PARSE_ERROR;                                                                                    \
+        }                                                                                                              \
+    }                                                                                                                  \
+    if (p25_bandplan_cli) {                                                                                            \
+        p25_bandplan_cli_seen = 1;                                                                                     \
+        /* Trunk-scan targets carry their own p25_bandplan_csv; a global plan would shadow them. Decided    \
+           here, before the import, so a rejected command line leaves the IDEN tables untouched. */          \
+        if (opts->trunk_scan_enabled) {                                                                                \
+            LOG_ERROR("--p25-bandplan cannot be combined with --trunk-scan; use per-target p25_bandplan_csv\n");       \
+            cli_set_exit_rc(out_exit_rc, 1);                                                                           \
+            return DSD_PARSE_ERROR;                                                                                    \
+        }                                                                                                              \
+        char bandplan_path[DSD_CLI_LOCAL_PATH_MAX];                                                                    \
+        if (!cli_resolve_existing_local_file_option("--p25-bandplan", p25_bandplan_cli, bandplan_path,                 \
+                                                    sizeof bandplan_path, out_exit_rc)) {                              \
+            return DSD_PARSE_ERROR;                                                                                    \
+        }                                                                                                              \
+        if (strlen(bandplan_path) >= sizeof opts->p25_bandplan_in_file) {                                              \
+            LOG_ERROR("--p25-bandplan path is too long\n");                                                            \
+            cli_set_exit_rc(out_exit_rc, 1);                                                                           \
+            return DSD_PARSE_ERROR;                                                                                    \
+        }                                                                                                              \
+        DSD_SNPRINTF(opts->p25_bandplan_in_file, sizeof opts->p25_bandplan_in_file, "%s", bandplan_path);              \
+        opts->p25_bandplan_in_file[sizeof opts->p25_bandplan_in_file - 1] = '\0';                                      \
+        if (csvP25BandplanImport(opts, state) != 0) {                                                                  \
+            opts->p25_bandplan_in_file[0] = '\0';                                                                      \
+            LOG_ERROR("Invalid --p25-bandplan value\n");                                                               \
+            cli_set_exit_rc(out_exit_rc, 1);                                                                           \
+            return DSD_PARSE_ERROR;                                                                                    \
+        }                                                                                                              \
+        LOG_INFO("NOTICE: Imported P25 band plan from %s\n", opts->p25_bandplan_in_file);                              \
+    }                                                                                                                  \
+    if (p25_bandplan_export_cli) {                                                                                     \
+        /* Output path, written once at clean shutdown by the engine: only the shape is checked here. */               \
+        if (p25_bandplan_export_cli[0] == '\0'                                                                         \
+            || strlen(p25_bandplan_export_cli) >= sizeof opts->p25_bandplan_export_file) {                             \
+            LOG_ERROR("Invalid --p25-bandplan-export value\n");                                                        \
+            cli_set_exit_rc(out_exit_rc, 1);                                                                           \
+            return DSD_PARSE_ERROR;                                                                                    \
+        }                                                                                                              \
+        DSD_SNPRINTF(opts->p25_bandplan_export_file, sizeof opts->p25_bandplan_export_file, "%s",                      \
+                     p25_bandplan_export_cli);                                                                         \
+        opts->p25_bandplan_export_file[sizeof opts->p25_bandplan_export_file - 1] = '\0';                              \
+        LOG_INFO("NOTICE: P25 band plan export file: %s\n", opts->p25_bandplan_export_file);                           \
+    }                                                                                                                  \
     if (dmr_force_algid_cli) {                                                                                         \
         char hex[3];                                                                                                   \
         size_t nhex = 0;                                                                                               \
@@ -1422,6 +1627,9 @@ dsd_parse_args(int argc, char** argv, dsd_opts* opts, dsd_state* state, int* out
     const char* dmr_baofeng_pc5_cli = NULL;
     const char* dmr_csi_ee72_cli = NULL;
     const char* dmr_vertex_ks_csv_cli = NULL;
+    const char* dmr_tg_key_csv_cli = NULL;
+    const char* p25_bandplan_cli = NULL;
+    const char* p25_bandplan_export_cli = NULL;
     const char* dmr_force_algid_cli = NULL;
     const char* m17_signature_public_key_cli = NULL;
     const char* iq_capture_cli = NULL;
@@ -1433,10 +1641,12 @@ dsd_parse_args(int argc, char** argv, dsd_opts* opts, dsd_state* state, int* out
     const char* iq_info_cli = NULL;
     int iq_loop_cli = 0;
     int rtl_udp_control_cli_seen = 0;
+    int lrrp_extra_ports_cli_seen = 0;
     unsigned long rtl_udp_control_cli_port = 0;
     const char* rtl_udp_control_cli_bindaddr = NULL;
     int trunk_scan_cli_seen = 0;
     int chan_csv_cli_seen = 0;
+    int p25_bandplan_cli_seen = 0;
     int config_one_shot_cli_seen = cli_has_config_one_shot_arg(argc, argv);
 
     DSD_PARSE_ARGS_PRESCAN_BLOCK();
@@ -1470,7 +1680,7 @@ dsd_parse_args(int argc, char** argv, dsd_opts* opts, dsd_state* state, int* out
     int parse_rc = dsd_parse_short_opts(new_argc, argv, opts, state, out_exit_rc, &chan_csv_cli_seen);
     if (parse_rc == DSD_PARSE_CONTINUE) {
         parse_rc = cli_validate_trunk_scan_runtime_args(opts, trunk_scan_cli_seen, chan_csv_cli_seen,
-                                                        config_one_shot_cli_seen, out_exit_rc);
+                                                        p25_bandplan_cli_seen, config_one_shot_cli_seen, out_exit_rc);
     }
     if (parse_rc == DSD_PARSE_CONTINUE && opts->iq_replay_requested && opts->iq_replay_path[0] != '\0') {
         opts->audio_in_type = AUDIO_IN_RTL;
@@ -1853,7 +2063,6 @@ dsd_parse_args(int argc, char** argv, dsd_opts* opts, dsd_state* state, int* out
             LOG_INFO("NOTICE: %s", KYEL);                                                                              \
             LOG_INFO("NOTICE: Relax P25 Phase 2 MAC_SIGNAL CRC Checksum Pass/Fail\n");                                 \
             LOG_INFO("NOTICE: Relax DMR RAS/CRC CSBK/DATA Pass/Fail\n");                                               \
-            LOG_INFO("NOTICE: Relax NXDN SACCH/FACCH/CAC/F2U CRC Pass/Fail\n");                                        \
             LOG_INFO("NOTICE: Relax M17 LSF/PKT CRC Pass/Fail\n");                                                     \
             LOG_INFO("NOTICE: %s", KNRM);                                                                              \
             break;                                                                                                     \
@@ -1942,9 +2151,9 @@ dsd_parse_args(int argc, char** argv, dsd_opts* opts, dsd_state* state, int* out
         }                                                                                                              \
         case 'n': {                                                                                                    \
             if (optarg[0] == 'm' && optarg[1] == '\0') {                                                               \
-                /* Accept the retired mono override without changing the active preset. DMR presets already select     \
-                 * the current dual-slot mixer; non-DMR audio routing must remain untouched. */                        \
-                LOG_INFO("NOTICE: -nm compatibility alias accepted; DMR uses the current preset mixer.\n");            \
+                cli_dmr_mono_override_seen = 1;                                                                        \
+                opts->dmr_mono = 1;                                                                                    \
+                LOG_INFO("NOTICE: DMR single-slot mono decoder enabled.\n");                                           \
                 break;                                                                                                 \
             }                                                                                                          \
             double parsed_ga = 0.0;                                                                                    \
@@ -2044,10 +2253,20 @@ dsd_parse_args(int argc, char** argv, dsd_opts* opts, dsd_state* state, int* out
             break;                                                                                                     \
         }                                                                                                              \
         case 'f': {                                                                                                    \
-            /* Any -f* preset should stop pure analog-monitor mode unless explicitly selecting it. */                  \
-            opts->analog_only = 0;                                                                                     \
-            opts->monitor_input_audio = 0;                                                                             \
-                                                                                                                       \
+            /* Leaving analog-monitor mode is dsd_apply_decode_mode_preset()'s job for every                           \
+               selector that reaches it, so an unrecognized -f selector no longer half-changes                         \
+               the mode. The selectors below are handled by the hand-rolled chain further down                         \
+               and never reach the preset helper, so they have to say it themselves: left set                          \
+               from an earlier -fA, analog_only pins the RTL front end to                                              \
+               DSD_DEMOD_OUTPUT_AUDIO_MONITOR and suppresses the digital output stream, so                             \
+               `-fA -fp` selects ProVoice and then never decodes it. */                                                \
+            const char f_selector = optarg[0];                                                                         \
+            if (f_selector == 'p' || f_selector == 'h' || f_selector == 'H' || f_selector == 'e'                       \
+                || f_selector == 'E' || f_selector == 'Z' || f_selector == 'B' || f_selector == 'P'                    \
+                || f_selector == 'U') {                                                                                \
+                opts->analog_only = 0;                                                                                 \
+                opts->monitor_input_audio = 0;                                                                         \
+            }                                                                                                          \
             const char decode_preset = optarg[0] == 'r' ? 's' : optarg[0];                                             \
             dsdneoUserDecodeMode core_mode = DSDCFG_MODE_UNSET;                                                        \
             if (dsd_decode_mode_from_cli_preset(decode_preset, &core_mode) == 0                                        \
@@ -2065,7 +2284,13 @@ dsd_parse_args(int argc, char** argv, dsd_opts* opts, dsd_state* state, int* out
                     case '2': LOG_INFO("NOTICE: Decoding only P25 Phase 2 frames.\n"); break;                          \
                     case 's': LOG_INFO("NOTICE: Decoding only DMR frames.\n"); break;                                  \
                     case 'r':                                                                                          \
-                        LOG_INFO("NOTICE: -fr compatibility alias uses the current DMR dual-slot mixer.\n");           \
+                        opts->dmr_stereo = 0;                                                                          \
+                        state->dmr_stereo = 0;                                                                         \
+                        opts->dmr_mono = 1;                                                                            \
+                        opts->pulse_digi_rate_out = 8000;                                                              \
+                        opts->pulse_digi_out_channels = 2;                                                             \
+                        DSD_SNPRINTF(opts->output_name, sizeof opts->output_name, "%s", "DMR-Mono");                  \
+                        LOG_INFO("NOTICE: Decoding DMR with the single-slot mono decoder.\n");                         \
                         break;                                                                                         \
                     case 'i': LOG_INFO("NOTICE: Decoding only NXDN48 frames.\n"); break;                               \
                     case 'n': LOG_INFO("NOTICE: Decoding only NXDN96 frames.\n"); break;                               \
@@ -2097,6 +2322,7 @@ dsd_parse_args(int argc, char** argv, dsd_opts* opts, dsd_state* state, int* out
                 opts->pulse_digi_rate_out = 8000;                                                                      \
                 opts->pulse_digi_out_channels = 1;                                                                     \
                 opts->dmr_stereo = 0;                                                                                  \
+                opts->dmr_mono = 0;                                                                                    \
                 state->dmr_stereo = 0;                                                                                 \
                 DSD_SNPRINTF(opts->output_name, sizeof opts->output_name, "%s", "EDACS/PV");                           \
                 LOG_INFO("NOTICE: Setting symbol rate to 9600 / second\n");                                            \
@@ -2108,9 +2334,16 @@ dsd_parse_args(int argc, char** argv, dsd_opts* opts, dsd_state* state, int* out
                 cli_decode_timing_source = CLI_TIMING_SOURCE_PRESET;                                                   \
             } else if (optarg[0] == 'h') {                                                                             \
                 if (optarg[1] != 0) {                                                                                  \
-                    char abits[2] = {optarg[1], 0};                                                                    \
-                    char fbits[2] = {optarg[2], 0};                                                                    \
-                    char sbits[2] = {optarg[3], 0};                                                                    \
+                    /* Each digit is only read once the one before it proved the                                       \
+                       string reaches that far. `-fh1` is a two-character selector,                                    \
+                       so optarg[3] is a byte past the end of the argv element, and                                    \
+                       whatever it happened to be was parsed into edacs_s_bits. */                                     \
+                    const char afs_a = optarg[1];                                                                      \
+                    const char afs_f = (afs_a != 0) ? optarg[2] : 0;                                                   \
+                    const char afs_s = (afs_f != 0) ? optarg[3] : 0;                                                   \
+                    char abits[2] = {afs_a, 0};                                                                        \
+                    char fbits[2] = {afs_f, 0};                                                                        \
+                    char sbits[2] = {afs_s, 0};                                                                        \
                     state->edacs_a_bits = (int)cli_parse_long_or_default(&abits[0], 10, 0);                            \
                     state->edacs_f_bits = (int)cli_parse_long_or_default(&fbits[0], 10, 0);                            \
                     state->edacs_s_bits = (int)cli_parse_long_or_default(&sbits[0], 10, 0);                            \
@@ -2137,6 +2370,7 @@ dsd_parse_args(int argc, char** argv, dsd_opts* opts, dsd_state* state, int* out
                 opts->pulse_digi_rate_out = 8000;                                                                      \
                 opts->pulse_digi_out_channels = 1;                                                                     \
                 opts->dmr_stereo = 0;                                                                                  \
+                opts->dmr_mono = 0;                                                                                    \
                 state->dmr_stereo = 0;                                                                                 \
                 DSD_SNPRINTF(opts->output_name, sizeof opts->output_name, "%s", "EDACS/PV");                           \
                 LOG_INFO("NOTICE: Setting symbol rate to 9600 / second\n");                                            \
@@ -2158,9 +2392,16 @@ dsd_parse_args(int argc, char** argv, dsd_opts* opts, dsd_state* state, int* out
                 cli_decode_timing_source = CLI_TIMING_SOURCE_PRESET;                                                   \
             } else if (optarg[0] == 'H') {                                                                             \
                 if (optarg[1] != 0) {                                                                                  \
-                    char abits[2] = {optarg[1], 0};                                                                    \
-                    char fbits[2] = {optarg[2], 0};                                                                    \
-                    char sbits[2] = {optarg[3], 0};                                                                    \
+                    /* Each digit is only read once the one before it proved the                                       \
+                       string reaches that far. `-fH1` is a two-character selector,                                    \
+                       so optarg[3] is a byte past the end of the argv element, and                                    \
+                       whatever it happened to be was parsed into edacs_s_bits. */                                     \
+                    const char afs_a = optarg[1];                                                                      \
+                    const char afs_f = (afs_a != 0) ? optarg[2] : 0;                                                   \
+                    const char afs_s = (afs_f != 0) ? optarg[3] : 0;                                                   \
+                    char abits[2] = {afs_a, 0};                                                                        \
+                    char fbits[2] = {afs_f, 0};                                                                        \
+                    char sbits[2] = {afs_s, 0};                                                                        \
                     state->edacs_a_bits = (int)cli_parse_long_or_default(&abits[0], 10, 0);                            \
                     state->edacs_f_bits = (int)cli_parse_long_or_default(&fbits[0], 10, 0);                            \
                     state->edacs_s_bits = (int)cli_parse_long_or_default(&sbits[0], 10, 0);                            \
@@ -2187,6 +2428,7 @@ dsd_parse_args(int argc, char** argv, dsd_opts* opts, dsd_state* state, int* out
                 opts->pulse_digi_rate_out = 8000;                                                                      \
                 opts->pulse_digi_out_channels = 1;                                                                     \
                 opts->dmr_stereo = 0;                                                                                  \
+                opts->dmr_mono = 0;                                                                                    \
                 state->dmr_stereo = 0;                                                                                 \
                 DSD_SNPRINTF(opts->output_name, sizeof opts->output_name, "%s", "EDACS/PV");                           \
                 LOG_INFO("NOTICE: Setting symbol rate to 9600 / second\n");                                            \
@@ -2229,6 +2471,7 @@ dsd_parse_args(int argc, char** argv, dsd_opts* opts, dsd_state* state, int* out
                 opts->pulse_digi_rate_out = 8000;                                                                      \
                 opts->pulse_digi_out_channels = 1;                                                                     \
                 opts->dmr_stereo = 0;                                                                                  \
+                opts->dmr_mono = 0;                                                                                    \
                 state->dmr_stereo = 0;                                                                                 \
                 DSD_SNPRINTF(opts->output_name, sizeof opts->output_name, "%s", "EDACS/PV");                           \
                 LOG_INFO("NOTICE: Setting symbol rate to 9600 / second\n");                                            \
@@ -2261,6 +2504,7 @@ dsd_parse_args(int argc, char** argv, dsd_opts* opts, dsd_state* state, int* out
                 opts->pulse_digi_rate_out = 8000;                                                                      \
                 opts->pulse_digi_out_channels = 1;                                                                     \
                 opts->dmr_stereo = 0;                                                                                  \
+                opts->dmr_mono = 0;                                                                                    \
                 state->dmr_stereo = 0;                                                                                 \
                 DSD_SNPRINTF(opts->output_name, sizeof opts->output_name, "%s", "EDACS/PV");                           \
                 LOG_INFO("NOTICE: Setting symbol rate to 9600 / second\n");                                            \
@@ -2538,6 +2782,26 @@ dsd_parse_args(int argc, char** argv, dsd_opts* opts, dsd_state* state, int* out
     }
 // clang-format on
 
+/* Options that parsed fine but cannot act, given everything else on the command line.
+ * Checked once getopt has finished so the warnings do not depend on flag order. */
+static void
+dsd_warn_ineffective_short_opts(const dsd_opts* opts, const dsd_state* state) {
+    // --dmr-tg-key-csv is imported in the long-option pass, before -k/-K arm the keyring here, so the
+    // ordering has to be resolved once both have run. The map only picks which key id to use, so
+    // without a keyring it is a silent no-op.
+    if (state->dmr_tg_key_map_count > 0 && state->keyloader != 1 && !dsd_state_trunk_lcn_keys_present(state)) {
+        LOG_WARN("WARNING: --dmr-tg-key-csv has no effect without an imported key CSV (-K/-k).\n");
+    }
+    // Row keys ride the -Y scanner: a plain -C trunking map stores them but never applies them. Checked here
+    // rather than at the `-C` flag so a later `-Y` on the same command line counts.
+    if (opts->chan_in_file[0] != '\0') {
+        dsd_scan_row_keys_warn_if_unused(state, opts->scanner_mode);
+    }
+    if (opts->scan_voice_only && !opts->scanner_mode && !opts->trunk_scan_enabled) {
+        LOG_WARN("WARNING: --scan-voice-only has no effect without -Y or --trunk-scan.\n");
+    }
+}
+
 static int
 dsd_parse_short_opts(int argc, char** argv, dsd_opts* opts, dsd_state* state, int* out_exit_rc,
                      int* out_chan_csv_cli_seen) {
@@ -2558,11 +2822,15 @@ dsd_parse_short_opts(int argc, char** argv, dsd_opts* opts, dsd_state* state, in
     dsdneoUserDecodeMode cli_decode_timing_mode = DSDCFG_MODE_AUTO;
     int cli_manual_timing_sps = 0;
     int cli_manual_timing_center = 0;
+    int cli_dmr_mono_override_seen = 0;
     while ((c = getopt(argc, argv,
                        "~yhaepPqs:t:v:z:i:o:d:c:g:n:w:B:C:R:f:m:x:A:S:M:G:D:L:V:U:YK:b:H:X:Q:WrlZTF@:!:01:2:345:6:7:_:"
                        "89:Ek:I:J:O^Nj"))
            != -1) {
         DSD_PARSE_SHORT_OPTS_SWITCH_BLOCK();
+    }
+    if (cli_dmr_mono_override_seen) {
+        opts->dmr_mono = 1;
     }
     if (cli_decode_timing_seen && dsd_opts_source_uses_effective_input_rate(opts)) {
         int timing_rate_hz = dsd_opts_effective_input_rate(opts);
@@ -2577,6 +2845,7 @@ dsd_parse_short_opts(int argc, char** argv, dsd_opts* opts, dsd_state* state, in
             }
         }
     }
+    dsd_warn_ineffective_short_opts(opts, state);
     // Set after getopt completes so -r file ordering is independent of later options.
     if (opts->playfiles == 1) {
         state->optind = optind;

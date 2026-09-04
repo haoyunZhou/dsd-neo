@@ -2,6 +2,7 @@
 #include <dsd-neo/core/bit_packing.h>
 
 #include <dsd-neo/core/audio.h>
+#include <dsd-neo/core/call_state.h>
 #include <dsd-neo/core/dibit.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/state.h>
@@ -13,6 +14,7 @@
 #include "dsd-neo/core/opts_fwd.h"
 #include "dsd-neo/core/safe_api.h"
 #include "dsd-neo/core/state_fwd.h"
+#include "provoice_confirm.h"
 #include "provoice_frame.h"
 
 typedef struct {
@@ -49,20 +51,26 @@ provoice_read_raw_bits(provoice_reader* reader, int count) {
 
 static void
 provoice_print_call_info(const dsd_opts* opts, const dsd_state* state) {
+    dsd_call_snapshot call;
+    if (dsd_call_state_get(state, 0U, &call) <= 0 || call.phase != DSD_CALL_PHASE_ACTIVE) {
+        return;
+    }
+    const unsigned long long target = (unsigned long long)call.ota_target_id;
+    const unsigned long long source = (unsigned long long)call.ota_source_id;
     if (opts->trunk_enable == 1 && opts->trunk_is_tuned == 1 && state->ea_mode == 1) {
         DSD_FPRINTF(stderr, "%s", KGRN);
-        if (state->lasttg > 100000) {
-            DSD_FPRINTF(stderr, " Site: %lld Target: %d Source: %d LCN: %d ", state->edacs_site_id,
-                        state->lasttg - 100000, state->lastsrc, state->edacs_tuned_lcn);
+        if (target > 100000ULL) {
+            DSD_FPRINTF(stderr, " Site: %lld Target: %llu Source: %llu LCN: %d ", state->edacs_site_id,
+                        target - 100000ULL, source, state->edacs_tuned_lcn);
         } else {
-            DSD_FPRINTF(stderr, " Site: %lld Group: %d Source: %d LCN: %d ", state->edacs_site_id, state->lasttg,
-                        state->lastsrc, state->edacs_tuned_lcn);
+            DSD_FPRINTF(stderr, " Site: %lld Group: %llu Source: %llu LCN: %d ", state->edacs_site_id, target, source,
+                        state->edacs_tuned_lcn);
         }
         DSD_FPRINTF(stderr, "%s", KNRM);
     } else if (opts->trunk_enable == 1 && opts->trunk_is_tuned == 1 && state->ea_mode == 0) {
         DSD_FPRINTF(stderr, "%s", KGRN);
-        DSD_FPRINTF(stderr, " Site: %lld AFS: %d-%d LCN: %d ", state->edacs_site_id, (state->lastsrc >> 7) & 0xF,
-                    state->lastsrc & 0x7F, state->edacs_tuned_lcn);
+        DSD_FPRINTF(stderr, " Site: %lld AFS: %llu-%llu LCN: %d ", state->edacs_site_id, (target >> 7U) & 0xFULL,
+                    target & 0x7FULL, state->edacs_tuned_lcn);
         DSD_FPRINTF(stderr, "%s", KNRM);
     }
 }
@@ -84,7 +92,7 @@ provoice_decode_imbe_pair(dsd_opts* opts, dsd_state* state, char frame1[7][24], 
     provoice_play_voice(opts, state);
 }
 
-void
+int
 processProVoice(dsd_opts* opts, dsd_state* state) {
     uint8_t raw_bits[800];
     char imbe7100_fr1[DSD_PROVOICE_IMBE_ROWS][DSD_PROVOICE_IMBE_COLS];
@@ -96,6 +104,12 @@ processProVoice(dsd_opts* opts, dsd_state* state) {
     provoice_reader reader;
 
     DSD_MEMSET(raw_bits, 0, sizeof(raw_bits));
+
+    /* Nothing in the frame below can fail a check, so the evidence is that this one arrived
+     * behind its own exact 32-symbol sync word. Weak on its own; two in a row confirm the
+     * transmission -- see provoice_confirm.h. */
+    provoice_confirm_begin_frame(state);
+    provoice_confirm_note_evidence(state, PROVOICE_EVIDENCE_WEAK);
 
     reader.opts = opts;
     reader.state = state;
@@ -117,7 +131,8 @@ processProVoice(dsd_opts* opts, dsd_state* state) {
 
     if (dsd_provoice_load_imbe_frame_pair(provoice_next_dibit_callback, &reader, imbe7100_fr1, imbe7100_fr2) < 0) {
         DSD_FPRINTF(stderr, "\n");
-        return;
+        provoice_confirm_end_frame(state);
+        return provoice_confirm_is_confirmed(state);
     }
     provoice_decode_imbe_pair(opts, state, imbe7100_fr1, imbe7100_fr2);
 
@@ -130,10 +145,14 @@ processProVoice(dsd_opts* opts, dsd_state* state) {
 
     if (dsd_provoice_load_imbe_frame_pair(provoice_next_dibit_callback, &reader, imbe7100_fr1, imbe7100_fr2) < 0) {
         DSD_FPRINTF(stderr, "\n");
-        return;
+        provoice_confirm_end_frame(state);
+        return provoice_confirm_is_confirmed(state);
     }
     provoice_decode_imbe_pair(opts, state, imbe7100_fr1, imbe7100_fr2);
 
     provoice_read_raw_bits(&reader, 2);
     DSD_FPRINTF(stderr, "\n");
+
+    provoice_confirm_end_frame(state);
+    return provoice_confirm_is_confirmed(state);
 }

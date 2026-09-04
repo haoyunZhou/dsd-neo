@@ -16,8 +16,10 @@
  */
 
 #include <dsd-neo/core/bit_packing.h>
+#include <dsd-neo/core/call_state.h>
 #include <dsd-neo/core/constants.h>
 #include <dsd-neo/core/dsd_time.h>
+#include <dsd-neo/core/enc_lockout.h>
 #include <dsd-neo/core/events.h>
 #include <dsd-neo/core/gps.h>
 #include <dsd-neo/core/opts.h>
@@ -27,13 +29,17 @@
 #include <dsd-neo/crypto/aes.h>
 #include <dsd-neo/crypto/des.h>
 #include <dsd-neo/dsp/frame_sync.h>
+#include <dsd-neo/protocol/nxdn/nxdn.h>
 #include <dsd-neo/protocol/nxdn/nxdn_alias_decode.h>
 #include <dsd-neo/protocol/nxdn/nxdn_deperm.h>
 #include <dsd-neo/protocol/nxdn/nxdn_lfsr.h>
 #include <dsd-neo/protocol/nxdn/nxdn_trunk_diag.h>
 #include <dsd-neo/protocol/p25/p25_frequency.h>
+
 #include <dsd-neo/runtime/colors.h>
+#include <dsd-neo/runtime/log.h>
 #include <dsd-neo/runtime/rigctl_query_hooks.h>
+#include <dsd-neo/runtime/trunk_scan_hooks.h>
 #include <dsd-neo/runtime/trunk_tuning_hooks.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -43,9 +49,9 @@
 #include "dsd-neo/core/safe_api.h"
 #include "dsd-neo/core/secret_redaction.h"
 #include "dsd-neo/core/state_fwd.h"
+#include "nxdn_confirm.h"
 #include "nxdn_crc.h"
 
-static inline void dsd_append(char* dst, size_t dstsz, const char* src);
 typedef void (*nxdn_element_handler_fn)(dsd_opts* opts, dsd_state* state, const uint8_t* elements,
                                         size_t elements_bits);
 
@@ -54,7 +60,6 @@ struct nxdn_element_dispatch_entry {
     nxdn_element_handler_fn handler;
 };
 
-static uint8_t nxdn_alias_crc_ok(const dsd_state* state);
 static void nxdn_reset_data_call_state(dsd_state* state);
 static void nxdn_data_call_option_to_str(uint8_t data_call_option, char* duplex, size_t duplex_sz, char* mode,
                                          size_t mode_sz);
@@ -95,8 +100,8 @@ static void nxdn_element_handle_vcall_iv(dsd_opts* opts, dsd_state* state, const
 static void nxdn_pdu_scrambler_keystream_creation(uint8_t* ks, int lfsr, int len_bits);
 static void nxdn_lfsr128_expand_iv_from_mi64(uint64_t mi, uint8_t out[16]);
 static int nxdn_load_data_aes_key(const dsd_state* state, uint8_t key_id, uint8_t out_key[32]);
-static void nxdn_sdcall_header(dsd_opts* opts, dsd_state* state, const uint8_t* Message);
-static void nxdn_dcall_header(dsd_opts* opts, dsd_state* state, const uint8_t* Message, size_t message_bits);
+static void nxdn_sdcall_header(const dsd_opts* opts, dsd_state* state, const uint8_t* Message);
+static void nxdn_dcall_header(const dsd_opts* opts, dsd_state* state, const uint8_t* Message, size_t message_bits);
 static void nxdn_sdcall_iv(dsd_opts* opts, dsd_state* state, const uint8_t* Message);
 static int nxdn_dcall_data(dsd_opts* opts, dsd_state* state, int type, const uint8_t* Message, size_t message_bits);
 static void NXDN_decode_VCALL(dsd_opts* opts, dsd_state* state, const uint8_t* Message);
@@ -179,7 +184,8 @@ NXDN_SACCH_Full_decode(dsd_opts* opts, dsd_state* state) {
     /* Decodes the element content */
     // currently only going to run this if all four CRCs are good
     if (CrcCorrect == 1) {
-        NXDN_Elements_Content_decode(opts, state, CrcCorrect, SACCH, sizeof(SACCH));
+        nxdn_confirm_note_evidence(state, NXDN_EVIDENCE_STRONG);
+        NXDN_Elements_Content_decode(opts, state, SACCH, sizeof(SACCH));
     }
 
     //reset the sacch field -- Github Issue #118
@@ -203,6 +209,7 @@ nxdn_element_handle_idle(dsd_opts* opts, dsd_state* state, const uint8_t* elemen
 }
 
 static void
+// cppcheck-suppress constParameterCallback -- signature is fixed by the message-type dispatch table.
 nxdn_element_handle_sdcall_header(dsd_opts* opts, dsd_state* state, const uint8_t* elements, size_t elements_bits) {
     if (elements_bits < 79U) {
         DSD_FPRINTF(stderr, " SDCALL Header Too Short (%zu bits); ", elements_bits);
@@ -230,6 +237,7 @@ nxdn_element_handle_sdcall_iv(dsd_opts* opts, dsd_state* state, const uint8_t* e
 }
 
 static void
+// cppcheck-suppress constParameterCallback -- signature is fixed by the message-type dispatch table.
 nxdn_element_handle_dcall_header(dsd_opts* opts, dsd_state* state, const uint8_t* elements, size_t elements_bits) {
     nxdn_dcall_header(opts, state, elements, elements_bits);
 }
@@ -280,7 +288,7 @@ nxdn_element_handle_alias(const dsd_opts* opts, dsd_state* state, const uint8_t*
     DSD_FPRINTF(stderr, "%s", KYEL);
     DSD_FPRINTF(stderr, " ALIAS");
     DSD_FPRINTF(stderr, "%s", KNRM);
-    nxdn_alias_decode_prop(opts, state, elements, nxdn_alias_crc_ok(state));
+    nxdn_alias_decode_prop(opts, state, elements);
 }
 
 static const char*
@@ -340,7 +348,8 @@ nxdn_element_handle_dst_info(dsd_opts* opts, dsd_state* state, const uint8_t* el
     if (start != 0U && end != 0U) {
         char event_string[55];
         DSD_SNPRINTF(event_string, sizeof(event_string), "NXDN Digital Station ID: %s", station_id_string);
-        watchdog_event_datacall(opts, state, 65520U, 0U, event_string, 0U);
+        const dsd_call_observation observation = dsd_call_observation_data(state->lastsynctype, 0U, 65520U, 0U);
+        (void)dsd_event_emit_data_notice(opts, state, 0U, &observation, event_string);
     }
 
     if (opts->payload == 1) {
@@ -360,8 +369,6 @@ nxdn_element_mark_control_sync(const dsd_opts* opts, dsd_state* state) {
 static void
 nxdn_element_handle_srv_info(const dsd_opts* opts, dsd_state* state, const uint8_t* elements, size_t elements_bits) {
     UNUSED(elements_bits);
-    state->nxdn_last_rid = 0;
-    state->nxdn_last_tg = 0;
     NXDN_decode_srv_info(opts, state, elements);
     nxdn_element_mark_control_sync(opts, state);
 }
@@ -387,8 +394,6 @@ nxdn_element_handle_adj_site(dsd_opts* opts, dsd_state* state, const uint8_t* el
 static void
 nxdn_element_handle_tx_release(dsd_opts* opts, dsd_state* state, const uint8_t* elements, size_t elements_bits) {
     UNUSED(elements_bits);
-    DSD_SNPRINTF(state->call_string[0], sizeof(state->call_string[0]), "%s", "");
-    DSD_SNPRINTF(state->nxdn_call_type, sizeof(state->nxdn_call_type), "%s", "");
     nxdn_reset_data_call_state(state);
     NXDN_decode_VCALL(opts, state, elements);
 }
@@ -405,8 +410,6 @@ nxdn_element_handle_disc(dsd_opts* opts, dsd_state* state, const uint8_t* elemen
     nxdn_reset_data_call_state(state);
     NXDN_decode_VCALL(opts, state, elements);
     nxdn_alias_reset(state);
-    DSD_SNPRINTF(state->call_string[0], sizeof(state->call_string[0]), "%s", "");
-    DSD_SNPRINTF(state->nxdn_call_type, sizeof(state->nxdn_call_type), "%s", "");
 
     if ((opts->trunk_enable == 1) && state->p25_cc_freq != 0 && (opts->trunk_is_tuned == 1)) {
         dsd_trunk_tune_result tune_result = dsd_trunk_tuning_hook_tune_to_cc(opts, state, state->p25_cc_freq, 0, NULL);
@@ -417,13 +420,11 @@ nxdn_element_handle_disc(dsd_opts* opts, dsd_state* state, const uint8_t* elemen
 
         DSD_MEMSET(state->nxdn_sacch_frame_segment, 1, sizeof(state->nxdn_sacch_frame_segment));
         DSD_MEMSET(state->nxdn_sacch_frame_segcrc, 1, sizeof(state->nxdn_sacch_frame_segcrc));
-        DSD_MEMSET(state->active_channel, 0, sizeof(state->active_channel));
-        state->nxdn_last_rid = 0;
-        state->nxdn_last_tg = 0;
+        (void)dsd_recent_activity_clear_all(state);
         if (state->M == 0) {
             state->nxdn_cipher_type = 0;
+            nxdn_cipher_class_reset(state);
         }
-        DSD_SNPRINTF(state->nxdn_call_type, sizeof(state->nxdn_call_type), "%s", "");
     }
 }
 
@@ -467,8 +468,7 @@ nxdn_element_dispatch_handler(uint8_t message_type) {
 }
 
 void
-NXDN_Elements_Content_decode(dsd_opts* opts, dsd_state* state, uint8_t CrcCorrect, const uint8_t* ElementsContent,
-                             size_t elements_bits) {
+NXDN_Elements_Content_decode(dsd_opts* opts, dsd_state* state, const uint8_t* ElementsContent, size_t elements_bits) {
     enum { NXDN_ELEMENTS_MIN_MESSAGE_TYPE_BITS = 8U };
 
     if (opts == NULL || state == NULL || ElementsContent == NULL) {
@@ -498,16 +498,13 @@ NXDN_Elements_Content_decode(dsd_opts* opts, dsd_state* state, uint8_t CrcCorrec
                                | ((state->NxdnElementsContent.F2 & 1U) << 6U) | MessageType);
     MessageTypeDispatch = MessageType;
 
-    nxdn_message_type(opts, state, MessageTypeExt);
-
     /* Save the "Message Type" field */
     state->NxdnElementsContent.MessageType = MessageType;
 
-    /* Set the CRC state */
-    state->NxdnElementsContent.VCallCrcIsGood = CrcCorrect;
+    nxdn_message_type(opts, state, MessageTypeExt);
 
     if (MessageTypeExt == 0xE7U) {
-        nxdn_alias_decode_arib(opts, state, ElementsContent, nxdn_alias_crc_ok(state));
+        nxdn_alias_decode_arib(opts, state, ElementsContent);
         return;
     }
 
@@ -656,10 +653,32 @@ nxdn_sdcall_iv(dsd_opts* opts, dsd_state* state, const uint8_t* Message) {
     DSD_FPRINTF(stderr, "%s", KNRM);
 }
 
+/*
+ * Report a decoded data-call header to the trunk-scan coordinator, so a parked conventional NXDN
+ * target keeps its activity hold for data traffic and not only for voice. A header is the only
+ * data element carrying a call identity; the blocks that follow it carry none.
+ *
+ * A header reaches here only through a channel decoder whose CRC passed, and is held behind the
+ * frame's confirmation for the same reason the VCALL site is: an unverified header carries a
+ * garbage identity, and acting on one parks the coordinator on noise for a full activity_hold_ms.
+ * The header's own two-bit cipher field is the encryption classification -- data calls have no
+ * equivalent of the voice hysteresis in nxdn_enc_class.c -- and a misread costs at most one hold
+ * refresh, because talkgroup policy exempts data calls from the encrypted-target lockout ledger.
+ */
 static void
-nxdn_sdcall_header(dsd_opts* opts, dsd_state* state, const uint8_t* Message) {
-    UNUSED(opts);
+nxdn_data_header_report_scan_activity(const dsd_opts* opts, const dsd_state* state, uint8_t call_type, uint16_t source,
+                                      uint16_t target, uint8_t cipher) {
+    if (!nxdn_confirm_is_confirmed(state)) {
+        return;
+    }
+    // call_type 4 is the individual/private call, spelled the same way as the trunked data-grant
+    // path in NXDN_decode_VCALL_ASSGN().
+    dsd_trunk_scan_hook_nxdn_conventional_activity(opts, state, target, source, (call_type == 4U) ? 1 : 0,
+                                                   (cipher != 0U) ? 1 : 0, 1);
+}
 
+static void
+nxdn_sdcall_header(const dsd_opts* opts, dsd_state* state, const uint8_t* Message) {
     if (state == NULL || Message == NULL) {
         return;
     }
@@ -743,6 +762,11 @@ nxdn_sdcall_header(dsd_opts* opts, dsd_state* state, const uint8_t* Message) {
     state->payload_keyid = key_id;
     state->dmr_lrrp_source[0] = source;
     state->dmr_lrrp_target[0] = target;
+    // Not a DMR talkgroup: clear the qualifier so a stale DMR group flag cannot make the
+    // --dmr-tg-key-csv lookup treat this address as one.
+    state->dmr_data_target_is_group[0] = 0;
+
+    nxdn_data_header_report_scan_activity(opts, state, call_type, source, target, cipher);
 }
 
 struct nxdn_dcall_header_info {
@@ -879,12 +903,12 @@ nxdn_dcall_header_apply(dsd_state* state, const struct nxdn_dcall_header_info* i
     state->payload_keyid = info->key_id;
     state->dmr_lrrp_source[0] = info->source;
     state->dmr_lrrp_target[0] = info->target;
+    // Not a DMR talkgroup -- see the sibling header handler above.
+    state->dmr_data_target_is_group[0] = 0;
 }
 
 static void
-nxdn_dcall_header(dsd_opts* opts, dsd_state* state, const uint8_t* Message, size_t message_bits) {
-    UNUSED(opts);
-
+nxdn_dcall_header(const dsd_opts* opts, dsd_state* state, const uint8_t* Message, size_t message_bits) {
     if (state == NULL || Message == NULL) {
         return;
     }
@@ -900,6 +924,7 @@ nxdn_dcall_header(dsd_opts* opts, dsd_state* state, const uint8_t* Message, size
     nxdn_dcall_header_parse(&info, state, Message, message_bits);
     nxdn_dcall_header_print(&info, state);
     nxdn_dcall_header_apply(state, &info);
+    nxdn_data_header_report_scan_activity(opts, state, info.call_type, info.source, info.target, info.cipher);
 }
 
 enum { NXDN_DCALL_MAX_BITS = 24 * 128, NXDN_DCALL_MAX_BYTES = NXDN_DCALL_MAX_BITS / 8 };
@@ -1041,7 +1066,7 @@ nxdn_dcall_apply_decryption(const dsd_opts* opts, dsd_state* state, const struct
         uint8_t ks_bytes[NXDN_DCALL_MAX_BYTES];
         DSD_MEMSET(ks_bytes, 0, sizeof(ks_bytes));
         des_ofb_keystream_output(state->payload_mi, key, ks_bytes, nblocks);
-        unpack_byte_array_into_bit_array(ks_bytes, ks, nblocks * 8);
+        DSD_UNPACK_ARRAY_TO_BITS(ks_bytes, ks, (size_t)nblocks * 8U);
     } else if (state->payload_algid == 3 && aes_key_loaded == 1) {
         if (state->payload_mi != 0ULL) {
             nxdn_lfsr128_expand_iv_from_mi64((uint64_t)state->payload_mi, state->aes_ivR);
@@ -1053,7 +1078,7 @@ nxdn_dcall_apply_decryption(const dsd_opts* opts, dsd_state* state, const struct
         uint8_t ks_bytes[NXDN_DCALL_MAX_BYTES];
         DSD_MEMSET(ks_bytes, 0, sizeof(ks_bytes));
         aes_ofb_keystream_output(state->aes_ivR, aes_key, ks_bytes, DSD_AES_KEY_256, nblocks);
-        unpack_byte_array_into_bit_array(ks_bytes, ks, nblocks * 16);
+        DSD_UNPACK_ARRAY_TO_BITS(ks_bytes, ks, (size_t)nblocks * 16U);
     }
 
     for (int i = 0; i < ctx->total_bits; i++) {
@@ -1074,14 +1099,18 @@ nxdn_dcall_print_payload(const dsd_opts* opts, const dsd_state* state, const str
 
 static void
 nxdn_dcall_watchdog(dsd_opts* opts, dsd_state* state, const char* event_text) {
+    dsd_event_history_transaction transaction;
+    dsd_event_history_transaction_begin(state, &transaction);
     DSD_SNPRINTF(state->event_history_s[0].Event_History_Items[0].text_message,
                  sizeof(state->event_history_s[0].Event_History_Items[0].text_message), "%s", event_text);
     dsd_event_history_mark_dirty(&state->event_history_s[0]);
+    dsd_event_history_transaction_end(&transaction);
     const uint32_t source = (uint32_t)state->dmr_lrrp_source[0];
     const uint32_t target = (uint32_t)state->dmr_lrrp_target[0];
     char comp_string[128];
     DSD_SNPRINTF(comp_string, sizeof(comp_string), "DATA CALL SRC: %u; TGT: %u;", source, target);
-    watchdog_event_datacall(opts, state, source, target, comp_string, 0);
+    const dsd_call_observation observation = dsd_call_observation_data(state->lastsynctype, 0U, source, target);
+    (void)dsd_event_emit_data_notice(opts, state, 0U, &observation, comp_string);
 }
 
 static void
@@ -1105,7 +1134,7 @@ nxdn_dcall_handle_reverse_gps(const dsd_opts* opts, dsd_state* state, const stru
     const int core_len = reverse_len - 4;
     uint8_t reverse_bits[NXDN_DCALL_MAX_BITS];
     DSD_MEMSET(reverse_bits, 0, sizeof(reverse_bits));
-    unpack_byte_array_into_bit_array(reverse_bytes, reverse_bits, core_len);
+    DSD_UNPACK_ARRAY_TO_BITS(reverse_bytes, reverse_bits, core_len);
     if (core_len >= 2 && (uint16_t)convert_bits_into_output(reverse_bits, 16) == 0xFFFCU) {
         nxdn_gps_report(opts, state, reverse_bits + 16, (uint32_t)state->dmr_lrrp_source[0]);
     }
@@ -1496,29 +1525,44 @@ nxdn_vcall_assgn_adjust_duplicate(dsd_opts* opts, const dsd_state* state, time_t
 }
 
 static void
-nxdn_vcall_assgn_track_active_channel(const dsd_opts* opts, dsd_state* state, const struct nxdn_vcall_assgn_info* info,
-                                      time_t now) {
+nxdn_vcall_assgn_track_active_channel(const dsd_opts* opts, dsd_state* state,
+                                      const struct nxdn_vcall_assgn_info* info) {
     const int dup = (info->message_type == 0x05U) ? 1 : 0;
     const uint16_t grant_chan = (state->nxdn_rcn == 1) ? info->ofn : (uint16_t)(info->channel & 0x3FFU);
     const long int grant_freq = nxdn_channel_to_frequency_quiet(state, grant_chan);
     state->nxdn_grant_chan = grant_chan;
     state->nxdn_grant_freq = grant_freq;
 
+    char notice[DSD_RECENT_ACTIVITY_TEXT_SIZE];
     if (grant_freq != 0) {
-        DSD_SNPRINTF(state->active_channel[dup], sizeof state->active_channel[dup],
-                     "Active Ch: %d (%.6lf MHz) TG: %d SRC: %d; ", grant_chan, (double)grant_freq / 1000000.0,
-                     info->destination_id, info->source_unit_id);
+        DSD_SNPRINTF(notice, sizeof notice, "Active Ch: %d (%.6lf MHz) TG: %d SRC: %d; ", grant_chan,
+                     (double)grant_freq / 1000000.0, info->destination_id, info->source_unit_id);
     } else if (opts && opts->chan_in_file[0] != '\0') {
         nxdn_trunk_diag_log_missing_channel_once(opts, state, grant_chan, "grant");
-        DSD_SNPRINTF(state->active_channel[dup], sizeof state->active_channel[dup],
-                     "Active Ch: %d (no chan_csv freq) TG: %d SRC: %d; ", grant_chan, info->destination_id,
-                     info->source_unit_id);
+        DSD_SNPRINTF(notice, sizeof notice, "Active Ch: %d (no chan_csv freq) TG: %d SRC: %d; ", grant_chan,
+                     info->destination_id, info->source_unit_id);
     } else {
         nxdn_trunk_diag_log_missing_channel_once(opts, state, grant_chan, "grant");
-        DSD_SNPRINTF(state->active_channel[dup], sizeof state->active_channel[dup], "Active Ch: %d TG: %d SRC: %d; ",
-                     grant_chan, info->destination_id, info->source_unit_id);
+        DSD_SNPRINTF(notice, sizeof notice, "Active Ch: %d TG: %d SRC: %d; ", grant_chan, info->destination_id,
+                     info->source_unit_id);
     }
-    state->last_active_time = now;
+    const int data_call = info->message_type == 0x0DU || info->message_type == 0x0EU;
+    const dsd_call_observation observation = {
+        .protocol = DSD_SYNC_NXDN_POS,
+        .slot = 0U,
+        .kind = data_call               ? DSD_CALL_KIND_DATA
+                : info->call_type == 4U ? DSD_CALL_KIND_PRIVATE_VOICE
+                                        : DSD_CALL_KIND_GROUP_VOICE,
+        .ota_target_id = info->destination_id,
+        .policy_target_id = info->destination_id,
+        .ota_source_id = info->source_unit_id,
+        .channel = grant_chan,
+        .frequency_hz = grant_freq,
+        .service_options = info->cc_option,
+        .emergency = (uint8_t)((info->cc_option & 0x80U) != 0U),
+        .has_service_metadata = 1U,
+    };
+    (void)dsd_recent_activity_publish(state, (uint8_t)dup, &observation, notice, 0U);
 }
 
 static int
@@ -1547,8 +1591,7 @@ nxdn_vcall_assgn_frequency(dsd_opts* opts, dsd_state* state, const struct nxdn_v
 }
 
 static int
-nxdn_vcall_assgn_setup_tuned_call(dsd_opts* opts, dsd_state* state, const struct nxdn_vcall_assgn_info* info,
-                                  long int freq) {
+nxdn_vcall_assgn_setup_tuned_call(dsd_opts* opts, dsd_state* state, long int freq) {
     dsd_trunk_tune_result tune_result = dsd_trunk_tuning_hook_tune_to_freq(opts, state, freq, 0, NULL);
     if (!dsd_trunk_tune_result_is_ok(tune_result)) {
         return 0;
@@ -1556,11 +1599,6 @@ nxdn_vcall_assgn_setup_tuned_call(dsd_opts* opts, dsd_state* state, const struct
     DSD_MEMSET(state->nxdn_sacch_frame_segment, 1, sizeof(state->nxdn_sacch_frame_segment));
     DSD_MEMSET(state->nxdn_sacch_frame_segcrc, 1, sizeof(state->nxdn_sacch_frame_segcrc));
     state->lastsynctype = DSD_SYNC_NONE;
-    DSD_SNPRINTF(state->nxdn_call_type, sizeof(state->nxdn_call_type), "%s", NXDN_Call_Type_To_Str(info->call_type));
-    DSD_SNPRINTF(state->call_string[0], sizeof(state->call_string[0]), "%s", NXDN_Call_Type_To_Str(info->call_type));
-    if (info->cc_option & 0x80U) {
-        dsd_append(state->call_string[0], sizeof state->call_string[0], " Emergency");
-    }
     return 1;
 }
 
@@ -1576,7 +1614,7 @@ nxdn_vcall_assgn_load_scrambler_key(const dsd_opts* opts, dsd_state* state, cons
         state->payload_miN = state->R;
     }
     if (state->M == 1) {
-        state->nxdn_cipher_type = 0x1;
+        nxdn_cipher_force(state, 0x1);
     }
 }
 
@@ -1602,7 +1640,7 @@ nxdn_vcall_assgn_apply_tune(dsd_opts* opts, dsd_state* state, const struct nxdn_
     const int policy_allowed = nxdn_policy_tune_allowed(opts, state, info->destination_id, info->source_unit_id,
                                                         is_private_call, data_call, 1, &policy_decision);
     if (nxdn_vcall_assgn_can_tune(opts, state, policy_allowed, hold_matches, freq)) {
-        if (!nxdn_vcall_assgn_setup_tuned_call(opts, state, info, freq)) {
+        if (!nxdn_vcall_assgn_setup_tuned_call(opts, state, freq)) {
             return;
         }
         nxdn_vcall_assgn_load_scrambler_key(opts, state, info);
@@ -1618,7 +1656,7 @@ NXDN_decode_VCALL_ASSGN(dsd_opts* opts, dsd_state* state, const uint8_t* Message
     nxdn_vcall_assgn_parse(state, Message, &info);
     nxdn_vcall_assgn_print(state, &info);
     nxdn_vcall_assgn_adjust_duplicate(opts, state, now, &info);
-    nxdn_vcall_assgn_track_active_channel(opts, state, &info, now);
+    nxdn_vcall_assgn_track_active_channel(opts, state, &info);
     if (nxdn_vcall_assgn_should_tune(opts, &info)) {
         const long int freq = nxdn_vcall_assgn_frequency(opts, state, &info);
         nxdn_anchor_control_channel_from_current_tuner(opts, state, 1);
@@ -1656,6 +1694,65 @@ nxdn_cch_info_channel_version(dsd_state* state, uint32_t location_id, uint8_t ch
         DSD_FPRINTF(stderr, "Candidate Deleted ");
     }
     UNUSED(state);
+}
+
+/*
+ * Whether the operator has pinned the control channel, in which case a site broadcast must not
+ * move it. A learned or imported LCN list is operator intent; the trunk-scan coordinator's
+ * slot-0 seed is only the target CSV's park frequency, which may be a few kHz off the real
+ * outbound CC, so the broadcast is allowed to correct it. p25_has_user_lcn_list()
+ * (src/protocol/p25/p25_trunk_sm.c) draws the same line for P25.
+ */
+static int
+nxdn_cc_is_operator_pinned(const dsd_opts* opts, const dsd_state* state) {
+    // Tested by count, not by trunk_lcn_freq[0]: an imported map is positional, so an
+    // unparseable row 1 deliberately stores 0 to keep LCN numbering, and reading slot 0
+    // alone would mistake that whole list for "nothing imported".
+    if (opts->trunk_scan_enabled != 1) {
+        return state->lcn_freq_count > 0;
+    }
+
+    // Only the parked target's own control channel may move, and only an nxdn-trunk target has one
+    // this broadcast can describe. Checked before the "nothing learned yet" case below: under -fa
+    // an NXDN element decoded while parked on another target type is stray traffic (or a false
+    // sync), and adopting from it would plant a control channel on a target that has none, or move
+    // one that belongs to another protocol.
+    //   - conventional targets run with trunk_enable == 0 and have no control channel at all;
+    //   - a p25-trunk target owns the coordinator's P25 SM context and carries its control channel
+    //     in the same p25_cc_freq field this adoption would overwrite;
+    //   - a dmr-trunk target owns the DMR SM context (and keeps p25_cc_freq at 0).
+    if (opts->trunk_enable != 1 || dsd_trunk_scan_hook_p25_ctx() != NULL || dsd_trunk_scan_hook_dmr_ctx() != NULL) {
+        return 1;
+    }
+    if (state->lcn_freq_count == 0) {
+        return 0;
+    }
+    // More entries than the single seeded slot mean a per-target chan_csv supplied real LCNs.
+    return (state->lcn_freq_count > 1 || state->p25_cc_freq == 0) ? 1 : 0;
+}
+
+/*
+ * Follow the control channel a CCH_INFO element announces, unless the operator pinned it.
+ */
+static void
+nxdn_cch_info_adopt_control_channel(const dsd_opts* opts, dsd_state* state, long int freq1) {
+    if (freq1 == 0 || nxdn_cc_is_operator_pinned(opts, state)) {
+        return;
+    }
+    const long int previous_cc = state->trunk_cc_freq;
+    state->trunk_lcn_freq[0] = freq1;
+    state->p25_cc_freq = freq1;
+    state->trunk_cc_freq = freq1;
+    // Raise, never assign: reaching here means no operator list is present, but the count can
+    // still be above 1 from learned entries that must not be discarded.
+    if (state->lcn_freq_count < 1) {
+        state->lcn_freq_count = 1;
+    }
+    // Announce only a real move: under trunk scan this runs on every CCH_INFO, and once the park
+    // frequency has been corrected the adoption is idempotent.
+    if (previous_cc != 0 && previous_cc != freq1) {
+        LOG_INFO("NOTICE: NXDN trunking: site control channel is %.6lf MHz; following it\n", (double)freq1 / 1000000.0);
+    }
 }
 
 static int
@@ -1705,12 +1802,7 @@ nxdn_cch_info_dfa_version(dsd_opts* opts, dsd_state* state, const uint8_t* Messa
 
     const long int freq1 = nxdn_channel_to_frequency(opts, state, OFN1);
     nxdn_channel_to_frequency(opts, state, IFN1);
-    if (state->trunk_lcn_freq[0] == 0 && freq1 != 0) {
-        state->trunk_lcn_freq[0] = freq1;
-        state->p25_cc_freq = freq1;
-        state->trunk_cc_freq = freq1;
-        state->lcn_freq_count = 1;
-    }
+    nxdn_cch_info_adopt_control_channel(opts, state, freq1);
 
     return 1;
 }
@@ -1780,7 +1872,6 @@ NXDN_decode_cch_info(dsd_opts* opts, dsd_state* state, const uint8_t* Message, s
 
 static void
 NXDN_decode_srv_info(const dsd_opts* opts, dsd_state* state, const uint8_t* Message) {
-    const time_t now = time(NULL);
     uint32_t location_id = 0;
     uint16_t svc_info = 0; //service information
     uint32_t rst_info = 0; //restriction information
@@ -1807,8 +1898,7 @@ NXDN_decode_srv_info(const dsd_opts* opts, dsd_state* state, const uint8_t* Mess
     nxdn_anchor_control_channel_from_current_tuner(opts, state, 0);
 
     //clear stale active channel listing -- consider best placement for this (NXDN Type C Trunking -- inside SRV_INFO)
-    if ((now - state->last_active_time) > 3) {
-        DSD_MEMSET(state->active_channel, 0, sizeof(state->active_channel));
+    if (dsd_recent_activity_expire(state, 0U, DSD_RECENT_ACTIVITY_TTL_MS) > 0) {
         state->nxdn_grant_chan = 0;
         state->nxdn_grant_freq = 0;
     }
@@ -2028,14 +2118,7 @@ nxdn_vcall_print_color(uint8_t message_type) {
 }
 
 static void
-nxdn_vcall_update_call_string(dsd_state* state, const struct nxdn_vcall_info* info) {
-    DSD_SNPRINTF(state->call_string[0], sizeof(state->call_string[0]), "%s", NXDN_Call_Type_To_Str(info->call_type));
-    if (info->cc_option & 0x80U) {
-        dsd_append(state->call_string[0], sizeof state->call_string[0], " Emergency");
-    }
-    if (info->cipher_type) {
-        dsd_append(state->call_string[0], sizeof state->call_string[0], " Enc");
-    }
+nxdn_vcall_update_crypto_flags(dsd_state* state, const struct nxdn_vcall_info* info) {
     if (info->cipher_type == 2U || info->cipher_type == 3U) {
         state->NxdnElementsContent.PartOfCurrentEncryptedFrame = 1;
         state->NxdnElementsContent.PartOfNextEncryptedFrame = 2;
@@ -2078,9 +2161,8 @@ nxdn_vcall_print_summary(dsd_state* state, const struct nxdn_vcall_info* info) {
         DSD_FPRINTF(stderr, "Priority Paging ");
     }
 
-    nxdn_vcall_update_call_string(state, info);
+    nxdn_vcall_update_crypto_flags(state, info);
     DSD_FPRINTF(stderr, "%s - ", NXDN_Call_Type_To_Str(info->call_type));
-    DSD_SNPRINTF(state->nxdn_call_type, sizeof(state->nxdn_call_type), "%s", NXDN_Call_Type_To_Str(info->call_type));
     nxdn_vcall_print_voice_option(info);
     DSD_FPRINTF(stderr, "Src=%u - Dst/TG=%u ", info->source_unit_id & 0xFFFF, info->destination_id & 0xFFFF);
     if (info->idas) {
@@ -2160,90 +2242,188 @@ nxdn_vcall_print_cipher(const dsd_opts* opts, const dsd_state* state, const stru
     }
 }
 
-static int
-nxdn_vcall_gi(uint8_t call_type) {
+static dsd_call_kind
+nxdn_vcall_kind(uint8_t call_type) {
+    if (call_type == 4U) {
+        return DSD_CALL_KIND_PRIVATE_VOICE;
+    }
     if (call_type == 0U || call_type == 1U) {
+        return DSD_CALL_KIND_GROUP_VOICE;
+    }
+    return DSD_CALL_KIND_VOICE;
+}
+
+static int
+nxdn_vcall_has_key(const dsd_state* state, uint8_t cipher_type) {
+    if (state == NULL) {
         return 0;
     }
-    if (call_type == 4U) {
-        return 1;
+    if (cipher_type == 3U) {
+        return state->aes_key_loaded[0] == 1;
     }
-    return -1;
+    if (cipher_type == 1U || cipher_type == 2U) {
+        return state->R != 0U;
+    }
+    return 0;
+}
+
+static void
+nxdn_vcall_publish_crypto(dsd_opts* opts, dsd_state* state, uint8_t cipher_type, uint8_t key_id) {
+    const int has_key = nxdn_vcall_has_key(state, cipher_type);
+    const dsd_call_crypto_update update = {
+        .classification = cipher_type == 0U ? DSD_CALL_CRYPTO_CLEAR
+                          : has_key         ? DSD_CALL_CRYPTO_DECRYPTABLE
+                                            : DSD_CALL_CRYPTO_ENCRYPTED_PENDING,
+        .algid = cipher_type,
+        .kid = key_id,
+        .mi = state->payload_miN,
+        .audio_permitted = (uint8_t)(cipher_type == 0U || has_key),
+    };
+    if (dsd_call_state_update_crypto(state, 0U, &update) > 0) {
+        dsd_event_sync_slot(opts, state, 0U);
+    }
+}
+
+static void
+nxdn_vcall_publish(dsd_opts* opts, dsd_state* state, const struct nxdn_vcall_info* info) {
+    int protocol = DSD_SYNC_IS_NXDN(state->synctype) ? state->synctype : state->lastsynctype;
+    if (!DSD_SYNC_IS_NXDN(protocol)) {
+        protocol = DSD_SYNC_NXDN_POS;
+    }
+    const dsd_call_observation observation = {
+        .protocol = protocol,
+        .slot = 0U,
+        .kind = nxdn_vcall_kind(info->call_type),
+        .ota_target_id = info->destination_id,
+        .policy_target_id = info->destination_id,
+        .ota_source_id = (info->voice_call_option & 0x0FU) < 4U ? info->source_unit_id : 0U,
+        .channel = state->nxdn_grant_chan,
+        .frequency_hz = state->trunk_vc_freq[0],
+        .service_options = info->cc_option,
+        .emergency = (uint8_t)((info->cc_option & 0x80U) != 0U),
+        .has_service_metadata = 1U,
+    };
+    (void)dsd_call_state_observe(state, &observation, DSD_CALL_BOUNDARY_CONTINUE);
+    // Publish the applied classification, not the raw observation: a quarantined contradiction
+    // must not flap the published crypto any more than it may flap the audio gate.
+    nxdn_vcall_publish_crypto(opts, state, (uint8_t)state->nxdn_cipher_type, (uint8_t)state->nxdn_key);
+    dsd_event_sync_slot(opts, state, 0U);
 }
 
 static void
 nxdn_vcall_apply_state(dsd_state* state, const struct nxdn_vcall_info* info) {
     if (info->message_type == 0x01U) {
-        if ((info->voice_call_option & 0x0FU) < 4U) {
-            state->nxdn_last_rid = info->source_unit_id;
-        }
-        state->nxdn_last_tg = info->destination_id;
+        // A VCALL reaches here only through a channel decoder whose CRC passed -- the element
+        // decoder is never handed unverified content -- and even then mutates the live cipher only
+        // through the classification hysteresis: trellis miscorrections that survive the short
+        // CRCs are exactly one element away from muting a clear call -- or unmuting an encrypted
+        // one -- and, under lockout, permanently blocking the talkgroup.
         state->nxdn_key = info->key_id;
-        state->gi[0] = nxdn_vcall_gi(info->call_type);
-        state->nxdn_cipher_type = info->cipher_type;
+        state->nxdn_cipher_type = nxdn_cipher_observe(state, info->cipher_type, 0);
     } else {
-        state->nxdn_last_rid = 0;
-        state->nxdn_last_tg = 0;
-        state->gi[0] = -1;
         DSD_SNPRINTF(state->generic_talker_alias[0], sizeof(state->generic_talker_alias[0]), "%s", "");
         nxdn_alias_reset(state);
     }
 
     state->dmr_encL = (state->nxdn_cipher_type != 0) ? 1 : 0;
-    if (state->nxdn_cipher_type == 0 || state->R != 0) {
+    if (state->nxdn_cipher_type == 0 || nxdn_vcall_has_key(state, (uint8_t)state->nxdn_cipher_type)) {
         state->dmr_encL = 0;
     }
-}
-
-static int
-nxdn_vcall_lockout_label(dsd_state* state, uint16_t destination_id, char gm[8], char gn[50]) {
-    dsd_tg_policy_entry lockout_entry;
-    if (destination_id != 0 && dsd_tg_policy_lookup_label(state, destination_id, gm, 8, gn, 50)) {
-        return 1;
-    }
-    if (dsd_tg_policy_make_exact_entry(destination_id, "DE", "ENC LO", DSD_TG_POLICY_SOURCE_ENC_LOCKOUT, &lockout_entry)
-            == 0
-        && dsd_tg_policy_upsert_exact(state, &lockout_entry, DSD_TG_POLICY_UPSERT_ADD_IF_MISSING) == 0) {
-        DSD_SNPRINTF(gm, 8, "%s", "DE");
-        DSD_SNPRINTF(gn, 50, "%s", "ENC LO");
-        return 0;
-    }
-    return 1;
 }
 
 static void
 nxdn_vcall_run_enc_lockout(dsd_opts* opts, dsd_state* state, const struct nxdn_vcall_info* info) {
     if (opts->trunk_enable != 1 || opts->trunk_tune_enc_calls != 0 || info->message_type != 0x01U
-        || state->dmr_encL != 1) {
+        || info->destination_id == 0) {
+        return;
+    }
+    const int is_group = (info->call_type == 4U) ? 0 : 1;
+    if (state->dmr_encL != 1) {
+        // Corroborated clear -- or encrypted-but-decryptable -- voice on this
+        // target releases any retained lockout entry so a talkgroup that
+        // stopped encrypting (or gained a key) recovers.
+        const int established_recoverable =
+            nxdn_cipher_established_clear(state)
+            || (nxdn_cipher_established_enc(state) && nxdn_vcall_has_key(state, (uint8_t)state->nxdn_cipher_type));
+        if (established_recoverable) {
+            (void)dsd_enc_lockout_release(state, info->destination_id, is_group);
+        }
+        return;
+    }
+    // The lockout entry is permanent for the session and the synthesized disconnect drops the
+    // channel, so the lockout acts only on corroborated evidence. The element was CRC-verified by
+    // the channel decoder that handed it over, and a lone non-clear observation stays tentative
+    // (or quarantined) in the hysteresis above and must repeat -- one superframe -- before it may
+    // lock the talkgroup out.
+    if (!nxdn_cipher_established_enc(state)) {
         return;
     }
 
-    char gm[8] = {0};
-    char gn[50] = {0};
-    const int locked = nxdn_vcall_lockout_label(state, info->destination_id, gm, gn);
-    if (info->destination_id != 0 && locked == 0) {
+    if (dsd_enc_lockout_note(state, info->destination_id, is_group, (int)state->nxdn_cipher_type,
+                             (int)state->nxdn_key)) {
+        dsd_event_history_transaction transaction;
+        dsd_event_history_transaction_begin(state, &transaction);
         DSD_SNPRINTF(state->event_history_s[0].Event_History_Items[0].internal_str,
                      sizeof(state->event_history_s[0].Event_History_Items[0].internal_str),
                      "Target: %d; has been locked out; Encryption Lock Out Enabled.", info->destination_id);
         dsd_event_history_mark_dirty(&state->event_history_s[0]);
+        dsd_event_history_transaction_end(&transaction);
         watchdog_event_current(opts, state, 0);
     }
 
+    // Deliberately unconditional (the event above fires once per lock, the
+    // disconnect fires per corroborated VCALL): retrying the synthesized
+    // disconnect until the trunking layer actually drops the channel is what
+    // lets an already-locked target still force a release.
+    //
+    // This fabricated DISC is the one element content no CRC ever covered, and deliberately so: it
+    // exists to drive the same teardown a received DISC would -- nxdn_message_type()'s call and
+    // alias reset, and nxdn_element_handle_disc()'s return to the control channel.
     uint8_t dbits[96];
     DSD_MEMSET(dbits, 0, sizeof(dbits));
     dbits[3] = 1;
     dbits[7] = 1;
-    if ((strcmp(gm, "DE") == 0) && (strcmp(gn, "ENC LO") == 0)) {
-        NXDN_Elements_Content_decode(opts, state, 1, dbits, sizeof(dbits));
-    }
+    NXDN_Elements_Content_decode(opts, state, dbits, sizeof(dbits));
+}
+
+// Release and disconnect variants that reach nxdn_vcall_process. TX_REL_EX (0x07) ends the epoch
+// only here: unlike TX_REL/DISC it deliberately skips the alias/cipher/keyloader resets in
+// nxdn_message_type(), so this is the one site where its end reason is recorded.
+static int
+nxdn_vcall_message_type_is_release(uint8_t message_type) {
+    return message_type == 0x07U || message_type == 0x08U || message_type == 0x11U;
 }
 
 static void
 nxdn_vcall_process(dsd_opts* opts, dsd_state* state, const struct nxdn_vcall_info* info) {
+    if (info->message_type != 0x01U) {
+        // A release reaching here was CRC-verified by the channel decoder that handed it over, so
+        // it is positive end evidence decoded over the air -- the terminator reason lets the event
+        // layer keep an audible epoch whose call identity never decoded, where EXPLICIT reads as a
+        // retune and drops the row.
+        const dsd_call_end_reason reason =
+            nxdn_vcall_message_type_is_release(info->message_type) ? DSD_CALL_END_TERMINATOR : DSD_CALL_END_EXPLICIT;
+        if (dsd_call_state_end_ex(state, 0U, 0.0, reason) > 0) {
+            dsd_event_sync_slot(opts, state, 0U);
+        }
+    }
     nxdn_vcall_print_summary(state, info);
     nxdn_vcall_load_key(opts, state, info);
     nxdn_vcall_print_cipher(opts, state, info);
     nxdn_vcall_apply_state(state, info);
+    if (info->message_type == 0x01U && nxdn_confirm_is_confirmed(state)) {
+        // Held, like the publish below, until the frame's content has confirmed the transmission:
+        // a miscorrected VCALL carries a garbage destination_id, and letting it refresh the
+        // conventional scan hold would park the coordinator on noise for a full activity_hold_ms
+        // per corrupt burst. The encryption
+        // flag is the corroborated classification nxdn_vcall_apply_state() just applied, not the
+        // raw element field -- a lone flipped cipher_type would otherwise drop the hold mid-call
+        // under --enc-lockout, the exact defect nxdn_enc_class.c exists to prevent.
+        dsd_trunk_scan_hook_nxdn_conventional_activity(
+            opts, state, info->destination_id, info->source_unit_id,
+            nxdn_vcall_kind(info->call_type) == DSD_CALL_KIND_PRIVATE_VOICE ? 1 : 0, state->nxdn_cipher_type != 0U, 0);
+        nxdn_vcall_publish(opts, state, info);
+    }
     nxdn_vcall_run_enc_lockout(opts, state, info);
 }
 
@@ -2309,13 +2489,12 @@ nxdn_vcall_iv_prepare_cipher(dsd_state* state) {
 
 static void
 NXDN_decode_VCALL_IV(dsd_opts* opts, dsd_state* state, const uint8_t* Message) {
-    UNUSED(opts);
-
     state->payload_miN = nxdn_vcall_iv_extract(state, Message);
     DSD_FPRINTF(stderr, "\n  VCALL_IV: %016llX", state->payload_miN);
     if (state->nxdn_cipher_type == 0x02 || state->nxdn_cipher_type == 0x03) {
         nxdn_vcall_iv_prepare_cipher(state);
     }
+    nxdn_vcall_publish_crypto(opts, state, (uint8_t)state->nxdn_cipher_type, (uint8_t)state->nxdn_key);
 }
 
 struct nxdn_scch_info {
@@ -2382,6 +2561,11 @@ nxdn_scch_print_payload_label(const dsd_opts* opts, const struct nxdn_scch_info*
 static void
 nxdn_scch_prepare_type_d(dsd_state* state, const struct nxdn_scch_info* info) {
     DSD_SNPRINTF(state->nxdn_location_category, sizeof(state->nxdn_location_category), "Type-D");
+    if (!nxdn_confirm_is_confirmed(state)) {
+        /* SCCH carries a 7-bit CRC, which noise clears often enough that a RAN and a scan
+         * hold cannot rest on one (issue #398). */
+        return;
+    }
     state->nxdn_last_ran = info->area;
     state->last_cc_sync_time = info->now;
     state->last_cc_sync_time_m = dsd_time_now_monotonic_s();
@@ -2470,7 +2654,7 @@ nxdn_scch_apply_busy_tune(dsd_opts* opts, dsd_state* state, const struct nxdn_sc
             state->R = state->rkey_array[info->id];
         }
         if (state->M == 1) {
-            state->nxdn_cipher_type = 0x1;
+            nxdn_cipher_force(state, 0x1);
         }
     } else if (opts->trunk_enable == 1) {
         nxdn_policy_log_block(opts, is_private_call, info->id, 0, &policy_decision);
@@ -2478,32 +2662,83 @@ nxdn_scch_apply_busy_tune(dsd_opts* opts, dsd_state* state, const struct nxdn_sc
 }
 
 static void
-nxdn_scch_update_busy_display(dsd_state* state, const struct nxdn_scch_info* info) {
+nxdn_scch_update_busy_display(dsd_opts* opts, dsd_state* state, const struct nxdn_scch_info* info) {
     if (info->rep1 == 31U) {
         DSD_FPRINTF(stderr, "\n%s ", KRED);
-        state->nxdn_last_tg = 0;
-        state->nxdn_last_rid = 0;
     } else {
         DSD_FPRINTF(stderr, "\n%s ", KGRN);
-        if (info->now - state->last_vc_sync_time < 1) {
-            state->nxdn_last_tg = info->id;
-        }
     }
 
     DSD_FPRINTF(stderr, " Channel Update - CH: %d - TGT: %d ", info->rep1, info->id);
     DSD_FPRINTF(stderr, "%s ", info->gu == 0U ? "Group Call" : "Private Call");
     if (info->rep1 == 31U) {
         DSD_FPRINTF(stderr, "Termination ");
-    }
-    if (info->rep1 != 0U && info->rep1 != 31U) {
-        if (info->gu == 0U) {
-            DSD_SNPRINTF(state->active_channel[info->rep1], sizeof(state->active_channel[info->rep1]),
-                         "Active Group Ch: %d TG: %d-%d; ", info->rep1, info->rep2, info->id);
-        } else {
-            DSD_SNPRINTF(state->active_channel[info->rep1], sizeof(state->active_channel[info->rep1]),
-                         "Active Private Ch: %d TGT: %d-%d; ", info->rep1, info->rep2, info->id);
+        // Channel-update termination signaling: positive over-the-air end evidence.
+        if (dsd_call_state_end_ex(state, 0U, 0.0, DSD_CALL_END_TERMINATOR) > 0) {
+            dsd_event_sync_slot(opts, state, 0U);
         }
-        state->last_active_time = info->now;
+    } else if (info->rep1 != 0U) {
+        const dsd_call_observation observation = {
+            .protocol = DSD_SYNC_NXDN_POS,
+            .slot = 0U,
+            .kind = info->gu == 0U ? DSD_CALL_KIND_GROUP_VOICE : DSD_CALL_KIND_PRIVATE_VOICE,
+            .ota_target_id = info->id,
+            .policy_target_id = info->id,
+            .channel = info->rep1,
+        };
+        char notice[DSD_RECENT_ACTIVITY_TEXT_SIZE];
+        if (info->gu == 0U) {
+            DSD_SNPRINTF(notice, sizeof(notice), "Active Group Ch: %d TG: %d-%d; ", info->rep1, info->rep2, info->id);
+        } else {
+            DSD_SNPRINTF(notice, sizeof(notice), "Active Private Ch: %d TGT: %d-%d; ", info->rep1, info->rep2,
+                         info->id);
+        }
+        (void)dsd_recent_activity_publish(state, info->rep1, &observation, notice, 0U);
+    }
+}
+
+static void
+nxdn_scch_enrich_identity(dsd_state* state, uint32_t source_id, uint32_t target_id) {
+    dsd_call_snapshot call;
+    if (dsd_call_state_get(state, 0U, &call) <= 0 || call.phase != DSD_CALL_PHASE_ACTIVE
+        || !DSD_SYNC_IS_NXDN(call.protocol)) {
+        return;
+    }
+    dsd_call_observation observation = {
+        .protocol = call.protocol,
+        .slot = 0U,
+        .kind = call.kind,
+        .ota_target_id = target_id != 0U ? target_id : call.ota_target_id,
+        .policy_target_id = target_id != 0U ? target_id : call.policy_target_id,
+        .ota_source_id = source_id != 0U ? source_id : call.ota_source_id,
+        .channel = call.channel,
+        .frequency_hz = call.frequency_hz,
+        .service_options = call.service_options,
+        .emergency = call.emergency,
+        .priority = call.priority,
+        .has_service_metadata = call.has_service_metadata,
+    };
+    if (source_id == 0U) {
+        DSD_MEMCPY(observation.source_text, call.source_text, sizeof(observation.source_text));
+    }
+    if (target_id == 0U) {
+        DSD_MEMCPY(observation.target_text, call.target_text, sizeof(observation.target_text));
+    }
+    DSD_MEMCPY(observation.route_text[0], call.route_text[0], sizeof(observation.route_text[0]));
+    DSD_MEMCPY(observation.route_text[1], call.route_text[1], sizeof(observation.route_text[1]));
+
+    if (dsd_call_state_observe(state, &observation, DSD_CALL_BOUNDARY_CONTINUE) > 0) {
+        const dsd_call_crypto_update crypto = {
+            .classification = call.crypto,
+            .algid = call.algid,
+            .kid = call.kid,
+            .mi = call.mi,
+            .audio_permitted = call.audio_permitted,
+        };
+        (void)dsd_call_state_update_crypto(state, 0U, &crypto);
+        if (call.media_active != 0U) {
+            (void)dsd_call_state_update_media(state, 0U, 1, 0.0);
+        }
     }
 }
 
@@ -2513,23 +2748,24 @@ nxdn_scch_handle_busy(dsd_opts* opts, dsd_state* state, const struct nxdn_scch_i
     DSD_FPRINTF(stderr, "Area: %d; ", info->area);
     DSD_FPRINTF(stderr, "Go to Repeater: %d; ", info->rep1);
     DSD_FPRINTF(stderr, "Home Repeater: %d; ", info->rep2);
-    nxdn_scch_update_busy_display(state, info);
+    nxdn_scch_update_busy_display(opts, state, info);
+    if (info->rep1 != 31U && info->now - state->last_vc_sync_time < 1) {
+        nxdn_scch_enrich_identity(state, 0U, info->id);
+    }
     nxdn_scch_apply_busy_tune(opts, state, info);
 }
 
 static void
 nxdn_scch_handle_info4(dsd_opts* opts, dsd_state* state, const struct nxdn_scch_info* info) {
-    if ((info->now - state->last_active_time) > 3) {
-        DSD_MEMSET(state->active_channel, 0, sizeof(state->active_channel));
-    }
+    (void)dsd_recent_activity_expire(state, 0U, DSD_RECENT_ACTIVITY_TTL_MS);
 
     if (info->id == 2046U) {
         DSD_FPRINTF(stderr, "Idle Repeater Message - ");
         DSD_FPRINTF(stderr, "Area: %d; ", info->area);
         DSD_FPRINTF(stderr, "Repeater 1: %d; ", info->rep1);
         DSD_FPRINTF(stderr, "Repeater 2: %d; ", info->rep2);
-        DSD_SNPRINTF(state->active_channel[info->rep1], sizeof(state->active_channel[info->rep1]), "%s", "");
-        DSD_SNPRINTF(state->active_channel[info->rep2], sizeof(state->active_channel[info->rep2]), "%s", "");
+        (void)dsd_recent_activity_clear(state, info->rep1);
+        (void)dsd_recent_activity_clear(state, info->rep2);
     } else if (info->id == 2045U) {
         DSD_FPRINTF(stderr, "Halt Repeater Message - ");
         DSD_FPRINTF(stderr, "Area: %d; ", info->area);
@@ -2560,7 +2796,7 @@ nxdn_scch_handle_info3(dsd_state* state, const struct nxdn_scch_info* info) {
         DSD_FPRINTF(stderr, " Source Update - Prefix CH: %d SRC: %d - (%d-%d) ", info->rep2, info->id, info->rep2,
                     info->id);
         if (info->now - state->last_vc_sync_time < 1) {
-            state->nxdn_last_rid = info->id;
+            nxdn_scch_enrich_identity(state, info->id, 0U);
         }
     }
 }
@@ -2579,13 +2815,13 @@ nxdn_scch_handle_info2(dsd_state* state, const struct nxdn_scch_info* info) {
         DSD_FPRINTF(stderr, " Target Update - Prefix CH: %d SRC: %d - (%d-%d) ", info->rep2, info->id, info->rep2,
                     info->id);
         if (info->now - state->last_vc_sync_time < 1) {
-            state->nxdn_last_tg = info->id;
+            nxdn_scch_enrich_identity(state, 0U, info->id);
         }
     }
 }
 
 static void
-nxdn_scch_handle_info1(dsd_state* state, const struct nxdn_scch_info* info) {
+nxdn_scch_handle_info1(dsd_opts* opts, dsd_state* state, const struct nxdn_scch_info* info) {
     uint8_t duplex_mode[32] = {0};
     uint8_t transmission_mode[32] = {0};
     DSD_FPRINTF(stderr, "Call Option - ");
@@ -2599,9 +2835,13 @@ nxdn_scch_handle_info1(dsd_state* state, const struct nxdn_scch_info* info) {
         if (info->cipher) {
             DSD_FPRINTF(stderr, "- %s - ", NXDN_Cipher_Type_To_Str(info->cipher));
             DSD_FPRINTF(stderr, "Key ID: %d; ", info->key_id);
-            state->nxdn_cipher_type = info->cipher;
-            state->nxdn_key = info->key_id;
         }
+        // One SCCH observation must not flip the classification the VCALLs established -- in
+        // either direction: a corrupt call option could mute a clear call, or silently unmute
+        // an encrypted one mid-stream. The hysteresis holds it until it repeats.
+        state->nxdn_cipher_type = nxdn_cipher_observe(state, (uint8_t)info->cipher, 0);
+        state->nxdn_key = info->key_id;
+        nxdn_vcall_publish_crypto(opts, state, (uint8_t)state->nxdn_cipher_type, info->key_id);
     } else {
         DSD_FPRINTF(stderr, "\n%s ", KYEL);
         DSD_FPRINTF(stderr, "Call IV B: %04llX; ", info->iv_b);
@@ -2609,6 +2849,7 @@ nxdn_scch_handle_info1(dsd_state* state, const struct nxdn_scch_info* info) {
         state->payload_miN = state->payload_miN | (info->iv_c << 6);
         state->payload_miN = state->payload_miN | info->iv_b;
         DSD_FPRINTF(stderr, "Completed IV: %016llX", state->payload_miN);
+        nxdn_vcall_publish_crypto(opts, state, (uint8_t)state->nxdn_cipher_type, (uint8_t)state->nxdn_key);
     }
 }
 
@@ -2634,7 +2875,7 @@ NXDN_decode_scch(dsd_opts* opts, dsd_state* state, const uint8_t* Message, uint8
         nxdn_scch_handle_info2(state, &info);
     }
     if (info.opcode == 0x07U || info.opcode == 0x03U) {
-        nxdn_scch_handle_info1(state, &info);
+        nxdn_scch_handle_info1(opts, state, &info);
     }
 }
 
@@ -2691,30 +2932,3 @@ NXDN_Cipher_Type_To_Str(uint8_t CipherType) {
 
     return Ptr;
 } /* End NXDN_Cipher_Type_To_Str() */
-
-static uint8_t
-nxdn_alias_crc_ok(const dsd_state* state) {
-    if (state == NULL) {
-        return 0U;
-    }
-
-    /* FACCH1/SACCH superframe CRC drives alias acceptance when available. */
-    if (!state->nxdn_sacch_non_superframe) {
-        return (uint8_t)((state->NxdnElementsContent.VCallCrcIsGood != 0U) ? 1U : 0U);
-    }
-
-    /* Standalone SACCH frames do not carry the same assembled CRC context. */
-    return 1U;
-}
-
-static inline void
-dsd_append(char* dst, size_t dstsz, const char* src) {
-    if (!dst || !src || dstsz == 0) {
-        return;
-    }
-    size_t len = strlen(dst);
-    if (len >= dstsz) {
-        return;
-    }
-    DSD_SNPRINTF(dst + len, dstsz - len, "%s", src);
-}

@@ -211,10 +211,12 @@ dmr_ms_process_audio_frames(dsd_opts* opts, dsd_state* state, dmr_ms_voice_frame
 
 static void
 dmr_ms_play_voice(dsd_opts* opts, dsd_state* state) {
-    if (opts->floating_point == 0 && opts->pulse_digi_out_channels == 2) {
-        playSynthesizedVoiceSS3(opts, state);
+    if (opts->pulse_digi_out_channels != 1 && opts->pulse_digi_out_channels != 2) {
+        return;
     }
-    if (opts->floating_point == 1 && opts->pulse_digi_out_channels == 2) {
+    if (opts->floating_point == 0) {
+        playSynthesizedVoiceSS3(opts, state);
+    } else if (opts->floating_point == 1) {
         playSynthesizedVoiceFS3(opts, state);
     }
 }
@@ -239,12 +241,11 @@ dmr_ms_advance_voice_cycle(dsd_opts* opts, dsd_state* state, uint8_t* vc) {
     }
 
     skipDibit(opts, state, 144); // skip to next TDMA channel
-    if (dsd_opts_frontend_active(opts)) {
+    if (dsd_telemetry_is_active()) {
         dsd_telemetry_publish_both_and_redraw(opts, state);
     }
 
-    watchdog_event_history(opts, state, 0);
-    watchdog_event_current(opts, state, 0);
+    dsd_event_sync_slot(opts, state, 0);
     dmr_sm_tick_ctx(dmr_sm_get_ctx(), opts, state); // handle hangtime/release logic
     return 1;
 }

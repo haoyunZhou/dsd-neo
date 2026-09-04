@@ -13,7 +13,9 @@
 
 #include <dsd-neo/core/audio.h>
 #include <dsd-neo/core/audio_filters.h>
+#include <dsd-neo/core/call_state.h>
 #include <dsd-neo/core/constants.h>
+#include <dsd-neo/core/file_io.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/state.h>
 #include <dsd-neo/core/synctype_ids.h>
@@ -22,6 +24,7 @@
 #include <dsd-neo/protocol/p25/p25_crypto.h>
 #include <dsd-neo/runtime/p25_p2_audio_ring.h>
 #include <dsd-neo/runtime/udp_audio_hooks.h>
+#include <limits.h>
 #include <math.h>
 #include <mbelib-neo/mbelib.h>
 #include <stdint.h>
@@ -38,6 +41,18 @@ write_s16_audio(dsd_opts* opts, const int16_t* buf, size_t frames) {
     if (opts->audio_out_stream) {
         dsd_audio_write(opts->audio_out_stream, buf, frames);
     }
+}
+
+static unsigned long
+dsd_audio_call_target(const dsd_state* state, uint8_t slot) {
+    dsd_call_snapshot call;
+    if (dsd_call_state_get(state, slot, &call) <= 0 || call.phase != DSD_CALL_PHASE_ACTIVE) {
+        return 0UL;
+    }
+    uint64_t target = DSD_SYNC_IS_P25(call.protocol)
+                          ? call.ota_target_id
+                          : (call.policy_target_id != 0U ? call.policy_target_id : call.ota_target_id);
+    return target <= ULONG_MAX ? (unsigned long)target : 0UL;
 }
 
 /* Convert float audio to int16 and write using the abstraction layer */
@@ -332,12 +347,25 @@ dmr_forced_privacy_unmute_enabled(const dsd_state* state) {
 }
 
 DSD_AUDIO2_INTERNAL void
+dsd_dmr_apply_mono_slot_gate(const dsd_opts* opts, const dsd_state* state, int* encL, int* encR) {
+    if (opts->dmr_mono != 1 || !DSD_SYNC_IS_DMR(state->synctype)) {
+        return;
+    }
+    if (state->dmr_mono_slot == 1) {
+        *encL = 1;
+    } else {
+        *encR = 1;
+    }
+}
+
+DSD_AUDIO2_INTERNAL void
 dsd_dmr_init_slot_mute_flags(const dsd_opts* opts, const dsd_state* state, int* encL, int* encR) {
     const int forced_dmr_privacy = dmr_forced_privacy_unmute_enabled(state);
     int l_is_enc = state->dmr_encL != 0;
     int r_is_enc = state->dmr_encR != 0;
     *encL = (forced_dmr_privacy || !l_is_enc || opts->dmr_mute_encL == 0) ? 0 : 1;
     *encR = (forced_dmr_privacy || !r_is_enc || opts->dmr_mute_encR == 0) ? 0 : 1;
+    dsd_dmr_apply_mono_slot_gate(opts, state, encL, encR);
 }
 
 DSD_AUDIO2_INTERNAL void
@@ -360,6 +388,21 @@ dsd_duplicate_active_float_slot_to_stereo(float* a, float* b, float* c, int encL
 }
 
 static void
+dsd_mix_mono_from_slots_s16(const short* left, const short* right, size_t n, int l_on, int r_on, short* mono_out) {
+    for (size_t i = 0; i < n; i++) {
+        if (l_on && r_on) {
+            mono_out[i] = (short)(((int)left[i] + (int)right[i]) / 2);
+        } else if (l_on) {
+            mono_out[i] = left[i];
+        } else if (r_on) {
+            mono_out[i] = right[i];
+        } else {
+            mono_out[i] = 0;
+        }
+    }
+}
+
+static void
 dsd_set_p25p2_slot_mute_flags(const dsd_state* state, int* encL, int* encR) {
     *encL = state->p25_p2_audio_allowed[0] ? 0 : 1;
     *encR = state->p25_p2_audio_allowed[1] ? 0 : 1;
@@ -377,8 +420,8 @@ dsd_apply_slot_hard_mute_flags(const dsd_opts* opts, int* encL, int* encR) {
 
 static void
 dsd_apply_dual_tg_audio_gate(const dsd_opts* opts, const dsd_state* state, int* encL, int* encR) {
-    unsigned long TGL = (unsigned long)state->lasttg;
-    unsigned long TGR = (unsigned long)state->lasttgR;
+    unsigned long TGL = dsd_audio_call_target(state, 0U);
+    unsigned long TGR = dsd_audio_call_target(state, 1U);
     (void)dsd_audio_group_gate_dual(opts, state, TGL, TGR, *encL, *encR, encL, encR);
     if (!dsd_p25_audio_output_permitted(opts, state, 0)) {
         *encL = 1;
@@ -388,39 +431,28 @@ dsd_apply_dual_tg_audio_gate(const dsd_opts* opts, const dsd_state* state, int* 
     }
 }
 
-DSD_AUDIO2_INTERNAL int
-dsd_p25p2_encrypted_lockout_slot_muted(const dsd_opts* opts, const dsd_state* state, int slot, int muted) {
-    if (!opts || !state || slot < 0 || slot > 1 || !muted) {
-        return 0;
-    }
-    return p25_crypto_companion_suppressed(state, slot);
-}
-
+// A muted companion slot (encryption lockout included) has already been zeroed
+// out of the interleaved buffer, so duplicating the audible slot into the muted
+// channel can never leak undecodable audio. Always duplicating keeps a
+// locked-out companion call transparent to the clear call's playback. Flags are
+// taken by value: the caller's per-slot mute flags must stay untouched so the
+// mono mixer never treats a muted slot's raw frames as audible.
 static void
-dsd_duplicate_active_float_quad_to_stereo(const dsd_opts* opts, const dsd_state* state, float stereo[4][320], int* encL,
-                                          int* encR) {
-    if (!*encL && *encR) {
-        if (dsd_p25p2_encrypted_lockout_slot_muted(opts, state, 1, *encR)) {
-            return;
-        }
+dsd_duplicate_active_float_quad_to_stereo(float stereo[4][320], int encL, int encR) {
+    if (!encL && encR) {
         for (int j = 0; j < 4; j++) {
             for (int i = 0; i < 320; i += 2) {
                 stereo[j][i + 1] = stereo[j][i + 0];
             }
         }
-        *encR = 0;
         return;
     }
-    if (*encL && !*encR) {
-        if (dsd_p25p2_encrypted_lockout_slot_muted(opts, state, 0, *encL)) {
-            return;
-        }
+    if (encL && !encR) {
         for (int j = 0; j < 4; j++) {
             for (int i = 0; i < 320; i += 2) {
                 stereo[j][i + 0] = stereo[j][i + 1];
             }
         }
-        *encL = 0;
     }
 }
 
@@ -498,11 +530,26 @@ dsd_interleave_s16_18_blocks(const dsd_state* state, short stereo_sf[18][320]) {
 }
 
 static void
-dsd_output_s16_18_blocks(dsd_opts* opts, dsd_state* state, short stereo_sf[18][320]) {
+dsd_output_s16_18_blocks(dsd_opts* opts, dsd_state* state, short stereo_sf[18][320], int filled_blocks) {
     if (opts->audio_out != 1) {
         return;
     }
+    if (filled_blocks < 0) {
+        filled_blocks = 0;
+    } else if (filled_blocks > 18) {
+        filled_blocks = 18;
+    }
+    // Blocks inside the filled superframe extent always play, so a legitimate
+    // all-zero stretch of decoded audio is kept as real silence. Beyond the
+    // extent, only zero blocks are dropped: they are the never-filled tails of
+    // partial-superframe flushes and early emission (e.g. around a companion
+    // slot's call boundaries) and would otherwise play as inserted silence.
+    // Non-zero blocks past the extent still play in case a caller buffered
+    // audio without advancing the voice counters.
     for (int j = 0; j < 18; j++) {
+        if (j >= filled_blocks && dsd_is_all_zero_s16(stereo_sf[j], 320)) {
+            continue;
+        }
         dsd_output_s16_block(opts, state, stereo_sf[j], 160, 2);
     }
 }
@@ -512,6 +559,9 @@ dsd_write_s16_wav_18_blocks(dsd_opts* opts, short stereo_sf[18][320]) {
     if (opts->wav_out_f == NULL || opts->static_wav_file != 1) {
         return;
     }
+    // Unlike live playback above, static wav output intentionally keeps all 18
+    // blocks (including zero tails) so the recording preserves a continuous
+    // superframe timeline.
     for (int j = 0; j < 18; j++) {
         dsd_audio_write_wav_short_block(opts->wav_out_f, stereo_sf[j], 320, "dsd_write_s16_wav_18_blocks");
     }
@@ -565,10 +615,21 @@ dsd_dmr_apply_tg_hold_and_slot_preference_ss3(dsd_opts* opts, const dsd_state* s
     }
 }
 
+// As with the SS18 policy below, a muted companion slot must not hold its
+// channel silent: the muted side is zeroed before the copy, so duplication
+// keeps a locked-out companion call transparent. The mute flag alone decides
+// it -- an audible slot mid-superframe is not always sitting on burst hint 16,
+// and gating duplication on the hint collapsed those spans into one ear.
 static int
-dsd_ss3_should_copy_right_to_left(const dsd_opts* opts, const dsd_state* state, int encR) {
+dsd_ss3_should_copy_right_to_left(const dsd_opts* opts, const dsd_state* state, int encL, int encR) {
     if (encR != 0) {
         return 0;
+    }
+    if (encL != 0) {
+        return 1;
+    }
+    if (opts->dmr_mono == 1 && DSD_SYNC_IS_DMR(state->synctype) && state->dmr_mono_slot == 1) {
+        return 1;
     }
     if (opts->slot1_on == 0 && opts->slot2_on == 1) {
         return 1;
@@ -583,9 +644,15 @@ dsd_ss3_should_copy_right_to_left(const dsd_opts* opts, const dsd_state* state, 
 }
 
 static int
-dsd_ss3_should_copy_left_to_right(const dsd_opts* opts, const dsd_state* state, int encL) {
+dsd_ss3_should_copy_left_to_right(const dsd_opts* opts, const dsd_state* state, int encL, int encR) {
     if (encL != 0) {
         return 0;
+    }
+    if (encR != 0) {
+        return 1;
+    }
+    if (opts->dmr_mono == 1 && DSD_SYNC_IS_DMR(state->synctype) && state->dmr_mono_slot != 1) {
+        return 1;
     }
     if (opts->slot1_on == 1 && opts->slot2_on == 0) {
         return 1;
@@ -607,9 +674,9 @@ dsd_dmr_apply_stereo_output_policy_ss3(const dsd_opts* opts, dsd_state* state, i
     if (encR) {
         DSD_MEMSET(state->s_r4, 0, sizeof(state->s_r4));
     }
-    if (dsd_ss3_should_copy_right_to_left(opts, state, encR)) {
+    if (dsd_ss3_should_copy_right_to_left(opts, state, encL, encR)) {
         DSD_MEMCPY(state->s_l4, state->s_r4, sizeof(state->s_l4));
-    } else if (dsd_ss3_should_copy_left_to_right(opts, state, encL)) {
+    } else if (dsd_ss3_should_copy_left_to_right(opts, state, encL, encR)) {
         DSD_MEMCPY(state->s_r4, state->s_l4, sizeof(state->s_r4));
     }
 }
@@ -627,13 +694,27 @@ dsd_p25p2_apply_slot_preference_ss18(dsd_opts* opts, const dsd_state* state, uns
     }
 }
 
+// The muted companion's channel is duplicated even when its burst hint still
+// shows active voice: a muted slot (encryption lockout, group gate) is zeroed
+// before the copy, and holding its channel silent would make an undecodable
+// companion call audibly change the clear call's playback.
+//
+// The mute flags -- not the burst hints -- decide that case. A muted channel
+// carries nothing but zeros, so whenever exactly one channel is audible it must
+// be mirrored regardless of the audible slot's MAC state. Burst hint 21 only
+// means "the last MAC PDU for this slot was MAC_ACTIVE"; a slot sitting on
+// MAC_PTT (20), MAC_HANGTIME (22), MAC_END (23), MAC_IDLE (24), an LCCH marker
+// (30) or a cleared hint still emits voice for the rest of its superframe, and
+// gating duplication on 21 collapsed those spans into one ear. The hints stay
+// in play only to break the tie when both channels are unmuted and just one is
+// actually carrying a voice burst.
 static int
 dsd_ss18_should_copy_right_to_left(const dsd_opts* opts, const dsd_state* state, int encL, int encR) {
     if (encR != 0) {
         return 0;
     }
-    if (dsd_p25p2_encrypted_lockout_slot_muted(opts, state, 0, encL)) {
-        return 0;
+    if (encL != 0) {
+        return 1;
     }
     if (opts->slot1_on == 0 && opts->slot2_on == 1) {
         return 1;
@@ -652,8 +733,8 @@ dsd_ss18_should_copy_left_to_right(const dsd_opts* opts, const dsd_state* state,
     if (encL != 0) {
         return 0;
     }
-    if (dsd_p25p2_encrypted_lockout_slot_muted(opts, state, 1, encR)) {
-        return 0;
+    if (encR != 0) {
+        return 1;
     }
     if (opts->slot1_on == 1 && opts->slot2_on == 0) {
         return 1;
@@ -665,6 +746,74 @@ dsd_ss18_should_copy_left_to_right(const dsd_opts* opts, const dsd_state* state,
         return 1;
     }
     return 0;
+}
+
+// Diagnostic trace of the P25p2 mixer's audible-slot decision into the
+// --p25-sm-log stream, where it interleaves with the trunk SM's events on the
+// decoder thread's single timeline. Logged only when the decision vector
+// changes, so a steady state costs one comparison per mixer pass and the log
+// records exactly the transitions: which ear went silent, which gate or copy
+// input moved, and what the decode-side state read at that instant. The
+// free-running ring and voice counters advance on nearly every pass while
+// audio flows, so they sit outside the change trigger — their instantaneous
+// values still print on every logged line for context. Function-local
+// statics: single instance, decoder thread only, like the mixers themselves.
+static void
+dsd_p25p2_mix_diag(dsd_opts* opts, const dsd_state* state, const char* path, int encL, int encR, int copy_rl,
+                   int copy_lr, unsigned long TGL, unsigned long TGR) {
+    if (!dsd_p25_sm_log_enabled(opts)) {
+        return;
+    }
+
+    // cur[] holds the trigger fields first, then the context-only counters.
+    enum { MIX_DIAG_TRIGGER_FIELDS = 15, MIX_DIAG_FIELDS = 19 };
+
+    static unsigned long prev[MIX_DIAG_TRIGGER_FIELDS];
+    static int prev_valid = 0;
+    // Invocation count, deliberately outside the change vector: when a change
+    // does log, run= reveals how many silent (unchanged) mixer passes happened
+    // since the previous line — distinguishing "ran steadily" from "never ran".
+    static unsigned long run_count = 0;
+    run_count++;
+
+    const unsigned long cur[MIX_DIAG_FIELDS] = {(unsigned long)encL,
+                                                (unsigned long)encR,
+                                                (unsigned long)copy_rl,
+                                                (unsigned long)copy_lr,
+                                                (unsigned long)state->p25_p2_audio_allowed[0],
+                                                (unsigned long)state->p25_p2_audio_allowed[1],
+                                                (unsigned long)state->dmrburstL,
+                                                (unsigned long)state->dmrburstR,
+                                                (unsigned long)state->p25_crypto_state[0],
+                                                (unsigned long)state->p25_crypto_state[1],
+                                                (unsigned long)opts->slot1_on,
+                                                (unsigned long)opts->slot2_on,
+                                                (unsigned long)opts->slot_preference,
+                                                TGL,
+                                                TGR,
+                                                (unsigned long)state->p25_p2_audio_ring_count[0],
+                                                (unsigned long)state->p25_p2_audio_ring_count[1],
+                                                (unsigned long)state->voice_counter[0],
+                                                (unsigned long)state->voice_counter[1]};
+
+    int changed = !prev_valid;
+    for (int i = 0; i < MIX_DIAG_TRIGGER_FIELDS; i++) {
+        if (prev[i] != cur[i]) {
+            changed = 1;
+        }
+        prev[i] = cur[i];
+    }
+    prev_valid = 1;
+    if (!changed) {
+        return;
+    }
+
+    dsd_p25_sm_logf(opts,
+                    "event=audio_mix path=%s run=%lu encL=%lu encR=%lu copy=%s allowed=%lu/%lu burst=%lu/%lu "
+                    "crypto=%lu/%lu slot_on=%lu/%lu pref=%lu tgl=%lu tgr=%lu ring=%lu/%lu vc=%lu/%lu",
+                    path, run_count, cur[0], cur[1], cur[2] ? "rl" : (cur[3] ? "lr" : "none"), cur[4], cur[5], cur[6],
+                    cur[7], cur[8], cur[9], cur[10], cur[11], cur[12], cur[13], cur[14], cur[15], cur[16], cur[17],
+                    cur[18]);
 }
 
 DSD_AUDIO2_INTERNAL void
@@ -723,6 +872,23 @@ dsd_p25p2_flush_partial_audio_slot(dsd_opts* opts, dsd_state* state, int slot) {
     const int other = slot ^ 1;
     int has_slot = (slot == 0) ? p25p2_s16_frames_have_audio(state->s_l4) : p25p2_s16_frames_have_audio(state->s_r4);
     if (!has_slot) {
+        return;
+    }
+
+    // The tail is only worth emitting while the slot's crypto classification
+    // still permits audio (every caller flushes before resetting it). A
+    // lockout- or classification-muted slot can hold stale pre-mute samples;
+    // emitting them would play audio the gate refused and wedge extra blocks
+    // into the audible companion's output stream. Drop the tail instead --
+    // downstream consumers treat a muted channel's buffers as blank, so the
+    // zeroing here just makes that assumption true immediately.
+    if (!p25_crypto_audio_permitted(opts, state, slot)) {
+        if (slot == 0) {
+            DSD_MEMSET(state->s_l4, 0, sizeof(state->s_l4));
+        } else {
+            DSD_MEMSET(state->s_r4, 0, sizeof(state->s_r4));
+        }
+        state->voice_counter[slot] = 0;
         return;
     }
 
@@ -794,11 +960,12 @@ playSynthesizedVoiceFS3(dsd_opts* opts, dsd_state* state) {
         encR = 1;
     }
 
-    unsigned long TGL = (unsigned long)state->lasttg;
-    unsigned long TGR = (unsigned long)state->lasttgR;
+    unsigned long TGL = dsd_audio_call_target(state, 0U);
+    unsigned long TGR = dsd_audio_call_target(state, 1U);
 
     // Apply whitelist/TG-hold gating shared with other mixers.
     (void)dsd_audio_group_gate_dual(opts, state, TGL, TGR, encL, encR, &encL, &encR);
+    dsd_dmr_apply_mono_slot_gate(opts, state, &encL, &encR);
 
     //run autogain on the f_ buffers
     agf(opts, state, state->f_l4[0], 0);
@@ -818,9 +985,6 @@ playSynthesizedVoiceFS3(dsd_opts* opts, dsd_state* state) {
         goto FS3_END;
     }
 
-    // If only one slot is active, duplicate to both channels for stereo sinks.
-    dsd_duplicate_active_float_slot_to_stereo(stereo_samp1, stereo_samp2, stereo_samp3, encL, encR, &encL, &encR);
-
     if (opts->pulse_digi_out_channels == 1) {
         float mono1[160], mono2[160], mono3[160];
         DSD_MEMSET(mono1, 0, sizeof(mono1));
@@ -834,6 +998,8 @@ playSynthesizedVoiceFS3(dsd_opts* opts, dsd_state* state) {
         const float* mono_blocks[] = {mono1, mono2, mono3};
         dsd_output_float_blocks(opts, state, mono_blocks, 3, 160, 1, 0);
     } else {
+        // If only one slot is active, duplicate to both channels for stereo sinks.
+        dsd_duplicate_active_float_slot_to_stereo(stereo_samp1, stereo_samp2, stereo_samp3, encL, encR, &encL, &encR);
         const float* stereo_blocks[] = {stereo_samp1, stereo_samp2, stereo_samp3};
         dsd_output_float_blocks(opts, state, stereo_blocks, 3, 160, 2, 0);
     }
@@ -877,10 +1043,15 @@ playSynthesizedVoiceFS4(dsd_opts* opts, dsd_state* state) {
     dsd_set_p25p2_slot_mute_flags(state, &encL, &encR);
     dsd_apply_slot_hard_mute_flags(opts, &encL, &encR);
     dsd_apply_dual_tg_audio_gate(opts, state, &encL, &encR);
+    dsd_p25p2_mix_diag(opts, state, "fs4", encL, encR, encL && !encR, !encL && encR, dsd_audio_call_target(state, 0U),
+                       dsd_audio_call_target(state, 1U));
 
     dsd_fs4_pop_gain_frames(opts, state, lf, rf, l_ok, r_ok);
     dsd_fs4_mix_interleaved_frames(lf, rf, encL, encR, l_ok, r_ok, stereo);
-    dsd_duplicate_active_float_quad_to_stereo(opts, state, stereo, &encL, &encR);
+    // Duplication operates on the interleaved buffer, whose muted channel is
+    // already zeroed; the mono mixer below still reads the raw lf/rf frames
+    // gated by the untouched per-slot mute flags.
+    dsd_duplicate_active_float_quad_to_stereo(stereo, encL, encR);
 
     if (encL && encR) {
         goto END_FS4;
@@ -920,7 +1091,7 @@ playSynthesizedVoiceFS(dsd_opts* opts, dsd_state* state) {
         encL = 1;
     }
 
-    unsigned long TGL = (unsigned long)state->lasttg;
+    unsigned long TGL = dsd_audio_call_target(state, 0U);
     (void)dsd_audio_group_gate_mono(opts, state, TGL, encL, &encL);
     if (is_p25p1 && !dsd_p25_audio_output_permitted(opts, state, 0)) {
         encL = 1;
@@ -940,10 +1111,7 @@ playSynthesizedVoiceFM(dsd_opts* opts, dsd_state* state) {
     agf(opts, state, state->f_l, 0);
     int encL = dsd_fdma_crypto_muted(opts, state, 1);
 
-    unsigned long TGL = (unsigned long)state->lasttg;
-    if (opts->frame_nxdn48 == 1 || opts->frame_nxdn96 == 1) {
-        TGL = (unsigned long)state->nxdn_last_tg;
-    }
+    unsigned long TGL = dsd_audio_call_target(state, 0U);
 
     encL = dsd_fdma_apply_group_gate(opts, state, TGL, encL);
 
@@ -989,7 +1157,7 @@ playSynthesizedVoiceSS(dsd_opts* opts, dsd_state* state) {
         encL = 1;
     }
 
-    unsigned long TGL = (unsigned long)state->lasttg;
+    unsigned long TGL = dsd_audio_call_target(state, 0U);
 
     encL = dsd_fdma_apply_group_gate(opts, state, TGL, encL);
 
@@ -1025,21 +1193,16 @@ playSynthesizedVoiceSS3(dsd_opts* opts, dsd_state* state) {
 
     dsd_dmr_ss3_init_enc_flags(state, &encL, &encR);
 
-    unsigned long TGL = (unsigned long)state->lasttg;
-    unsigned long TGR = (unsigned long)state->lasttgR;
+    unsigned long TGL = dsd_audio_call_target(state, 0U);
+    unsigned long TGR = dsd_audio_call_target(state, 1U);
 
     (void)dsd_audio_group_gate_dual(opts, state, TGL, TGR, encL, encR, &encL, &encR);
 
     dsd_dmr_apply_tg_hold_and_slot_preference_ss3(opts, state, TGL, TGR, &encL, &encR);
+    dsd_apply_slot_hard_mute_flags(opts, &encL, &encR);
+    dsd_dmr_apply_mono_slot_gate(opts, state, &encL, &encR);
     dsd_hpf_short_triplet_if_enabled(opts, state);
     dsd_dmr_apply_stereo_output_policy_ss3(opts, state, encL, encR);
-
-    //check this last
-    if (opts->slot1_on == 0 && opts->slot2_on == 0) //both slots are hard off, disable playback
-    {
-        encL = 1;
-        encR = 1;
-    }
 
     //at this point, if both channels are still flagged as enc, then we can skip all playback/writing functions
     if (encL && encR) {
@@ -1050,8 +1213,19 @@ playSynthesizedVoiceSS3(dsd_opts* opts, dsd_state* state) {
     audio_mix_interleave_stereo_s16(state->s_l4[1], state->s_r4[1], 160, 0, 0, stereo_samp2);
     audio_mix_interleave_stereo_s16(state->s_l4[2], state->s_r4[2], 160, 0, 0, stereo_samp3);
 
-    const short* stereo_blocks[] = {stereo_samp1, stereo_samp2, stereo_samp3};
-    dsd_output_s16_blocks(opts, state, stereo_blocks, 3, 160, 2, 0);
+    if (opts->pulse_digi_out_channels == 1) {
+        short mono1[160], mono2[160], mono3[160];
+        int l_on = !encL;
+        int r_on = !encR;
+        dsd_mix_mono_from_slots_s16(state->s_l4[0], state->s_r4[0], 160, l_on, r_on, mono1);
+        dsd_mix_mono_from_slots_s16(state->s_l4[1], state->s_r4[1], 160, l_on, r_on, mono2);
+        dsd_mix_mono_from_slots_s16(state->s_l4[2], state->s_r4[2], 160, l_on, r_on, mono3);
+        const short* mono_blocks[] = {mono1, mono2, mono3};
+        dsd_output_s16_blocks(opts, state, mono_blocks, 3, 160, 1, 0);
+    } else {
+        const short* stereo_blocks[] = {stereo_samp1, stereo_samp2, stereo_samp3};
+        dsd_output_s16_blocks(opts, state, stereo_blocks, 3, 160, 2, 0);
+    }
 
     if (opts->wav_out_f != NULL && opts->static_wav_file == 1) {
         dsd_audio_write_wav_short_block(opts->wav_out_f, stereo_samp1, 320, "processAudioDMRstereo3v2 block1");
@@ -1079,8 +1253,8 @@ playSynthesizedVoiceSS18(dsd_opts* opts, dsd_state* state) {
     // then apply whitelist/TG-hold rules shared with other mixers.
     dsd_set_p25p2_slot_mute_flags(state, &encL, &encR);
 
-    unsigned long TGL = (unsigned long)state->lasttg;
-    unsigned long TGR = (unsigned long)state->lasttgR;
+    unsigned long TGL = dsd_audio_call_target(state, 0U);
+    unsigned long TGR = dsd_audio_call_target(state, 1U);
 
     (void)dsd_audio_group_gate_dual(opts, state, TGL, TGR, encL, encR, &encL, &encR);
     if (!dsd_p25_audio_output_permitted(opts, state, 0)) {
@@ -1092,6 +1266,8 @@ playSynthesizedVoiceSS18(dsd_opts* opts, dsd_state* state) {
 
     dsd_p25p2_apply_slot_preference_ss18(opts, state, TGL, TGR);
     dsd_hpf_short_18_if_enabled(opts, state);
+    dsd_p25p2_mix_diag(opts, state, "ss18", encL, encR, dsd_ss18_should_copy_right_to_left(opts, state, encL, encR),
+                       dsd_ss18_should_copy_left_to_right(opts, state, encL, encR), TGL, TGR);
     dsd_p25p2_apply_stereo_output_policy_ss18(opts, state, encL, encR);
 
     //check this last
@@ -1106,8 +1282,20 @@ playSynthesizedVoiceSS18(dsd_opts* opts, dsd_state* state) {
         goto SS18_END;
     }
 
+    // Every caller emits before resetting the voice counters, so the counters
+    // still describe how many blocks of this superframe were actually filled.
+    // A muted slot's (frozen, possibly stale) counter is excluded: its buffers
+    // were zeroed by the output policy above and contribute no extent.
+    int filled_blocks = 0;
+    if (!encL && state->voice_counter[0] > filled_blocks) {
+        filled_blocks = state->voice_counter[0];
+    }
+    if (!encR && state->voice_counter[1] > filled_blocks) {
+        filled_blocks = state->voice_counter[1];
+    }
+
     dsd_interleave_s16_18_blocks(state, stereo_sf);
-    dsd_output_s16_18_blocks(opts, state, stereo_sf);
+    dsd_output_s16_18_blocks(opts, state, stereo_sf, filled_blocks);
     dsd_write_s16_wav_18_blocks(opts, stereo_sf);
 
 SS18_END:

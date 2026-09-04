@@ -30,6 +30,7 @@
 #include <dsd-neo/dsp/sps_filters.h>
 #include <dsd-neo/dsp/symbol.h>
 #include <dsd-neo/dsp/symbol_levels.h>
+#include <dsd-neo/dsp/symbol_timing_debug.h>
 #include <dsd-neo/dsp/sync_calibration.h>
 #include <dsd-neo/platform/audio.h>
 #include <dsd-neo/platform/file_compat.h>
@@ -73,7 +74,6 @@ void dsd_symbol_test_select_window(int rf_mod, int synctype, int lastsynctype, i
                                    int* r_edge);
 int dsd_symbol_test_adjust_timing_index(int samples_per_symbol, int symbol_center, int rf_mod, int jitter,
                                         int have_sync, int symbol_span, int start_i, int* jitter_after);
-int dsd_symbol_test_is_m17_sync(int lastsynctype);
 float dsd_symbol_test_apply_matched_filter(const dsd_opts* opts, const dsd_state* state, float sample,
                                            int rtl_symbol_rate_output, int cqpsk_symbol_rate);
 unsigned int dsd_symbol_test_convert_analog_block_to_i16(const float* input, short* output, unsigned int count);
@@ -246,6 +246,17 @@ typedef struct {
     int symbol_span;
     int l_edge_pre;
     int r_edge_pre;
+    /* DSD_NEO_DEBUG_SYMBOL_TIMING, read once per symbol rather than per sample. */
+    int timing_level;
+    /* Samples this symbol has actually taken, which is not the span index: the
+       timing nudge moves that index and a stream flush restarts it. */
+    int timing_samples;
+    /* The matched filter this sample goes through, a dsd_sps_filter_kind,
+       decided once per sample by the seam so the switch and the filtering agree. */
+    int matched_filter_kind;
+    /* Set when the sample came back out of the seam's raw history rather than
+       from the input: it is already recorded there and already captured. */
+    int sample_replayed;
     unsigned int analog_out_cap;
 #ifdef USE_RADIO
     int rtl_output_kind;
@@ -253,6 +264,9 @@ typedef struct {
     int rtl_symbol_rate_output;
     int rtl_fsk_discriminator_output;
     int rtl_profile_changed;
+    /* Set when the cache handed back a discontinuity: the samples already taken
+       for this symbol came off a stream that is gone. */
+    int rtl_span_restart;
     int rtl_channel_profile;
     int rtl_symbol_rate_hz;
     int rtl_symbol_levels;
@@ -268,6 +282,7 @@ symbol_work_ctx_init(symbol_work_ctx* work, const dsd_state* state) {
     }
     *work = (symbol_work_ctx){0};
     work->symbol_span = 1;
+    work->timing_level = dsd_symbol_timing_debug_level();
 #ifdef USE_RADIO
     work->rtl_symbol_levels = 4;
 #endif
@@ -277,70 +292,126 @@ symbol_work_ctx_init(symbol_work_ctx* work, const dsd_state* state) {
     work->analog_out_cap = (unsigned int)(sizeof(state->analog_out) / sizeof(state->analog_out[0]));
 }
 
+/* No have_sync term: the frame is exactly the window a timing question needs to see,
+   and gating it out is what made this trace useless to #404. lastsynctype still gates
+   it, so the pre-first-sync noise hunt stays quiet. */
 static inline int
-symbol_timing_debug_enabled(const dsd_opts* opts, const dsd_state* state, int have_sync) {
-    return opts->symboltiming == 1 && have_sync == 0 && state->lastsynctype != DSD_SYNC_NONE;
+symbol_timing_debug_enabled(const dsd_state* state, int timing_level) {
+    return timing_level >= DSD_NEO_SYMBOL_TIMING_TRACE && state->lastsynctype != DSD_SYNC_NONE;
 }
 
 static inline void
-symbol_timing_debug_char(const dsd_opts* opts, const dsd_state* state, int have_sync, char c) {
-    if (symbol_timing_debug_enabled(opts, state, have_sync)) {
+symbol_timing_debug_char(const dsd_state* state, int timing_level, char c) {
+    if (symbol_timing_debug_enabled(state, timing_level)) {
         DSD_FPRINTF(stderr, "%c", c);
     }
 }
 
-static inline int
-symbol_is_m17_sync(int lastsynctype) {
-    return lastsynctype == DSD_SYNC_M17_STR_POS || lastsynctype == DSD_SYNC_M17_STR_NEG
-           || lastsynctype == DSD_SYNC_M17_LSF_POS || lastsynctype == DSD_SYNC_M17_LSF_NEG
-           || lastsynctype == DSD_SYNC_M17_PKT_POS || lastsynctype == DSD_SYNC_M17_PKT_NEG
-           || lastsynctype == DSD_SYNC_M17_PRE_POS || lastsynctype == DSD_SYNC_M17_PRE_NEG
-           || lastsynctype == DSD_SYNC_M17_EOT_POS || lastsynctype == DSD_SYNC_M17_EOT_NEG;
-}
-
-static inline float
-symbol_apply_matched_filter(const dsd_opts* opts, const dsd_state* state, float sample, int rtl_symbol_rate_output,
-                            int cqpsk_symbol_rate) {
+/* M17 is deliberately absent below. Its own preset says so -- -fz clears use_cosine_filter
+ * outright -- but that is a global switch, so under AUTO the flag kept its default and M17
+ * frames were the only ones handed a matched filter their preset rejects. The filter also runs
+ * from a cold history the moment a sync sets lastsynctype, and its group delay lands on the very
+ * payload that sync introduces: it cost the LSF its CRC and the stream its LICH, which is why
+ * AUTO could match M17 sync words and never decode a frame behind them (#399). */
+static inline dsd_sps_filter_kind
+symbol_matched_filter_kind(const dsd_opts* opts, const dsd_state* state, int rtl_symbol_rate_output,
+                           int cqpsk_symbol_rate) {
     if (!opts->use_cosine_filter || rtl_symbol_rate_output || cqpsk_symbol_rate) {
-        return sample;
+        return DSD_SPS_FILTER_NONE;
     }
     if (DSD_SYNC_IS_DMR_BS(state->lastsynctype) || DSD_SYNC_IS_DMR_MS(state->lastsynctype)
         || DSD_SYNC_IS_YSF(state->lastsynctype)) {
-        return dmr_filter(sample, state->samplesPerSymbol);
-    }
-    if (symbol_is_m17_sync(state->lastsynctype)) {
-        return m17_filter(sample, state->samplesPerSymbol);
+        return DSD_SPS_FILTER_DMR;
     }
     if (DSD_SYNC_IS_P25P1(state->lastsynctype)) {
-        return p25_filter(sample, state->samplesPerSymbol);
+        return DSD_SPS_FILTER_P25;
     }
     if (DSD_SYNC_IS_DPMR(state->lastsynctype)) {
         if (opts->frame_dpmr == 1) {
-            return dpmr_filter(sample, state->samplesPerSymbol);
+            return DSD_SPS_FILTER_DPMR;
         }
-        return sample;
+        return DSD_SPS_FILTER_NONE;
     }
     if (DSD_SYNC_IS_NXDN(state->lastsynctype)) {
         const dsd_nxdn_variant variant = dsd_frame_sync_active_nxdn_variant(opts, state);
         if (variant == DSD_NXDN_VARIANT_48) {
-            return nxdn_filter(sample, state->samplesPerSymbol);
+            return DSD_SPS_FILTER_NXDN;
         }
         if (variant != DSD_NXDN_VARIANT_96) {
-            return sample;
+            return DSD_SPS_FILTER_NONE;
         }
         if (state->samplesPerSymbol == 8) {
-            return sample;
+            return DSD_SPS_FILTER_NONE;
         }
-        return dmr_filter(sample, state->samplesPerSymbol);
+        return DSD_SPS_FILTER_DMR;
     }
-    return sample;
+    return DSD_SPS_FILTER_NONE;
+}
+
+/* The raw history the seam works from: samples the grid consumed, newest last. */
+static inline void
+seam_note_raw(dsd_matched_filter_seam* seam, float sample) {
+    seam->raw[seam->raw_head] = sample;
+    seam->raw_head = (seam->raw_head + 1) % DSD_MATCHED_FILTER_HISTORY;
+    if (seam->raw_count < DSD_MATCHED_FILTER_HISTORY) {
+        seam->raw_count++;
+    }
+}
+
+/* The sample recorded @p back samples ago; 1 is the newest. */
+static inline float
+seam_raw_at(const dsd_matched_filter_seam* seam, int back) {
+    int idx = seam->raw_head - back;
+    while (idx < 0) {
+        idx += DSD_MATCHED_FILTER_HISTORY;
+    }
+    return seam->raw[idx];
+}
+
+#ifdef USE_RADIO
+/* Across a stream discontinuity: the history describes a transmission that is
+   gone, and nothing from it is owed back. Only the radio stream has seams. */
+static inline void
+seam_forget(dsd_matched_filter_seam* seam) {
+    DSD_MEMSET(seam->raw, 0, sizeof(seam->raw));
+    seam->raw_head = 0;
+    seam->raw_count = 0;
+    seam->replay = 0;
+}
+#endif
+
+/* Hand @p kind the newest history it can use, leaving out the newest @p skip
+   samples, so its first real output is computed from signal rather than from
+   whatever the previous transmission left in it. */
+static void
+seam_prime(const dsd_matched_filter_seam* seam, dsd_sps_filter_kind kind, int sps, int skip, int delay) {
+    if (kind == DSD_SPS_FILTER_NONE) {
+        return;
+    }
+    const int taps = 2 * delay + 1;
+    int n = seam->raw_count - skip;
+    if (n > taps) {
+        n = taps;
+    }
+    for (int back = skip + n; back > skip; back--) {
+        dsd_sps_filter_prime(kind, seam_raw_at(seam, back), sps);
+    }
+}
+
+void
+dsd_symbol_matched_filter_reset(dsd_state* state) {
+    if (!state) {
+        return;
+    }
+    DSD_MEMSET(&state->matched_filter, 0, sizeof(state->matched_filter));
 }
 
 #ifdef DSD_NEO_TEST_HOOKS
 float
 dsd_symbol_test_apply_matched_filter(const dsd_opts* opts, const dsd_state* state, float sample,
                                      int rtl_symbol_rate_output, int cqpsk_symbol_rate) {
-    return symbol_apply_matched_filter(opts, state, sample, rtl_symbol_rate_output, cqpsk_symbol_rate);
+    const dsd_sps_filter_kind kind = symbol_matched_filter_kind(opts, state, rtl_symbol_rate_output, cqpsk_symbol_rate);
+    return dsd_sps_filter_apply(kind, sample, state->samplesPerSymbol);
 }
 #endif
 
@@ -358,41 +429,41 @@ symbol_apply_sync_clip(const dsd_state* state, int have_sync, float sample) {
 }
 
 static inline void
-symbol_jitter_above_center(const dsd_opts* opts, dsd_state* state, int have_sync, int i, float sample) {
+symbol_jitter_above_center(dsd_state* state, int timing_level, int i, float sample) {
     if (sample > (state->maxref * 1.25f)) {
         if ((state->jitter < 0) && (state->rf_mod == 1)) {
             state->jitter = i;
         }
-        symbol_timing_debug_char(opts, state, have_sync, 'O');
+        symbol_timing_debug_char(state, timing_level, 'O');
         return;
     }
-    symbol_timing_debug_char(opts, state, have_sync, '+');
+    symbol_timing_debug_char(state, timing_level, '+');
     if ((state->jitter < 0) && (state->lastsample < state->center) && (state->rf_mod != 1)) {
         state->jitter = i;
     }
 }
 
 static inline void
-symbol_jitter_below_center(const dsd_opts* opts, dsd_state* state, int have_sync, int i, float sample) {
+symbol_jitter_below_center(dsd_state* state, int timing_level, int i, float sample) {
     if (sample < (state->minref * 1.25f)) {
         if ((state->jitter < 0) && (state->rf_mod == 1)) {
             state->jitter = i;
         }
-        symbol_timing_debug_char(opts, state, have_sync, 'X');
+        symbol_timing_debug_char(state, timing_level, 'X');
         return;
     }
-    symbol_timing_debug_char(opts, state, have_sync, '-');
+    symbol_timing_debug_char(state, timing_level, '-');
     if ((state->jitter < 0) && (state->lastsample > state->center) && (state->rf_mod != 1)) {
         state->jitter = i;
     }
 }
 
 static inline void
-symbol_update_jitter(const dsd_opts* opts, dsd_state* state, int have_sync, int i, float sample) {
+symbol_update_jitter(dsd_state* state, int timing_level, int i, float sample) {
     if (sample > state->center) {
-        symbol_jitter_above_center(opts, state, have_sync, i, sample);
+        symbol_jitter_above_center(state, timing_level, i, sample);
     } else {
-        symbol_jitter_below_center(opts, state, have_sync, i, sample);
+        symbol_jitter_below_center(state, timing_level, i, sample);
     }
 }
 
@@ -459,6 +530,38 @@ symbol_accumulate_sample(const dsd_state* state, symbol_work_ctx* work, int i, f
     }
 }
 
+/*
+ * The bands below decide which way the open-loop FSK grid slips, from the index
+ * of the first centre crossing the previous symbol produced. It is a bang-bang
+ * loop driven by one unfiltered sample index, with no averaging and no
+ * confidence, and issue #444 documents what that costs: which crossing happens
+ * to reach it moves decode quality on a real call by 3x.
+ *
+ * Everything about that is true and the constants still stand, because they were
+ * measured. Five ways of making the loop more careful were A/B'd against this
+ * code on two real NXDN48 captures (tools/replay_ab.sh, 12 rotated repeats each,
+ * errors per decoded voice frame, paired per repeat):
+ *
+ *   requiring 2 agreeing crossings before slipping   +0.94 +/- 0.21, lost sync
+ *   requiring 3                                      +2.18 +/- 0.60, lost sync
+ *   freezing the grid once a call is up              +4.43 +/- 0.68, lost sync
+ *   acting only on symbols that crossed exactly once +1.17 +/- 0.11, lost sync
+ *   widening these bands to cover the whole symbol   +1.39 +/- 0.18
+ *
+ * All five are worse, none is within noise, and a control of the unmodified code
+ * against itself came in at -0.07 +/- 0.08. The first four also decoded ~10 fewer
+ * voice frames per run, which is the mechanism: between frames this is the only
+ * thing tracking the sampling instant, so a grid it stops correcting drifts until
+ * the next sync word is missed and the call ends early. Widening the bands keeps
+ * sync and degrades quality instead, so the dead zone is not slack either.
+ *
+ * The loop is therefore at a local optimum, and the cheap directions #444 lists
+ * are spent. Making it better means replacing it with a real timing loop -- a
+ * measured phase error through a loop filter, as op25_gardner_cc() already gives
+ * the CQPSK path -- not making this one more cautious. Anything tried here needs
+ * measuring the same way, on a real capture: none of these variants is visible in
+ * the iq-decode suite, which they all pass.
+ */
 static inline void
 symbol_adjust_timing_nxdn(const dsd_state* state, int* i) {
     if ((state->jitter >= 7) && (state->jitter <= 10)) {
@@ -552,10 +655,6 @@ dsd_symbol_test_adjust_timing_index(int samples_per_symbol, int symbol_center, i
     return i;
 }
 
-int
-dsd_symbol_test_is_m17_sync(int lastsynctype) {
-    return symbol_is_m17_sync(lastsynctype);
-}
 #endif
 
 #ifdef USE_RADIO
@@ -1163,7 +1262,7 @@ symbol_close_audio_in_file(dsd_opts* opts) {
 
 static inline int
 symbol_stop_after_shutdown(float* sample_out) {
-    if (exitflag != 1) {
+    if (dsd_exitflag_load() != 1) {
         return 0;
     }
     if (sample_out != NULL) {
@@ -1235,6 +1334,12 @@ symbol_read_sample_wav(dsd_opts* opts, dsd_state* state, float* sample_out) {
         }
         symbol_close_audio_in_file(opts);
         DSD_FPRINTF(stderr, "\nEnd of %s\n", opts->audio_in_dev);
+        /* Deliberately still the frontend kind, not dsd_telemetry_is_active(): the
+         * question here is whether an interactive terminal session is driving this
+         * process and would expect to keep going on live input after the file runs
+         * out, not whether anything is consuming telemetry. A GUI or embedding host
+         * gets the headless answer -- end of input ends the run -- and re-runs the
+         * engine itself when it wants another source. */
         if (opts->audio_out_type == 0 && dsd_opts_frontend_active(opts)) {
             return symbol_open_pulse_input_and_reconfigure_output(opts, state);
         }
@@ -1330,6 +1435,7 @@ symbol_reset_rtl_fsk_timing_if_needed(dsd_state* state, int output_rate_hz, int 
     state->rtl_fsk_sps_den = symbol_rate_hz;
     state->rtl_fsk_sps_accum = 0;
     state->jitter = -1;
+    dsd_symbol_timing_trace_reset(state);
     symbol_reset_rtl_fsk_discriminator_slicer(state);
     return 1;
 }
@@ -1373,7 +1479,17 @@ symbol_apply_rtl_fsk_discriminator_timing(const dsd_opts* opts, dsd_state* state
         return;
     }
     int output_rate_hz = symbol_rtl_fsk_output_rate_hz(opts);
-    int symbol_rate_hz = symbol_rtl_fsk_symbol_rate_hz(work);
+    /* The SPS hunt's profile, not the front end's published rate. A hunt step only
+     * queues its RTL profile request for the demod thread to apply between input
+     * blocks, so the published rate lags by at least a block -- and under fast I/Q
+     * replay of a fixture that fits the output ring it never moves at all. Slicing
+     * on the lagging rate put the timing back on the old profile after every hunt
+     * step, which frame_sync_ensure_enabled_sps_profile() then read as "the hunt is
+     * on the old profile", cancelling the step and pinning AUTO to 4800/4. */
+    int symbol_rate_hz = dsd_frame_sync_active_profile_symbol_rate_hz(state);
+    if (symbol_rate_hz <= 0) {
+        symbol_rate_hz = symbol_rtl_fsk_symbol_rate_hz(work);
+    }
     (void)symbol_reset_rtl_fsk_timing_if_needed(state, output_rate_hz, symbol_rate_hz, work);
 
     state->samplesPerSymbol = symbol_rtl_fsk_next_sps(state, output_rate_hz, symbol_rate_hz);
@@ -1393,6 +1509,7 @@ symbol_read_cached_rtl_sample(dsd_opts* opts, dsd_state* state, float* sample_ou
             dsd_request_shutdown(opts, state);
             return 0;
         }
+        work->rtl_span_restart = 1;
         symbol_refresh_rtl_profile(state, work);
         if (!work->rtl_fsk_discriminator_output) {
             return 0;
@@ -1438,7 +1555,7 @@ symbol_read_sample_tcp(dsd_opts* opts, dsd_state* state, float* sample_out) {
     if (tcp_result == 0) {
         int reconnected = 0;
     TCP_RETRY:
-        if (exitflag == 1) {
+        if (dsd_exitflag_load() == 1) {
             dsd_request_shutdown(opts, state);
             return 0;
         }
@@ -1535,6 +1652,16 @@ symbol_take_sample(dsd_opts* opts, dsd_state* state, symbol_work_ctx* work) {
     if (symbol_stop_after_shutdown(&work->sample)) {
         return 0;
     }
+    /* Samples a matched-filter switch handed back are read again, oldest first,
+       before live input resumes. */
+    dsd_matched_filter_seam* seam = &state->matched_filter;
+    if (seam->replay > 0) {
+        work->sample = seam_raw_at(seam, seam->replay);
+        seam->replay--;
+        work->sample_replayed = 1;
+        return 1;
+    }
+    work->sample_replayed = 0;
     if (dsd_pcm_input_uses_staged_resampler(opts) && opts->input_upsample_pos < opts->input_upsample_len) {
         work->sample = opts->input_upsample_buf[opts->input_upsample_pos++];
         return 1;
@@ -1576,7 +1703,7 @@ symbol_init_rtl_profile(const dsd_opts* opts, dsd_state* state, symbol_work_ctx*
 
 static int
 symbol_try_rtl_symbol_rate_fast_path(dsd_opts* opts, dsd_state* state, symbol_work_ctx* work) {
-    if (!work->rtl_symbol_rate_output || opts->symboltiming == 1) {
+    if (!work->rtl_symbol_rate_output) {
         return 0;
     }
     if (!state->rtl_ctx) {
@@ -1612,6 +1739,12 @@ symbol_try_rtl_symbol_rate_fast_path(dsd_opts* opts, dsd_state* state, symbol_wo
     }
     opts->rtl_pwr = dsd_rtl_stream_io_hook_return_pwr(state);
     state->lastsample = work->sample;
+    /* One sample per symbol here, which the measurement recognises as a grid with no
+       sub-symbol structure to report on. */
+    if (work->timing_level >= DSD_NEO_SYMBOL_TIMING_SYNC_LINE) {
+        dsd_symbol_timing_trace_push_sample(state, work->sample);
+        dsd_symbol_timing_trace_push_span(state, 1);
+    }
     dsd_symbol_history_push(state, work->sample);
     state->symbolcnt++;
     symbol_maybe_publish_rtl_input_level(opts, state);
@@ -1665,8 +1798,8 @@ symbol_prepare_span(const dsd_opts* opts, dsd_state* state, symbol_work_ctx* wor
 #endif
 
 static inline void
-symbol_print_timing_line(const dsd_opts* opts, dsd_state* state, int have_sync) {
-    if (!symbol_timing_debug_enabled(opts, state, have_sync)) {
+symbol_print_timing_line(const dsd_state* state, int timing_level) {
+    if (!symbol_timing_debug_enabled(state, timing_level)) {
         return;
     }
     if (state->jitter >= 0) {
@@ -1731,6 +1864,7 @@ symbol_process_symbol_bin_input(dsd_opts* opts, dsd_state* state, float* symbol_
             *symbol_out = 0.0f;
             return 1;
         }
+        /* Frontend kind on purpose; same reasoning as the PCM end-of-file path above. */
         if (opts->audio_out_type == 0 && dsd_opts_frontend_active(opts)) {
             (void)symbol_open_pulse_input_and_reconfigure_output(opts, state);
             *symbol_out = 0.0f;
@@ -1747,54 +1881,188 @@ symbol_process_symbol_flt_input(dsd_opts* opts, float* symbol_out) {
     float float_symbol = 0.0f;
     size_t read_count = fread(&float_symbol, sizeof(float), 1, opts->symbolfile);
     if (read_count != 1) {
-        exitflag = 1;
+        dsd_exitflag_store(1);
         *symbol_out = 0.0f;
         return 1;
     }
     if (feof(opts->symbolfile)) {
-        exitflag = 1;
+        dsd_exitflag_store(1);
     }
     *symbol_out = float_symbol * 10000.0f;
     return 1;
 }
 
+/* Take the next sample and, when it is live rather than handed back, record it. */
 static int
-symbol_process_live_samples(dsd_opts* opts, dsd_state* state, int have_sync, symbol_work_ctx* work) {
-    for (int i = 0; i < work->symbol_span; i++) {
-        symbol_adjust_timing_index(state, have_sync, work->symbol_span, &i);
-        if (!symbol_take_sample(opts, state, work)) {
-            return 0;
-        }
-
-        symbol_process_analog_capture(opts, state, work, have_sync);
-#ifdef USE_RADIO
-        int rtl_symbol_rate_output = work->rtl_symbol_rate_output;
-        int cqpsk_symbol_rate = work->cqpsk_symbol_rate;
-#else
-        int rtl_symbol_rate_output = 0;
-        int cqpsk_symbol_rate = 0;
-#endif
-        work->sample =
-            symbol_apply_matched_filter(opts, state, work->sample, rtl_symbol_rate_output, cqpsk_symbol_rate);
-        work->sample = symbol_apply_sync_clip(state, have_sync, work->sample);
-        symbol_update_jitter(opts, state, have_sync, i, work->sample);
-        symbol_accumulate_sample(state, work, i, work->sample);
-        state->lastsample = work->sample;
+symbol_take_sample_into_history(dsd_opts* opts, dsd_state* state, symbol_work_ctx* work) {
+    if (!symbol_take_sample(opts, state, work)) {
+        return 0;
+    }
+    if (!work->sample_replayed) {
+        seam_note_raw(&state->matched_filter, work->sample);
     }
     return 1;
 }
 
+/*
+ * The stream the grid samples changes identity when a sync names a protocol: up
+ * to that point the grid reads the raw discriminator, afterwards the matched
+ * filter's output, which describes the signal one group delay in the past. Left
+ * alone that makes the decoder re-read content it has already consumed -- 3.35
+ * symbols for NXDN48 at 20 samples per symbol, 4.5 for P25p1, and for P25p1 half
+ * a symbol of phase on top -- at every accept, which noCarrier makes roughly
+ * once per frame rather than once per call (issue #444). Switching back is the
+ * mirror image: the samples the filter still had in flight would be skipped.
+ *
+ * So treat every switch as a move of the content position and pay it off in
+ * samples. On the stream it is leaving, the sample in hand would have produced
+ * the position after the last one read; the new stream puts a different
+ * position under that same sample, and the difference is either consumed (a
+ * longer delay: prime the filter with the history it missed, then feed it that
+ * many samples and discard what they produce, since those describe positions
+ * already read) or handed back (a shorter delay, or none: re-read that many
+ * samples from the history through the new filter before live input resumes).
+ * Only the change in delay is owed, so between two filters, which is what AUTO
+ * does when the sync it accepts changes protocol, it is their difference. A
+ * samples-per-symbol change is the same discontinuity by another route, because
+ * the redesign clears the filter's history.
+ */
+static int
+symbol_sync_matched_filter_seam(dsd_opts* opts, dsd_state* state, int have_sync, symbol_work_ctx* work) {
+#ifdef USE_RADIO
+    const int rtl_symbol_rate_output = work->rtl_symbol_rate_output;
+    const int cqpsk_symbol_rate = work->cqpsk_symbol_rate;
+#else
+    const int rtl_symbol_rate_output = 0;
+    const int cqpsk_symbol_rate = 0;
+#endif
+    const dsd_sps_filter_kind kind = symbol_matched_filter_kind(opts, state, rtl_symbol_rate_output, cqpsk_symbol_rate);
+    work->matched_filter_kind = (int)kind;
+    dsd_matched_filter_seam* seam = &state->matched_filter;
+    const int sps = state->samplesPerSymbol;
+    if ((int)kind == seam->kind && sps == seam->sps) {
+        return 1;
+    }
+
+    const int previous_delay = seam->delay;
+    const int delay = dsd_sps_filter_group_delay(kind, sps);
+    seam->kind = (int)kind;
+    seam->sps = sps;
+    seam->delay = delay;
+
+    /* The sample in hand is the newest the history holds, unless a hand-back is
+       still being read out, in which case those come after it. */
+    const int newer_than_in_hand = seam->replay;
+    if (delay < previous_delay) {
+        int rewind = previous_delay - delay;
+        const int held_before_in_hand = seam->raw_count - newer_than_in_hand - 1;
+        if (rewind > held_before_in_hand) {
+            rewind = held_before_in_hand > 0 ? held_before_in_hand : 0;
+        }
+        seam->replay = newer_than_in_hand + 1 + rewind;
+        seam_prime(seam, kind, sps, seam->replay, delay);
+        /* The oldest handed-back sample replaces the one in hand, which is read
+           again in its turn. */
+        if (!symbol_take_sample(opts, state, work)) {
+            return 0;
+        }
+    } else {
+        seam_prime(seam, kind, sps, newer_than_in_hand + 1, delay);
+        for (int owed = delay - previous_delay; owed > 0; owed--) {
+            (void)dsd_sps_filter_apply(kind, work->sample, sps);
+            if (!work->sample_replayed) {
+                symbol_process_analog_capture(opts, state, work, have_sync);
+            }
+            if (!symbol_take_sample_into_history(opts, state, work)) {
+                return 0;
+            }
+        }
+    }
+    /* The crossing that was pending belonged to the stream that just ended. */
+    state->jitter = -1;
+    dsd_symbol_timing_trace_reset(state);
+    return 1;
+}
+
+/* A while loop rather than a for: the span index is not a plain counter. The
+   timing nudge moves it before the first sample is taken, and a stream flush
+   restarts the span from it, so every step it takes belongs in the body where
+   it reads as one. */
+static int
+symbol_process_live_samples(dsd_opts* opts, dsd_state* state, int have_sync, symbol_work_ctx* work) {
+    int i = 0;
+    while (i < work->symbol_span) {
+        symbol_adjust_timing_index(state, have_sync, work->symbol_span, &i);
+        if (!symbol_take_sample_into_history(opts, state, work)) {
+            return 0;
+        }
+        /* Before the span-restart check below, so a flush the catch-up runs into
+           is handled by it rather than being swallowed here. */
+        if (!symbol_sync_matched_filter_seam(opts, state, have_sync, work)) {
+            return 0;
+        }
+#ifdef USE_RADIO
+        /* This sample opens a new stream: every retune and replay RESET bumps
+           the stream generation, which flushes whatever was cached. Averaging it
+           with what the old stream left in this symbol would make the symbol
+           depend on how full the cache happened to be when the flush landed. */
+        if (work->rtl_span_restart) {
+            work->rtl_span_restart = 0;
+            work->sum = 0.0f;
+            work->count = 0;
+            if (work->rtl_fsk_discriminator_output && state->samplesPerSymbol > 1) {
+                work->symbol_span = state->samplesPerSymbol;
+            }
+            state->jitter = -1;
+            /* The recorded raw history is from the stream that just ended, so it
+               cannot prime a filter for the one starting here. */
+            seam_forget(&state->matched_filter);
+            seam_note_raw(&state->matched_filter, work->sample);
+            /* Same reasoning for the timing trace: correlating a sync word across a
+               stream seam would measure the flush, not the grid. */
+            dsd_symbol_timing_trace_reset(state);
+            work->timing_samples = 0;
+            i = 0;
+        }
+#endif
+
+        if (!work->sample_replayed) {
+            symbol_process_analog_capture(opts, state, work, have_sync);
+        }
+        work->sample =
+            dsd_sps_filter_apply((dsd_sps_filter_kind)work->matched_filter_kind, work->sample, state->samplesPerSymbol);
+        work->sample = symbol_apply_sync_clip(state, have_sync, work->sample);
+        if (work->timing_level >= DSD_NEO_SYMBOL_TIMING_SYNC_LINE) {
+            dsd_symbol_timing_trace_push_sample(state, work->sample);
+            work->timing_samples++;
+        }
+        symbol_update_jitter(state, work->timing_level, i, work->sample);
+        symbol_accumulate_sample(state, work, i, work->sample);
+        state->lastsample = work->sample;
+        i++;
+    }
+    if (work->timing_level >= DSD_NEO_SYMBOL_TIMING_SYNC_LINE) {
+        dsd_symbol_timing_trace_push_span(state, work->timing_samples);
+    }
+    return 1;
+}
+
+// apply_rtl_symbol_thresholds() writes through state in the USE_RADIO build, which is the
+// configuration this ships in; only the radio-less build could take a const pointer here.
+// cppcheck-suppress-begin constParameterPointer
 static inline float
-symbol_finalize_live_symbol(const dsd_opts* opts, dsd_state* state, int have_sync, const symbol_work_ctx* work) {
+symbol_finalize_live_symbol(dsd_state* state, const symbol_work_ctx* work) {
     float symbol = (work->count > 0) ? (work->sum / (float)work->count) : 0.0f;
 #ifdef USE_RADIO
     if (work->rtl_symbol_rate_output) {
         apply_rtl_symbol_thresholds(state, work->rtl_symbol_levels);
     }
 #endif
-    symbol_print_timing_line(opts, state, have_sync);
+    symbol_print_timing_line(state, work->timing_level);
     return symbol;
 }
+
+// cppcheck-suppress-end constParameterPointer
 
 #ifndef USE_RADIO
 static inline void
@@ -1866,7 +2134,7 @@ getSymbol(dsd_opts* opts, dsd_state* state, int have_sync) {
         return 0.0f;
     }
 
-    float symbol = symbol_finalize_live_symbol(opts, state, have_sync, &work);
+    float symbol = symbol_finalize_live_symbol(state, &work);
 
     symbol_apply_replay_overrides(opts, state, &symbol);
     return symbol_commit_symbol(opts, state, have_sync, &work, symbol);

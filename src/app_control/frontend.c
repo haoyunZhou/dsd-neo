@@ -4,14 +4,15 @@
  */
 
 #include <dsd-neo/app_control/frontend.h>
+#include <dsd-neo/app_control/snapshot.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/state.h>
+#include <dsd-neo/dsp/demod_pipeline.h>
 #include <dsd-neo/runtime/rtl_stream_metrics_hooks.h>
 #include <stddef.h>
 #include "dsd-neo/core/opts_fwd.h"
 #include "dsd-neo/core/safe_api.h"
 #include "dsd-neo/core/state_fwd.h"
-#include "snapshot_internal.h"
 
 #ifdef USE_RADIO
 #include <dsd-neo/io/rtl_stream_c.h>
@@ -37,11 +38,39 @@ frontend_snr_value_is_valid(double snr_db) {
     return snr_db > (double)FRONTEND_SNR_INVALID_DB;
 }
 
+/*
+ * Whether anything below the decoder is a radio at all.
+ *
+ * Every reading gathered further down comes from the RTL stream, whose state is
+ * process-global and outlives the session that produced it. A host that runs a
+ * second session on a different input -- the Android app is the only frontend
+ * that can, since the CLI is one input per process -- would otherwise republish
+ * the previous run's carrier lock, CFO, SNR and output rate as though a decoder
+ * with no demodulator behind it had measured them. The input type is what says
+ * whether any of it applies; it is re-parsed per session, so it cannot go stale
+ * the way the stream globals do.
+ *
+ * Shared with the notification publisher through <dsd-neo/core/opts.h> so the two
+ * cannot come to disagree about whether a session has a tuner behind it.
+ */
+static int
+frontend_input_is_radio(const dsd_opts* opts) {
+    return dsd_opts_input_is_radio(opts);
+}
+
 static void
 frontend_metrics_from_runtime_hooks(dsd_frontend_metrics* out) {
     out->output_rate_hz = dsd_rtl_stream_metrics_hook_output_rate_hz();
     out->output_kind = dsd_rtl_stream_metrics_hook_output_kind();
     (void)dsd_rtl_stream_metrics_hook_symbol_profile(&out->symbol_rate_hz, &out->symbol_levels, &out->channel_profile);
+    /* Only once the front end has actually published a profile. The mirror behind
+     * channel_profile is process-global and reads WIDE until the first publish, so
+     * deriving a width from it unconditionally reports 16 kHz for a session that
+     * has not chosen a channel yet -- and a consumer drawing that shades a channel
+     * band over the waterfall that belongs to nothing. 0 is the documented "there
+     * is nothing to draw". */
+    out->channel_bandwidth_hz =
+        (out->symbol_rate_hz > 0) ? (int)(2.0 * dsd_channel_lpf_protected_edge_hz(out->channel_profile)) : 0;
     out->stream_generation = dsd_rtl_stream_metrics_hook_stream_generation();
     out->stream_active = dsd_rtl_stream_metrics_hook_stream_active();
     (void)dsd_rtl_stream_metrics_hook_input_level(&out->input_level);
@@ -132,6 +161,13 @@ frontend_get_metrics(const dsd_opts* opts, const dsd_state* state, dsd_frontend_
         return -1;
     }
     frontend_metrics_defaults(out, opts);
+    if (!frontend_input_is_radio(opts)) {
+        /* The defaults are the whole truth here: no tuner, no demodulator, and an
+         * invalid-SNR sentinel that keeps the estimators' no-reading value off the
+         * screen. See frontend_input_is_radio(). */
+        (void)state;
+        return 0;
+    }
     frontend_metrics_from_runtime_hooks(out);
 #ifdef USE_RADIO
     frontend_metrics_from_radio(opts, state, out);
@@ -148,7 +184,13 @@ frontend_get_metrics_with_snr_fallbacks(const dsd_opts* opts, const dsd_state* s
     if (rc != 0) {
         return rc;
     }
-    frontend_metrics_add_snr_fallbacks(out, snr_fallbacks);
+    /* The fallbacks are estimators of last resort, and they read the same stream
+     * globals: on a non-radio input every primary reading is the invalid sentinel,
+     * so asking for them would substitute a previous session's eye measurement for
+     * the "no estimator reported" the caller is owed. */
+    if (frontend_input_is_radio(opts)) {
+        frontend_metrics_add_snr_fallbacks(out, snr_fallbacks);
+    }
     return 0;
 }
 
@@ -161,6 +203,12 @@ int
 dsd_app_frontend_get_metrics_with_snr_fallbacks(dsd_frontend_metrics* out, unsigned int snr_fallbacks) {
     return frontend_get_metrics_with_snr_fallbacks(dsd_app_get_latest_opts_snapshot(), dsd_app_get_latest_snapshot(),
                                                    out, snr_fallbacks);
+}
+
+int
+dsd_app_frontend_get_metrics_for_snapshot(const dsd_opts* opts, const dsd_state* state, dsd_frontend_metrics* out,
+                                          unsigned int snr_fallbacks) {
+    return frontend_get_metrics_with_snr_fallbacks(opts, state, out, snr_fallbacks);
 }
 
 int
@@ -199,5 +247,35 @@ dsd_app_frontend_spectrum_get(float* out_db, int max_bins, int* out_rate) {
         *out_rate = 0;
     }
     return 0;
+#endif
+}
+
+int
+dsd_app_frontend_wideband_spectrum_get(float* out_db, int max_bins, uint32_t* out_center_freq_hz, uint32_t* out_span_hz,
+                                       uint32_t* out_frame_serial) {
+#ifdef USE_RADIO
+    return rtl_stream_wideband_spectrum_get(out_db, max_bins, out_center_freq_hz, out_span_hz, out_frame_serial);
+#else
+    (void)out_db;
+    (void)max_bins;
+    if (out_center_freq_hz) {
+        *out_center_freq_hz = 0;
+    }
+    if (out_span_hz) {
+        *out_span_hz = 0;
+    }
+    if (out_frame_serial) {
+        *out_frame_serial = 0;
+    }
+    return 0;
+#endif
+}
+
+void
+dsd_app_frontend_wideband_spectrum_set_enabled(int on) {
+#ifdef USE_RADIO
+    rtl_stream_wideband_spectrum_set_enabled(on);
+#else
+    (void)on;
 #endif
 }

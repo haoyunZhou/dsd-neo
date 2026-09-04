@@ -38,6 +38,8 @@ DSD_AUDIO2_INTERNAL void dsd_audio_maybe_reset_output_ring_left(dsd_state* state
 DSD_AUDIO2_INTERNAL void dsd_audio_maybe_reset_output_ring_right(dsd_state* state);
 DSD_AUDIO2_INTERNAL void dsd_dmr_init_slot_mute_flags(const dsd_opts* opts, const dsd_state* state, int* encL,
                                                       int* encR);
+DSD_AUDIO2_INTERNAL void dsd_dmr_apply_mono_slot_gate(const dsd_opts* opts, const dsd_state* state, int* encL,
+                                                      int* encR);
 DSD_AUDIO2_INTERNAL void dsd_duplicate_active_float_slot_to_stereo(float* a, float* b, float* c, int encL, int encR,
                                                                    int* outL, int* outR);
 DSD_AUDIO2_INTERNAL void dsd_dmr_ss3_init_enc_flags(const dsd_state* state, int* encL, int* encR);
@@ -46,8 +48,6 @@ DSD_AUDIO2_INTERNAL void dsd_dmr_apply_tg_hold_and_slot_preference_ss3(dsd_opts*
                                                                        int* encR);
 DSD_AUDIO2_INTERNAL void dsd_dmr_apply_stereo_output_policy_ss3(const dsd_opts* opts, dsd_state* state, int encL,
                                                                 int encR);
-DSD_AUDIO2_INTERNAL int dsd_p25p2_encrypted_lockout_slot_muted(const dsd_opts* opts, const dsd_state* state, int slot,
-                                                               int muted);
 DSD_AUDIO2_INTERNAL void dsd_p25p2_apply_slot_preference_ss18(dsd_opts* opts, const dsd_state* state, unsigned long TGL,
                                                               unsigned long TGR);
 DSD_AUDIO2_INTERNAL void dsd_p25p2_apply_stereo_output_policy_ss18(const dsd_opts* opts, dsd_state* state, int encL,

@@ -139,6 +139,8 @@ config_snapshot_equals_block_b(const dsdneoRuntimeConfig& lhs, const dsdneoRunti
     CONFIG_EQ_FIELD(debug_sync_enable);
     CONFIG_EQ_FIELD(debug_cqpsk_is_set);
     CONFIG_EQ_FIELD(debug_cqpsk_enable);
+    CONFIG_EQ_FIELD(debug_symbol_timing_is_set);
+    CONFIG_EQ_FIELD(debug_symbol_timing);
     CONFIG_EQ_FIELD(cqpsk_is_set);
     CONFIG_EQ_FIELD(cqpsk_enable);
     CONFIG_EQ_FIELD(cqpsk_sync_inv_is_set);
@@ -622,6 +624,10 @@ config_init_bootstrap_and_debug(dsdneoRuntimeConfig& c) {
     c.no_bootstrap_is_set = env_is_set(nb);
     c.no_bootstrap_enable = c.no_bootstrap_is_set ? (env_is_falsey(nb) ? 0 : 1) : 0;
 
+    const char* nsh = getenv("DSD_NEO_NO_SIGNAL_HANDLERS");
+    c.no_signal_handlers_is_set = env_is_set(nsh);
+    c.no_signal_handlers_enable = c.no_signal_handlers_is_set ? (env_is_falsey(nsh) ? 0 : 1) : 0;
+
     /* Debug/tuning toggles */
     const char* ds = getenv("DSD_NEO_DEBUG_SYNC");
     c.debug_sync_is_set = env_is_set(ds);
@@ -630,6 +636,20 @@ config_init_bootstrap_and_debug(dsdneoRuntimeConfig& c) {
     const char* dcq = getenv("DSD_NEO_DEBUG_CQPSK");
     c.debug_cqpsk_is_set = env_is_set(dcq);
     c.debug_cqpsk_enable = c.debug_cqpsk_is_set ? (env_is_falsey(dcq) ? 0 : 1) : 0;
+
+    /* A level, so "2" selects the per-sample trace rather than reading as a plain truthy 1. */
+    const char* dst = getenv("DSD_NEO_DEBUG_SYMBOL_TIMING");
+    int symbol_timing_level = 0;
+    if (env_parse_int_range(dst, 0, DSD_NEO_SYMBOL_TIMING_TRACE, &symbol_timing_level)) {
+        c.debug_symbol_timing_is_set = 1;
+        c.debug_symbol_timing = symbol_timing_level;
+    } else if (env_is_truthy(dst)) {
+        c.debug_symbol_timing_is_set = 1;
+        c.debug_symbol_timing = DSD_NEO_SYMBOL_TIMING_SYNC_LINE;
+    } else if (env_is_falsey(dst)) {
+        c.debug_symbol_timing_is_set = 1;
+        c.debug_symbol_timing = DSD_NEO_SYMBOL_TIMING_OFF;
+    }
 }
 
 static void

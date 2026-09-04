@@ -13,6 +13,7 @@
  *-----------------------------------------------------------------------------*/
 
 #include <dsd-neo/core/audio.h>
+#include <dsd-neo/core/call_state.h>
 #include <dsd-neo/core/constants.h>
 #include <dsd-neo/core/dibit.h>
 #include <dsd-neo/core/dsd_time.h>
@@ -32,10 +33,10 @@
 #include <dsd-neo/protocol/p25/p25p2_soft.h>
 #include <dsd-neo/runtime/colors.h>
 #include <dsd-neo/runtime/config.h>
-#include <dsd-neo/runtime/p25_optional_hooks.h>
 #include <dsd-neo/runtime/p25_p2_audio_ring.h>
 #include <dsd-neo/runtime/rtl_stream_metrics_hooks.h>
 #include <dsd-neo/runtime/telemetry.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <time.h>
@@ -113,24 +114,14 @@ p25p2_teardown_call(dsd_opts* opts, dsd_state* state) {
     state->p25_p2_last_mac_active[1] = 0;
     state->p25_p2_last_end_ptt[0] = 0;
     state->p25_p2_last_end_ptt[1] = 0;
-    state->p25_call_is_packet[0] = 0;
-    state->p25_call_is_packet[1] = 0;
-    state->p25_call_emergency[0] = 0;
-    state->p25_call_emergency[1] = 0;
-    state->p25_call_priority[0] = 0;
-    state->p25_call_priority[1] = 0;
     state->dmr_so = 0;
     state->dmr_soR = 0;
-    state->p25_service_options_valid[0] = 0;
-    state->p25_service_options_valid[1] = 0;
     state->payload_algid = 0;
     state->payload_keyid = 0;
     state->payload_miP = 0ULL;
     state->payload_algidR = 0;
     state->payload_keyidR = 0;
     state->payload_miN = 0ULL;
-    DSD_SNPRINTF(state->call_string[0], sizeof state->call_string[0], "%s", "                     ");
-    DSD_SNPRINTF(state->call_string[1], sizeof state->call_string[1], "%s", "                     ");
 }
 
 //DUID Look Up Table from OP25
@@ -288,7 +279,6 @@ int16_t p2xllr[1400] = {0}; /* bit LLRs after descramble */
 static int dibit = 0;
 static int vc_counter = 0;
 static int framing_counter = 0;
-static int voice = 0; // If voice in vch 0 or vch 1
 
 static uint64_t isch = 0;
 static int isch_decoded = -1;
@@ -324,7 +314,6 @@ p25_p2_frame_reset(void) {
     ts_counter = 0;
     vc_counter = 0;
     framing_counter = 0;
-    voice = 0;
     dibit = 0;
 
     // Reset bit buffers (stale data from previous channel causes decode failures)
@@ -519,10 +508,8 @@ p25p2_process_facchc(dsd_opts* opts, dsd_state* state, int timeslot_index) {
 
     if (state->currentslot == 0) {
         state->dmr_so = opcode;
-        state->p25_service_options_valid[0] = 0;
     } else {
         state->dmr_soR = opcode;
-        state->p25_service_options_valid[1] = 0;
     }
 
     if (ec >= 0) {
@@ -581,10 +568,8 @@ process_FACCHs(dsd_opts* opts, dsd_state* state) {
 
     if (state->currentslot == 0) {
         state->dmr_so = opcode;
-        state->p25_service_options_valid[0] = 0;
     } else {
         state->dmr_soR = opcode;
-        state->p25_service_options_valid[1] = 0;
     }
 
     if (ec >= 0) {
@@ -641,10 +626,8 @@ p25p2_process_sacchc(dsd_opts* opts, dsd_state* state, int timeslot_index) {
     //set inverse true for SACCH
     if (state->currentslot == 0) {
         state->dmr_soR = opcode;
-        state->p25_service_options_valid[1] = 0;
     } else {
         state->dmr_so = opcode;
-        state->p25_service_options_valid[0] = 0;
     }
 
     if (ec >= 0) {
@@ -700,10 +683,8 @@ process_SACCHs(dsd_opts* opts, dsd_state* state) {
     //set inverse true for SACCH
     if (state->currentslot == 0) {
         state->dmr_soR = opcode;
-        state->p25_service_options_valid[1] = 0;
     } else {
         state->dmr_so = opcode;
-        state->p25_service_options_valid[0] = 0;
     }
 
     if (ec >= 0) {
@@ -791,11 +772,53 @@ p25p2_voice_crypto_is_authoritatively_clear(const dsd_state* state, int slot) {
         return 1;
     }
 
-    if (state->gi[slot] == 1) {
+    dsd_call_snapshot call;
+    if (dsd_call_state_get(state, (uint8_t)slot, &call) <= 0 || call.phase != DSD_CALL_PHASE_ACTIVE
+        || call.kind == DSD_CALL_KIND_PRIVATE_VOICE || call.ota_target_id > INT_MAX) {
         return 0;
     }
-    const int talkgroup = (slot == 0) ? state->lasttg : state->lasttgR;
+    const int talkgroup = (int)call.ota_target_id;
     return p25_patch_tg_key_is_clear(state, talkgroup) || p25_patch_sg_key_is_clear(state, talkgroup);
+}
+
+static int
+p25p2_active_target(const dsd_state* state, uint8_t slot) {
+    dsd_call_snapshot call;
+    if (dsd_call_state_get(state, slot, &call) <= 0 || call.phase != DSD_CALL_PHASE_ACTIVE
+        || call.ota_target_id > INT_MAX) {
+        return 0;
+    }
+    return (int)call.ota_target_id;
+}
+
+// Diagnostic trace of decode-side audio gate transitions into the --p25-sm-log
+// stream. The gate decides whether a slot's vocoder output lands in the
+// playback buffers at all, so a flip between mixer passes is invisible to the
+// mixer trace except as silence; this catches it at the decode chokepoints
+// with the state that drove it. Logged only on change. Function-local
+// statics: single instance, decoder thread only, like the decode path.
+static void
+p25p2_audio_gate_diag(dsd_opts* opts, const dsd_state* state, const char* at) {
+    if (!dsd_p25_sm_log_enabled(opts)) {
+        return;
+    }
+    static int prev[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
+    const int cur[8] = {state->p25_p2_audio_allowed[0],  state->p25_p2_audio_allowed[1],
+                        (int)state->p25_crypto_state[0], (int)state->p25_crypto_state[1],
+                        state->p25_p2_media_rejected[0], state->p25_p2_media_rejected[1],
+                        (int)state->dmrburstL,           (int)state->dmrburstR};
+    int changed = 0;
+    for (int i = 0; i < 8; i++) {
+        if (prev[i] != cur[i]) {
+            changed = 1;
+            prev[i] = cur[i];
+        }
+    }
+    if (!changed) {
+        return;
+    }
+    dsd_p25_sm_logf(opts, "event=audio_gate at=%s allowed=%d/%d crypto=%d/%d rejected=%d/%d burst=%d/%d", at, cur[0],
+                    cur[1], cur[2], cur[3], cur[4], cur[5], cur[6], cur[7]);
 }
 
 static void
@@ -809,6 +832,7 @@ p25p2_prepare_voice_crypto(dsd_opts* opts, dsd_state* state) {
     }
     if (state->p25_p2_media_rejected[slot]) {
         state->p25_p2_audio_allowed[slot] = 0;
+        p25p2_audio_gate_diag(opts, state, "prepare-rejected");
         return;
     }
     const int svc = (slot == 0) ? state->dmr_so : state->dmr_soR;
@@ -819,6 +843,7 @@ p25p2_prepare_voice_crypto(dsd_opts* opts, dsd_state* state) {
         const int alg = (slot == 0) ? state->payload_algid : state->payload_algidR;
         state->p25_p2_audio_allowed[slot] = dsd_p25p2_decode_audio_allowed(opts, state, slot, alg);
     }
+    p25p2_audio_gate_diag(opts, state, "prepare-voice");
 }
 
 static int
@@ -899,13 +924,20 @@ p25p2_increment_fourv_counter(dsd_state* state) {
     }
 }
 
+// Wrap only the slot this burst writes. The output stage resets both counters
+// after playback, so a companion counter sitting at a full 18 is a completed
+// superframe still waiting for the next odd-boundary output check — zeroing it
+// here discards it unplayed. With a muted lockout call occupying the other
+// slot, that companion burst runs this reset between the clear slot's
+// superframe completing and the output boundary that would have played it,
+// silencing the clear call for its entire transmission; an idle companion
+// (no voice bursts) never triggered it, which is why only shared-channel
+// calls lost audio.
 static void
 p25p2_reset_voice_counters_if_needed(dsd_state* state) {
-    if (state->voice_counter[0] >= 18) {
-        state->voice_counter[0] = 0;
-    }
-    if (state->voice_counter[1] >= 18) {
-        state->voice_counter[1] = 0;
+    const int slot = state->currentslot;
+    if ((slot == 0 || slot == 1) && state->voice_counter[slot] >= 18) {
+        state->voice_counter[slot] = 0;
     }
 }
 
@@ -932,13 +964,31 @@ p25p2_store_decoded_voice_frame(dsd_state* state, int frame_index, int push_ring
 
 static void
 p25p2_zero_voice_frame(dsd_state* state, int frame_index) {
+    // Muted frames must not advance voice_counter: the SS18 output trigger
+    // fires when either slot's counter reaches a full superframe and then
+    // resets both, so a slot that contributes no audible audio (e.g. an
+    // encryption-lockout companion call) advancing its counter de-phases the
+    // clear slot's cadence and forces early, zero-padded superframe emission.
+    // Accepted trade-off: a slot that un-mutes mid-superframe resumes writing
+    // at its frozen index rather than the companion's phase, skewing its audio
+    // within that one superframe until the shared reset realigns both slots.
+    // This matches how an idle slot behaves when a call starts on it
+    // mid-superframe (its counter is equally stale), which is exactly the
+    // "muted companion is indistinguishable from an idle slot" policy.
+    // Because the counter is frozen, vc_idx is constant for the superframe and
+    // only that one s_l4/s_r4 block is re-zeroed here; the other 17 keep stale
+    // pre-mute audio. That is safe only because every downstream consumer
+    // (dsd_p25p2_apply_stereo_output_policy_ss18 and
+    // dsd_audio_reset_short_stereo_working_state) memsets the muted channel
+    // before copying/reusing it -- if that ever changes, this function must
+    // zero the full 18-block extent instead of one slot.
     if (state->currentslot == 0) {
-        int vc_idx = p25p2_next_voice_slot(state, 0);
+        int vc_idx = state->voice_counter[0] % 18;
         DSD_MEMSET(state->f_l4[frame_index], 0, sizeof(state->f_l4[frame_index]));
         DSD_MEMSET(state->s_l4[vc_idx], 0, sizeof(state->s_l4[0]));
         return;
     }
-    int vc_idx = p25p2_next_voice_slot(state, 1);
+    int vc_idx = state->voice_counter[1] % 18;
     DSD_MEMSET(state->f_r4[frame_index], 0, sizeof(state->f_r4[frame_index]));
     DSD_MEMSET(state->s_r4[vc_idx], 0, sizeof(state->s_r4[0]));
 }
@@ -1088,11 +1138,8 @@ p25p2_ess_decode(dsd_state* state) {
 }
 
 static double
-p25p2_frame_mac_hold_s(const dsd_state* state, double fallback) {
+p25p2_frame_mac_hold_s(double fallback) {
     const dsdneoRuntimeConfig* cfg = dsd_neo_get_config();
-    if (state->p25_cfg_mac_hold_s > 0.0) {
-        return state->p25_cfg_mac_hold_s;
-    }
     if (cfg && cfg->p25_mac_hold_is_set) {
         return cfg->p25_mac_hold_s;
     }
@@ -1100,19 +1147,23 @@ p25p2_frame_mac_hold_s(const dsd_state* state, double fallback) {
 }
 
 static double
-p25p2_frame_vc_grace_s(const dsd_state* state, double fallback) {
+p25p2_frame_vc_grace_s(double fallback) {
     const dsdneoRuntimeConfig* cfg = dsd_neo_get_config();
-    if (state->p25_cfg_vc_grace_s > 0.0) {
-        return state->p25_cfg_vc_grace_s;
-    }
     if (cfg && cfg->p25_vc_grace_is_set) {
         return cfg->p25_vc_grace_s;
     }
     return fallback;
 }
 
+// Re-open a slot's audio gate once its ESS resolves the classification the
+// gate was waiting on. The canonical call state -- not the slot's burst hint,
+// which only records the last MAC PDU decoded -- decides whether the slot is
+// in a call: dsd_p25p2_decode_audio_allowed() requires an ACTIVE epoch, and
+// MAC_END/MAC_IDLE run p25_crypto_reset_slot(), which drops the classification
+// p25_crypto_audio_permitted() checks just above, so post-transmission states
+// stay closed. The media-rejection latch keeps a denied identity closed here.
 static void
-p25p2_ess_maybe_enable_audio_slot(const dsd_opts* opts, dsd_state* state, int slot, int alg, int burst) {
+p25p2_ess_maybe_enable_audio_slot(const dsd_opts* opts, dsd_state* state, int slot, int alg) {
     if (state->p25_p2_media_rejected[slot]) {
         state->p25_p2_audio_allowed[slot] = 0;
         return;
@@ -1124,9 +1175,15 @@ p25p2_ess_maybe_enable_audio_slot(const dsd_opts* opts, dsd_state* state, int sl
     if (state->p25_p2_audio_allowed[slot] != 0) {
         return;
     }
-    int in_call = ((burst >= 20 && burst <= 22) || voice);
-    int allow = in_call && dsd_p25p2_decode_audio_allowed(opts, state, slot, alg);
-    if (allow) {
+    // Only a resolved classification re-opens the gate: under follow mode the
+    // encrypted-audio unmute override makes p25_crypto_audio_permitted() above
+    // answer yes for UNKNOWN/ENCRYPTED_PENDING, but that override exists for
+    // audio whose classification is settled, not for an unresolved probe.
+    const dsd_p25_crypto_state crypto = state->p25_crypto_state[slot];
+    if (crypto == DSD_P25_CRYPTO_UNKNOWN || crypto == DSD_P25_CRYPTO_ENCRYPTED_PENDING) {
+        return;
+    }
+    if (dsd_p25p2_decode_audio_allowed(opts, state, slot, alg)) {
         state->p25_p2_audio_allowed[slot] = 1;
     }
 }
@@ -1134,8 +1191,9 @@ p25p2_ess_maybe_enable_audio_slot(const dsd_opts* opts, dsd_state* state, int sl
 static void
 p25p2_ess_apply_slot0(dsd_opts* opts, dsd_state* state, const p25p2_ess_result* result) {
     (void)p25_crypto_resolve(opts, state, DSD_P25_CRYPTO_PHASE2, 0, result->algid, result->keyid, result->mi,
-                             state->lasttg);
-    p25p2_ess_maybe_enable_audio_slot(opts, state, 0, state->payload_algid, state->dmrburstL);
+                             p25p2_active_target(state, 0U));
+    p25p2_ess_maybe_enable_audio_slot(opts, state, 0, state->payload_algid);
+    p25p2_audio_gate_diag(opts, state, "ess-slot0");
 
     if (state->payload_algid == 0x80 || state->payload_algid == 0x0) {
         return;
@@ -1175,8 +1233,9 @@ p25p2_ess_apply_slot0(dsd_opts* opts, dsd_state* state, const p25p2_ess_result* 
 static void
 p25p2_ess_apply_slot1(dsd_opts* opts, dsd_state* state, const p25p2_ess_result* result) {
     (void)p25_crypto_resolve(opts, state, DSD_P25_CRYPTO_PHASE2, 1, result->algid, result->keyid, result->mi,
-                             state->lasttgR);
-    p25p2_ess_maybe_enable_audio_slot(opts, state, 1, state->payload_algidR, state->dmrburstR);
+                             p25p2_active_target(state, 1U));
+    p25p2_ess_maybe_enable_audio_slot(opts, state, 1, state->payload_algidR);
+    p25p2_audio_gate_diag(opts, state, "ess-slot1");
 
     if (state->payload_algidR == 0x80 || state->payload_algidR == 0x0) {
         return;
@@ -1436,7 +1495,6 @@ p25p2_duid_maybe_open_mbe(dsd_opts* opts, dsd_state* state, int slot) {
         return;
     }
 
-    voice = 1;
     p25p2_open_mbe_for_ready_slot(opts, state, slot);
 }
 
@@ -1476,13 +1534,13 @@ p25p2_duid_compute_pending_release(dsd_opts* opts, dsd_state* state, time_t now)
         return 0;
     }
 
-    double vc_grace = p25p2_frame_vc_grace_s(state, 0.75);
+    double vc_grace = p25p2_frame_vc_grace_s(0.75);
     double dt_since_tune = (state->p25_last_vc_tune_time != 0) ? (double)(now - state->p25_last_vc_tune_time) : 1e9;
     if (dt_since_tune < vc_grace) {
         return 0;
     }
 
-    double mac_hold = p25p2_frame_mac_hold_s(state, 0.75);
+    double mac_hold = p25p2_frame_mac_hold_s(0.75);
     int left_mac_active = (state->p25_p2_last_mac_active_m[0] > 0.0)
                           && (dsd_time_now_monotonic_s() - state->p25_p2_last_mac_active_m[0]) <= mac_hold;
     int right_mac_active = (state->p25_p2_last_mac_active_m[1] > 0.0)
@@ -1491,8 +1549,14 @@ p25p2_duid_compute_pending_release(dsd_opts* opts, dsd_state* state, time_t now)
         return !(left_mac_active || right_mac_active);
     }
 
+    const double ended_m = dsd_time_now_monotonic_s();
+    for (int slot = 0; slot < DSD_CALL_STATE_SLOT_COUNT; slot++) {
+        if (dsd_call_state_end(state, (uint8_t)slot, ended_m) > 0) {
+            dsd_event_sync_slot(opts, state, (uint8_t)slot);
+        }
+    }
     state->p25_vc_freq[0] = state->p25_vc_freq[1] = 0;
-    DSD_MEMSET(state->active_channel, 0, sizeof(state->active_channel));
+    (void)dsd_recent_activity_clear_all(state);
     state->voice_counter[0] = 0;
     state->voice_counter[1] = 0;
     DSD_MEMSET(state->s_l4, 0, sizeof(state->s_l4));
@@ -1503,8 +1567,9 @@ p25p2_duid_compute_pending_release(dsd_opts* opts, dsd_state* state, time_t now)
 
 static void
 p25p2_duid_clear_idle_state(const dsd_opts* opts, dsd_state* state, time_t now) {
-    if (duid_decoded == 13 && ((now - state->last_active_time) > 2) && opts->trunk_is_tuned == 0) {
-        DSD_MEMSET(state->active_channel, 0, sizeof(state->active_channel));
+    UNUSED(now);
+    if (duid_decoded == 13 && opts->trunk_is_tuned == 0
+        && dsd_recent_activity_expire(state, 0U, DSD_RECENT_ACTIVITY_TTL_MS) > 0) {
         state->voice_counter[0] = 0;
         state->voice_counter[1] = 0;
         DSD_MEMSET(state->s_l4, 0, sizeof(state->s_l4));
@@ -1614,14 +1679,12 @@ p25p2_duid_post_timeslot(dsd_opts* opts, dsd_state* state, int timeslot_index, i
     ts_counter = timeslot_index;
     const int output_pair = (ts_counter & 1) != 0;
 
-    if (dsd_opts_frontend_active(opts)) {
+    dsd_event_sync_slot(opts, state, 0);
+    dsd_event_sync_slot(opts, state, 1);
+
+    if (dsd_telemetry_is_active()) {
         dsd_telemetry_publish_both_and_redraw(opts, state);
     }
-
-    watchdog_event_history(opts, state, 0);
-    dsd_p25_optional_hook_watchdog_event_current(opts, state, 0);
-    watchdog_event_history(opts, state, 1);
-    dsd_p25_optional_hook_watchdog_event_current(opts, state, 1);
 
     vc_counter = vc_counter + 360;
 
@@ -1639,9 +1702,24 @@ p25p2_duid_post_timeslot(dsd_opts* opts, dsd_state* state, int timeslot_index, i
     } else {
         state->currentslot = 0;
     }
-    if (ts_counter & 1) {
-        voice = 0;
+}
+
+// A slot still occupies the carrier when its gate is open, it holds buffered
+// audio, or its MAC signaling is fresh inside the hold window. The audio gate
+// alone cannot say "idle": an encryption-lockout-suppressed transmission
+// keeps its gate closed for its whole life while MAC_PTT/ACTIVE repeats prove
+// the site is still transmitting on the slot -- the same signals the LCCH
+// pending-release check consumes. Latching p25_sm_force_release on a slot the
+// SM is deliberately holding (classification in flight, companion bridging)
+// would bypass every guard the SM applies, because the forced-release tick
+// runs unguarded.
+static int
+p25p2_frame_slot_recently_occupied(const dsd_state* state, int slot, double mac_hold_s) {
+    if (state->p25_p2_audio_allowed[slot] || state->p25_p2_audio_ring_count[slot] > 0) {
+        return 1;
     }
+    return (state->p25_p2_last_mac_active_m[slot] > 0.0)
+           && (dsd_time_now_monotonic_s() - state->p25_p2_last_mac_active_m[slot]) <= mac_hold_s;
 }
 
 static void DSD_ATTR_USED
@@ -1652,9 +1730,11 @@ p25p2_duid_fallback_release(dsd_opts* opts, dsd_state* state) {
 
     time_t now2 = time(NULL);
     int no_recent_voice = (state->last_vc_sync_time != 0) && ((now2 - state->last_vc_sync_time) > opts->trunk_hangtime);
-    int both_slots_idle = (state->p25_p2_audio_allowed[0] == 0 && state->p25_p2_audio_allowed[1] == 0);
+    double mac_hold = p25p2_frame_mac_hold_s(0.75);
+    int both_slots_idle = !p25p2_frame_slot_recently_occupied(state, 0, mac_hold)
+                          && !p25p2_frame_slot_recently_occupied(state, 1, mac_hold);
     double dt_since_tune = (state->p25_last_vc_tune_time != 0) ? (double)(now2 - state->p25_last_vc_tune_time) : 1e9;
-    double vc_grace = p25p2_frame_vc_grace_s(state, 0.75);
+    double vc_grace = p25p2_frame_vc_grace_s(0.75);
     if (no_recent_voice && both_slots_idle && dt_since_tune >= vc_grace) {
         state->p25_sm_force_release = 1;
         p25p2_teardown_call(opts, state);
@@ -1678,22 +1758,19 @@ p25p2_process_duid(dsd_opts* opts, dsd_state* state) {
         p25p2_duid_clear_idle_state(opts, state, now);
         p25p2_duid_dispatch(opts, state, now, p2_pending_release, &err_counter);
         if (p25p2_duid_should_abort(opts, state, err_counter)) {
-            goto END;
+            return;
         }
 
         p25p2_duid_post_timeslot(opts, state, ts_counter, sacch_status);
     }
 
     p25p2_duid_fallback_release(opts, state);
-END:
-    voice = 0;
 }
 
 void
 processP2(dsd_opts* opts, dsd_state* state) {
     state->dmr_stereo = 1;
     p2_dibit_buffer(opts, state);
-    voice = 0;
 
     //look at our ISCH values and determine location in superframe before running frame scramble
     for (framing_counter = 0; framing_counter < 4; framing_counter++) {

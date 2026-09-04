@@ -11,6 +11,7 @@
 #ifndef DSD_NEO_INCLUDE_DSD_NEO_APP_CONTROL_COMMANDS_H_
 #define DSD_NEO_INCLUDE_DSD_NEO_APP_CONTROL_COMMANDS_H_
 
+#include <dsd-neo/app_control/rr_import_apply.h>
 #include <dsd-neo/runtime/config.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -89,6 +90,11 @@ enum dsd_app_command_id {
     DSD_APP_CMD_TRUNK_DATA_TOGGLE = 212,
     DSD_APP_CMD_TRUNK_ENC_TOGGLE = 213,
     DSD_APP_CMD_WAV_TOGGLE = 214,
+    DSD_APP_CMD_ENC_LOCKOUT_CLEAR = 215, // forget all encrypted-target lockouts
+    // On-the-fly scan controls (#380): -Y rows or --trunk-scan targets, whichever is running
+    DSD_APP_CMD_SCAN_HOLD_TOGGLE = 216, // pause/resume rotation on the channel/target on air
+    DSD_APP_CMD_SCAN_AVOID = 217,       // avoid the channel/target on air for the session and step on
+    DSD_APP_CMD_SCAN_AVOID_CLEAR = 218, // put every avoided channel/target back into the rotation
 
     // Additional commands used by terminal hotkeys in async mode
     DSD_APP_CMD_QUIT = 300,
@@ -150,6 +156,30 @@ enum dsd_app_command_id {
     DSD_APP_CMD_RTL_SET_BIAS_TEE = 489,    // payload: int32_t on(0/1)
     DSD_APP_CMD_RTLTCP_SET_AUTOTUNE = 490, // payload: int32_t on(0/1)
     DSD_APP_CMD_RTL_SET_AUTO_PPM = 491,    // payload: int32_t on(0/1)
+    // Live retune from a spectrum tap. Separate from RTL_SET_FREQ so taps coalesce only
+    // with taps, the trunking gate is enforced at drain time, and an accepted tune resets
+    // the decoder's auto-modulation votes and call state for re-acquisition.
+    DSD_APP_CMD_MANUAL_TUNE = 492, // payload: uint32_t hz
+    // Hand the tuner back to the operator: trunking and conventional scanner mode both off,
+    // idempotent. Distinct from TRUNK_TOGGLE/SCANNER_TOGGLE, which cannot express "off" from a
+    // frontend that only sees whether *something* owns the tuner.
+    DSD_APP_CMD_TUNER_RELEASE = 493, // no payload
+    // Set the modulation outright rather than cycling it. A view showing C4FM and
+    // QPSK as two choices has to be able to ask for the one it is not on; a toggle
+    // makes that a guess about state that may already have moved.
+    DSD_APP_CMD_MOD_SET = 494, // payload: int32_t (0 = C4FM, 1 = QPSK, 2 = GFSK), matching dsd_state::rf_mod
+    // Switch which protocols are decoded, mid-session. Payload is a
+    // dsdneoUserDecodeMode (<dsd-neo/runtime/config.h>), applied through the same
+    // preset helper the CLI and config paths use.
+    DSD_APP_CMD_DECODE_MODE_SET = 495, // payload: int32_t dsdneoUserDecodeMode
+    // Hand the tuner to trunking, or take it back, from a frontend that knows which
+    // of the two it is asking for. TRUNK_TOGGLE cannot say that: a view offering
+    // "follow this system" as a choice has to be able to ask for the state it is not
+    // in, and a flip makes that a guess about state that may already have moved.
+    // Turning it on clears scanner mode, which is the same exclusion SCANNER_TOGGLE
+    // already applies in the other direction — both cannot own the tuner. Turning it
+    // off is deliberately narrow; TUNER_RELEASE remains the way to clear both at once.
+    DSD_APP_CMD_TRUNK_SET = 496, // payload: int32_t on(0/1)
 
     // Rigctl / tuning params
     DSD_APP_CMD_RIGCTL_SET_MOD_BW = 500, // payload: int32_t hz
@@ -157,6 +187,13 @@ enum dsd_app_command_id {
     DSD_APP_CMD_HANGTIME_SET = 502,      // payload: double seconds
     DSD_APP_CMD_SLOT_PREF_SET = 503,     // payload: int32_t pref (0=slot 1, 1=slot 2, 2=auto)
     DSD_APP_CMD_SLOTS_ONOFF_SET = 504,   // payload: int32_t mask
+    // Voice-gated scan (-Y and --trunk-scan): hold on a signal only while it carries voice.
+    // The qualify window opens at sync; voice must appear before it lapses or
+    // the scan moves on. The hold window restarts on every voice frame and the
+    // scan leaves only after it lapses with no voice.
+    DSD_APP_CMD_SCAN_VOICE_ONLY_SET = 505,       // payload: int32_t on(0/1)
+    DSD_APP_CMD_SCAN_VOICE_QUALIFY_MS_SET = 506, // payload: int32_t ms (100..600000)
+    DSD_APP_CMD_SCAN_VOICE_HOLD_MS_SET = 507,    // payload: int32_t ms (100..600000)
 
     // Pulse audio device selection
     DSD_APP_CMD_PULSE_OUT_SET = 520, // payload: char name[]
@@ -176,6 +213,24 @@ enum dsd_app_command_id {
     DSD_APP_CMD_IMPORT_GROUP_LIST = 561,  // payload: char path[]
     DSD_APP_CMD_IMPORT_KEYS_DEC = 562,    // payload: char path[]
     DSD_APP_CMD_IMPORT_KEYS_HEX = 563,    // payload: char path[]
+
+    // Unload what those imported. A frontend that lets a system clear its CSV
+    // selection needs to express "none", and re-importing cannot: every command
+    // above takes a path, and the services reject an empty one. Without these,
+    // clearing a picker left the previous file naming talkgroups and mapping
+    // channels for the rest of the session.
+    DSD_APP_CMD_IMPORT_CHANNEL_MAP_CLEAR = 564, // no payload
+    DSD_APP_CMD_IMPORT_GROUP_LIST_CLEAR = 565,  // no payload
+    DSD_APP_CMD_IMPORT_KEYS_CLEAR = 566,        // no payload; dec and hex share one keyring
+
+    // P25 band plan (docs/csv-formats.md, "P25 Band Plan CSV"): load a user plan into the IDEN
+    // tables, or write the learned tables (every trunk-scan target under trunk scan) to a file.
+    DSD_APP_CMD_IMPORT_P25_BANDPLAN = 567, // payload: char path[]
+    DSD_APP_CMD_EXPORT_P25_BANDPLAN = 568, // payload: char path[]
+
+    // RadioReference import (docs/radioreference-import.md)
+    DSD_APP_CMD_RR_APPLY_IMPORT = 570, // payload: dsd_app_rr_apply_payload
+    DSD_APP_CMD_RR_ACCOUNT_SET = 571,  // payload: dsd_app_rr_account_payload
 
     // P25 helpers
     DSD_APP_CMD_P25_P2_PARAMS_SET = 580, // payload: struct { uint64_t wacn, sysid, cc; }
@@ -297,6 +352,8 @@ int dsd_app_command_set_aes_key(const dsd_app_aes_key_payload* payload);
 int dsd_app_command_dsp_op(const dsd_app_dsp_payload* payload);
 int dsd_app_command_apply_config(const dsdneoUserConfig* config);
 int dsd_app_command_set_config_metadata(const dsd_app_config_metadata_payload* payload);
+int dsd_app_command_set_rr_apply(const dsd_app_rr_apply_payload* payload);
+int dsd_app_command_set_rr_account(const dsd_app_rr_account_payload* payload);
 
 #ifdef __cplusplus
 }

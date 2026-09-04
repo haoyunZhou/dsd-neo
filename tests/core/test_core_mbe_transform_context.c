@@ -6,11 +6,13 @@
  * Copyright (C) 2026 by arancormonk <180709949+arancormonk@users.noreply.github.com>
  */
 
+#include <dsd-neo/core/call_state.h>
 #include <dsd-neo/core/file_io.h>
 #include <dsd-neo/core/keyring.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/safe_api.h>
 #include <dsd-neo/core/state.h>
+#include <dsd-neo/core/state_ext.h>
 #include <dsd-neo/core/synctype_ids.h>
 #include <dsd-neo/core/vocoder.h>
 #include <dsd-neo/crypto/aes.h>
@@ -551,6 +553,7 @@ test_changed_frame_restores_total_error_repeat_fallback(void) {
 static void
 init_mbe_state(dsd_state* state, mbe_parms* cur, mbe_parms* prev, mbe_parms* prev_enhanced, mbe_parms* cur2,
                mbe_parms* prev2, mbe_parms* prev_enhanced2) {
+    dsd_state_ext_free_all(state);
     DSD_MEMSET(state, 0, sizeof(*state));
     mbe_initMbeParms(cur, prev, prev_enhanced);
     mbe_initMbeParms(cur2, prev2, prev_enhanced2);
@@ -981,6 +984,7 @@ test_process_mbe_frame_p25p1_tail_erasure_requires_exact_clear_state(void) {
         rc |= expect_eq_int("p25p1-tail-nonclear corrections", (int)state.p25_p1_accepted_corrections, 10);
         rc |= expect_eq_int("p25p1-tail-nonclear suppressed", (int)state.p25_p1_suppressed_tail_frames, 0);
         rc |= expect_eq_int("p25p1-tail-nonclear excluded", (int)state.p25_p1_excluded_tail_corrections, 0);
+        dsd_state_ext_free_all(&state);
     }
     return rc;
 }
@@ -1704,6 +1708,7 @@ test_process_mbe_frame_hard_dmr_left_stages_audio(void) {
 
     DSD_MEMSET(&opts, 0, sizeof(opts));
     opts.floating_point = 1;
+    opts.dmr_mono = 1;
     opts.dmr_stereo = 1;
     init_mbe_state(&state, &cur, &prev, &prev_enhanced, &cur2, &prev2, &prev_enhanced2);
     state.synctype = DSD_SYNC_DMR_BS_VOICE_POS;
@@ -1717,7 +1722,103 @@ test_process_mbe_frame_hard_dmr_left_stages_audio(void) {
     rc |= expect_eq_mem("frame-hard-dmr temp audio", state.audio_out_temp_buf, expected_audio, sizeof(expected_audio));
     rc |= expect_eq_mem("frame-hard-dmr staged left", state.f_l, expected_audio, sizeof(expected_audio));
     rc |= expect_eq_int("frame-hard-dmr enc flag", state.dmr_encL, 0);
+    rc |= expect_eq_int("frame-hard-dmr inactive right muted", state.dmr_encR, 1);
     rc |= expect_eq_int("frame-hard-dmr debug errors", state.debug_audio_errors, state.errs2);
+
+    return rc;
+}
+
+static int
+test_process_mbe_frame_trunked_mono_bs_fallback_gates_to_granted_slot(void) {
+    int rc = 0;
+    static dsd_opts opts;
+    static dsd_state state;
+    static mbe_parms cur;
+    static mbe_parms prev;
+    static mbe_parms prev_enhanced;
+    static mbe_parms cur2;
+    static mbe_parms prev2;
+    static mbe_parms prev_enhanced2;
+    mbe_parms expected_cur;
+    mbe_parms expected_prev;
+    mbe_parms expected_prev_enhanced;
+    char ambe_fr[4][24] = {{0}};
+    char ambe_d[49] = {0};
+    float expected_audio[160] = {0};
+    float silent_audio[160] = {0};
+    char expected_err_str[96] = {0};
+    int expected_errs = -1;
+    int expected_errs2 = -1;
+    mbe_process_result result;
+    char wav_path_l[1024];
+    char wav_path_r[1024];
+    SNDFILE* wav_out_l = create_wav_temp(wav_path_l, sizeof(wav_path_l), "dmr_bs_fallback_l");
+    SNDFILE* wav_out_r = create_wav_temp(wav_path_r, sizeof(wav_path_r), "dmr_bs_fallback_r");
+
+    ambe_fr[0][11] = 1;
+    ambe_fr[2][20] = 1;
+
+    int ret = mbe_decodeAmbe3600x2450Frame((const char (*)[24])ambe_fr, ambe_d, &result);
+    store_expected_decode_status(ret, &expected_errs, &expected_errs2, &result);
+    rc |= expect_eq_int("dmr-bs-fallback fixture decodes", ret >= 0, 1);
+    if (ret >= 0) {
+        mbe_initMbeParms(&expected_cur, &expected_prev, &expected_prev_enhanced);
+        ret = mbe_processAmbe2450Dataf(expected_audio, &result, ambe_d, &expected_cur, &expected_prev,
+                                       &expected_prev_enhanced);
+        store_expected_process_status(ret, expected_audio, &expected_errs, &expected_errs2, expected_err_str,
+                                      sizeof(expected_err_str), &result);
+        rc |= expect_eq_int("dmr-bs-fallback fixture processes", ret >= 0, 1);
+    }
+
+    DSD_MEMSET(&opts, 0, sizeof(opts));
+    opts.floating_point = 1;
+    opts.dmr_mono = 1;
+    opts.dmr_stereo = 1;
+    opts.dmr_stereo_wav = 1;
+    opts.wav_out_f = wav_out_l;
+    opts.wav_out_fR = wav_out_r;
+    init_mbe_state(&state, &cur, &prev, &prev_enhanced, &cur2, &prev2, &prev_enhanced2);
+    state.synctype = DSD_SYNC_DMR_BS_VOICE_POS;
+    state.dmr_stereo = 1;
+    state.dmr_mono_slot = 1;
+
+    state.currentslot = 0;
+    processMbeFrame(&opts, &state, NULL, ambe_fr, NULL);
+
+    rc |= expect_eq_int("dmr-bs-fallback adjacent slot muted", state.dmr_encL, 1);
+    rc |= expect_eq_mem("dmr-bs-fallback adjacent slot not staged", state.f_l, silent_audio, sizeof(silent_audio));
+    rc |= expect_eq_int("dmr-bs-fallback adjacent slot debug errors", state.debug_audio_errors, 0);
+
+    state.currentslot = 1;
+    processMbeFrame(&opts, &state, NULL, ambe_fr, NULL);
+
+    rc |= expect_eq_int("dmr-bs-fallback errs", state.errsR, expected_errs);
+    rc |= expect_eq_int("dmr-bs-fallback errs2", state.errs2R, expected_errs2);
+    rc |= expect_eq_int("dmr-bs-fallback status", strcmp(state.err_strR, expected_err_str), 0);
+    rc |=
+        expect_eq_mem("dmr-bs-fallback temp audio", state.audio_out_temp_bufR, expected_audio, sizeof(expected_audio));
+    rc |= expect_eq_mem("dmr-bs-fallback staged right", state.f_r, expected_audio, sizeof(expected_audio));
+    rc |= expect_eq_int("dmr-bs-fallback enc flag", state.dmr_encR, 0);
+    rc |= expect_eq_int("dmr-bs-fallback debug errors", state.debug_audio_errorsR, state.errs2R);
+
+    if (wav_out_l) {
+        sf_write_sync(wav_out_l);
+        rc |= expect_eq_int("dmr-bs-fallback slot1 wav frames", (int)sf_seek(wav_out_l, 0, SEEK_END), 0);
+        rc |= expect_eq_int("dmr-bs-fallback slot1 wav close", sf_close(wav_out_l), 0);
+        (void)remove(wav_path_l);
+        opts.wav_out_f = NULL;
+    } else {
+        rc |= 1;
+    }
+    if (wav_out_r) {
+        sf_write_sync(wav_out_r);
+        rc |= expect_eq_int("dmr-bs-fallback slot2 wav frames", (int)sf_seek(wav_out_r, 0, SEEK_END), 160);
+        rc |= expect_eq_int("dmr-bs-fallback slot2 wav close", sf_close(wav_out_r), 0);
+        (void)remove(wav_path_r);
+        opts.wav_out_fR = NULL;
+    } else {
+        rc |= 1;
+    }
 
     return rc;
 }
@@ -2068,6 +2169,101 @@ test_process_mbe_frame_dmr_aes_stream_advances_slot_state(void) {
     return rc;
 }
 
+// Issue #351 follow-up review (task 2, finding "important 2"): mbe_prepare_frame_state()'s
+// `state->keyloader == 1 && algid != 0 && algid != 0x80` gate decides whether the DMR TG key
+// map resolver runs at all, and keyring_dmr_slot_kid_for_call() has no visibility into
+// payload_algid to cover that gate itself -- no other test in the tree sets keyloader, so
+// nothing here exercised the gate before this test existed. Drives processMbeFrame() directly
+// with keyloader armed to close that gap, and folds in the regression coverage for the review's
+// "critical 1" finding: a signaled key id above 0xFF (P25's 16-bit KID space; rkey_array is
+// sized to 0x1FFFF) must activate from its own full index, not one narrowed to a uint8_t before
+// ever reaching the resolver.
+static int
+test_process_mbe_frame_activation_gate_and_wide_kid(void) {
+    int rc = 0;
+    static dsd_opts opts;
+    static dsd_state state;
+    static mbe_parms cur;
+    static mbe_parms prev;
+    static mbe_parms prev_enhanced;
+    static mbe_parms cur2;
+    static mbe_parms prev2;
+    static mbe_parms prev_enhanced2;
+    char imbe_fr[8][23] = {{0}};
+    char ambe_fr[4][24] = {{0}};
+    char imbe7100_fr[7][24] = {{0}};
+
+    ambe_fr[0][6] = 1;
+    ambe_fr[2][18] = 1;
+
+    // algid == 0: the BP/HBP TG autoload owns the slot, so the gate must stay shut even with
+    // keyloader armed and material imported for the signaled id -- R must survive untouched.
+    DSD_MEMSET(&opts, 0, sizeof(opts));
+    opts.floating_point = 1;
+    init_mbe_state(&state, &cur, &prev, &prev_enhanced, &cur2, &prev2, &prev_enhanced2);
+    state.synctype = DSD_SYNC_DMR_BS_VOICE_POS;
+    state.currentslot = 0;
+    state.keyloader = 1;
+    state.payload_keyid = 0x03;
+    state.rkey_array[0x03] = 0xAAAAAULL;
+    state.rkey_array_loaded[0x03] = 1U;
+    state.R = 0x99ULL;
+    processMbeFrame(&opts, &state, imbe_fr, ambe_fr, imbe7100_fr);
+    rc |= expect_eq_int("gate-algid-zero-skips-activation", (int)state.R, 0x99);
+
+    // algid == 0x80: the scrambler path owns the slot -- same non-activation as algid == 0.
+    DSD_MEMSET(&opts, 0, sizeof(opts));
+    opts.floating_point = 1;
+    init_mbe_state(&state, &cur, &prev, &prev_enhanced, &cur2, &prev2, &prev_enhanced2);
+    state.synctype = DSD_SYNC_DMR_BS_VOICE_POS;
+    state.currentslot = 0;
+    state.keyloader = 1;
+    state.payload_algid = 0x80;
+    state.payload_keyid = 0x03;
+    state.rkey_array[0x03] = 0xAAAAAULL;
+    state.rkey_array_loaded[0x03] = 1U;
+    state.R = 0x99ULL;
+    processMbeFrame(&opts, &state, imbe_fr, ambe_fr, imbe7100_fr);
+    rc |= expect_eq_int("gate-alg80-skips-activation", (int)state.R, 0x99);
+
+    // algid == 0x21 with keyloader armed: the gate opens and the signaled id's own material
+    // activates, overwriting whatever R held before.
+    DSD_MEMSET(&opts, 0, sizeof(opts));
+    opts.floating_point = 1;
+    init_mbe_state(&state, &cur, &prev, &prev_enhanced, &cur2, &prev2, &prev_enhanced2);
+    state.synctype = DSD_SYNC_DMR_BS_VOICE_POS;
+    state.currentslot = 0;
+    state.keyloader = 1;
+    state.payload_algid = 0x21;
+    state.payload_keyid = 0x03;
+    state.rkey_array[0x03] = 0xAAAAAULL;
+    state.rkey_array_loaded[0x03] = 1U;
+    state.R = 0x99ULL;
+    processMbeFrame(&opts, &state, imbe_fr, ambe_fr, imbe7100_fr);
+    rc |= expect_eq_int("gate-alg21-activates-signaled-key", (int)state.R, (int)0xAAAAAULL);
+
+    // Critical 1 regression: 0x0101 truncates to 0x01 if the signaled id is narrowed to a
+    // uint8_t before reaching the resolver. Seed a decoy at the truncated index so a
+    // reintroduced truncation is caught by the wrong *value*, not merely a missing key.
+    DSD_MEMSET(&opts, 0, sizeof(opts));
+    opts.floating_point = 1;
+    init_mbe_state(&state, &cur, &prev, &prev_enhanced, &cur2, &prev2, &prev_enhanced2);
+    state.synctype = DSD_SYNC_DMR_BS_VOICE_POS;
+    state.currentslot = 0;
+    state.keyloader = 1;
+    state.payload_algid = 0x21;
+    state.payload_keyid = 0x0101;
+    state.rkey_array[0x0101] = 0xCCCCCULL;
+    state.rkey_array_loaded[0x0101] = 1U;
+    state.rkey_array[0x01] = 0xBADULL;
+    state.rkey_array_loaded[0x01] = 1U;
+    state.R = 0x99ULL;
+    processMbeFrame(&opts, &state, imbe_fr, ambe_fr, imbe7100_fr);
+    rc |= expect_eq_int("gate-wide-kid-activates-full-index", (int)state.R, (int)0xCCCCCULL);
+
+    return rc;
+}
+
 static int
 test_process_mbe_frame_hard_p25p2_right_stages_audio(void) {
     int rc = 0;
@@ -2105,6 +2301,7 @@ test_process_mbe_frame_hard_p25p2_right_stages_audio(void) {
 
     DSD_MEMSET(&opts, 0, sizeof(opts));
     opts.floating_point = 1;
+    opts.dmr_mono = 1;
     opts.dmr_stereo = 1;
     init_mbe_state(&state, &cur, &prev, &prev_enhanced, &cur2, &prev2, &prev_enhanced2);
     state.synctype = DSD_SYNC_P25P2_POS;
@@ -2198,6 +2395,8 @@ test_process_mbe_frame_hard_provoice_stages_audio(void) {
     int expected_errs = -1;
     int expected_errs2 = -1;
     mbe_process_result result;
+    char wav_path[1024];
+    SNDFILE* wav_out = create_wav_temp(wav_path, sizeof(wav_path), "provoice_stale_slot_wav");
 
     imbe7100_fr[0][3] = 1;
     imbe7100_fr[2][11] = 1;
@@ -2216,8 +2415,11 @@ test_process_mbe_frame_hard_provoice_stages_audio(void) {
 
     DSD_MEMSET(&opts, 0, sizeof(opts));
     opts.floating_point = 1;
+    opts.dmr_mono = 1;
+    opts.wav_out_f = wav_out;
     init_mbe_state(&state, &cur, &prev, &prev_enhanced, &cur2, &prev2, &prev_enhanced2);
     state.synctype = DSD_SYNC_PROVOICE_POS;
+    state.currentslot = 1;
 
     processMbeFrame(&opts, &state, imbe_fr, ambe_fr, imbe7100_fr);
 
@@ -2228,6 +2430,14 @@ test_process_mbe_frame_hard_provoice_stages_audio(void) {
     rc |= expect_eq_mem("hard-provoice staged left", state.f_l, expected_audio, sizeof(expected_audio));
     rc |= expect_eq_int("hard-provoice debug errors", state.debug_audio_errors, state.errs2);
     rc |= expect_eq_int("hard-provoice keeps p25 history length", state.p25_p1_voice_err_hist_len, 0);
+    rc |= expect_eq_int("hard-provoice stale-slot wav output opened", wav_out != NULL, 1);
+    if (wav_out) {
+        sf_write_sync(wav_out);
+        rc |= expect_eq_int("hard-provoice stale-slot wav frames", (int)sf_seek(wav_out, 0, SEEK_END), 160);
+        rc |= expect_eq_int("hard-provoice stale-slot wav close", sf_close(wav_out), 0);
+        (void)remove(wav_path);
+        opts.wav_out_f = NULL;
+    }
 
     return rc;
 }
@@ -2331,6 +2541,11 @@ test_process_mbe_frame_dstar_ignores_stale_stereo_slot_state(void) {
 
     processMbeFrame(&opts, &state, NULL, ambe_fr, NULL);
 
+    dsd_call_snapshot call;
+    rc |= expect_eq_int("dstar-second canonical slot0", dsd_call_state_get(&state, 0U, &call), 1);
+    rc |= expect_eq_int("dstar-second canonical slot0 active", call.phase, DSD_CALL_PHASE_ACTIVE);
+    rc |= expect_eq_int("dstar-second canonical slot0 media", call.media_active, 1);
+    rc |= expect_eq_int("dstar-second no phantom slot1", dsd_call_state_get(&state, 1U, &call), 0);
     rc |= expect_eq_int("dstar-second errs", state.errs, expected_errs);
     rc |= expect_eq_int("dstar-second errs2", state.errs2, expected_errs2);
     rc |= expect_eq_int("dstar-second status", strcmp(state.err_str, expected_err_str), 0);
@@ -2348,6 +2563,128 @@ test_process_mbe_frame_dstar_ignores_stale_stereo_slot_state(void) {
         opts.wav_out_f = NULL;
     }
 
+    dsd_state_ext_free_all(&state);
+    return rc;
+}
+
+static int
+test_process_mbe_frame_media_protocol_lifecycle(void) {
+    int rc = 0;
+    static dsd_opts opts;
+    static dsd_state state;
+    static mbe_parms cur;
+    static mbe_parms prev;
+    static mbe_parms prev_enhanced;
+    static mbe_parms cur2;
+    static mbe_parms prev2;
+    static mbe_parms prev_enhanced2;
+    char imbe_fr[8][23] = {{0}};
+    char ambe_fr[4][24] = {{0}};
+    dsd_call_snapshot call;
+
+    DSD_MEMSET(&opts, 0, sizeof(opts));
+    opts.floating_point = 1;
+
+    static const int dstar_header_synctypes[] = {DSD_SYNC_DSTAR_HD_POS, DSD_SYNC_DSTAR_HD_NEG};
+    for (size_t i = 0U; i < sizeof(dstar_header_synctypes) / sizeof(dstar_header_synctypes[0]); i++) {
+        init_mbe_state(&state, &cur, &prev, &prev_enhanced, &cur2, &prev2, &prev_enhanced2);
+        state.synctype = dstar_header_synctypes[i];
+        processMbeFrame(&opts, &state, NULL, ambe_fr, NULL);
+        rc |= expect_eq_int("dstar-header canonical call", dsd_call_state_get(&state, 0U, &call), 1);
+        rc |= expect_eq_int("dstar-header protocol", call.protocol, dstar_header_synctypes[i]);
+        rc |= expect_eq_int("dstar-header media", call.media_active, 1);
+    }
+
+    init_mbe_state(&state, &cur, &prev, &prev_enhanced, &cur2, &prev2, &prev_enhanced2);
+    dsd_call_observation dstar_data = {
+        .protocol = DSD_SYNC_DSTAR_HD_POS,
+        .slot = 0U,
+        .kind = DSD_CALL_KIND_DATA,
+    };
+    DSD_SNPRINTF(dstar_data.source_text, sizeof(dstar_data.source_text), "%s", "N0CALL /TST");
+    DSD_SNPRINTF(dstar_data.target_text, sizeof(dstar_data.target_text), "%s", "CQCQCQ");
+    (void)dsd_call_state_observe(&state, &dstar_data, DSD_CALL_BOUNDARY_BEGIN);
+    rc |= expect_eq_int("dstar-data initial call", dsd_call_state_get(&state, 0U, &call), 1);
+    const uint64_t dstar_data_epoch = call.epoch;
+    state.synctype = DSD_SYNC_DSTAR_HD_POS;
+    processMbeFrame(&opts, &state, NULL, ambe_fr, NULL);
+    rc |= expect_eq_int("dstar-data retained call", dsd_call_state_get(&state, 0U, &call), 1);
+    rc |= expect_eq_int("dstar-data retained epoch", call.epoch == dstar_data_epoch, 1);
+    rc |= expect_eq_int("dstar-data retained kind", call.kind, DSD_CALL_KIND_DATA);
+    rc |= expect_eq_int("dstar-data retained source", strcmp(call.source_text, "N0CALL /TST"), 0);
+    rc |= expect_eq_int("dstar-data retained target", strcmp(call.target_text, "CQCQCQ"), 0);
+
+    static const int clear_dpmr_synctypes[] = {DSD_SYNC_DPMR_FS1_POS, DSD_SYNC_DPMR_FS4_NEG};
+    for (size_t i = 0U; i < sizeof(clear_dpmr_synctypes) / sizeof(clear_dpmr_synctypes[0]); i++) {
+        init_mbe_state(&state, &cur, &prev, &prev_enhanced, &cur2, &prev2, &prev_enhanced2);
+        const dsd_call_observation observation = {
+            .protocol = clear_dpmr_synctypes[i],
+            .slot = 0U,
+            .kind = DSD_CALL_KIND_VOICE,
+        };
+        (void)dsd_call_state_observe(&state, &observation, DSD_CALL_BOUNDARY_BEGIN);
+        rc |= expect_eq_int("clear-dpmr initial call", dsd_call_state_get(&state, 0U, &call), 1);
+        const uint64_t epoch = call.epoch;
+        state.synctype = clear_dpmr_synctypes[i];
+        processMbeFrame(&opts, &state, NULL, ambe_fr, NULL);
+        rc |= expect_eq_int("clear-dpmr retained call", dsd_call_state_get(&state, 0U, &call), 1);
+        rc |= expect_eq_int("clear-dpmr retained epoch", call.epoch == epoch, 1);
+        rc |= expect_eq_int("clear-dpmr retained protocol", call.protocol, clear_dpmr_synctypes[i]);
+        rc |= expect_eq_int("clear-dpmr media", call.media_active, 1);
+    }
+
+    init_mbe_state(&state, &cur, &prev, &prev_enhanced, &cur2, &prev2, &prev_enhanced2);
+    const dsd_call_observation stale_dmr = {
+        .protocol = DSD_SYNC_DMR_BS_VOICE_POS,
+        .slot = 0U,
+        .kind = DSD_CALL_KIND_GROUP_VOICE,
+        .ota_target_id = 1234U,
+    };
+    (void)dsd_call_state_observe(&state, &stale_dmr, DSD_CALL_BOUNDARY_BEGIN);
+    rc |= expect_eq_int("cross-protocol stale call", dsd_call_state_get(&state, 0U, &call), 1);
+    const uint64_t stale_epoch = call.epoch;
+    state.synctype = DSD_SYNC_DSTAR_VOICE_POS;
+    processMbeFrame(&opts, &state, NULL, ambe_fr, NULL);
+    rc |= expect_eq_int("cross-protocol replacement", dsd_call_state_get(&state, 0U, &call), 1);
+    rc |= expect_eq_int("cross-protocol replacement epoch", call.epoch != stale_epoch, 1);
+    rc |= expect_eq_int("cross-protocol replacement protocol", call.protocol, DSD_SYNC_DSTAR_VOICE_POS);
+    rc |= expect_eq_int("cross-protocol replacement target", (int)call.ota_target_id, 0);
+    rc |= expect_eq_int("cross-protocol replacement media", call.media_active, 1);
+
+    static const struct {
+        int call_protocol;
+        int decoder_protocol;
+    } decoder_overrides[] = {
+        {DSD_SYNC_YSF_POS, DSD_SYNC_NXDN_POS},
+        {DSD_SYNC_YSF_NEG, DSD_SYNC_P25P1_POS},
+        {DSD_SYNC_DPMR_FS2_POS, DSD_SYNC_NXDN_POS},
+    };
+
+    for (size_t i = 0U; i < sizeof(decoder_overrides) / sizeof(decoder_overrides[0]); i++) {
+        init_mbe_state(&state, &cur, &prev, &prev_enhanced, &cur2, &prev2, &prev_enhanced2);
+        const dsd_call_observation observation = {
+            .protocol = decoder_overrides[i].call_protocol,
+            .slot = 0U,
+            .kind = DSD_CALL_KIND_GROUP_VOICE,
+            .ota_target_id = 4321U,
+        };
+        (void)dsd_call_state_observe(&state, &observation, DSD_CALL_BOUNDARY_BEGIN);
+        rc |= expect_eq_int("decoder-override initial call", dsd_call_state_get(&state, 0U, &call), 1);
+        const uint64_t epoch = call.epoch;
+        state.synctype = decoder_overrides[i].decoder_protocol;
+        if (DSD_SYNC_IS_P25P1(state.synctype)) {
+            processMbeFrame(&opts, &state, imbe_fr, NULL, NULL);
+        } else {
+            processMbeFrame(&opts, &state, NULL, ambe_fr, NULL);
+        }
+        rc |= expect_eq_int("decoder-override retained call", dsd_call_state_get(&state, 0U, &call), 1);
+        rc |= expect_eq_int("decoder-override retained epoch", call.epoch == epoch, 1);
+        rc |= expect_eq_int("decoder-override retained protocol", call.protocol, decoder_overrides[i].call_protocol);
+        rc |= expect_eq_int("decoder-override retained target", (int)call.ota_target_id, 4321);
+        rc |= expect_eq_int("decoder-override media", call.media_active, 1);
+    }
+
+    dsd_state_ext_free_all(&state);
     return rc;
 }
 
@@ -2485,11 +2822,13 @@ main(void) {
     rc |= test_process_mbe_frame_nxdn_cipher3_uses_aes_voice_offset();
     rc |= test_process_mbe_frame_hard_dstar_stages_audio();
     rc |= test_process_mbe_frame_hard_dmr_left_stages_audio();
+    rc |= test_process_mbe_frame_trunked_mono_bs_fallback_gates_to_granted_slot();
     rc |= test_process_mbe_frame_dmr_rc4_transforms_left_and_right_slots();
     rc |= test_process_mbe_frame_dmr_reverse_mute_preserves_p25_override();
     rc |= test_process_mbe_frame_dmr_missing_alg_key_unmutes_slots();
     rc |= test_process_mbe_frame_dmr_post_decode_gates_override_enc_flags();
     rc |= test_process_mbe_frame_dmr_aes_stream_advances_slot_state();
+    rc |= test_process_mbe_frame_activation_gate_and_wide_kid();
     rc |= test_process_mbe_frame_hard_p25p2_right_stages_audio();
     rc |= test_play_mbe_files_processes_imbe_ambe_and_dstar_records();
     rc |= test_process_mbe_frame_p25p1_updates_error_history();
@@ -2497,6 +2836,7 @@ main(void) {
     rc |= test_process_mbe_frame_hard_provoice_stages_audio();
     rc |= test_process_mbe_frame_ambe2_routes_slot2_error_state();
     rc |= test_process_mbe_frame_dstar_ignores_stale_stereo_slot_state();
+    rc |= test_process_mbe_frame_media_protocol_lifecycle();
     rc |= test_process_mbe_frame_x2_slot2_uses_right_error_state_and_stages_audio();
 
     if (rc == 0) {

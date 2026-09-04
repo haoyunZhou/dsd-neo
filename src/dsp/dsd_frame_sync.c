@@ -33,15 +33,18 @@
 #include <dsd-neo/dsp/dmr_sync.h>
 #include <dsd-neo/dsp/frame_sync.h>
 #include <dsd-neo/dsp/symbol.h>
+#include <dsd-neo/dsp/symbol_timing_debug.h>
 #include <dsd-neo/dsp/sync_calibration.h>
 #include <dsd-neo/dsp/sync_hamming.h>
 #include <dsd-neo/platform/atomic_compat.h>
 #include <dsd-neo/runtime/colors.h>
 #include <dsd-neo/runtime/config.h>
+#include <dsd-neo/runtime/decode_mode.h>
 #include <dsd-neo/runtime/exitflag.h>
 #include <dsd-neo/runtime/frame_sync_hooks.h>
 #include <dsd-neo/runtime/shutdown.h>
 #include <dsd-neo/runtime/telemetry.h>
+#include <limits.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -66,24 +69,6 @@
 enum {
     FRAME_SYNC_HISTORY_CAPACITY = 128,
 };
-
-typedef struct {
-    int symbol_rate_hz;
-    int levels;
-} frame_sync_sps_profile;
-
-/* Keep this order in sync with dsd_state::sps_hunt_idx. */
-static const frame_sync_sps_profile k_frame_sync_sps_profiles[DSD_FRAME_SYNC_SPS_PROFILE_COUNT] = {
-    {4800, 4}, {2400, 4}, {9600, 2}, {6000, 4}, {4800, 2},
-};
-
-static const frame_sync_sps_profile*
-frame_sync_sps_profile_for_index(int index) {
-    if (index < 0 || index >= DSD_FRAME_SYNC_SPS_PROFILE_COUNT) {
-        return &k_frame_sync_sps_profiles[DSD_FRAME_SYNC_SPS_PROFILE_4800_4];
-    }
-    return &k_frame_sync_sps_profiles[index];
-}
 
 static int
 frame_sync_opts_has_4800_four_level_mode(const dsd_opts* opts) {
@@ -142,19 +127,10 @@ rtl_profile_for_sps_profile(const dsd_opts* opts, const dsd_state* state, const 
     if (!profile) {
         return DSD_RTL_STREAM_CHANNEL_PROFILE_WIDE;
     }
-    if (profile->symbol_rate_hz == 2400 || (profile->symbol_rate_hz == 4800 && profile->levels == 2)) {
-        return DSD_RTL_STREAM_CHANNEL_PROFILE_6K25;
-    }
-    if (profile->symbol_rate_hz == 9600) {
-        return DSD_RTL_STREAM_CHANNEL_PROFILE_PROVOICE;
-    }
-    if (state && state->rf_mod == 1) {
-        return DSD_RTL_STREAM_CHANNEL_PROFILE_P25_CQPSK;
-    }
-    if (profile->symbol_rate_hz == 6000 || (state && state->rf_mod == 2) || dsd_opts_uses_wide_4800_profile(opts)) {
-        return DSD_RTL_STREAM_CHANNEL_PROFILE_12K5;
-    }
-    return DSD_RTL_STREAM_CHANNEL_PROFILE_P25_C4FM;
+    /* Shared with the operator-facing modulation control, which reaches the same
+     * front end by a different route: two copies of this drift, and then the
+     * filter changes under the user every time the hunt re-runs. */
+    return dsd_rtl_channel_profile_for(opts, profile->symbol_rate_hz, profile->levels, state ? state->rf_mod : 0);
 }
 
 #ifdef DSD_NEO_TEST_HOOKS
@@ -228,7 +204,7 @@ enum { DSD_FRAME_SYNC_UI_PUBLISH_INTERVAL_MS = 50 };
 
 static void
 frame_sync_publish_ui_throttled(const dsd_opts* opts, const dsd_state* state) {
-    if (!dsd_opts_frontend_active(opts)) {
+    if (!dsd_telemetry_is_active()) {
         return;
     }
 
@@ -618,7 +594,27 @@ frame_sync_accept_p25p1(frame_sync_match_ctx* ctx, int synctype, const char* lab
                         frame_sync_p25_center_mode_t center_mode) {
     const dsd_opts* opts = ctx->opts;
     dsd_state* state = ctx->state;
+#ifdef USE_RADIO
+    /* Hold the CQPSK chain the way P25p2 does, without claiming it: a P25p1 sync word is the
+     * same on both modulations, so it can only re-assert a decision already made, never make
+     * one. Re-pushing on every sync corrects front-end drift left by an engine retune. */
+    if (!opts->mod_cli_lock && state->rf_mod == 1) {
+        rtl_maybe_apply_active_demod_profile(opts, state);
+    }
+#endif
     frame_sync_set_basic_lock(ctx);
+    /* Open the span this frame owns, or close any span still standing, according to which chain
+     * carried the sync. Only CQPSK closes it: there the NID is sliced by the QPSK chain and the
+     * NXDN matcher's blend is the wideband level tracker that chain leans on. GFSK opens it like
+     * C4FM does, because a P25p1 sync arriving under rf_mod 2 means the modulation votes have
+     * flapped off a C4FM signal -- which the loose NXDN window is itself what does here -- and
+     * that is precisely when the frame behind the sync most needs the profile to itself (#388). */
+    if (state->rf_mod == 1) {
+        state->p25_p1_c4fm_frame_valid = 0;
+    } else {
+        state->p25_p1_c4fm_frame_symbolcnt = state->symbolcnt;
+        state->p25_p1_c4fm_frame_valid = 1;
+    }
     state->dmrburstR = 17;
     state->payload_algidR = 0;
     state->dmr_stereo = 1;
@@ -842,6 +838,19 @@ frame_sync_try_p25p2(frame_sync_match_ctx* ctx) {
 #endif
 }
 
+/**
+ * @brief Record that an FS2 sync just opened a dPMR frame on the 2400/4 profile.
+ *
+ * The stamp is what dsd_frame_sync_suppress_nxdn48_sync() measures the frame's span from, so it
+ * is taken on every accepted FS2 -- including one arriving inside the previous frame's span,
+ * which re-arms the window rather than extending it indefinitely.
+ */
+static void
+frame_sync_note_dpmr_fs2_frame(dsd_state* state) {
+    state->dpmr_fs2_frame_symbolcnt = state->symbolcnt;
+    state->dpmr_fs2_frame_valid = 1;
+}
+
 static int
 frame_sync_try_dpmr(frame_sync_match_ctx* ctx) {
     const dsd_opts* opts = ctx->opts;
@@ -853,6 +862,7 @@ frame_sync_try_dpmr(frame_sync_match_ctx* ctx) {
 
     if (opts->inverted_dpmr == 0 && strcmp(ctx->synctest12, DPMR_FRAME_SYNC_2) == 0) {
         frame_sync_set_basic_lock(ctx);
+        frame_sync_note_dpmr_fs2_frame(state);
         DSD_SNPRINTF(state->ftype, sizeof(state->ftype), "dPMR ");
         if (opts->errorbars == 1) {
             printFrameSync(opts, state, "+dPMR ", ctx->synctest_pos + 1, ctx->modulation);
@@ -864,6 +874,7 @@ frame_sync_try_dpmr(frame_sync_match_ctx* ctx) {
 
     if (opts->inverted_dpmr == 1 && strcmp(ctx->synctest12, INV_DPMR_FRAME_SYNC_2) == 0) {
         frame_sync_set_basic_lock(ctx);
+        frame_sync_note_dpmr_fs2_frame(state);
         DSD_SNPRINTF(state->ftype, sizeof(state->ftype), "dPMR ");
         if (opts->errorbars == 1) {
             printFrameSync(opts, state, "-dPMR ", ctx->synctest_pos + 1, ctx->modulation);
@@ -932,46 +943,86 @@ frame_sync_try_tetra(frame_sync_match_ctx* ctx) {
     return DSD_SYNC_NONE;
 }
 
-static int
-frame_sync_try_m17_preamble(frame_sync_match_ctx* ctx, int ham_pre, int ham_piv) {
-    const dsd_opts* opts = ctx->opts;
+/**
+ * @brief Latch an M17 preamble as a candidate rather than accepting it as a sync.
+ *
+ * M17's preamble is `31313131` -- a pure alternating run with no structure to check. Any signal
+ * that alternates at 4800 baud presents one: D-STAR's bit sync does, and so does noise on an
+ * open squelch. Accepting it as a sync therefore said nothing about the signal, while demanding
+ * more of it -- an exact marker, or two exact markers in a row -- did not discriminate either,
+ * because doubling an alternating run leaves an alternating run. What that rule did do was
+ * reject real M17, whose markers arrive with the odd symbol error, and M17 has no other way into
+ * its sync chain: everything downstream is gated on `lastsynctype` (issue #399).
+ *
+ * So a preamble is treated as what it is -- a hint that a sync word may be about to arrive --
+ * and the decision waits for the LSF or BERT word behind it, which is eight symbols of real
+ * structure. Nothing is printed, no lock is taken and no thresholds move here; a signal that
+ * never produces the sync word costs a lapsed candidate and nothing else.
+ */
+static void
+frame_sync_note_m17_pre_candidate(frame_sync_match_ctx* ctx, int ham_pre, int ham_piv) {
     dsd_state* state = ctx->state;
-    /* An 8-symbol one-error preamble is ambiguous with several 4800/4 sync prefixes.
-     * Keep the one-error tolerance in forced M17 mode, but require the exact marker
-     * when the full profile has other candidates. D-STAR starts with an exact M17
-     * marker, so require a second marker before accepting M17 when D-STAR is enabled. */
-    const int other_4800_candidate =
-        opts->frame_p25p1 == 1 || opts->frame_dmr == 1 || opts->frame_nxdn96 == 1 || opts->frame_ysf == 1;
-    const int max_hamming = other_4800_candidate ? 0 : 1;
-    const int require_repeated_marker = opts->frame_dstar == 1;
-    const int repeated_pre = !require_repeated_marker
-                             || (frame_sync_match_window_ready(ctx, 16)
-                                 && dsd_sync_hamming_distance(ctx->synctest16, M17_PRE, 8) <= max_hamming);
-    const int repeated_piv = !require_repeated_marker
-                             || (frame_sync_match_window_ready(ctx, 16)
-                                 && dsd_sync_hamming_distance(ctx->synctest16, M17_PIV, 8) <= max_hamming);
 
-    if (ham_pre <= max_hamming && repeated_pre) {
-        state->m17_polarity = 1;
-        printFrameSync(opts, state, "+M17 PREAMBLE", ctx->synctest_pos + 1, ctx->modulation);
-        frame_sync_set_basic_lock(ctx);
-        state->lastsynctype = DSD_SYNC_M17_PRE_POS;
-        dsd_sync_warm_start_thresholds_outer_only(opts, state, 8);
-        DSD_FPRINTF(stderr, "\n");
-        return DSD_SYNC_M17_PRE_POS;
+    if (ham_pre > 1 && ham_piv > 1) {
+        state->m17_pre_run = 0;
+        return;
     }
 
-    if (ham_piv <= max_hamming && repeated_piv) {
-        state->m17_polarity = 2;
-        printFrameSync(opts, state, "-M17 PREAMBLE", ctx->synctest_pos + 1, ctx->modulation);
-        frame_sync_set_basic_lock(ctx);
-        state->lastsynctype = DSD_SYNC_M17_PRE_NEG;
-        dsd_sync_warm_start_thresholds_outer_only(opts, state, 8);
-        DSD_FPRINTF(stderr, "\n");
-        return DSD_SYNC_M17_PRE_NEG;
+    /* One matching window is not a preamble. A preamble is 192 symbols of alternating outer
+     * rails, so every window across it matches -- at one polarity or the other, since the run
+     * reads as its own inversion one symbol over -- and a real transmission has some 180 of
+     * them to spare. Noise supplies a single window at this tolerance often enough to matter,
+     * and supplies eight in a row essentially never. Counting the run is what separates the two
+     * without asking any single window to be cleaner than real M17 delivers (#399). */
+    if (state->m17_pre_run < DSD_FRAME_SYNC_M17_PRE_RUN_SYMBOLS) {
+        state->m17_pre_run++;
+    }
+    if (state->m17_pre_run < DSD_FRAME_SYNC_M17_PRE_RUN_SYMBOLS) {
+        return;
     }
 
-    return DSD_SYNC_NONE;
+    /* The other half of what the old accept did here, and the half worth keeping: a run of
+     * symbols alternating between the outer rails is the best level reference M17 ever offers,
+     * and the sync word behind it cannot be sliced without it. Carrier is deliberately not
+     * raised and nothing is printed -- an alternating run is not yet a lock. */
+    state->offset = ctx->synctest_pos;
+    state->max = ((state->max) + ctx->lmax) / 2;
+    state->min = ((state->min) + ctx->lmin) / 2;
+    dsd_sync_warm_start_thresholds_outer_only(ctx->opts, state, 8);
+
+    state->m17_pre_candidate = (ham_pre <= 1) ? 1 : 2;
+    state->m17_pre_candidate_ttl = DSD_FRAME_SYNC_M17_CANDIDATE_TTL;
+}
+
+/** @brief Age a latched candidate by one evaluation, dropping it when it lapses. */
+static void
+frame_sync_age_m17_pre_candidate(dsd_state* state) {
+    if (state->m17_pre_candidate == 0) {
+        return;
+    }
+    if (state->m17_pre_candidate_ttl > 0) {
+        state->m17_pre_candidate_ttl--;
+    }
+    if (state->m17_pre_candidate_ttl == 0) {
+        state->m17_pre_candidate = 0;
+    }
+}
+
+/**
+ * @brief Whether the M17 chain in progress has produced anything that checked out.
+ *
+ * Frame sync reads the protocol layer's evidence rather than re-deriving any of it. A chain that
+ * has proved nothing is not allowed to keep extending itself frame after frame, which is how a
+ * single false sync used to occupy the profile for the rest of a capture (#399).
+ *
+ * A pending weak streak counts, not just full confirmation: a real stream whose LSF arrived too
+ * damaged to clear its CRC rebuilds the link setup from the LICH carried by six consecutive
+ * stream frames, and demanding confirmation before the second of them would stop the chain that
+ * produces it. One clean LICH is enough to earn the next frame; noise does not supply even that.
+ */
+static int
+frame_sync_m17_chain_has_evidence(const dsd_state* state) {
+    return state->m17_confirmed != 0 || state->m17_confirm_weak_streak != 0;
 }
 
 static int
@@ -987,7 +1038,8 @@ frame_sync_try_m17_eot(frame_sync_match_ctx* ctx, int ham_eot, int ham_eot_inv, 
     const dsd_opts* opts = ctx->opts;
     dsd_state* state = ctx->state;
     const int ham = is_inverted ? ham_eot_inv : ham_eot;
-    if (ham > 1 || !frame_sync_m17_eot_allowed_after(state->lastsynctype)) {
+    if (ham > 1 || !frame_sync_m17_eot_allowed_after(state->lastsynctype)
+        || !frame_sync_m17_chain_has_evidence(state)) {
         return DSD_SYNC_NONE;
     }
 
@@ -1010,7 +1062,8 @@ frame_sync_try_m17_packet(frame_sync_match_ctx* ctx, int ham_pkt, int ham_brt, i
     dsd_state* state = ctx->state;
 
     if (ham_pkt <= 1 && !is_inverted) {
-        if (state->lastsynctype != DSD_SYNC_M17_LSF_POS && state->lastsynctype != DSD_SYNC_M17_PKT_POS) {
+        if (state->lastsynctype != DSD_SYNC_M17_LSF_POS
+            && !(state->lastsynctype == DSD_SYNC_M17_PKT_POS && frame_sync_m17_chain_has_evidence(state))) {
             return DSD_SYNC_NONE;
         }
         printFrameSync(opts, state, "+M17 PKT", ctx->synctest_pos + 1, ctx->modulation);
@@ -1021,7 +1074,8 @@ frame_sync_try_m17_packet(frame_sync_match_ctx* ctx, int ham_pkt, int ham_brt, i
     }
 
     if (ham_brt <= 1 && is_inverted) {
-        if (state->lastsynctype != DSD_SYNC_M17_LSF_NEG && state->lastsynctype != DSD_SYNC_M17_PKT_NEG) {
+        if (state->lastsynctype != DSD_SYNC_M17_LSF_NEG
+            && !(state->lastsynctype == DSD_SYNC_M17_PKT_NEG && frame_sync_m17_chain_has_evidence(state))) {
             return DSD_SYNC_NONE;
         }
         printFrameSync(opts, state, "-M17 PKT", ctx->synctest_pos + 1, ctx->modulation);
@@ -1040,7 +1094,8 @@ frame_sync_try_m17_stream(frame_sync_match_ctx* ctx, int ham_str, int ham_lsf, i
     dsd_state* state = ctx->state;
 
     if (ham_str <= 1 && !is_inverted) {
-        if (state->lastsynctype != DSD_SYNC_M17_LSF_POS && state->lastsynctype != DSD_SYNC_M17_STR_POS) {
+        if (state->lastsynctype != DSD_SYNC_M17_LSF_POS
+            && !(state->lastsynctype == DSD_SYNC_M17_STR_POS && frame_sync_m17_chain_has_evidence(state))) {
             return DSD_SYNC_NONE;
         }
         printFrameSync(opts, state, "+M17 STR", ctx->synctest_pos + 1, ctx->modulation);
@@ -1051,7 +1106,8 @@ frame_sync_try_m17_stream(frame_sync_match_ctx* ctx, int ham_str, int ham_lsf, i
     }
 
     if (ham_lsf <= 1 && is_inverted) {
-        if (state->lastsynctype != DSD_SYNC_M17_LSF_NEG && state->lastsynctype != DSD_SYNC_M17_STR_NEG) {
+        if (state->lastsynctype != DSD_SYNC_M17_LSF_NEG
+            && !(state->lastsynctype == DSD_SYNC_M17_STR_NEG && frame_sync_m17_chain_has_evidence(state))) {
             return DSD_SYNC_NONE;
         }
         printFrameSync(opts, state, "-M17 STR", ctx->synctest_pos + 1, ctx->modulation);
@@ -1073,27 +1129,28 @@ frame_sync_accept_m17(frame_sync_match_ctx* ctx, const char* label, int synctype
     return synctype;
 }
 
-static int
-frame_sync_after_m17_preamble(const dsd_state* state, int is_inverted) {
-    return (!is_inverted && state->lastsynctype == DSD_SYNC_M17_PRE_POS)
-           || (is_inverted && state->lastsynctype == DSD_SYNC_M17_PRE_NEG);
+/**
+ * @brief Spend a candidate on the sync word that confirmed it, at the polarity that word named.
+ */
+static void
+frame_sync_consume_m17_pre_candidate(dsd_state* state, int polarity) {
+    state->m17_polarity = (uint8_t)polarity;
+    state->m17_pre_candidate = 0;
+    state->m17_pre_candidate_ttl = 0;
 }
 
 static int
 frame_sync_after_m17_bert(const dsd_state* state, int is_inverted) {
+    /* A BERT frame carries no CRC and its sync word is eight symbols, so one accepted on noise
+     * used to hand the next frame the same permission and the chain sustained itself for the
+     * rest of the capture, crowding out every other protocol on the profile. Continuing it
+     * costs a PRBS9 lock -- the one thing a real bit-error-rate test has and noise does not.
+     * The session's first frame still arrives on a preamble candidate (#399). */
+    if (state->m17_bert_locked == 0) {
+        return 0;
+    }
     return (!is_inverted && state->lastsynctype == DSD_SYNC_M17_BRT_POS)
            || (is_inverted && state->lastsynctype == DSD_SYNC_M17_BRT_NEG);
-}
-
-static int
-frame_sync_try_m17_lsf_after_preamble(frame_sync_match_ctx* ctx, int ham_lsf, int ham_str, int is_inverted) {
-    const int hamming = is_inverted ? ham_str : ham_lsf;
-    if (hamming > 1) {
-        return DSD_SYNC_NONE;
-    }
-
-    return is_inverted ? frame_sync_accept_m17(ctx, "-M17 LSF", DSD_SYNC_M17_LSF_NEG)
-                       : frame_sync_accept_m17(ctx, "+M17 LSF", DSD_SYNC_M17_LSF_POS);
 }
 
 static int
@@ -1110,29 +1167,65 @@ frame_sync_try_m17_bert_after_context(frame_sync_match_ctx* ctx, int ham_brt, in
 static int
 frame_sync_try_m17_lsf_or_bert(frame_sync_match_ctx* ctx, int ham_lsf, int ham_str, int ham_brt, int ham_pkt,
                                int is_inverted) {
-    const dsd_state* state = ctx->state;
-    const int after_preamble = frame_sync_after_m17_preamble(state, is_inverted);
-    const int after_bert = frame_sync_after_m17_bert(state, is_inverted);
-    if (!after_preamble && !after_bert) {
-        return DSD_SYNC_NONE;
-    }
+    dsd_state* state = ctx->state;
 
-    if (after_preamble) {
-        const int lsf_sync = frame_sync_try_m17_lsf_after_preamble(ctx, ham_lsf, ham_str, is_inverted);
-        if (lsf_sync != DSD_SYNC_NONE) {
-            return lsf_sync;
+    if (state->m17_pre_candidate != 0) {
+        /* An alternating run is symmetric: read one symbol later, the marker is its own
+         * inversion, so a preamble can never say which polarity the transmission has -- the old
+         * code's answer was whichever phase it happened to accept on. The sync word behind it
+         * can say, because M17_LSF and M17_STR are not shifts of each other. Try both readings
+         * and let the one that matches name the polarity the rest of the chain locks to. */
+        for (int pass = 0; pass < 2; pass++) {
+            const int inverted = (ctx->opts->inverted_m17 == 0) ? pass : !pass;
+            if ((inverted ? ham_str : ham_lsf) <= 1) {
+                frame_sync_consume_m17_pre_candidate(state, inverted ? 2 : 1);
+                return inverted ? frame_sync_accept_m17(ctx, "-M17 LSF", DSD_SYNC_M17_LSF_NEG)
+                                : frame_sync_accept_m17(ctx, "+M17 LSF", DSD_SYNC_M17_LSF_POS);
+            }
+        }
+        for (int pass = 0; pass < 2; pass++) {
+            const int inverted = (ctx->opts->inverted_m17 == 0) ? pass : !pass;
+            if ((inverted ? ham_pkt : ham_brt) <= 1) {
+                frame_sync_consume_m17_pre_candidate(state, inverted ? 2 : 1);
+                return inverted ? frame_sync_accept_m17(ctx, "-M17 BRT", DSD_SYNC_M17_BRT_NEG)
+                                : frame_sync_accept_m17(ctx, "+M17 BRT", DSD_SYNC_M17_BRT_POS);
+            }
         }
     }
 
-    return frame_sync_try_m17_bert_after_context(ctx, ham_brt, ham_pkt, is_inverted);
+    /* A BERT session repeats its own sync word without a fresh preamble between frames. */
+    if (frame_sync_after_m17_bert(state, is_inverted)) {
+        return frame_sync_try_m17_bert_after_context(ctx, ham_brt, ham_pkt, is_inverted);
+    }
+
+    return DSD_SYNC_NONE;
 }
 
 static int
 frame_sync_try_m17(frame_sync_match_ctx* ctx) {
     const dsd_opts* opts = ctx->opts;
-    const dsd_state* state = ctx->state;
+    dsd_state* state = ctx->state;
     if (opts->frame_m17 != 1 || !frame_sync_match_profile_active(ctx, DSD_FRAME_SYNC_SPS_PROFILE_4800_4)
         || !frame_sync_match_window_ready(ctx, 8)) {
+        return DSD_SYNC_NONE;
+    }
+
+    /* The frame an accepted P25p1 sync opened is not this matcher's to read either. An M17
+     * preamble is an alternating run, which P25 payload supplies readily, and the candidate it
+     * latches is spendable on any sync word within one error -- so the run is dropped and a
+     * candidate already in hand is aged out rather than left to spend the moment the span
+     * lapses. Unlike the NXDN window below, this one stands down completely: what it would
+     * contribute is not a blend but a hard rewrite of every threshold from eight symbols of
+     * whatever is in hand, which is worth having from a real preamble and worth nothing from
+     * P25 payload (#388).
+     *
+     * A transmission the hunt has just stepped away from supplies the same thing: 2400-baud
+     * payload sliced at 4800 is as ready a source of alternating runs as P25's is, and it is
+     * still on air (#445). */
+    if (dsd_frame_sync_suppress_4800_4_for_p25p1_frame(opts, state)
+        || dsd_frame_sync_suppress_4800_4_for_2400_4_transmission(opts, state)) {
+        state->m17_pre_run = 0;
+        frame_sync_age_m17_pre_candidate(state);
         return DSD_SYNC_NONE;
     }
 
@@ -1145,15 +1238,19 @@ frame_sync_try_m17(frame_sync_match_ctx* ctx) {
     int ham_eot = dsd_sync_hamming_distance(ctx->synctest8, M17_EOT, 8);
     int ham_eot_inv = dsd_sync_hamming_distance(ctx->synctest8, M17_EOT_INV, 8);
     int is_inverted = opts->inverted_m17;
-    if (!opts->inverted_m17 && state->m17_polarity == 2) {
-        is_inverted = 1;
+    if (!opts->inverted_m17) {
+        /* Before any frame has been accepted the polarity of the run in hand is all there is to
+         * go on, so a pending candidate speaks for it. */
+        const int polarity = state->m17_polarity != 0 ? state->m17_polarity : state->m17_pre_candidate;
+        if (polarity == 2) {
+            is_inverted = 1;
+        }
     }
 
-    int sync_type = frame_sync_try_m17_preamble(ctx, ham_pre, ham_piv);
-    if (sync_type != DSD_SYNC_NONE) {
-        return sync_type;
-    }
-    sync_type = frame_sync_try_m17_eot(ctx, ham_eot, ham_eot_inv, is_inverted);
+    frame_sync_age_m17_pre_candidate(state);
+    frame_sync_note_m17_pre_candidate(ctx, ham_pre, ham_piv);
+
+    int sync_type = frame_sync_try_m17_eot(ctx, ham_eot, ham_eot_inv, is_inverted);
     if (sync_type != DSD_SYNC_NONE) {
         return sync_type;
     }
@@ -1385,6 +1482,25 @@ frame_sync_try_dmr_dm_ts2_voice(frame_sync_match_ctx* ctx) {
 }
 
 static int
+frame_sync_try_dmr_rc_data(frame_sync_match_ctx* ctx) {
+    dsd_opts* opts = ctx->opts;
+    dsd_state* state = ctx->state;
+    /* The RC sync has no voice/data complement partner: its symbol-wise
+     * complement is the ETSI-reserved pattern, so it maps to RC only when the
+     * input polarity is inverted and is never claimed at normal polarity. */
+    const char* pattern = (opts->inverted_dmr == 0) ? DMR_MS_RC_SYNC : DMR_MS_RC_SYNC_INV;
+    if (strcmp(ctx->synctest, pattern) != 0) {
+        return DSD_SYNC_NONE;
+    }
+
+    frame_sync_prepare_dmr_sync(ctx);
+    DSD_SNPRINTF(state->ftype, sizeof(state->ftype), "DMR RC");
+    state->lastsynctype = DSD_SYNC_DMR_RC_DATA;
+    dmr_resample_on_sync(opts, state);
+    return DSD_SYNC_DMR_RC_DATA;
+}
+
+static int
 frame_sync_try_dmr(frame_sync_match_ctx* ctx) {
     if (ctx->opts->frame_dmr != 1 || !frame_sync_match_profile_active(ctx, DSD_FRAME_SYNC_SPS_PROFILE_4800_4)
         || !frame_sync_match_window_ready(ctx, 24)) {
@@ -1419,7 +1535,11 @@ frame_sync_try_dmr(frame_sync_match_ctx* ctx) {
     if (sync_type != DSD_SYNC_NONE) {
         return sync_type;
     }
-    return frame_sync_try_dmr_dm_ts2_voice(ctx);
+    sync_type = frame_sync_try_dmr_dm_ts2_voice(ctx);
+    if (sync_type != DSD_SYNC_NONE) {
+        return sync_type;
+    }
+    return frame_sync_try_dmr_rc_data(ctx);
 }
 
 static int
@@ -1577,9 +1697,12 @@ frame_sync_try_nxdn(frame_sync_match_ctx* ctx) {
         /* Symbol captures carry no rate metadata, so an enabled variant must be unambiguous. */
         nxdn_profile_enabled = (opts->frame_nxdn48 == 1) != (opts->frame_nxdn96 == 1);
     } else {
+        /* The 2400/4 term yields to dPMR outright: that is the profile the two share, and the
+         * frame a 12-symbol FS2 opened is not this matcher's to re-open (#374). */
         nxdn_profile_enabled =
             (opts->frame_nxdn96 == 1 && frame_sync_match_profile_active(ctx, DSD_FRAME_SYNC_SPS_PROFILE_4800_4))
-            || (opts->frame_nxdn48 == 1 && frame_sync_match_profile_active(ctx, DSD_FRAME_SYNC_SPS_PROFILE_2400_4));
+            || (opts->frame_nxdn48 == 1 && frame_sync_match_profile_active(ctx, DSD_FRAME_SYNC_SPS_PROFILE_2400_4)
+                && !dsd_frame_sync_suppress_nxdn48_sync(opts, state));
     }
     if (!nxdn_profile_enabled || !frame_sync_match_window_ready(ctx, 10)) {
         return DSD_SYNC_NONE;
@@ -1590,9 +1713,30 @@ frame_sync_try_nxdn(frame_sync_match_ctx* ctx) {
         return DSD_SYNC_NONE;
     }
 
-    state->offset = ctx->synctest_pos;
     state->max = ((state->max) + ctx->lmax) / 2;
     state->min = ((state->min) + ctx->lmin) / 2;
+
+    /* 4800/4 is the one profile where this matcher cannot simply stand down inside the frame it
+     * is intruding on. The blend above is the wideband level estimate the other protocols there
+     * lean on -- withdraw it for the span and the CQPSK voice capture stops decoding its HDU
+     * altogether -- so what the span withholds is the sync, not the levels. Refusing here rather
+     * than at the profile gate keeps the estimate flowing while denying the accept everything it
+     * costs P25p1: the symbols the handler would read, a slicer warm-started from P25 payload,
+     * the control-channel timestamp, and the lastsynctype that keeps use_symbol()'s C4FM
+     * threshold tracker engaged between one P25p1 sync and the next (#388). The offset is left
+     * alone for the same reason -- inside this span it belongs to the frame P25p1 opened.
+     *
+     * The second span withholds it for a transmission proved on 2400/4 that the hunt has since
+     * stepped off, which this matcher would otherwise read at twice its rate and accept as
+     * NXDN96 (#445). The profile term above is what keeps that guard off the NXDN48 arm on
+     * 2400/4: the transmission it protects is the one it must never mute. */
+    if (frame_sync_match_profile_active(ctx, DSD_FRAME_SYNC_SPS_PROFILE_4800_4)
+        && (dsd_frame_sync_suppress_4800_4_for_p25p1_frame(opts, state)
+            || dsd_frame_sync_suppress_4800_4_for_2400_4_transmission(opts, state))) {
+        return DSD_SYNC_NONE;
+    }
+
+    state->offset = ctx->synctest_pos;
     if (state->lastsynctype == synctype) {
         frame_sync_note_cc_sync(ctx);
         dsd_sync_warm_start_thresholds_outer_only(opts, state, 10);
@@ -1680,7 +1824,7 @@ frame_sync_try_provoice_conventional(frame_sync_match_ctx* ctx) {
 #endif
 
 static int
-frame_sync_try_protocol_matches(frame_sync_match_ctx* ctx) {
+frame_sync_try_protocol_matches_inner(frame_sync_match_ctx* ctx) {
     int sync_type = frame_sync_try_p25p1(ctx);
     if (sync_type != DSD_SYNC_NONE) {
         return sync_type;
@@ -1737,6 +1881,22 @@ frame_sync_try_protocol_matches(frame_sync_match_ctx* ctx) {
     }
 
     return frame_sync_try_provoice_conventional(ctx);
+}
+
+/* Every accept the sync hunt makes passes through here, which is where the symbol-timing
+ * diagnostic measures the phase the grid settled on. The template is the trailing
+ * DSD_SYMBOL_TIMING_TEMPLATE_SYMS decided dibits rather than the matched sync word: those
+ * are inside the sync word whatever matched -- no protocol's word is shorter -- so no
+ * per-protocol window table has to be kept in step with the matchers above.
+ *
+ * In-frame resyncs a protocol handler does privately do not come through here. */
+static int
+frame_sync_try_protocol_matches(frame_sync_match_ctx* ctx) {
+    const int sync_type = frame_sync_try_protocol_matches_inner(ctx);
+    if (sync_type != DSD_SYNC_NONE && frame_sync_match_window_ready(ctx, DSD_SYMBOL_TIMING_TEMPLATE_SYMS)) {
+        dsd_symbol_timing_report_sync(ctx->state, sync_type, ctx->synctest8);
+    }
+    return sync_type;
 }
 
 static time_t g_p25_trunk_tick_last_tick = 0;
@@ -1948,6 +2108,41 @@ frame_sync_override_want_mod_with_hamming(const dsd_opts* opts, const dsd_state*
     return want_mod;
 }
 
+/**
+ * @brief Keep the CQPSK chain while it is the one decoding P25p1 frames.
+ *
+ * Both inputs to the modulation vote are indirect: the SNR bias compares an estimate the
+ * inactive chain cannot make honestly, and the sync-hamming candidates score patterns a strong
+ * signal matches on more than one modulation. A P25p1 frame whose 63-bit NID BCH decoded is
+ * direct evidence instead -- it says this demodulator is working right now -- so while such
+ * frames keep arriving the guesses do not get to move off it.
+ *
+ * This matters because CQPSK is the side that cannot defend itself. C4FM is the profile
+ * default and what every rotation falls back to, whereas entering GFSK costs a single vote, so
+ * without a hold the chain is taken back within a few dozen symbols and an LSM control channel
+ * never gets to keep the demodulator that decodes it. The hold lapses as soon as the frames
+ * stop, so it can never strand a profile on a modulation that has gone quiet.
+ */
+static int
+frame_sync_hold_validated_p25p1_modulation(const dsd_opts* opts, const dsd_state* state, int want_mod) {
+    if (opts->frame_p25p1 != 1 || state->sps_hunt_idx != DSD_FRAME_SYNC_SPS_PROFILE_4800_4) {
+        return want_mod;
+    }
+    /* A trial the votes can revoke before it has decoded a single frame is not a trial, so the
+     * probe's own dwell is protected whichever chain it selected. */
+    if (state->p25_p1_mod_probe_active && (state->rf_mod == 0 || state->rf_mod == 1)) {
+        return state->rf_mod;
+    }
+    if (state->rf_mod != 1 || state->p25_p1_validated_rf_mod != 1) {
+        return want_mod;
+    }
+    if ((uint32_t)(state->symbolcnt - state->p25_p1_validated_symbolcnt)
+        >= DSD_FRAME_SYNC_P25P1_VALIDATED_HOLD_SYMBOLS) {
+        return want_mod;
+    }
+    return 1;
+}
+
 static void
 frame_sync_update_mod_votes(int want_mod) {
     if (want_mod == 1) {
@@ -2021,9 +2216,6 @@ frame_sync_maybe_auto_switch_modulation(const dsd_opts* opts, dsd_state* state, 
     }
 
     *lastt = 0;
-    if (state->carrier == 1) {
-        state->sps_hunt_counter = 0;
-    }
     if (opts->mod_cli_lock) {
         return;
     }
@@ -2031,6 +2223,7 @@ frame_sync_maybe_auto_switch_modulation(const dsd_opts* opts, dsd_state* state, 
     int want_mod = frame_sync_active_profile_modulation(opts, state);
     want_mod = frame_sync_bias_want_mod_with_snr(opts, state, want_mod);
     want_mod = frame_sync_override_want_mod_with_hamming(opts, state, want_mod);
+    want_mod = frame_sync_hold_validated_p25p1_modulation(opts, state, want_mod);
     frame_sync_update_mod_votes(want_mod);
     frame_sync_apply_mod_switch(opts, state, frame_sync_decide_mod_switch(state, want_mod));
 }
@@ -2041,6 +2234,11 @@ dsd_frame_sync_test_set_recent_hamming(int ham_c4fm, int ham_qpsk, int ham_gfsk)
     atomic_store(&g_ham_c4fm_recent, ham_c4fm);
     atomic_store(&g_ham_qpsk_recent, ham_qpsk);
     atomic_store(&g_ham_gfsk_recent, ham_gfsk);
+}
+
+int
+dsd_frame_sync_test_qpsk_dwell_armed(void) {
+    return atomic_load(&g_qpsk_dwell_enter_ms) != 0;
 }
 
 void
@@ -2409,7 +2607,7 @@ frame_sync_window_levels(const dsd_opts* opts, dsd_state* state, frame_sync_runt
 
 static int
 frame_sync_profile_uses_gfsk_exclusively(const dsd_opts* opts, int profile_index) {
-    if (frame_sync_sps_profile_for_index(profile_index)->levels == 2) {
+    if (dsd_frame_sync_profile_levels_force_gfsk(frame_sync_sps_profile_for_index(profile_index)->levels)) {
         return 1;
     }
     if (!opts) {
@@ -2599,6 +2797,17 @@ frame_sync_nxdn_gfsk_ham(const dsd_opts* opts, const dsd_state* state, const fra
         return 24;
     }
     if (state->sps_hunt_idx == DSD_FRAME_SYNC_SPS_PROFILE_4800_4 && opts->frame_nxdn96 == 1) {
+        /* Silent inside a P25p1 frame for the same reason the matcher is. Ten sign-sliced
+         * symbols one error from an NXDN word score 3 on the 24-symbol axis these votes are
+         * compared on, which is enough to carry the GFSK vote outright -- so P25 payload read
+         * through this window walks the demodulator off the chain that is decoding it (#388).
+         * Silent for a proved 2400/4 transmission too, whose payload read at 4800 supplies the
+         * same misleading score (#445). The 2400/4 branch below is left alone: there the vote
+         * is NXDN48's own, cast on the profile its transmission proved. */
+        if (dsd_frame_sync_suppress_4800_4_for_p25p1_frame(opts, state)
+            || dsd_frame_sync_suppress_4800_4_for_2400_4_transmission(opts, state)) {
+            return 24;
+        }
         return frame_sync_best_nxdn_scaled_ham(rt->synctest10, 24);
     }
     if (state->sps_hunt_idx == DSD_FRAME_SYNC_SPS_PROFILE_2400_4 && opts->frame_nxdn48 == 1) {
@@ -2827,6 +3036,11 @@ dsd_frame_sync_test_eval_window(dsd_opts* opts, dsd_state* state, const char* sy
 
 static void
 frame_sync_advance_sync_window(dsd_opts* opts, dsd_state* state, frame_sync_runtime_ctx* rt) {
+    /* One more symbol spent looking for a sync on this profile. Unlike synctest_pos this
+     * lives in dsd_state, so returning a sync does not hand the profile a fresh budget. */
+    if (state->sps_hunt_counter < INT_MAX) {
+        state->sps_hunt_counter++;
+    }
     if (rt->synctest_pos < 10200) {
         rt->synctest_pos++;
         return;
@@ -2912,6 +3126,11 @@ dsd_frame_sync_test_sps_hunt_profile_levels(int profile_index) {
     return frame_sync_sps_profile_for_index(profile_index)->levels;
 }
 
+int
+dsd_frame_sync_test_sps_hunt_profile_has_candidate(const dsd_opts* opts, int profile_index) {
+    return frame_sync_sps_profile_has_candidate(opts, profile_index);
+}
+
 #endif
 
 static void
@@ -2932,6 +3151,45 @@ frame_sync_apply_sps_profile_timing(const dsd_opts* opts, dsd_state* state, cons
     }
 }
 
+/**
+ * @brief Modulation a profile comes up on when the hunt normalises it.
+ *
+ * Four-level profiles default to C4FM, which is the right guess for a profile the hunt has
+ * learned nothing about. Once a P25p1 NID has decoded through the CQPSK chain, though, the
+ * 4800/4-level profile has been told which modulation the signal actually uses, and rotating
+ * away and back must not throw that away -- otherwise an LSM control channel loses the chain
+ * it just decoded on every time the hunt visits another protocol's profile.
+ */
+static int
+frame_sync_sps_profile_normalized_modulation(const dsd_opts* opts, const dsd_state* state,
+                                             const frame_sync_sps_profile* profile, int profile_index) {
+    const int requested = (profile_index == DSD_FRAME_SYNC_SPS_PROFILE_4800_4 && opts->frame_p25p1 == 1
+                           && state->p25_p1_validated_rf_mod == 1)
+                              ? 1
+                              : 0;
+    return dsd_frame_sync_profile_modulation(profile->levels, requested);
+}
+
+/**
+ * @brief Adopt a profile's modulation and start the vote state over for it.
+ *
+ * The votes and hamming counters belong to the acquisition that just ended, so they are always
+ * cleared. The QPSK dwell is different: it is the grace period a modulation gets before the
+ * votes may argue with it, and clearing it under a restored CQPSK would let the SNR bias and
+ * the three-vote C4FM re-entry evict that modulation before the first sync of the new dwell
+ * could even arrive.
+ */
+static void
+frame_sync_normalize_profile_modulation(dsd_state* state, int normalize, int modulation) {
+    if (normalize) {
+        state->rf_mod = modulation;
+    }
+    dsd_frame_sync_reset_mod_state();
+    if (normalize && modulation == 1) {
+        atomic_store(&g_qpsk_dwell_enter_ms, (int)(uint32_t)dsd_time_monotonic_ms());
+    }
+}
+
 void
 frame_sync_apply_sps_hunt_profile(const dsd_opts* opts, dsd_state* state, int next_idx, int preserve_modulation) {
     if (!opts || !state || next_idx < 0 || next_idx >= DSD_FRAME_SYNC_SPS_PROFILE_COUNT) {
@@ -2940,7 +3198,7 @@ frame_sync_apply_sps_hunt_profile(const dsd_opts* opts, dsd_state* state, int ne
 
     const frame_sync_sps_profile* profile = frame_sync_sps_profile_for_index(next_idx);
     const int profile_changed = next_idx != state->sps_hunt_idx;
-    const int profile_default_modulation = profile->levels == 2 ? 2 : 0;
+    const int profile_default_modulation = frame_sync_sps_profile_normalized_modulation(opts, state, profile, next_idx);
     const int normalize_profile_modulation = !preserve_modulation && !opts->mod_cli_lock
                                              && state->rf_mod != profile_default_modulation
                                              && (profile_changed || profile->levels == 2);
@@ -2949,10 +3207,39 @@ frame_sync_apply_sps_hunt_profile(const dsd_opts* opts, dsd_state* state, int ne
     }
 
     state->sps_hunt_idx = next_idx;
-    if (normalize_profile_modulation) {
-        state->rf_mod = profile_default_modulation;
+    if (profile_changed) {
+        /* The dwell belongs to the profile, so adopting one starts its budget over. That is
+         * the defect: left alone, the incoming profile inherits whatever the outgoing one had
+         * already spent, and one that arrives a symbol short of the dwell is stepped off again
+         * on the very next symbol, because frame_sync_advance_sync_window() bills one symbol
+         * per symbol (#394).
+         *
+         * The measurement anchor moves with the budget so the pair stays consistent, not
+         * because it is stale today: every path that reaches here already has a current mark.
+         * getFrameSync() runs frame_sync_sps_hunt_note_handler_consumption() -- which
+         * re-anchors -- immediately before frame_sync_ensure_enabled_sps_profile(), and the
+         * hunt's own call site leaves getFrameSync() through frame_sync_sps_hunt_mark_return()
+         * at the same symbolcnt. A fresh budget paired with an anchor taken under the outgoing
+         * profile is what would let frame_sync_sps_hunt_note_handler_consumption() credit the
+         * new profile for symbols a handler consumed before it was selected, so the two are
+         * written together rather than left to each caller to keep in step.
+         *
+         * This sits here rather than at the call sites so it covers every path through the
+         * helper: the hunt itself (which zeroes the counter just before calling), both adopt
+         * paths in frame_sync_ensure_enabled_sps_profile(), and any future caller. The guard is
+         * load-bearing -- a call that leaves the index alone can still get past the early-out
+         * above to normalise a two-level profile's modulation, and that is the same profile
+         * spending the same dwell, so its budget must survive. */
+        state->sps_hunt_counter = 0;
+        state->sps_hunt_symbolcnt_mark = state->symbolcnt;
+        /* The refund snapshot belongs to the budget it was taken against. This helper can run
+         * after the snapshot has been stamped for the cycle in progress -- both adopt paths in
+         * frame_sync_ensure_enabled_sps_profile() do, immediately after
+         * frame_sync_sps_hunt_note_handler_consumption() -- so leaving it would let a withheld
+         * frame refund the incoming profile to a figure the outgoing one had. */
+        state->sps_hunt_counter_at_entry = 0;
     }
-    dsd_frame_sync_reset_mod_state();
+    frame_sync_normalize_profile_modulation(state, normalize_profile_modulation, profile_default_modulation);
 
     if (profile_changed) {
         frame_sync_apply_sps_profile_timing(opts, state, profile);
@@ -3026,24 +3313,258 @@ frame_sync_ensure_enabled_sps_profile(const dsd_opts* opts, dsd_state* state) {
     }
 }
 
+/** @brief Symbols a profile is owed before the hunt may leave it. */
+static int
+frame_sync_sps_hunt_dwell_symbols(const dsd_opts* opts, const dsd_state* state) {
+    int passes = dsd_frame_sync_sps_hunt_dwell_passes(opts, state);
+    if (passes < 1) {
+        passes = 1;
+    }
+    return passes * DSD_FRAME_SYNC_NO_SYNC_PASS_SYMBOLS;
+}
+
+/**
+ * @brief Debit what the last frame handler consumed from the hunt's budget.
+ *
+ * Called on entry to getFrameSync(), where dsd_state::symbolcnt has advanced by exactly the
+ * symbols one protocol handler took since the previous return. The budget is a net count of
+ * symbols the search burned that no frame handler claimed. A profile carrying traffic sits
+ * at zero -- its handlers take a frame's worth between syncs that arrive a few symbols
+ * apart -- while a profile matching nothing spends its dwell at one symbol per symbol.
+ *
+ * Credit is per sync and floored at DSD_FRAME_SYNC_MIN_FRAME_SYMBOLS. A handler that returns
+ * inside that did not decode a frame; it recognised a marker and bailed, and buys nothing.
+ * The floor is what keeps the rule independent of how often an unproductive matcher fires.
+ * Crediting an accumulator instead made the dwell a function of that cadence -- a matcher
+ * firing every few symbols, the shape an alternating bit-sync run on any other protocol
+ * presents, banked a refund faster than the search could spend the budget and pinned the
+ * profile for good (#388).
+ *
+ * Size alone cannot separate a decoded frame from a block skipped on a sync no CRC would
+ * accept, so a handler that ran a check and failed it says so: processFrame() leaves its
+ * dsd_frame_verdict in dsd_state::sps_hunt_last_frame_verdict, and an unproductive one is
+ * refused the debit however much it took (#391). Where the check is per transmission rather
+ * than per frame the protocol reports a sticky verdict instead, so a frame that fails its own
+ * check inside a confirmed transmission still counts -- D-STAR voice and ProVoice were the
+ * last two with no verdict at any point and now confirm this way (#421). The verdict is
+ * default-productive, so every handler that still reports nothing -- DMR, P25 Phase 2, dPMR
+ * and X2-TDMA, which is the whole of the set that does not -- buys dwell in proportion to
+ * what it swallowed, as before.
+ *
+ * Consumption credit answers "how much of this profile's time went somewhere", which is not
+ * the same question as "is this the right profile". A P25p1 control channel reads 134
+ * symbols of a ~180-symbol TSDU slot -- it stops on the standard's last-block bit, not on a
+ * budget -- so a decoded frame cannot get ahead of the slot it sat in, and the floor at zero
+ * denies it a reserve to spend on the failures between. Runs of failing NIDs then rotated
+ * the hunt off a control channel it was decoding (#400). A handler whose own check proves
+ * the profile says so with DSD_FRAME_VERDICT_PROFILE_PROVEN, and the dwell restarts outright
+ * -- the same thing a profile change does (#415), and for the same reason: this profile is
+ * starting its dwell over, not being paid for a frame.
+ *
+ * Restarting cannot re-open #388 the way an accumulator did. Zero is the floor the credit
+ * path already has, so nothing banks: holding a profile takes evidence recurring inside every
+ * dwell, and one false proof buys exactly one dwell. Values are compared as literals because
+ * the DSP layer includes no engine headers; anything this does not recognise is refused
+ * credit, so an unhandled verdict degrades toward rotating rather than toward pinning.
+ *
+ * A withheld frame is measured by neither rule, because the engine declined to run the
+ * handler at all: trunked DMR skips the MS paths, and a frame the retune generation makes
+ * undispatchable skips processFrame(). Consumption is zero on both, so the credit path
+ * refuses the debit at its size floor and the search that found the sync stands charged --
+ * which is what rotated the hunt off channels the engine had just tuned (#392). The cycle is
+ * made neutral instead: the counter goes back to what it was when the cycle began. Not
+ * credit, because the reason for declining is about the engine's state and says nothing
+ * about the profile; and not a reserve, because a refund can only reach the value it
+ * started from.
+ */
+static void
+frame_sync_sps_hunt_note_handler_consumption(dsd_state* state) {
+    /* DSD_FRAME_VERDICT_* (engine/protocol_dispatch.h): 0 productive, 1 unproductive,
+     * 2 profile proven, 3 withheld. Kept in step by FRAME_SYNC_SPS_HUNT_FALSE_SYNC, which
+     * drives this through getFrameSync() with the enumerators themselves. */
+    const int verdict = state->sps_hunt_last_frame_verdict;
+    const int proven = verdict == 2;
+    const int withheld = verdict == 3;
+    const int unproductive = verdict != 0 && !proven && !withheld;
+    /* One verdict answers for one handler call. processFrame() already re-stamps the field
+     * on every dispatch, so this is belt and braces for the entries no handler precedes --
+     * a no-sync return, or a frame the retune generation made undispatchable -- where a
+     * stale verdict would be read against consumption that is not the handler's. */
+    state->sps_hunt_last_frame_verdict = 0;
+
+    /* Both operands wrap at 2^32, so this modular difference stays exact when the free-running
+     * symbol counter rolls over mid-measurement. */
+    uint32_t consumed = state->symbolcnt - state->sps_hunt_symbolcnt_mark;
+    if (consumed > (uint32_t)INT_MAX) {
+        /* symbolcnt went backwards, so an unrelated subsystem zeroed it rather than a
+         * handler having consumed 4 billion symbols: nxdn_reset_after_cac_fail(),
+         * initState() on an in-process restart, and print_datascope() on each refresh.
+         * Credit nothing; the mark below re-anchors the measurement on the next call.
+         *
+         * The datascope is the only one of the three that can zero it faster than handlers
+         * consume -- once every opts->ssize symbols after the count passes
+         * 4800/opts->scoperate, so a few hundred symbols apart -- which means an interval
+         * that really did decode a frame can straddle a reset and be credited nothing.
+         * That is accepted here rather than worked around: nothing in the tree ever sets
+         * opts->datascope to 1, so the display is unreachable and the overlap is latent,
+         * and a missed credit costs only the debit, leaving the hunt on the undebited
+         * dwell it had before #390 rather than mis-crediting anything. Wiring the
+         * datascope back to a switch means giving its reset a form this can tell apart
+         * from a rollover. */
+        consumed = 0;
+    }
+    if (proven) {
+        /* The handler's check, not the measurement, is what carries this: a proof holds
+         * however few symbols the frame took to read, so the size floor and the backwards-
+         * jump guard above -- both of which exist to keep consumption honest -- have no say
+         * in it. */
+        state->sps_hunt_counter = 0;
+    } else if (withheld) {
+        /* Hand back this cycle's search and nothing else. Charging happens only inside
+         * frame_sync_advance_sync_window(), between the snapshot below being stamped and
+         * this read, so the snapshot is exactly what the counter held before the search
+         * that produced the withheld frame.
+         *
+         * Clamped rather than assigned, because the counter can legitimately be lower than
+         * the snapshot by now: a profile change, a retune, or a trunk-scan target switch
+         * inside dsd_trunk_scan_hook_tick() can zero it in between, and the last of those
+         * can even leave this stamp landing on a different target's budget. Every one of
+         * those is a reset this has no business undoing, so the refund is only ever allowed
+         * to lower the counter -- worst case it does nothing. */
+        if (state->sps_hunt_counter > state->sps_hunt_counter_at_entry) {
+            state->sps_hunt_counter = state->sps_hunt_counter_at_entry;
+        }
+    } else if (!unproductive && consumed >= (uint32_t)DSD_FRAME_SYNC_MIN_FRAME_SYMBOLS) {
+        /* dsd_state::sps_hunt_counter only ever counts up from zero, so this is exact.
+         * Sites outside the hunt park a profile by zeroing it; the floor at zero means
+         * consumption measured across such a reset cannot drive it negative. */
+        const uint32_t counter = (uint32_t)state->sps_hunt_counter;
+        state->sps_hunt_counter = (int)(consumed >= counter ? 0U : counter - consumed);
+    }
+    state->sps_hunt_symbolcnt_mark = state->symbolcnt;
+    state->sps_hunt_counter_at_entry = state->sps_hunt_counter;
+}
+
+#ifdef DSD_NEO_TEST_HOOKS
 void
+dsd_frame_sync_test_sps_hunt_note_handler_consumption(dsd_state* state) {
+    frame_sync_sps_hunt_note_handler_consumption(state);
+}
+#endif
+
+/** @brief Remember where the handler starts consuming, so the next call can measure it. */
+static void
+frame_sync_sps_hunt_mark_return(dsd_state* state) {
+    state->sps_hunt_symbolcnt_mark = state->symbolcnt;
+}
+
+void
+dsd_frame_sync_sps_hunt_restart_dwell(dsd_state* state) {
+    if (!state) {
+        return;
+    }
+    state->sps_hunt_counter = 0;
+    state->sps_hunt_symbolcnt_mark = state->symbolcnt;
+    state->sps_hunt_counter_at_entry = 0;
+}
+
+/**
+ * @brief Spend alternate 4800/4-level dwells watching for P25p1 on the CQPSK chain.
+ *
+ * A P25p1 FDMA signal cannot argue its way onto CQPSK passively. Both passive routes are
+ * structurally closed: while the CQPSK chain is off the front end runs the FM discriminator, so
+ * the QPSK SNR estimate comes from a constellation ring fed raw un-derotated, un-timed IQ and
+ * never clears the entry margin; and the sync-hamming candidate scores a superset of the C4FM
+ * hypotheses, so an LSM signal -- which decodes its sync words unrotated through the
+ * discriminator -- ties rather than wins, and the override only moves on a strict improvement.
+ *
+ * So the decision is made by trying it. This runs only where a dwell has already expired with
+ * nothing productive decoded, which is exactly where the hunt was going to leave this profile
+ * anyway: a control channel that is decoding never gets here, because its handlers keep the
+ * dwell counter spent. Whichever chain then starts decoding P25p1 frames keeps the profile,
+ * because frame_sync_hold_validated_p25p1_modulation() stops the votes from arguing with it.
+ */
+static void
+frame_sync_maybe_probe_p25p1_cqpsk(const dsd_opts* opts, dsd_state* state, int preserve_modulation,
+                                   int expired_dwell_idx, int expired_dwell_rf_mod) {
+    if (preserve_modulation || opts->mod_cli_lock || opts->frame_p25p1 != 1) {
+        return;
+    }
+    if (opts->audio_in_type != AUDIO_IN_RTL || !state->rtl_ctx) {
+        return;
+    }
+    /* The dwell that just expired decoded nothing. If that dwell was this profile running on
+     * the CQPSK chain then whatever evidence put it there has been disproved, so withdraw it
+     * rather than let the restore keep handing the profile back to a chain producing nothing.
+     * This judges the dwell that ended, not the one about to start. */
+    if (expired_dwell_idx == DSD_FRAME_SYNC_SPS_PROFILE_4800_4 && expired_dwell_rf_mod == 1
+        && state->p25_p1_validated_rf_mod == 1) {
+        state->p25_p1_validated_rf_mod = -1;
+    }
+    if (state->sps_hunt_idx != DSD_FRAME_SYNC_SPS_PROFILE_4800_4) {
+        return;
+    }
+    if (state->p25_p1_validated_rf_mod == 1) {
+        return;
+    }
+
+    /* Own both directions. A profile the hunt re-enters at its own index is not normalised --
+     * frame_sync_apply_sps_hunt_profile() returns early when neither the index nor a binary
+     * profile forces its hand -- so without handing the chain back here a probe that decoded
+     * nothing would keep it for good. */
+    const int probe_qpsk = state->p25_p1_mod_probe_next_qpsk ? 1 : 0;
+    state->p25_p1_mod_probe_next_qpsk = !probe_qpsk;
+    if (state->rf_mod == probe_qpsk) {
+        return;
+    }
+
+    state->rf_mod = probe_qpsk;
+    state->p25_p1_mod_probe_active = 1;
+    if (probe_qpsk) {
+        atomic_store(&g_qpsk_dwell_enter_ms, (int)(uint32_t)dsd_time_monotonic_ms());
+    }
+#ifdef USE_RADIO
+    rtl_maybe_apply_active_demod_profile(opts, state);
+#endif
+}
+
+int
 frame_sync_no_sync_sps_hunt(const dsd_opts* opts, dsd_state* state) {
     if (opts->frame_tetra == 1) {
         const int demod_rate = frame_sync_current_demod_rate(opts, state);
         state->samplesPerSymbol = dsd_opts_compute_sps_rate(opts, 18000, demod_rate);
         state->symbolCenter = dsd_opts_symbol_center(state->samplesPerSymbol);
         state->rf_mod = 1;
-        return;
+        return 0;
     }
-    const int preserve_modulation = opts->mod_cli_lock ? 1 : 0;
-    if (state->carrier != 0) {
-        return;
-    }
-    state->sps_hunt_counter++;
-    if (state->sps_hunt_counter < dsd_frame_sync_sps_hunt_dwell_passes(opts, state)) {
-        return;
+    if (state->sps_hunt_counter < frame_sync_sps_hunt_dwell_symbols(opts, state)) {
+        return 0;
     }
     state->sps_hunt_counter = 0;
+    /* Reaching here is the trial's verdict: its dwell expired with nothing decoded. That is
+     * true whether or not the profile then rotates, and this is the only place the flag is
+     * cleared, so it must be cleared before the hold below returns -- a probe left active
+     * across a grant would pin rf_mod against the modulation votes for the whole call. */
+    state->p25_p1_mod_probe_active = 0;
+
+    /* The hunt does not get to second-guess a channel the engine chose. On a trunked voice
+     * channel the profile came from the grant that tuned it, so rotating it is wrong however
+     * the budget reads: a call fading toward the noise floor credits less than the search
+     * between its syncs burns, and reaches the dwell while it is still decoding (#392).
+     *
+     * This holds the profile, not the channel, so it returns non-zero like any other dwell
+     * expiry. The caller owes the P25 SM the same no-sync accounting either way (#393) --
+     * VC no-sync pass, release check, no-carrier -- and that accounting is the only thing
+     * that gives a dead voice channel up when false syncs keep arriving often enough to
+     * stop the in-call timeout ever arming. Suppressing it here would leave nothing to drop
+     * trunk_is_tuned, which is the flag this reads: the hold would never end.
+     *
+     * Control channels are not tuned in this sense -- the CC tune path deliberately leaves
+     * the flag alone -- so the hunt still rotates and still probes there. */
+    if (opts->trunk_enable == 1 && opts->trunk_is_tuned == 1) {
+        return 1;
+    }
+    const int preserve_modulation = opts->mod_cli_lock ? 1 : 0;
 
     /* Generic modulation locks retain their demodulator while rotating equal-timing protocol gates. A P25p2-specific
      * lock retains whichever P25 profile was selected explicitly by the helper or by a CC retune. This keeps a known
@@ -3057,7 +3578,17 @@ frame_sync_no_sync_sps_hunt(const dsd_opts* opts, dsd_state* state) {
                        ? state->sps_hunt_idx
                        : (preserve_modulation ? frame_sync_sps_hunt_next_index_matching_timing(opts, state)
                                               : frame_sync_sps_hunt_next_index(opts, state));
+    const int previous_idx = state->sps_hunt_idx;
+    const int previous_mod = state->rf_mod;
     frame_sync_apply_sps_hunt_profile(opts, state, next_idx, preserve_modulation);
+    frame_sync_maybe_probe_p25p1_cqpsk(opts, state, preserve_modulation, previous_idx, previous_mod);
+    /* A repeated binary profile is a step too: frame_sync_apply_sps_hunt_profile() normalises
+     * dsd_state::rf_mod and resets the modulation vote state without the index moving, and the
+     * caller's sync window -- its level ring, its min/max, its history -- was captured under the
+     * old modulation. Say so, so the window is rebuilt rather than matched across the change.
+     * The two comparisons are exact: the helper mutates nothing else once it is past its own
+     * no-op guard. */
+    return state->sps_hunt_idx != previous_idx || state->rf_mod != previous_mod;
 }
 
 double
@@ -3119,9 +3650,33 @@ frame_sync_no_sync_try_p25_release(dsd_opts* opts, dsd_state* state, time_t now)
     }
 }
 
+/**
+ * @brief The accounting every no-sync return from getFrameSync() owes, in contract order.
+ *
+ * The P25 trunk SM counts VC no-sync passes and decides releases off these, and expects
+ * the VC no-sync note before the no-carrier teardown (the ordering is asserted in
+ * tests/dsp/test_frame_sync_internal_helpers.c). Both no-sync exits -- the timeout and
+ * the SPS hunt's budget exit -- go through here so they cannot drift apart (#393).
+ */
+static void
+frame_sync_no_sync_run_hooks(dsd_opts* opts, dsd_state* state, time_t now) {
+    dsd_frame_sync_hook_p25_sm_vc_no_sync(opts, state);
+    frame_sync_no_sync_try_p25_release(opts, state, now);
+    dsd_frame_sync_hook_no_carrier(opts, state);
+}
+
+/**
+ * @brief Give up on this call once a whole matchless pass has gone by.
+ *
+ * The dwell is the only gate: no protocol gets a carve-out here. A
+ * `lastsynctype == DSD_SYNC_P25P1_NEG` term used to short-circuit the whole timeout,
+ * inherited unexplained from upstream DSD, which let an inverted P25p1 sync hold off
+ * this exit -- and only this one -- until the sync window's 10200-symbol wrap fired
+ * no_carrier and cleared lastsynctype (#389).
+ */
 static int
 frame_sync_handle_no_sync_timeout(dsd_opts* opts, dsd_state* state, const frame_sync_runtime_ctx* rt, time_t now) {
-    if (state->lastsynctype == DSD_SYNC_P25P1_NEG || rt->synctest_pos < 1800) {
+    if (rt->synctest_pos < DSD_FRAME_SYNC_NO_SYNC_PASS_SYMBOLS) {
         return 0;
     }
 
@@ -3130,10 +3685,8 @@ frame_sync_handle_no_sync_timeout(dsd_opts* opts, dsd_state* state, const frame_
         DSD_FPRINTF(stderr, "Sync: no sync\n");
     }
 
-    frame_sync_no_sync_sps_hunt(opts, state);
-    dsd_frame_sync_hook_p25_sm_vc_no_sync(opts, state);
-    frame_sync_no_sync_try_p25_release(opts, state, now);
-    dsd_frame_sync_hook_no_carrier(opts, state);
+    (void)frame_sync_no_sync_sps_hunt(opts, state);
+    frame_sync_no_sync_run_hooks(opts, state, now);
     return 1;
 }
 
@@ -3146,6 +3699,40 @@ dsd_frame_sync_test_handle_no_sync_timeout(dsd_opts* opts, dsd_state* state, int
 }
 #endif
 
+/* Symbols seen since the last sync or unsynced dump; only the DSP thread
+ * touches it (same pattern as the g_vote_* diagnostics). */
+static unsigned int g_unsynced_dmr_dump_symbols = 0;
+
+/* --dmr-debug-unsynced: while hunting, print the trailing 144 dibits from the
+ * rolling DMR payload buffer as non-overlapping "Debug Demod -Sync" chunks.
+ * Chunk boundaries are arbitrary and thresholds may be uncalibrated; this is a
+ * best-effort raw view of demod output that never achieved sync. The first
+ * chunk after the rolling buffer rewinds its write pointer can also span
+ * stale pre-rewind dibits. */
+static void
+frame_sync_maybe_dump_unsynced_dmr(const dsd_opts* opts, const dsd_state* state) {
+    if (opts->dmr_debug_unsynced == 0 || opts->frame_dmr != 1) {
+        return;
+    }
+    if (opts->audio_in_type != AUDIO_IN_SYMBOL_BIN && opts->audio_in_type != AUDIO_IN_SYMBOL_FLT
+        && state->sps_hunt_idx != DSD_FRAME_SYNC_SPS_PROFILE_4800_4) {
+        return;
+    }
+    if (++g_unsynced_dmr_dump_symbols < 144U) {
+        return;
+    }
+    g_unsynced_dmr_dump_symbols = 0;
+
+    if (state->dmr_payload_buf == NULL || state->dmr_payload_p == NULL
+        || state->dmr_payload_p - state->dmr_payload_buf < 144) {
+        return;
+    }
+    char line[192];
+    if (dmr_debug_format_unsynced(line, sizeof(line), state->dmr_payload_p - 144, 144U) != 0U) {
+        DSD_FPRINTF(stderr, "%s\n", line);
+    }
+}
+
 int
 getFrameSync(dsd_opts* opts, dsd_state* state) {
     if (!opts || !state) {
@@ -3156,16 +3743,15 @@ getFrameSync(dsd_opts* opts, dsd_state* state) {
     const double nowm = dsd_time_now_monotonic_s();
     frame_sync_maybe_tick_p25_trunk_sm(opts, state, now);
     frame_sync_apply_cli_mod_lock(opts, state);
+    frame_sync_sps_hunt_note_handler_consumption(state);
     frame_sync_ensure_enabled_sps_profile(opts, state);
 
     frame_sync_runtime_ctx rt;
     frame_sync_runtime_init(&rt, opts, state);
 
     frame_sync_publish_ui_throttled(opts, state);
-    watchdog_event_history(opts, state, 0);
-    watchdog_event_current(opts, state, 0);
-    watchdog_event_history(opts, state, 1);
-    watchdog_event_current(opts, state, 1);
+    dsd_event_sync_slot(opts, state, 0);
+    dsd_event_sync_slot(opts, state, 1);
 
     for (;;) {
         rt.t++;
@@ -3182,17 +3768,40 @@ getFrameSync(dsd_opts* opts, dsd_state* state) {
         if (rt.history_count >= 8) {
             int sync_type = frame_sync_eval_window(opts, state, &rt, now, nowm);
             if (sync_type != DSD_SYNC_NONE) {
+                g_unsynced_dmr_dump_symbols = 0;
+                frame_sync_sps_hunt_mark_return(state);
                 return sync_type;
             }
         }
+        frame_sync_maybe_dump_unsynced_dmr(opts, state);
 
-        if (exitflag == 1) {
+        if (dsd_exitflag_load() == 1) {
             dsd_request_shutdown(opts, state);
+            frame_sync_sps_hunt_mark_return(state);
             return DSD_SYNC_NONE;
         }
 
         frame_sync_advance_sync_window(opts, state, &rt);
         if (frame_sync_handle_no_sync_timeout(opts, state, &rt, now)) {
+            frame_sync_sps_hunt_mark_return(state);
+            return -1;
+        }
+
+        /* The timeout above is the usual trigger, but it needs a whole matchless pass
+         * inside one call. Syncs arriving more often than that -- the permissive 4800/4
+         * matchers do, on signals belonging to another profile entirely -- would otherwise
+         * keep the hunt from ever running. The budget spans calls, so they cannot.
+         *
+         * One pass is the smallest dwell frame_sync_sps_hunt_dwell_symbols() can return, so
+         * the compare below is a necessary condition for the step and keeps the policy call
+         * out of the per-symbol path.
+         *
+         * This is a no-sync exit like the timeout above and owes the P25 SM the same
+         * accounting, in the same order. */
+        if (state->sps_hunt_counter >= DSD_FRAME_SYNC_NO_SYNC_PASS_SYMBOLS
+            && frame_sync_no_sync_sps_hunt(opts, state)) {
+            frame_sync_no_sync_run_hooks(opts, state, now);
+            frame_sync_sps_hunt_mark_return(state);
             return -1;
         }
     }

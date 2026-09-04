@@ -8,9 +8,12 @@
  * 4-state model: IDLE, ON_CC, TUNED, HUNTING
  */
 
+#include <dsd-neo/core/call_state.h>
 #include <dsd-neo/core/dsd_time.h>
+#include <dsd-neo/core/events.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/state.h>
+#include <dsd-neo/core/synctype_ids.h>
 #include <dsd-neo/core/talkgroup_policy.h>
 #include <dsd-neo/protocol/p25/p25_crypto.h>
 #include <dsd-neo/protocol/p25/p25_trunk_sm.h>
@@ -19,7 +22,8 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
-#include <time.h>
+#include "../../../src/protocol/p25/p25_trunk_sm_internal.h"
+#include "dsd-neo/core/enc_lockout.h"
 #include "dsd-neo/core/opts_fwd.h"
 #include "dsd-neo/core/safe_api.h"
 #include "dsd-neo/core/state_ext.h"
@@ -67,11 +71,128 @@ reset_test_state(void) {
     g_opts.trunk_tune_group_calls = 1;
     g_opts.verbose = 0;
     g_state.p25_cc_freq = 851000000; // Fake CC freq
+    // The SM defers TDMA grants until the descrambler seed (WACN/SYSID/NAC)
+    // has been decoded from the control channel.
+    g_state.p2_wacn = 0xBEE00;
+    g_state.p2_sysid = 0x1A2;
+    g_state.p2_cc = 0x293;
+}
+
+static int
+canonical_call_is(uint8_t slot, dsd_call_phase phase, dsd_call_kind kind, uint64_t target, uint64_t source) {
+    dsd_call_snapshot call;
+    return dsd_call_state_get(&g_state, slot, &call) > 0 && call.phase == phase && call.kind == kind
+           && call.ota_target_id == target && call.policy_target_id == target && call.ota_source_id == source;
+}
+
+static int
+canonical_slot_is_active(uint8_t slot) {
+    dsd_call_snapshot call;
+    return dsd_call_state_get(&g_state, slot, &call) > 0 && call.phase == DSD_CALL_PHASE_ACTIVE;
+}
+
+static int
+canonical_call_has_service(uint8_t slot, uint16_t service_options, uint8_t emergency, uint8_t priority) {
+    dsd_call_snapshot call;
+    return dsd_call_state_get(&g_state, slot, &call) > 0 && call.phase == DSD_CALL_PHASE_ACTIVE
+           && call.service_options == service_options && call.emergency == emergency && call.priority == priority;
+}
+
+static int
+canonical_call_set_service(uint8_t slot, uint16_t service_options) {
+    dsd_call_snapshot call = {0};
+    const int found = dsd_call_state_get(&g_state, slot, &call);
+    if (found <= 0 || call.phase != DSD_CALL_PHASE_ACTIVE) {
+        return 0;
+    }
+    const dsd_call_observation observation = {
+        .protocol = call.protocol,
+        .slot = slot,
+        .kind = call.kind,
+        .ota_target_id = call.ota_target_id,
+        .policy_target_id = call.policy_target_id,
+        .ota_source_id = call.ota_source_id,
+        .channel = call.channel,
+        .frequency_hz = call.frequency_hz,
+        .service_options = service_options,
+        .emergency = (uint8_t)((service_options & 0x80U) != 0U),
+        .priority = (uint8_t)(service_options & 0x07U),
+        .has_service_metadata = 1U,
+        .observed_m = dsd_time_now_monotonic_s(),
+    };
+    return dsd_call_state_observe(&g_state, &observation, DSD_CALL_BOUNDARY_CONTINUE) >= 0;
+}
+
+static void
+make_ptt_signature(uint8_t signature[P25_SM_PTT_SIGNATURE_BYTES], uint64_t mi, int algid, int keyid, int src, int tg) {
+    for (int i = 0; i < 8; i++) {
+        signature[i] = (uint8_t)((mi >> (56 - i * 8)) & UINT64_C(0xFF));
+    }
+    signature[8] = 0x99U;
+    signature[9] = (uint8_t)algid;
+    signature[10] = (uint8_t)((keyid >> 8) & 0xFF);
+    signature[11] = (uint8_t)(keyid & 0xFF);
+    signature[12] = (uint8_t)((src >> 16) & 0xFF);
+    signature[13] = (uint8_t)((src >> 8) & 0xFF);
+    signature[14] = (uint8_t)(src & 0xFF);
+    signature[15] = (uint8_t)((tg >> 8) & 0xFF);
+    signature[16] = (uint8_t)(tg & 0xFF);
+}
+
+static p25_sm_event_t
+raw_ptt_event(int slot, int tg, int src, const uint8_t signature[P25_SM_PTT_SIGNATURE_BYTES], double observed_m,
+              int facch) {
+    p25_sm_event_t ev = p25_sm_ev_ptt_call(slot, tg, 0, src, 1, 0);
+    DSD_MEMCPY(ev.ptt_signature, signature, sizeof(ev.ptt_signature));
+    ev.ptt_signature_valid = 1;
+    ev.observed_m = observed_m;
+    ev.facch = facch ? 1 : 0;
+    return ev;
+}
+
+static void
+start_tdma_fixture(p25_sm_ctx_t* ctx, int second_slot) {
+    g_state.trunk_chan_map[0x1234] = 851500000;
+    g_state.trunk_chan_map[0x1235] = 851500000;
+    g_state.p25_chan_tdma_explicit[1] = 2;
+    p25_sm_init_ctx(ctx, &g_opts, &g_state);
+    p25_sm_event_t grant = p25_sm_ev_group_grant(second_slot ? 0x1235 : 0x1234, 851500000, second_slot ? 2000 : 1000,
+                                                 second_slot ? 456 : 123, 0);
+    p25_sm_event(ctx, &g_opts, &g_state, &grant);
+}
+
+static int
+canonical_call_begin_p1(uint64_t target, uint64_t source, uint16_t service_options) {
+    const dsd_call_observation observation = {
+        .protocol = DSD_SYNC_P25P1_POS,
+        .slot = 0U,
+        .kind = DSD_CALL_KIND_GROUP_VOICE,
+        .ota_target_id = target,
+        .policy_target_id = target,
+        .ota_source_id = source,
+        .service_options = service_options,
+        .emergency = (uint8_t)((service_options & 0x80U) != 0U),
+        .priority = (uint8_t)(service_options & 0x07U),
+        .has_service_metadata = 1U,
+        .observed_m = dsd_time_now_monotonic_s(),
+    };
+    return dsd_call_state_observe(&g_state, &observation, DSD_CALL_BOUNDARY_BEGIN) > 0;
+}
+
+/*
+ * Force the derived hangtime countdown to have started at @p started_m. The
+ * deadline is the most recent moment any slot carried followed traffic, so one
+ * slot carries the forced value and the other is cleared.
+ */
+static void
+set_hangtime_started(p25_sm_ctx_t* ctx, double started_m) {
+    ctx->slots[0].last_followed_m = started_m;
+    ctx->slots[1].last_followed_m = 0.0;
 }
 
 static void
 expire_traffic_hang(p25_sm_ctx_t* ctx) {
-    ctx->t_hangtime_m = dsd_time_now_monotonic_s() - ctx->config.hangtime_s - 0.1;
+    set_hangtime_started(ctx, dsd_time_now_monotonic_s() - ctx->config.hangtime_s - 0.1);
     p25_sm_tick_ctx(ctx, &g_opts, &g_state);
 }
 
@@ -87,15 +208,7 @@ seed_exact(uint32_t id, const char* mode, const char* name) {
 
 static int
 encrypted_call_cache_has(uint32_t target, int is_group) {
-    const time_t now = time(NULL);
-    for (int i = 0; i < DSD_P25_ENC_TG_CACHE_DEPTH; i++) {
-        if (g_state.p25_enc_tg_cache_tg[i] == target
-            && g_state.p25_enc_tg_cache_is_group[i] == (uint8_t)(is_group ? 1 : 0)
-            && g_state.p25_enc_tg_cache_until[i] > now) {
-            return 1;
-        }
-    }
-    return 0;
+    return dsd_enc_lockout_entry_active(&g_state, target, is_group);
 }
 
 // Test: Init sets correct initial state
@@ -206,7 +319,8 @@ test_private_ptt_preserves_grant_identity(void) {
     ev = p25_sm_ev_ptt_call(0, 0, 0, 0x010203, 1, P25_SM_SVC_UNKNOWN);
     p25_sm_event(&ctx, &g_opts, &g_state, &ev);
     if (!ctx.slots[0].voice_active || ctx.slots[0].is_group || ctx.slots[0].dst != 0xABCDEF
-        || ctx.slots[0].target_id != 0xABCDEF || g_state.gi[0] != 1 || g_state.lasttg != 0xABCDEF) {
+        || ctx.slots[0].target_id != 0xABCDEF
+        || !canonical_call_is(0U, DSD_CALL_PHASE_ACTIVE, DSD_CALL_KIND_PRIVATE_VOICE, 0xABCDEF, 0x010203)) {
         DSD_FPRINTF(stderr, "FAIL: Zero-address MAC_PTT did not retain the private grant identity\n");
         return 1;
     }
@@ -217,8 +331,8 @@ test_private_ptt_preserves_grant_identity(void) {
     p25_sm_event(&ctx, &g_opts, &g_state, &ev);
     if (ctx.slots[0].voice_active || ctx.slots[0].is_group || ctx.slots[0].dst != 0xABCDEF
         || ctx.slots[0].target_id != 0xABCDEF || ctx.slots[0].svc_bits != P25_SM_SVC_UNKNOWN
-        || g_state.p25_crypto_state[0] != DSD_P25_CRYPTO_ENCRYPTED_PENDING || g_state.gi[0] != 1
-        || g_state.lasttg != 0xABCDEF) {
+        || g_state.p25_crypto_state[0] != DSD_P25_CRYPTO_ENCRYPTED_PENDING
+        || !canonical_call_is(0U, DSD_CALL_PHASE_ACTIVE, DSD_CALL_KIND_PRIVATE_VOICE, 0xABCDEF, 0x010203)) {
         DSD_FPRINTF(stderr, "FAIL: Nonzero MAC_PTT group field replaced the private grant identity\n");
         return 1;
     }
@@ -226,7 +340,7 @@ test_private_ptt_preserves_grant_identity(void) {
     ev = p25_sm_ev_end_call_at(0, 0x4567, 0x010203, ctx.slots[0].last_start_m + 0.001);
     p25_sm_event(&ctx, &g_opts, &g_state, &ev);
     if (ctx.slots[0].voice_active || !ctx.slots[0].grant_active || ctx.slots[0].last_end_m <= 0.0
-        || ctx.t_hangtime_m <= 0.0) {
+        || p25_sm_hangtime_started_m(&ctx) <= 0.0) {
         DSD_FPRINTF(stderr, "FAIL: Private END treated the MAC group field as the destination identity\n");
         return 1;
     }
@@ -254,8 +368,8 @@ test_authoritative_group_replaces_private_identity(void) {
     ev = p25_sm_ev_active_call(0, 0x2345, 0, 0x040506, 1, 0);
     p25_sm_event(&ctx, &g_opts, &g_state, &ev);
     if (!ctx.slots[0].voice_active || !ctx.slots[0].is_group || ctx.slots[0].ota_tg != 0x2345 || ctx.slots[0].dst != 0
-        || ctx.slots[0].target_id != 0x2345 || ctx.slots[0].src != 0x040506 || g_state.gi[0] != 0
-        || g_state.lasttg != 0x2345 || g_state.lastsrc != 0x040506) {
+        || ctx.slots[0].target_id != 0x2345 || ctx.slots[0].src != 0x040506
+        || !canonical_call_is(0U, DSD_CALL_PHASE_ACTIVE, DSD_CALL_KIND_GROUP_VOICE, 0x2345, 0x040506)) {
         DSD_FPRINTF(stderr, "FAIL: Authoritative group ACTIVE retained the preceding private identity\n");
         return 1;
     }
@@ -275,7 +389,8 @@ test_inband_zero_source_preserves_grant_identity(void) {
         p25_sm_event(&ctx, &g_opts, &g_state, &ev);
         ev = use_active ? p25_sm_ev_active_call(0, 1000, 0, 0, 1, 0) : p25_sm_ev_ptt_call(0, 1000, 0, 0, 1, 0);
         p25_sm_event(&ctx, &g_opts, &g_state, &ev);
-        if (!ctx.slots[0].voice_active || ctx.slots[0].src != 123 || g_state.lastsrc != 123) {
+        if (!ctx.slots[0].voice_active || ctx.slots[0].src != 123
+            || !canonical_call_is(0U, DSD_CALL_PHASE_ACTIVE, DSD_CALL_KIND_GROUP_VOICE, 1000, 123)) {
             DSD_FPRINTF(stderr, "FAIL: Source-less in-band identity discarded the grant RID\n");
             return 1;
         }
@@ -334,6 +449,385 @@ test_same_identity_ptt_starts_new_epoch_after_missed_end(void) {
 }
 
 static int
+test_raw_ptt_retransmissions_coalesce_history(void) {
+    static Event_History_I event_history[2];
+    reset_test_state();
+    DSD_MEMSET(event_history, 0, sizeof(event_history));
+    init_event_history(&event_history[0], 0, 255);
+    init_event_history(&event_history[1], 0, 255);
+    g_state.event_history_s = event_history;
+
+    p25_sm_ctx_t ctx;
+    start_tdma_fixture(&ctx, 0);
+    uint8_t signature[P25_SM_PTT_SIGNATURE_BYTES];
+    const uint64_t mi = UINT64_C(0x0102030405060708);
+    make_ptt_signature(signature, mi, 0x80, 0x2468, 123, 1000);
+    const double first_m = dsd_time_now_monotonic_s() - 10.0;
+    p25_sm_event_t ev = raw_ptt_event(0, 1000, 123, signature, first_m, 0);
+    p25_sm_event(&ctx, &g_opts, &g_state, &ev);
+
+    dsd_call_snapshot call;
+    if (!canonical_call_is(0U, DSD_CALL_PHASE_ACTIVE, DSD_CALL_KIND_GROUP_VOICE, 1000, 123)
+        || dsd_call_state_get(&g_state, 0U, &call) <= 0 || call.epoch != 1U || !ctx.slots[0].ptt_signature_valid) {
+        DSD_FPRINTF(stderr, "FAIL: Raw PTT retransmission fixture did not open its first epoch\n");
+        return 1;
+    }
+    const double first_start_m = ctx.slots[0].last_start_m;
+    if (p25_crypto_resolve(&g_opts, &g_state, DSD_P25_CRYPTO_PHASE2, 0, 0x80, 0x2468, mi, 1000) != DSD_P25_CRYPTO_CLEAR
+        || dsd_event_enrich_alias(&g_state, 0U, call.epoch, "RETX-ALIAS") <= 0) {
+        DSD_FPRINTF(stderr, "FAIL: Raw PTT retransmission fixture did not seed crypto/alias metadata\n");
+        return 1;
+    }
+    dsd_event_sync_slot(&g_opts, &g_state, 0U);
+
+    signature[0] ^= 0x01U;  // Clear-call MI is not an epoch discriminator.
+    signature[8] ^= 0x02U;  // The remaining crypto synchronization octet is also non-authoritative.
+    signature[10] ^= 0x04U; // Neither is the clear-call KID.
+    ev = raw_ptt_event(0, 1000, 123, signature, first_m + 0.2, 0);
+    p25_sm_event(&ctx, &g_opts, &g_state, &ev);
+    signature[7] ^= 0x08U;
+    signature[11] ^= 0x10U;
+    ev = raw_ptt_event(0, 1000, 123, signature, first_m + 1.2, 1);
+    p25_sm_event(&ctx, &g_opts, &g_state, &ev);
+    if (dsd_call_state_get(&g_state, 0U, &call) <= 0 || call.epoch != 1U
+        || fabs(ctx.slots[0].last_start_m - first_start_m) > 1.0e-9
+        || fabs(ctx.slots[0].ptt_last_seen_m - (first_m + 1.2)) > 1.0e-9
+        || g_state.p25_crypto_state[0] != DSD_P25_CRYPTO_CLEAR || g_state.payload_algid != 0x80
+        || strcmp(g_state.generic_talker_alias[0], "RETX-ALIAS") != 0
+        || event_history[0].Event_History_Items[1].event_string[0] != '\0') {
+        DSD_FPRINTF(stderr, "FAIL: Matching clear PTTs inside the inclusive window rotated or cleared the epoch\n");
+        return 1;
+    }
+
+    ev = p25_sm_ev_end_call_at(0, 1000, 123, first_m + 1.3);
+    p25_sm_event(&ctx, &g_opts, &g_state, &ev);
+    // The marker survives the explicit END so a straddling SACCH PTT repeat
+    // inside the retention tail stays recognizable as retention.
+    if (!ctx.slots[0].ptt_signature_valid || dsd_call_state_get(&g_state, 0U, &call) <= 0
+        || call.phase != DSD_CALL_PHASE_ENDED || call.epoch != 1U
+        || event_history[0].Event_History_Items[1].target_id != 1000U
+        || strcmp(event_history[0].Event_History_Items[1].alias, "RETX-ALIAS") != 0
+        || event_history[0].Event_History_Items[2].event_string[0] != '\0') {
+        DSD_FPRINTF(stderr, "FAIL: Retransmitted PTT epoch did not commit exactly one enriched history row\n");
+        return 1;
+    }
+
+    ev = raw_ptt_event(0, 1000, 123, signature, first_m + 1.4, 0);
+    p25_sm_event(&ctx, &g_opts, &g_state, &ev);
+    if (dsd_call_state_get(&g_state, 0U, &call) <= 0 || call.phase != DSD_CALL_PHASE_ACTIVE || call.epoch != 2U) {
+        DSD_FPRINTF(stderr, "FAIL: Accepted END did not permit an immediate same-signature epoch\n");
+        return 1;
+    }
+    const double boundary_start_m = ctx.slots[0].last_start_m;
+    ev = raw_ptt_event(0, 1000, 123, signature, first_m + 2.400001, 1);
+    p25_sm_event(&ctx, &g_opts, &g_state, &ev);
+    if (dsd_call_state_get(&g_state, 0U, &call) <= 0 || call.epoch != 3U
+        || ctx.slots[0].last_start_m <= boundary_start_m
+        || event_history[0].Event_History_Items[1].target_id != 1000U) {
+        DSD_FPRINTF(stderr, "FAIL: Post-window identical PTT did not open and record a separate epoch\n");
+        return 1;
+    }
+    return 0;
+}
+
+static int
+test_raw_ptt_signature_changes_open_epochs(void) {
+    reset_test_state();
+    p25_sm_ctx_t ctx;
+    start_tdma_fixture(&ctx, 0);
+
+    uint8_t signature[P25_SM_PTT_SIGNATURE_BYTES];
+    make_ptt_signature(signature, UINT64_C(0x0102030405060708), 0x84, 0x1111, 123, 1000);
+    const double first_m = dsd_time_now_monotonic_s() - 10.0;
+    p25_sm_event_t ev = raw_ptt_event(0, 1000, 123, signature, first_m, 0);
+    p25_sm_event(&ctx, &g_opts, &g_state, &ev);
+
+    dsd_call_snapshot call;
+    if (dsd_call_state_get(&g_state, 0U, &call) <= 0 || call.epoch != 1U) {
+        return 1;
+    }
+    uint64_t expected_epoch = call.epoch;
+
+    signature[0] ^= 0x01U; // MI
+    ev = raw_ptt_event(0, 1000, 123, signature, first_m + 0.1, 0);
+    p25_sm_event(&ctx, &g_opts, &g_state, &ev);
+    expected_epoch++;
+    if (dsd_call_state_get(&g_state, 0U, &call) <= 0 || call.epoch != expected_epoch) {
+        DSD_FPRINTF(stderr, "FAIL: Changed MI did not open a new PTT epoch\n");
+        return 1;
+    }
+
+    signature[9] = 0x89U; // ALGID
+    ev = raw_ptt_event(0, 1000, 123, signature, first_m + 0.2, 1);
+    p25_sm_event(&ctx, &g_opts, &g_state, &ev);
+    expected_epoch++;
+    if (dsd_call_state_get(&g_state, 0U, &call) <= 0 || call.epoch != expected_epoch) {
+        DSD_FPRINTF(stderr, "FAIL: Changed ALGID did not open a new PTT epoch\n");
+        return 1;
+    }
+
+    signature[10] ^= 0x01U; // KID
+    ev = raw_ptt_event(0, 1000, 123, signature, first_m + 0.3, 0);
+    p25_sm_event(&ctx, &g_opts, &g_state, &ev);
+    expected_epoch++;
+    if (dsd_call_state_get(&g_state, 0U, &call) <= 0 || call.epoch != expected_epoch) {
+        DSD_FPRINTF(stderr, "FAIL: Changed KID did not open a new PTT epoch\n");
+        return 1;
+    }
+
+    signature[14] = 124U; // Source identity
+    ev = raw_ptt_event(0, 1000, 124, signature, first_m + 0.4, 1);
+    p25_sm_event(&ctx, &g_opts, &g_state, &ev);
+    expected_epoch++;
+    if (dsd_call_state_get(&g_state, 0U, &call) <= 0 || call.epoch != expected_epoch || call.ota_source_id != 124U) {
+        DSD_FPRINTF(stderr, "FAIL: Changed PTT identity did not open a new epoch\n");
+        return 1;
+    }
+    return 0;
+}
+
+static int
+test_raw_ptt_boundary_invalidation(void) {
+    const p25_sm_event_type_e boundaries[] = {P25_SM_EV_END, P25_SM_EV_IDLE, P25_SM_EV_HANGTIME};
+    for (size_t i = 0; i < sizeof(boundaries) / sizeof(boundaries[0]); i++) {
+        reset_test_state();
+        p25_sm_ctx_t ctx;
+        start_tdma_fixture(&ctx, 0);
+        uint8_t signature[P25_SM_PTT_SIGNATURE_BYTES];
+        make_ptt_signature(signature, UINT64_C(0x1112131415161718), 0x80, 0, 123, 1000);
+        const double first_m = dsd_time_now_monotonic_s() - 10.0;
+        p25_sm_event_t ev = raw_ptt_event(0, 1000, 123, signature, first_m, 0);
+        p25_sm_event(&ctx, &g_opts, &g_state, &ev);
+
+        if (boundaries[i] == P25_SM_EV_END) {
+            ev = p25_sm_ev_end_call_at(0, 1000, 123, first_m + 0.1);
+        } else if (boundaries[i] == P25_SM_EV_IDLE) {
+            ev = p25_sm_ev_idle_at(0, first_m + 0.1);
+        } else {
+            ev = p25_sm_ev_hangtime(0);
+            ev.observed_m = first_m + 0.1;
+        }
+        p25_sm_event(&ctx, &g_opts, &g_state, &ev);
+        // An explicit END keeps the marker so a straddling SACCH PTT repeat
+        // inside its retention tail stays recognizable; inactivity teardowns
+        // have no straddle to recognize and drop it.
+        const int marker_should_survive = boundaries[i] == P25_SM_EV_END;
+        if (ctx.slots[0].ptt_signature_valid != marker_should_survive) {
+            DSD_FPRINTF(stderr, "FAIL: Boundary %d marker handling changed\n", (int)boundaries[i]);
+            return 1;
+        }
+
+        ev = raw_ptt_event(0, 1000, 123, signature, first_m + 0.2, 1);
+        p25_sm_event(&ctx, &g_opts, &g_state, &ev);
+        dsd_call_snapshot call;
+        if (dsd_call_state_get(&g_state, 0U, &call) <= 0 || call.phase != DSD_CALL_PHASE_ACTIVE || call.epoch != 2U) {
+            DSD_FPRINTF(stderr, "FAIL: Boundary %d suppressed an immediate same-signature PTT\n", (int)boundaries[i]);
+            return 1;
+        }
+    }
+
+    reset_test_state();
+    p25_sm_ctx_t ctx;
+    start_tdma_fixture(&ctx, 0);
+    uint8_t signature[P25_SM_PTT_SIGNATURE_BYTES];
+    make_ptt_signature(signature, UINT64_C(0x2122232425262728), 0x80, 0, 123, 1000);
+    const double first_m = dsd_time_now_monotonic_s() - 10.0;
+    p25_sm_event_t ev = raw_ptt_event(0, 1000, 123, signature, first_m, 0);
+    p25_sm_event(&ctx, &g_opts, &g_state, &ev);
+    p25_sm_release(&ctx, &g_opts, &g_state, "ptt-marker-test");
+    if (ctx.slots[0].ptt_signature_valid || ctx.state != P25_SM_ON_CC) {
+        DSD_FPRINTF(stderr, "FAIL: Retune/release retained a PTT marker\n");
+        return 1;
+    }
+    start_tdma_fixture(&ctx, 0);
+    ev = raw_ptt_event(0, 1000, 123, signature, first_m + 0.1, 0);
+    p25_sm_event(&ctx, &g_opts, &g_state, &ev);
+    dsd_call_snapshot call;
+    if (dsd_call_state_get(&g_state, 0U, &call) <= 0 || call.phase != DSD_CALL_PHASE_ACTIVE || call.epoch != 2U) {
+        DSD_FPRINTF(stderr, "FAIL: Retune did not permit an immediate same-signature PTT\n");
+        return 1;
+    }
+
+    reset_test_state();
+    start_tdma_fixture(&ctx, 0);
+    make_ptt_signature(signature, UINT64_C(0x4142434445464748), 0x80, 0, 123, 1000);
+    ev = raw_ptt_event(0, 1000, 123, signature, first_m, 0);
+    p25_sm_event(&ctx, &g_opts, &g_state, &ev);
+    ev = p25_sm_ev_end_call_at(0, 9999, 999, first_m + 0.1);
+    p25_sm_event(&ctx, &g_opts, &g_state, &ev);
+    if (!ctx.slots[0].ptt_signature_valid) {
+        DSD_FPRINTF(stderr, "FAIL: Rejected stale boundary invalidated the PTT marker\n");
+        return 1;
+    }
+    ev = raw_ptt_event(0, 1000, 123, signature, first_m + 0.2, 1);
+    p25_sm_event(&ctx, &g_opts, &g_state, &ev);
+    if (dsd_call_state_get(&g_state, 0U, &call) <= 0 || call.epoch != 1U) {
+        DSD_FPRINTF(stderr, "FAIL: Rejected stale boundary broke retransmission coalescing\n");
+        return 1;
+    }
+
+    reset_test_state();
+    start_tdma_fixture(&ctx, 0);
+    ctx.slots[0].svc_bits = P25_SM_SVC_UNKNOWN;
+    make_ptt_signature(signature, UINT64_C(0x5152535455565758), 0x80, 0, 123, 1000);
+    ev = raw_ptt_event(0, 1000, 123, signature, first_m, 0);
+    ev.svc_bits = P25_SM_SVC_UNKNOWN;
+    p25_sm_event(&ctx, &g_opts, &g_state, &ev);
+    p25_sm_event_t reassignment = p25_sm_ev_group_grant(0x1234, 851500000, 2000, 456, 0);
+    p25_sm_event(&ctx, &g_opts, &g_state, &reassignment);
+    if (ctx.slots[0].target_id != 2000 || ctx.slots[0].ptt_signature_valid) {
+        DSD_FPRINTF(stderr, "FAIL: Accepted call reassignment did not invalidate the PTT marker\n");
+        return 1;
+    }
+    make_ptt_signature(signature, UINT64_C(0x5152535455565758), 0x80, 0, 456, 2000);
+    ev = raw_ptt_event(0, 2000, 456, signature, first_m + 0.1, 1);
+    p25_sm_event(&ctx, &g_opts, &g_state, &ev);
+    if (dsd_call_state_get(&g_state, 0U, &call) <= 0 || call.phase != DSD_CALL_PHASE_ACTIVE || call.epoch != 2U) {
+        DSD_FPRINTF(stderr, "FAIL: Reassignment suppressed an immediate replacement-call PTT\n");
+        return 1;
+    }
+    return 0;
+}
+
+static int
+test_raw_ptt_markers_are_slot_local(void) {
+    reset_test_state();
+    p25_sm_ctx_t ctx;
+    start_tdma_fixture(&ctx, 0);
+    p25_sm_event_t grant = p25_sm_ev_group_grant(0x1235, 851500000, 2000, 456, 0);
+    p25_sm_event(&ctx, &g_opts, &g_state, &grant);
+
+    uint8_t signature[P25_SM_PTT_SIGNATURE_BYTES];
+    make_ptt_signature(signature, UINT64_C(0x3132333435363738), 0x80, 0, 123, 1000);
+    const double first_m = dsd_time_now_monotonic_s() - 10.0;
+    p25_sm_event_t ev = raw_ptt_event(0, 1000, 123, signature, first_m, 0);
+    p25_sm_event(&ctx, &g_opts, &g_state, &ev);
+    ev = raw_ptt_event(1, 2000, 456, signature, first_m + 0.1, 1);
+    p25_sm_event(&ctx, &g_opts, &g_state, &ev);
+    const double slot0_start_m = ctx.slots[0].last_start_m;
+    const double slot1_start_m = ctx.slots[1].last_start_m;
+
+    ev = raw_ptt_event(0, 1000, 123, signature, first_m + 0.2, 1);
+    p25_sm_event(&ctx, &g_opts, &g_state, &ev);
+    if (!ctx.slots[0].ptt_signature_valid || !ctx.slots[1].ptt_signature_valid
+        || fabs(ctx.slots[0].last_start_m - slot0_start_m) > 1.0e-9
+        || fabs(ctx.slots[1].last_start_m - slot1_start_m) > 1.0e-9
+        || fabs(ctx.slots[0].ptt_last_seen_m - (first_m + 0.2)) > 1.0e-9
+        || fabs(ctx.slots[1].ptt_last_seen_m - (first_m + 0.1)) > 1.0e-9) {
+        DSD_FPRINTF(stderr, "FAIL: Identical PTT markers leaked across TDMA slots\n");
+        return 1;
+    }
+    return 0;
+}
+
+static int
+test_conventional_raw_ptt_retransmissions_coalesce(void) {
+    reset_test_state();
+    g_opts.trunk_enable = 0;
+    g_state.p25_cc_freq = 0;
+    g_state.synctype = DSD_SYNC_P25P2_POS;
+    g_state.lastsynctype = DSD_SYNC_P25P2_POS;
+    p25_sm_ctx_t* ctx = p25_sm_get_ctx();
+    p25_sm_init_ctx(ctx, &g_opts, &g_state);
+
+    uint8_t signature[P25_SM_PTT_SIGNATURE_BYTES];
+    make_ptt_signature(signature, UINT64_C(0x6162636465666768), 0x80, 0, 123, 1000);
+    const double first_m = dsd_time_now_monotonic_s() - 10.0;
+    if (!p25_sm_emit_ptt_call_metadata(&g_opts, &g_state, 0, 1000, 0, 123, 1, P25_SM_SVC_UNKNOWN, signature, first_m,
+                                       0)) {
+        return 1;
+    }
+    dsd_call_snapshot call;
+    if (dsd_call_state_get(&g_state, 0U, &call) <= 0 || call.phase != DSD_CALL_PHASE_ACTIVE || call.epoch != 1U
+        || !ctx->slots[0].ptt_signature_valid) {
+        DSD_FPRINTF(stderr, "FAIL: Conventional raw PTT did not start its first Phase 2 epoch\n");
+        return 1;
+    }
+
+    if (!p25_sm_emit_ptt_call_metadata(&g_opts, &g_state, 0, 1000, 0, 123, 1, P25_SM_SVC_UNKNOWN, signature,
+                                       first_m + 0.5, 1)
+        || dsd_call_state_get(&g_state, 0U, &call) <= 0 || call.epoch != 1U
+        || fabs(ctx->slots[0].ptt_last_seen_m - (first_m + 0.5)) > 1.0e-9) {
+        DSD_FPRINTF(stderr, "FAIL: Conventional identical raw PTT rotated the active Phase 2 epoch\n");
+        return 1;
+    }
+
+    if (!p25_sm_emit_end_call_at(&g_opts, &g_state, 0, 1000, 123, first_m + 0.6) || ctx->slots[0].ptt_signature_valid
+        || !p25_sm_emit_ptt_call_metadata(&g_opts, &g_state, 0, 1000, 0, 123, 1, P25_SM_SVC_UNKNOWN, signature,
+                                          first_m + 0.7, 0)
+        || dsd_call_state_get(&g_state, 0U, &call) <= 0 || call.phase != DSD_CALL_PHASE_ACTIVE || call.epoch != 2U) {
+        DSD_FPRINTF(stderr, "FAIL: Conventional Phase 2 END did not delimit the raw PTT epochs\n");
+        return 1;
+    }
+    return 0;
+}
+
+static int
+test_trunked_late_voice_is_rejected_after_encryption_lockout(void) {
+    static Event_History_I event_history[2];
+    reset_test_state();
+    DSD_MEMSET(event_history, 0, sizeof(event_history));
+    init_event_history(&event_history[0], 0, 255);
+    init_event_history(&event_history[1], 0, 255);
+    g_state.event_history_s = event_history;
+    g_opts.trunk_tune_enc_calls = 0;
+    g_state.trunk_chan_map[0x1234] = 851500000;
+    g_state.p25_chan_tdma_explicit[1] = 2;
+
+    p25_sm_ctx_t* ctx = p25_sm_get_ctx();
+    p25_sm_init_ctx(ctx, &g_opts, &g_state);
+    p25_sm_event_t ev = p25_sm_ev_group_grant(0x1234, 851500000, 20601, 618620, 0);
+    p25_sm_event(ctx, &g_opts, &g_state, &ev);
+
+    uint8_t signature[P25_SM_PTT_SIGNATURE_BYTES];
+    const uint64_t mi = UINT64_C(0xE83FF2906EA8F0D1);
+    const double first_m = dsd_time_now_monotonic_s();
+    make_ptt_signature(signature, mi, 0x84, 0x026C, 618620, 20601);
+    if (!p25_sm_emit_ptt_call_metadata(&g_opts, &g_state, 0, 20601, 0, 618620, 1, P25_SM_SVC_UNKNOWN, signature,
+                                       first_m, 0)
+        || p25_crypto_resolve(&g_opts, &g_state, DSD_P25_CRYPTO_PHASE2, 0, 0x84, 0x026C, mi, 20601)
+               != DSD_P25_CRYPTO_BLOCKED) {
+        DSD_FPRINTF(stderr, "FAIL: Late encrypted PTT fixture did not reach lockout\n");
+        return 1;
+    }
+
+    dsd_call_snapshot locked_call = {0};
+    if (ctx->state != P25_SM_ON_CC || g_opts.trunk_is_tuned != 0 || g_return_requests != 1
+        || dsd_call_state_get(&g_state, 0U, &locked_call) <= 0 || locked_call.phase != DSD_CALL_PHASE_ENDED
+        || locked_call.ota_target_id != 20601U || locked_call.ota_source_id != 618620U || ctx->slots[0].grant_active
+        || ctx->slots[0].voice_active || ctx->slots[0].ptt_signature_valid || g_state.payload_algid != 0
+        || g_state.payload_keyid != 0 || g_state.payload_miP != 0U
+        || g_state.p25_crypto_state[0] != DSD_P25_CRYPTO_UNKNOWN || g_state.p25_p2_audio_allowed[0] != 0) {
+        DSD_FPRINTF(stderr, "FAIL: Encryption lockout did not leave an ended call on the control channel\n");
+        return 1;
+    }
+
+    const uint64_t history_revision = event_history[0].revision;
+    if (p25_sm_emit_ptt_call_metadata(&g_opts, &g_state, 0, 20601, 0, 618620, 1, P25_SM_SVC_UNKNOWN, signature,
+                                      first_m + 0.1, 1)
+            != 0
+        || p25_sm_emit_active_call(&g_opts, &g_state, 0, 20601, 0, 618620, 1, 0x40) != 0) {
+        DSD_FPRINTF(stderr, "FAIL: Late trunked voice was accepted without a traffic assignment\n");
+        return 1;
+    }
+
+    dsd_call_snapshot after_late_voice = {0};
+    if (dsd_call_state_get(&g_state, 0U, &after_late_voice) <= 0 || after_late_voice.revision != locked_call.revision
+        || after_late_voice.epoch != locked_call.epoch || after_late_voice.phase != DSD_CALL_PHASE_ENDED
+        || after_late_voice.crypto != locked_call.crypto || after_late_voice.algid != locked_call.algid
+        || after_late_voice.kid != locked_call.kid || after_late_voice.mi != locked_call.mi
+        || event_history[0].revision != history_revision || ctx->state != P25_SM_ON_CC || g_opts.trunk_is_tuned != 0
+        || g_return_requests != 1 || ctx->slots[0].grant_active || ctx->slots[0].voice_active
+        || ctx->slots[0].ptt_signature_valid || g_state.payload_algid != 0 || g_state.payload_keyid != 0
+        || g_state.payload_miP != 0U || g_state.p25_crypto_state[0] != DSD_P25_CRYPTO_UNKNOWN
+        || g_state.p25_p2_audio_allowed[0] != 0) {
+        DSD_FPRINTF(stderr, "FAIL: Late trunked voice reopened or mutated the locked-out call\n");
+        return 1;
+    }
+    return 0;
+}
+
+static int
 test_source_less_identity_change_does_not_inherit_rid(void) {
     const struct {
         int tg;
@@ -360,8 +854,9 @@ test_source_less_identity_change_does_not_inherit_rid(void) {
         ev = p25_sm_ev_active_call(0, cases[i].tg, cases[i].dst, 0, cases[i].is_group, 0);
         p25_sm_event(&ctx, &g_opts, &g_state, &ev);
         const int target = cases[i].is_group ? cases[i].tg : cases[i].dst;
+        const dsd_call_kind kind = cases[i].is_group ? DSD_CALL_KIND_GROUP_VOICE : DSD_CALL_KIND_PRIVATE_VOICE;
         if (!ctx.slots[0].voice_active || ctx.slots[0].target_id != target || ctx.slots[0].is_group != cases[i].is_group
-            || ctx.slots[0].src != 0 || g_state.lastsrc != 0) {
+            || ctx.slots[0].src != 0 || !canonical_call_is(0U, DSD_CALL_PHASE_ACTIVE, kind, (uint64_t)target, 0U)) {
             DSD_FPRINTF(stderr, "FAIL: Source-less changed identity case %zu inherited the preceding RID\n", i);
             return 1;
         }
@@ -444,7 +939,7 @@ test_pending_crypto_uses_classification_deadline(void) {
     ev = p25_sm_ev_ptt_call(0, 1000, 0, 123, 1, P25_SM_SVC_UNKNOWN);
     p25_sm_event(&ctx, &g_opts, &g_state, &ev);
     if (g_state.p25_crypto_state[0] != DSD_P25_CRYPTO_ENCRYPTED_PENDING || ctx.slots[0].voice_active
-        || ctx.slots[0].crypto_attempt_m <= 0.0 || ctx.t_hangtime_m > 0.0) {
+        || ctx.slots[0].crypto_attempt_m <= 0.0 || p25_sm_hangtime_started_m(&ctx) > 0.0) {
         DSD_FPRINTF(stderr, "FAIL: Pending crypto did not retain its classification-only deadline\n");
         return 1;
     }
@@ -546,7 +1041,10 @@ test_p1_fresh_hdu_survives_missed_terminator(void) {
     const int algid = 0x81;
     const int keyid = 0x5678;
     const uint64_t mi = UINT64_C(0x1112131415161718);
-    g_state.p25_call_emergency[0] = 1;
+    if (!canonical_call_set_service(0U, 0x80)) {
+        DSD_FPRINTF(stderr, "FAIL: Could not seed stale emergency metadata on the canonical call\n");
+        return 1;
+    }
     g_state.p25_p1_identity_pending = 1;
     g_state.p25_p1_hdu_crypto_fresh = 1;
     if (p25_crypto_resolve(NULL, &g_state, DSD_P25_CRYPTO_PHASE1, 0, algid, keyid, mi, 2000)
@@ -557,11 +1055,12 @@ test_p1_fresh_hdu_survives_missed_terminator(void) {
 
     ev = p25_sm_ev_active_call(0, 2000, 0, 456, 1, 0x40);
     p25_sm_event(&ctx, &g_opts, &g_state, &ev);
+    dsd_call_snapshot call;
     if (ctx.state != P25_SM_TUNED || !ctx.slots[0].voice_active || ctx.slots[0].ota_tg != 2000
         || ctx.slots[0].src != 456 || g_state.p25_crypto_state[0] != DSD_P25_CRYPTO_DECRYPTABLE
         || g_state.payload_algid != algid || g_state.payload_keyid != keyid || g_state.payload_miP != mi
         || !p25_crypto_audio_permitted(&g_opts, &g_state, 0) || g_state.p25_p1_hdu_crypto_fresh
-        || g_state.p25_call_emergency[0]) {
+        || dsd_call_state_get(&g_state, 0U, &call) <= 0 || call.phase != DSD_CALL_PHASE_ACTIVE || call.emergency) {
         DSD_FPRINTF(stderr, "FAIL: Identity change after missed terminator discarded fresh HDU crypto\n");
         return 1;
     }
@@ -762,11 +1261,16 @@ test_p1_clear_identity_quarantines_conflicting_hdu(void) {
     if (setup_p1_retained_clear_conflict(&ctx, 0) != 0) {
         return 1;
     }
+    // An unconfirmed conflict expiring under encryption lockout resumes the
+    // presumed-clear call exactly like encrypted-follow mode: the tuple never
+    // corroborated against explicit-clear service options, so releasing the
+    // channel would drop clear voice over a single unrepeated observation.
     ctx.slots[0].crypto_attempt_m = dsd_time_now_monotonic_s() - ctx.config.grant_timeout_s - 0.1;
     p25_sm_tick_ctx(&ctx, &g_opts, &g_state);
-    if (ctx.state != P25_SM_ON_CC || g_return_requests != 1 || encrypted_call_cache_has(3069U, 1)
-        || g_state.p25_p1_crypto_conflict.active) {
-        DSD_FPRINTF(stderr, "FAIL: Unconfirmed Phase 1 conflict timeout produced encrypted-call side effects\n");
+    if (ctx.state != P25_SM_TUNED || g_return_requests != 0 || encrypted_call_cache_has(3069U, 1)
+        || g_state.p25_p1_crypto_conflict.active || g_state.p25_crypto_state[0] != DSD_P25_CRYPTO_CLEAR
+        || !p25_crypto_audio_permitted(&g_opts, &g_state, 0)) {
+        DSD_FPRINTF(stderr, "FAIL: Unconfirmed lockout conflict timeout did not resume the presumed-clear call\n");
         return 1;
     }
     return 0;
@@ -800,7 +1304,7 @@ test_p1_follow_mode_does_not_clear_conflict_after_encrypted_lcw(void) {
 
     p25_sm_event_t ev = p25_sm_ev_active_call(0, 3069, 0, 4009646, 1, 0x44);
     p25_sm_event(&ctx, &g_opts, &g_state, &ev);
-    if (ctx.slots[0].svc_bits != 0x44 || g_state.dmr_so != 0x44 || !g_state.p25_service_options_valid[0]
+    if (ctx.slots[0].svc_bits != 0x44 || g_state.dmr_so != 0x44 || !canonical_call_has_service(0U, 0x44, 0U, 4U)
         || !g_state.p25_p1_crypto_conflict.active || g_state.p25_crypto_state[0] != DSD_P25_CRYPTO_ENCRYPTED_PENDING) {
         DSD_FPRINTF(stderr, "FAIL: Encrypted LCW did not replace the clear conflict service options\n");
         return 1;
@@ -831,7 +1335,6 @@ test_p1_clear_conflict_restarts_deadline(void) {
     ev = p25_sm_ev_active_call(0, 3069, 0, 4009646, 1, 0x04);
     p25_sm_event(ctx, &g_opts, &g_state, &ev);
     g_state.dmr_so = 0x04;
-    g_state.p25_service_options_valid[0] = 1;
 
     if (p25_crypto_resolve(&g_opts, &g_state, DSD_P25_CRYPTO_PHASE1, 0, 0xA0, 0x0064, UINT64_C(0x0102030405060708),
                            3069)
@@ -873,7 +1376,7 @@ test_p1_grant_hdu_conflict_survives_first_active(void) {
     p25_sm_init_ctx(ctx, &g_opts, &g_state);
     p25_sm_event_t ev = p25_sm_ev_group_grant(0x1234, 851500000, 3069, 4009646, 0x04);
     p25_sm_event(ctx, &g_opts, &g_state, &ev);
-    if (ctx->state != P25_SM_TUNED || g_state.dmr_so != 0x04 || !g_state.p25_service_options_valid[0]
+    if (ctx->state != P25_SM_TUNED || ctx->slots[0].svc_bits != 0x04 || g_state.dmr_so != 0x04
         || g_state.p25_crypto_state[0] != DSD_P25_CRYPTO_CLEAR) {
         DSD_FPRINTF(stderr, "FAIL: Clear Phase 1 grant did not retain service options for HDU reconciliation\n");
         return 1;
@@ -883,8 +1386,9 @@ test_p1_grant_hdu_conflict_survives_first_active(void) {
     const int keyid = 0x0064;
     const uint64_t mi = UINT64_C(0x0102030405060708);
     g_state.p25_p1_hdu_crypto_fresh = 1;
-    if (p25_crypto_resolve(&g_opts, &g_state, DSD_P25_CRYPTO_PHASE1, 0, algid, keyid, mi, 3069)
-            != DSD_P25_CRYPTO_ENCRYPTED_PENDING
+    if (!canonical_call_begin_p1(3069U, 4009646U, 0x04U)
+        || p25_crypto_resolve(&g_opts, &g_state, DSD_P25_CRYPTO_PHASE1, 0, algid, keyid, mi, 3069)
+               != DSD_P25_CRYPTO_ENCRYPTED_PENDING
         || !g_state.p25_p1_crypto_conflict.active || ctx->slots[0].crypto_attempt_m <= 0.0) {
         DSD_FPRINTF(stderr, "FAIL: Conflicting HDU did not enter Phase 1 quarantine after a clear grant\n");
         return 1;
@@ -923,9 +1427,10 @@ test_p1_follow_mode_preserves_grant_conflict_deadline(void) {
     p25_sm_event(ctx, &g_opts, &g_state, &ev);
 
     g_state.p25_p1_hdu_crypto_fresh = 1;
-    if (p25_crypto_resolve(&g_opts, &g_state, DSD_P25_CRYPTO_PHASE1, 0, 0xA0, 0x0064, UINT64_C(0x0102030405060708),
-                           3069)
-            != DSD_P25_CRYPTO_ENCRYPTED_PENDING
+    if (!canonical_call_begin_p1(3069U, 4009646U, 0x04U)
+        || p25_crypto_resolve(&g_opts, &g_state, DSD_P25_CRYPTO_PHASE1, 0, 0xA0, 0x0064, UINT64_C(0x0102030405060708),
+                              3069)
+               != DSD_P25_CRYPTO_ENCRYPTED_PENDING
         || !g_state.p25_p1_crypto_conflict.active || ctx->slots[0].crypto_attempt_m <= 0.0) {
         DSD_FPRINTF(stderr, "FAIL: Encrypted-follow fixture did not start the grant conflict deadline\n");
         return 1;
@@ -1065,17 +1570,213 @@ test_conventional_end_is_follower_noop(void) {
     p25_sm_ctx_t* ctx = p25_sm_get_ctx();
     p25_sm_init_ctx(ctx, &g_opts, &g_state);
     const double now_m = dsd_time_now_monotonic_s();
+    dsd_call_snapshot call;
 
+    if (!p25_sm_emit_ptt_call(&g_opts, &g_state, 0, 1000, 0, 123, 1, 0) || dsd_call_state_get(&g_state, 0U, &call) <= 0
+        || call.phase != DSD_CALL_PHASE_ACTIVE) {
+        DSD_FPRINTF(stderr, "FAIL: Conventional SACCH fixture did not publish an active canonical call\n");
+        return 1;
+    }
     if (!p25_sm_emit_end_call_at(&g_opts, &g_state, 0, 1000, 123, now_m)) {
         DSD_FPRINTF(stderr, "FAIL: Conventional SACCH END was rejected by the trunk follower\n");
+        return 1;
+    }
+    if (dsd_call_state_get(&g_state, 0U, &call) <= 0 || call.phase != DSD_CALL_PHASE_ENDED) {
+        DSD_FPRINTF(stderr, "FAIL: Conventional SACCH END did not finalize the canonical call\n");
+        return 1;
+    }
+    if (!p25_sm_emit_ptt_call(&g_opts, &g_state, 1, 2000, 0, 456, 1, 0) || dsd_call_state_get(&g_state, 1U, &call) <= 0
+        || call.phase != DSD_CALL_PHASE_ACTIVE) {
+        DSD_FPRINTF(stderr, "FAIL: Conventional FACCH fixture did not publish an active canonical call\n");
         return 1;
     }
     if (p25_sm_emit_facch_end_call_at(&g_opts, &g_state, 1, 2000, 456, now_m) != P25_SM_END_APPLIED) {
         DSD_FPRINTF(stderr, "FAIL: Conventional FACCH END was rejected by the trunk follower\n");
         return 1;
     }
+    if (dsd_call_state_get(&g_state, 1U, &call) <= 0 || call.phase != DSD_CALL_PHASE_ENDED) {
+        DSD_FPRINTF(stderr, "FAIL: Conventional FACCH END did not finalize the canonical call\n");
+        return 1;
+    }
     if (ctx->state != P25_SM_IDLE || g_return_requests != 0) {
         DSD_FPRINTF(stderr, "FAIL: Conventional END follower no-op changed trunk state\n");
+        return 1;
+    }
+    return 0;
+}
+
+static int
+conventional_slot_ended_with_reason(uint8_t slot, dsd_call_end_reason want_reason, const char* label) {
+    dsd_call_snapshot call;
+    if (dsd_call_state_get(&g_state, slot, &call) <= 0 || call.phase != DSD_CALL_PHASE_ENDED
+        || call.end_reason != (uint8_t)want_reason) {
+        DSD_FPRINTF(stderr, "FAIL: Conventional %s end did not record end reason %d\n", label, (int)want_reason);
+        return 1;
+    }
+    return 0;
+}
+
+// Regression: outside P25_SM_TUNED, the emit wrappers finish the canonical call through a
+// fallback that used to hardcode DSD_CALL_END_EXPLICIT. Decoded OTA end signaling
+// (MAC_END_PTT, FACCH end, TDU, LCW termination, MAC Release) must end the epoch with
+// DSD_CALL_END_TERMINATOR so the event layer keeps audible identity-less receptions, while
+// inactivity-driven idle/hangtime ends stay EXPLICIT.
+static int
+test_conventional_ota_end_reasons_are_terminator(void) {
+    reset_test_state();
+    g_opts.trunk_enable = 0;
+    g_state.p25_cc_freq = 0;
+    p25_sm_ctx_t* ctx = p25_sm_get_ctx();
+    p25_sm_init_ctx(ctx, &g_opts, &g_state);
+    const double now_m = dsd_time_now_monotonic_s();
+
+    if (!p25_sm_emit_ptt_call(&g_opts, &g_state, 0, 1000, 0, 123, 1, 0)
+        || !p25_sm_emit_end_call_at(&g_opts, &g_state, 0, 1000, 123, now_m)
+        || conventional_slot_ended_with_reason(0U, DSD_CALL_END_TERMINATOR, "MAC_END_PTT")) {
+        return 1;
+    }
+
+    if (!p25_sm_emit_ptt_call(&g_opts, &g_state, 1, 1500, 0, 321, 1, 0)
+        || p25_sm_emit_facch_end_call_at(&g_opts, &g_state, 1, 1500, 321, now_m) != P25_SM_END_APPLIED
+        || conventional_slot_ended_with_reason(1U, DSD_CALL_END_TERMINATOR, "FACCH")) {
+        return 1;
+    }
+
+    if (!p25_sm_emit_ptt_call(&g_opts, &g_state, 0, 2000, 0, 456, 1, 0)) {
+        return 1;
+    }
+    p25_sm_emit_tdu(&g_opts, &g_state);
+    if (conventional_slot_ended_with_reason(0U, DSD_CALL_END_TERMINATOR, "TDU")) {
+        return 1;
+    }
+
+    if (!p25_sm_emit_ptt_call(&g_opts, &g_state, 0, 3000, 0, 789, 1, 0)) {
+        return 1;
+    }
+    p25_sm_emit_end(&g_opts, &g_state, 0);
+    if (conventional_slot_ended_with_reason(0U, DSD_CALL_END_TERMINATOR, "LCW termination")) {
+        return 1;
+    }
+
+    if (!p25_sm_emit_ptt_call(&g_opts, &g_state, 0, 4000, 0, 111, 1, 0)) {
+        return 1;
+    }
+    p25_sm_emit_mac_release(&g_opts, &g_state, 0, dsd_time_now_monotonic_s());
+    if (conventional_slot_ended_with_reason(0U, DSD_CALL_END_TERMINATOR, "MAC Release")) {
+        return 1;
+    }
+
+    if (!p25_sm_emit_ptt_call(&g_opts, &g_state, 0, 5000, 0, 222, 1, 0)) {
+        return 1;
+    }
+    p25_sm_emit_idle(&g_opts, &g_state, 0);
+    if (conventional_slot_ended_with_reason(0U, DSD_CALL_END_EXPLICIT, "idle")) {
+        return 1;
+    }
+
+    if (!p25_sm_emit_ptt_call(&g_opts, &g_state, 0, 6000, 0, 333, 1, 0)) {
+        return 1;
+    }
+    p25_sm_emit_hangtime(&g_opts, &g_state, 0);
+    if (conventional_slot_ended_with_reason(0U, DSD_CALL_END_EXPLICIT, "hangtime")) {
+        return 1;
+    }
+    return 0;
+}
+
+static int
+test_conventional_anonymous_activity_waits_for_identity(void) {
+    reset_test_state();
+    g_opts.trunk_enable = 0;
+    g_state.p25_cc_freq = 0;
+    p25_sm_ctx_t* ctx = p25_sm_get_ctx();
+    p25_sm_init_ctx(ctx, &g_opts, &g_state);
+    dsd_call_snapshot call;
+
+    if (!p25_sm_emit_active_call(&g_opts, &g_state, 0, 1000, 0, 123, 1, 0x85)
+        || dsd_call_state_get(&g_state, 0U, &call) <= 0 || call.phase != DSD_CALL_PHASE_ACTIVE) {
+        DSD_FPRINTF(stderr, "FAIL: Conventional stale-identity fixture did not publish its first epoch\n");
+        return 1;
+    }
+    const uint64_t first_epoch = call.epoch;
+
+    p25_sm_emit_tdu(&g_opts, &g_state);
+    if (dsd_call_state_get(&g_state, 0U, &call) <= 0 || call.phase != DSD_CALL_PHASE_ENDED
+        || call.epoch != first_epoch) {
+        DSD_FPRINTF(stderr, "FAIL: Conventional TDU did not finish the stale-identity fixture\n");
+        return 1;
+    }
+    const uint64_t ended_revision = call.revision;
+
+    if (!p25_sm_emit_active(&g_opts, &g_state, 0) || dsd_call_state_get(&g_state, 0U, &call) <= 0
+        || call.phase != DSD_CALL_PHASE_ENDED || call.epoch != first_epoch || call.revision != ended_revision) {
+        DSD_FPRINTF(stderr, "FAIL: Anonymous conventional activity reopened the completed canonical identity\n");
+        return 1;
+    }
+
+    if (!p25_sm_emit_active_call(&g_opts, &g_state, 0, 2000, 0, 456, 1, 0x82)
+        || dsd_call_state_get(&g_state, 0U, &call) <= 0 || call.phase != DSD_CALL_PHASE_ACTIVE
+        || call.epoch != first_epoch + 1U || call.ota_target_id != 2000U || call.ota_source_id != 456U) {
+        DSD_FPRINTF(stderr, "FAIL: Identified conventional follow-up did not open exactly one correct epoch\n");
+        return 1;
+    }
+    return 0;
+}
+
+static int
+test_conventional_anonymous_activity_preserves_service_options(void) {
+    reset_test_state();
+    g_opts.trunk_enable = 0;
+    g_state.p25_cc_freq = 0;
+    g_state.dmr_so = 0x85;
+    p25_sm_ctx_t* ctx = p25_sm_get_ctx();
+    p25_sm_init_ctx(ctx, &g_opts, &g_state);
+    dsd_call_snapshot call;
+
+    if (!p25_sm_emit_active_call(&g_opts, &g_state, 0, 1000, 0, 123, 1, 0x85)
+        || !p25_sm_emit_active(&g_opts, &g_state, 0) || !p25_sm_emit_ptt(&g_opts, &g_state, 0)
+        || dsd_call_state_get(&g_state, 0U, &call) <= 0 || call.phase != DSD_CALL_PHASE_ACTIVE || call.epoch != 1U
+        || call.service_options != 0x85U || !call.emergency || call.priority != 5U) {
+        DSD_FPRINTF(stderr, "FAIL: Anonymous conventional activity cleared service options or rotated the epoch\n");
+        return 1;
+    }
+    return 0;
+}
+
+static int
+test_conventional_unknown_service_stays_unconfirmed(void) {
+    reset_test_state();
+    g_opts.trunk_enable = 0;
+    g_state.p25_cc_freq = 0;
+    p25_sm_ctx_t* ctx = p25_sm_get_ctx();
+    p25_sm_init_ctx(ctx, &g_opts, &g_state);
+    dsd_call_snapshot call;
+
+    if (!p25_sm_emit_ptt_call(&g_opts, &g_state, 0, 1000, 0, 123, 1, P25_SM_SVC_UNKNOWN)
+        || dsd_call_state_get(&g_state, 0U, &call) <= 0 || call.phase != DSD_CALL_PHASE_ACTIVE
+        || call.has_service_metadata != 0U || call.service_options != 0U || call.emergency != 0U
+        || call.priority != 0U) {
+        DSD_FPRINTF(stderr, "FAIL: Conventional unknown service options were recorded as confirmed metadata\n");
+        return 1;
+    }
+
+    reset_test_state();
+    g_opts.trunk_enable = 0;
+    g_state.p25_cc_freq = 0;
+    ctx = p25_sm_get_ctx();
+    p25_sm_init_ctx(ctx, &g_opts, &g_state);
+    if (!p25_sm_emit_ptt_call(&g_opts, &g_state, 0, 1000, 0, 123, 1, 0x85)
+        || dsd_call_state_get(&g_state, 0U, &call) <= 0 || call.has_service_metadata == 0U) {
+        DSD_FPRINTF(stderr, "FAIL: Conventional stale-service fixture did not publish confirmed metadata\n");
+        return 1;
+    }
+    const uint64_t first_epoch = call.epoch;
+    if (!p25_sm_emit_ptt_call(&g_opts, &g_state, 0, 2000, 0, 456, 1, P25_SM_SVC_UNKNOWN)
+        || dsd_call_state_get(&g_state, 0U, &call) <= 0 || call.phase != DSD_CALL_PHASE_ACTIVE
+        || call.epoch != first_epoch + 1U || call.ota_target_id != 2000U || call.ota_source_id != 456U
+        || call.has_service_metadata != 0U || call.service_options != 0U || call.emergency != 0U
+        || call.priority != 0U) {
+        DSD_FPRINTF(stderr, "FAIL: Conventional unknown BEGIN inherited service metadata from a prior epoch\n");
         return 1;
     }
     return 0;
@@ -1101,7 +1802,7 @@ test_end_clears_voice(void) {
     ev = p25_sm_ev_end(0);
     p25_sm_event(&ctx, &g_opts, &g_state, &ev);
 
-    if (ctx.state != P25_SM_TUNED || ctx.t_hangtime_m <= 0.0 || !ctx.slots[0].grant_active) {
+    if (ctx.state != P25_SM_TUNED || p25_sm_hangtime_started_m(&ctx) <= 0.0 || !ctx.slots[0].grant_active) {
         DSD_FPRINTF(stderr, "FAIL: Expected retained TUNED allocation after END, got %s\n",
                     p25_sm_state_name(ctx.state));
         return 1;
@@ -1137,7 +1838,7 @@ test_tdma_boundaries_only_hang_after_last_assigned_voice(void) {
 
     ev = p25_sm_ev_idle(1);
     p25_sm_event(&ctx, &g_opts, &g_state, &ev);
-    if (ctx.vc_activity_seen || ctx.t_hangtime_m > 0.0 || !ctx.slots[0].grant_active) {
+    if (ctx.vc_activity_seen || p25_sm_hangtime_started_m(&ctx) > 0.0 || !ctx.slots[0].grant_active) {
         DSD_FPRINTF(stderr, "FAIL: Unassigned companion IDLE manufactured traffic activity or hang\n");
         return 1;
     }
@@ -1167,14 +1868,14 @@ test_tdma_boundaries_only_hang_after_last_assigned_voice(void) {
 
     ev = p25_sm_ev_hangtime(1);
     p25_sm_event(&ctx, &g_opts, &g_state, &ev);
-    if (!ctx.slots[0].voice_active || ctx.slots[1].voice_active || ctx.t_hangtime_m > 0.0) {
+    if (!ctx.slots[0].voice_active || ctx.slots[1].voice_active || p25_sm_hangtime_started_m(&ctx) > 0.0) {
         DSD_FPRINTF(stderr, "FAIL: Ending one assigned slot armed hang while its companion remained active\n");
         return 1;
     }
 
     ev = p25_sm_ev_end(0);
     p25_sm_event(&ctx, &g_opts, &g_state, &ev);
-    if (ctx.t_hangtime_m <= 0.0 || g_return_requests != 0) {
+    if (p25_sm_hangtime_started_m(&ctx) <= 0.0 || g_return_requests != 0) {
         DSD_FPRINTF(stderr, "FAIL: Last assigned voice transition did not arm traffic hang\n");
         return 1;
     }
@@ -1207,7 +1908,7 @@ test_tdma_idle_ends_voice_with_newer_grant(void) {
     p25_sm_event(&ctx, &g_opts, &g_state, &ev);
     if (ctx.slots[0].voice_active || !ctx.slots[0].grant_active || ctx.slots[0].target_id != 1000
         || ctx.slots[0].src != 123 || fabs(ctx.slots[0].last_grant_m - newer_grant_m) > 1.0e-9
-        || ctx.t_hangtime_m <= 0.0 || g_state.p25_crypto_state[0] != DSD_P25_CRYPTO_CLEAR
+        || p25_sm_hangtime_started_m(&ctx) <= 0.0 || g_state.p25_crypto_state[0] != DSD_P25_CRYPTO_CLEAR
         || g_state.p25_p2_audio_allowed[0]) {
         DSD_FPRINTF(stderr, "FAIL: TDMA IDLE did not end voice while preserving its newer grant\n");
         return 1;
@@ -1250,11 +1951,50 @@ test_anonymous_followup_restarts_crypto_pending(void) {
 
     ev = p25_sm_ev_end(0);
     p25_sm_event(&ctx, &g_opts, &g_state, &ev);
+    // Past the post-END retention tail: inside it an identity-less ACTIVE is
+    // retention of the ended call and must not reopen (P25_P2_ACTIVE_PTT_EPOCH
+    // covers that); after it, one that fails identity decode is the next
+    // transmission and must not inherit the ended call's clear classification.
+    ctx.slots[0].last_end_m = dsd_time_now_monotonic_s() - 1.1;
     ev = p25_sm_ev_active(0);
     p25_sm_event(&ctx, &g_opts, &g_state, &ev);
     if (g_state.p25_crypto_state[0] != DSD_P25_CRYPTO_ENCRYPTED_PENDING || ctx.slots[0].svc_bits != P25_SM_SVC_UNKNOWN
         || ctx.slots[0].voice_active || g_state.p25_p2_audio_allowed[0] != 0 || ctx.slots[0].crypto_attempt_m <= 0.0) {
         DSD_FPRINTF(stderr, "FAIL: Anonymous follow-up inherited stale clear crypto classification\n");
+        return 1;
+    }
+    return 0;
+}
+
+static int
+test_source_less_duplicate_grant_republishes_crypto(void) {
+    reset_test_state();
+    g_state.trunk_chan_map[0x1234] = 851500000;
+    g_state.p25_chan_tdma_explicit[1] = 2;
+
+    p25_sm_ctx_t ctx;
+    p25_sm_init_ctx(&ctx, &g_opts, &g_state);
+    p25_sm_event_t ev = p25_sm_ev_group_grant(0x1234, 851500000, 1000, 0, 0);
+    p25_sm_event(&ctx, &g_opts, &g_state, &ev);
+    ev = p25_sm_ev_active_call(0, 1000, 0, 0, 1, 0);
+    p25_sm_event(&ctx, &g_opts, &g_state, &ev);
+    if (!ctx.slots[0].voice_active || dsd_call_state_end(&g_state, 0U, 0.0) <= 0) {
+        DSD_FPRINTF(stderr, "FAIL: Source-less crypto republish fixture did not retain stale activity\n");
+        return 1;
+    }
+
+    g_state.payload_algid = 0x84;
+    g_state.payload_keyid = 0x1234;
+    g_state.payload_miP = UINT64_C(0x0102030405060708);
+    g_state.p25_crypto_state[0] = DSD_P25_CRYPTO_BLOCKED;
+    ev = p25_sm_ev_group_grant_update(0x1234, 851500000, 1000, 0, 0);
+    p25_sm_event(&ctx, &g_opts, &g_state, &ev);
+
+    dsd_call_snapshot call;
+    if (dsd_call_state_get(&g_state, 0U, &call) <= 0 || call.phase != DSD_CALL_PHASE_ENDED || call.algid != 0x84U
+        || call.kid != 0x1234U || call.mi != UINT64_C(0x0102030405060708) || call.crypto != DSD_CALL_CRYPTO_ENCRYPTED
+        || call.audio_permitted != 0U) {
+        DSD_FPRINTF(stderr, "FAIL: Source-less duplicate grant dropped the crypto republish\n");
         return 1;
     }
     return 0;
@@ -1274,12 +2014,13 @@ test_unassigned_companion_start_is_rejected(void) {
     p25_sm_event(&ctx, &g_opts, &g_state, &ev);
     ev = p25_sm_ev_end(0);
     p25_sm_event(&ctx, &g_opts, &g_state, &ev);
-    const double hang_started_m = ctx.t_hangtime_m;
+    const double hang_started_m = p25_sm_hangtime_started_m(&ctx);
 
     ev = p25_sm_ev_active_call(1, 2000, 0, 456, 1, 0);
     p25_sm_event(&ctx, &g_opts, &g_state, &ev);
-    if (ctx.slots[1].voice_active || fabs(ctx.t_hangtime_m - hang_started_m) > 1.0e-9 || ctx.state != P25_SM_TUNED
-        || g_return_requests != 0 || !g_state.p25_p2_media_rejected[1] || g_state.p25_p2_audio_allowed[1] != 0) {
+    if (ctx.slots[1].voice_active || fabs(p25_sm_hangtime_started_m(&ctx) - hang_started_m) > 1.0e-9
+        || ctx.state != P25_SM_TUNED || g_return_requests != 0 || !g_state.p25_p2_media_rejected[1]
+        || g_state.p25_p2_audio_allowed[1] != 0) {
         DSD_FPRINTF(stderr, "FAIL: Unassigned companion ACTIVE bypassed routing policy or canceled hang\n");
         return 1;
     }
@@ -1414,7 +2155,7 @@ test_tdma_partial_end_stays_tuned(void) {
     p25_sm_event(&ctx, &g_opts, &g_state, &ev);
 
     // Both transmissions have ended, but the physical allocation remains.
-    if (ctx.state != P25_SM_TUNED || ctx.t_hangtime_m <= 0.0 || g_return_requests != 0) {
+    if (ctx.state != P25_SM_TUNED || p25_sm_hangtime_started_m(&ctx) <= 0.0 || g_return_requests != 0) {
         DSD_FPRINTF(stderr, "FAIL: Expected retained TDMA carrier after both ENDs, got %s\n",
                     p25_sm_state_name(ctx.state));
         return 1;
@@ -1467,8 +2208,11 @@ test_tdma_pending_other_slot_blocks_release(void) {
         DSD_FPRINTF(stderr, "FAIL: END discarded a retained slot assignment\n");
         return 1;
     }
-    if (ctx.t_hangtime_m > 0.0) {
-        DSD_FPRINTF(stderr, "FAIL: Pending companion grant was placed on the shorter traffic hang timer\n");
+    /* The countdown runs -- slot 0's END is a fact about slot 0 -- but a
+       companion assignment the SM has reason to follow outranks it until its
+       own acquisition window closes, which the two ticks below pin. */
+    if (p25_sm_hangtime_started_m(&ctx) <= 0.0) {
+        DSD_FPRINTF(stderr, "FAIL: Expected the ended slot to start the hangtime countdown\n");
         return 1;
     }
 
@@ -1504,8 +2248,8 @@ test_tdma_pending_other_slot_blocks_release(void) {
     p25_sm_event(&ctx, &g_opts, &g_state, &ev);
     ev = p25_sm_ev_end(0);
     p25_sm_event(&ctx, &g_opts, &g_state, &ev);
-    if (ctx.t_hangtime_m > 0.0 || !ctx.slots[1].grant_active || !ctx.slots[1].data_call) {
-        DSD_FPRINTF(stderr, "FAIL: Pending data companion was placed on the traffic hang timer\n");
+    if (p25_sm_hangtime_started_m(&ctx) <= 0.0 || !ctx.slots[1].grant_active || !ctx.slots[1].data_call) {
+        DSD_FPRINTF(stderr, "FAIL: Expected the ended slot to start the countdown beside the data grant\n");
         return 1;
     }
     acquisition_m = dsd_time_now_monotonic_s() - ctx.config.hangtime_s - 0.1;
@@ -1563,7 +2307,7 @@ test_tdma_enc_lockout_slot_does_not_block_release(void) {
 
     ev = p25_sm_ev_end(0);
     p25_sm_event(&ctx, &g_opts, &g_state, &ev);
-    if (ctx.state != P25_SM_TUNED || ctx.t_hangtime_m <= 0.0 || g_return_requests != 0) {
+    if (ctx.state != P25_SM_TUNED || p25_sm_hangtime_started_m(&ctx) <= 0.0 || g_return_requests != 0) {
         DSD_FPRINTF(stderr, "FAIL: Expected hang retention after clear slot END with encrypted slot muted, got %s\n",
                     p25_sm_state_name(ctx.state));
         return 1;
@@ -1620,7 +2364,8 @@ test_tdma_single_slot_end_retains_carrier(void) {
     ev = p25_sm_ev_end(0);
     p25_sm_event(&ctx, &g_opts, &g_state, &ev);
 
-    if (ctx.state != P25_SM_TUNED || ctx.t_hangtime_m <= 0.0 || !ctx.slots[0].grant_active || g_return_requests != 0) {
+    if (ctx.state != P25_SM_TUNED || p25_sm_hangtime_started_m(&ctx) <= 0.0 || !ctx.slots[0].grant_active
+        || g_return_requests != 0) {
         DSD_FPRINTF(stderr, "FAIL: Expected retained carrier after END on single-slot TDMA call, got %s\n",
                     p25_sm_state_name(ctx.state));
         return 1;
@@ -1666,10 +2411,6 @@ test_tdma_end_identity_and_order_guards(void) {
     p25_sm_event(&ctx, &g_opts, &g_state, &ev);
     ev = p25_sm_ev_ptt(1);
     p25_sm_event(&ctx, &g_opts, &g_state, &ev);
-    g_state.lasttg = 1000;
-    g_state.lastsrc = 101;
-    g_state.lasttgR = 2000;
-    g_state.lastsrcR = 202;
     g_state.p25_p2_audio_allowed[0] = 1;
     g_state.p25_p2_audio_allowed[1] = 1;
 
@@ -1727,8 +2468,6 @@ test_tdma_end_identity_and_order_guards(void) {
     ctx.slots[1].src = 303;
     ctx.slots[1].is_group = 1;
     ctx.slots[1].last_grant_m = ctx.slots[1].last_end_m + 1.0;
-    g_state.lasttgR = 3000;
-    g_state.lastsrcR = 303;
     const double before_new_grant = ctx.slots[1].last_grant_m - 0.001;
     ev = p25_sm_ev_end_call_at(1, 3000, 303, before_new_grant);
     p25_sm_event(&ctx, &g_opts, &g_state, &ev);
@@ -1877,6 +2616,67 @@ test_tdma_facch_double_end_release(void) {
     return 0;
 }
 
+// Regression: MAC_END_PTT frequently names the fixed-network placeholder
+// source (0xFFFFFF) instead of the completed talker, while the first END now
+// records the talker as the ended source. A placeholder-sourced repeat must
+// resolve to that recorded talker and still qualify the double-END fast
+// release -- otherwise the carrier lingers until hangtime expires after the
+// traffic channel already went quiet.
+static int
+test_tdma_facch_double_end_release_placeholder_src(void) {
+    reset_test_state();
+    g_state.trunk_chan_map[0x1234] = 851500000;
+    g_state.p25_chan_tdma_explicit[1] = 2;
+
+    p25_sm_ctx_t ctx;
+    p25_sm_init_ctx(&ctx, &g_opts, &g_state);
+    p25_sm_event_t ev = p25_sm_ev_group_grant(0x1234, 851500000, 1000, 123, 0);
+    p25_sm_event(&ctx, &g_opts, &g_state, &ev);
+    ev = p25_sm_ev_ptt_call(0, 1000, 0, 123, 1, 0);
+    p25_sm_event(&ctx, &g_opts, &g_state, &ev);
+
+    const double first_m = dsd_time_now_monotonic_s() + 0.01;
+    ev = p25_sm_ev_facch_end_call_at(0, 1000, 0xFFFFFF, first_m);
+    p25_sm_event(&ctx, &g_opts, &g_state, &ev);
+    if (ctx.state != P25_SM_TUNED || g_return_requests != 0) {
+        DSD_FPRINTF(stderr, "FAIL: First placeholder FACCH END released the carrier\n");
+        return 1;
+    }
+    if (ctx.slots[0].last_end_src != 123) {
+        DSD_FPRINTF(stderr, "FAIL: Placeholder END did not record the talker as the ended source\n");
+        return 1;
+    }
+
+    ev = p25_sm_ev_facch_end_call_at(0, 1000, 0xFFFFFF, first_m + 0.5);
+    p25_sm_event(&ctx, &g_opts, &g_state, &ev);
+    if (ctx.state != P25_SM_ON_CC || g_return_requests != 1) {
+        DSD_FPRINTF(stderr, "FAIL: Placeholder FACCH END pair did not release exactly once\n");
+        return 1;
+    }
+
+    // A repeat naming a different real talker is fresh evidence, never a
+    // qualifying pair.
+    reset_test_state();
+    g_state.trunk_chan_map[0x1234] = 851500000;
+    g_state.p25_chan_tdma_explicit[1] = 2;
+    p25_sm_init_ctx(&ctx, &g_opts, &g_state);
+    ev = p25_sm_ev_group_grant(0x1234, 851500000, 1000, 123, 0);
+    p25_sm_event(&ctx, &g_opts, &g_state, &ev);
+    ev = p25_sm_ev_ptt_call(0, 1000, 0, 123, 1, 0);
+    p25_sm_event(&ctx, &g_opts, &g_state, &ev);
+    const double second_m = dsd_time_now_monotonic_s() + 0.01;
+    ev = p25_sm_ev_facch_end_call_at(0, 1000, 0xFFFFFF, second_m);
+    p25_sm_event(&ctx, &g_opts, &g_state, &ev);
+    ev = p25_sm_ev_facch_end_call_at(0, 1000, 456, second_m + 0.5);
+    p25_sm_event(&ctx, &g_opts, &g_state, &ev);
+    if (g_return_requests != 0) {
+        DSD_FPRINTF(stderr, "FAIL: Different-talker FACCH END qualified the fast release\n");
+        return 1;
+    }
+
+    return 0;
+}
+
 static int
 test_inband_target_change_rechecks_policy(void) {
     reset_test_state();
@@ -1936,13 +2736,13 @@ test_inband_policy_reject_preserves_tdma_companion(void) {
     ev = p25_sm_ev_active_call(0, 1001, 0, 303, 1, 0);
     p25_sm_event(&ctx, &g_opts, &g_state, &ev);
     if (ctx.state != P25_SM_TUNED || g_return_requests != 0 || ctx.slots[0].grant_active || ctx.slots[0].voice_active
-        || g_state.p25_p2_audio_allowed[0] || g_state.p25_policy_tg[0] != 0) {
+        || g_state.p25_p2_audio_allowed[0] || canonical_slot_is_active(0U)) {
         DSD_FPRINTF(stderr, "FAIL: Rejected slot was not cleared without releasing its TDMA carrier\n");
         return 1;
     }
     if (!ctx.slots[1].grant_active || !ctx.slots[1].voice_active || ctx.slots[1].target_id != 2000
-        || ctx.slots[1].src != 202 || !g_state.p25_p2_audio_allowed[1] || g_state.lasttgR != 2000
-        || g_state.lastsrcR != 202) {
+        || ctx.slots[1].src != 202 || !g_state.p25_p2_audio_allowed[1]
+        || !canonical_call_is(1U, DSD_CALL_PHASE_ACTIVE, DSD_CALL_KIND_GROUP_VOICE, 2000, 202)) {
         DSD_FPRINTF(stderr, "FAIL: Policy rejection changed the allowed TDMA companion\n");
         return 1;
     }
@@ -1974,7 +2774,7 @@ test_inband_policy_reject_releases_after_companion_ended(void) {
     ev = p25_sm_ev_end_call_at(1, 2000, 202, dsd_time_now_monotonic_s());
     p25_sm_event(&ctx, &g_opts, &g_state, &ev);
     if (ctx.state != P25_SM_TUNED || ctx.slots[1].voice_active || !ctx.slots[1].grant_active
-        || ctx.t_hangtime_m > 0.0) {
+        || p25_sm_hangtime_started_m(&ctx) > 0.0) {
         DSD_FPRINTF(stderr, "FAIL: Companion END did not leave the active slot in control of the carrier\n");
         return 1;
     }
@@ -2011,9 +2811,6 @@ test_tdma_enc_respects_media_policy(void) {
     ev = p25_sm_ev_ptt(0);
     p25_sm_event(&ctx, &g_opts, &g_state, &ev);
 
-    g_state.lasttg = 1001;
-    g_state.lastsrc = 123;
-    g_state.gi[0] = 0;
     g_state.aes_key_loaded[0] = 1;
     g_state.aes_key_segments[0] = 4U;
     g_state.p25_crypto_state[0] = DSD_P25_CRYPTO_DECRYPTABLE;
@@ -2039,9 +2836,6 @@ test_tdma_enc_respects_media_policy(void) {
     ev = p25_sm_ev_ptt(0);
     p25_sm_event(&ctx, &g_opts, &g_state, &ev);
 
-    g_state.lasttg = 2001;
-    g_state.lastsrc = 123;
-    g_state.gi[0] = 0;
     g_state.aes_key_loaded[0] = 1;
     g_state.aes_key_segments[0] = 4U;
     g_state.p25_crypto_state[0] = DSD_P25_CRYPTO_DECRYPTABLE;
@@ -2071,9 +2865,6 @@ test_tdma_enc_respects_media_policy(void) {
     ev = p25_sm_ev_ptt(0);
     p25_sm_event(&ctx, &g_opts, &g_state, &ev);
 
-    g_state.lasttg = 3000;
-    g_state.lastsrc = 123;
-    g_state.gi[0] = 0;
     g_state.aes_key_loaded[0] = 1;
     g_state.aes_key_segments[0] = 4U;
     g_state.p25_crypto_state[0] = DSD_P25_CRYPTO_DECRYPTABLE;
@@ -2105,6 +2896,12 @@ main(void) {
     fail += test_authoritative_group_replaces_private_identity();
     fail += test_inband_zero_source_preserves_grant_identity();
     fail += test_same_identity_ptt_starts_new_epoch_after_missed_end();
+    fail += test_raw_ptt_retransmissions_coalesce_history();
+    fail += test_raw_ptt_signature_changes_open_epochs();
+    fail += test_raw_ptt_boundary_invalidation();
+    fail += test_raw_ptt_markers_are_slot_local();
+    fail += test_conventional_raw_ptt_retransmissions_coalesce();
+    fail += test_trunked_late_voice_is_rejected_after_encryption_lockout();
     fail += test_source_less_identity_change_does_not_inherit_rid();
     fail += test_p2_resolved_crypto_survives_pending_active();
     fail += test_pending_crypto_uses_classification_deadline();
@@ -2122,10 +2919,15 @@ main(void) {
     fail += test_identified_followup_without_service_restarts_crypto_pending();
     fail += test_missed_end_identity_change_without_service_restarts_crypto_pending();
     fail += test_conventional_end_is_follower_noop();
+    fail += test_conventional_ota_end_reasons_are_terminator();
+    fail += test_conventional_anonymous_activity_waits_for_identity();
+    fail += test_conventional_anonymous_activity_preserves_service_options();
+    fail += test_conventional_unknown_service_stays_unconfirmed();
     fail += test_end_clears_voice();
     fail += test_tdma_boundaries_only_hang_after_last_assigned_voice();
     fail += test_tdma_idle_ends_voice_with_newer_grant();
     fail += test_anonymous_followup_restarts_crypto_pending();
+    fail += test_source_less_duplicate_grant_republishes_crypto();
     fail += test_unassigned_companion_start_is_rejected();
     fail += test_state_names();
     fail += test_config_defaults();
@@ -2137,6 +2939,7 @@ main(void) {
     fail += test_tdma_single_slot_end_retains_carrier();
     fail += test_tdma_end_identity_and_order_guards();
     fail += test_tdma_facch_double_end_release();
+    fail += test_tdma_facch_double_end_release_placeholder_src();
     fail += test_inband_target_change_rechecks_policy();
     fail += test_inband_policy_reject_preserves_tdma_companion();
     fail += test_inband_policy_reject_releases_after_companion_ended();

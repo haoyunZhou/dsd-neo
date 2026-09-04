@@ -310,6 +310,8 @@ apply_input_rtltcp_soapy_keys(dsdneoUserConfig* cfg, const char* key_lc, const c
         if (apply_integer_setting(val, -1, mode, &cfg->soapy_bandwidth_hz)) {
             cfg->soapy_bandwidth_hz_is_set = 1;
         }
+    } else if (strcmp(key_lc, "digital_resample") == 0) {
+        copy_text_value(cfg->digital_resample, sizeof cfg->digital_resample, val);
     } else {
         return 0;
     }
@@ -338,6 +340,15 @@ apply_input_file_network_keys(dsdneoUserConfig* cfg, const char* key_lc, const c
 
 static void
 apply_input_section_key(dsdneoUserConfig* cfg, const char* key_lc, const char* val, user_cfg_parse_mode_t mode) {
+    /* Source-independent advisory threshold; LOW advisories exist for every input family. */
+    if (strcmp(key_lc, "input_warn_db") == 0) {
+        double parsed = 0.0;
+        if (user_config_parse_double_value(val, &parsed) == 0) {
+            cfg->input_warn_db = parsed;
+            cfg->input_warn_db_is_set = 1;
+        }
+        return;
+    }
     apply_input_source_keys(cfg, key_lc, val);
     if (apply_input_rtl_keys(cfg, key_lc, val, mode)) {
         return;
@@ -370,6 +381,21 @@ apply_output_section_key(dsdneoUserConfig* cfg, const char* key_lc, const char* 
     }
 }
 
+/*
+ * Assign a parsed boolean, leaving the field alone when the value does not
+ * parse. Factored out because eight [trunking] keys repeated it verbatim and
+ * the resulting if-chain hit the CCN 15 ceiling tools/lizard.sh --strict
+ * enforces the moment the scanner and candidate-preference keys were added.
+ * One decision per key now, not two.
+ */
+static void
+assign_bool_key(int* field, const char* val) {
+    int b = 0;
+    if (user_config_parse_bool_value(val, &b) == 0) {
+        *field = b;
+    }
+}
+
 static void
 apply_mode_section_key(dsdneoUserConfig* cfg, const char* key_lc, const char* val) {
     if (strcmp(key_lc, "decode") == 0) {
@@ -377,6 +403,17 @@ apply_mode_section_key(dsdneoUserConfig* cfg, const char* key_lc, const char* va
         if (user_config_parse_decode_mode_value(val, &mode) == 0) {
             cfg->decode_mode = mode;
         }
+    } else if (strcmp(key_lc, "dmr_mono") == 0) {
+        cfg->has_dmr_mono = 1;
+        assign_bool_key(&cfg->dmr_mono, val);
+    } else if (strcmp(key_lc, "dmr_lrrp_ports") == 0) {
+        copy_text_value(cfg->dmr_lrrp_ports, sizeof cfg->dmr_lrrp_ports, val);
+    } else if (strcmp(key_lc, "edacs_ea") == 0) {
+        cfg->has_edacs_variant = 1;
+        assign_bool_key(&cfg->edacs_ea, val);
+    } else if (strcmp(key_lc, "edacs_esk") == 0) {
+        cfg->has_edacs_variant = 1;
+        assign_bool_key(&cfg->edacs_esk, val);
     } else if (strcmp(key_lc, "demod") == 0) {
         dsdneoUserDemodPath path = DSDCFG_DEMOD_UNSET;
         cfg->has_demod = 1;
@@ -386,42 +423,76 @@ apply_mode_section_key(dsdneoUserConfig* cfg, const char* key_lc, const char* va
     }
 }
 
-static void
-apply_trunking_section_key(dsdneoUserConfig* cfg, const char* key_lc, const char* val) {
-    if (strcmp(key_lc, "enabled") == 0) {
-        int b = 0;
-        if (user_config_parse_bool_value(val, &b) == 0) {
-            cfg->trunk_enabled = b;
-        }
-    } else if (strcmp(key_lc, "chan_csv") == 0) {
+/* The [trunking] PATH keys, split out of apply_trunking_section_key() to keep
+   that if-chain under the CCN 15 ceiling (see assign_bool_key above).
+   Returns 1 when key_lc was one of them. */
+static int
+apply_trunking_section_path_key(dsdneoUserConfig* cfg, const char* key_lc, const char* val) {
+    if (strcmp(key_lc, "chan_csv") == 0) {
         copy_path_expanded(cfg->trunk_chan_csv, sizeof cfg->trunk_chan_csv, val);
     } else if (strcmp(key_lc, "group_csv") == 0) {
         copy_path_expanded(cfg->trunk_group_csv, sizeof cfg->trunk_group_csv, val);
+    } else if (strcmp(key_lc, "p25_bandplan_csv") == 0) {
+        copy_path_expanded(cfg->trunk_p25_bandplan_csv, sizeof cfg->trunk_p25_bandplan_csv, val);
+    } else {
+        return 0;
+    }
+    return 1;
+}
+
+static int
+apply_trunking_section_voice_gate_key(dsdneoUserConfig* cfg, const char* key_lc, const char* val) {
+    if (strcmp(key_lc, "scan_voice_only") == 0) {
+        assign_bool_key(&cfg->trunk_scan_voice_only, val);
+    } else if (strcmp(key_lc, "scan_voice_qualify_ms") == 0) {
+        int parsed = 0;
+        if (user_config_parse_int_value(val, &parsed) == 0) {
+            cfg->trunk_scan_voice_qualify_ms = parsed;
+        }
+    } else if (strcmp(key_lc, "scan_voice_hold_ms") == 0) {
+        int parsed = 0;
+        if (user_config_parse_int_value(val, &parsed) == 0) {
+            cfg->trunk_scan_voice_hold_ms = parsed;
+        }
+    } else {
+        return 0;
+    }
+    return 1;
+}
+
+static void
+apply_trunking_section_key(dsdneoUserConfig* cfg, const char* key_lc, const char* val) {
+    if (apply_trunking_section_voice_gate_key(cfg, key_lc, val)) {
+        return;
+    }
+    if (apply_trunking_section_path_key(cfg, key_lc, val)) {
+        return;
+    }
+    if (strcmp(key_lc, "enabled") == 0) {
+        assign_bool_key(&cfg->trunk_enabled, val);
     } else if (strcmp(key_lc, "allow_list") == 0) {
-        int b = 0;
-        if (user_config_parse_bool_value(val, &b) == 0) {
-            cfg->trunk_use_allow_list = b;
-        }
+        assign_bool_key(&cfg->trunk_use_allow_list, val);
     } else if (strcmp(key_lc, "tune_group_calls") == 0) {
-        int b = 0;
-        if (user_config_parse_bool_value(val, &b) == 0) {
-            cfg->trunk_tune_group_calls = b;
-        }
+        assign_bool_key(&cfg->trunk_tune_group_calls, val);
     } else if (strcmp(key_lc, "tune_private_calls") == 0) {
-        int b = 0;
-        if (user_config_parse_bool_value(val, &b) == 0) {
-            cfg->trunk_tune_private_calls = b;
-        }
+        assign_bool_key(&cfg->trunk_tune_private_calls, val);
     } else if (strcmp(key_lc, "tune_data_calls") == 0) {
-        int b = 0;
-        if (user_config_parse_bool_value(val, &b) == 0) {
-            cfg->trunk_tune_data_calls = b;
-        }
+        assign_bool_key(&cfg->trunk_tune_data_calls, val);
     } else if (strcmp(key_lc, "tune_enc_calls") == 0) {
-        int b = 0;
-        if (user_config_parse_bool_value(val, &b) == 0) {
-            cfg->trunk_tune_enc_calls = b;
-        }
+        assign_bool_key(&cfg->trunk_tune_enc_calls, val);
+    } else if (strcmp(key_lc, "scanner") == 0) {
+        assign_bool_key(&cfg->trunk_scanner, val);
+    } else if (strcmp(key_lc, "p25_prefer_candidates") == 0) {
+        assign_bool_key(&cfg->trunk_p25_prefer_candidates, val);
+    }
+}
+
+static void
+apply_radioreference_section_key(dsdneoUserConfig* cfg, const char* key_lc, const char* val) {
+    if (strcmp(key_lc, "username") == 0) {
+        copy_text_value(cfg->rr_username, sizeof cfg->rr_username, val);
+    } else if (strcmp(key_lc, "app_key") == 0) {
+        copy_text_value(cfg->rr_app_key, sizeof cfg->rr_app_key, val);
     }
 }
 
@@ -595,6 +666,9 @@ apply_section_key(dsdneoUserConfig* cfg, const char* section, const char* key_lc
     } else if (strcmp(section, "trunking") == 0) {
         cfg->has_trunking = 1;
         apply_trunking_section_key(cfg, key_lc, val);
+    } else if (strcmp(section, "radioreference") == 0) {
+        cfg->has_radioreference = 1;
+        apply_radioreference_section_key(cfg, key_lc, val);
     } else if (strcmp(section, "trunk_scan") == 0) {
         cfg->has_trunk_scan = 1;
         apply_trunk_scan_section_key(cfg, key_lc, val);

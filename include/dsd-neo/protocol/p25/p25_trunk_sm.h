@@ -63,7 +63,15 @@ enum {
     // Grant decoder sentinel for opcodes that do not carry service options.
     // Passing svc_bits=0 explicitly clears the service option.
     P25_SM_SVC_UNKNOWN = -1,
+    // Exact MAC_PTT octets 1-17, excluding the SACCH/FACCH transport header.
+    P25_SM_PTT_SIGNATURE_BYTES = 17,
 };
+
+/** Return non-zero only for a subscriber source ID, excluding network controllers. */
+static inline int
+p25_source_id_is_subscriber(uint64_t source) {
+    return source != 0U && source != 0xFFFFFDU && source != 0xFFFFFFU;
+}
 
 typedef enum {
     // Callers constructing grant events directly should identify whether the
@@ -95,22 +103,25 @@ typedef enum {
 
 typedef struct {
     p25_sm_event_type_e type;
-    int slot;                                   // 0 or 1 for TDMA, -1 for P1/N/A
-    int channel;                                // 16-bit channel number (for GRANT)
-    long freq_hz;                               // Frequency in Hz (for GRANT)
-    int tg;                                     // Talkgroup (for GRANT/PTT/END, 0 if individual or unavailable)
-    int src;                                    // Source RID (for GRANT/PTT/END, 0 if unavailable)
-    int dst;                                    // Destination RID (for individual GRANT)
-    int svc_bits;                               // Service options (for GRANT), or P25_SM_SVC_UNKNOWN when absent
-    int is_group;                               // 1 for group grant, 0 for individual
-    p25_sm_grant_provenance_e grant_provenance; // Initial assignment or continuing assignment update
-    int algid;                                  // Algorithm ID (for ENC event)
-    int keyid;                                  // Key ID (for ENC event)
-    int data_call_override;                     // 0=infer from svc_bits, 1=force data, -1=force non-data
-    int identity_valid;                         // 1 when PTT/ACTIVE carries a decoded call identity
-    int facch;                                  // 1 when END was decoded from valid FACCH
-    int crypto_new_epoch;                       // 1 when CRYPTO_PENDING must start a fresh deadline
-    double observed_m;                          // Optional monotonic timestamp when the event was observed
+    int slot;                                          // 0 or 1 for TDMA, -1 for P1/N/A
+    int channel;                                       // 16-bit channel number (for GRANT)
+    long freq_hz;                                      // Frequency in Hz (for GRANT)
+    int tg;                                            // Talkgroup (for GRANT/PTT/END, 0 if individual or unavailable)
+    int src;                                           // Source RID (for GRANT/PTT/END, 0 if unavailable)
+    int dst;                                           // Destination RID (for individual GRANT)
+    int svc_bits;                                      // Service options (for GRANT), or P25_SM_SVC_UNKNOWN when absent
+    int is_group;                                      // 1 for group grant, 0 for individual
+    p25_sm_grant_provenance_e grant_provenance;        // Initial assignment or continuing assignment update
+    int algid;                                         // Algorithm ID (for ENC event)
+    int keyid;                                         // Key ID (for ENC event)
+    int data_call_override;                            // 0=infer from svc_bits, 1=force data, -1=force non-data
+    int identity_valid;                                // 1 when PTT/ACTIVE carries a decoded call identity
+    int source_absent;                                 // 1 when the message type carries no source by design
+    int facch;                                         // 1 when PTT/END was decoded from valid FACCH
+    int crypto_new_epoch;                              // 1 when CRYPTO_PENDING must start a fresh deadline
+    double observed_m;                                 // Optional monotonic timestamp when the event was observed
+    uint8_t ptt_signature[P25_SM_PTT_SIGNATURE_BYTES]; // Optional exact MAC octets 1-17 for PTT
+    int ptt_signature_valid;                           // 1 when ptt_signature and observed_m are authoritative
 } p25_sm_event_t;
 
 /* ============================================================================
@@ -128,9 +139,16 @@ typedef struct {
  * ============================================================================ */
 
 typedef struct {
-    double last_active_m;    // Monotonic timestamp of last activity (PTT/ACTIVE/voice)
-    double last_start_m;     // Monotonic timestamp of the last PTT/ACTIVE call-epoch boundary
-    double last_stop_m;      // Monotonic timestamp when the last followed epoch transitioned inactive
+    double last_active_m; // Monotonic timestamp of last activity (PTT/ACTIVE/voice)
+    double last_start_m;  // Monotonic timestamp of the last PTT/ACTIVE call-epoch boundary
+    double last_stop_m;   // Monotonic timestamp when the last followed epoch transitioned inactive
+    // Monotonic timestamp this slot last carried traffic the SM was following,
+    // 0 when it has carried none on the current carrier. The hangtime deadline
+    // is derived from these two per-slot stamps rather than armed
+    // (p25_sm_hangtime_started_m), so signaling the SM is not following -- a
+    // locked-out slot's MAC repeats, an encryption-lockout reprobe assignment
+    // -- can neither restart nor erase the countdown by construction.
+    double last_followed_m;
     int voice_active;        // 1 if voice is currently active on this slot
     int algid;               // Current algorithm ID for this slot
     int keyid;               // Current key ID for this slot
@@ -146,6 +164,10 @@ typedef struct {
     int data_call;           // 1 for data grant, 0 for voice
     int svc_bits;            // Service options, or P25_SM_SVC_UNKNOWN when absent
     int enc_override_clear;  // 1 when regroup KEY=0 supplied the current clear classification
+    int enc_lockout_reprobe; // 1 when this assignment was re-admitted from the encryption-lockout
+                             // ledger by a clear-claiming grant. The SM has no positive evidence
+                             // for it, so it may acquire but may not outlive the hangtime the last
+                             // followed transmission set.
     double last_grant_m;     // Monotonic timestamp of last accepted grant for this slot
     double crypto_attempt_m; // Monotonic start of the current crypto classification attempt
     double last_end_m;       // Monotonic timestamp of the last accepted MAC_END_PTT
@@ -154,6 +176,13 @@ typedef struct {
     double facch_end_m;      // Monotonic timestamp of the first qualifying FACCH END_PTT
     int facch_end_tg;        // Identity carried by the qualifying FACCH END_PTT
     int facch_end_src;
+    uint8_t ptt_signature[P25_SM_PTT_SIGNATURE_BYTES]; // Last accepted raw P25P2 MAC_PTT signature
+    double ptt_last_seen_m;                            // Last observation of that PTT, including retransmissions
+    int ptt_signature_valid;                           // 1 while no accepted call boundary/replacement intervened
+    uint64_t ptt_canonical_epoch;                      // Canonical epoch that most recently accepted a MAC_PTT
+    double last_enc_suppress_m; // Monotonic timestamp of the last enc-lockout suppression action on this slot.
+                                // The suppressed transmission occupies the carrier with no assignment, epoch,
+                                // or audio trace, so this is the only evidence of it that survives the teardown.
 } p25_sm_slot_ctx_t;
 
 typedef struct {
@@ -167,6 +196,26 @@ typedef struct {
     int probe_attempted; // 1 after the bounded validation tune becomes eligible
     int valid;           // 1 while matching ambiguous CC updates remain quarantined
 } p25_sm_recent_call_end_t;
+
+/**
+ * Targets tracked for the encryption-lockout reprobe backoff. Sized so that a
+ * busy site's set of concurrently locked-out talkgroups fits: a live cooldown
+ * is never evicted to make room, so a table too small to hold them would hand
+ * the overflow targets no backoff at all.
+ */
+enum { P25_SM_ENC_REPROBE_MEMO_MAX = 16 };
+
+/**
+ * One target re-admitted from the encryption-lockout ledger because a grant
+ * claimed clear service options. The ledger entry is consumed by that
+ * admission, so without this record every repeat of the same grant update
+ * looks like the first one.
+ */
+typedef struct {
+    double admitted_m; // Monotonic timestamp of the re-admission, 0 when unused
+    uint32_t target;   // OTA talkgroup for group calls, destination RID for private calls
+    uint8_t is_group;  // 1 for group/SG target, 0 for private destination
+} p25_sm_enc_reprobe_memo_t;
 
 /* ============================================================================
  * State Machine Context
@@ -203,10 +252,18 @@ typedef struct {
     // Per-slot activity (index 0 = left/P1, index 1 = right)
     p25_sm_slot_ctx_t slots[2];
 
+    // Targets recently re-admitted from the encryption-lockout ledger by a
+    // clear-claiming grant. Survives the carrier release the failed reprobe
+    // ends in, which is the whole point: the ledger entry the reprobe consumed
+    // is gone by then, so nothing else can tell the site's next identical grant
+    // update apart from the first one.
+    p25_sm_enc_reprobe_memo_t enc_reprobes[P25_SM_ENC_REPROBE_MEMO_MAX];
+
     // Timing
-    double t_tune_m;             // Monotonic time of last VC tune
-    double t_voice_m;            // Monotonic time of last voice activity
-    double t_hangtime_m;         // Monotonic time hangtime started
+    double t_tune_m;  // Monotonic time of last VC tune
+    double t_voice_m; // Monotonic time of last voice activity
+    // The hangtime countdown has no field: it is derived from the per-slot
+    // last_followed_m stamps by p25_sm_hangtime_started_m().
     double t_cc_sync_m;          // Monotonic time of last CC sync
     double t_cc_tune_m;          // Monotonic time of last CC tune awaiting decode
     double t_cc_reacquire_m;     // Monotonic time a soft CQPSK reacquire was queued
@@ -360,6 +417,21 @@ const char* p25_sm_state_name(p25_sm_state_e state);
 p25_sm_ctx_t* p25_sm_get_ctx(void);
 
 /**
+ * @brief When the tuned carrier's hangtime countdown started, or 0 when none runs.
+ *
+ * Derived, never armed: the most recent moment any slot carried traffic the SM
+ * was following, and 0 while a slot still is. Because only followed traffic
+ * writes p25_sm_slot_ctx_t.last_followed_m, no amount of signaling from a
+ * locked-out slot -- suppressed voice starts, ESS repeats, clear-claiming grant
+ * updates -- can restart or cancel the countdown.
+ *
+ * @param ctx State machine context (may be NULL).
+ * @return Monotonic start of the countdown, or 0.0 when the carrier is not in
+ *         hangtime.
+ */
+double p25_sm_hangtime_started_m(const p25_sm_ctx_t* ctx);
+
+/**
  * @brief Trigger explicit release and return to CC.
  *
  * @param ctx State machine context.
@@ -425,12 +497,65 @@ int p25_sm_vc_reacquire_hold_active(const p25_sm_ctx_t* ctx, const dsd_opts* opt
  */
 int p25_sm_slot_grant_newer_than(int slot, double observed_m);
 
+/**
+ * @brief Check whether a voice-user observation re-describes a call that just ended.
+ *
+ * After an accepted MAC_END_PTT the FNE keeps describing the completed call
+ * for a few bursts: END repeats interleave with SACCH voice-user copies whose
+ * assembly began before the END decoded. A voice user naming the completed
+ * talker (or naming no talker) on the unchanged target inside that short tail
+ * is retention of the ended transmission and must not begin a canonical
+ * epoch. A changed source, or the same identity outside the tail, is fresh
+ * evidence and returns 0.
+ *
+ * @param slot Slot index (0 or 1).
+ * @param target OTA talkgroup for group calls, destination RID for private calls.
+ * @param src Source RID, or 0/unknown when the observation carries none.
+ * @param now_m Monotonic timestamp of the observation.
+ * @return 1 when the observation repeats the recently ended call, 0 otherwise.
+ */
+int p25_sm_voice_user_repeats_recent_end(int slot, int target, int src, double now_m);
+
+/**
+ * @brief Whether a Phase 1 ESS observation may open a canonical epoch.
+ *
+ * Mirrors the voice-start rule: a trunked receiver with no traffic assignment
+ * is parked on or hunting the control channel, where Phase 1 ESS can only be
+ * noise briefly false-syncing as an LDU. Conventional receivers (trunking
+ * disabled) always qualify.
+ *
+ * @param opts Decoder options (trunking configuration).
+ * @return 1 when an ESS-driven epoch may open, 0 to decline the mint.
+ */
+int p25_sm_phase1_crypto_epoch_allowed(const dsd_opts* opts);
+
+/**
+ * @brief Fetch the tuned Phase 1 assignment identity for a pre-identity epoch.
+ *
+ * When ESS crypto resolves on a tuned FDMA traffic channel before any
+ * LCW/voice evidence names the call, the epoch opened to hold the
+ * classification should carry the assignment identity the grant already
+ * established rather than begin identity-less. Only a tuned, non-TDMA,
+ * non-data assignment with a known target qualifies; the conventional
+ * identity-pending flow keeps its identity-less epoch (the following LCW
+ * names that call).
+ *
+ * @param[out] is_group 1 for a group assignment, 0 for a private one.
+ * @param[out] ota_target OTA talkgroup or destination RID of the assignment.
+ * @param[out] policy_target Patch-aware policy target, or 0 when unknown.
+ * @return 1 when a tuned Phase 1 assignment identity was filled, 0 otherwise.
+ */
+int p25_sm_phase1_assignment_identity(int* is_group, uint32_t* ota_target, uint32_t* policy_target);
+
 /* ============================================================================
  * Public API - Convenience Emit Functions (use global singleton)
  * ============================================================================ */
 
 /**
  * @brief Emit PTT event for a slot.
+ *
+ * Trunk-follow mode rejects the event unless the state machine owns an active
+ * traffic-channel assignment. Conventional decoding does not require one.
  * @return 1 when downstream media handling may proceed; 0 when the event was rejected.
  */
 int p25_sm_emit_ptt(dsd_opts* opts, dsd_state* state, int slot);
@@ -440,7 +565,8 @@ int p25_sm_emit_ptt(dsd_opts* opts, dsd_state* state, int slot);
  *
  * The state machine reopens the call epoch from the retained carrier
  * assignment, re-evaluates policy/crypto, and never invokes the tuner for an
- * accepted identity on the current carrier.
+ * accepted identity on the current carrier. Trunk-follow mode rejects the
+ * event when no traffic-channel assignment is active.
  * @return 1 when downstream media handling may proceed; 0 when the event was rejected.
  */
 int p25_sm_emit_ptt_call(dsd_opts* opts, dsd_state* state, int slot, int tg, int dst, int src, int is_group,
@@ -448,16 +574,30 @@ int p25_sm_emit_ptt_call(dsd_opts* opts, dsd_state* state, int slot, int tg, int
 
 /**
  * @brief Emit ACTIVE event for a slot.
+ *
+ * Trunk-follow mode rejects the event unless the state machine owns an active
+ * traffic-channel assignment. Conventional decoding does not require one.
  * @return 1 when downstream media handling may proceed; 0 when the event was rejected.
  */
 int p25_sm_emit_active(dsd_opts* opts, dsd_state* state, int slot);
 
 /**
  * @brief Emit an ACTIVE event carrying an authoritative in-band call identity.
+ *
+ * Trunk-follow mode rejects the event when no traffic-channel assignment is active.
  * @return 1 when downstream media handling may proceed; 0 when the event was rejected.
  */
 int p25_sm_emit_active_call(dsd_opts* opts, dsd_state* state, int slot, int tg, int dst, int src, int is_group,
                             int svc_bits);
+
+/**
+ * @brief Emit an ACTIVE call whose message type carries no source field.
+ *
+ * See p25_sm_ev_active_call_source_absent(): the voice start must not inherit
+ * the preceding assignment's talker for these calls.
+ */
+int p25_sm_emit_active_call_source_absent(dsd_opts* opts, dsd_state* state, int slot, int tg, int dst, int is_group,
+                                          int svc_bits);
 
 /**
  * @brief Emit END event for a slot.
@@ -525,6 +665,19 @@ void p25_sm_emit_tdu(dsd_opts* opts, dsd_state* state);
  * @param tg Talkgroup associated with this call.
  */
 void p25_sm_emit_enc(dsd_opts* opts, dsd_state* state, int slot, int algid, int keyid, int tg);
+
+/**
+ * @brief Note a FEC-accepted ESS repeat of an already-suppressed BLOCKED classification.
+ *
+ * The full ENC event is edge-triggered on the classification transition; this
+ * lightweight note is the per-repeat liveness signal that the locked-out
+ * transmission still occupies its slot. It refreshes the suppression stamp the
+ * release heuristics read and keeps the slot's audio gate closed — it runs no
+ * teardown and no stay-or-release decision. A slot whose lockout action never
+ * ran (no suppression stamp) is left untouched so a stray repeat cannot invent
+ * liveness for an idle slot.
+ */
+void p25_sm_note_enc_suppressed(dsd_opts* opts, dsd_state* state, int slot);
 
 /**
  * @brief Emit an in-band encrypted indication that requires classification.
@@ -639,6 +792,7 @@ p25_sm_ev_ptt(int slot) {
     p25_sm_event_t ev = {0};
     ev.type = P25_SM_EV_PTT;
     ev.slot = slot;
+    ev.svc_bits = P25_SM_SVC_UNKNOWN;
     return ev;
 }
 
@@ -659,6 +813,7 @@ p25_sm_ev_active(int slot) {
     p25_sm_event_t ev = {0};
     ev.type = P25_SM_EV_ACTIVE;
     ev.slot = slot;
+    ev.svc_bits = P25_SM_SVC_UNKNOWN;
     return ev;
 }
 
@@ -671,6 +826,22 @@ p25_sm_ev_active_call(int slot, int tg, int dst, int src, int is_group, int svc_
     ev.is_group = is_group ? 1 : 0;
     ev.svc_bits = svc_bits;
     ev.identity_valid = 1;
+    return ev;
+}
+
+/**
+ * @brief ACTIVE call event whose message type carries no source field at all.
+ *
+ * Telephone Interconnect Voice Channel User is the case in practice: the
+ * landline leg has no subscriber source, so src 0 means "none exists" rather
+ * than "not decoded". Without that distinction the voice start would inherit
+ * the talker from the preceding assignment and attribute a landline call to
+ * whichever radio last held the channel.
+ */
+static inline p25_sm_event_t
+p25_sm_ev_active_call_source_absent(int slot, int tg, int dst, int is_group, int svc_bits) {
+    p25_sm_event_t ev = p25_sm_ev_active_call(slot, tg, dst, 0, is_group, svc_bits);
+    ev.source_absent = 1;
     return ev;
 }
 
@@ -925,8 +1096,8 @@ void p25_ga_tick(dsd_state* state);
 /**
  * @brief Emit a single encryption lockout event for a group or private target.
  *
- * Records transient encrypted-call state and pushes the corresponding event to history/log exactly once per TG until
- * scrubbed.
+ * Arms the session-permanent encrypted-target ledger (core/enc_lockout.h) and
+ * pushes the corresponding event to history/log.
  *
  * @param opts Decoder options.
  * @param state Decoder state.
@@ -934,19 +1105,11 @@ void p25_ga_tick(dsd_state* state);
  * @param target Group or private target.
  * @param svc_bits Optional service bits (pass 0 if unknown).
  * @param is_group Nonzero for a group target, zero for a private target.
+ * @param algid Confirmed ALGID, or DSD_ENC_LOCKOUT_ALGID_UNKNOWN.
+ * @param keyid Confirmed key id (0 when unknown).
  */
 void p25_emit_enc_lockout_once_typed(dsd_opts* opts, dsd_state* state, uint8_t slot, int target, int svc_bits,
-                                     int is_group);
-
-/**
- * @brief Clear all transient blocked-call classifications.
- *
- * Runtime key-management paths call this after successfully changing key
- * material so the next encrypted grant can be classified with the new keys.
- *
- * @param state Decoder state.
- */
-void p25_sm_clear_encrypted_call_cache(dsd_state* state);
+                                     int is_group, int algid, int keyid);
 
 #ifdef __cplusplus
 }

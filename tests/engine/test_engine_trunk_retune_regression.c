@@ -12,6 +12,7 @@
  */
 
 #include <assert.h>
+#include <dsd-neo/core/call_state.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/state.h>
 #include <dsd-neo/core/synctype_ids.h>
@@ -24,7 +25,6 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 #include "dsd-neo/core/opts_fwd.h"
 #include "dsd-neo/core/safe_api.h"
 #include "dsd-neo/core/state_fwd.h"
@@ -46,6 +46,7 @@ static long int g_last_setfreq_hz = 0;
 static bool g_setfreq_result = true;
 static bool g_setmod_result = true;
 static int g_frame_sync_reset_calls = 0;
+static int g_sps_hunt_restart_calls = 0;
 static int g_p25p2_frame_reset_calls = 0;
 static int g_rtl_tune_result = RTL_STREAM_TUNE_OK;
 static int g_rtl_cqpsk_enable = 0;
@@ -72,12 +73,45 @@ static int g_rtl_pending_tuner_autogain_is_set = 0;
 static int g_rtl_pending_tuner_autogain_on = 0;
 static uint32_t g_rtl_pending_target_freq_hz = 0;
 static size_t g_trunk_scan_target_count = 0;
+static int g_trunk_scan_active_gfsk_symbol_rate = 0;
 static int g_trunk_scan_saved_autogain_is_set = 0;
 static int g_trunk_scan_saved_autogain_on = 0;
 static int g_trunk_scan_active_p25_cqpsk_is_set = 0;
 static int g_trunk_scan_active_p25_cqpsk_enable = 0;
 static int g_trunk_scan_active_p25_target = 0;
 static int g_runtime_config_is_set = 0;
+
+int
+// NOLINTNEXTLINE(misc-use-internal-linkage)
+dsd_call_state_end_ex(dsd_state* state, uint8_t slot, double observed_m, dsd_call_end_reason reason) {
+    (void)state;
+    (void)slot;
+    (void)observed_m;
+    (void)reason;
+    return 0;
+}
+
+int
+// NOLINTNEXTLINE(misc-use-internal-linkage)
+dsd_call_state_end(dsd_state* state, uint8_t slot, double observed_m) {
+    return dsd_call_state_end_ex(state, slot, observed_m, DSD_CALL_END_EXPLICIT);
+}
+
+void
+// NOLINTNEXTLINE(misc-use-internal-linkage)
+dsd_event_sync_slot(dsd_opts* opts, dsd_state* state, uint8_t slot) {
+    (void)opts;
+    (void)state;
+    (void)slot;
+}
+
+int
+// NOLINTNEXTLINE(misc-use-internal-linkage)
+dsd_recent_activity_clear_all(dsd_state* state) {
+    (void)state;
+    return 0;
+}
+
 static int g_tune_generation_advance_calls = 0;
 static uint64_t g_tune_request_next = 0U;
 static uint64_t g_tune_request_pending = 0U;
@@ -92,8 +126,29 @@ dmr_reset_blocks(dsd_opts* opts, dsd_state* state) {
 
 void
 // NOLINTNEXTLINE(misc-use-internal-linkage)
+dmr_enc_class_reset(dsd_state* state, uint8_t slot) {
+    (void)state;
+    (void)slot;
+}
+
+void
+// NOLINTNEXTLINE(misc-use-internal-linkage)
 dsd_frame_sync_reset_mod_state(void) {
     g_frame_sync_reset_calls++;
+}
+
+/* Mirrors the real helper in src/dsp/dsd_frame_sync.c so the assertions below read the
+ * behavior rather than the stub. */
+void
+// NOLINTNEXTLINE(misc-use-internal-linkage)
+dsd_frame_sync_sps_hunt_restart_dwell(dsd_state* state) {
+    g_sps_hunt_restart_calls++;
+    if (!state) {
+        return;
+    }
+    state->sps_hunt_counter = 0;
+    state->sps_hunt_symbolcnt_mark = state->symbolcnt;
+    state->sps_hunt_counter_at_entry = 0;
 }
 
 void
@@ -177,6 +232,13 @@ dsd_engine_trunk_scan_saved_tuner_autogain(const dsd_state* state, int* out_on) 
         *out_on = g_trunk_scan_saved_autogain_on;
     }
     return g_trunk_scan_saved_autogain_is_set;
+}
+
+int
+// NOLINTNEXTLINE(misc-use-internal-linkage)
+dsd_engine_trunk_scan_active_gfsk_symbol_rate(const dsd_state* state) {
+    (void)state;
+    return g_trunk_scan_active_gfsk_symbol_rate;
 }
 
 int
@@ -363,6 +425,36 @@ rtl_stream_set_ted_sps_no_override(int sps) {
     g_rtl_ted_sps = sps;
 }
 
+/* Model the queued profile request as an immediate apply (the real demod
+ * thread consumes it between blocks with the same ordering). */
+int
+rtl_stream_request_demod_profile(int cqpsk_enable, int symbol_rate_hz, int levels, int channel_profile, int ted_sps,
+                                 int ted_sps_is_override) {
+    if (symbol_rate_hz > 0 && levels != 2 && levels != 4) {
+        return -1;
+    }
+    if (ted_sps_is_override && ted_sps <= 0) {
+        return -1;
+    }
+    if (cqpsk_enable >= 0) {
+        rtl_stream_toggle_cqpsk(cqpsk_enable);
+    }
+    if (ted_sps >= 0) {
+        rtl_stream_clear_ted_sps_override();
+        if (ted_sps > 0) {
+            if (ted_sps_is_override) {
+                rtl_stream_set_ted_sps(ted_sps);
+            } else {
+                rtl_stream_set_ted_sps_no_override(ted_sps);
+            }
+        }
+    }
+    if (symbol_rate_hz > 0) {
+        (void)rtl_stream_set_symbol_profile(symbol_rate_hz, levels, channel_profile);
+    }
+    return 0;
+}
+
 uint64_t
 // NOLINTNEXTLINE(misc-use-internal-linkage)
 dsd_time_monotonic_ns(void) {
@@ -405,10 +497,6 @@ main(void) {
     state->p25_crypto_state[1] = DSD_P25_CRYPTO_BLOCKED;
     state->last_cc_sync_time = 0;
     state->last_cc_sync_time_m = 0.0;
-    DSD_SNPRINTF(state->call_string[0], sizeof(state->call_string[0]), "%s", "left active");
-    DSD_SNPRINTF(state->call_string[1], sizeof(state->call_string[1]), "%s", "right active");
-    DSD_SNPRINTF(state->active_channel[0], sizeof(state->active_channel[0]), "%s", "Active Ch: 1234 TG: 56;");
-    DSD_SNPRINTF(state->active_channel[1], sizeof(state->active_channel[1]), "%s", "Active Ch: 5678 TG: 90;");
 
     /* DMR/GFSK-ish demod settings should remain unchanged on DMR return. */
     state->samplesPerSymbol = 17;
@@ -428,10 +516,6 @@ main(void) {
     assert(state->p25_p2_audio_allowed[1] == 0);
     assert(state->p25_crypto_state[0] == DSD_P25_CRYPTO_UNKNOWN);
     assert(state->p25_crypto_state[1] == DSD_P25_CRYPTO_UNKNOWN);
-    assert(strcmp(state->call_string[0], "                     ") == 0);
-    assert(strcmp(state->call_string[1], "                     ") == 0);
-    assert(state->active_channel[0][0] == '\0');
-    assert(state->active_channel[1][0] == '\0');
 
     /* Critical regression check: DMR return must still issue a retune to CC. */
     assert(g_setfreq_calls == 1);
@@ -445,6 +529,91 @@ main(void) {
     assert(state->samplesPerSymbol == 17);
     assert(state->symbolCenter == 8);
     assert(state->rf_mod == 2);
+
+    /* NXDN trunking populates p25_cc_freq the same way P25 does, so a return to an NXDN control
+     * channel must not be mistaken for a P25 one: rewriting rf_mod to C4FM/QPSK drops the GFSK
+     * slicing an NXDN96 (or DMR-class) control channel needs. */
+    DSD_MEMSET(opts, 0, sizeof(*opts));
+    DSD_MEMSET(state, 0, sizeof(*state));
+    opts->trunk_enable = 1;
+    opts->trunk_is_tuned = 1;
+    opts->audio_in_type = AUDIO_IN_PULSE;
+    opts->use_rigctl = 1;
+    opts->rigctl_sockfd = 1;
+
+    state->p25_cc_freq = 461000000;
+    state->trunk_cc_freq = 461000000;
+    state->p25_cc_is_tdma = 2; /* initState() sentinel: no P25 control channel seen */
+    state->synctype = DSD_SYNC_NXDN_POS;
+    state->lastsynctype = DSD_SYNC_NXDN_POS;
+    state->samplesPerSymbol = 10;
+    state->symbolCenter = 4;
+    state->rf_mod = 2;
+    state->sps_hunt_counter = 5;
+
+    g_setfreq_calls = 0;
+    g_last_setfreq_hz = 0;
+
+    assert(dsd_engine_return_to_cc_request(opts, state, 0U) == DSD_TRUNK_TUNE_RESULT_OK);
+
+    assert(g_setfreq_calls == 1);
+    assert(g_last_setfreq_hz == 461000000);
+    assert(state->rf_mod == 2);
+    assert(state->samplesPerSymbol == 10);
+    assert(state->symbolCenter == 4);
+    assert(state->sps_hunt_counter == 5);
+
+    /* EDACS also anchors p25_cc_freq and runs GFSK; same rule applies. */
+    DSD_MEMSET(opts, 0, sizeof(*opts));
+    DSD_MEMSET(state, 0, sizeof(*state));
+    opts->trunk_enable = 1;
+    opts->trunk_is_tuned = 1;
+    opts->audio_in_type = AUDIO_IN_PULSE;
+    opts->use_rigctl = 1;
+    opts->rigctl_sockfd = 1;
+
+    state->p25_cc_freq = 856000000;
+    state->trunk_cc_freq = 856000000;
+    state->p25_cc_is_tdma = 2;
+    state->synctype = DSD_SYNC_EDACS_POS;
+    state->lastsynctype = DSD_SYNC_EDACS_POS;
+    state->samplesPerSymbol = 5;
+    state->symbolCenter = 2;
+    state->rf_mod = 2;
+
+    g_setfreq_calls = 0;
+    assert(dsd_engine_return_to_cc_request(opts, state, 0U) == DSD_TRUNK_TUNE_RESULT_OK);
+    assert(g_setfreq_calls == 1);
+    assert(state->rf_mod == 2);
+    assert(state->samplesPerSymbol == 5);
+    assert(state->symbolCenter == 2);
+
+    /* A parked non-P25 trunk-scan target that has not synced yet reads as P25 by synctype alone
+     * (DSD_SYNC_P25P1_POS is 0), so the coordinator's own target type is the authority. */
+    DSD_MEMSET(opts, 0, sizeof(*opts));
+    DSD_MEMSET(state, 0, sizeof(*state));
+    opts->trunk_enable = 1;
+    opts->trunk_is_tuned = 1;
+    opts->trunk_scan_enabled = 1;
+    opts->audio_in_type = AUDIO_IN_PULSE;
+    opts->use_rigctl = 1;
+    opts->rigctl_sockfd = 1;
+
+    state->p25_cc_freq = 462000000;
+    state->trunk_cc_freq = 462000000;
+    state->p25_cc_is_tdma = 2;
+    state->samplesPerSymbol = 10;
+    state->symbolCenter = 4;
+    state->rf_mod = 0; /* global -mc lock with an empty target modulation column */
+    state->sps_hunt_counter = 5;
+    g_trunk_scan_target_count = 2;
+    g_trunk_scan_active_p25_target = 0;
+
+    g_setfreq_calls = 0;
+    assert(dsd_engine_return_to_cc_request(opts, state, 0U) == DSD_TRUNK_TUNE_RESULT_OK);
+    assert(g_setfreq_calls == 1);
+    assert(state->sps_hunt_counter == 5);
+    g_trunk_scan_target_count = 0;
 
     /* A fixed input without rigctl has no tuner backend and must not fabricate
      * successful voice, control-channel, or scan retunes. */
@@ -557,10 +726,22 @@ main(void) {
     assert(state->sps_hunt_idx == DSD_FRAME_SYNC_SPS_PROFILE_2400_4);
     assert(state->sps_hunt_counter == 17);
 
+    /* The voice-channel tune keeps the NXDN48 profile but starts its dwell over: the grant
+     * put the decoder here, so the control channel's spend is not this channel's to inherit
+     * (#392). The profile index is the invariant this case is about, and it is untouched. */
     state->sps_hunt_counter = 23;
+    state->symbolcnt = 7000U;
+    state->sps_hunt_symbolcnt_mark = 1234U;
+    state->sps_hunt_counter_at_entry = 23;
+    g_sps_hunt_restart_calls = 0;
     assert(dsd_engine_trunk_tune_to_freq_request(opts, state, 451500000, 0, 0U) == DSD_TRUNK_TUNE_RESULT_OK);
     assert(state->sps_hunt_idx == DSD_FRAME_SYNC_SPS_PROFILE_2400_4);
-    assert(state->sps_hunt_counter == 23);
+    assert(g_sps_hunt_restart_calls == 1);
+    assert(state->sps_hunt_counter == 0);
+    /* The anchor moves with the budget, so the fresh dwell is not immediately credited for
+     * symbols spent before the tune (#394). */
+    assert(state->sps_hunt_symbolcnt_mark == 7000U);
+    assert(state->sps_hunt_counter_at_entry == 0);
 
     /* Direct conventional scan retunes publish a new generation only after
      * the backend completes the target. */
@@ -686,6 +867,147 @@ main(void) {
     assert(g_rtl_channel_profile == RTL_STREAM_CHANNEL_PROFILE_12K5);
     assert(g_rtl_ted_sps == 10);
     assert(g_rtl_ted_sps_override == 0);
+
+    /* A parked nxdn48-conventional scan target runs 2400 sym/s in a 6.25 kHz channel. rf_mod == 2
+     * is true for every GFSK-family target, so only the coordinator's own answer separates it from
+     * the 4800 sym/s DMR/NXDN96 case above -- and a wrong filter here never self-corrects, because
+     * a pinned SPS hunt stops re-applying the demod profile. */
+    DSD_MEMSET(opts, 0, sizeof(*opts));
+    DSD_MEMSET(state, 0, sizeof(*state));
+    opts->audio_in_type = AUDIO_IN_RTL;
+    opts->trunk_scan_enabled = 1;
+    state->rtl_ctx = (RtlSdrContext*)state;
+    state->rf_mod = 2;
+    g_trunk_scan_target_count = 2;
+    g_trunk_scan_active_gfsk_symbol_rate = 2400;
+    g_rtl_tune_result = RTL_STREAM_TUNE_OK;
+    g_rtl_cqpsk_enable = 1;
+    g_rtl_symbol_rate_hz = 4800;
+    g_rtl_symbol_levels = 4;
+    g_rtl_channel_profile = RTL_STREAM_CHANNEL_PROFILE_12K5;
+    g_rtl_ted_sps = 10;
+    g_rtl_ted_sps_override = 10;
+    g_rtl_pending_active = 0;
+    assert(dsd_engine_scan_tune_to_freq(opts, state, 461556250, 20, NULL) == DSD_TRUNK_TUNE_RESULT_OK);
+    assert(g_rtl_pending_active == 0);
+    assert(g_rtl_cqpsk_enable == 0);
+    assert(g_rtl_symbol_rate_hz == 2400);
+    assert(g_rtl_symbol_levels == 4);
+    assert(g_rtl_channel_profile == RTL_STREAM_CHANNEL_PROFILE_6K25);
+    assert(g_rtl_ted_sps == 20); /* 48000 / 2400 from the stubbed RTL output rate */
+    assert(g_rtl_ted_sps_override == 0);
+
+    /* A parked 4800-class scan target keeps the 12.5 kHz chain. */
+    g_trunk_scan_active_gfsk_symbol_rate = 4800;
+    g_rtl_symbol_rate_hz = 2400;
+    g_rtl_channel_profile = RTL_STREAM_CHANNEL_PROFILE_6K25;
+    g_rtl_ted_sps = 20;
+    g_rtl_pending_active = 0;
+    assert(dsd_engine_scan_tune_to_freq(opts, state, 461112500, 10, NULL) == DSD_TRUNK_TUNE_RESULT_OK);
+    assert(g_rtl_symbol_rate_hz == 4800);
+    assert(g_rtl_channel_profile == RTL_STREAM_CHANNEL_PROFILE_12K5);
+    assert(g_rtl_ted_sps == 10);
+
+    /* Outside trunk scan the coordinator answers 0 and the rf_mod == 2 gate still picks 4800. */
+    g_trunk_scan_target_count = 0;
+    g_trunk_scan_active_gfsk_symbol_rate = 0;
+    g_rtl_symbol_rate_hz = 2400;
+    g_rtl_channel_profile = RTL_STREAM_CHANNEL_PROFILE_6K25;
+    g_rtl_ted_sps = 20;
+    g_rtl_pending_active = 0;
+    assert(dsd_engine_scan_tune_to_freq(opts, state, 461112500, 10, NULL) == DSD_TRUNK_TUNE_RESULT_OK);
+    assert(g_rtl_symbol_rate_hz == 4800);
+    assert(g_rtl_channel_profile == RTL_STREAM_CHANNEL_PROFILE_12K5);
+    assert(g_rtl_ted_sps == 10);
+    rtl_stream_clear_pending_retune_profile();
+
+    /* A global -mc lock with an empty per-target modulation column leaves rf_mod at the locked C4FM
+     * value, so the coordinator's answer is the only thing that can pick the chain for a parked
+     * DMR/NXDN96 target. Without it the retune re-queues whatever the front end already had -- after
+     * an nxdn48-conventional dwell, a 2400 sym/s 6.25 kHz chain on a 12.5 kHz channel -- and the
+     * locked SPS hunt never re-applies over it, because it only rotates among equal-timing profiles. */
+    DSD_MEMSET(opts, 0, sizeof(*opts));
+    DSD_MEMSET(state, 0, sizeof(*state));
+    opts->audio_in_type = AUDIO_IN_RTL;
+    opts->trunk_scan_enabled = 1;
+    state->rtl_ctx = (RtlSdrContext*)state;
+    state->rf_mod = 0;
+    g_trunk_scan_target_count = 2;
+    g_trunk_scan_active_p25_target = 0;
+    g_trunk_scan_active_gfsk_symbol_rate = 4800;
+    g_rtl_tune_result = RTL_STREAM_TUNE_OK;
+    g_rtl_cqpsk_enable = 0;
+    g_rtl_symbol_rate_hz = 2400;
+    g_rtl_symbol_levels = 4;
+    g_rtl_channel_profile = RTL_STREAM_CHANNEL_PROFILE_6K25;
+    g_rtl_ted_sps = 20;
+    g_rtl_ted_sps_override = 0;
+    g_rtl_pending_active = 0;
+    assert(dsd_engine_scan_tune_to_freq(opts, state, 461112500, 10, NULL) == DSD_TRUNK_TUNE_RESULT_OK);
+    assert(g_rtl_cqpsk_enable == 0);
+    assert(g_rtl_symbol_rate_hz == 4800);
+    assert(g_rtl_symbol_levels == 4);
+    assert(g_rtl_channel_profile == RTL_STREAM_CHANNEL_PROFILE_12K5);
+    assert(g_rtl_ted_sps == 10);
+    assert(g_rtl_ted_sps_override == 0);
+    /* The chain follows the parked target; the lock keeps owning symbol slicing. */
+    assert(state->rf_mod == 0);
+    rtl_stream_clear_pending_retune_profile();
+
+    /* Same on the trunk-CC path under -mq: a parked GFSK target must not inherit the previous P25
+     * target's CQPSK demod and C4FM-family filter. */
+    DSD_MEMSET(opts, 0, sizeof(*opts));
+    DSD_MEMSET(state, 0, sizeof(*state));
+    opts->audio_in_type = AUDIO_IN_RTL;
+    opts->trunk_enable = 1;
+    opts->trunk_scan_enabled = 1;
+    state->rtl_ctx = (RtlSdrContext*)state;
+    state->rf_mod = 1;
+    g_trunk_scan_target_count = 2;
+    g_trunk_scan_active_p25_target = 0;
+    g_trunk_scan_active_gfsk_symbol_rate = 4800;
+    g_rtl_tune_result = RTL_STREAM_TUNE_OK;
+    g_rtl_cqpsk_enable = 1;
+    g_rtl_symbol_rate_hz = 4800;
+    g_rtl_symbol_levels = 4;
+    g_rtl_channel_profile = RTL_STREAM_CHANNEL_PROFILE_P25_CQPSK;
+    g_rtl_ted_sps = 10;
+    g_rtl_ted_sps_override = 0;
+    g_rtl_pending_active = 0;
+    assert(dsd_engine_trunk_tune_to_cc_request(opts, state, 452000000, 10, 0U) == DSD_TRUNK_TUNE_RESULT_OK);
+    assert(g_rtl_cqpsk_enable == 0);
+    assert(g_rtl_symbol_rate_hz == 4800);
+    assert(g_rtl_symbol_levels == 4);
+    assert(g_rtl_channel_profile == RTL_STREAM_CHANNEL_PROFILE_12K5);
+    assert(g_rtl_ted_sps == 10);
+    assert(state->rf_mod == 1);
+    rtl_stream_clear_pending_retune_profile();
+
+    /* Outside trunk scan the fall-through still owns a locked non-GFSK session: the coordinator
+     * answers 0, rf_mod != 2, and the retune re-queues the front end's current chain unchanged. */
+    DSD_MEMSET(opts, 0, sizeof(*opts));
+    DSD_MEMSET(state, 0, sizeof(*state));
+    opts->audio_in_type = AUDIO_IN_RTL;
+    state->rtl_ctx = (RtlSdrContext*)state;
+    state->rf_mod = 0;
+    g_trunk_scan_target_count = 0;
+    g_trunk_scan_active_p25_target = 0;
+    g_trunk_scan_active_gfsk_symbol_rate = 0;
+    g_rtl_tune_result = RTL_STREAM_TUNE_OK;
+    g_rtl_cqpsk_enable = 0;
+    g_rtl_symbol_rate_hz = 4800;
+    g_rtl_symbol_levels = 4;
+    g_rtl_channel_profile = RTL_STREAM_CHANNEL_PROFILE_P25_C4FM;
+    g_rtl_ted_sps = 8;
+    g_rtl_ted_sps_override = 0;
+    g_rtl_pending_active = 0;
+    assert(dsd_engine_scan_tune_to_freq(opts, state, 461112500, 10, NULL) == DSD_TRUNK_TUNE_RESULT_OK);
+    assert(g_rtl_cqpsk_enable == 0);
+    assert(g_rtl_symbol_rate_hz == 4800);
+    assert(g_rtl_symbol_levels == 4);
+    assert(g_rtl_channel_profile == RTL_STREAM_CHANNEL_PROFILE_P25_C4FM);
+    assert(g_rtl_ted_sps == 10);
+    rtl_stream_clear_pending_retune_profile();
 
     /* Trunk-scan RTL retunes queue the active target/global gain with the
      * demod profile so gain changes happen at the retune boundary. */
@@ -1018,6 +1340,131 @@ main(void) {
     assert(g_rtl_ted_sps == 10);
     assert(g_rtl_ted_sps_override == 0);
     assert(g_frame_sync_reset_calls == 1);
+
+    /* Issue #423: under AUTO an FDMA control channel was pinned to C4FM on every tune, so a
+     * P25p1 LSM site could never keep the CQPSK chain it had just decoded on. Once a NID has
+     * validated through that chain the return-to-CC restores it without -mq. */
+    DSD_MEMSET(opts, 0, sizeof(*opts));
+    DSD_MEMSET(state, 0, sizeof(*state));
+    opts->audio_in_type = AUDIO_IN_RTL;
+    opts->trunk_enable = 1;
+    opts->trunk_is_tuned = 1;
+    opts->mod_qpsk = 0;
+    state->rtl_ctx = (RtlSdrContext*)state;
+    state->p25_cc_freq = 851000000;
+    state->trunk_cc_freq = 851000000;
+    state->p25_cc_is_tdma = 0;
+    state->p25_p2_active_slot = 0;
+    state->p25_p1_validated_rf_mod = 1;
+    state->rf_mod = 1;
+    state->sps_hunt_idx = DSD_FRAME_SYNC_SPS_PROFILE_4800_2;
+    g_rtl_tune_result = RTL_STREAM_TUNE_OK;
+    g_rtl_cqpsk_enable = 1;
+    g_rtl_symbol_rate_hz = 6000;
+    g_rtl_symbol_levels = 4;
+    g_rtl_channel_profile = RTL_STREAM_CHANNEL_PROFILE_P25_CQPSK;
+    g_rtl_ted_sps = 8;
+    g_rtl_ted_sps_override = 8;
+    g_rtl_pending_active = 0;
+    assert(dsd_engine_return_to_cc_request(opts, state, 0U) == DSD_TRUNK_TUNE_RESULT_OK);
+    assert(state->rf_mod == 1);
+    assert(state->samplesPerSymbol == 10);
+    assert(state->sps_hunt_idx == DSD_FRAME_SYNC_SPS_PROFILE_4800_4);
+    assert(g_rtl_cqpsk_enable == 1);
+    assert(g_rtl_symbol_rate_hz == 4800);
+    assert(g_rtl_channel_profile == RTL_STREAM_CHANNEL_PROFILE_P25_CQPSK);
+
+    /* The counter-case that rules out simply preserving rf_mod: a C4FM control channel with
+     * P25p2 TDMA voice channels leaves rf_mod at 1 when the grant ends, and the control channel
+     * must still come back on C4FM. Nothing validated a P25p1 NID through CQPSK here. */
+    DSD_MEMSET(opts, 0, sizeof(*opts));
+    DSD_MEMSET(state, 0, sizeof(*state));
+    opts->audio_in_type = AUDIO_IN_RTL;
+    opts->trunk_enable = 1;
+    opts->trunk_is_tuned = 1;
+    opts->mod_qpsk = 0;
+    state->rtl_ctx = (RtlSdrContext*)state;
+    state->p25_cc_freq = 851000000;
+    state->trunk_cc_freq = 851000000;
+    state->p25_cc_is_tdma = 0;
+    state->p25_p2_active_slot = 0;
+    state->p25_p1_validated_rf_mod = -1;
+    state->rf_mod = 1;
+    state->sps_hunt_idx = DSD_FRAME_SYNC_SPS_PROFILE_4800_2;
+    g_rtl_tune_result = RTL_STREAM_TUNE_OK;
+    g_rtl_cqpsk_enable = 1;
+    g_rtl_symbol_rate_hz = 6000;
+    g_rtl_channel_profile = RTL_STREAM_CHANNEL_PROFILE_P25_CQPSK;
+    g_rtl_pending_active = 0;
+    assert(dsd_engine_return_to_cc_request(opts, state, 0U) == DSD_TRUNK_TUNE_RESULT_OK);
+    assert(state->rf_mod == 0);
+    assert(g_rtl_cqpsk_enable == 0);
+    assert(g_rtl_channel_profile == RTL_STREAM_CHANNEL_PROFILE_P25_C4FM);
+
+    /* An explicit CLI modulation lock still owns the decision. */
+    DSD_MEMSET(opts, 0, sizeof(*opts));
+    DSD_MEMSET(state, 0, sizeof(*state));
+    opts->audio_in_type = AUDIO_IN_RTL;
+    opts->trunk_enable = 1;
+    opts->trunk_is_tuned = 1;
+    opts->mod_qpsk = 0;
+    opts->mod_cli_lock = 1;
+    state->rtl_ctx = (RtlSdrContext*)state;
+    state->p25_cc_freq = 851000000;
+    state->trunk_cc_freq = 851000000;
+    state->p25_cc_is_tdma = 0;
+    state->p25_p1_validated_rf_mod = 1;
+    state->rf_mod = 1;
+    state->sps_hunt_idx = DSD_FRAME_SYNC_SPS_PROFILE_4800_2;
+    g_rtl_tune_result = RTL_STREAM_TUNE_OK;
+    g_rtl_cqpsk_enable = 1;
+    g_rtl_channel_profile = RTL_STREAM_CHANNEL_PROFILE_P25_CQPSK;
+    g_rtl_pending_active = 0;
+    assert(dsd_engine_return_to_cc_request(opts, state, 0U) == DSD_TRUNK_TUNE_RESULT_OK);
+    assert(state->rf_mod == 0);
+    assert(g_rtl_channel_profile == RTL_STREAM_CHANNEL_PROFILE_P25_C4FM);
+
+    /* The CC-tune path stages the same decision, so a CC hunt lands on the learned chain. */
+    DSD_MEMSET(opts, 0, sizeof(*opts));
+    DSD_MEMSET(state, 0, sizeof(*state));
+    opts->audio_in_type = AUDIO_IN_RTL;
+    opts->trunk_enable = 1;
+    state->rtl_ctx = (RtlSdrContext*)state;
+    state->p25_cc_is_tdma = 0;
+    state->p25_p1_validated_rf_mod = 1;
+    state->lastsynctype = 0;
+    g_rtl_tune_result = RTL_STREAM_TUNE_OK;
+    g_rtl_pending_active = 0;
+    g_rtl_pending_cqpsk = -1;
+    g_rtl_pending_channel_profile = -1;
+    assert(dsd_engine_trunk_tune_to_cc_request(opts, state, 852000000, 10, 0U) == DSD_TRUNK_TUNE_RESULT_OK);
+    assert(state->rf_mod == 1);
+    assert(g_rtl_cqpsk_enable == 1);
+    assert(g_rtl_symbol_rate_hz == 4800);
+    assert(g_rtl_channel_profile == RTL_STREAM_CHANNEL_PROFILE_P25_CQPSK);
+    rtl_stream_clear_pending_retune_profile();
+
+    /* A P25p1 FDMA voice grant carries no modulation of its own -- it inherits the control
+     * channel's -- so on an LSM site the voice channel reaches CQPSK too. */
+    DSD_MEMSET(opts, 0, sizeof(*opts));
+    DSD_MEMSET(state, 0, sizeof(*state));
+    opts->audio_in_type = AUDIO_IN_RTL;
+    opts->trunk_enable = 1;
+    state->rtl_ctx = (RtlSdrContext*)state;
+    state->p25_cc_is_tdma = 0;
+    state->p25_p1_validated_rf_mod = 1;
+    state->p25_p2_active_slot = -1;
+    state->rf_mod = 1;
+    state->lastsynctype = 0;
+    g_rtl_tune_result = RTL_STREAM_TUNE_OK;
+    g_rtl_pending_active = 0;
+    g_rtl_pending_cqpsk = -1;
+    g_rtl_pending_channel_profile = -1;
+    assert(dsd_engine_trunk_tune_to_freq_request(opts, state, 853000000, 10, 0U) == DSD_TRUNK_TUNE_RESULT_OK);
+    assert(g_rtl_cqpsk_enable == 1);
+    assert(g_rtl_symbol_rate_hz == 4800);
+    assert(g_rtl_channel_profile == RTL_STREAM_CHANNEL_PROFILE_P25_CQPSK);
+    rtl_stream_clear_pending_retune_profile();
 #endif
 
     printf("ENGINE_TRUNK_RETUNE_REGRESSION: OK\n");

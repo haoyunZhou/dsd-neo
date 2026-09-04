@@ -3,7 +3,6 @@
  * Focused checks for D-STAR voice/header processing loop boundaries.
  */
 
-#include "dsd-neo/core/frontend_types.h"
 #include "dsd-neo/core/opts_fwd.h"
 #include "dsd-neo/core/state_fwd.h"
 
@@ -37,9 +36,13 @@ static int mbe_frame_calls;
 static int voice_play_calls;
 static int slow_data_calls;
 static int ui_calls;
+/* Publishing now follows the installed telemetry hooks, not the frontend kind. */
+static int telemetry_active;
 static int watchdog_history_calls;
 static int watchdog_current_calls;
 static int header_decode_soft_calls;
+/* What the stubbed header CRC reports; processDSTAR_HD() must hand it straight back. */
+static int header_decode_soft_result = 1;
 static uint8_t captured_slow_data[DSTAR_EXPECTED_SLOW_DIBITS];
 static char captured_ambe_frame[4][24];
 static float captured_soft_symbols[DSD_DSTAR_HEADER_CODED_BITS];
@@ -52,6 +55,7 @@ reset_counters(void) {
     voice_play_calls = 0;
     slow_data_calls = 0;
     ui_calls = 0;
+    telemetry_active = 0;
     watchdog_history_calls = 0;
     watchdog_current_calls = 0;
     header_decode_soft_calls = 0;
@@ -130,6 +134,11 @@ processDSTAR_SD(const dsd_opts* opts, dsd_state* state, uint8_t* sd) {
     slow_data_calls++;
 }
 
+int
+dsd_telemetry_is_active(void) {
+    return telemetry_active;
+}
+
 void
 dsd_telemetry_publish_both_and_redraw(const dsd_opts* opts, const dsd_state* state) {
     (void)opts;
@@ -138,27 +147,21 @@ dsd_telemetry_publish_both_and_redraw(const dsd_opts* opts, const dsd_state* sta
 }
 
 void
-watchdog_event_history(dsd_opts* opts, dsd_state* state, uint8_t slot) {
+dsd_event_sync_slot(dsd_opts* opts, dsd_state* state, uint8_t slot) {
     (void)opts;
     (void)state;
     assert(slot == 0);
     watchdog_history_calls++;
-}
-
-void
-watchdog_event_current(const dsd_opts* opts, dsd_state* state, uint8_t slot) {
-    (void)opts;
-    (void)state;
-    assert(slot == 0);
     watchdog_current_calls++;
 }
 
-void
+int
 dstar_header_decode_soft(struct dsd_state* state, const float soft_symbols[DSD_DSTAR_HEADER_CODED_BITS]) {
     (void)state;
     assert(soft_symbols != NULL);
     DSD_MEMCPY(captured_soft_symbols, soft_symbols, sizeof(captured_soft_symbols));
     header_decode_soft_calls++;
+    return header_decode_soft_result;
 }
 
 static void
@@ -189,7 +192,7 @@ assert_slow_data_starts_after_first_voice_frame(void) {
 }
 
 static void
-test_voice_process_without_ncurses(void) {
+test_voice_process_without_telemetry(void) {
     static dsd_opts opts;
     static dsd_state state;
     DSD_MEMSET(&opts, 0, sizeof(opts));
@@ -198,7 +201,9 @@ test_voice_process_without_ncurses(void) {
     opts.pulse_digi_out_channels = 1;
     reset_counters();
 
-    processDSTAR(&opts, &state);
+    /* Unconfirmed on its own: one superframe whose slow data checked nothing is weak
+     * evidence, and weak evidence has to repeat (#421). */
+    assert(processDSTAR(&opts, &state) == 0);
 
     assert_voice_loop_counts(0);
     assert(soft_symbol_calls == 0);
@@ -208,15 +213,15 @@ test_voice_process_without_ncurses(void) {
 }
 
 static void
-test_voice_process_with_ncurses_refresh(void) {
+test_voice_process_with_telemetry_attached(void) {
     static dsd_opts opts;
     static dsd_state state;
     DSD_MEMSET(&opts, 0, sizeof(opts));
     DSD_MEMSET(&state, 0, sizeof(state));
     opts.floating_point = 0;
     opts.pulse_digi_out_channels = 2;
-    opts.frontend_kind = DSD_FRONTEND_TERMINAL;
     reset_counters();
+    telemetry_active = 1;
 
     processDSTAR(&opts, &state);
 
@@ -235,7 +240,8 @@ test_header_process_captures_header_then_voice(void) {
     opts.pulse_digi_out_channels = 1;
     reset_counters();
 
-    processDSTAR_HD(&opts, &state);
+    header_decode_soft_result = 1;
+    assert(processDSTAR_HD(&opts, &state) == 1);
 
     assert(soft_symbol_calls == DSD_DSTAR_HEADER_CODED_BITS);
     assert(header_decode_soft_calls == 1);
@@ -244,11 +250,105 @@ test_header_process_captures_header_then_voice(void) {
     assert_voice_loop_counts(0);
 }
 
+/* #391: the header CRC is the only verdict the D-STAR data path has, and processDSTAR_HD()
+ * must report it unchanged -- it decodes the voice frame behind a failed header either way,
+ * so the caller's only way to know those 1992 symbols validated nothing is this return. */
+static void
+test_header_process_reports_the_header_crc_verdict(void) {
+    static dsd_opts opts;
+    static dsd_state state;
+    DSD_MEMSET(&opts, 0, sizeof(opts));
+    DSD_MEMSET(&state, 0, sizeof(state));
+    opts.floating_point = 1;
+    opts.pulse_digi_out_channels = 1;
+    reset_counters();
+
+    header_decode_soft_result = 0;
+    assert(processDSTAR_HD(&opts, &state) == 0);
+
+    assert(header_decode_soft_calls == 1);
+    /* The voice frame is consumed regardless: that is the point of reporting the failure. */
+    assert_voice_loop_counts(0);
+    header_decode_soft_result = 1;
+}
+
+/* #421: the 1992 symbols a superframe takes are the largest block any handler consumes, on
+ * the profile where D-STAR is the only candidate. One is weak evidence -- an exact 24-symbol
+ * sync word was matched, nothing more -- so the verdict only turns productive when a second
+ * arrives before the carrier drops. */
+static void
+test_voice_process_confirms_on_the_second_superframe(void) {
+    static dsd_opts opts;
+    static dsd_state state;
+    DSD_MEMSET(&opts, 0, sizeof(opts));
+    DSD_MEMSET(&state, 0, sizeof(state));
+    opts.floating_point = 1;
+    opts.pulse_digi_out_channels = 1;
+
+    reset_counters();
+    assert(processDSTAR(&opts, &state) == 0);
+    assert(state.dstar_confirm_weak_streak == 1);
+
+    reset_counters();
+    assert(processDSTAR(&opts, &state) == 1);
+    assert(state.dstar_confirmed == 1);
+
+    /* Sticky: a third superframe that proves nothing of its own stays productive, because a
+     * confirmed transmission that fades is still decoding (#391). */
+    reset_counters();
+    assert(processDSTAR(&opts, &state) == 1);
+
+    /* And it clears with the carrier. */
+    dstar_confirm_reset(&state);
+    assert(state.dstar_confirmed == 0);
+    assert(state.dstar_confirm_weak_streak == 0);
+}
+
+/* A passing header CRC-16/X.25 is proof on its own, so the voice superframe behind it is
+ * productive on the first call rather than the second (#421). */
+static void
+test_passing_header_confirms_the_voice_frame_behind_it(void) {
+    static dsd_opts opts;
+    static dsd_state state;
+    DSD_MEMSET(&opts, 0, sizeof(opts));
+    DSD_MEMSET(&state, 0, sizeof(state));
+    opts.floating_point = 1;
+    opts.pulse_digi_out_channels = 1;
+    reset_counters();
+
+    header_decode_soft_result = 1;
+    assert(processDSTAR_HD(&opts, &state) == 1);
+    assert(state.dstar_confirmed == 1);
+}
+
+/* A failed header leaves the transmission unproved: the superframe it consumed anyway is
+ * weak evidence only, so it reports unconfirmed and the header's own verdict stands. */
+static void
+test_failed_header_leaves_the_transmission_pending(void) {
+    static dsd_opts opts;
+    static dsd_state state;
+    DSD_MEMSET(&opts, 0, sizeof(opts));
+    DSD_MEMSET(&state, 0, sizeof(state));
+    opts.floating_point = 1;
+    opts.pulse_digi_out_channels = 1;
+    reset_counters();
+
+    header_decode_soft_result = 0;
+    assert(processDSTAR_HD(&opts, &state) == 0);
+    assert(state.dstar_confirmed == 0);
+    assert(state.dstar_confirm_weak_streak == 1);
+    header_decode_soft_result = 1;
+}
+
 int
 main(void) {
-    test_voice_process_without_ncurses();
-    test_voice_process_with_ncurses_refresh();
+    test_voice_process_without_telemetry();
+    test_voice_process_with_telemetry_attached();
     test_header_process_captures_header_then_voice();
+    test_header_process_reports_the_header_crc_verdict();
+    test_voice_process_confirms_on_the_second_superframe();
+    test_passing_header_confirms_the_voice_frame_behind_it();
+    test_failed_header_leaves_the_transmission_pending();
     printf("DSTAR_PROCESS: OK\n");
     return 0;
 }

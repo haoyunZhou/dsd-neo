@@ -56,13 +56,10 @@ compact_copy_terminator_tail_or_stop(int start, int argc, char** argv, int* out_
 }
 
 static const char* const k_skip_exact_no_arg[] = {
-    "--auto-ppm",          "--rtltcp-autotune",
-    "--iq-loop",           "--rdio-api-delete-after-upload",
-    "--enc-lockout",       "--enc-follow",
-    "--no-config",         "--print-config",
-    "--interactive-setup", "--dump-config-template",
-    "--strict-config",     "--list-profiles",
-    "--dmr-debug-burst",   "--show-keys",
+    "--auto-ppm",          "--rtltcp-autotune",      "--iq-loop",       "--rdio-api-delete-after-upload",
+    "--enc-lockout",       "--enc-follow",           "--no-config",     "--print-config",
+    "--interactive-setup", "--dump-config-template", "--strict-config", "--list-profiles",
+    "--dmr-debug-burst",   "--dmr-debug-unsynced",   "--show-keys",     "--scan-voice-only",
 };
 
 static const char* const k_skip_exact_next_any[] = {
@@ -79,6 +76,9 @@ static const char* const k_skip_exact_next_any[] = {
     "--dmr-baofeng-pc5",
     "--dmr-csi-ee72",
     "--dmr-vertex-ks-csv",
+    "--dmr-tg-key-csv",
+    "--p25-bandplan",
+    "--p25-bandplan-export",
     "--dmr-force-algid",
     "--m17-signature-public-key",
     "--auto-ppm-snr",
@@ -97,6 +97,8 @@ static const char* const k_skip_exact_next_any[] = {
     "--trunk-scan",
     "--trunk-scan-dwell-ms",
     "--trunk-scan-activity-hold-ms",
+    "--scan-voice-qualify-ms",
+    "--scan-voice-hold-ms",
     "--calc-lcn",
     "--calc-step",
     "--calc-cc-freq",
@@ -110,13 +112,11 @@ static const char* const k_skip_exact_next_nonnull[] = {
 };
 
 static const char* const k_skip_exact_next_nonopt[] = {
-    "--rtl-udp-control",
-    "--rtl-udp-control-bind",
-    "--config",
-    "--validate-config",
+    "--lrrp-extra-port", "--rtl-udp-control", "--rtl-udp-control-bind", "--config", "--validate-config",
 };
 
 static const char* const k_skip_prefix[] = {
+    "--lrrp-extra-port=",
     "--rtl-udp-control=",
     "--rtl-udp-control-bind=",
     "--iq-capture=",
@@ -129,12 +129,17 @@ static const char* const k_skip_prefix[] = {
     "--dmr-baofeng-pc5=",
     "--dmr-csi-ee72=",
     "--dmr-vertex-ks-csv=",
+    "--dmr-tg-key-csv=",
+    "--p25-bandplan=",
+    "--p25-bandplan-export=",
     "--dmr-force-algid=",
     "--m17-signature-public-key=",
     "--config=",
     "--trunk-scan=",
     "--trunk-scan-dwell-ms=",
     "--trunk-scan-activity-hold-ms=",
+    "--scan-voice-qualify-ms=",
+    "--scan-voice-hold-ms=",
     "--frontend=",
 };
 

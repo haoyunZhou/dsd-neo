@@ -7,6 +7,7 @@
  * Verify policy-backed NXDN VCALL assignment grant filtering.
  */
 
+#include <dsd-neo/core/call_state.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/state.h>
 #include <dsd-neo/core/state_ext.h>
@@ -63,20 +64,18 @@ nxdn_message_type(const dsd_opts* opts, dsd_state* state, uint8_t MessageType) {
 
 void
 // NOLINTNEXTLINE(misc-use-internal-linkage)
-nxdn_alias_decode_arib(dsd_opts* opts, dsd_state* state, const uint8_t* message_bits, uint8_t crc_ok) {
+nxdn_alias_decode_arib(dsd_opts* opts, dsd_state* state, const uint8_t* message_bits) {
     (void)opts;
     (void)state;
     (void)message_bits;
-    (void)crc_ok;
 }
 
 void
 // NOLINTNEXTLINE(misc-use-internal-linkage)
-nxdn_alias_decode_prop(dsd_opts* opts, dsd_state* state, const uint8_t* message_bits, uint8_t crc_ok) {
+nxdn_alias_decode_prop(dsd_opts* opts, dsd_state* state, const uint8_t* message_bits) {
     (void)opts;
     (void)state;
     (void)message_bits;
-    (void)crc_ok;
 }
 
 void
@@ -142,15 +141,17 @@ watchdog_event_current(dsd_opts* opts, dsd_state* state, uint8_t slot) {
     (void)slot;
 }
 
-void
+int
 // NOLINTNEXTLINE(misc-use-internal-linkage)
-watchdog_event_datacall(dsd_opts* opts, dsd_state* state, uint32_t src, uint32_t dst, char* data_string, uint8_t slot) {
+dsd_event_emit_data_notice(dsd_opts* opts, dsd_state* state, uint8_t slot, const dsd_call_observation* observation,
+                           const char* notice) {
     (void)opts;
     (void)state;
-    (void)src;
-    (void)dst;
-    (void)data_string;
+    (void)observation->ota_source_id;
+    (void)observation->ota_target_id;
+    (void)notice;
     (void)slot;
+    return 0;
 }
 
 void
@@ -190,6 +191,12 @@ uint64_t
 // NOLINTNEXTLINE(misc-use-internal-linkage)
 dsd_time_monotonic_ns(void) {
     return 0ULL;
+}
+
+uint64_t
+// NOLINTNEXTLINE(misc-use-internal-linkage)
+dsd_time_monotonic_ms(void) {
+    return dsd_time_monotonic_ns() / 1000000U;
 }
 
 static dsd_trunk_tune_result

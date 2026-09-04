@@ -34,6 +34,7 @@
 #include <dsd-neo/core/synctype_ids.h>
 #include <dsd-neo/dsp/frame_sync.h>
 #include <dsd-neo/protocol/nxdn/nxdn.h>
+
 #include <dsd-neo/protocol/nxdn/nxdn_deperm.h>
 #include <dsd-neo/protocol/nxdn/nxdn_lfsr.h>
 #include <dsd-neo/protocol/nxdn/nxdn_voice.h>
@@ -44,6 +45,7 @@
 #include "dsd-neo/core/opts_fwd.h"
 #include "dsd-neo/core/safe_api.h"
 #include "dsd-neo/core/state_fwd.h"
+#include "nxdn_confirm.h"
 
 #ifdef LIMAZULUTWEAKS
 #include <dsd-neo/runtime/rigctl_query_hooks.h>
@@ -262,9 +264,15 @@ nxdn_apply_lich_profile(dsd_state* state, nxdn_frame_ctx* ctx) {
     return 0;
 }
 
+/**
+ * @brief Refresh the sync clock a conventional scan and the trunking SMs read.
+ *
+ * Held behind nxdn_confirm_is_confirmed(): this timestamp is what stops a `-Y` scan on a
+ * channel, and a sync word plus a LICH is not enough to believe there is a transmission
+ * here (issue #398).
+ */
 static void
 nxdn_mark_carrier_sync_active(dsd_state* state) {
-    state->carrier = 1;
     state->last_cc_sync_time = time(NULL);
     state->last_cc_sync_time_m = dsd_time_now_monotonic_s();
 }
@@ -409,7 +417,7 @@ nxdn_apply_limazulu_voice_tweak(const dsd_opts* opts, dsd_state* state, const nx
     }
 
     if (state->R != 0 && state->M == 1) {
-        state->nxdn_cipher_type = 0x1;
+        nxdn_cipher_force(state, 0x1);
     }
 
     state->last_cc_sync_time = time(NULL) + 2;
@@ -449,7 +457,7 @@ nxdn_apply_data_frame_lfsr(dsd_state* state) {
 static void
 nxdn_apply_pre_voice_facch1_lfsr(dsd_state* state) {
     if (state->M == 1 && state->R != 0) {
-        state->nxdn_cipher_type = 0x1;
+        nxdn_cipher_force(state, 0x1);
     }
     if (state->nxdn_cipher_type == 0x1 && state->R != 0) {
         if (state->payload_miN == 0) {
@@ -542,14 +550,18 @@ nxdn_decode_control_channels(dsd_opts* opts, dsd_state* state, const nxdn_frame_
 
 static void
 nxdn_process_voice_and_mbe(dsd_opts* opts, dsd_state* state, const nxdn_frame_ctx* ctx) {
-    if (ctx->voice) {
+    /* The LICH alone decides whether a frame claims to carry voice, and noise clears the
+     * LICH often enough that acting on that claim is what put fictional speech on a dead
+     * channel. Synthesize only once the frame body has passed a CRC; a real call confirms
+     * on its first FACCH, or within two frames of SACCH (issue #398). */
+    if (ctx->voice && nxdn_confirm_is_confirmed(state)) {
         if ((opts->mbe_out_dir[0] != 0) && (opts->mbe_out_f == NULL)) {
             openMbeOutFile(opts, state);
         }
         state->last_vc_sync_time = time(NULL);
         state->last_vc_sync_time_m = dsd_time_now_monotonic_s();
         if (state->M == 1 && state->R != 0) {
-            state->nxdn_cipher_type = 0x1;
+            nxdn_cipher_force(state, 0x1);
         }
         nxdn_voice(opts, state, ctx->voice, (uint8_t*)ctx->dbuf, (uint8_t*)ctx->dbuf_reliab);
         return;
@@ -590,9 +602,13 @@ nxdn_finalize_sync_reject(dsd_state* state) {
     }
 }
 
-void
+int
 nxdn_frame(dsd_opts* opts, dsd_state* state) {
     nxdn_frame_ctx ctx;
+    /* Declared out here so every goto END path below carries the "proved nothing" answer:
+     * those bail before the frame body is read, so there is no CRC of this frame's own to
+     * report however much the transmission has proved before now (#445). */
+    int frame_proved = 0;
 
     nxdn_frame_ctx_init(&ctx);
     nxdn_collect_lich(opts, state, &ctx);
@@ -608,7 +624,7 @@ nxdn_frame(dsd_opts* opts, dsd_state* state) {
         goto END;
     }
 
-    nxdn_mark_carrier_sync_active(state);
+    state->carrier = 1;
     nxdn_print_sync_banner(opts, state, &ctx);
 
     for (int i = 0; i < 174; i++) {
@@ -626,13 +642,22 @@ nxdn_frame(dsd_opts* opts, dsd_state* state) {
     nxdn_print_rf_channel_type(&ctx);
     nxdn_apply_limazulu_voice_tweak(opts, state, &ctx);
 
-    if (opts->scanner_mode == 1) {
-        state->last_cc_sync_time = time(NULL) + 2;
-    }
-
+    nxdn_confirm_begin_frame(state);
     nxdn_print_voice_or_data_and_sync_lfsr(state, &ctx);
     nxdn_update_sacch_mode(state, ctx.lich);
     nxdn_decode_control_channels(opts, state, &ctx);
+    nxdn_confirm_end_frame(state);
+    frame_proved = nxdn_confirm_frame_proved(state);
+
+    if (nxdn_confirm_is_confirmed(state)) {
+        nxdn_mark_carrier_sync_active(state);
+        if (opts->scanner_mode == 1) {
+            /* Hold the scanner a little past this frame so the gap to the next one does
+             * not read as loss of signal. */
+            state->last_cc_sync_time = time(NULL) + 2;
+        }
+    }
+
     nxdn_process_voice_and_mbe(opts, state, &ctx);
     nxdn_handle_post_voice_facch2_lfsr(state, &ctx);
 
@@ -642,4 +667,13 @@ nxdn_frame(dsd_opts* opts, dsd_state* state) {
 
 END:
     nxdn_finalize_sync_reject(state);
+    /* The sticky flag, not this frame's evidence: a confirmed transmission whose current
+     * frame happens to carry no CRC still decoded, and reporting it unproductive would let
+     * the SPS hunt rotate off a live call.
+     *
+     * This frame's own evidence is reported alongside it as the 2, because the caller needs
+     * both answers: the sticky one says the call is live, and the per-frame one is what proves
+     * the profile the frame was read on -- a standing that the syncs between transmissions must
+     * not inherit, however confirmed the last call was (#445). */
+    return frame_proved ? 2 : nxdn_confirm_is_confirmed(state);
 }

@@ -13,9 +13,12 @@
 
 #include <dsd-neo/core/audio.h>
 #include <dsd-neo/core/bit_packing.h>
+#include <dsd-neo/core/call_state.h>
 #include <dsd-neo/core/constants.h>
 #include <dsd-neo/core/dsd_time.h>
 #include <dsd-neo/core/embedded_alias.h>
+#include <dsd-neo/core/events.h>
+#include <dsd-neo/core/file_io.h>
 #include <dsd-neo/core/gps.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/state.h>
@@ -40,6 +43,7 @@
 #include "../p25_cc_update.h"
 #include "../p25_extended_function.h"
 #include "../p25_response_reason.h"
+#include "../p25_trunk_sm_internal.h"
 #include "dsd-neo/core/opts_fwd.h"
 #include "dsd-neo/core/safe_api.h"
 #include "dsd-neo/core/state_fwd.h"
@@ -54,12 +58,215 @@ static inline void dsd_append(char* dst, size_t dstsz, const char* src);
 #define VPDU_LABEL_UNUSED
 #endif
 
+/** @brief Octets a MAC PDU actually carries. */
+#define P25P2_MAC_OCTETS         24
+
+/**
+ * @brief Staging span for the MAC octets handed to the block handlers.
+ *
+ * Handlers address fields as MAC[N + len_a] with a fixed N and a len_a taken from the
+ * received segment offset. Newer handlers bound that sum (see p25p2_vpdu_can_read), but
+ * many of the older ones index raw, so a segment offset near the end of the PDU could
+ * read past a bare 24-octet array. Staging into P25P2_MAC_OCTETS real octets followed by
+ * a zero-filled tail keeps every such read in range and yields the absent-field value.
+ * Well-formed PDUs never reach the tail.
+ *
+ * This is containment, not a substitute for bounding each handler; the remaining raw
+ * MAC[N + len_a] sites still deserve an audit.
+ */
+#define P25P2_MAC_STAGING_OCTETS (P25P2_MAC_OCTETS * 2)
+
 static void
 p25p2_vpdu_print_group_label(const dsd_state* state, uint32_t id) {
     char name[50];
     if (id != 0U && dsd_tg_policy_lookup_label(state, id, NULL, 0, name, sizeof(name))) {
         DSD_FPRINTF(stderr, " [%s]", name);
     }
+}
+
+static void p25p2_vpdu_publish_activityf(dsd_state* state, uint8_t index, dsd_call_kind kind, uint64_t target,
+                                         uint64_t source, uint16_t channel, long int frequency,
+                                         uint16_t service_options, const char* fmt, ...) DSD_ATTR_FORMAT(printf, 9, 10);
+
+static void
+p25p2_vpdu_publish_activityf(dsd_state* state, uint8_t index, dsd_call_kind kind, uint64_t target, uint64_t source,
+                             uint16_t channel, long int frequency, uint16_t service_options, const char* fmt, ...) {
+    char notice[DSD_RECENT_ACTIVITY_TEXT_SIZE];
+    va_list ap;
+    va_start(ap, fmt);
+    DSD_VSNPRINTF(notice, sizeof notice, fmt, ap);
+    va_end(ap);
+    if (frequency == 0 && dsd_state_trunk_chan_valid(channel)) {
+        frequency = state->trunk_chan_map[channel];
+    }
+    const dsd_call_observation observation = {
+        .protocol = state->lastsynctype,
+        .slot = index & 1U,
+        .kind = kind,
+        .ota_target_id = target,
+        .policy_target_id = target,
+        .ota_source_id = source,
+        .channel = channel,
+        .frequency_hz = frequency,
+        .service_options = service_options,
+        .emergency = (service_options & 0x80U) != 0U,
+        .has_service_metadata = 1U,
+    };
+    (void)dsd_recent_activity_publish(state, index, &observation, notice, 0U);
+}
+
+static int
+p25p2_vpdu_voice_protocol(const dsd_state* state) {
+    if (state && DSD_SYNC_IS_P25P2(state->synctype)) {
+        return state->synctype;
+    }
+    if (state && DSD_SYNC_IS_P25P2(state->lastsynctype)) {
+        return state->lastsynctype;
+    }
+    return DSD_SYNC_P25P2_POS;
+}
+
+static uint64_t
+p25p2_vpdu_voice_policy_target(const dsd_state* state, int slot, dsd_call_kind kind, uint64_t target) {
+    if (!state || kind != DSD_CALL_KIND_GROUP_VOICE || slot < 0 || slot > 1) {
+        return target;
+    }
+
+    dsd_call_snapshot active = {0};
+    if (dsd_call_state_get(state, (uint8_t)slot, &active) > 0 && active.phase == DSD_CALL_PHASE_ACTIVE
+        && active.ota_target_id == target && active.policy_target_id != 0U) {
+        return active.policy_target_id;
+    }
+
+    const p25_sm_ctx_t* sm = p25_sm_get_ctx();
+    if (sm && sm->slots[slot].ota_tg > 0 && (uint64_t)(uint32_t)sm->slots[slot].ota_tg == target
+        && sm->slots[slot].target_id > 0) {
+        return (uint64_t)(uint32_t)sm->slots[slot].target_id;
+    }
+    return target;
+}
+
+static int
+p25p2_vpdu_is_encrypted_probe(const dsd_opts* opts, int service_options) {
+    return service_options >= 0 && (service_options & 0x40) != 0 && opts && opts->trunk_enable == 1
+           && opts->trunk_is_tuned == 1 && opts->trunk_tune_enc_calls == 0;
+}
+
+// Whether a voice-user block on this slot describes traffic this receiver is
+// actually following. Independent of the outer PDU type: it answers "may we
+// track this slot at all", not "is a transmission on the air right now".
+static int
+p25p2_vpdu_voice_is_addressable(const dsd_opts* opts, const dsd_state* state, int slot) {
+    if (!state || state->p2_is_lcch == 1 || slot < 0 || slot > 1) {
+        return 0;
+    }
+    if (!opts || opts->trunk_enable != 1) {
+        return 1;
+    }
+
+    const p25_sm_ctx_t* sm = p25_sm_get_ctx();
+    return opts->trunk_is_tuned == 1 && sm && sm->state == P25_SM_TUNED && sm->slots[slot].grant_active
+           && !sm->slots[slot].data_call;
+}
+
+// Whether the outer PDU type makes this voice user positive evidence that a
+// transmission is on the air. IDLE and HANGTIME carry voice-user messages that
+// re-describe the call that just ended, so they must not drive a canonical
+// epoch. Both reference decoders draw the line at exactly these two types:
+// sdrtrunk routes IDLE/HANGTIME to continueState() instead of its traffic
+// channel call update, and op25 drains audio for them while still decoding the
+// embedded MAC messages.
+static int
+p25p2_vpdu_pdu_type_is_live_voice(p25_mac_pdu_type pdu_type) {
+    return pdu_type != P25_MAC_PDU_IDLE && pdu_type != P25_MAC_PDU_HANGTIME;
+}
+
+static void
+p25p2_vpdu_update_voice_crypto(dsd_state* state, int slot, int service_options, int began, int encrypted_probe) {
+    if (service_options < 0 || encrypted_probe) {
+        return;
+    }
+    if (began > 0) {
+        p25_crypto_begin_voice_call(state, DSD_P25_CRYPTO_PHASE2, slot, service_options, 0);
+        return;
+    }
+    if ((service_options & 0x40) != 0
+        && (state->p25_crypto_state[slot] == DSD_P25_CRYPTO_UNKNOWN
+            || state->p25_crypto_state[slot] == DSD_P25_CRYPTO_CLEAR)) {
+        p25_crypto_mark_encrypted_pending(state, slot);
+    }
+}
+
+// A live-typed voice user whose four-burst SACCH assembly straddled the
+// accepted MAC_END_PTT still re-describes the ended transmission. Track the
+// slot -- liveness and crypto classification -- without reopening a canonical
+// epoch, which would commit the ended call's row a second time.
+static int
+p25p2_vpdu_voice_repeats_recent_end(dsd_opts* opts, dsd_state* state, int slot, uint64_t target,
+                                    uint64_t subscriber_source, int service_options) {
+    dsd_call_snapshot current = {0};
+    if (dsd_call_state_get(state, (uint8_t)slot, &current) <= 0 || current.phase != DSD_CALL_PHASE_ENDED
+        || !p25_sm_voice_user_repeats_recent_end(slot, (int)target, (int)subscriber_source,
+                                                 dsd_time_now_monotonic_s())) {
+        return 0;
+    }
+    p25p2_vpdu_update_voice_crypto(state, slot, service_options, 0,
+                                   p25p2_vpdu_is_encrypted_probe(opts, service_options));
+    dsd_p25_sm_logf(
+        opts, "event=voice_observation_suppressed path=p2-vpdu reason=repeats-recent-end slot=%d tg=%llu src=%llu",
+        slot, (unsigned long long)target, (unsigned long long)subscriber_source);
+    return 1;
+}
+
+static int
+p25p2_vpdu_observe_voice(dsd_opts* opts, dsd_state* state, int slot, dsd_call_kind kind, uint64_t target,
+                         uint64_t source, int service_options, p25_mac_pdu_type pdu_type) {
+    if (!state || slot < 0 || slot > 1 || target == 0U
+        || (kind != DSD_CALL_KIND_GROUP_VOICE && kind != DSD_CALL_KIND_PRIVATE_VOICE)
+        || !p25p2_vpdu_voice_is_addressable(opts, state, slot)) {
+        return 0;
+    }
+    if (!p25p2_vpdu_pdu_type_is_live_voice(pdu_type)) {
+        // Track the slot -- the caller's liveness timer and service options,
+        // and the crypto classification below -- but do not begin or continue
+        // a canonical epoch. Resurrecting the ended call here is what minted
+        // the phantom identity-less rows after MAC_END_PTT. Keeping the
+        // tracking separate from the epoch decision matters: the two were
+        // previously bundled behind one boolean, which silently let the slot
+        // liveness hold lapse during hangtime.
+        p25p2_vpdu_update_voice_crypto(state, slot, service_options, 0,
+                                       p25p2_vpdu_is_encrypted_probe(opts, service_options));
+        return 1;
+    }
+    const uint64_t subscriber_source = p25_source_id_is_subscriber(source) ? source : 0U;
+    if (p25p2_vpdu_voice_repeats_recent_end(opts, state, slot, target, subscriber_source, service_options)) {
+        return 1;
+    }
+    const uint16_t svc = service_options >= 0 ? (uint16_t)service_options : 0U;
+    const dsd_call_observation observation = {
+        .protocol = p25p2_vpdu_voice_protocol(state),
+        .slot = (uint8_t)slot,
+        .kind = kind,
+        .ota_target_id = target,
+        .policy_target_id = p25p2_vpdu_voice_policy_target(state, slot, kind, target),
+        .ota_source_id = subscriber_source,
+        .service_options = svc,
+        .emergency = (uint8_t)((svc & 0x80U) != 0U),
+        .priority = (uint8_t)(svc & 0x07U),
+        .has_service_metadata = (uint8_t)(service_options >= 0),
+    };
+    const int began = dsd_call_state_observe(state, &observation, DSD_CALL_BOUNDARY_CONTINUE);
+    const int encrypted_probe = p25p2_vpdu_is_encrypted_probe(opts, service_options);
+    if (began > 0) {
+        state->generic_talker_alias[slot][0] = '\0';
+        dsd_p25_sm_logf(opts, "event=canonical_epoch_begin path=p2-vpdu slot=%d kind=%d tg=%llu src=%llu svc=%d", slot,
+                        (int)kind, (unsigned long long)target, (unsigned long long)subscriber_source, service_options);
+    }
+    p25p2_vpdu_update_voice_crypto(state, slot, service_options, began, encrypted_probe);
+    if (began >= 0 && opts) {
+        dsd_event_sync_slot(opts, state, (uint8_t)slot);
+    }
+    return began >= 0;
 }
 
 static int
@@ -87,9 +294,21 @@ p25p2_sccb_implicit_channel_b_valid(int bridged_p1, int channel1, int channel2, 
     return sysclass2 != 0;
 }
 
+/*
+ * Seed the low scan-list slots with secondary control channels announced for the current site.
+ *
+ * Only ever raises lcn_freq_count: an operator-supplied list is positional and may be far longer
+ * than the three slots this touches, so assigning the count here would discard the rest of it.
+ * Such a list is left alone entirely - a deliberate 0 placeholder holding an LCN position is not
+ * a free slot.
+ */
 static void
-p25p2_seed_secondary_lcn_fallback(dsd_state* state, int rfssid, int siteid, const long* freqs, int count) {
+p25p2_seed_secondary_lcn_fallback(const dsd_opts* opts, dsd_state* state, int rfssid, int siteid, const long* freqs,
+                                  int count) {
     if (!state || !freqs || count <= 0 || !p25p2_sccb_matches_current_site(state, rfssid, siteid)) {
+        return;
+    }
+    if (dsd_state_trunk_lcn_user_list_present(opts, state)) {
         return;
     }
 
@@ -298,15 +517,15 @@ p25_set_playback_vc_freq(const dsd_opts* opts, dsd_state* state, long int freq) 
 }
 
 static inline void
-p25_set_mfid90_active_channel_single(dsd_state* state, int channel, int group) {
+p25_set_mfid90_active_channel_single(dsd_state* state, int channel, int group, int service_options) {
     if (!state) {
         return;
     }
     char suffix[32];
     p25_format_chan_suffix(state, (uint16_t)channel, -1, suffix, sizeof(suffix));
-    DSD_SNPRINTF(state->active_channel[0], sizeof(state->active_channel[0]), "MFID90 Active Ch: %04X%s SG: %d; ",
-                 channel, suffix, group);
-    state->last_active_time = time(NULL);
+    p25p2_vpdu_publish_activityf(state, 0U, DSD_CALL_KIND_GROUP_VOICE, (uint64_t)group, 0U, (uint16_t)channel, 0,
+                                 (uint16_t)service_options, "MFID90 Active Ch: %04X%s SG: %d; ", channel, suffix,
+                                 group);
 }
 
 static inline void
@@ -320,21 +539,20 @@ p25_set_mfid90_active_channel_update(dsd_state* state, int channel1, int group1,
         char suffix2[32];
         p25_format_chan_suffix(state, (uint16_t)channel1, -1, suffix1, sizeof(suffix1));
         p25_format_chan_suffix(state, (uint16_t)channel2, -1, suffix2, sizeof(suffix2));
-        DSD_SNPRINTF(state->active_channel[0], sizeof(state->active_channel[0]),
-                     "MFID90 Active Ch: %04X%s SG: %d; Ch: %04X%s SG: %d; ", channel1, suffix1, group1, channel2,
-                     suffix2, group2);
+        p25p2_vpdu_publish_activityf(state, 0U, DSD_CALL_KIND_GROUP_VOICE, (uint64_t)group1, 0U, (uint16_t)channel1, 0,
+                                     0U, "MFID90 Active Ch: %04X%s SG: %d; Ch: %04X%s SG: %d; ", channel1, suffix1,
+                                     group1, channel2, suffix2, group2);
     } else {
-        p25_set_mfid90_active_channel_single(state, channel1, group1);
+        p25_set_mfid90_active_channel_single(state, channel1, group1, 0);
         return;
     }
-
-    state->last_active_time = time(NULL);
 }
 
 typedef struct {
     dsd_opts* opts;
     dsd_state* state;
     int type;
+    p25_mac_pdu_type pdu_type;
     unsigned long long int* mac;
     struct p25p2_mac_result* mac_res;
     int len_a;
@@ -357,14 +575,19 @@ static void
 p25p2_vpdu_emit_json(const p25p2_vpdu_ctx* ctx) {
     uint8_t mfid = (uint8_t)ctx->mac[2];
     uint8_t opcode = (uint8_t)ctx->mac[1];
+    // The tag names the outer MAC PDU type, which is a different namespace
+    // from the inner MAC message opcode also emitted here: PDU type 3 is IDLE
+    // while opcode 3 is Telephone Interconnect Voice Channel User. Deriving
+    // the tag from mac[1] labelled every row by the first MAC message instead,
+    // so a hangtime PDU carrying a Group Voice Channel User read as "PTT".
     const char* tag = NULL;
-    switch (opcode) {
-        case 0x0: tag = "SIGNAL"; break;
-        case 0x1: tag = "PTT"; break;
-        case 0x2: tag = "END"; break;
-        case 0x3: tag = "TELE"; break;
-        case 0x4: tag = "ACTIVE"; break;
-        case 0x6: tag = "HANGTIME"; break;
+    switch (ctx->pdu_type) {
+        case P25_MAC_PDU_SIGNAL: tag = "SIGNAL"; break;
+        case P25_MAC_PDU_PTT: tag = "PTT"; break;
+        case P25_MAC_PDU_END_PTT: tag = "END"; break;
+        case P25_MAC_PDU_IDLE: tag = "IDLE"; break;
+        case P25_MAC_PDU_ACTIVE: tag = "ACTIVE"; break;
+        case P25_MAC_PDU_HANGTIME: tag = "HANGTIME"; break;
         default: tag = "MAC"; break;
     }
     p25p2_emit_mac_json_if_enabled(ctx->state, ctx->type, mfid, opcode, ctx->slot, ctx->len_b, ctx->len_c, tag);
@@ -473,12 +696,34 @@ p25p2_vpdu_can_dispatch_grant(const dsd_opts* opts, dsd_state* state, long int f
     return p25p2_vpdu_current_carrier_matches(opts, state, freq);
 }
 
+static int
+p25p2_vpdu_active_target_matches(const dsd_state* state, uint64_t target) {
+    for (int slot = 0; slot < DSD_CALL_STATE_SLOT_COUNT; slot++) {
+        dsd_call_snapshot call;
+        if (dsd_call_state_get(state, (uint8_t)slot, &call) > 0 && call.phase == DSD_CALL_PHASE_ACTIVE
+            && call.ota_target_id == target) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static uint32_t
+p25p2_vpdu_active_source(const dsd_state* state, uint8_t slot) {
+    dsd_call_snapshot call;
+    if (dsd_call_state_get(state, slot & 1U, &call) <= 0 || call.phase != DSD_CALL_PHASE_ACTIVE
+        || call.ota_source_id > UINT32_MAX) {
+        return 0U;
+    }
+    return (uint32_t)call.ota_source_id;
+}
+
 static void
 p25p2_vpdu_update_playback_if_match(const dsd_opts* opts, dsd_state* state, int group, long int freq) {
     if (opts->trunk_enable != 0) {
         return;
     }
-    if (group == state->lasttg || group == state->lasttgR) {
+    if (p25p2_vpdu_active_target_matches(state, (uint64_t)(uint32_t)group)) {
         p25_set_playback_vc_freq(opts, state, freq);
     }
 }
@@ -503,24 +748,15 @@ p25p2_vpdu_print_svc_payload(const dsd_opts* opts, int svc) {
 }
 
 static void
-p25p2_vpdu_apply_svc_slot_state(const dsd_opts* opts, dsd_state* state, int slot_idx, int svc, int set_packet_bit) {
-    state->p25_call_emergency[slot_idx] = (uint8_t)((svc & 0x80) ? 1 : 0);
-    if (set_packet_bit) {
-        state->p25_call_is_packet[slot_idx] = (uint8_t)((svc & 0x10) ? 1 : 0);
-    }
-    state->p25_call_priority[slot_idx] = (uint8_t)((opts->payload == 1) ? (svc & 0x7) : 0);
-}
-
-static void
 p25p2_vpdu_print_svc_with_slot_state(const dsd_opts* opts, dsd_state* state, int slot_idx, int svc,
                                      int set_packet_bit) {
+    UNUSED3(state, slot_idx, set_packet_bit);
     if (svc & 0x80) {
         DSD_FPRINTF(stderr, " Emergency");
     }
     if (svc & 0x40) {
         DSD_FPRINTF(stderr, " Encrypted");
     }
-    p25p2_vpdu_apply_svc_slot_state(opts, state, slot_idx, svc, set_packet_bit);
     p25p2_vpdu_print_svc_payload(opts, svc);
 }
 
@@ -535,14 +771,20 @@ p25p2_vpdu_print_svc_no_state(const dsd_opts* opts, int svc) {
     p25p2_vpdu_print_svc_payload(opts, svc);
 }
 
+// Per-slot service options feed p25p2_prepare_voice_crypto(), where an
+// encrypted service bit flips the slot to ENCRYPTED_PENDING and, under
+// encryption lockout, closes its audio gate. Only voice-channel-user MCOs,
+// which describe the decode slot's own call, may store here: a channel-grant
+// announcement heard in this carrier's MAC signaling describes a call on some
+// other channel or slot, and writing its bits onto the decode slot mutes a
+// clear call whenever an encrypted call is announced nearby. Grant service
+// options reach classification through the SM grant event's svc_bits instead.
 static void
 p25p2_vpdu_store_slot_svc(dsd_state* state, int slot, int svc) {
     if ((slot & 1) == 0) {
         state->dmr_so = (uint16_t)svc;
-        state->p25_service_options_valid[0] = 1;
     } else {
         state->dmr_soR = (uint16_t)svc;
-        state->p25_service_options_valid[1] = 1;
     }
 }
 
@@ -577,12 +819,11 @@ p25p2_vpdu_fqid_sysid(const unsigned long long int* mac, int idx) {
 }
 
 static void
-p25p2_vpdu_set_active_group_single(dsd_state* state, int channel, int group) {
+p25p2_vpdu_set_active_group_single(dsd_state* state, int channel, int group, int service_options) {
     char suffix[32];
     p25_format_chan_suffix(state, (uint16_t)channel, -1, suffix, sizeof suffix);
-    DSD_SNPRINTF(state->active_channel[0], sizeof(state->active_channel[0]), "Active Ch: %04X%s TG: %d; ", channel,
-                 suffix, group);
-    state->last_active_time = time(NULL);
+    p25p2_vpdu_publish_activityf(state, 0U, DSD_CALL_KIND_GROUP_VOICE, (uint64_t)group, 0U, (uint16_t)channel, 0,
+                                 (uint16_t)service_options, "Active Ch: %04X%s TG: %d; ", channel, suffix, group);
 }
 
 static void
@@ -592,13 +833,12 @@ p25p2_vpdu_set_active_group_pair(dsd_state* state, int channel1, int group1, int
         char suffix2[32];
         p25_format_chan_suffix(state, (uint16_t)channel1, -1, suffix1, sizeof suffix1);
         p25_format_chan_suffix(state, (uint16_t)channel2, -1, suffix2, sizeof suffix2);
-        DSD_SNPRINTF(state->active_channel[0], sizeof(state->active_channel[0]),
-                     "Active Ch: %04X%s TG: %d; Ch: %04X%s TG: %d; ", channel1, suffix1, group1, channel2, suffix2,
-                     group2);
-        state->last_active_time = time(NULL);
+        p25p2_vpdu_publish_activityf(state, 0U, DSD_CALL_KIND_GROUP_VOICE, (uint64_t)group1, 0U, (uint16_t)channel1, 0,
+                                     0U, "Active Ch: %04X%s TG: %d; Ch: %04X%s TG: %d; ", channel1, suffix1, group1,
+                                     channel2, suffix2, group2);
         return;
     }
-    p25p2_vpdu_set_active_group_single(state, channel1, group1);
+    p25p2_vpdu_set_active_group_single(state, channel1, group1, 0);
 }
 
 static void
@@ -610,10 +850,9 @@ p25p2_vpdu_set_active_group_triple(dsd_state* state, int channel1, int group1, i
     p25_format_chan_suffix(state, (uint16_t)channel1, -1, suffix1, sizeof suffix1);
     p25_format_chan_suffix(state, (uint16_t)channel2, -1, suffix2, sizeof suffix2);
     p25_format_chan_suffix(state, (uint16_t)channel3, -1, suffix3, sizeof suffix3);
-    DSD_SNPRINTF(state->active_channel[0], sizeof(state->active_channel[0]),
-                 "Active Ch: %04X%s TG: %d; Ch: %04X%s TG: %d; Ch: %04X%s TG: %d; ", channel1, suffix1, group1,
-                 channel2, suffix2, group2, channel3, suffix3, group3);
-    state->last_active_time = time(NULL);
+    p25p2_vpdu_publish_activityf(state, 0U, DSD_CALL_KIND_GROUP_VOICE, (uint64_t)group1, 0U, (uint16_t)channel1, 0, 0U,
+                                 "Active Ch: %04X%s TG: %d; Ch: %04X%s TG: %d; Ch: %04X%s TG: %d; ", channel1, suffix1,
+                                 group1, channel2, suffix2, group2, channel3, suffix3, group3);
 }
 
 typedef struct {
@@ -680,27 +919,14 @@ p25p2_vpdu_try_group_candidates(dsd_opts* opts, dsd_state* state, const p25p2_vp
 }
 
 static void
-p25p2_vpdu_clear_slot_banner(dsd_state* state, int slot) {
-    if (slot == 0) {
-        DSD_SNPRINTF(state->call_string[0], sizeof state->call_string[0], "%s", "                     ");
-    } else {
-        DSD_SNPRINTF(state->call_string[1], sizeof state->call_string[1], "%s", "                     ");
-    }
-}
-
-static void
 p25p2_vpdu_gate_slot_audio(dsd_state* state, int slot) {
     state->p25_p2_audio_allowed[slot] = 0;
-    state->p25_policy_tg[slot & 1] = 0;
     p25_p2_audio_ring_reset(state, slot);
 }
 
 static double
-p25p2_vpdu_cfg_mac_hold_s(const dsd_state* state, double fallback) {
+p25p2_vpdu_cfg_mac_hold_s(double fallback) {
     const dsdneoRuntimeConfig* cfg = dsd_neo_get_config();
-    if (state && state->p25_cfg_mac_hold_s > 0.0) {
-        return state->p25_cfg_mac_hold_s;
-    }
     if (cfg && cfg->p25_mac_hold_is_set) {
         return cfg->p25_mac_hold_s;
     }
@@ -717,11 +943,8 @@ p25p2_vpdu_cfg_voice_hold_s(double fallback) {
 }
 
 static double
-p25p2_vpdu_cfg_vc_grace_s(const dsd_state* state, double fallback) {
+p25p2_vpdu_cfg_vc_grace_s(double fallback) {
     const dsdneoRuntimeConfig* cfg = dsd_neo_get_config();
-    if (state->p25_cfg_vc_grace_s > 0.0) {
-        return state->p25_cfg_vc_grace_s;
-    }
     if (cfg && cfg->p25_vc_grace_is_set) {
         return cfg->p25_vc_grace_s;
     }
@@ -760,9 +983,26 @@ p25p2_vpdu_other_slot_audio_with_history(const dsd_state* state, int slot, doubl
            || recent_voice;
 }
 
+// Whether either logical slot still looks occupied: gated or buffered audio,
+// MAC activity inside the hold window, or recent voice on the carrier. A
+// Deny/Queued response heard in a voice channel's signaling answers some
+// unit's request; releasing the carrier over one while a call -- or the
+// hangtime gap the SM promises to bridge -- still occupies a slot tears down
+// audible traffic, so the voice hold is stretched to the trunking hangtime.
+static int
+p25p2_vpdu_carrier_occupied_for_response(const dsd_opts* opts, const dsd_state* state) {
+    double mac_hold = p25p2_vpdu_cfg_mac_hold_s(0.75);
+    double voice_hold = p25p2_vpdu_cfg_voice_hold_s(0.75);
+    if (opts != NULL && (double)opts->trunk_hangtime > voice_hold) {
+        voice_hold = (double)opts->trunk_hangtime;
+    }
+    return p25p2_vpdu_other_slot_audio_with_history(state, 0, mac_hold, voice_hold)
+           || p25p2_vpdu_other_slot_audio_with_history(state, 1, mac_hold, voice_hold);
+}
+
 static int
 p25p2_vpdu_force_release_after_grace(dsd_opts* opts, dsd_state* state) {
-    double vc_grace = p25p2_vpdu_cfg_vc_grace_s(state, 0.75);
+    double vc_grace = p25p2_vpdu_cfg_vc_grace_s(0.75);
     double nowm = dsd_time_now_monotonic_s();
     double dt_since_tune = (state->p25_last_vc_tune_time_m > 0.0) ? (nowm - state->p25_last_vc_tune_time_m) : 1e9;
     if (dt_since_tune < vc_grace) {
@@ -771,100 +1011,6 @@ p25p2_vpdu_force_release_after_grace(dsd_opts* opts, dsd_state* state) {
     state->p25_sm_force_release = 1;
     p25_sm_release(p25_sm_get_ctx(), opts, state, "mac-release");
     return 1;
-}
-
-static void
-p25p2_vpdu_set_group_call_banner(dsd_state* state, int slot, int svc) {
-    DSD_SNPRINTF(state->call_string[slot], sizeof(state->call_string[slot]), "   Group ");
-    if (svc & 0x80) {
-        dsd_append(state->call_string[slot], sizeof state->call_string[slot], " Emergency  ");
-    } else if (svc & 0x40) {
-        dsd_append(state->call_string[slot], sizeof state->call_string[slot], " Encrypted  ");
-    } else {
-        dsd_append(state->call_string[slot], sizeof state->call_string[slot], "            ");
-    }
-}
-
-static void
-p25p2_vpdu_set_private_call_banner(dsd_state* state, int slot, int svc) {
-    DSD_SNPRINTF(state->call_string[slot], sizeof(state->call_string[slot]), " Private ");
-    if (svc & 0x80) {
-        dsd_append(state->call_string[slot], sizeof state->call_string[slot], " Emergency  ");
-    } else if (svc & 0x40) {
-        dsd_append(state->call_string[slot], sizeof state->call_string[slot], " Encrypted  ");
-    } else {
-        dsd_append(state->call_string[slot], sizeof state->call_string[slot], "            ");
-    }
-}
-
-static int
-p25p2_vpdu_policy_tg_matches_patch_member(const dsd_state* state, int slot, int talkgroup) {
-    uint16_t wgids[8] = {0};
-    int count = 0;
-    uint32_t policy_tg = 0;
-    if (!state || slot < 0 || slot > 1 || talkgroup <= 0) {
-        return 0;
-    }
-
-    policy_tg = state->p25_policy_tg[slot & 1];
-    if (policy_tg == 0U || policy_tg > 0xFFFFU) {
-        return 0;
-    }
-
-    count = p25_patch_collect_active_wgids(state, talkgroup, wgids, sizeof(wgids) / sizeof(wgids[0]));
-    for (int i = 0; i < count && i < 8; i++) {
-        if ((uint32_t)wgids[i] == policy_tg) {
-            return 1;
-        }
-    }
-    return 0;
-}
-
-static void
-p25p2_vpdu_update_group_last_ids(dsd_state* state, int slot, int talkgroup, int source) {
-    int previous = (slot == 0) ? state->lasttg : state->lasttgR;
-    if (previous != talkgroup && !p25p2_vpdu_policy_tg_matches_patch_member(state, slot & 1, talkgroup)) {
-        state->p25_policy_tg[slot & 1] = 0;
-    }
-    if (slot == 0) {
-        state->lasttg = talkgroup;
-        if (source != 0) {
-            state->lastsrc = source;
-            state->generic_talker_alias[0][0] = '\0';
-            state->generic_talker_alias_src[0] = 0;
-        }
-        return;
-    }
-    state->lasttgR = talkgroup;
-    if (source != 0) {
-        state->lastsrcR = source;
-        state->generic_talker_alias[1][0] = '\0';
-        state->generic_talker_alias_src[1] = 0;
-    }
-}
-
-static void
-p25p2_vpdu_update_private_last_ids(dsd_state* state, int slot, int talkgroup, int source) {
-    state->p25_policy_tg[slot & 1] = 0;
-    if (slot == 0) {
-        state->lasttg = talkgroup;
-        if (source != 0) {
-            state->lastsrc = source;
-            if (state->generic_talker_alias_src[0] != (uint32_t)source) {
-                state->generic_talker_alias[0][0] = '\0';
-                state->generic_talker_alias_src[0] = 0;
-            }
-        }
-        return;
-    }
-    state->lasttgR = talkgroup;
-    if (source != 0) {
-        state->lastsrcR = source;
-        if (state->generic_talker_alias_src[1] != (uint32_t)source) {
-            state->generic_talker_alias[1][0] = '\0';
-            state->generic_talker_alias_src[1] = 0;
-        }
-    }
 }
 
 static void
@@ -901,7 +1047,6 @@ typedef struct {
     int group;
     int source;
     int set_packet_bit;
-    int store_slot_svc;
     p25_sm_grant_provenance_e provenance;
     const char* label;
 } p25p2_group_explicit_grant;
@@ -928,10 +1073,7 @@ p25p2_vpdu_handle_group_explicit_grant(dsd_opts* opts, dsd_state* state, int slo
     if (p25p2_vpdu_channel_is_valid(grant->channelr)) {
         (void)process_channel_to_freq(opts, state, grant->channelr);
     }
-    if (grant->store_slot_svc) {
-        p25p2_vpdu_store_slot_svc(state, slot_idx, grant->svc);
-    }
-    p25p2_vpdu_set_active_group_single(state, grant->channelt, grant->group);
+    p25p2_vpdu_set_active_group_single(state, grant->channelt, grant->group, grant->svc);
     p25p2_vpdu_print_group_label(state, (uint32_t)grant->group);
 
     if (p25p2_vpdu_can_dispatch_grant(opts, state, freq_t)) {
@@ -1006,8 +1148,7 @@ p25p2_vpdu_iter_block_01(p25p2_vpdu_ctx* ctx) {
         freq = process_channel_to_freq(opts, state, channel);
 
         //add active channel to string for ncurses display
-        p25_set_mfid90_active_channel_single(state, channel, sgroup);
-        p25p2_vpdu_store_slot_svc(state, slot_idx, svc);
+        p25_set_mfid90_active_channel_single(state, channel, sgroup, svc);
 
         p25p2_vpdu_print_group_label(state, (uint32_t)sgroup);
 
@@ -1064,8 +1205,7 @@ p25p2_vpdu_iter_block_02(p25p2_vpdu_ctx* ctx) {
         }
 
         //add active channel to string for ncurses display
-        p25_set_mfid90_active_channel_single(state, channel, sgroup);
-        p25p2_vpdu_store_slot_svc(state, slot_idx, svc);
+        p25_set_mfid90_active_channel_single(state, channel, sgroup, svc);
 
         p25p2_vpdu_print_group_label(state, (uint32_t)sgroup);
 
@@ -1076,7 +1216,7 @@ p25p2_vpdu_iter_block_02(p25p2_vpdu_ctx* ctx) {
         // If playing back files, and we still want to see what freqs are in use in the ncurses terminal
         //might only want to do these on a grant update, and not a grant by itself?
         if (opts->trunk_enable == 0) {
-            if (sgroup == state->lasttg || sgroup == state->lasttgR) {
+            if (p25p2_vpdu_active_target_matches(state, (uint64_t)(uint32_t)sgroup)) {
                 p25_set_playback_vc_freq(opts, state, freq);
             }
         }
@@ -1180,8 +1320,7 @@ p25p2_vpdu_iter_block_04(p25p2_vpdu_ctx* ctx) {
         DSD_FPRINTF(stderr, " Group Voice Channel Grant");
         DSD_FPRINTF(stderr, "\n  SVC [%02X] CHAN [%04X] Group [%d] Source [%d]", svc, channel, group, src);
         freq = process_channel_to_freq(opts, state, channel);
-        p25p2_vpdu_store_slot_svc(state, slot_idx, svc);
-        p25p2_vpdu_set_active_group_single(state, channel, group);
+        p25p2_vpdu_set_active_group_single(state, channel, group, svc);
         p25p2_vpdu_print_group_label(state, (uint32_t)group);
 
         if (p25p2_vpdu_can_dispatch_grant(opts, state, freq)) {
@@ -1238,15 +1377,13 @@ p25p2_vpdu_iter_block_05(p25p2_vpdu_ctx* ctx) {
         DSD_FPRINTF(stderr, (MAC[1 + len_a] & 0x80) ? " Explicit" : " Implicit");
         DSD_FPRINTF(stderr, "\n  CHAN: %04X; Timer: %f Seconds; Target: %d;", channel, (float)timer * 0.1f, target);
         freq = process_channel_to_freq(opts, state, channel);
-        p25p2_vpdu_store_slot_svc(state, slot_idx, svc);
 
         if (p25p2_vpdu_channel_is_valid(channel)) {
             char suffix[32];
             p25_format_chan_suffix(state, (uint16_t)channel, -1, suffix, sizeof suffix);
-            DSD_SNPRINTF(state->active_channel[0], sizeof(state->active_channel[0]), "Active Tele Ch: %04X%s TGT: %u; ",
-                         channel, suffix, target);
+            p25p2_vpdu_publish_activityf(state, 0U, DSD_CALL_KIND_PRIVATE_VOICE, target, 0U, (uint16_t)channel, freq,
+                                         (uint16_t)svc, "Active Tele Ch: %04X%s TGT: %u; ", channel, suffix, target);
         }
-        state->last_active_time = time(NULL);
 
         p25p2_vpdu_print_group_label(state, target);
         if (p25p2_vpdu_can_dispatch_grant(opts, state, freq)) {
@@ -1254,8 +1391,7 @@ p25p2_vpdu_iter_block_05(p25p2_vpdu_ctx* ctx) {
                                    p25p2_grant_provenance((MAC[1 + len_a] & 0x01) != 0),
                                    /*policy_encrypted*/ -1, /*policy_data*/ -1);
         }
-        if (opts->trunk_enable == 0
-            && ((uint32_t)target == (uint32_t)state->lasttg || (uint32_t)target == (uint32_t)state->lasttgR)) {
+        if (opts->trunk_enable == 0 && p25p2_vpdu_active_target_matches(state, target)) {
             p25_set_playback_vc_freq(opts, state, freq);
         }
     }
@@ -1291,9 +1427,9 @@ p25p2_vpdu_handle_unit_to_unit_grant_abbreviated(p25p2_vpdu_ctx* ctx, int opcode
 
     char suffix[32];
     p25_format_chan_suffix(state, (uint16_t)channel, -1, suffix, sizeof suffix);
-    DSD_SNPRINTF(state->active_channel[0], sizeof(state->active_channel[0]), "Active Ch: %04X%s TGT: %d SRC: %d; ",
-                 channel, suffix, target, source);
-    state->last_active_time = time(NULL);
+    p25p2_vpdu_publish_activityf(state, 0U, DSD_CALL_KIND_PRIVATE_VOICE, (uint64_t)target, (uint64_t)source,
+                                 (uint16_t)channel, freq, 0U, "Active Ch: %04X%s TGT: %d SRC: %d; ", channel, suffix,
+                                 target, source);
 
     if (opts->trunk_tune_private_calls == 0) {
         ctx->skip_rest = 1;
@@ -1339,9 +1475,9 @@ p25p2_vpdu_handle_unit_to_unit_grant_extended(p25p2_vpdu_ctx* ctx, int opcode) {
 
     char suffix[32];
     p25_format_chan_suffix(state, (uint16_t)channelt, -1, suffix, sizeof suffix);
-    DSD_SNPRINTF(state->active_channel[0], sizeof(state->active_channel[0]), "Active Ch: %04X%s TGT: %d SRC: %d; ",
-                 channelt, suffix, target, source);
-    state->last_active_time = time(NULL);
+    p25p2_vpdu_publish_activityf(state, 0U, DSD_CALL_KIND_PRIVATE_VOICE, (uint64_t)target, (uint64_t)source,
+                                 (uint16_t)channelt, freq, 0U, "Active Ch: %04X%s TGT: %d SRC: %d; ", channelt, suffix,
+                                 target, source);
 
     if (opts->trunk_tune_private_calls == 0) {
         ctx->skip_rest = 1;
@@ -1419,11 +1555,11 @@ p25p2_vpdu_iter_block_07(p25p2_vpdu_ctx* ctx) {
             char suffix2[32];
             p25_format_chan_suffix(state, (uint16_t)channelt1, -1, suffix1, sizeof suffix1);
             p25_format_chan_suffix(state, (uint16_t)channelt2, -1, suffix2, sizeof suffix2);
-            DSD_SNPRINTF(state->active_channel[0], sizeof(state->active_channel[0]),
-                         "Active Ch: %04X%s TG: %d; Ch: %04X%s TG: %d; ", channelt1, suffix1, group1, channelt2,
-                         suffix2, group2);
+            p25p2_vpdu_publish_activityf(state, 0U, DSD_CALL_KIND_GROUP_VOICE, (uint64_t)group1, 0U,
+                                         (uint16_t)channelt1, freq1t, (uint16_t)svc1,
+                                         "Active Ch: %04X%s TG: %d; Ch: %04X%s TG: %d; ", channelt1, suffix1, group1,
+                                         channelt2, suffix2, group2);
         }
-        state->last_active_time = time(NULL);
 
         if (opts->trunk_tune_group_calls == 0) {
             ctx->skip_rest = 1;
@@ -1592,7 +1728,6 @@ p25p2_vpdu_iter_block_10(p25p2_vpdu_ctx* ctx) {
             .group = group,
             .source = 0,
             .set_packet_bit = 0,
-            .store_slot_svc = 0,
             .provenance = P25_SM_GRANT_PROVENANCE_UPDATE,
             .label = "Group Voice Channel Grant Update - Explicit",
         };
@@ -1613,7 +1748,6 @@ p25p2_vpdu_iter_block_10(p25p2_vpdu_ctx* ctx) {
             .group = group,
             .source = source,
             .set_packet_bit = 1,
-            .store_slot_svc = 1,
             .provenance = P25_SM_GRANT_PROVENANCE_ASSIGNMENT,
             .label = "Group Voice Channel Grant - Explicit",
         };
@@ -1633,7 +1767,6 @@ p25p2_vpdu_iter_block_10(p25p2_vpdu_ctx* ctx) {
             .group = group,
             .source = 0,
             .set_packet_bit = 0,
-            .store_slot_svc = 0,
             .provenance = P25_SM_GRANT_PROVENANCE_UPDATE,
             .label = "Group Voice Channel Grant Update - Explicit",
         };
@@ -1698,10 +1831,9 @@ p25p2_vpdu_iter_block_11(p25p2_vpdu_ctx* ctx) {
         {
             char suf_dat[32];
             p25_format_chan_suffix(state, (uint16_t)channelt, -1, suf_dat, sizeof suf_dat);
-            DSD_SNPRINTF(state->active_channel[0], sizeof(state->active_channel[0]), "Active Data Ch: %04X%s TGT: %d; ",
-                         channelt, suf_dat, target);
+            p25p2_vpdu_publish_activityf(state, 0U, DSD_CALL_KIND_DATA, (uint64_t)target, 0U, (uint16_t)channelt, freq,
+                                         0U, "Active Data Ch: %04X%s TGT: %d; ", channelt, suf_dat, target);
         }
-        state->last_active_time = time(NULL);
 
         if (p25p2_vpdu_can_dispatch_grant(opts, state, freq)) {
             const int policy_encrypted = (opts->trunk_tune_enc_calls == 0) ? 1 : 0;
@@ -1709,7 +1841,7 @@ p25p2_vpdu_iter_block_11(p25p2_vpdu_ctx* ctx) {
                                    P25_SM_GRANT_PROVENANCE_ASSIGNMENT, policy_encrypted, /*policy_data*/ 1);
         }
         if (opts->trunk_enable == 0) {
-            if (target == state->lasttg || target == state->lasttgR) {
+            if (p25p2_vpdu_active_target_matches(state, (uint64_t)(uint32_t)target)) {
                 //P1 FDMA
                 if (DSD_SYNC_IS_P25P1(state->synctype)) {
                     state->p25_vc_freq[0] = freq;
@@ -1967,13 +2099,12 @@ p25p2_vpdu_iter_block_17(p25p2_vpdu_ctx* ctx) {
         long int freq = process_channel_to_freq(opts, state, channel);
         char suf[32];
         p25_format_chan_suffix(state, (uint16_t)channel, -1, suf, sizeof suf);
-        DSD_SNPRINTF(state->active_channel[slot], sizeof(state->active_channel[slot]),
-                     "MFID90 GRG VCH Upd: %04X%s SG: %d; ", channel, suf, sg);
-        p25p2_vpdu_store_slot_svc(state, slot_idx, svc);
-        state->last_active_time = time(NULL);
+        p25p2_vpdu_publish_activityf(state, (uint8_t)slot, DSD_CALL_KIND_GROUP_VOICE, (uint64_t)sg, 0U,
+                                     (uint16_t)channel, freq, (uint16_t)svc, "MFID90 GRG VCH Upd: %04X%s SG: %d; ",
+                                     channel, suf, sg);
         DSD_FPRINTF(stderr, "\n");
         // Route through SM for tuning consideration
-        if (opts->trunk_enable == 1 && channel != 0 && freq != 0) {
+        if (channel != 0 && p25p2_vpdu_can_dispatch_grant(opts, state, freq)) {
             p25_sm_event_t ev = p25_sm_ev_group_grant_update(channel, 0, sg, /*source*/ 0, svc);
             p25_sm_event(p25_sm_get_ctx(), opts, state, &ev);
         }
@@ -2012,7 +2143,9 @@ p25p2_vpdu_iter_block_19(p25p2_vpdu_ctx* ctx) {
         for (int bi = 0; bi < 24 && (len_a + bi) < 24; bi++) {
             bytes[bi] = (uint8_t)MAC[len_a + bi];
         }
-        unpack_byte_array_into_bit_array(bytes + 1, mac_bits, len);
+        // len is an unvalidated over-the-air octet; bytes + 1 spans only sizeof(bytes) - 1 octets,
+        // so a malformed length is truncated rather than trusted.
+        dsd_unpack_bytes_to_bits_truncating(bytes + 1, sizeof(bytes) - 1U, mac_bits, sizeof(mac_bits), len);
         DSD_FPRINTF(stderr, "\n MFID90 (Moto) Talker Alias Header");
         apx_embedded_alias_header_phase2(opts, state, state->currentslot, mac_bits);
     }
@@ -2050,7 +2183,9 @@ p25p2_vpdu_iter_block_20(p25p2_vpdu_ctx* ctx) {
         for (int bi = 0; bi < 24 && (len_a + bi) < 24; bi++) {
             bytes[bi] = (uint8_t)MAC[len_a + bi];
         }
-        unpack_byte_array_into_bit_array(bytes + 1, mac_bits, len);
+        // len is an unvalidated over-the-air octet; bytes + 1 spans only sizeof(bytes) - 1 octets,
+        // so a malformed length is truncated rather than trusted.
+        dsd_unpack_bytes_to_bits_truncating(bytes + 1, sizeof(bytes) - 1U, mac_bits, sizeof(mac_bits), len);
         DSD_FPRINTF(stderr, "\n MFID90 (Moto) Talker Alias Blocks");
         apx_embedded_alias_blocks_phase2(opts, state, state->currentslot, mac_bits);
     }
@@ -2189,6 +2324,23 @@ BLOCK_END:
     ctx->iter_idx = i;
 }
 
+/**
+ * @brief Hex-dump MAC octets 4..len of a segment, bounded by the MAC array.
+ *
+ * Both len and len_a come from the wire, so the sum has to be checked against
+ * P25P2_MAC_OCTETS rather than len alone.
+ *
+ * @return Index one past the last octet printed, for the caller's iterator.
+ */
+static int
+p25p2_vpdu_dump_segment_octets(const unsigned long long int* MAC, int len_a, int len) {
+    int i = 4;
+    for (; i <= len && (i + len_a) < P25P2_MAC_OCTETS; i++) {
+        DSD_FPRINTF(stderr, "%02llX", MAC[i + len_a]);
+    }
+    return i;
+}
+
 static void
 p25p2_vpdu_iter_block_24(p25p2_vpdu_ctx* ctx) {
     const dsd_opts* opts VPDU_MAYBE_UNUSED = ctx->opts;
@@ -2221,25 +2373,24 @@ p25p2_vpdu_iter_block_24(p25p2_vpdu_ctx* ctx) {
             for (int bi = 0; bi < 24 && (len_a + bi) < 24; bi++) {
                 bytes[bi] = (uint8_t)MAC[len_a + bi];
             }
-            l3h_embedded_alias_decode(opts, state, slot, len, bytes);
+            // The decoder's len is the last readable index, not a count, so cap it at the
+            // last element of bytes rather than at its size.
+            const int16_t alias_last = (len > (int)(sizeof(bytes) - 1U)) ? (int16_t)(sizeof(bytes) - 1U) : (int16_t)len;
+            l3h_embedded_alias_decode(opts, state, slot, alias_last, bytes);
         }
 
         else if (MAC[1 + len_a]
                  == 0x81) //speculative based on the EDACS message that is also flushed with all F hex values
         {
             DSD_FPRINTF(stderr, "\n MFID A4 (Harris) Group Regroup Bitmap: ");
-            for (i = 4; i <= len; i++) {
-                DSD_FPRINTF(stderr, "%02llX", MAC[i + len_a]);
-            }
+            i = p25p2_vpdu_dump_segment_octets(MAC, len_a, len);
         }
 
         else {
             int res = MAC[3 + len_a] >> 6;
             DSD_FPRINTF(stderr, "\n MFID A4 (Harris); Res: %d; Len: %d; Opcode: %02llX; ", res, len,
                         MAC[1 + len_a] & 0x3F); //first two bits are the b0 and b1
-            for (i = 4; i <= len; i++) {
-                DSD_FPRINTF(stderr, "%02llX", MAC[i + len_a]);
-            }
+            i = p25p2_vpdu_dump_segment_octets(MAC, len_a, len);
         }
 
         //assign here so we don't read an extra opcode value, like MAC Release on FL-DCC-1 (0x31 opcode)
@@ -2291,13 +2442,7 @@ p25p2_vpdu_iter_block_25(p25p2_vpdu_ctx* ctx) {
             }
         }
 
-        int tsrc = 0;
-        if (slot == 0 && state->lastsrc != 0) {
-            tsrc = state->lastsrc;
-        }
-        if (slot == 1 && state->lastsrcR != 0) {
-            tsrc = state->lastsrcR;
-        }
+        int tsrc = (int)p25p2_vpdu_active_source(state, (uint8_t)slot);
 
         nmea_harris(opts, state, mac_bits + 0, tsrc, slot); //new
 
@@ -2376,7 +2521,8 @@ p25p2_vpdu_iter_block_27(p25p2_vpdu_ctx* ctx) {
 
         //dump entire payload
         DSD_FPRINTF(stderr, " Payload: ");
-        for (i = 4; i < len; i++) {
+        // Clamping len alone is not enough: len_a is an over-the-air offset into MAC[24].
+        for (i = 4; i < len && (i + len_a) < 24; i++) {
             DSD_FPRINTF(stderr, "%02llX", MAC[i + len_a]);
         }
 
@@ -2819,7 +2965,7 @@ p25p2_vpdu_iter_block_34(p25p2_vpdu_ctx* ctx) {
         const long scc_freqs[2] = {freq1, freq2};
 
         //place the cc freq into the list at index 0 if 0 is empty so we can hunt for rotating CCs without user LCN list
-        p25p2_seed_secondary_lcn_fallback(state, rfssid, siteid, scc_freqs, channel2_valid ? 2 : 1);
+        p25p2_seed_secondary_lcn_fallback(opts, state, rfssid, siteid, scc_freqs, channel2_valid ? 2 : 1);
     }
 
     if (len_b < 0) {
@@ -2854,14 +3000,17 @@ p25p2_vpdu_iter_block_35(p25p2_vpdu_ctx* ctx) {
         DSD_FPRINTF(stderr, "\n VCH %d - Super Group %d SRC %d ", slot + 1, gr, src);
         p25p2_vpdu_print_svc_with_slot_state(opts, state, slot, svc, /*set_packet_bit*/ 0);
         DSD_FPRINTF(stderr, "MFID90 Group Regroup Voice");
-        state->gi[slot] = 0;
-        p25p2_vpdu_store_slot_svc(state, slot, svc);
-        p25p2_vpdu_set_group_call_banner(state, slot, svc);
+        const int tracked_voice =
+            p25p2_vpdu_observe_voice(opts, state, slot, DSD_CALL_KIND_GROUP_VOICE, (uint64_t)(uint32_t)gr,
+                                     (uint64_t)(uint32_t)src, svc, ctx->pdu_type);
+        if (tracked_voice) {
+            p25p2_vpdu_store_slot_svc(state, slot, svc);
+        }
         // Treat observed Super Group activity as an active patch (vendor-specific signaling may differ)
         p25_patch_update(state, gr, /*is_patch*/ 1, /*active*/ 1);
-        p25p2_vpdu_update_group_last_ids(state, slot, gr, src);
 
-        if ((svc & 0x40) && opts->trunk_enable == 1 && opts->trunk_is_tuned == 1 && opts->trunk_tune_enc_calls == 0) {
+        if (tracked_voice && p25p2_vpdu_pdu_type_is_live_voice(ctx->pdu_type) && (svc & 0x40) && opts->trunk_enable == 1
+            && opts->trunk_is_tuned == 1 && opts->trunk_tune_enc_calls == 0) {
             p25p2_vpdu_handle_group_voice_enc_fallback(opts, state, slot, gr);
         }
     }
@@ -2898,9 +3047,12 @@ p25p2_vpdu_iter_block_36(p25p2_vpdu_ctx* ctx) {
         DSD_FPRINTF(stderr, "\n VCH %d - Super Group %d SRC %d ", slot + 1, gr, src);
         p25p2_vpdu_print_svc_with_slot_state(opts, state, slot, svc, /*set_packet_bit*/ 0);
         DSD_FPRINTF(stderr, "MFID90 Group Regroup Voice");
-        state->gi[slot] = 0;
-        p25p2_vpdu_store_slot_svc(state, slot, svc);
-        p25p2_vpdu_set_group_call_banner(state, slot, svc);
+        const int tracked_voice =
+            p25p2_vpdu_observe_voice(opts, state, slot, DSD_CALL_KIND_GROUP_VOICE, (uint64_t)(uint32_t)gr,
+                                     (uint64_t)(uint32_t)src, svc, ctx->pdu_type);
+        if (tracked_voice) {
+            p25p2_vpdu_store_slot_svc(state, slot, svc);
+        }
         p25_patch_update(state, gr, /*is_patch*/ 1, /*active*/ 1);
 
         uint32_t mfid90_wacn = (MAC[10 + len_a] << 16) | (MAC[11 + len_a] << 8) | (MAC[12 + len_a] & 0xF0);
@@ -2908,11 +3060,11 @@ p25p2_vpdu_iter_block_36(p25p2_vpdu_ctx* ctx) {
         uint16_t mfid90_sys = (uint16_t)(((MAC[12 + len_a] & 0x0F) << 8) | MAC[13 + len_a]);
         DSD_FPRINTF(stderr, " EXT - FQSUID: %05X:%03X.%d", mfid90_wacn, mfid90_sys, src);
 
-        p25p2_vpdu_update_group_last_ids(state, slot, gr, src);
         if (src != 0 && gr != 0) {
             p25_ga_add(state, (uint32_t)src, (uint16_t)gr);
         }
-        if ((svc & 0x40) && opts->trunk_enable == 1 && opts->trunk_is_tuned == 1 && opts->trunk_tune_enc_calls == 0) {
+        if (tracked_voice && p25p2_vpdu_pdu_type_is_live_voice(ctx->pdu_type) && (svc & 0x40) && opts->trunk_enable == 1
+            && opts->trunk_is_tuned == 1 && opts->trunk_tune_enc_calls == 0) {
             p25p2_vpdu_handle_group_voice_enc_fallback(opts, state, slot, gr);
         }
     }
@@ -3304,9 +3456,10 @@ p25p2_vpdu_iter_block_44(p25p2_vpdu_ctx* ctx) {
         int resr2 = MAC[6 + len_a] >> 4;
         int cc = ((MAC[6 + len_a] & 0xF) << 8) | MAC[7 + len_a];
         int eslot = slot;
-        double mac_hold = p25p2_vpdu_cfg_mac_hold_s(state, 0.75);
+        double mac_hold = p25p2_vpdu_cfg_mac_hold_s(0.75);
         double voice_hold = p25p2_vpdu_cfg_voice_hold_s(0.75);
         int other_audio = 0;
+        uint8_t released_slot = (uint8_t)(eslot & 1);
 
         DSD_FPRINTF(stderr, "\n MAC Release:  ");
         DSD_FPRINTF(stderr, uf ? "Forced; " : "Unforced; ");
@@ -3316,14 +3469,13 @@ p25p2_vpdu_iter_block_44(p25p2_vpdu_ctx* ctx) {
         DSD_FPRINTF(stderr, "TGT: %d; ", add);
         DSD_FPRINTF(stderr, "CC: %03X; ", cc);
 
-        dsd_p25p2_flush_partial_audio_slot(opts, state, eslot & 1);
+        dsd_p25p2_flush_partial_audio_slot(opts, state, released_slot);
         p25p2_vpdu_gate_slot_audio(state, eslot);
-        p25_crypto_reset_slot(state, eslot & 1);
+        p25_sm_emit_mac_release(opts, state, released_slot, dsd_time_now_monotonic_s());
+        p25_crypto_reset_slot(state, released_slot);
         other_audio = p25p2_vpdu_other_slot_audio_with_history(state, eslot, mac_hold, voice_hold);
         if (!other_audio) {
             (void)p25p2_vpdu_force_release_after_grace(opts, state);
-        } else {
-            p25p2_vpdu_clear_slot_banner(state, eslot);
         }
     }
 
@@ -3366,20 +3518,23 @@ p25p2_vpdu_iter_block_45(p25p2_vpdu_ctx* ctx) {
         }
 
         DSD_FPRINTF(stderr, "\n VCH %d - TG: %d; SRC: %d; ", slot + 1, gr, src);
-        state->p25_p2_last_mac_active[slot] = time(NULL);
         if (MAC[1 + len_a] == 0x21) {
             DSD_FPRINTF(stderr, "SUID: %08llX-%08d; ", src_suid >> 24, src);
         }
 
         p25p2_vpdu_print_svc_with_slot_state(opts, state, slot_idx, svc, /*set_packet_bit*/ 0);
         DSD_FPRINTF(stderr, " Group Voice");
-        state->gi[slot] = 0;
-        p25p2_vpdu_store_slot_svc(state, slot, svc);
-        p25p2_vpdu_set_group_call_banner(state, slot, svc);
+        const int tracked_voice =
+            p25p2_vpdu_observe_voice(opts, state, slot, DSD_CALL_KIND_GROUP_VOICE, (uint64_t)(uint32_t)gr,
+                                     (uint64_t)(uint32_t)src, svc, ctx->pdu_type);
+        if (tracked_voice) {
+            state->p25_p2_last_mac_active[slot] = time(NULL);
+            p25p2_vpdu_store_slot_svc(state, slot, svc);
+        }
         DSD_FPRINTF(stderr, (MAC[1 + len_a] == 0x21) ? " - Extended " : " - Abbreviated ");
-        p25p2_vpdu_update_group_last_ids(state, slot, gr, src);
 
-        if ((svc & 0x40) && opts->trunk_enable == 1 && opts->trunk_is_tuned == 1 && opts->trunk_tune_enc_calls == 0) {
+        if (tracked_voice && p25p2_vpdu_pdu_type_is_live_voice(ctx->pdu_type) && (svc & 0x40) && opts->trunk_enable == 1
+            && opts->trunk_is_tuned == 1 && opts->trunk_tune_enc_calls == 0) {
             p25p2_vpdu_handle_group_voice_enc_fallback(opts, state, slot, gr);
         }
     }
@@ -3422,19 +3577,22 @@ p25p2_vpdu_iter_block_46(p25p2_vpdu_ctx* ctx) {
         }
 
         DSD_FPRINTF(stderr, "\n VCH %d - TGT: %d; SRC %d; ", slot + 1, gr, src);
-        state->p25_p2_last_mac_active[slot] = time(NULL);
         if (MAC[1 + len_a] == 0x22) {
             DSD_FPRINTF(stderr, "SUID: %08llX-%08d; ", src_suid >> 24, src);
         }
 
         p25p2_vpdu_print_svc_no_state(opts, svc);
         DSD_FPRINTF(stderr, " Unit to Unit Voice");
-        state->gi[slot] = 1;
-        p25p2_vpdu_store_slot_svc(state, slot, svc);
-        p25p2_vpdu_set_private_call_banner(state, slot, svc);
-        p25p2_vpdu_update_private_last_ids(state, slot, gr, src);
+        const int tracked_voice =
+            p25p2_vpdu_observe_voice(opts, state, slot, DSD_CALL_KIND_PRIVATE_VOICE, (uint64_t)(uint32_t)gr,
+                                     (uint64_t)(uint32_t)src, svc, ctx->pdu_type);
+        if (tracked_voice) {
+            state->p25_p2_last_mac_active[slot] = time(NULL);
+            p25p2_vpdu_store_slot_svc(state, slot, svc);
+        }
 
-        if ((svc & 0x40) && opts->trunk_enable == 1 && opts->trunk_is_tuned == 1 && opts->trunk_tune_enc_calls == 0) {
+        if (tracked_voice && p25p2_vpdu_pdu_type_is_live_voice(ctx->pdu_type) && (svc & 0x40) && opts->trunk_enable == 1
+            && opts->trunk_is_tuned == 1 && opts->trunk_tune_enc_calls == 0) {
             p25_sm_emit_crypto_pending(opts, state, slot & 1);
         }
     }
@@ -3893,13 +4051,8 @@ p25p2_vpdu_iter_block_53(p25p2_vpdu_ctx* ctx) {
         long int sccf = process_channel_to_freq(opts, state, channelt);
         (void)process_channel_to_freq(opts, state, channelr);
         // Add to CC candidate list for hunting
-        if (sccf > 0 && p25p2_sccb_matches_current_site(state, rfssid, siteid) && state->trunk_lcn_freq[1] == 0) {
-            state->trunk_lcn_freq[1] = sccf;
-            state->lcn_freq_count = 2;
-        } else if (sccf > 0 && p25p2_sccb_matches_current_site(state, rfssid, siteid) && state->trunk_lcn_freq[2] == 0
-                   && sccf != state->trunk_lcn_freq[1]) {
-            state->trunk_lcn_freq[2] = sccf;
-            state->lcn_freq_count = 3;
+        if (sccf > 0) {
+            p25p2_seed_secondary_lcn_fallback(opts, state, rfssid, siteid, &sccf, 1);
         }
         (void)p25_announce_secondary_cc_channel(opts, state, (uint16_t)channelt, (uint8_t)rfssid, (uint8_t)siteid,
                                                 (uint8_t)sysclass);
@@ -4120,23 +4273,26 @@ p25p2_vpdu_iter_block_57(p25p2_vpdu_ctx* ctx) {
         DSD_FPRINTF(stderr, " Target [%d]", target_addr);
 
         if (has_addl_info) {
-            DSD_SNPRINTF(state->active_channel[0], sizeof state->active_channel[0],
-                         "%s Target: %d Reason: %s Info: %06X; ", is_deny ? "DENY" : "QUEUED", target_addr, reason_str,
-                         addl_info);
+            p25p2_vpdu_publish_activityf(state, 0U, DSD_CALL_KIND_DATA, (uint64_t)target_addr, 0U, 0U, 0,
+                                         (uint16_t)svc_type, "%s Target: %d Reason: %s Info: %06X; ",
+                                         is_deny ? "DENY" : "QUEUED", target_addr, reason_str, addl_info);
         } else {
-            DSD_SNPRINTF(state->active_channel[0], sizeof state->active_channel[0], "%s Target: %d Reason: %s; ",
-                         is_deny ? "DENY" : "QUEUED", target_addr, reason_str);
+            p25p2_vpdu_publish_activityf(state, 0U, DSD_CALL_KIND_DATA, (uint64_t)target_addr, 0U, 0U, 0,
+                                         (uint16_t)svc_type, "%s Target: %d Reason: %s; ", is_deny ? "DENY" : "QUEUED",
+                                         target_addr, reason_str);
         }
-        state->last_active_time = time(NULL);
 
-        // Notify the trunking state machine.
+        // Notify the trunking state machine. An occupied carrier keeps its
+        // calls; the acquisition watchdog owns cleaning up a granted-then-
+        // denied assignment that never produces voice.
         if (opts) {
             if (is_deny) {
                 state->p25_sm_deny_count++;
-                p25_sm_release(p25_sm_get_ctx(), opts, state, "deny-rsp");
             } else {
                 state->p25_sm_queued_count++;
-                p25_sm_release(p25_sm_get_ctx(), opts, state, "queued-rsp");
+            }
+            if (!p25p2_vpdu_carrier_occupied_for_response(opts, state)) {
+                p25_sm_release(p25_sm_get_ctx(), opts, state, is_deny ? "deny-rsp" : "queued-rsp");
             }
         }
     }
@@ -4223,9 +4379,9 @@ p25p2_vpdu_handle_status_update_abbreviated(p25p2_vpdu_ctx* ctx) {
     DSD_FPRINTF(stderr, "\n Status Update - Abbreviated");
     DSD_FPRINTF(stderr, "\n  Target [%d] Source [%d] Unit [%02X] User [%02X]", target, source, unit_status,
                 user_status);
-    DSD_SNPRINTF(state->active_channel[0], sizeof state->active_channel[0],
-                 "STATUS Target: %d Source: %d Unit: %02X User: %02X; ", target, source, unit_status, user_status);
-    state->last_active_time = time(NULL);
+    p25p2_vpdu_publish_activityf(state, 0U, DSD_CALL_KIND_DATA, (uint64_t)target, (uint64_t)source, 0U, 0, 0U,
+                                 "STATUS Target: %d Source: %d Unit: %02X User: %02X; ", target, source, unit_status,
+                                 user_status);
 }
 
 static const char*
@@ -4258,9 +4414,8 @@ p25p2_vpdu_handle_query_alert_affiliation_abbreviated(p25p2_vpdu_ctx* ctx, int o
 
     DSD_FPRINTF(stderr, "\n %s - Abbreviated", label);
     DSD_FPRINTF(stderr, "\n  Target [%d] Source [%d]", target, source);
-    DSD_SNPRINTF(state->active_channel[0], sizeof state->active_channel[0], "%s Target: %d Source: %d; ", label, target,
-                 source);
-    state->last_active_time = time(NULL);
+    p25p2_vpdu_publish_activityf(state, 0U, DSD_CALL_KIND_DATA, (uint64_t)target, (uint64_t)source, 0U, 0, 0U,
+                                 "%s Target: %d Source: %d; ", label, target, source);
 }
 
 static void
@@ -4275,9 +4430,8 @@ p25p2_vpdu_handle_message_update_abbreviated(p25p2_vpdu_ctx* ctx) {
 
     DSD_FPRINTF(stderr, "\n Message Update - Abbreviated");
     DSD_FPRINTF(stderr, "\n  Target [%d] Source [%d] Message [%04X]", target, source, message);
-    DSD_SNPRINTF(state->active_channel[0], sizeof state->active_channel[0], "MSG Target: %d Source: %d Message: %04X; ",
-                 target, source, message);
-    state->last_active_time = time(NULL);
+    p25p2_vpdu_publish_activityf(state, 0U, DSD_CALL_KIND_DATA, (uint64_t)target, (uint64_t)source, 0U, 0, 0U,
+                                 "MSG Target: %d Source: %d Message: %04X; ", target, source, message);
 }
 
 static void
@@ -4300,9 +4454,8 @@ p25p2_vpdu_handle_ack_response_fne_abbreviated(p25p2_vpdu_ctx* ctx) {
         int source = p25p2_vpdu_u24(MAC, 4 + len_a);
         DSD_FPRINTF(stderr, " Source [%d]", source);
     }
-    DSD_SNPRINTF(state->active_channel[0], sizeof state->active_channel[0], "ACK Target: %d Service: %02X; ", target,
-                 svc_type);
-    state->last_active_time = time(NULL);
+    p25p2_vpdu_publish_activityf(state, 0U, DSD_CALL_KIND_DATA, (uint64_t)target, 0U, 0U, 0, (uint16_t)svc_type,
+                                 "ACK Target: %d Service: %02X; ", target, svc_type);
 }
 
 static void
@@ -4347,10 +4500,12 @@ p25p2_vpdu_handle_telephone_interconnect_voice_user(p25p2_vpdu_ctx* ctx) {
     DSD_FPRINTF(stderr, "\n Telephone Interconnect Voice Channel User");
     DSD_FPRINTF(stderr, "\n  SVC [%02X] Target [%d] Timer [%0.1fs]", svc, target, (double)timer / 10.0);
     p25p2_vpdu_print_svc_with_slot_state(ctx->opts, state, slot_idx, svc, /*set_packet_bit*/ 0);
-    p25p2_vpdu_store_slot_svc(state, slot_idx, svc);
-    DSD_SNPRINTF(state->active_channel[0], sizeof state->active_channel[0], "TELE Target: %d Timer: %.1fs; ", target,
-                 (double)timer / 10.0);
-    state->last_active_time = time(NULL);
+    if (p25p2_vpdu_observe_voice(ctx->opts, state, slot_idx, DSD_CALL_KIND_PRIVATE_VOICE, (uint64_t)(uint32_t)target,
+                                 0U, svc, ctx->pdu_type)) {
+        p25p2_vpdu_store_slot_svc(state, slot_idx, svc);
+    }
+    p25p2_vpdu_publish_activityf(state, 0U, DSD_CALL_KIND_PRIVATE_VOICE, (uint64_t)target, 0U, 0U, 0, (uint16_t)svc,
+                                 "TELE Target: %d Timer: %.1fs; ", target, (double)timer / 10.0);
 }
 
 static void
@@ -4367,10 +4522,9 @@ p25p2_vpdu_handle_radio_unit_monitor_abbreviated(p25p2_vpdu_ctx* ctx) {
     DSD_FPRINTF(stderr, "\n Radio Unit Monitor Command - Abbreviated");
     DSD_FPRINTF(stderr, "\n  Target [%d] Source [%d] Time [%d] Mult [%d]%s", target, source, transmit_time, multiplier,
                 silent ? " Silent" : "");
-    DSD_SNPRINTF(state->active_channel[0], sizeof state->active_channel[0],
-                 "RUM Target: %d Source: %d Time: %d Mult: %d%s; ", target, source, transmit_time, multiplier,
-                 silent ? " Silent" : "");
-    state->last_active_time = time(NULL);
+    p25p2_vpdu_publish_activityf(state, 0U, DSD_CALL_KIND_DATA, (uint64_t)target, (uint64_t)source, 0U, 0, 0U,
+                                 "RUM Target: %d Source: %d Time: %d Mult: %d%s; ", target, source, transmit_time,
+                                 multiplier, silent ? " Silent" : "");
 }
 
 static void
@@ -4391,10 +4545,10 @@ p25p2_vpdu_handle_radio_unit_monitor_enhanced_abbreviated(p25p2_vpdu_ctx* ctx) {
     DSD_FPRINTF(stderr, "\n Radio Unit Monitor Enhanced Command - Abbreviated");
     DSD_FPRINTF(stderr, "\n  Target [%d] %s [%d] Time [%d] ALG [%02X] KID [%04X]%s", target,
                 talkgroup_mode ? "Group" : "Source", monitor, transmit_time, algid, key_id, silent ? " Silent" : "");
-    DSD_SNPRINTF(state->active_channel[0], sizeof state->active_channel[0],
-                 "RUM-E Target: %d %s: %d Time: %d ALG: %02X KID: %04X%s; ", target, talkgroup_mode ? "TG" : "RID",
-                 monitor, transmit_time, algid, key_id, silent ? " Silent" : "");
-    state->last_active_time = time(NULL);
+    p25p2_vpdu_publish_activityf(
+        state, 0U, DSD_CALL_KIND_DATA, (uint64_t)target, talkgroup_mode ? 0U : (uint64_t)source, 0U, 0, 0U,
+        "RUM-E Target: %d %s: %d Time: %d ALG: %02X KID: %04X%s; ", target, talkgroup_mode ? "TG" : "RID", monitor,
+        transmit_time, algid, key_id, silent ? " Silent" : "");
 }
 
 static void
@@ -4413,10 +4567,9 @@ p25p2_vpdu_handle_radio_unit_monitor_extended_vch(p25p2_vpdu_ctx* ctx) {
     DSD_FPRINTF(stderr, "\n Radio Unit Monitor Command - Extended VCH");
     DSD_FPRINTF(stderr, "\n  Target [%d] Source [%05X:%03X.%d] Time [%d] Mult [%d]%s", target, source_wacn, source_sys,
                 source, transmit_time, multiplier, silent ? " Silent" : "");
-    DSD_SNPRINTF(state->active_channel[0], sizeof state->active_channel[0],
-                 "RUM-X Target: %d Source: %d Time: %d Mult: %d%s; ", target, source, transmit_time, multiplier,
-                 silent ? " Silent" : "");
-    state->last_active_time = time(NULL);
+    p25p2_vpdu_publish_activityf(state, 0U, DSD_CALL_KIND_DATA, (uint64_t)target, (uint64_t)source, 0U, 0, 0U,
+                                 "RUM-X Target: %d Source: %d Time: %d Mult: %d%s; ", target, source, transmit_time,
+                                 multiplier, silent ? " Silent" : "");
 }
 
 static void
@@ -4434,9 +4587,9 @@ p25p2_vpdu_handle_status_update_extended_vch(p25p2_vpdu_ctx* ctx) {
     DSD_FPRINTF(stderr, "\n Status Update - Extended VCH");
     DSD_FPRINTF(stderr, "\n  Target [%d] Source [%05X:%03X.%d] Unit [%02X] User [%02X]", target, source_wacn,
                 source_sys, source, unit_status, user_status);
-    DSD_SNPRINTF(state->active_channel[0], sizeof state->active_channel[0],
-                 "STATUS-X Target: %d Source: %d Unit: %02X User: %02X; ", target, source, unit_status, user_status);
-    state->last_active_time = time(NULL);
+    p25p2_vpdu_publish_activityf(state, 0U, DSD_CALL_KIND_DATA, (uint64_t)target, (uint64_t)source, 0U, 0, 0U,
+                                 "STATUS-X Target: %d Source: %d Unit: %02X User: %02X; ", target, source, unit_status,
+                                 user_status);
 }
 
 static void
@@ -4452,9 +4605,8 @@ p25p2_vpdu_handle_status_query_alert_affiliation_extended_vch(p25p2_vpdu_ctx* ct
 
     DSD_FPRINTF(stderr, "\n %s - Extended VCH", label);
     DSD_FPRINTF(stderr, "\n  Target [%d] Source [%05X:%03X.%d]", target, source_wacn, source_sys, source);
-    DSD_SNPRINTF(state->active_channel[0], sizeof state->active_channel[0], "%s-X Target: %d Source: %d; ", label,
-                 target, source);
-    state->last_active_time = time(NULL);
+    p25p2_vpdu_publish_activityf(state, 0U, DSD_CALL_KIND_DATA, (uint64_t)target, (uint64_t)source, 0U, 0, 0U,
+                                 "%s-X Target: %d Source: %d; ", label, target, source);
 }
 
 static void
@@ -4471,9 +4623,8 @@ p25p2_vpdu_handle_message_update_extended_vch(p25p2_vpdu_ctx* ctx) {
     DSD_FPRINTF(stderr, "\n Message Update - Extended VCH");
     DSD_FPRINTF(stderr, "\n  Target [%d] Source [%05X:%03X.%d] Message [%04X]", target, source_wacn, source_sys, source,
                 message);
-    DSD_SNPRINTF(state->active_channel[0], sizeof state->active_channel[0],
-                 "MSG-X Target: %d Source: %d Message: %04X; ", target, source, message);
-    state->last_active_time = time(NULL);
+    p25p2_vpdu_publish_activityf(state, 0U, DSD_CALL_KIND_DATA, (uint64_t)target, (uint64_t)source, 0U, 0, 0U,
+                                 "MSG-X Target: %d Source: %d Message: %04X; ", target, source, message);
 }
 
 static void
@@ -4496,9 +4647,9 @@ p25p2_vpdu_handle_extended_function_extended_vch(p25p2_vpdu_ctx* ctx) {
     if (class_id == 0) {
         DSD_FPRINTF(stderr, " %s", p25_extended_function_class0_operand_label((uint8_t)operand));
     }
-    DSD_SNPRINTF(state->active_channel[0], sizeof state->active_channel[0],
-                 "EXTFUNC-X Target: %d Source: %d Function: %04X Arg: %06X; ", target, source, function, argument);
-    state->last_active_time = time(NULL);
+    p25p2_vpdu_publish_activityf(state, 0U, DSD_CALL_KIND_DATA, (uint64_t)target, (uint64_t)source, 0U, 0, 0U,
+                                 "EXTFUNC-X Target: %d Source: %d Function: %04X Arg: %06X; ", target, source, function,
+                                 argument);
 }
 
 static void
@@ -4520,10 +4671,9 @@ p25p2_vpdu_handle_extended_function_extended_lcch(p25p2_vpdu_ctx* ctx) {
     if (class_id == 0) {
         DSD_FPRINTF(stderr, " %s", p25_extended_function_class0_operand_label((uint8_t)operand));
     }
-    DSD_SNPRINTF(state->active_channel[0], sizeof state->active_channel[0],
-                 "EXTFUNC-L Target: %d Source: %05X:%03X Function: %04X Arg: %06X; ", target, source_wacn, source_sys,
-                 function, argument);
-    state->last_active_time = time(NULL);
+    p25p2_vpdu_publish_activityf(state, 0U, DSD_CALL_KIND_DATA, (uint64_t)target, 0U, 0U, 0, 0U,
+                                 "EXTFUNC-L Target: %d Source: %05X:%03X Function: %04X Arg: %06X; ", target,
+                                 source_wacn, source_sys, function, argument);
 }
 
 static void
@@ -4543,9 +4693,9 @@ p25p2_vpdu_handle_group_affiliation_response_extended(p25p2_vpdu_ctx* ctx) {
     DSD_FPRINTF(stderr, "\n Group Affiliation Response - Extended");
     DSD_FPRINTF(stderr, "\n  LG [%d] Response [%d] AGA [%d] GA [%d] SourceGID [%05X:%03X.%d] Target [%d]", local,
                 response, announcement_group, group, source_wacn, source_sys, source_gid, target);
-    DSD_SNPRINTF(state->active_channel[0], sizeof state->active_channel[0],
-                 "AFF-X Target: %d GA: %d AGA: %d Response: %d; ", target, group, announcement_group, response);
-    state->last_active_time = time(NULL);
+    p25p2_vpdu_publish_activityf(state, 0U, DSD_CALL_KIND_DATA, (uint64_t)target, 0U, 0U, 0, 0U,
+                                 "AFF-X Target: %d GA: %d AGA: %d Response: %d; ", target, group, announcement_group,
+                                 response);
 
     if (response == 0) {
         p25_aff_register(state, (uint32_t)target);
@@ -4629,23 +4779,25 @@ p25p2_vpdu_handle_motorola_queued_deny(p25p2_vpdu_ctx* ctx, int is_deny) {
     DSD_FPRINTF(stderr, "\n  SVC [%02X] Reason [%s]", svc_type, reason_str);
     if (has_addl_info) {
         DSD_FPRINTF(stderr, " Addl [%06X]", addl_info);
-        DSD_SNPRINTF(state->active_channel[0], sizeof state->active_channel[0],
-                     "MOT %s Target: %d Reason: %s Info: %06X; ", is_deny ? "DENY" : "QUEUED", target_addr, reason_str,
-                     addl_info);
+        p25p2_vpdu_publish_activityf(state, 0U, DSD_CALL_KIND_DATA, (uint64_t)target_addr, 0U, 0U, 0,
+                                     (uint16_t)svc_type, "MOT %s Target: %d Reason: %s Info: %06X; ",
+                                     is_deny ? "DENY" : "QUEUED", target_addr, reason_str, addl_info);
     } else {
-        DSD_SNPRINTF(state->active_channel[0], sizeof state->active_channel[0], "MOT %s Target: %d Reason: %s; ",
-                     is_deny ? "DENY" : "QUEUED", target_addr, reason_str);
+        p25p2_vpdu_publish_activityf(state, 0U, DSD_CALL_KIND_DATA, (uint64_t)target_addr, 0U, 0U, 0,
+                                     (uint16_t)svc_type, "MOT %s Target: %d Reason: %s; ", is_deny ? "DENY" : "QUEUED",
+                                     target_addr, reason_str);
     }
     DSD_FPRINTF(stderr, " Target [%d]", target_addr);
-    state->last_active_time = time(NULL);
 
+    // Same occupancy rule as the standard Deny/Queued handler above.
     if (opts) {
         if (is_deny) {
             state->p25_sm_deny_count++;
-            p25_sm_release(p25_sm_get_ctx(), opts, state, "deny-rsp");
         } else {
             state->p25_sm_queued_count++;
-            p25_sm_release(p25_sm_get_ctx(), opts, state, "queued-rsp");
+        }
+        if (!p25p2_vpdu_carrier_occupied_for_response(opts, state)) {
+            p25_sm_release(p25_sm_get_ctx(), opts, state, is_deny ? "deny-rsp" : "queued-rsp");
         }
     }
 }
@@ -4661,9 +4813,9 @@ p25p2_vpdu_handle_motorola_ack_response(p25p2_vpdu_ctx* ctx) {
 
     DSD_FPRINTF(stderr, "\n Motorola Acknowledge Response");
     DSD_FPRINTF(stderr, "\n  Service [%02X] Source [%d] Target [%d]", svc_type, source, target);
-    DSD_SNPRINTF(state->active_channel[0], sizeof state->active_channel[0],
-                 "MOT ACK Target: %d Source: %d Service: %02X; ", target, source, svc_type);
-    state->last_active_time = time(NULL);
+    p25p2_vpdu_publish_activityf(state, 0U, DSD_CALL_KIND_DATA, (uint64_t)target, (uint64_t)source, 0U, 0,
+                                 (uint16_t)svc_type, "MOT ACK Target: %d Source: %d Service: %02X; ", target, source,
+                                 svc_type);
 }
 
 static void
@@ -4783,14 +4935,13 @@ p25p2_vpdu_handle_motorola_active_group_radios(p25p2_vpdu_ctx* ctx, int opcode) 
     DSD_FPRINTF(stderr, "\n Motorola %d Active Group Radios", opcode);
     if (status >= 0) {
         DSD_FPRINTF(stderr, "\n  Status [%02X] Radios [%s]", status, radios);
-        DSD_SNPRINTF(state->active_channel[0], sizeof state->active_channel[0], "MOT AGR %d Status: %02X Radios: %s; ",
-                     opcode, status, radios);
+        p25p2_vpdu_publish_activityf(state, 0U, DSD_CALL_KIND_DATA, 0U, 0U, 0U, 0, 0U,
+                                     "MOT AGR %d Status: %02X Radios: %s; ", opcode, status, radios);
     } else {
         DSD_FPRINTF(stderr, "\n  Radios [%s]", radios);
-        DSD_SNPRINTF(state->active_channel[0], sizeof state->active_channel[0], "MOT AGR %d Radios: %s; ", opcode,
-                     radios);
+        p25p2_vpdu_publish_activityf(state, 0U, DSD_CALL_KIND_DATA, 0U, 0U, 0U, 0, 0U, "MOT AGR %d Radios: %s; ",
+                                     opcode, radios);
     }
-    state->last_active_time = time(NULL);
 }
 
 static void
@@ -4812,8 +4963,7 @@ p25p2_vpdu_handle_motorola_active_group_marker(p25p2_vpdu_ctx* ctx) {
     if (raw[0] != '\0') {
         DSD_FPRINTF(stderr, " MSG [%s]", raw);
     }
-    DSD_SNPRINTF(state->active_channel[0], sizeof state->active_channel[0], "MOT AGR Feature Active: %s; ", raw);
-    state->last_active_time = time(NULL);
+    p25p2_vpdu_publish_activityf(state, 0U, DSD_CALL_KIND_DATA, 0U, 0U, 0U, 0, 0U, "MOT AGR Feature Active: %s; ", raw);
 }
 
 static void
@@ -4828,7 +4978,7 @@ p25p2_vpdu_handle_harris_gps_location(p25p2_vpdu_ctx* ctx) {
     const dsd_opts* opts = ctx->opts;
     dsd_state* state = ctx->state;
     uint8_t bits[24 * 8];
-    int src = (ctx->slot == 0) ? state->lastsrc : state->lastsrcR;
+    int src = (int)p25p2_vpdu_active_source(state, (uint8_t)ctx->slot);
     int payload_octets = ctx->len_b - 3;
 
     if (payload_octets <= 0 || !p25p2_vpdu_vendor_has_octets(ctx, 4, 1)) {
@@ -4863,13 +5013,13 @@ p25p2_vpdu_handle_harris_data_channel_grant(p25p2_vpdu_ctx* ctx, int opcode) {
 
     p25_format_chan_suffix(state, (uint16_t)channel, -1, suffix, sizeof suffix);
     if (source != 0) {
-        DSD_SNPRINTF(state->active_channel[0], sizeof state->active_channel[0],
-                     "Harris Data Ch: %04X%s TGT: %d SRC: %d; ", channel, suffix, target, source);
+        p25p2_vpdu_publish_activityf(state, 0U, DSD_CALL_KIND_DATA, (uint64_t)target, (uint64_t)source,
+                                     (uint16_t)channel, freq, 0U, "Harris Data Ch: %04X%s TGT: %d SRC: %d; ", channel,
+                                     suffix, target, source);
     } else {
-        DSD_SNPRINTF(state->active_channel[0], sizeof state->active_channel[0], "Harris Data Ch: %04X%s TGT: %d; ",
-                     channel, suffix, target);
+        p25p2_vpdu_publish_activityf(state, 0U, DSD_CALL_KIND_DATA, (uint64_t)target, 0U, (uint16_t)channel, freq, 0U,
+                                     "Harris Data Ch: %04X%s TGT: %d; ", channel, suffix, target);
     }
-    state->last_active_time = time(NULL);
 
     if (p25p2_vpdu_can_dispatch_grant(opts, state, freq)) {
         int policy_encrypted = (opts->trunk_tune_enc_calls == 0) ? 1 : 0;
@@ -4893,14 +5043,14 @@ p25p2_vpdu_handle_standard_group_regroup_voice_user_abbreviated(p25p2_vpdu_ctx* 
 
     DSD_FPRINTF(stderr, "\n VCH %d - Super Group %d SRC %d Standard Group Regroup Voice", slot + 1, supergroup, source);
 
-    state->p25_p2_last_mac_active[slot] = time(NULL);
-    state->p25_p2_last_mac_active_m[slot] = dsd_time_now_monotonic_s();
-    state->gi[slot] = 0;
-    p25p2_vpdu_set_group_call_banner(state, slot, /*svc*/ 0);
     if (supergroup != 0) {
         p25_patch_update(state, supergroup, /*is_patch*/ 1, /*active*/ 1);
+        if (p25p2_vpdu_observe_voice(ctx->opts, state, slot, DSD_CALL_KIND_GROUP_VOICE, (uint64_t)(uint32_t)supergroup,
+                                     (uint64_t)(uint32_t)source, -1, ctx->pdu_type)) {
+            state->p25_p2_last_mac_active[slot] = time(NULL);
+            state->p25_p2_last_mac_active_m[slot] = dsd_time_now_monotonic_s();
+        }
     }
-    p25p2_vpdu_update_group_last_ids(state, slot, supergroup, source);
 }
 
 static void
@@ -5089,13 +5239,15 @@ static void p25p2_vpdu_multifrag_set_active(dsd_state* state, const char* fmt, .
 static void
 p25p2_vpdu_multifrag_set_active(dsd_state* state, const char* fmt, ...) {
     va_list ap;
+    char notice[DSD_RECENT_ACTIVITY_TEXT_SIZE];
     if (!state || !fmt) {
         return;
     }
     va_start(ap, fmt);
-    DSD_VSNPRINTF(state->active_channel[0], sizeof state->active_channel[0], fmt, ap);
+    DSD_VSNPRINTF(notice, sizeof notice, fmt, ap);
     va_end(ap);
-    state->last_active_time = time(NULL);
+    const dsd_call_observation observation = dsd_call_observation_data(state->lastsynctype, 0U, 0U, 0U);
+    (void)dsd_recent_activity_publish(state, 0U, &observation, notice, 0U);
 }
 
 static void
@@ -5158,8 +5310,9 @@ p25p2_vpdu_handle_multifrag_unit_to_unit_grant(p25p2_vpdu_ctx* ctx, int is_servi
         (void)process_channel_to_freq(opts, state, channelr);
     }
     p25_format_chan_suffix(state, (uint16_t)channelt, -1, suffix, sizeof suffix);
-    p25p2_vpdu_multifrag_set_active(state, "%s Active Ch: %04X%s TGT: %d SRC: %d; ",
-                                    is_service_grant ? "UU-SVC-L" : "UU-UP-L", channelt, suffix, target, source);
+    p25p2_vpdu_publish_activityf(state, 0U, DSD_CALL_KIND_PRIVATE_VOICE, (uint64_t)target, (uint64_t)source,
+                                 (uint16_t)channelt, freq, (uint16_t)svc, "%s Active Ch: %04X%s TGT: %d SRC: %d; ",
+                                 is_service_grant ? "UU-SVC-L" : "UU-UP-L", channelt, suffix, target, source);
 
     if (opts->trunk_tune_private_calls && p25p2_vpdu_can_dispatch_grant(opts, state, freq)) {
         p25p2_mac_handle_indiv(ctx->mac_res, opts, state, channelt, svc, target, source,
@@ -5479,6 +5632,10 @@ p25p2_vpdu_select_segment(p25p2_vpdu_ctx* ctx, int index) {
     if (!ctx || !ctx->mac_res || index < 0 || index >= ctx->mac_res->segment_count) {
         return 0;
     }
+    // A segment offset must address a real octet; handlers add fixed field offsets to it.
+    if (ctx->mac_res->segments[index].offset < 0 || ctx->mac_res->segments[index].offset >= P25P2_MAC_OCTETS) {
+        return 0;
+    }
     ctx->len_a = ctx->mac_res->segments[index].offset;
     ctx->len_b = ctx->mac_res->segments[index].length;
     ctx->len_c = (index + 1 < ctx->mac_res->segment_count) ? ctx->mac_res->segments[index + 1].length : 0;
@@ -5503,14 +5660,15 @@ p25p2_vpdu_print_payload(const dsd_opts* opts, const unsigned long long int mac[
 }
 
 void
-process_MAC_VPDU(dsd_opts* opts, dsd_state* state, int type, unsigned long long int mac[24]) {
-    unsigned long long int mac_octets[24] = {0};
-    for (int bi = 0; bi < 24; bi++) {
+process_MAC_VPDU(dsd_opts* opts, dsd_state* state, int type, p25_mac_pdu_type pdu_type,
+                 unsigned long long int mac[24]) {
+    unsigned long long int mac_octets[P25P2_MAC_STAGING_OCTETS] = {0};
+    for (int bi = 0; bi < P25P2_MAC_OCTETS; bi++) {
         mac_octets[bi] = mac[bi] & 0xFFu;
     }
     const unsigned long long int* MAC = mac_octets;
-    //handle variable content MAC PDUs (Active, Idle, Hangtime, or Signal)
-    //use type to specify SACCH or FACCH, so we know if we should invert the currentslot when assigning ids etc
+    // Handle variable content MAC PDUs. Keep the outer PDU type distinct from
+    // the SACCH/FACCH transport so voice-user blocks retain their provenance.
 
     //b values - 0 = Unique TDMA Message,  1 Phase 1 OSP/ISP abbreviated
     // 2 = Manufacturer Message, 3 Phase 1 OSP/ISP extended/explicit
@@ -5529,6 +5687,7 @@ process_MAC_VPDU(dsd_opts* opts, dsd_state* state, int type, unsigned long long 
         .opts = opts,
         .state = state,
         .type = type,
+        .pdu_type = pdu_type,
         .mac = mac_octets,
         .mac_res = &mac_res,
         .len_a = initial_len_a,

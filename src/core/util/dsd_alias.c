@@ -13,14 +13,15 @@
 
 #include <dsd-neo/core/bit_packing.h>
 
+#include <dsd-neo/core/call_state.h>
 #include <dsd-neo/core/constants.h>
 #include <dsd-neo/core/embedded_alias.h>
 #include <dsd-neo/core/events.h>
 #include <dsd-neo/core/state.h>
 #include <dsd-neo/core/string_utils.h>
 #include <dsd-neo/core/talkgroup_policy.h>
+#include <dsd-neo/core/utf16.h>
 #include <dsd-neo/runtime/unicode.h>
-#include <locale.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -65,17 +66,23 @@ alias_slot_index(uint8_t slot) {
 }
 
 static int
-alias_current_call_matches(const dsd_state* state, uint8_t slot, uint32_t src, uint32_t tg) {
-    if (!state || !state->event_history_s || src == 0) {
+alias_current_call_snapshot(const dsd_state* state, uint8_t slot, uint32_t src, uint32_t tg, dsd_call_snapshot* out) {
+    if (!state || !out || src == 0) {
         return 0;
     }
 
     uint8_t slot_idx = alias_slot_index(slot);
-    const Event_History* ev = &state->event_history_s[slot_idx].Event_History_Items[0];
-    if (ev->source_id != src) {
+    if (dsd_call_state_get(state, slot_idx, out) <= 0 || out->ota_source_id != src) {
         return 0;
     }
-    if (tg != 0 && ev->target_id != 0 && ev->target_id != tg) {
+    // Motorola P25 systems transmit the talker alias during hangtime, after the
+    // transmission's MAC_END_PTT has already ended the epoch. The retained ended
+    // epoch still names that talker, and the exact source-id match above keeps a
+    // late alias from landing on a different call.
+    if (out->phase != DSD_CALL_PHASE_ACTIVE && out->phase != DSD_CALL_PHASE_ENDED) {
+        return 0;
+    }
+    if (tg != 0 && out->ota_target_id != 0U && out->ota_target_id != tg && out->policy_target_id != tg) {
         return 0;
     }
     return 1;
@@ -127,6 +134,28 @@ apx_alias_state_accept_block(dsd_state* state, uint8_t slot, uint8_t sequence, u
     } else {
         apx_alias_state_reset(state, slot);
     }
+    return 1;
+}
+
+/**
+ * @brief Store one alias block into the superframe row, bounded.
+ *
+ * The block number is checked against ta_len, but ta_len is itself an unvalidated 8-bit field
+ * taken off the air: a header claiming more blocks than the row holds would walk this copy past
+ * the end of the row and into unrelated dsd_state members.
+ *
+ * @return 1 when the block was stored, 0 when the record was rejected and the store reset.
+ */
+static int
+apx_alias_store_block(dsd_state* state, uint8_t slot, size_t offset, const uint8_t* bits, size_t len) {
+    const size_t capacity = sizeof(state->dmr_pdu_sf[slot]);
+    if (offset > capacity || len > capacity - offset) {
+        DSD_FPRINTF(stderr, " Alias Block Overflow");
+        DSD_MEMSET(state->dmr_pdu_sf[slot], 0, capacity);
+        apx_alias_state_reset(state, slot);
+        return 0;
+    }
+    DSD_MEMCPY(state->dmr_pdu_sf[slot] + offset, bits, len);
     return 1;
 }
 
@@ -202,7 +231,9 @@ apx_embedded_alias_blocks_phase1(dsd_opts* opts, dsd_state* state, uint8_t slot,
         DSD_FPRINTF(stderr, " BN: %d/%d;", bn, ta_len);
 
         //use dmr_pdu_sf for storage, store data relevant portion at ptr of (bn-1) * 44 + 72 offset for header
-        DSD_MEMCPY(state->dmr_pdu_sf[slot] + (((bn - 1) * 44) + 72), lc_bits + 28, 44 * sizeof(uint8_t));
+        if (!apx_alias_store_block(state, slot, ((size_t)(bn - 1U) * 44U) + 72U, lc_bits + 28, 44U)) {
+            return;
+        }
 
         if (ta_len == bn) //this is the last block, proceed to decoding
         {
@@ -301,8 +332,11 @@ apx_embedded_alias_blocks_phase2(dsd_opts* opts, dsd_state* state, uint8_t slot,
         DSD_FPRINTF(stderr, " BN: %d/%d;", bn, ta_len);
 
         //use dmr_pdu_sf for storage, store data relevant portion at ptr calculated below
-        DSD_MEMCPY(state->dmr_pdu_sf[slot] + (alias_st + ((bn - 1) * rel_bits)), lc_bits + rel_st,
-                   rel_bits * sizeof(uint8_t)); //Fix this value when samples arrive
+        const size_t store_off = (size_t)alias_st + ((size_t)(bn - 1U) * (size_t)rel_bits);
+        if (!apx_alias_store_block(state, slot, store_off, lc_bits + rel_st,
+                                   (size_t)rel_bits)) { //Fix this value when samples arrive
+            return;
+        }
 
         //debug, dump accumulated data at this end
 
@@ -333,11 +367,115 @@ apx_embedded_alias_blocks_phase2(dsd_opts* opts, dsd_state* state, uint8_t slot,
 }
 
 void
+apx_embedded_alias_unscramble(const uint8_t* encoded, size_t encoded_size, uint16_t num_bytes, uint8_t* decoded,
+                              size_t decoded_size) {
+    if (encoded == NULL || decoded == NULL) {
+        return;
+    }
+
+    uint16_t accumulator = num_bytes;
+
+    // The count is uint16_t and both spans are size_t. Fold them into one size_t bound rather than
+    // comparing a narrow counter against a wider limit in the loop condition, which is only safe
+    // here by way of the num_bytes term (CodeQL cpp/comparison-with-wider-type).
+    size_t limit = num_bytes;
+    if (limit > encoded_size) {
+        limit = encoded_size;
+    }
+    if (limit > decoded_size) {
+        limit = decoded_size;
+    }
+
+    //Ilya's Voodoo Code
+    for (size_t i = 0; i < limit; i++) {
+        // Multiplication step 1
+        uint16_t accum_mult = accumulator * 293 + 0x72E9;
+
+        // Lookup table step
+        uint8_t lut = moto_alias_lut[encoded[i]];
+        uint8_t mult1 = lut - (accum_mult >> 8);
+
+        // Incrementing step
+        uint8_t mult2 = 1;
+        uint8_t shortstop = accum_mult | 0x1;
+        uint8_t increment = shortstop << 1;
+
+        //clang warning -- warning: result of comparison of constant -1 with expression of type 'uint8_t' (aka 'unsigned char') is always true [-Wtautological-constant-out-of-range-compare]
+        while (shortstop != 1) //this one tests out okay, so may use it instead
+        {
+            shortstop += increment;
+            mult2 += 2;
+        }
+
+        // Multiplication step 2
+        decoded[i] = mult1 * mult2;
+
+        // Update the accumulator
+        accumulator += encoded[i] + 1;
+    }
+}
+
+// The alias octets descramble to whatever the air carried, so controls are shown as a space the
+// way the DMR alias and UDT printers do: an unfiltered C0 byte would put an ESC sequence from
+// off-air data straight onto the operator's terminal.
+static void
+apx_embedded_alias_print_scalar(uint32_t scalar) {
+    if (!dsd_unicode_scalar_is_control(scalar)) {
+        dsd_unicode_fput_scalar(scalar, stderr);
+    } else {
+        DSD_FPRINTF(stderr, " ");
+    }
+}
+
+// The alias octets are UTF-16BE. Pairs are combined and unpaired halves shown as U+FFFD before
+// anything reaches stderr, so the C runtime never sees a code unit it cannot encode (issue #358).
+static void
+apx_embedded_alias_print_utf16(const uint8_t* decoded, uint16_t num_bytes) {
+    dsd_utf16_decoder decoder;
+    uint32_t scalars[DSD_UTF16_MAX_SCALARS_PER_UNIT];
+    dsd_utf16_decoder_reset(&decoder);
+    for (int i = 0; i < num_bytes / 2; i++) {
+        uint16_t unit = (uint16_t)(((decoded[(i * 2) + 0]) << 8) | ((decoded[(i * 2) + 1]) << 0));
+        size_t n = dsd_utf16_decoder_push(&decoder, unit, scalars, DSD_UTF16_MAX_SCALARS_PER_UNIT);
+        for (size_t k = 0; k < n; k++) {
+            apx_embedded_alias_print_scalar(scalars[k]);
+        }
+    }
+    if (dsd_utf16_decoder_finish(&decoder, scalars, 1U) > 0U) {
+        apx_embedded_alias_print_scalar(scalars[0]);
+    }
+}
+
+/** @brief Scratch capacity for one Motorola APX embedded alias record, in octets. */
+#define APX_ALIAS_MAX_OCTETS 200
+
+void
 apx_embedded_alias_decode(dsd_opts* opts, dsd_state* state, uint8_t slot, int16_t num_bits, uint8_t* input) {
 
     UNUSED(opts);
     UNUSED(state);
     UNUSED(slot);
+
+    // num_bits is measured off the air, and every span below is derived from it, so validate it
+    // before deriving any of them. The record is a 56-bit fully qualified SUID, the alias octets,
+    // then a 16-bit CRC: below 72 bits the CRC would read before input[72] and its (size_t) length
+    // would underflow.
+    //subtract 2 CRC and 7 FQSUID
+    const int alias_octets = (num_bits / 8) - 9;
+    if (input == NULL || num_bits < 72 || alias_octets < 0) {
+        DSD_FPRINTF(stderr, " Alias Length Error;");
+        return;
+    }
+
+    // A record longer than the scratch buffers used to run past them. Clamping is not a safe
+    // truncation here: the octet count seeds the descrambler, so a clamped count decodes every
+    // octet wrong rather than yielding a correct prefix. Report the length instead of printing text
+    // that is known to be garbage. Rejecting here also caps the CRC span below at 72 + 1679 bits.
+    if (alias_octets > APX_ALIAS_MAX_OCTETS) {
+        DSD_FPRINTF(stderr, " Alias Length Error (%d octets);", alias_octets);
+        return;
+    }
+    const uint16_t num_bytes = (uint16_t)alias_octets;
 
     //debug, dump completed data set
 
@@ -365,67 +503,26 @@ apx_embedded_alias_decode(dsd_opts* opts, dsd_state* state, uint8_t slot, int16_
 
         //WIP: Working, needs more samples to verify various num_bits values
         uint16_t ptr = 128; //starting point of encoded alias
-        uint8_t encoded[200];
+        uint8_t encoded[APX_ALIAS_MAX_OCTETS];
         DSD_MEMSET(encoded, 0, sizeof(encoded));
-        uint8_t decoded[200];
+        uint8_t decoded[APX_ALIAS_MAX_OCTETS];
         DSD_MEMSET(decoded, 0, sizeof(decoded));
-        uint16_t num_bytes = (num_bits / 8) - 9; //subtract 2 CRC and 7 FQSUID
-
-        //sanity check
-        if (num_bytes == 0) {
-            num_bytes = 1;
-        }
 
         for (uint16_t i = 0; i < num_bytes; i++) {
             encoded[i] = (uint8_t)convert_bits_into_output(&input[ptr], 8);
             ptr += 8;
         }
 
-        uint16_t accumulator = num_bytes;
+        apx_embedded_alias_unscramble(encoded, sizeof(encoded), num_bytes, decoded, sizeof(decoded));
 
-        //Ilya's Voodoo Code
-        for (uint16_t i = 0; i < num_bytes; i++) {
-            // Multiplication step 1
-            uint16_t accum_mult = accumulator * 293 + 0x72E9;
-
-            // Lookup table step
-            uint8_t lut = moto_alias_lut[encoded[i]];
-            uint8_t mult1 = lut - (accum_mult >> 8);
-
-            // Incrementing step
-            uint8_t mult2 = 1;
-            uint8_t shortstop = accum_mult | 0x1;
-            uint8_t increment = shortstop << 1;
-
-            //clang warning -- warning: result of comparison of constant -1 with expression of type 'uint8_t' (aka 'unsigned char') is always true [-Wtautological-constant-out-of-range-compare]
-            while (shortstop != 1) //this one tests out okay, so may use it instead
-            {
-                shortstop += increment;
-                mult2 += 2;
-            }
-
-            // Multiplication step 2
-            decoded[i] = mult1 * mult2;
-
-            // Update the accumulator
-            accumulator += encoded[i] + 1;
-        }
         DSD_FPRINTF(stderr, " Alias: ");
-        for (int i = 0; i < num_bytes / 2; i++) {
-            uint16_t ch = (uint16_t)(((decoded[(i * 2) + 0]) << 8) | ((decoded[(i * 2) + 1]) << 0));
-            if (dsd_unicode_supported()) {
-                DSD_FPRINTF(stderr, "%lc", ch);
-            } else {
-                unsigned char lo = (unsigned char)(ch & 0xFF);
-                if (lo >= 0x20 && lo < 0x7F) {
-                    fputc((int)lo, stderr);
-                } else {
-                    fputc('?', stderr);
-                }
-            }
-        }
+        apx_embedded_alias_print_utf16(decoded, num_bytes);
 
-        apx_embedded_alias_dump(opts, state, slot, num_bytes, input, decoded);
+        // Fewer than two octets is no UTF-16 unit at all; dumping it would persist an empty alias
+        // into the talkgroup policy table and the user's group file.
+        if (num_bytes >= 2) {
+            apx_embedded_alias_dump(opts, state, slot, num_bytes, input, decoded);
+        }
     }
 }
 
@@ -460,11 +557,12 @@ apx_embedded_alias_dump(const dsd_opts* opts, dsd_state* state, uint8_t slot, ui
 
     DSD_SNPRINTF(fqs, sizeof fqs, " FQ-SUID: %05X:%03X.%06X (%d);", wacn, sys, rid, rid);
     uint8_t slot_idx = alias_slot_index(slot);
-    int current_call_match = alias_current_call_matches(state, slot, rid, 0);
+    dsd_call_snapshot call;
+    int current_call_match = alias_current_call_snapshot(state, slot, rid, 0, &call);
     if (current_call_match) {
-        DSD_SNPRINTF(state->event_history_s[slot_idx].Event_History_Items[0].alias,
-                     sizeof(state->event_history_s[slot_idx].Event_History_Items[0].alias), "%s; %s", str, fqs);
-        dsd_event_history_mark_dirty(&state->event_history_s[slot_idx]);
+        char alias[500];
+        DSD_SNPRINTF(alias, sizeof(alias), "%s; %s", str, fqs);
+        (void)dsd_event_enrich_alias(state, slot_idx, call.epoch, alias);
     }
 
     if (current_call_match
@@ -485,8 +583,10 @@ apx_embedded_alias_dump(const dsd_opts* opts, dsd_state* state, uint8_t slot, ui
 
 static uint8_t l3h_alias_sanitize_char(uint8_t value);
 static int l3h_embedded_alias_decode_internal(const dsd_opts* opts, dsd_state* state, uint8_t slot, int16_t len,
-                                              const uint8_t* input, int save_policy);
-static void l3h_alias_resolve_src_tg(const dsd_state* state, uint8_t slot, uint32_t* tsrc, uint32_t* ttg);
+                                              const uint8_t* input, int save_policy, uint64_t required_epoch);
+static int l3h_alias_resolve_call(const dsd_state* state, uint8_t slot, dsd_call_snapshot* out);
+static int l3h_alias_attach_target(const dsd_state* state, uint8_t slot, uint64_t required_epoch,
+                                   dsd_call_snapshot* out);
 
 static p25_l3h_alias_phase1_state_t*
 l3h_alias_phase1_state_for(dsd_state* state, uint8_t slot) {
@@ -514,16 +614,18 @@ l3h_alias_phase1_clear_fragments(dsd_state* state, uint8_t slot) {
     rx->mask = 0;
     rx->src = 0;
     rx->tg = 0;
+    rx->epoch = 0;
     DSD_MEMSET(rx->fragment, 0, sizeof(rx->fragment));
 }
 
 static void
-l3h_alias_phase1_set_key(p25_l3h_alias_phase1_state_t* rx, uint32_t src, uint32_t tg) {
+l3h_alias_phase1_set_key(p25_l3h_alias_phase1_state_t* rx, uint32_t src, uint32_t tg, uint64_t epoch) {
     if (!rx) {
         return;
     }
     rx->src = src;
     rx->tg = tg;
+    rx->epoch = epoch;
 }
 
 static int
@@ -659,12 +761,10 @@ l3h_alias_phase1_maybe_decode(const dsd_opts* opts, dsd_state* state, uint8_t sl
     uint8_t input[44];
     size_t alias_len = l3h_alias_phase1_make_input(alias, input, sizeof(input));
 
-    uint32_t tsrc = 0;
-    uint32_t ttg = 0;
-    l3h_alias_resolve_src_tg(state, slot, &tsrc, &ttg);
-    if (!alias_current_call_matches(state, slot, tsrc, ttg)) {
+    dsd_call_snapshot call;
+    if (!l3h_alias_attach_target(state, slot, rx->epoch, &call)) {
         (void)l3h_embedded_alias_decode_internal(opts, state, slot, (int16_t)(4U + alias_len - 1U), input,
-                                                 /*save_policy*/ is_complete);
+                                                 /*save_policy*/ is_complete, rx->epoch);
         l3h_alias_phase1_clear_fragments(state, slot);
         return;
     }
@@ -677,7 +777,7 @@ l3h_alias_phase1_maybe_decode(const dsd_opts* opts, dsd_state* state, uint8_t sl
         DSD_SNPRINTF(rx->last_alias, sizeof(rx->last_alias), "%s", alias);
     }
     int saved = l3h_embedded_alias_decode_internal(opts, state, slot, (int16_t)(4U + alias_len - 1U), input,
-                                                   /*save_policy*/ is_complete);
+                                                   /*save_policy*/ is_complete, rx->epoch);
     if (saved) {
         DSD_SNPRINTF(rx->last_saved_alias, sizeof(rx->last_saved_alias), "%s", alias);
     }
@@ -702,13 +802,28 @@ l3h_embedded_alias_blocks_phase1(const dsd_opts* opts, dsd_state* state, uint8_t
     if (!rx) {
         return;
     }
+    dsd_call_snapshot key_call;
     uint32_t tsrc = 0;
     uint32_t ttg = 0;
-    l3h_alias_resolve_src_tg(state, slot, &tsrc, &ttg);
+    int have_call = l3h_alias_resolve_call(state, slot, &key_call);
+    if (have_call) {
+        tsrc = (uint32_t)key_call.ota_source_id;
+        uint64_t target = key_call.policy_target_id != 0U ? key_call.policy_target_id : key_call.ota_target_id;
+        if (target <= UINT32_MAX) {
+            ttg = (uint32_t)target;
+        }
+    }
     if (ptr == 0U) {
         l3h_alias_phase1_reset(state, slot);
         rx = l3h_alias_phase1_state_for(state, slot);
-        l3h_alias_phase1_set_key(rx, tsrc, ttg);
+        // The epoch is only recorded while the keyed call is ACTIVE: it is the proof that
+        // this fragment set started inside that transmission, which is what later allows
+        // the assembled alias to attach after the same epoch has ended (hangtime straddle).
+        // A fragment set keyed against an already-ended epoch carries no such proof -- it
+        // may belong to a talker whose grant has not been observed yet -- so it can only
+        // attach once a matching ACTIVE call exists.
+        uint64_t key_epoch = have_call && key_call.phase == DSD_CALL_PHASE_ACTIVE ? key_call.epoch : 0U;
+        l3h_alias_phase1_set_key(rx, tsrc, ttg, key_epoch);
     } else if ((rx->mask & 0x01U) == 0U) {
         return;
     } else if (!l3h_alias_phase1_key_matches(rx, tsrc, ttg)) {
@@ -729,17 +844,38 @@ l3h_embedded_alias_blocks_phase1(const dsd_opts* opts, dsd_state* state, uint8_t
     }
 }
 
-static void
-l3h_alias_resolve_src_tg(const dsd_state* state, uint8_t slot, uint32_t* tsrc, uint32_t* ttg) {
-    *tsrc = 0;
-    *ttg = 0;
-    if (slot == 0) {
-        *tsrc = state->lastsrc;
-        *ttg = state->lasttg;
-    } else if (slot == 1) {
-        *tsrc = state->lastsrcR;
-        *ttg = state->lasttgR;
+// The slot's current or retained ended call, when it has a usable source id. This is
+// identity resolution only -- whether an alias may actually attach to the returned call
+// is decided by l3h_alias_attach_target().
+static int
+l3h_alias_resolve_call(const dsd_state* state, uint8_t slot, dsd_call_snapshot* out) {
+    uint8_t slot_idx = alias_slot_index(slot);
+    if (dsd_call_state_get(state, slot_idx, out) <= 0) {
+        return 0;
     }
+    if (out->phase != DSD_CALL_PHASE_ACTIVE && out->phase != DSD_CALL_PHASE_ENDED) {
+        return 0;
+    }
+    return out->ota_source_id != 0U && out->ota_source_id <= UINT32_MAX;
+}
+
+// The Harris alias payload names no source, so the talker has to be inferred from the
+// slot's call state -- and that inference is only safe against a call that provably
+// overlaps the alias. An ACTIVE call qualifies on its own. The retained ended epoch
+// qualifies only when the caller proves the alias belongs to it (required_epoch, the
+// epoch that was ACTIVE when phase-1 fragment assembly started). A self-contained alias
+// that arrives when no call is active must defer instead: it may describe a talker whose
+// grant has not been observed yet, and attaching it to the previous call overwrites that
+// call's history row with the next talker's alias.
+static int
+l3h_alias_attach_target(const dsd_state* state, uint8_t slot, uint64_t required_epoch, dsd_call_snapshot* out) {
+    if (!l3h_alias_resolve_call(state, slot, out)) {
+        return 0;
+    }
+    if (out->phase == DSD_CALL_PHASE_ACTIVE) {
+        return 1;
+    }
+    return required_epoch != 0U && out->epoch == required_epoch;
 }
 
 static void
@@ -779,19 +915,27 @@ l3h_alias_append_policy_row(const dsd_opts* opts, dsd_state* state, uint32_t tsr
 
 static int
 l3h_embedded_alias_decode_internal(const dsd_opts* opts, dsd_state* state, uint8_t slot, int16_t len,
-                                   const uint8_t* input, int save_policy) {
+                                   const uint8_t* input, int save_policy, uint64_t required_epoch) {
 
     //storage info for storing to groupName, if not available
     char str[40];
     DSD_MEMSET(str, 0, sizeof(str));
     char ttemp[40];
     DSD_MEMSET(ttemp, 0, sizeof(ttemp));
+    dsd_call_snapshot call;
+    int attach = l3h_alias_attach_target(state, slot, required_epoch, &call);
     uint32_t tsrc = 0;
     uint32_t ttg = 0;
-    l3h_alias_resolve_src_tg(state, slot, &tsrc, &ttg);
+    if (attach) {
+        tsrc = (uint32_t)call.ota_source_id;
+        uint64_t target = call.policy_target_id != 0U ? call.policy_target_id : call.ota_target_id;
+        if (target <= UINT32_MAX) {
+            ttg = (uint32_t)target;
+        }
+    }
 
     int8_t ptr = 0;
-    if (tsrc != 0) {
+    if (attach) {
         DSD_FPRINTF(stderr, " TG: %d; SRC: %d; Talker Alias: ", ttg, tsrc);
     } else {
         DSD_FPRINTF(stderr, " TG: UNK; SRC: UNK; Talker Alias: ");
@@ -806,33 +950,33 @@ l3h_embedded_alias_decode_internal(const dsd_opts* opts, dsd_state* state, uint8
     DSD_SNPRINTF(str, ptr + 1, "%s", ttemp);
 
     uint8_t slot_idx = alias_slot_index(slot);
-    int current_call_match = alias_current_call_matches(state, slot, tsrc, ttg);
-    if (current_call_match) {
-        DSD_SNPRINTF(state->event_history_s[slot_idx].Event_History_Items[0].alias,
-                     sizeof(state->event_history_s[slot_idx].Event_History_Items[0].alias), "%s", str);
-        dsd_event_history_mark_dirty(&state->event_history_s[slot_idx]);
+    if (attach) {
+        (void)dsd_event_enrich_alias(state, slot_idx, call.epoch, str);
         if (save_policy) {
             // The Duke Energy system may relay two src values, may be a good idea to pick one and stick with it
             l3h_alias_append_policy_row(opts, state, tsrc, ttg, str);
         }
-    } else if (tsrc != 0) {
-        DSD_FPRINTF(stderr, " Alias Deferred: current call source/talkgroup mismatch;");
+    } else {
+        DSD_FPRINTF(stderr, " Alias Deferred: no attributable call for this slot;");
     }
 
     DSD_MEMSET(state->dmr_pdu_sf[slot_idx], 0, sizeof(state->dmr_pdu_sf[slot_idx]));
-    return current_call_match && save_policy;
+    return attach && save_policy;
 }
 
 void
 l3h_embedded_alias_decode(const dsd_opts* opts, dsd_state* state, uint8_t slot, int16_t len, const uint8_t* input) {
-    (void)l3h_embedded_alias_decode_internal(opts, state, slot, len, input, /*save_policy*/ 1);
+    // A phase-2 Harris alias is a single self-contained MAC message with no fragment
+    // key to anchor it to an epoch, so it may only attach to an ACTIVE call
+    // (required_epoch 0). Harris repeats the alias throughout the transmission, so
+    // dropping the copies sent during hangtime loses nothing.
+    (void)l3h_embedded_alias_decode_internal(opts, state, slot, len, input, /*save_policy*/ 1, /*required_epoch*/ 0U);
 }
 
 void
 tait_iso7_embedded_alias_decode(const dsd_opts* opts, dsd_state* state, uint8_t slot, int16_t len,
                                 const uint8_t* input) {
 
-    UNUSED(slot);
     uint8_t alias[24];
     DSD_MEMSET(alias, 0, sizeof(alias));
     for (int16_t i = 0; i < len; i++) {
@@ -845,13 +989,16 @@ tait_iso7_embedded_alias_decode(const dsd_opts* opts, dsd_state* state, uint8_t 
         }
     }
 
-    uint32_t rid = state->lastsrc;
+    dsd_call_snapshot call;
+    uint8_t slot_idx = alias_slot_index(slot);
+    uint32_t rid = dsd_call_state_get(state, slot_idx, &call) > 0 && call.phase == DSD_CALL_PHASE_ACTIVE
+                           && call.ota_source_id <= UINT32_MAX
+                       ? (uint32_t)call.ota_source_id
+                       : 0U;
     uint16_t nac = state->nac;
 
-    if (state->event_history_s[slot].Event_History_Items[0].source_id == rid) {
-        DSD_SNPRINTF(state->event_history_s[slot].Event_History_Items[0].alias,
-                     sizeof(state->event_history_s[slot].Event_History_Items[0].alias), "%s", alias);
-        dsd_event_history_mark_dirty(&state->event_history_s[slot]);
+    if (rid != 0U) {
+        (void)dsd_event_enrich_alias(state, slot_idx, call.epoch, (const char*)alias);
     }
 
     if (rid != 0) {
@@ -1013,6 +1160,31 @@ dmr_talker_alias_append_char(char* alias_string, size_t alias_size, char charact
 }
 
 static void
+dmr_talker_alias_print_scalar(uint32_t scalar) {
+    if (!dsd_unicode_scalar_is_control(scalar) && scalar != 0xFFFFU) {
+        dsd_unicode_fput_scalar(scalar, stderr);
+    } else {
+        DSD_FPRINTF(stderr, " ");
+    }
+}
+
+static void
+dmr_talker_alias_collect_scalar(uint32_t scalar, char* alias_string, size_t alias_size) {
+    if (scalar == 0U) {
+        dmr_talker_alias_append_text(alias_string, alias_size, " ");
+    } else if (!dsd_unicode_scalar_is_control(scalar) && scalar <= 0xFEU) {
+        // Encoded, not truncated to a byte: 0x80..0xFE stored raw is invalid UTF-8, and the stored
+        // alias is rendered as UTF-8 by both the ncurses UI and the event log.
+        char utf8[DSD_UTF8_MAX_BYTES + 1];
+        if (dsd_utf8_encode_scalar(scalar, utf8, sizeof utf8) > 0U) {
+            dmr_talker_alias_append_text(alias_string, alias_size, utf8);
+        }
+    } else {
+        dmr_talker_alias_append_text(alias_string, alias_size, "*");
+    }
+}
+
+static void
 dmr_talker_alias_decode_iso7(const uint8_t* bits, uint16_t end, char* alias_string, size_t alias_size) {
     for (uint16_t i = 0; i < end; i++) {
         uint8_t character = (uint8_t)convert_bits_into_output((uint8_t*)&bits[((size_t)i * 7)], 7);
@@ -1026,13 +1198,16 @@ dmr_talker_alias_decode_iso7(const uint8_t* bits, uint16_t end, char* alias_stri
     }
 }
 
+// ISO-8859-1 octets are Unicode scalar values already, so they go out through the same UTF-8
+// encoder the UTF-16 format uses: 0x80..0xFE written as a raw byte is invalid UTF-8 both on stderr
+// and in the stored alias, which the ncurses UI and the event log both render as UTF-8.
 static void
 dmr_talker_alias_decode_iso8(const uint8_t* bits, uint16_t end, char* alias_string, size_t alias_size) {
     for (uint16_t i = 0; i < end; i++) {
         uint8_t character = (uint8_t)convert_bits_into_output((uint8_t*)&bits[((size_t)i * 8)], 8);
         if (character >= 0x20 && character != 0x7F && character != 0xFF) {
-            DSD_FPRINTF(stderr, "%c", character);
-            dmr_talker_alias_append_char(alias_string, alias_size, (char)character);
+            dmr_talker_alias_print_scalar(character);
+            dmr_talker_alias_collect_scalar(character, alias_string, alias_size);
         } else {
             DSD_FPRINTF(stderr, " ");
             dmr_talker_alias_append_text(alias_string, alias_size, " ");
@@ -1040,53 +1215,26 @@ dmr_talker_alias_decode_iso8(const uint8_t* bits, uint16_t end, char* alias_stri
     }
 }
 
-static void
-dmr_talker_alias_print_utf16_char(uint16_t character) {
-    if (character >= 0x20 && character != 0x7F && character != 0xFFFF) {
-        if (dsd_unicode_supported()) {
-            DSD_FPRINTF(stderr, "%lc", character);
-        } else {
-            unsigned char lo = (unsigned char)(character & 0xFF);
-            if (lo >= 0x20 && lo < 0x7F) {
-                fputc((int)lo, stderr);
-            } else {
-                fputc('?', stderr);
-            }
-        }
-    } else {
-        DSD_FPRINTF(stderr, " ");
-    }
-}
-
-static void
-dmr_talker_alias_collect_utf16_char(uint16_t character, char* alias_string, size_t alias_size) {
-    if (character == 0) {
-        dmr_talker_alias_append_text(alias_string, alias_size, " ");
-    } else if (character >= 0x20 && character <= 0xFE) {
-        dmr_talker_alias_append_char(alias_string, alias_size, (char)(character & 0xFF));
-    } else {
-        dmr_talker_alias_append_text(alias_string, alias_size, "*");
-    }
-}
-
+// The units are UTF-16. Pairs are combined and unpaired halves shown as U+FFFD before anything
+// reaches stderr, so the C runtime never sees a code unit it cannot encode (issue #358). The
+// output locale is dsd_unicode_init_locale()'s business; this path no longer resets it.
 static void
 dmr_talker_alias_decode_utf16(const uint8_t* bits, uint16_t end, char* alias_string, size_t alias_size) {
-    setlocale(
-        LC_ALL,
-        ""); //needed when encoded alias contains Chinese (or probably any non-roman charset that isn't default on users terminal)
+    dsd_utf16_decoder decoder;
+    uint32_t scalars[DSD_UTF16_MAX_SCALARS_PER_UNIT];
+    dsd_utf16_decoder_reset(&decoder);
     for (uint16_t i = 0; i < end; i++) {
-        uint16_t character = (uint16_t)convert_bits_into_output((uint8_t*)&bits[((size_t)i * 16)], 16);
-        dmr_talker_alias_print_utf16_char(character);
-        dmr_talker_alias_collect_utf16_char(character, alias_string, alias_size);
+        uint16_t unit = (uint16_t)convert_bits_into_output((uint8_t*)&bits[((size_t)i * 16)], 16);
+        size_t n = dsd_utf16_decoder_push(&decoder, unit, scalars, DSD_UTF16_MAX_SCALARS_PER_UNIT);
+        for (size_t k = 0; k < n; k++) {
+            dmr_talker_alias_print_scalar(scalars[k]);
+            dmr_talker_alias_collect_scalar(scalars[k], alias_string, alias_size);
+        }
     }
-}
-
-static uint32_t
-dmr_talker_alias_source_for_slot(const dsd_state* state, uint8_t slot) {
-    if (slot == 0) {
-        return state->lastsrc;
+    if (dsd_utf16_decoder_finish(&decoder, scalars, 1U) > 0U) {
+        dmr_talker_alias_print_scalar(scalars[0]);
+        dmr_talker_alias_collect_scalar(scalars[0], alias_string, alias_size);
     }
-    return state->lastsrcR;
 }
 
 //Decode partial or completed alias
@@ -1112,14 +1260,10 @@ dmr_talker_alias_lc_decode(dsd_opts* opts, dsd_state* state, uint8_t slot, uint8
     }
 
     //assign to string for event history and ncurses display
-    uint32_t source = dmr_talker_alias_source_for_slot(state, slot);
-
-    if (state->event_history_s[slot].Event_History_Items[0].source_id == source) {
-        DSD_SNPRINTF(state->event_history_s[slot].Event_History_Items[0].alias,
-                     sizeof(state->event_history_s[slot].Event_History_Items[0].alias), "%s; ", alias_string);
-        dsd_event_history_mark_dirty(&state->event_history_s[slot]);
+    dsd_call_snapshot call;
+    if (dsd_call_state_get(state, slot, &call) > 0 && call.phase == DSD_CALL_PHASE_ACTIVE) {
+        char alias[500];
+        DSD_SNPRINTF(alias, sizeof(alias), "%s; ", alias_string);
+        (void)dsd_event_enrich_alias(state, slot, call.epoch, alias);
     }
-    DSD_SNPRINTF(state->generic_talker_alias[slot], sizeof(state->generic_talker_alias[slot]), "Talker Alias: %s; ",
-                 alias_string);
-    state->generic_talker_alias_src[slot] = source;
 }

@@ -14,8 +14,10 @@
 #include <dsd-neo/app_control/commands.h>
 #include <dsd-neo/app_control/frontend.h>
 #include <dsd-neo/app_control/history.h>
+#include <dsd-neo/core/call_state.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/state.h>
+#include <dsd-neo/core/synctype_ids.h>
 #include <dsd-neo/runtime/telemetry.h>
 #include <dsd-neo/ui/keymap.h>
 #include <dsd-neo/ui/menu_core.h>
@@ -42,19 +44,22 @@ ncurses_drain_escape_sequence(void) {
 
 static uint32_t DSD_ATTR_USED
 ncurses_resolve_tg_hold_target(const dsd_opts* opts, const dsd_state* state, int right_slot) {
-    uint32_t tg = 0;
+    (void)opts;
     if (state->tg_hold != 0) {
-        return tg;
+        return 0;
     }
 
-    tg = (uint32_t)(right_slot ? state->lasttgR : state->lasttg);
-    if (tg == 0 && (opts->frame_nxdn48 == 1 || opts->frame_nxdn96 == 1)) {
-        return (uint32_t)state->nxdn_last_tg;
+    dsd_call_snapshot call;
+    if (dsd_call_state_get(state, (uint8_t)(right_slot != 0), &call) && call.phase != DSD_CALL_PHASE_ENDED) {
+        uint64_t target = call.policy_target_id != 0 ? call.policy_target_id : call.ota_target_id;
+        if (target == 0 && state->ea_mode == 0 && DSD_SYNC_IS_PROVOICE(call.protocol)) {
+            target = call.ota_source_id;
+        }
+        if (target <= UINT32_MAX) {
+            return (uint32_t)target;
+        }
     }
-    if (tg == 0 && opts->frame_provoice == 1 && state->ea_mode == 0) {
-        return (uint32_t)(right_slot ? state->lastsrcR : state->lastsrc);
-    }
-    return tg;
+    return 0;
 }
 
 static int
@@ -95,13 +100,15 @@ ncurses_try_post_simple_cmd(int c) {
         {DSD_KEY_TRUNK_PRIV, DSD_APP_CMD_TRUNK_PRIV_TOGGLE},
         {DSD_KEY_TRUNK_DATA, DSD_APP_CMD_TRUNK_DATA_TOGGLE},
         {DSD_KEY_TRUNK_ENC, DSD_APP_CMD_TRUNK_ENC_TOGGLE},
-        {'g', DSD_APP_CMD_TRUNK_GROUP_TOGGLE},
-        {'A', DSD_APP_CMD_PROVOICE_ESK_TOGGLE},
-        {'S', DSD_APP_CMD_PROVOICE_MODE_TOGGLE},
+        {DSD_KEY_TRUNK_GROUP, DSD_APP_CMD_TRUNK_GROUP_TOGGLE},
+        {DSD_KEY_PROVOICE_ESK, DSD_APP_CMD_PROVOICE_ESK_TOGGLE},
+        {DSD_KEY_PROVOICE_MODE, DSD_APP_CMD_PROVOICE_MODE_TOGGLE},
         {DSD_KEY_TCP_AUDIO, DSD_APP_CMD_TCP_CONNECT_AUDIO},
         {DSD_KEY_RIGCTL_CONN, DSD_APP_CMD_RIGCTL_CONNECT},
         {DSD_KEY_RETURN_CC, DSD_APP_CMD_RETURN_CC},
         {DSD_KEY_CHANNEL_CYCLE, DSD_APP_CMD_CHANNEL_CYCLE},
+        {DSD_KEY_SCAN_HOLD, DSD_APP_CMD_SCAN_HOLD_TOGGLE},
+        {DSD_KEY_SCAN_AVOID, DSD_APP_CMD_SCAN_AVOID},
         {DSD_KEY_SYMCAP_SAVE, DSD_APP_CMD_SYMCAP_SAVE},
         {DSD_KEY_SYMCAP_STOP, DSD_APP_CMD_SYMCAP_STOP},
         {DSD_KEY_REPLAY_LAST, DSD_APP_CMD_REPLAY_LAST},
@@ -185,8 +192,8 @@ ncurses_handle_encoder_and_lockout_keys(dsd_opts* opts, dsd_state* state, int c)
         (void)dsd_app_command_action(opts->m17encoder == 1 ? DSD_APP_CMD_M17_TX_TOGGLE : DSD_APP_CMD_EH_TOGGLE_SLOT);
         return 1;
     }
-    if (c == '!' || c == '@') {
-        uint8_t slot = (uint8_t)((c == '@') ? 1 : 0);
+    if (c == DSD_KEY_LOCKOUT_SLOT1 || c == DSD_KEY_LOCKOUT_SLOT2) {
+        uint8_t slot = (uint8_t)((c == DSD_KEY_LOCKOUT_SLOT2) ? 1 : 0);
         (void)dsd_app_command_set_u8(DSD_APP_CMD_LOCKOUT_SLOT, slot);
         return 1;
     }

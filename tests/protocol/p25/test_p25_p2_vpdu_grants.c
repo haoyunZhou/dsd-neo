@@ -9,6 +9,7 @@
  */
 
 #include <dsd-neo/core/audio.h>
+#include <dsd-neo/core/call_state.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/state.h>
 #include <dsd-neo/core/state_ext.h>
@@ -21,6 +22,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include "dsd-neo/core/enc_lockout.h"
 #include "dsd-neo/core/opts_fwd.h"
 #include "dsd-neo/core/safe_api.h"
 #include "dsd-neo/core/state_fwd.h"
@@ -133,6 +135,46 @@ expect_not_contains(const char* tag, const char* text, const char* needle) {
     return 0;
 }
 
+static const dsd_recent_activity_entry*
+recent_activity(const dsd_state* state, uint8_t index) {
+    static dsd_recent_activity_snapshot recent;
+    DSD_MEMSET(&recent, 0, sizeof recent);
+    if (index >= DSD_RECENT_ACTIVITY_COUNT || dsd_recent_activity_copy_snapshot(state, &recent) <= 0) {
+        return NULL;
+    }
+    return &recent.entries[index];
+}
+
+static const char*
+recent_notice(const dsd_state* state, uint8_t index) {
+    const dsd_recent_activity_entry* entry = recent_activity(state, index);
+    return entry ? entry->notice : "";
+}
+
+static int
+copy_call(const dsd_state* state, uint8_t slot, dsd_call_snapshot* call) {
+    DSD_MEMSET(call, 0, sizeof *call);
+    return dsd_call_state_get(state, slot, call) > 0;
+}
+
+static int
+seed_voice_call(dsd_state* state, uint8_t slot, dsd_call_kind kind, uint64_t target, uint64_t policy_target,
+                uint64_t source, uint16_t service_options) {
+    const dsd_call_observation observation = {
+        .protocol = DSD_SYNC_P25P2_POS,
+        .slot = slot,
+        .kind = kind,
+        .ota_target_id = target,
+        .policy_target_id = policy_target,
+        .ota_source_id = source,
+        .service_options = service_options,
+        .emergency = (uint8_t)((service_options & 0x80U) != 0U),
+        .priority = (uint8_t)(service_options & 0x07U),
+        .has_service_metadata = 1U,
+    };
+    return dsd_call_state_observe(state, &observation, DSD_CALL_BOUNDARY_BEGIN) > 0;
+}
+
 static int
 seed_policy_group(dsd_state* st, uint32_t tg, const char* mode, const char* name) {
     dsd_tg_policy_entry row;
@@ -211,6 +253,11 @@ seed_tdma_iden(dsd_state* state, int iden, int type, long base, int spac) {
     state->p25_iden_tdma[iden].trust = 2;
     state->p25_iden_tdma[iden].populated = 1;
     state->p25_chan_tdma_explicit[iden] = 2;
+    // The SM defers TDMA grants until the descrambler seed (WACN/SYSID/NAC)
+    // has been decoded from the control channel.
+    state->p2_wacn = 0xBEE00;
+    state->p2_sysid = 0x1A2;
+    state->p2_cc = 0x293;
 }
 
 static int
@@ -227,22 +274,11 @@ run_standard_regroup_voice_user_case(int mfid, int slot, const char* tag) {
     opts.trunk_is_tuned = 1;
     opts.trunk_tune_enc_calls = 0;
     state.currentslot = slot;
-    state.gi[slot] = 1;
-    state.p25_service_options_valid[slot] = 1;
-    state.p25_call_emergency[slot] = 1;
-    state.p25_call_is_packet[slot] = 1;
-    state.p25_call_priority[slot] = 7;
     DSD_SNPRINTF(state.generic_talker_alias[slot], sizeof state.generic_talker_alias[slot], "%s", "STALE");
-    state.generic_talker_alias_src[slot] = 0x0F0E0D;
-    if (slot == 0) {
-        state.dmr_so = 0x5A;
-        state.lasttg = 0x1111;
-        state.lastsrc = 0x010101;
-    } else {
-        state.dmr_soR = 0x6B;
-        state.lasttgR = 0x2222;
-        state.lastsrcR = 0x020202;
-    }
+    rc |= expect_true("regroup voice user seed call",
+                      seed_voice_call(&state, (uint8_t)slot, DSD_CALL_KIND_PRIVATE_VOICE, slot == 0 ? 0x1111U : 0x2222U,
+                                      slot == 0 ? 0x1111U : 0x2222U, slot == 0 ? 0x010101U : 0x020202U,
+                                      slot == 0 ? 0x5AU : 0x6BU));
 
     MAC[1] = 0x90;
     MAC[2] = (unsigned long long int)(mfid & 0xFF);
@@ -252,15 +288,22 @@ run_standard_regroup_voice_user_case(int mfid, int slot, const char* tag) {
     MAC[6] = 0x02;
     MAC[7] = 0x03;
 
-    p25_sm_init_ctx(p25_sm_get_ctx(), &opts, &state);
-    process_MAC_VPDU(&opts, &state, 0, MAC);
+    p25_sm_ctx_t* sm = p25_sm_get_ctx();
+    p25_sm_init_ctx(sm, &opts, &state);
+    sm->state = P25_SM_TUNED;
+    sm->vc_is_tdma = 1;
+    sm->slots[slot].grant_active = 1;
+    process_MAC_VPDU(&opts, &state, 0, P25_MAC_PDU_ACTIVE, MAC);
 
     DSD_SNPRINTF(label, sizeof label, "%s no grant dispatch", tag);
-    rc |= expect_eq_long(label, p25_sm_get_ctx()->grant_count, 0);
+    rc |= expect_eq_long(label, sm->grant_count, 0);
     DSD_SNPRINTF(label, sizeof label, "%s no retune", tag);
     rc |= expect_eq_long(label, opts.trunk_is_tuned, 1);
+    dsd_call_snapshot call = {0};
+    DSD_SNPRINTF(label, sizeof label, "%s canonical call", tag);
+    rc |= expect_true(label, copy_call(&state, (uint8_t)slot, &call));
     DSD_SNPRINTF(label, sizeof label, "%s group call", tag);
-    rc |= expect_eq_long(label, state.gi[slot], 0);
+    rc |= expect_eq_long(label, (long)call.kind, DSD_CALL_KIND_GROUP_VOICE);
     DSD_SNPRINTF(label, sizeof label, "%s mac wall timestamp", tag);
     rc |= expect_true(label, state.p25_p2_last_mac_active[slot] != 0);
     DSD_SNPRINTF(label, sizeof label, "%s mac mono timestamp", tag);
@@ -275,37 +318,92 @@ run_standard_regroup_voice_user_case(int mfid, int slot, const char* tag) {
     rc |= expect_eq_long(label, state.p25_patch_is_patch[0], 1);
     DSD_SNPRINTF(label, sizeof label, "%s alias cleared", tag);
     rc |= expect_true(label, state.generic_talker_alias[slot][0] == '\0');
-    DSD_SNPRINTF(label, sizeof label, "%s alias src cleared", tag);
-    rc |= expect_eq_long(label, state.generic_talker_alias_src[slot], 0);
-    DSD_SNPRINTF(label, sizeof label, "%s call banner", tag);
-    rc |= expect_contains(label, state.call_string[slot], "Group");
-    DSD_SNPRINTF(label, sizeof label, "%s service options valid unchanged", tag);
-    rc |= expect_eq_long(label, state.p25_service_options_valid[slot], 1);
-    DSD_SNPRINTF(label, sizeof label, "%s emergency unchanged", tag);
-    rc |= expect_eq_long(label, state.p25_call_emergency[slot], 1);
-    DSD_SNPRINTF(label, sizeof label, "%s packet unchanged", tag);
-    rc |= expect_eq_long(label, state.p25_call_is_packet[slot], 1);
-    DSD_SNPRINTF(label, sizeof label, "%s priority unchanged", tag);
-    rc |= expect_eq_long(label, state.p25_call_priority[slot], 7);
+    DSD_SNPRINTF(label, sizeof label, "%s service options unknown", tag);
+    rc |= expect_eq_long(label, call.service_options, 0);
+    DSD_SNPRINTF(label, sizeof label, "%s emergency clear", tag);
+    rc |= expect_eq_long(label, call.emergency, 0);
+    DSD_SNPRINTF(label, sizeof label, "%s priority clear", tag);
+    rc |= expect_eq_long(label, call.priority, 0);
     DSD_SNPRINTF(label, sizeof label, "%s crypto state unchanged", tag);
     rc |= expect_eq_long(label, state.p25_crypto_state[slot], DSD_P25_CRYPTO_UNKNOWN);
 
-    if (slot == 0) {
-        DSD_SNPRINTF(label, sizeof label, "%s last tg", tag);
-        rc |= expect_eq_long(label, state.lasttg, 0x3456);
-        DSD_SNPRINTF(label, sizeof label, "%s last src", tag);
-        rc |= expect_eq_long(label, state.lastsrc, 0x010203);
-        DSD_SNPRINTF(label, sizeof label, "%s service options unchanged", tag);
-        rc |= expect_eq_long(label, state.dmr_so, 0x5A);
-    } else {
-        DSD_SNPRINTF(label, sizeof label, "%s last tg", tag);
-        rc |= expect_eq_long(label, state.lasttgR, 0x3456);
-        DSD_SNPRINTF(label, sizeof label, "%s last src", tag);
-        rc |= expect_eq_long(label, state.lastsrcR, 0x010203);
-        DSD_SNPRINTF(label, sizeof label, "%s service options unchanged", tag);
-        rc |= expect_eq_long(label, state.dmr_soR, 0x6B);
-    }
+    DSD_SNPRINTF(label, sizeof label, "%s target", tag);
+    rc |= expect_eq_long(label, (long)call.ota_target_id, 0x3456);
+    DSD_SNPRINTF(label, sizeof label, "%s source", tag);
+    rc |= expect_eq_long(label, (long)call.ota_source_id, 0x010203);
 
+    dsd_state_ext_free_all(&state);
+    return rc;
+}
+
+static int
+test_rejected_tdma_slot_voice_user_does_not_reopen_call(void) {
+    static dsd_opts opts;
+    static dsd_state state;
+    unsigned long long int MAC[24] = {0};
+    int rc = 0;
+
+    DSD_MEMSET(&opts, 0, sizeof opts);
+    DSD_MEMSET(&state, 0, sizeof state);
+    opts.trunk_enable = 1;
+    opts.trunk_is_tuned = 1;
+    opts.trunk_tune_enc_calls = 1;
+    state.currentslot = 0;
+    state.synctype = DSD_SYNC_P25P2_POS;
+    state.dmr_so = 0x12U;
+    rc |= expect_true("rejected-slot voice user seed slot0",
+                      seed_voice_call(&state, 0U, DSD_CALL_KIND_GROUP_VOICE, 20601U, 20601U, 618620U, 0x12U));
+    rc |= expect_true("rejected-slot voice user end slot0", dsd_call_state_end(&state, 0U, 0.0) > 0);
+    rc |= expect_true("rejected-slot voice user seed companion",
+                      seed_voice_call(&state, 1U, DSD_CALL_KIND_GROUP_VOICE, 20700U, 20700U, 618621U, 0x20U));
+
+    dsd_call_snapshot slot0_before = {0};
+    dsd_call_snapshot slot1_before = {0};
+    rc |= expect_true("rejected-slot voice user snapshot slot0", copy_call(&state, 0U, &slot0_before));
+    rc |= expect_true("rejected-slot voice user snapshot slot1", copy_call(&state, 1U, &slot1_before));
+
+    p25_sm_ctx_t* sm = p25_sm_get_ctx();
+    p25_sm_init_ctx(sm, &opts, &state);
+    sm->state = P25_SM_TUNED;
+    sm->vc_is_tdma = 1;
+    sm->vc_freq_hz = 851500000;
+    sm->slots[0].grant_active = 0;
+    sm->slots[1].grant_active = 1;
+    sm->slots[1].freq_hz = sm->vc_freq_hz;
+    sm->slots[1].target_id = 20700;
+    sm->slots[1].ota_tg = 20700;
+    sm->slots[1].is_group = 1;
+
+    MAC[1] = 0x01; // Group Voice Channel User, abbreviated
+    MAC[2] = 0x44; // Encrypted, priority 4
+    MAC[3] = 0x50;
+    MAC[4] = 0x79; // TG 20601
+    MAC[5] = 0x09;
+    MAC[6] = 0x70;
+    MAC[7] = 0x7C; // SRC 618620
+    process_MAC_VPDU(&opts, &state, 0, P25_MAC_PDU_ACTIVE, MAC);
+
+    dsd_call_snapshot slot0_after = {0};
+    dsd_call_snapshot slot1_after = {0};
+    rc |= expect_true("rejected-slot voice user preserved slot0", copy_call(&state, 0U, &slot0_after));
+    rc |= expect_true("rejected-slot voice user preserved companion", copy_call(&state, 1U, &slot1_after));
+    rc |= expect_eq_long("rejected-slot voice user slot0 phase", slot0_after.phase, DSD_CALL_PHASE_ENDED);
+    rc |= expect_eq_long("rejected-slot voice user slot0 revision", (long)slot0_after.revision,
+                         (long)slot0_before.revision);
+    rc |= expect_eq_long("rejected-slot voice user slot0 epoch", (long)slot0_after.epoch, (long)slot0_before.epoch);
+    rc |= expect_eq_long("rejected-slot voice user slot0 service", slot0_after.service_options,
+                         slot0_before.service_options);
+    rc |= expect_eq_long("rejected-slot voice user companion revision", (long)slot1_after.revision,
+                         (long)slot1_before.revision);
+    rc |= expect_eq_long("rejected-slot voice user carrier stays tuned", sm->state, P25_SM_TUNED);
+    rc |= expect_eq_long("rejected-slot voice user rejected grant stays clear", sm->slots[0].grant_active, 0);
+    rc |= expect_eq_long("rejected-slot voice user companion grant remains", sm->slots[1].grant_active, 1);
+    rc |= expect_eq_long("rejected-slot voice user service state preserved", state.dmr_so, 0x12);
+    rc |= expect_eq_long("rejected-slot voice user crypto state preserved", state.p25_crypto_state[0],
+                         DSD_P25_CRYPTO_UNKNOWN);
+    rc |= expect_eq_long("rejected-slot voice user timestamp preserved", state.p25_p2_last_mac_active[0], 0);
+
+    dsd_state_ext_free_all(&state);
     return rc;
 }
 
@@ -319,16 +417,12 @@ run_standard_regroup_voice_user_nonstandard_guard_case(void) {
     DSD_MEMSET(&opts, 0, sizeof opts);
     DSD_MEMSET(&state, 0, sizeof state);
     state.currentslot = 0;
-    state.gi[0] = 1;
-    state.lasttg = 0x1111;
-    state.lastsrc = 0x010101;
-    state.dmr_so = 0x5A;
-    state.p25_service_options_valid[0] = 1;
+    rc |= expect_true("0x90/mfid90 guard seed call",
+                      seed_voice_call(&state, 0U, DSD_CALL_KIND_PRIVATE_VOICE, 0x1111U, 0x1111U, 0x010101U, 0x5AU));
     state.p25_patch_count = 1;
     state.p25_patch_sgid[0] = 0x2222;
     state.p25_patch_active[0] = 1;
     DSD_SNPRINTF(state.generic_talker_alias[0], sizeof state.generic_talker_alias[0], "%s", "KEEP");
-    state.generic_talker_alias_src[0] = 0x010101;
 
     MAC[1] = 0x90;
     MAC[2] = 0x90;
@@ -339,19 +433,21 @@ run_standard_regroup_voice_user_nonstandard_guard_case(void) {
     MAC[7] = 0x03;
 
     p25_sm_init_ctx(p25_sm_get_ctx(), &opts, &state);
-    process_MAC_VPDU(&opts, &state, 0, MAC);
+    process_MAC_VPDU(&opts, &state, 0, P25_MAC_PDU_ACTIVE, MAC);
 
     rc |= expect_eq_long("0x90/mfid90 guard no grant dispatch", p25_sm_get_ctx()->grant_count, 0);
-    rc |= expect_eq_long("0x90/mfid90 guard last tg", state.lasttg, 0x1111);
-    rc |= expect_eq_long("0x90/mfid90 guard last src", state.lastsrc, 0x010101);
-    rc |= expect_eq_long("0x90/mfid90 guard group flag", state.gi[0], 1);
-    rc |= expect_eq_long("0x90/mfid90 guard service options", state.dmr_so, 0x5A);
-    rc |= expect_eq_long("0x90/mfid90 guard service valid", state.p25_service_options_valid[0], 1);
+    dsd_call_snapshot call = {0};
+    rc |= expect_true("0x90/mfid90 guard canonical call", copy_call(&state, 0U, &call));
+    rc |= expect_eq_long("0x90/mfid90 guard target", (long)call.ota_target_id, 0x1111);
+    rc |= expect_eq_long("0x90/mfid90 guard source", (long)call.ota_source_id, 0x010101);
+    rc |= expect_eq_long("0x90/mfid90 guard kind", (long)call.kind, DSD_CALL_KIND_PRIVATE_VOICE);
+    rc |= expect_eq_long("0x90/mfid90 guard service options", call.service_options, 0x5A);
     rc |= expect_eq_long("0x90/mfid90 guard patch count", state.p25_patch_count, 1);
     rc |= expect_eq_long("0x90/mfid90 guard patch sg", state.p25_patch_sgid[0], 0x2222);
     rc |= expect_eq_long("0x90/mfid90 guard mac timestamp", state.p25_p2_last_mac_active[0], 0);
     rc |= expect_contains("0x90/mfid90 guard alias", state.generic_talker_alias[0], "KEEP");
 
+    dsd_state_ext_free_all(&state);
     return rc;
 }
 
@@ -383,7 +479,7 @@ test_harris_a4_grg_state_management(void) {
     MAC[15] = 0x22;
     MAC[16] = 0x33;
     MAC[17] = 0x33;
-    process_MAC_VPDU(&opts, &state, 1, MAC);
+    process_MAC_VPDU(&opts, &state, 1, P25_MAC_PDU_ACTIVE, MAC);
 
     int idx = find_patch_idx(&state, 0x1234);
     rc |= expect_true("harris a4 wgid sg exists", idx >= 0);
@@ -411,7 +507,7 @@ test_harris_a4_grg_state_management(void) {
     MAC[9] = 0x89;
     MAC[10] = 0x44;
     MAC[11] = 0x44;
-    process_MAC_VPDU(&opts, &state, 1, MAC);
+    process_MAC_VPDU(&opts, &state, 1, P25_MAC_PDU_ACTIVE, MAC);
     idx = find_patch_idx(&state, 0x1234);
     rc |= expect_true("harris a4 replacement sg exists", idx >= 0);
     if (idx >= 0) {
@@ -434,7 +530,7 @@ test_harris_a4_grg_state_management(void) {
     MAC[9] = 0x89;
     MAC[10] = 0x55;
     MAC[11] = 0x55;
-    process_MAC_VPDU(&opts, &state, 1, MAC);
+    process_MAC_VPDU(&opts, &state, 1, P25_MAC_PDU_ACTIVE, MAC);
     idx = find_patch_idx(&state, 0x1234);
     rc |= expect_true("harris a4 inactive sg exists", idx >= 0);
     if (idx >= 0) {
@@ -458,7 +554,7 @@ test_harris_a4_grg_state_management(void) {
     MAC[12] = 0x00;
     MAC[13] = 0x00;
     MAC[14] = 0x00;
-    process_MAC_VPDU(&opts, &state, 1, MAC);
+    process_MAC_VPDU(&opts, &state, 1, P25_MAC_PDU_ACTIVE, MAC);
     idx = find_patch_idx(&state, 0x2222);
     rc |= expect_true("harris a4 wuid sg exists", idx >= 0);
     if (idx >= 0) {
@@ -491,7 +587,7 @@ test_motorola_extended_function_supergroup_state(void) {
     MAC[9] = 0x01;
     MAC[10] = 0x02;
     MAC[11] = 0x03;
-    process_MAC_VPDU(&opts, &state, 0, MAC);
+    process_MAC_VPDU(&opts, &state, 0, P25_MAC_PDU_ACTIVE, MAC);
 
     int idx = find_patch_idx(&state, 0x1234);
     rc |= expect_true("moto ext create sg exists", idx >= 0);
@@ -502,7 +598,7 @@ test_motorola_extended_function_supergroup_state(void) {
     }
 
     MAC[5] = 0x01;
-    process_MAC_VPDU(&opts, &state, 0, MAC);
+    process_MAC_VPDU(&opts, &state, 0, P25_MAC_PDU_ACTIVE, MAC);
     idx = find_patch_idx(&state, 0x1234);
     rc |= expect_true("moto ext cancel sg exists", idx >= 0);
     if (idx >= 0) {
@@ -513,7 +609,7 @@ test_motorola_extended_function_supergroup_state(void) {
     DSD_MEMSET(&state, 0, sizeof state);
     MAC[4] = 0x00;
     MAC[5] = 0x7F;
-    process_MAC_VPDU(&opts, &state, 0, MAC);
+    process_MAC_VPDU(&opts, &state, 0, P25_MAC_PDU_ACTIVE, MAC);
     rc |= expect_eq_long("moto ext class0 metadata only", state.p25_patch_count, 0);
     return rc;
 }
@@ -554,7 +650,7 @@ test_inband_encrypted_voice_starts_classification_deadline(void) {
     MAC[7] = 0x02;
     MAC[8] = 0x03;
 
-    process_MAC_VPDU(&opts, &state, 0, MAC);
+    process_MAC_VPDU(&opts, &state, 0, P25_MAC_PDU_ACTIVE, MAC);
     rc |=
         expect_eq_long("in-band encrypted voice pending", state.p25_crypto_state[0], DSD_P25_CRYPTO_ENCRYPTED_PENDING);
     rc |= expect_eq_long("in-band encrypted voice gate closed", state.p25_p2_audio_allowed[0], 0);
@@ -563,7 +659,7 @@ test_inband_encrypted_voice_starts_classification_deadline(void) {
 
     const double started_m = ctx->slots[0].crypto_attempt_m;
     ctx->slots[0].voice_active = 1;
-    process_MAC_VPDU(&opts, &state, 0, MAC);
+    process_MAC_VPDU(&opts, &state, 0, P25_MAC_PDU_ACTIVE, MAC);
     rc |= expect_eq_long("repeated in-band encrypted voice activity cleared", ctx->slots[0].voice_active, 0);
     rc |= expect_true("repeated in-band encrypted voice keeps deadline",
                       fabs(ctx->slots[0].crypto_attempt_m - started_m) <= 1.0e-9);
@@ -608,9 +704,11 @@ test_private_voice_ignores_regroup_clear_key_collision(void) {
     MAC[7] = 0x02;
     MAC[8] = 0x03;
 
-    process_MAC_VPDU(&opts, &state, 0, MAC);
-    rc |= expect_eq_long("private patch collision call type", state.gi[0], 1);
-    rc |= expect_eq_long("private patch collision target", state.lasttg, 0x123456);
+    process_MAC_VPDU(&opts, &state, 0, P25_MAC_PDU_ACTIVE, MAC);
+    dsd_call_snapshot call = {0};
+    rc |= expect_true("private patch collision canonical call", copy_call(&state, 0U, &call));
+    rc |= expect_eq_long("private patch collision call type", (long)call.kind, DSD_CALL_KIND_PRIVATE_VOICE);
+    rc |= expect_eq_long("private patch collision target", (long)call.ota_target_id, 0x123456);
     rc |=
         expect_eq_long("private patch collision pending", state.p25_crypto_state[0], DSD_P25_CRYPTO_ENCRYPTED_PENDING);
     rc |= expect_eq_long("private patch collision gate closed", state.p25_p2_audio_allowed[0], 0);
@@ -721,7 +819,7 @@ main(void) {
         MAC[6] = 0x01;
         MAC[9] = 0x02;
 
-        process_MAC_VPDU(&opts, &state, 0, MAC);
+        process_MAC_VPDU(&opts, &state, 0, P25_MAC_PDU_ACTIVE, MAC);
         rc |= expect_true("UU unknown-service probe tunes", opts.trunk_is_tuned == 1);
         rc |= expect_eq_long("UU unknown-service probe vc", state.p25_vc_freq[0], 851125000);
         rc |= expect_eq_long("UU unknown-service probe pending", state.p25_crypto_state[0],
@@ -836,7 +934,7 @@ main(void) {
         MAC[9] = 0x56;
 
         p25_sm_init_ctx(p25_sm_get_ctx(), &opts, &state);
-        process_MAC_VPDU(&opts, &state, 0, MAC);
+        process_MAC_VPDU(&opts, &state, 0, P25_MAC_PDU_ACTIVE, MAC);
 
         p25_sm_ctx_t* ctx = p25_sm_get_ctx();
         rc |= expect_eq_long("0x43 capture called", ctx->grant_count, 1);
@@ -845,7 +943,7 @@ main(void) {
         rc |= expect_eq_long("0x43 capture tg", ctx->slots[0].ota_tg, 0x3456);
         rc |= expect_eq_long("0x43 capture src", ctx->vc_src, 0);
         rc |= expect_eq_long("0x43 CHAN-R cache", state.trunk_chan_map[0x100B], 851137500);
-        rc |= expect_contains("0x43 active channel", state.active_channel[0], "TG: 13398");
+        rc |= expect_contains("0x43 active channel", recent_notice(&state, 0U), "TG: 13398");
     }
 
     // Case D4: True MAC 0xC0 Group Voice Channel Grant Explicit propagates source and both channels.
@@ -903,7 +1001,7 @@ main(void) {
         MAC[11] = 0x03;
 
         p25_sm_init_ctx(p25_sm_get_ctx(), &opts, &state);
-        process_MAC_VPDU(&opts, &state, 0, MAC);
+        process_MAC_VPDU(&opts, &state, 0, P25_MAC_PDU_ACTIVE, MAC);
 
         p25_sm_ctx_t* ctx = p25_sm_get_ctx();
         rc |= expect_eq_long("0xC0 capture called", ctx->grant_count, 1);
@@ -912,8 +1010,9 @@ main(void) {
         rc |= expect_eq_long("0xC0 capture tg", ctx->slots[0].ota_tg, 0x2222);
         rc |= expect_eq_long("0xC0 capture src", ctx->vc_src, 0x010203);
         rc |= expect_eq_long("0xC0 CHAN-R cache", state.trunk_chan_map[0x100D], 851162500);
-        rc |= expect_eq_long("0xC0 stored service options", state.dmr_so, 0x23);
-        rc |= expect_eq_long("0xC0 service options valid", state.p25_service_options_valid[0], 1);
+        const dsd_recent_activity_entry* recent = recent_activity(&state, 0U);
+        rc |= expect_true("0xC0 recent activity", recent != NULL);
+        rc |= expect_eq_long("0xC0 stored service options", recent ? recent->observation.service_options : -1, 0x23);
     }
 
     // Case D5a: patched-supergroup grants dispatch to the SM even when TG hold matches only a member WGID.
@@ -944,7 +1043,7 @@ main(void) {
         MAC[11] = 0x03;
 
         p25_sm_init_ctx(p25_sm_get_ctx(), &opts, &state);
-        process_MAC_VPDU(&opts, &state, 0, MAC);
+        process_MAC_VPDU(&opts, &state, 0, P25_MAC_PDU_ACTIVE, MAC);
 
         p25_sm_ctx_t* ctx = p25_sm_get_ctx();
         rc |= expect_eq_long("0xC0 patch member hold dispatch", ctx->grant_count, 1);
@@ -978,7 +1077,7 @@ main(void) {
         MAC[11] = 0x03;
 
         p25_sm_init_ctx(p25_sm_get_ctx(), &opts, &state);
-        process_MAC_VPDU(&opts, &state, 0, MAC);
+        process_MAC_VPDU(&opts, &state, 0, P25_MAC_PDU_ACTIVE, MAC);
 
         p25_sm_ctx_t* ctx = p25_sm_get_ctx();
         rc |= expect_eq_long("0xA3 capture called", ctx->grant_count, 1);
@@ -986,8 +1085,10 @@ main(void) {
         rc |= expect_eq_long("0xA3 capture svc", ctx->slots[0].svc_bits, 0xA5);
         rc |= expect_eq_long("0xA3 capture tg", ctx->slots[0].ota_tg, 0x3456);
         rc |= expect_eq_long("0xA3 capture src", ctx->vc_src, 0x010203);
-        rc |= expect_eq_long("0xA3 stored service options", state.dmr_so, 0xA5);
-        rc |= expect_eq_long("0xA3 emergency state", state.p25_call_emergency[0], 1);
+        const dsd_recent_activity_entry* recent = recent_activity(&state, 0U);
+        rc |= expect_true("0xA3 recent activity", recent != NULL);
+        rc |= expect_eq_long("0xA3 stored service options", recent ? recent->observation.service_options : -1, 0xA5);
+        rc |= expect_eq_long("0xA3 emergency state", recent ? recent->observation.emergency : 0, 1);
     }
 
     // Case D5c: MFID90 0xA4 propagates service options, source, and CHAN-R cache.
@@ -1017,7 +1118,7 @@ main(void) {
         MAC[13] = 0x0C;
 
         p25_sm_init_ctx(p25_sm_get_ctx(), &opts, &state);
-        process_MAC_VPDU(&opts, &state, 0, MAC);
+        process_MAC_VPDU(&opts, &state, 0, P25_MAC_PDU_ACTIVE, MAC);
 
         p25_sm_ctx_t* ctx = p25_sm_get_ctx();
         rc |= expect_eq_long("0xA4 capture called", ctx->grant_count, 1);
@@ -1026,6 +1127,10 @@ main(void) {
         rc |= expect_eq_long("0xA4 capture tg", ctx->slots[0].ota_tg, 0x4567);
         rc |= expect_eq_long("0xA4 capture src", ctx->vc_src, 0x0A0B0C);
         rc |= expect_eq_long("0xA4 CHAN-R cache", state.trunk_chan_map[0x100B], 851137500);
+        // Dispatched: the accepted assignment commits its service options to
+        // the granted slot through the SM identity path. Undispatchable
+        // announcements must leave per-slot service options alone (covered by
+        // P25_P2_VPDU_FOREIGN_GRANT_SVC).
         rc |= expect_eq_long("0xA4 stored service options", state.dmr_so, 0x23);
     }
 
@@ -1051,7 +1156,7 @@ main(void) {
         MAC[7] = 0x0A;
 
         p25_sm_init_ctx(p25_sm_get_ctx(), &opts, &state);
-        process_MAC_VPDU(&opts, &state, 0, MAC);
+        process_MAC_VPDU(&opts, &state, 0, P25_MAC_PDU_ACTIVE, MAC);
 
         p25_sm_ctx_t* ctx = p25_sm_get_ctx();
         rc |= expect_eq_long("0x83 capture called", ctx->grant_count, 1);
@@ -1059,7 +1164,45 @@ main(void) {
         rc |= expect_eq_long("0x83 capture svc", ctx->slots[0].svc_bits, 0x81);
         rc |= expect_eq_long("0x83 capture tg", ctx->slots[0].ota_tg, 0x5566);
         rc |= expect_eq_long("0x83 capture src", ctx->vc_src, 0);
+        // Dispatched, same as 0xA4: the SM identity commit stores the granted
+        // slot's service options.
         rc |= expect_eq_long("0x83 stored service options", state.dmr_so, 0x81);
+    }
+
+    // Case D5c1: MFID90 0x83 heard while tuned to a different carrier must not
+    // dispatch a grant (regression: Moto hangtime-era VCH updates restarting
+    // release timers); the same update on the matching carrier still dispatches.
+    {
+        static dsd_opts opts;
+        static dsd_state state;
+        unsigned long long int MAC[24] = {0};
+        DSD_MEMSET(&opts, 0, sizeof opts);
+        DSD_MEMSET(&state, 0, sizeof state);
+        opts.trunk_enable = 1;
+        opts.trunk_tune_group_calls = 1;
+        opts.trunk_tune_enc_calls = 1;
+        opts.trunk_is_tuned = 1;
+        state.p25_cc_freq = cc;
+        seed_fdma_iden(&state, iden, type, base, spac);
+
+        MAC[1] = 0x83;
+        MAC[2] = 0x90;
+        MAC[3] = 0x81;
+        MAC[4] = 0x55;
+        MAC[5] = 0x66;
+        MAC[6] = 0x10;
+        MAC[7] = 0x0A; // channel 0x100A -> 851.125 MHz
+
+        p25_sm_init_ctx(p25_sm_get_ctx(), &opts, &state);
+        p25_sm_ctx_t* ctx = p25_sm_get_ctx();
+        ctx->state = P25_SM_TUNED;
+        ctx->vc_freq_hz = 851500000; // camped on a different VC
+        process_MAC_VPDU(&opts, &state, 0, P25_MAC_PDU_ACTIVE, MAC);
+        rc |= expect_eq_long("0x83 off-carrier no dispatch", ctx->grant_count, 0);
+
+        ctx->vc_freq_hz = 851125000; // now matches the update's channel
+        process_MAC_VPDU(&opts, &state, 0, P25_MAC_PDU_ACTIVE, MAC);
+        rc |= expect_eq_long("0x83 on-carrier dispatch", ctx->grant_count, 1);
     }
 
     // Case D5c2: SACCH grants apply service-option state to the decoded slot, not currentslot.
@@ -1070,9 +1213,14 @@ main(void) {
         DSD_MEMSET(&opts, 0, sizeof opts);
         DSD_MEMSET(&state, 0, sizeof state);
         state.currentslot = 0;
-        state.dmr_so = 0x11;
-        state.dmr_soR = 0x22;
-        state.p25_service_options_valid[0] = 1;
+        rc |= expect_true("0x40 SACCH seed slot0",
+                          seed_voice_call(&state, 0U, DSD_CALL_KIND_GROUP_VOICE, 0x1111U, 0x1111U, 0x010101U, 0x11U));
+        rc |= expect_true("0x40 SACCH seed slot1",
+                          seed_voice_call(&state, 1U, DSD_CALL_KIND_GROUP_VOICE, 0x2222U, 0x2222U, 0x020202U, 0x22U));
+        dsd_call_snapshot before0 = {0};
+        dsd_call_snapshot before1 = {0};
+        (void)copy_call(&state, 0U, &before0);
+        (void)copy_call(&state, 1U, &before1);
 
         MAC[1] = 0x40;
         MAC[2] = 0x93; // emergency, packet, priority 3
@@ -1084,14 +1232,19 @@ main(void) {
         MAC[8] = 0x02;
         MAC[9] = 0x03;
 
-        process_MAC_VPDU(&opts, &state, 1, MAC);
-        rc |= expect_eq_long("0x40 SACCH slot0 svc unchanged", state.dmr_so, 0x11);
-        rc |= expect_eq_long("0x40 SACCH slot1 svc", state.dmr_soR, 0x93);
-        rc |= expect_eq_long("0x40 SACCH slot0 valid unchanged", state.p25_service_options_valid[0], 1);
-        rc |= expect_eq_long("0x40 SACCH slot1 valid", state.p25_service_options_valid[1], 1);
-        rc |= expect_eq_long("0x40 SACCH slot0 emergency unchanged", state.p25_call_emergency[0], 0);
-        rc |= expect_eq_long("0x40 SACCH slot1 emergency", state.p25_call_emergency[1], 1);
-        rc |= expect_eq_long("0x40 SACCH slot1 packet", state.p25_call_is_packet[1], 1);
+        process_MAC_VPDU(&opts, &state, 1, P25_MAC_PDU_ACTIVE, MAC);
+        dsd_call_snapshot after0 = {0};
+        dsd_call_snapshot after1 = {0};
+        (void)copy_call(&state, 0U, &after0);
+        (void)copy_call(&state, 1U, &after1);
+        rc |= expect_eq_long("0x40 SACCH slot0 epoch unchanged", (long)after0.epoch, (long)before0.epoch);
+        rc |= expect_eq_long("0x40 SACCH slot1 epoch unchanged", (long)after1.epoch, (long)before1.epoch);
+        rc |= expect_eq_long("0x40 SACCH slot0 svc unchanged", after0.service_options, 0x11);
+        rc |= expect_eq_long("0x40 SACCH slot1 svc unchanged", after1.service_options, 0x22);
+        const dsd_recent_activity_entry* recent = recent_activity(&state, 0U);
+        rc |= expect_true("0x40 SACCH recent activity", recent != NULL);
+        rc |= expect_eq_long("0x40 SACCH recent service", recent ? recent->observation.service_options : -1, 0x93);
+        rc |= expect_eq_long("0x40 SACCH recent emergency", recent ? recent->observation.emergency : 0, 1);
     }
 
     // Case D5c3: shared explicit-grant helper also stores SACCH service bits on the decoded slot.
@@ -1102,9 +1255,14 @@ main(void) {
         DSD_MEMSET(&opts, 0, sizeof opts);
         DSD_MEMSET(&state, 0, sizeof state);
         state.currentslot = 1;
-        state.dmr_so = 0x11;
-        state.dmr_soR = 0x22;
-        state.p25_service_options_valid[1] = 1;
+        rc |= expect_true("0xC0 SACCH seed slot0",
+                          seed_voice_call(&state, 0U, DSD_CALL_KIND_GROUP_VOICE, 0x1111U, 0x1111U, 0x010101U, 0x11U));
+        rc |= expect_true("0xC0 SACCH seed slot1",
+                          seed_voice_call(&state, 1U, DSD_CALL_KIND_GROUP_VOICE, 0x2222U, 0x2222U, 0x020202U, 0x22U));
+        dsd_call_snapshot before0 = {0};
+        dsd_call_snapshot before1 = {0};
+        (void)copy_call(&state, 0U, &before0);
+        (void)copy_call(&state, 1U, &before1);
 
         MAC[1] = 0xC0;
         MAC[2] = 0x50; // encrypted packet
@@ -1118,13 +1276,18 @@ main(void) {
         MAC[10] = 0x02;
         MAC[11] = 0x03;
 
-        process_MAC_VPDU(&opts, &state, 1, MAC);
-        rc |= expect_eq_long("0xC0 SACCH slot0 svc", state.dmr_so, 0x50);
-        rc |= expect_eq_long("0xC0 SACCH slot1 svc unchanged", state.dmr_soR, 0x22);
-        rc |= expect_eq_long("0xC0 SACCH slot0 valid", state.p25_service_options_valid[0], 1);
-        rc |= expect_eq_long("0xC0 SACCH slot1 valid unchanged", state.p25_service_options_valid[1], 1);
-        rc |= expect_eq_long("0xC0 SACCH slot0 packet", state.p25_call_is_packet[0], 1);
-        rc |= expect_eq_long("0xC0 SACCH slot1 packet unchanged", state.p25_call_is_packet[1], 0);
+        process_MAC_VPDU(&opts, &state, 1, P25_MAC_PDU_ACTIVE, MAC);
+        dsd_call_snapshot after0 = {0};
+        dsd_call_snapshot after1 = {0};
+        (void)copy_call(&state, 0U, &after0);
+        (void)copy_call(&state, 1U, &after1);
+        rc |= expect_eq_long("0xC0 SACCH slot0 epoch unchanged", (long)after0.epoch, (long)before0.epoch);
+        rc |= expect_eq_long("0xC0 SACCH slot1 epoch unchanged", (long)after1.epoch, (long)before1.epoch);
+        rc |= expect_eq_long("0xC0 SACCH slot0 svc unchanged", after0.service_options, 0x11);
+        rc |= expect_eq_long("0xC0 SACCH slot1 svc unchanged", after1.service_options, 0x22);
+        const dsd_recent_activity_entry* recent = recent_activity(&state, 0U);
+        rc |= expect_true("0xC0 SACCH recent activity", recent != NULL);
+        rc |= expect_eq_long("0xC0 SACCH recent service", recent ? recent->observation.service_options : -1, 0x50);
     }
 
     // Case D5c4: MFID90 grant helpers use the decoded SACCH slot for call state.
@@ -1135,8 +1298,14 @@ main(void) {
         DSD_MEMSET(&opts, 0, sizeof opts);
         DSD_MEMSET(&state, 0, sizeof state);
         state.currentslot = 1;
-        state.dmr_so = 0x11;
-        state.dmr_soR = 0x22;
+        rc |= expect_true("0xA3 SACCH seed slot0",
+                          seed_voice_call(&state, 0U, DSD_CALL_KIND_GROUP_VOICE, 0x1111U, 0x1111U, 0x010101U, 0x11U));
+        rc |= expect_true("0xA3 SACCH seed slot1",
+                          seed_voice_call(&state, 1U, DSD_CALL_KIND_GROUP_VOICE, 0x2222U, 0x2222U, 0x020202U, 0x22U));
+        dsd_call_snapshot before0 = {0};
+        dsd_call_snapshot before1 = {0};
+        (void)copy_call(&state, 0U, &before0);
+        (void)copy_call(&state, 1U, &before1);
 
         MAC[1] = 0xA3;
         MAC[2] = 0x90;
@@ -1149,11 +1318,17 @@ main(void) {
         MAC[10] = 0x02;
         MAC[11] = 0x03;
 
-        process_MAC_VPDU(&opts, &state, 1, MAC);
-        rc |= expect_eq_long("0xA3 SACCH slot0 svc", state.dmr_so, 0x81);
-        rc |= expect_eq_long("0xA3 SACCH slot1 svc unchanged", state.dmr_soR, 0x22);
-        rc |= expect_eq_long("0xA3 SACCH slot0 emergency", state.p25_call_emergency[0], 1);
-        rc |= expect_eq_long("0xA3 SACCH slot1 emergency unchanged", state.p25_call_emergency[1], 0);
+        process_MAC_VPDU(&opts, &state, 1, P25_MAC_PDU_ACTIVE, MAC);
+        dsd_call_snapshot after0 = {0};
+        dsd_call_snapshot after1 = {0};
+        (void)copy_call(&state, 0U, &after0);
+        (void)copy_call(&state, 1U, &after1);
+        rc |= expect_eq_long("0xA3 SACCH slot0 epoch unchanged", (long)after0.epoch, (long)before0.epoch);
+        rc |= expect_eq_long("0xA3 SACCH slot1 epoch unchanged", (long)after1.epoch, (long)before1.epoch);
+        const dsd_recent_activity_entry* recent = recent_activity(&state, 0U);
+        rc |= expect_true("0xA3 SACCH recent activity", recent != NULL);
+        rc |= expect_eq_long("0xA3 SACCH recent service", recent ? recent->observation.service_options : -1, 0x81);
+        rc |= expect_eq_long("0xA3 SACCH recent emergency", recent ? recent->observation.emergency : 0, 1);
     }
 
     // Case D5d: encrypted MFID90 0xA3 grants become silent classification probes
@@ -1182,13 +1357,13 @@ main(void) {
         MAC[10] = 0x02;
         MAC[11] = 0x03;
 
-        process_MAC_VPDU(&opts, &state, 0, MAC);
+        process_MAC_VPDU(&opts, &state, 0, P25_MAC_PDU_ACTIVE, MAC);
 
         rc |= expect_true("0xA3 encrypted probe tunes", opts.trunk_is_tuned == 1);
         rc |= expect_eq_long("0xA3 encrypted probe gate closed", state.p25_p2_audio_allowed[0], 0);
         rc |=
             expect_eq_long("0xA3 encrypted probe pending", state.p25_crypto_state[0], DSD_P25_CRYPTO_ENCRYPTED_PENDING);
-        rc |= expect_contains("0xA3 encrypted active", state.active_channel[0], "MFID90 Active Ch: 100A");
+        rc |= expect_contains("0xA3 encrypted active", recent_notice(&state, 0U), "MFID90 Active Ch: 100A");
     }
 
     // Case D5e: MFID90 0x80 voice-user messages store service options.
@@ -1210,13 +1385,15 @@ main(void) {
         MAC[7] = 0x02;
         MAC[8] = 0x03;
 
-        process_MAC_VPDU(&opts, &state, 0, MAC);
-        rc |= expect_eq_long("0x80 last tg", state.lasttg, 0x3456);
-        rc |= expect_eq_long("0x80 last src", state.lastsrc, 0x010203);
-        rc |= expect_eq_long("0x80 stored service options", state.dmr_so, 0xA5);
-        rc |= expect_eq_long("0x80 service options valid", state.p25_service_options_valid[0], 1);
-        rc |= expect_eq_long("0x80 emergency state", state.p25_call_emergency[0], 1);
-        rc |= expect_contains("0x80 call banner", state.call_string[0], "Emergency");
+        process_MAC_VPDU(&opts, &state, 0, P25_MAC_PDU_ACTIVE, MAC);
+        dsd_call_snapshot call = {0};
+        rc |= expect_true("0x80 canonical call", copy_call(&state, 0U, &call));
+        rc |= expect_eq_long("0x80 target", (long)call.ota_target_id, 0x3456);
+        rc |= expect_eq_long("0x80 source", (long)call.ota_source_id, 0x010203);
+        rc |= expect_eq_long("0x80 kind", (long)call.kind, DSD_CALL_KIND_GROUP_VOICE);
+        rc |= expect_eq_long("0x80 stored service options", call.service_options, 0xA5);
+        rc |= expect_eq_long("0x80 emergency state", call.emergency, 1);
+        rc |= expect_eq_long("0x80 priority state", call.priority, 5);
     }
 
     // Case D5e2: first regroup voice-user metadata preserves the patch-member policy target from the grant.
@@ -1229,12 +1406,14 @@ main(void) {
         opts.trunk_use_allow_list = 1;
         state.synctype = DSD_SYNC_P25P2_POS;
         state.currentslot = 0;
-        state.lasttg = 0x2222;
-        state.lastsrc = 0x010101;
 
         rc |= expect_eq_long("0x80 policy seed member", seed_policy_group(&state, 0x1234, "A", "PATCH-MEMBER"), 0);
         p25_patch_add_wgid(&state, 0x3456, 0x1234);
-        state.p25_policy_tg[0] = 0x1234;
+        p25_sm_init_ctx(p25_sm_get_ctx(), &opts, &state);
+        p25_sm_ctx_t* ctx = p25_sm_get_ctx();
+        ctx->slots[0].is_group = 1;
+        ctx->slots[0].ota_tg = 0x3456;
+        ctx->slots[0].target_id = 0x1234;
 
         MAC[1] = 0x80;
         MAC[2] = 0x90;
@@ -1245,17 +1424,21 @@ main(void) {
         MAC[7] = 0x02;
         MAC[8] = 0x03;
 
-        process_MAC_VPDU(&opts, &state, 0, MAC);
-        rc |= expect_eq_long("0x80 policy member last tg", state.lasttg, 0x3456);
-        rc |= expect_eq_long("0x80 policy member preserved", state.p25_policy_tg[0], 0x1234);
+        process_MAC_VPDU(&opts, &state, 0, P25_MAC_PDU_ACTIVE, MAC);
+        dsd_call_snapshot call = {0};
+        rc |= expect_true("0x80 policy member canonical call", copy_call(&state, 0U, &call));
+        rc |= expect_eq_long("0x80 policy member ota target", (long)call.ota_target_id, 0x3456);
+        rc |= expect_eq_long("0x80 policy member preserved", (long)call.policy_target_id, 0x1234);
         state.p25_crypto_state[0] = DSD_P25_CRYPTO_CLEAR;
         rc |= expect_eq_long("0x80 policy member audio", dsd_p25p2_decode_audio_allowed(&opts, &state, 0, 0), 1);
 
-        state.p25_policy_tg[0] = 0x7777;
+        ctx->slots[0].ota_tg = 0x3456;
+        ctx->slots[0].target_id = 0x7777;
         MAC[4] = 0x45;
         MAC[5] = 0x67;
-        process_MAC_VPDU(&opts, &state, 0, MAC);
-        rc |= expect_eq_long("0x80 stale policy clears", state.p25_policy_tg[0], 0);
+        process_MAC_VPDU(&opts, &state, 0, P25_MAC_PDU_ACTIVE, MAC);
+        rc |= expect_true("0x80 replacement canonical call", copy_call(&state, 0U, &call));
+        rc |= expect_eq_long("0x80 stale policy replaced by ota", (long)call.policy_target_id, 0x4567);
 
         dsd_state_ext_free_all(&state);
     }
@@ -1283,16 +1466,18 @@ main(void) {
         MAC[12] = 0x50;
         MAC[13] = 0x67;
 
-        process_MAC_VPDU(&opts, &state, 0, MAC);
-        rc |= expect_eq_long("0xA0 last tg", state.lasttgR, 0x4567);
-        rc |= expect_eq_long("0xA0 last src", state.lastsrcR, 0x0A0B0C);
-        rc |= expect_eq_long("0xA0 stored service options", state.dmr_soR, 0x40);
-        rc |= expect_eq_long("0xA0 service options valid", state.p25_service_options_valid[1], 1);
-        rc |= expect_contains("0xA0 call banner", state.call_string[1], "Encrypted");
+        process_MAC_VPDU(&opts, &state, 0, P25_MAC_PDU_ACTIVE, MAC);
+        dsd_call_snapshot call = {0};
+        rc |= expect_true("0xA0 canonical call", copy_call(&state, 1U, &call));
+        rc |= expect_eq_long("0xA0 target", (long)call.ota_target_id, 0x4567);
+        rc |= expect_eq_long("0xA0 source", (long)call.ota_source_id, 0x0A0B0C);
+        rc |= expect_eq_long("0xA0 stored service options", call.service_options, 0x40);
+        rc |= expect_eq_long("0xA0 encrypted classification", call.crypto, DSD_CALL_CRYPTO_ENCRYPTED_PENDING);
     }
 
     rc |= run_standard_regroup_voice_user_case(0x00, 0, "0x90/mfid00");
     rc |= run_standard_regroup_voice_user_case(0x01, 1, "0x90/mfid01");
+    rc |= test_rejected_tdma_slot_voice_user_does_not_reopen_call();
     rc |= run_standard_regroup_voice_user_nonstandard_guard_case();
 
     // Case D6: Group Affiliation Response 0x68 accepts on low GAV bits, not status bits 5-6.
@@ -1313,7 +1498,7 @@ main(void) {
         MAC[9] = 0x02;
         MAC[10] = 0x03; // TA
 
-        process_MAC_VPDU(&opts, &state, 0, MAC);
+        process_MAC_VPDU(&opts, &state, 0, P25_MAC_PDU_ACTIVE, MAC);
         rc |= expect_eq_long("0x68 accepted aff count", state.p25_aff_count, 1);
         rc |= expect_eq_long("0x68 accepted ga count", state.p25_ga_count, 1);
         rc |= expect_eq_long("0x68 accepted TA", state.p25_aff_rid[0], 0x010203);
@@ -1339,7 +1524,7 @@ main(void) {
         MAC[9] = 0x02;
         MAC[10] = 0x03;
 
-        process_MAC_VPDU(&opts, &state, 0, MAC);
+        process_MAC_VPDU(&opts, &state, 0, P25_MAC_PDU_ACTIVE, MAC);
         rc |= expect_eq_long("0x68 rejected aff count", state.p25_aff_count, 0);
         rc |= expect_eq_long("0x68 rejected ga count", state.p25_ga_count, 0);
     }
@@ -1363,7 +1548,7 @@ main(void) {
         MAC[8] = 0x0B;
         MAC[9] = 0x0C; // target address
 
-        process_MAC_VPDU(&opts, &state, 0, MAC);
+        process_MAC_VPDU(&opts, &state, 0, P25_MAC_PDU_ACTIVE, MAC);
         rc |= expect_eq_long("0x6B accepted aff count", state.p25_aff_count, 1);
         rc |= expect_eq_long("0x6B accepted ga count", state.p25_ga_count, 1);
         rc |= expect_eq_long("0x6B accepted TA", state.p25_aff_rid[0], 0x0A0B0C);
@@ -1388,7 +1573,7 @@ main(void) {
         MAC[8] = 0x0B;
         MAC[9] = 0x0C;
 
-        process_MAC_VPDU(&opts, &state, 0, MAC);
+        process_MAC_VPDU(&opts, &state, 0, P25_MAC_PDU_ACTIVE, MAC);
         rc |= expect_eq_long("0x6B rejected aff count", state.p25_aff_count, 0);
         rc |= expect_eq_long("0x6B rejected ga count", state.p25_ga_count, 0);
     }
@@ -1423,7 +1608,7 @@ main(void) {
         MAC[8] = 0x00;
         MAC[9] = 0x02; // source
 
-        process_MAC_VPDU(&opts, &state, 0, MAC);
+        process_MAC_VPDU(&opts, &state, 0, P25_MAC_PDU_ACTIVE, MAC);
         rc |= expect_true("0x40 accepted after release", opts.trunk_is_tuned == 1);
         rc |= expect_eq_long("0x40 reassigned vc", state.p25_vc_freq[0], 851125000);
     }
@@ -1461,7 +1646,7 @@ main(void) {
         MAC[9] = 0x07; // source
 
         p25_sm_init_ctx(p25_sm_get_ctx(), &opts, &state);
-        process_MAC_VPDU(&opts, &state, 0, MAC);
+        process_MAC_VPDU(&opts, &state, 0, P25_MAC_PDU_ACTIVE, MAC);
 
         p25_sm_ctx_t* ctx = p25_sm_get_ctx();
         rc |= expect_eq_long("0x40 tuned same-carrier dispatch", ctx->grant_count, 1);
@@ -1504,7 +1689,7 @@ main(void) {
         MAC[9] = 0x02; // source
 
         p25_sm_init_ctx(p25_sm_get_ctx(), &opts, &state);
-        process_MAC_VPDU(&opts, &state, 0, MAC);
+        process_MAC_VPDU(&opts, &state, 0, P25_MAC_PDU_ACTIVE, MAC);
         rc |= expect_true("0x40 LCCH grant tuned", opts.trunk_is_tuned == 1);
         rc |= expect_eq_long("0x40 LCCH grant seeded CC", state.p25_cc_freq, cc);
         rc |= expect_eq_long("0x40 LCCH grant seeded trunk CC", state.trunk_cc_freq, cc);
@@ -1543,7 +1728,7 @@ main(void) {
         MAC[9] = 0x02; // source
 
         p25_sm_init_ctx(p25_sm_get_ctx(), &opts, &state);
-        process_MAC_VPDU(&opts, &state, 0, MAC);
+        process_MAC_VPDU(&opts, &state, 0, P25_MAC_PDU_ACTIVE, MAC);
 
         rc |= expect_eq_long("0x40 unseeded LCCH grant not dispatched", p25_sm_get_ctx()->grant_count, 0);
         rc |= expect_true("0x40 unseeded LCCH grant not tuned", opts.trunk_is_tuned == 0);
@@ -1583,7 +1768,7 @@ main(void) {
         MAC[8] = 0x00;
         MAC[9] = 0x02; // source
 
-        process_MAC_VPDU(&opts, &state, 0, MAC);
+        process_MAC_VPDU(&opts, &state, 0, P25_MAC_PDU_ACTIVE, MAC);
         rc |= expect_true("0x40 traffic MAC not tuned", opts.trunk_is_tuned == 0);
         rc |= expect_eq_long("0x40 traffic MAC no p25 CC seed", state.p25_cc_freq, 0);
         rc |= expect_eq_long("0x40 traffic MAC no trunk CC seed", state.trunk_cc_freq, 0);
@@ -1619,7 +1804,7 @@ main(void) {
         MAC[8] = 0x00;
         MAC[9] = 0x02; // source
 
-        process_MAC_VPDU(&opts, &state, 0, MAC);
+        process_MAC_VPDU(&opts, &state, 0, P25_MAC_PDU_ACTIVE, MAC);
         rc |= expect_true("0x40 trunk alias CC tuned", opts.trunk_is_tuned == 1);
         rc |= expect_eq_long("0x40 trunk alias p25 CC", state.p25_cc_freq, cc);
         rc |= expect_eq_long("0x40 trunk alias trunk CC", state.trunk_cc_freq, cc);
@@ -1655,7 +1840,7 @@ main(void) {
         MAC[8] = 0x12;
         MAC[9] = 0x35; // group2
 
-        process_MAC_VPDU(&opts, &state, 0, MAC);
+        process_MAC_VPDU(&opts, &state, 0, P25_MAC_PDU_ACTIVE, MAC);
         rc |= expect_true("0x42 accepted after release", opts.trunk_is_tuned == 1);
         rc |= expect_eq_long("0x42 reassigned vc", state.p25_vc_freq[0], 851125000);
     }
@@ -1679,7 +1864,7 @@ main(void) {
         state.p25_iden_fdma[iden].populated = 1;
         state.p25_chan_tdma_explicit[iden] = 1;
         p25_sm_init_ctx(p25_sm_get_ctx(), &opts, &state);
-        p25_emit_enc_lockout_once_typed(&opts, &state, 0, 0x1234, /*svc_bits*/ 0, 1);
+        p25_emit_enc_lockout_once_typed(&opts, &state, 0, 0x1234, /*svc_bits*/ 0, 1, DSD_ENC_LOCKOUT_ALGID_UNKNOWN, 0);
 
         MAC[1] = 0x42; // Group Voice Channel Grant Update - Implicit
         MAC[2] = 0x10;
@@ -1691,7 +1876,7 @@ main(void) {
         MAC[8] = 0x12;
         MAC[9] = 0x35; // group2
 
-        process_MAC_VPDU(&opts, &state, 0, MAC);
+        process_MAC_VPDU(&opts, &state, 0, P25_MAC_PDU_ACTIVE, MAC);
         rc |= expect_true("0x42 suppressed by transient enc cache", opts.trunk_is_tuned == 0);
         rc |= expect_eq_long("0x42 transient enc cache no vc", state.p25_vc_freq[0], 0);
     }
@@ -1730,7 +1915,7 @@ main(void) {
         MAC[10] = 0x00;
         MAC[11] = 0x55; // NAC
 
-        process_MAC_VPDU(&opts, &state, 0, MAC);
+        process_MAC_VPDU(&opts, &state, 0, P25_MAC_PDU_ACTIVE, MAC);
         rc |= expect_true("p2 rejected nsb sets system tdma hint", state.p25_sys_is_tdma == 1);
         rc |= expect_true("p2 rejected nsb preserves cc modulation", state.p25_cc_is_tdma == 0);
         rc |= expect_eq_long("p2 rejected nsb preserves p25 cc", state.p25_cc_freq, cc);
@@ -1770,7 +1955,7 @@ main(void) {
         MAC[10] = 0x00;
         MAC[11] = 0x55;
 
-        process_MAC_VPDU(&opts, &state, 0, MAC);
+        process_MAC_VPDU(&opts, &state, 0, P25_MAC_PDU_ACTIVE, MAC);
         rc |= expect_true("p2 unknown-iden nsb marks system tdma", state.p25_sys_is_tdma == 1);
         rc |= expect_true("p2 unknown-iden nsb does not mark cc tdma", state.p25_cc_is_tdma == 0);
         rc |= expect_eq_long("p2 unknown-iden nsb p25 cc empty", state.p25_cc_freq, 0);
@@ -1817,7 +2002,7 @@ main(void) {
         MAC[12] = 0x00;
         MAC[13] = 0x56;
 
-        process_MAC_VPDU(&opts, &state, 0, MAC);
+        process_MAC_VPDU(&opts, &state, 0, P25_MAC_PDU_ACTIVE, MAC);
         rc |= expect_true("p2 unknown-iden nsb-ext marks system tdma", state.p25_sys_is_tdma == 1);
         rc |= expect_true("p2 unknown-iden nsb-ext does not mark cc tdma", state.p25_cc_is_tdma == 0);
         rc |= expect_eq_long("p2 unknown-iden nsb-ext p25 cc empty", state.p25_cc_freq, 0);
@@ -1863,7 +2048,7 @@ main(void) {
         MAC[10] = 0x00;
         MAC[11] = 0x55; // NAC
 
-        process_MAC_VPDU(&opts, &state, 0, MAC);
+        process_MAC_VPDU(&opts, &state, 0, P25_MAC_PDU_ACTIVE, MAC);
         rc |= expect_true("p2 accepted nsb marks system tdma", state.p25_sys_is_tdma == 1);
         rc |= expect_true("p2 accepted nsb marks cc tdma", state.p25_cc_is_tdma == 1);
         rc |= expect_eq_long("p2 accepted nsb p25 cc", state.p25_cc_freq, 851125000);
@@ -1906,7 +2091,7 @@ main(void) {
         MAC[10] = 0x00;
         MAC[11] = 0x55;
 
-        process_MAC_VPDU(&opts, &state, 0, MAC);
+        process_MAC_VPDU(&opts, &state, 0, P25_MAC_PDU_ACTIVE, MAC);
         rc |= expect_eq_long("p2 rejected voice nsb preserves p25 cc", state.p25_cc_freq, 851000000);
         rc |= expect_eq_long("p2 rejected voice nsb preserves lra", state.p25_site_lra, 0x44);
         rc |= expect_eq_long("p2 rejected voice nsb preserves lra valid", state.p25_site_lra_valid, 1);
@@ -1940,7 +2125,7 @@ main(void) {
         MAC[12] = 0x00;
         MAC[13] = 0x56; // NAC
 
-        process_MAC_VPDU(&opts, &state, 0, MAC);
+        process_MAC_VPDU(&opts, &state, 0, P25_MAC_PDU_ACTIVE, MAC);
         rc |= expect_true("p2 accepted nsb-ext marks system tdma", state.p25_sys_is_tdma == 1);
         rc |= expect_true("p2 accepted nsb-ext marks cc tdma", state.p25_cc_is_tdma == 1);
         rc |= expect_eq_long("p2 accepted nsb-ext p25 cc", state.p25_cc_freq, 851125000);
@@ -1985,7 +2170,7 @@ main(void) {
         MAC[12] = 0x00;
         MAC[13] = 0x56;
 
-        process_MAC_VPDU(&opts, &state, 0, MAC);
+        process_MAC_VPDU(&opts, &state, 0, P25_MAC_PDU_ACTIVE, MAC);
         rc |= expect_eq_long("p2 rejected voice nsb-ext preserves p25 cc", state.p25_cc_freq, 851000000);
         rc |= expect_eq_long("p2 rejected voice nsb-ext preserves lra", state.p25_site_lra, 0x45);
         rc |= expect_eq_long("p2 rejected voice nsb-ext preserves lra valid", state.p25_site_lra_valid, 1);
@@ -2028,15 +2213,15 @@ main(void) {
         MAC[14] = 0x56;
         MAC[15] = 0x78;
 
-        process_MAC_VPDU(&opts, &state, 0, MAC);
+        process_MAC_VPDU(&opts, &state, 0, P25_MAC_PDU_ACTIVE, MAC);
         rc |= expect_true("0x25 encrypted multi probe tunes", opts.trunk_is_tuned == 1);
         rc |= expect_eq_long("0x25 encrypted multi probe vc", state.p25_vc_freq[0], 851125000);
         rc |= expect_eq_long("0x25 encrypted multi probe pending", state.p25_crypto_state[0],
                              DSD_P25_CRYPTO_ENCRYPTED_PENDING);
-        rc |= expect_contains("0x25 encrypted multi active ch1", state.active_channel[0], "Active Ch: 100A");
-        rc |= expect_contains("0x25 encrypted multi active ch2", state.active_channel[0], "Ch: 100B");
-        rc |= expect_contains("0x25 encrypted multi active ch group1", state.active_channel[0], "TG: 4660");
-        rc |= expect_contains("0x25 encrypted multi active ch group2", state.active_channel[0], "TG: 22136");
+        rc |= expect_contains("0x25 encrypted multi active ch1", recent_notice(&state, 0U), "Active Ch: 100A");
+        rc |= expect_contains("0x25 encrypted multi active ch2", recent_notice(&state, 0U), "Ch: 100B");
+        rc |= expect_contains("0x25 encrypted multi active ch group1", recent_notice(&state, 0U), "TG: 4660");
+        rc |= expect_contains("0x25 encrypted multi active ch group2", recent_notice(&state, 0U), "TG: 22136");
     }
 
     // Case P: MAC words are specified as octets. If high bits leak into a
@@ -2076,11 +2261,11 @@ main(void) {
         MAC[14] = 0x00;
         MAC[15] = 0x3E;
 
-        process_MAC_VPDU(&opts, &state, 0, MAC);
-        rc |= expect_contains("0x25 octet clamp active ch1", state.active_channel[0], "Active Ch: 100A");
-        rc |= expect_contains("0x25 octet clamp active ch2", state.active_channel[0], "Ch: 6F10");
-        rc |= expect_contains("0x25 octet clamp group1", state.active_channel[0], "TG: 34560");
-        rc |= expect_contains("0x25 octet clamp group2", state.active_channel[0], "TG: 62");
+        process_MAC_VPDU(&opts, &state, 0, P25_MAC_PDU_ACTIVE, MAC);
+        rc |= expect_contains("0x25 octet clamp active ch1", recent_notice(&state, 0U), "Active Ch: 100A");
+        rc |= expect_contains("0x25 octet clamp active ch2", recent_notice(&state, 0U), "Ch: 6F10");
+        rc |= expect_contains("0x25 octet clamp group1", recent_notice(&state, 0U), "TG: 34560");
+        rc |= expect_contains("0x25 octet clamp group2", recent_notice(&state, 0U), "TG: 62");
     }
 
     // Case O2: a clear explicit grant must be selected before an earlier
@@ -2116,7 +2301,7 @@ main(void) {
         MAC[14] = 0x56;
         MAC[15] = 0x78;
 
-        process_MAC_VPDU(&opts, &state, 0, MAC);
+        process_MAC_VPDU(&opts, &state, 0, P25_MAC_PDU_ACTIVE, MAC);
         rc |= expect_true("0x25 mixed update tunes", opts.trunk_is_tuned == 1);
         rc |= expect_eq_long("0x25 mixed update prefers clear vc", state.p25_vc_freq[0], 851137500);
         rc |= expect_eq_long("0x25 mixed update clear classification", state.p25_crypto_state[0], DSD_P25_CRYPTO_CLEAR);
@@ -2143,7 +2328,8 @@ main(void) {
         state.p25_iden_fdma[iden].populated = 1;
         state.p25_chan_tdma_explicit[iden] = 1;
         p25_sm_init_ctx(p25_sm_get_ctx(), &opts, &state);
-        p25_emit_enc_lockout_once_typed(&opts, &state, 0, 0x1234, /*svc_bits*/ 0x40, 1);
+        p25_emit_enc_lockout_once_typed(&opts, &state, 0, 0x1234, /*svc_bits*/ 0x40, 1, DSD_ENC_LOCKOUT_ALGID_UNKNOWN,
+                                        0);
 
         MAC[1] = 0x25;
         MAC[2] = 0x40; // cached encrypted group
@@ -2157,7 +2343,7 @@ main(void) {
         MAC[14] = 0x56;
         MAC[15] = 0x78;
 
-        process_MAC_VPDU(&opts, &state, 0, MAC);
+        process_MAC_VPDU(&opts, &state, 0, P25_MAC_PDU_ACTIVE, MAC);
         rc |= expect_true("0x25 cached first candidate falls through", opts.trunk_is_tuned == 1);
         rc |= expect_eq_long("0x25 later uncached probe selected", state.p25_vc_freq[0], 851137500);
         rc |= expect_eq_long("0x25 later uncached probe pending", state.p25_crypto_state[0],
@@ -2202,14 +2388,14 @@ main(void) {
         MAC[15] = 0x9A;
         MAC[16] = 0xBC;
 
-        process_MAC_VPDU(&opts, &state, 0, MAC);
+        process_MAC_VPDU(&opts, &state, 0, P25_MAC_PDU_ACTIVE, MAC);
         rc |= expect_true("0x05 encrypted triple probe tunes", opts.trunk_is_tuned == 1);
         rc |= expect_eq_long("0x05 encrypted triple probe vc", state.p25_vc_freq[0], 851125000);
         rc |= expect_eq_long("0x05 encrypted triple probe pending", state.p25_crypto_state[0],
                              DSD_P25_CRYPTO_ENCRYPTED_PENDING);
-        rc |= expect_contains("0x05 encrypted triple active group1", state.active_channel[0], "TG: 4660");
-        rc |= expect_contains("0x05 encrypted triple active group2", state.active_channel[0], "TG: 22136");
-        rc |= expect_contains("0x05 encrypted triple active group3", state.active_channel[0], "TG: 39612");
+        rc |= expect_contains("0x05 encrypted triple active group1", recent_notice(&state, 0U), "TG: 4660");
+        rc |= expect_contains("0x05 encrypted triple active group2", recent_notice(&state, 0U), "TG: 22136");
+        rc |= expect_contains("0x05 encrypted triple active group3", recent_notice(&state, 0U), "TG: 39612");
     }
 
     // Case Q2: standard TDMA 0x05 with service option 0x90 is still a grant update, not MFID90 BSI.
@@ -2252,7 +2438,7 @@ main(void) {
         if (dsd_test_capture_stderr_begin(&cap, "p25_p2_0x05_not_bsi") != 0) {
             return 100;
         }
-        process_MAC_VPDU(&opts, &state, 0, MAC);
+        process_MAC_VPDU(&opts, &state, 0, P25_MAC_PDU_ACTIVE, MAC);
         if (dsd_test_capture_stderr_end(&cap) != 0) {
             return 101;
         }
@@ -2266,7 +2452,7 @@ main(void) {
         rc |=
             expect_contains("0x05 output is grant update", out, "Group Voice Channel Grant Update Multiple - Implicit");
         rc |= expect_not_contains("0x05 output is not BSI", out, "System Broadcast (BSI)");
-        rc |= expect_contains("0x05 svc 0x90 active group1", state.active_channel[0], "TG: 4660");
+        rc |= expect_contains("0x05 svc 0x90 active group1", recent_notice(&state, 0U), "TG: 4660");
     }
 
     // Case Q3: implicit multi-grants likewise select a later clear call before
@@ -2307,7 +2493,7 @@ main(void) {
         MAC[15] = 0x9A;
         MAC[16] = 0xBC;
 
-        process_MAC_VPDU(&opts, &state, 0, MAC);
+        process_MAC_VPDU(&opts, &state, 0, P25_MAC_PDU_ACTIVE, MAC);
         rc |= expect_true("0x05 mixed update tunes", opts.trunk_is_tuned == 1);
         rc |= expect_eq_long("0x05 mixed update prefers clear vc", state.p25_vc_freq[0], 851137500);
         rc |= expect_eq_long("0x05 mixed update clear classification", state.p25_crypto_state[0], DSD_P25_CRYPTO_CLEAR);
@@ -2344,14 +2530,16 @@ main(void) {
         MAC[8] = 0x04;
         MAC[9] = 0x05; // target
 
-        process_MAC_VPDU(&opts, &state, 0, MAC);
+        process_MAC_VPDU(&opts, &state, 0, P25_MAC_PDU_ACTIVE, MAC);
         rc |= expect_true("0x48 telephone no unsupported tune", opts.trunk_is_tuned == 0);
         rc |= expect_eq_long("0x48 telephone no vc", state.p25_vc_freq[0], 0);
-        rc |= expect_contains("0x48 telephone active", state.active_channel[0], "Active Tele Ch: 100A");
-        rc |= expect_contains("0x48 telephone target", state.active_channel[0], "TGT: 197637");
-        rc |= expect_eq_long("0x48 telephone svc", state.dmr_so, 0x93);
-        rc |= expect_eq_long("0x48 telephone emergency", state.p25_call_emergency[0], 1);
-        rc |= expect_eq_long("0x48 telephone packet", state.p25_call_is_packet[0], 1);
+        rc |= expect_contains("0x48 telephone active", recent_notice(&state, 0U), "Active Tele Ch: 100A");
+        rc |= expect_contains("0x48 telephone target", recent_notice(&state, 0U), "TGT: 197637");
+        const dsd_recent_activity_entry* recent = recent_activity(&state, 0U);
+        rc |= expect_eq_long("0x48 telephone svc", recent ? recent->observation.service_options : -1, 0x93);
+        rc |= expect_eq_long("0x48 telephone emergency", recent ? recent->observation.emergency : 0, 1);
+        dsd_call_snapshot no_call = {0};
+        rc |= expect_eq_long("0x48 telephone grant is not voice epoch", copy_call(&state, 0U, &no_call), 0);
     }
 
     // Case S0: explicit SNDCP data grants use the data-grant SM surface and respect data tuning policy.
@@ -2387,12 +2575,12 @@ main(void) {
         MAC[9] = 0x05;
 
         p25_sm_init_ctx(p25_sm_get_ctx(), &opts, &state);
-        process_MAC_VPDU(&opts, &state, 0, MAC);
+        process_MAC_VPDU(&opts, &state, 0, P25_MAC_PDU_ACTIVE, MAC);
         rc |= expect_eq_long("0x54 data disabled no callback", p25_sm_get_ctx()->grant_count, 0);
 
         opts.trunk_tune_data_calls = 1;
         p25_sm_init_ctx(p25_sm_get_ctx(), &opts, &state);
-        process_MAC_VPDU(&opts, &state, 0, MAC);
+        process_MAC_VPDU(&opts, &state, 0, P25_MAC_PDU_ACTIVE, MAC);
         p25_sm_ctx_t* ctx = p25_sm_get_ctx();
         rc |= expect_eq_long("0x54 data callback", ctx->grant_count, 1);
         rc |= expect_eq_long("0x54 data callback channel", ctx->vc_channel, 0x100A);
@@ -2433,7 +2621,7 @@ main(void) {
         MAC[9] = 0x05;
 
         p25_sm_init_ctx(p25_sm_get_ctx(), &opts, &state);
-        process_MAC_VPDU(&opts, &state, 0, MAC);
+        process_MAC_VPDU(&opts, &state, 0, P25_MAC_PDU_ACTIVE, MAC);
         p25_sm_ctx_t* ctx = p25_sm_get_ctx();
         rc |= expect_eq_long("Harris A0 data callback", ctx->grant_count, 1);
         rc |= expect_eq_long("Harris A0 data channel", ctx->vc_channel, 0x100A);
@@ -2455,7 +2643,7 @@ main(void) {
         MAC[12] = 0x18;
 
         p25_sm_init_ctx(p25_sm_get_ctx(), &opts, &state);
-        process_MAC_VPDU(&opts, &state, 0, MAC);
+        process_MAC_VPDU(&opts, &state, 0, P25_MAC_PDU_ACTIVE, MAC);
         ctx = p25_sm_get_ctx();
         rc |= expect_eq_long("Harris AC data callback", ctx->grant_count, 1);
         rc |= expect_eq_long("Harris AC data channel", ctx->vc_channel, 0x100A);
@@ -2474,8 +2662,11 @@ main(void) {
         p25_sm_release(p25_sm_get_ctx(), &opts, &state, "explicit-release");
 
         opts.trunk_enable = 0;
-        state.lasttg = 0x030405;
         state.synctype = DSD_SYNC_P25P2_POS;
+        rc |= expect_true("0x54 data seed active voice", seed_voice_call(&state, 0U, DSD_CALL_KIND_PRIVATE_VOICE,
+                                                                         0x030405U, 0x030405U, 0x010203U, 0U));
+        dsd_call_snapshot voice_before = {0};
+        (void)copy_call(&state, 0U, &voice_before);
         state.p25_iden_fdma[iden].base_freq = base;
         state.p25_iden_fdma[iden].chan_type = type;
         state.p25_iden_fdma[iden].chan_spac = spac;
@@ -2493,11 +2684,14 @@ main(void) {
         MAC[8] = 0x04;
         MAC[9] = 0x05; // target
 
-        process_MAC_VPDU(&opts, &state, 0, MAC);
-        rc |= expect_contains("0x54 data active", state.active_channel[0], "Active Data Ch: 100A");
-        rc |= expect_contains("0x54 data target", state.active_channel[0], "TGT: 197637");
+        process_MAC_VPDU(&opts, &state, 0, P25_MAC_PDU_ACTIVE, MAC);
+        rc |= expect_contains("0x54 data active", recent_notice(&state, 0U), "Active Data Ch: 100A");
+        rc |= expect_contains("0x54 data target", recent_notice(&state, 0U), "TGT: 197637");
         rc |= expect_eq_long("0x54 data vc0", state.p25_vc_freq[0], 851125000);
         rc |= expect_eq_long("0x54 data vc1", state.p25_vc_freq[1], 851125000);
+        dsd_call_snapshot voice_after = {0};
+        (void)copy_call(&state, 0U, &voice_after);
+        rc |= expect_eq_long("0x54 data preserves voice epoch", (long)voice_after.epoch, (long)voice_before.epoch);
     }
 
     // Case T: L3Harris private data grants use vendor MFID 0xA4 offsets.
@@ -2510,8 +2704,11 @@ main(void) {
         p25_sm_release(p25_sm_get_ctx(), &opts, &state, "explicit-release");
 
         opts.trunk_enable = 0;
-        state.lasttg = 0x030405;
         state.synctype = DSD_SYNC_P25P2_POS;
+        rc |= expect_true("Harris A0 seed active voice", seed_voice_call(&state, 0U, DSD_CALL_KIND_PRIVATE_VOICE,
+                                                                         0x030405U, 0x030405U, 0x010203U, 0U));
+        dsd_call_snapshot voice_before = {0};
+        (void)copy_call(&state, 0U, &voice_before);
         state.p25_iden_fdma[iden].base_freq = base;
         state.p25_iden_fdma[iden].chan_type = type;
         state.p25_iden_fdma[iden].chan_spac = spac;
@@ -2529,11 +2726,14 @@ main(void) {
         MAC[8] = 0x04;
         MAC[9] = 0x05; // target
 
-        process_MAC_VPDU(&opts, &state, 0, MAC);
-        rc |= expect_contains("Harris A0 active", state.active_channel[0], "Harris Data Ch: 100A");
-        rc |= expect_contains("Harris A0 target", state.active_channel[0], "TGT: 197637");
+        process_MAC_VPDU(&opts, &state, 0, P25_MAC_PDU_ACTIVE, MAC);
+        rc |= expect_contains("Harris A0 active", recent_notice(&state, 0U), "Harris Data Ch: 100A");
+        rc |= expect_contains("Harris A0 target", recent_notice(&state, 0U), "TGT: 197637");
         rc |= expect_eq_long("Harris A0 vc0", state.p25_vc_freq[0], 851125000);
         rc |= expect_eq_long("Harris A0 vc1", state.p25_vc_freq[1], 851125000);
+        dsd_call_snapshot voice_after = {0};
+        (void)copy_call(&state, 0U, &voice_after);
+        rc |= expect_eq_long("Harris A0 preserves voice epoch", (long)voice_after.epoch, (long)voice_before.epoch);
     }
 
     // Case U: L3Harris unit-to-unit data grants include both target and source radios.
@@ -2546,8 +2746,11 @@ main(void) {
         p25_sm_release(p25_sm_get_ctx(), &opts, &state, "explicit-release");
 
         opts.trunk_enable = 0;
-        state.lasttg = 0x030405;
         state.synctype = DSD_SYNC_P25P2_POS;
+        rc |= expect_true("Harris AC seed active voice", seed_voice_call(&state, 0U, DSD_CALL_KIND_PRIVATE_VOICE,
+                                                                         0x030405U, 0x030405U, 0x010203U, 0U));
+        dsd_call_snapshot voice_before = {0};
+        (void)copy_call(&state, 0U, &voice_before);
         state.p25_iden_fdma[iden].base_freq = base;
         state.p25_iden_fdma[iden].chan_type = type;
         state.p25_iden_fdma[iden].chan_spac = spac;
@@ -2568,12 +2771,15 @@ main(void) {
         MAC[11] = 0x04;
         MAC[12] = 0x18; // source
 
-        process_MAC_VPDU(&opts, &state, 0, MAC);
-        rc |= expect_contains("Harris AC active", state.active_channel[0], "Harris Data Ch: 100A");
-        rc |= expect_contains("Harris AC target", state.active_channel[0], "TGT: 197637");
-        rc |= expect_contains("Harris AC source", state.active_channel[0], "SRC: 9962520");
+        process_MAC_VPDU(&opts, &state, 0, P25_MAC_PDU_ACTIVE, MAC);
+        rc |= expect_contains("Harris AC active", recent_notice(&state, 0U), "Harris Data Ch: 100A");
+        rc |= expect_contains("Harris AC target", recent_notice(&state, 0U), "TGT: 197637");
+        rc |= expect_contains("Harris AC source", recent_notice(&state, 0U), "SRC: 9962520");
         rc |= expect_eq_long("Harris AC vc0", state.p25_vc_freq[0], 851125000);
         rc |= expect_eq_long("Harris AC vc1", state.p25_vc_freq[1], 851125000);
+        dsd_call_snapshot voice_after = {0};
+        (void)copy_call(&state, 0U, &voice_after);
+        rc |= expect_eq_long("Harris AC preserves voice epoch", (long)voice_after.epoch, (long)voice_before.epoch);
     }
 
     dsd_trunk_tuning_hooks_set((dsd_trunk_tuning_hooks){0});

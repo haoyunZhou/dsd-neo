@@ -3,8 +3,14 @@
  * Copyright (C) 2026 by arancormonk <180709949+arancormonk@users.noreply.github.com>
  */
 
+#include <dsd-neo/core/call_state.h>
+#include <dsd-neo/core/dsd_time.h>
+#include <dsd-neo/core/events.h>
+#include <dsd-neo/core/file_io.h>
 #include <dsd-neo/core/keyring.h>
+#include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/state.h>
+#include <dsd-neo/core/synctype_ids.h>
 #include <dsd-neo/core/vocoder.h>
 #include <dsd-neo/protocol/p25/p25_crypto.h>
 #include <dsd-neo/protocol/p25/p25_trunk_sm.h>
@@ -14,6 +20,8 @@
 #include "dsd-neo/core/opts_fwd.h"
 #include "dsd-neo/core/safe_api.h"
 #include "dsd-neo/core/state_fwd.h"
+
+#define P25_P1_LOCKOUT_ESS_REPEAT_WINDOW_S 1.0
 
 static int
 p25_crypto_slot_valid(int slot) {
@@ -75,6 +83,173 @@ p25_crypto_set_state(dsd_state* state, int slot, dsd_p25_crypto_state crypto_sta
     if (!p25_crypto_audio_ready(state, slot)) {
         state->p25_p2_audio_allowed[slot] = 0;
     }
+}
+
+static dsd_call_crypto_state
+p25_crypto_canonical_classification(dsd_p25_crypto_state crypto_state) {
+    switch (crypto_state) {
+        case DSD_P25_CRYPTO_CLEAR: return DSD_CALL_CRYPTO_CLEAR;
+        case DSD_P25_CRYPTO_ENCRYPTED_PENDING: return DSD_CALL_CRYPTO_ENCRYPTED_PENDING;
+        case DSD_P25_CRYPTO_DECRYPTABLE: return DSD_CALL_CRYPTO_DECRYPTABLE;
+        case DSD_P25_CRYPTO_BLOCKED: return DSD_CALL_CRYPTO_ENCRYPTED;
+        default: return DSD_CALL_CRYPTO_UNKNOWN;
+    }
+}
+
+static int
+p25_crypto_phase1_protocol(const dsd_state* state) {
+    if (DSD_SYNC_IS_P25P1(state->synctype)) {
+        return state->synctype;
+    }
+    return DSD_SYNC_IS_P25P1(state->lastsynctype) ? state->lastsynctype : DSD_SYNC_P25P1_POS;
+}
+
+static int64_t
+p25_crypto_phase1_carrier_frequency(const dsd_state* state) {
+    const p25_sm_ctx_t* sm = p25_sm_get_ctx();
+    if (sm && sm->initialized && !sm->vc_is_tdma && sm->vc_freq_hz != 0) {
+        return sm->vc_freq_hz;
+    }
+    if (state->p25_vc_freq[0] != 0) {
+        return state->p25_vc_freq[0];
+    }
+    return state->trunk_vc_freq[0];
+}
+
+void
+p25_crypto_note_phase1_lockout_epoch(dsd_state* state, uint64_t call_epoch) {
+    if (!state) {
+        return;
+    }
+    DSD_MEMSET(&state->p25_p1_lockout_epoch, 0, sizeof(state->p25_p1_lockout_epoch));
+    if (call_epoch == 0U) {
+        return;
+    }
+    const p25_sm_ctx_t* sm = p25_sm_get_ctx();
+    state->p25_p1_lockout_epoch.call_epoch = call_epoch;
+    state->p25_p1_lockout_epoch.frequency_hz = p25_crypto_phase1_carrier_frequency(state);
+    state->p25_p1_lockout_epoch.recorded_m = dsd_time_now_monotonic_s();
+    state->p25_p1_lockout_epoch.grant_generation = sm ? sm->grant_count : 0U;
+    state->p25_p1_lockout_epoch.valid = 1U;
+}
+
+void
+p25_crypto_clear_phase1_lockout_epoch(dsd_state* state) {
+    if (state) {
+        DSD_MEMSET(&state->p25_p1_lockout_epoch, 0, sizeof(state->p25_p1_lockout_epoch));
+    }
+}
+
+// Whether the recorded lockout still describes the carrier we are on: same
+// assignment generation, same frequency, and a repeat seen recently enough.
+static int
+p25_crypto_phase1_lockout_context_current(const dsd_state* state, double now_m) {
+    const dsd_p25_p1_lockout_epoch_state* locked = &state->p25_p1_lockout_epoch;
+    const p25_sm_ctx_t* sm = p25_sm_get_ctx();
+    return locked->valid && locked->recorded_m > 0.0 && now_m >= locked->recorded_m
+           && (now_m - locked->recorded_m) <= P25_P1_LOCKOUT_ESS_REPEAT_WINDOW_S
+           && locked->grant_generation == (sm ? sm->grant_count : 0U)
+           && locked->frequency_hz == p25_crypto_phase1_carrier_frequency(state);
+}
+
+// Whether the canonical slot still holds the ended call the lockout recorded,
+// carrying the same key this ESS resolved.
+static int
+p25_crypto_phase1_lockout_call_matches(const dsd_state* state) {
+    dsd_call_snapshot call;
+    if (dsd_call_state_get(state, 0U, &call) <= 0 || call.phase != DSD_CALL_PHASE_ENDED
+        || !DSD_SYNC_IS_P25P1(call.protocol) || call.epoch != state->p25_p1_lockout_epoch.call_epoch) {
+        return 0;
+    }
+    return call.algid != 0U && (int)call.algid == state->payload_algid && (int)call.kid == state->payload_keyid;
+}
+
+static int
+p25_crypto_phase1_ess_continues_ended_call(dsd_state* state) {
+    // The encryption lockout ends the canonical call directly, without the
+    // TDU path that arms p25_p1_identity_pending. ESS repeats that follow on
+    // the same carrier (LDU2 every superframe until the release retunes)
+    // re-describe the transmission already recorded; beginning an
+    // identity-less epoch for them surfaces a phantom TGT 0 / SRC 0 event
+    // carrying the resolved ALG/KID when the channel releases.
+    if (state->p25_p1_identity_pending) {
+        return 0;
+    }
+    const double now_m = dsd_time_now_monotonic_s();
+    if (!p25_crypto_phase1_lockout_context_current(state, now_m) || !p25_crypto_phase1_lockout_call_matches(state)) {
+        return 0;
+    }
+    // Slide the window forward on every accepted repeat. Measuring from the
+    // lockout instant alone would expire mid-hangtime and let the next LDU2
+    // mint the phantom epoch anyway; measuring from the last accepted repeat
+    // keeps the suppression alive exactly as long as the carrier keeps
+    // re-describing the same ended call, and still lets a later transmission
+    // through once the ESS stops repeating for longer than the window.
+    state->p25_p1_lockout_epoch.recorded_m = now_m;
+    return 1;
+}
+
+static int
+p25_crypto_ensure_phase1_call(const dsd_opts* opts, dsd_state* state) {
+    dsd_call_snapshot call;
+    const int active = dsd_call_state_get(state, 0U, &call) > 0 && call.phase == DSD_CALL_PHASE_ACTIVE;
+    if (active && DSD_SYNC_IS_P25P1(call.protocol)
+        && (!state->p25_p1_identity_pending || state->p25_p1_identity_epoch_started)) {
+        return 0;
+    }
+    if (!p25_sm_phase1_crypto_epoch_allowed(opts)) {
+        return 0;
+    }
+    if (p25_crypto_phase1_ess_continues_ended_call(state)) {
+        return 0;
+    }
+
+    int64_t frequency_hz = state->p25_vc_freq[0];
+    if (frequency_hz == 0) {
+        frequency_hz = state->trunk_vc_freq[0];
+    }
+    dsd_call_observation observation = {
+        .protocol = p25_crypto_phase1_protocol(state),
+        .slot = 0U,
+        .kind = DSD_CALL_KIND_VOICE,
+        .frequency_hz = frequency_hz,
+    };
+    // On a tuned assignment whose ESS resolves before any LCW/voice evidence,
+    // the grant already names this call. Beginning identity-less here splits
+    // the call across two rows when the encryption lockout releases the
+    // channel before an LCW ever decodes: a TGT 0 row carrying the resolved
+    // ALG/KID plus the staged assignment row with pending crypto. The
+    // conventional identity-pending flow keeps the identity-less epoch -- the
+    // LCW that follows names that call, not the retained assignment.
+    int assignment_is_group = 0;
+    uint32_t assignment_target = 0U;
+    uint32_t assignment_policy_target = 0U;
+    if (!state->p25_p1_identity_pending
+        && p25_sm_phase1_assignment_identity(&assignment_is_group, &assignment_target, &assignment_policy_target)) {
+        observation.kind = assignment_is_group ? DSD_CALL_KIND_GROUP_VOICE : DSD_CALL_KIND_PRIVATE_VOICE;
+        observation.ota_target_id = assignment_target;
+        observation.policy_target_id = assignment_policy_target;
+    }
+    const int began = dsd_call_state_observe(state, &observation, DSD_CALL_BOUNDARY_BEGIN) > 0;
+    if (began && state->p25_p1_identity_pending) {
+        state->p25_p1_identity_epoch_started = 1;
+    }
+    return began;
+}
+
+static void
+p25_crypto_publish_canonical(const dsd_opts* opts, dsd_state* state, int slot) {
+    if (!state || !p25_crypto_slot_valid(slot)) {
+        return;
+    }
+    dsd_call_crypto_update update = {
+        .classification = p25_crypto_canonical_classification(state->p25_crypto_state[slot]),
+        .algid = (uint8_t)p25_crypto_slot_algid(state, slot),
+        .kid = (uint16_t)p25_crypto_slot_keyid(state, slot),
+        .mi = p25_crypto_slot_mi(state, slot),
+        .audio_permitted = (uint8_t)(p25_crypto_audio_permitted(opts, state, slot) ? 1 : 0),
+    };
+    (void)dsd_call_state_update_crypto(state, (uint8_t)slot, &update);
 }
 
 static void
@@ -164,7 +339,10 @@ p25_crypto_p1_clear_conflict(dsd_state* state) {
 
 static int
 p25_crypto_p1_has_explicit_clear_service(const dsd_state* state) {
-    return state && state->p25_service_options_valid[0] != 0 && (state->dmr_so & 0x40U) == 0;
+    dsd_call_snapshot call;
+    return state && dsd_call_state_get(state, 0U, &call) > 0 && call.phase == DSD_CALL_PHASE_ACTIVE
+           && DSD_SYNC_IS_P25P1(call.protocol) && call.has_service_metadata != 0U
+           && (call.service_options & 0x40U) == 0;
 }
 
 static int
@@ -197,6 +375,51 @@ p25_crypto_p1_reconcile_clear_conflict(dsd_state* state, int algid, int keyid) {
     return 1;
 }
 
+static void
+p25_crypto_p2_clear_conflict(dsd_state* state, int slot) {
+    if (state && p25_crypto_slot_valid(slot)) {
+        DSD_MEMSET(&state->p25_p2_crypto_conflict[slot], 0, sizeof(state->p25_p2_crypto_conflict[slot]));
+    }
+}
+
+static int
+p25_crypto_p2_has_explicit_clear_service(const dsd_state* state, int slot) {
+    dsd_call_snapshot call;
+    return state && dsd_call_state_get(state, (uint8_t)slot, &call) > 0 && call.phase == DSD_CALL_PHASE_ACTIVE
+           && DSD_SYNC_IS_P25P2(call.protocol) && call.has_service_metadata != 0U
+           && (call.service_options & 0x40U) == 0;
+}
+
+static int
+p25_crypto_p2_conflict_matches(const dsd_state* state, int slot, int algid, int keyid) {
+    return state && state->p25_p2_crypto_conflict[slot].active
+           && state->p25_p2_crypto_conflict[slot].algid == (uint8_t)algid
+           && state->p25_p2_crypto_conflict[slot].keyid == (uint16_t)keyid;
+}
+
+// Whether a Phase 2 tuple that would classify BLOCKED must wait for a repeat.
+// A single FEC-accepted ESS can still carry an undetected corruption, and a
+// blocked classification ends the call and releases the channel under
+// encryption lockout. When the call's own service context says clear, one
+// contradicting tuple is quarantined until another FEC-accepted ESS repeats
+// the same ALGID and KID (mirroring the Phase 1 clear-conflict rule).
+static int
+p25_crypto_p2_reconcile_clear_conflict(dsd_state* state, int slot, int algid, int keyid) {
+    if (p25_crypto_p2_conflict_matches(state, slot, algid, keyid)) {
+        // A matching second observation corroborates the tuple.
+        p25_crypto_p2_clear_conflict(state, slot);
+        return 0;
+    }
+    if (!p25_crypto_p2_has_explicit_clear_service(state, slot)) {
+        p25_crypto_p2_clear_conflict(state, slot);
+        return 0;
+    }
+    state->p25_p2_crypto_conflict[slot].active = 1U;
+    state->p25_p2_crypto_conflict[slot].algid = (uint8_t)algid;
+    state->p25_p2_crypto_conflict[slot].keyid = (uint16_t)keyid;
+    return 1;
+}
+
 static dsd_p25_crypto_state
 p25_crypto_resolve_algid_zero(dsd_state* state, int slot) {
     const dsd_p25_crypto_state current = state->p25_crypto_state[slot];
@@ -213,6 +436,53 @@ p25_crypto_classify_metadata(const dsd_state* state, dsd_p25_crypto_phase phase,
         return DSD_P25_CRYPTO_CLEAR;
     }
     return p25_crypto_has_complete_key(state, phase, slot, algid) ? DSD_P25_CRYPTO_DECRYPTABLE : DSD_P25_CRYPTO_BLOCKED;
+}
+
+// The ENC event is edge-triggered on the classification transition. A Phase 2
+// ESS repeats every superframe, and each FEC-accepted repeat of a BLOCKED slot
+// used to re-run the full lockout action (~3 Hz for the life of the
+// transmission): re-ending the canonical call, clearing the slot's burst hint,
+// and revisiting stay-or-release inside the companion conversation's talker
+// gaps. Under lockout the repeat carries no new information — MAC_END/MAC_IDLE
+// reset the slot's classification, so every transmission's first BLOCKED
+// resolve is a transition — but it is the liveness proof that the locked-out
+// call still occupies the slot, which the release-hold heuristics consume as a
+// suppression stamp. Hand repeats to that lightweight note instead; the
+// hangtime tick owns releasing an emptied channel once the stamps age out.
+// Phase 1 keeps per-repeat emission: its identity-pending lockout defers
+// inside the handler and relies on a later repeat to fire once the identity
+// resolves. Follow mode (and non-trunked runs) also keep it, because the
+// repeat re-publishes crypto metadata and refreshes the audio gate for calls
+// that stay tuned.
+//
+// The repeat identity is deliberately ALG/KID only, not the talkgroup: a
+// target change with no observed MAC boundary is swallowed as a repeat, but
+// the audio stays gated either way, and the next MAC_END/MAC_IDLE resets the
+// classification so the new target's transition fires then. This layer also
+// cannot see whether the trunk SM is actually tuned; when trunking is enabled
+// but the SM is not on a voice channel, repeats used to take the handler's
+// precheck path and re-publish crypto metadata each superframe. Swallowing
+// them there too is accepted: the transition still publishes once per
+// transmission and dsd_event_sync_slot() runs per timeslot regardless.
+static int
+p25_crypto_p2_lockout_repeat(const dsd_opts* opts, dsd_p25_crypto_phase phase, const p25_crypto_snapshot* previous,
+                             dsd_p25_crypto_state resolved, int key_identity_changed) {
+    if (phase != DSD_P25_CRYPTO_PHASE2 || resolved != DSD_P25_CRYPTO_BLOCKED
+        || previous->state != DSD_P25_CRYPTO_BLOCKED || key_identity_changed) {
+        return 0;
+    }
+    return opts->trunk_tune_enc_calls == 0 && opts->trunk_enable == 1;
+}
+
+static void
+p25_crypto_emit_enc_or_note(dsd_opts* opts, dsd_state* state, dsd_p25_crypto_phase phase, int slot, int algid,
+                            int keyid, int talkgroup, const p25_crypto_snapshot* previous,
+                            dsd_p25_crypto_state resolved, int key_identity_changed) {
+    if (p25_crypto_p2_lockout_repeat(opts, phase, previous, resolved, key_identity_changed)) {
+        p25_sm_note_enc_suppressed(opts, state, slot);
+        return;
+    }
+    p25_sm_emit_enc(opts, state, slot, algid, keyid, talkgroup);
 }
 
 static void
@@ -234,10 +504,18 @@ p25_crypto_apply_resolution(dsd_opts* opts, dsd_state* state, dsd_p25_crypto_pha
     if (reset_stream) {
         p25_crypto_reset_stream_state(state, phase, slot);
     }
+    const int began_phase1_call = phase == DSD_P25_CRYPTO_PHASE1 ? p25_crypto_ensure_phase1_call(opts, state) : 0;
     p25_crypto_set_state(state, slot, resolved);
+    p25_crypto_publish_canonical(opts, state, slot);
+    if (began_phase1_call && opts) {
+        dsd_p25_sm_logf(opts, "event=canonical_epoch_begin path=p1-crypto slot=%d algid=0x%02X keyid=0x%04X", slot,
+                        algid, keyid);
+        dsd_event_sync_slot(opts, state, (uint8_t)slot);
+    }
 
     if ((resolved == DSD_P25_CRYPTO_DECRYPTABLE || resolved == DSD_P25_CRYPTO_BLOCKED) && opts) {
-        p25_sm_emit_enc(opts, state, slot, algid, keyid, talkgroup);
+        p25_crypto_emit_enc_or_note(opts, state, phase, slot, algid, keyid, talkgroup, previous, resolved,
+                                    key_identity_changed);
     }
 }
 
@@ -251,12 +529,13 @@ p25_crypto_begin_voice_call(dsd_state* state, dsd_p25_crypto_phase phase, int sl
     p25_crypto_p1_clear_conflict(state);
     if (phase == DSD_P25_CRYPTO_PHASE1) {
         slot = 0;
+        p25_crypto_clear_phase1_lockout_epoch(state);
         state->p25_p1_hdu_crypto_fresh = 0;
         state->dmr_so = svc_bits >= 0 ? (unsigned int)svc_bits : 0U;
-        state->p25_service_options_valid[0] = svc_bits >= 0 ? 1U : 0U;
     }
 
     DSD_MEMSET(&state->p25_p2_rekey[slot], 0, sizeof(state->p25_p2_rekey[slot]));
+    p25_crypto_p2_clear_conflict(state, slot);
     dsd_mbe_purge_slot_audio(state, slot);
     p25_crypto_store_metadata(state, slot, 0, 0, 0ULL);
     p25_crypto_reset_stream_state(state, phase, slot);
@@ -264,6 +543,7 @@ p25_crypto_begin_voice_call(dsd_state* state, dsd_p25_crypto_phase phase, int sl
     const int service_options_clear = svc_bits >= 0 && (svc_bits & 0x40) == 0;
     p25_crypto_set_state(
         state, slot, (force_clear || service_options_clear) ? DSD_P25_CRYPTO_CLEAR : DSD_P25_CRYPTO_ENCRYPTED_PENDING);
+    p25_crypto_publish_canonical(NULL, state, slot);
     state->p25_p2_audio_allowed[slot] = 0;
 }
 
@@ -283,6 +563,7 @@ p25_crypto_mark_encrypted_pending(dsd_state* state, int slot) {
     }
 
     p25_crypto_set_state(state, slot, DSD_P25_CRYPTO_ENCRYPTED_PENDING);
+    p25_crypto_publish_canonical(NULL, state, slot);
     dsd_mbe_purge_slot_audio(state, slot);
 }
 
@@ -294,8 +575,35 @@ p25_crypto_p1_defer_clear_conflict(dsd_state* state, int svc_bits) {
 
     p25_crypto_p1_arm_conflict(state, state->payload_algid, state->payload_keyid);
     p25_crypto_set_state(state, 0, DSD_P25_CRYPTO_ENCRYPTED_PENDING);
+    p25_crypto_publish_canonical(NULL, state, 0);
     dsd_mbe_purge_slot_audio(state, 0);
     return 1;
+}
+
+static dsd_p25_crypto_state
+p25_crypto_p2_apply_blocked_quarantine(dsd_state* state, int slot, int algid, int keyid, dsd_p25_crypto_state resolved,
+                                       int* deferred) {
+    if (resolved == DSD_P25_CRYPTO_BLOCKED) {
+        if (p25_crypto_p2_reconcile_clear_conflict(state, slot, algid, keyid)) {
+            *deferred = 1;
+            return DSD_P25_CRYPTO_ENCRYPTED_PENDING;
+        }
+        return resolved;
+    }
+    p25_crypto_p2_clear_conflict(state, slot);
+    return resolved;
+}
+
+static void
+p25_crypto_emit_deferred_pending(dsd_opts* opts, dsd_state* state, int slot, const p25_crypto_snapshot* previous) {
+    if (!opts) {
+        return;
+    }
+    if (previous->state == DSD_P25_CRYPTO_ENCRYPTED_PENDING) {
+        p25_sm_emit_crypto_pending(opts, state, slot);
+    } else {
+        p25_sm_emit_crypto_pending_epoch(opts, state, slot);
+    }
 }
 
 dsd_p25_crypto_state
@@ -323,34 +631,38 @@ p25_crypto_resolve(dsd_opts* opts, dsd_state* state, dsd_p25_crypto_phase phase,
     const p25_crypto_snapshot previous = p25_crypto_capture_snapshot(state, slot);
     p25_crypto_store_metadata(state, slot, algid, keyid, mi);
 
-    int defer_clear_conflict = 0;
+    int deferred = 0;
     if (phase == DSD_P25_CRYPTO_PHASE1) {
-        defer_clear_conflict = p25_crypto_p1_reconcile_clear_conflict(state, algid, keyid);
+        deferred = p25_crypto_p1_reconcile_clear_conflict(state, algid, keyid);
     }
 
-    if (!defer_clear_conflict && algid != 0x80 && state->keyloader == 1) {
+    if (!deferred && algid != 0x80 && state->keyloader == 1) {
         keyring_activate_slot(opts, state, slot);
     }
 
-    const dsd_p25_crypto_state resolved = defer_clear_conflict
-                                              ? DSD_P25_CRYPTO_ENCRYPTED_PENDING
-                                              : p25_crypto_classify_metadata(state, phase, slot, algid);
+    dsd_p25_crypto_state resolved =
+        deferred ? DSD_P25_CRYPTO_ENCRYPTED_PENDING : p25_crypto_classify_metadata(state, phase, slot, algid);
+    if (phase == DSD_P25_CRYPTO_PHASE2) {
+        resolved = p25_crypto_p2_apply_blocked_quarantine(state, slot, algid, keyid, resolved, &deferred);
+    }
     p25_crypto_apply_resolution(opts, state, phase, slot, algid, keyid, mi, talkgroup, &previous, resolved);
-    if (defer_clear_conflict && opts) {
-        if (previous.state == DSD_P25_CRYPTO_ENCRYPTED_PENDING) {
-            p25_sm_emit_crypto_pending(opts, state, slot);
-        } else {
-            p25_sm_emit_crypto_pending_epoch(opts, state, slot);
-        }
+    if (deferred) {
+        p25_crypto_emit_deferred_pending(opts, state, slot, &previous);
     }
     return resolved;
 }
 
 void
-p25_crypto_block_pending(dsd_state* state, int slot) {
+p25_crypto_expire_pending(dsd_state* state, int slot) {
     if (!state || !p25_crypto_slot_valid(slot) || state->p25_crypto_state[slot] != DSD_P25_CRYPTO_ENCRYPTED_PENDING) {
         return;
     }
-    p25_crypto_set_state(state, slot, DSD_P25_CRYPTO_BLOCKED);
+    // No FEC-accepted ESS arrived inside the classification window. That is
+    // absence of evidence, not an encryption verdict: publishing BLOCKED here
+    // surfaced clear calls in signal fades as "Encrypted" and primed the
+    // downstream lockout paths with a classification nothing ever observed.
+    p25_crypto_p2_clear_conflict(state, slot);
+    p25_crypto_set_state(state, slot, DSD_P25_CRYPTO_UNKNOWN);
+    p25_crypto_publish_canonical(NULL, state, slot);
     dsd_mbe_purge_slot_audio(state, slot);
 }

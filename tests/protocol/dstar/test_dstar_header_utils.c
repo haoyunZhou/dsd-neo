@@ -4,6 +4,7 @@
  */
 
 #include <assert.h>
+#include <dsd-neo/core/call_state.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/state.h>
 #include <dsd-neo/protocol/dstar/dstar.h>
@@ -29,8 +30,16 @@ gmsk_soft_symbol_to_viterbi_cost(float symbol, const dsd_state* state) {
 }
 
 static void pack_slow_data_bytes(const uint8_t bytes[60], uint8_t bits[480]);
-static void build_encoded_header_fixture(float soft_rx[DSD_DSTAR_HEADER_CODED_BITS]);
+static void build_encoded_header_fixture(float soft_rx[DSD_DSTAR_HEADER_CODED_BITS], uint8_t flags);
 static void set_compacted_slow_data_bytes(uint8_t bytes[60], const uint8_t compact[51]);
+
+static dsd_call_snapshot
+get_dstar_call(const dsd_state* state) {
+    dsd_call_snapshot call;
+    DSD_MEMSET(&call, 0, sizeof(call));
+    assert(dsd_call_state_get(state, 0U, &call) == 1);
+    return call;
+}
 
 static void
 convolution_encode(const int* bits, size_t bit_count, int* symbols) {
@@ -92,7 +101,7 @@ test_soft_decode_pipeline(void) {
 }
 
 static void
-build_encoded_header_fixture(float soft_rx[DSD_DSTAR_HEADER_CODED_BITS]) {
+build_encoded_header_fixture_ex(float soft_rx[DSD_DSTAR_HEADER_CODED_BITS], uint8_t flags, int corrupt_crc) {
     uint8_t header[41];
     int info_bits[DSD_DSTAR_HEADER_INFO_BITS];
     int coded[DSD_DSTAR_HEADER_CODED_BITS];
@@ -101,11 +110,14 @@ build_encoded_header_fixture(float soft_rx[DSD_DSTAR_HEADER_CODED_BITS]) {
     uint16_t soft_scrambled[DSD_DSTAR_HEADER_CODED_BITS];
 
     DSD_MEMSET(header, 0, sizeof header);
-    header[0] = 0xF8U;
+    header[0] = flags;
     DSD_MEMCPY(header + 3, "RPT2TST ", 8);
     DSD_MEMCPY(header + 11, "RPT1TST ", 8);
     DSD_MEMCPY(header + 19, "CQCQCQ  ", 8);
     DSD_MEMCPY(header + 27, "N0CALL  /TST", 12);
+    const uint16_t crc = (uint16_t)(dstar_crc16(header, 39U) ^ (corrupt_crc ? 0xFFFFU : 0x0000U));
+    header[39] = (uint8_t)(crc >> 8U);
+    header[40] = (uint8_t)crc;
 
     DSD_MEMSET(info_bits, 0, sizeof info_bits);
     for (int byte_idx = 0; byte_idx < 41; byte_idx++) {
@@ -127,6 +139,11 @@ build_encoded_header_fixture(float soft_rx[DSD_DSTAR_HEADER_CODED_BITS]) {
 }
 
 static void
+build_encoded_header_fixture(float soft_rx[DSD_DSTAR_HEADER_CODED_BITS], uint8_t flags) {
+    build_encoded_header_fixture_ex(soft_rx, flags, 0);
+}
+
+static void
 test_soft_header_decode_extracts_callsigns(void) {
     static dsd_state state;
     float soft_rx[DSD_DSTAR_HEADER_CODED_BITS];
@@ -135,14 +152,59 @@ test_soft_header_decode_extracts_callsigns(void) {
     state.min = -1.0F;
     state.center = 0.0F;
     state.max = 1.0F;
-    build_encoded_header_fixture(soft_rx);
+    build_encoded_header_fixture(soft_rx, 0x78U);
 
-    dstar_header_decode_soft(&state, soft_rx);
+    assert(dstar_header_decode_soft(&state, soft_rx) == 1);
 
-    assert(strcmp(state.dstar_rpt2, "RPT2TST ") == 0);
-    assert(strcmp(state.dstar_rpt1, "RPT1TST ") == 0);
-    assert(strcmp(state.dstar_dst, "CQCQCQ  ") == 0);
-    assert(strcmp(state.dstar_src, "N0CALL  /TST") == 0);
+    const dsd_call_snapshot call = get_dstar_call(&state);
+    assert(call.kind == DSD_CALL_KIND_VOICE);
+    assert(strcmp(call.route_text[1], "RPT2TST") == 0);
+    assert(strcmp(call.route_text[0], "RPT1TST") == 0);
+    assert(strcmp(call.target_text, "CQCQCQ") == 0);
+    assert(strcmp(call.source_text, "N0CALL /TST") == 0);
+}
+
+static void
+test_soft_data_header_preserves_callsigns(void) {
+    static dsd_state state;
+    float soft_rx[DSD_DSTAR_HEADER_CODED_BITS];
+
+    DSD_MEMSET(&state, 0, sizeof state);
+    state.min = -1.0F;
+    state.center = 0.0F;
+    state.max = 1.0F;
+    build_encoded_header_fixture(soft_rx, 0x80U);
+
+    assert(dstar_header_decode_soft(&state, soft_rx) == 1);
+
+    const dsd_call_snapshot call = get_dstar_call(&state);
+    assert(call.kind == DSD_CALL_KIND_DATA);
+    assert(strcmp(call.route_text[1], "RPT2TST") == 0);
+    assert(strcmp(call.route_text[0], "RPT1TST") == 0);
+    assert(strcmp(call.target_text, "CQCQCQ") == 0);
+    assert(strcmp(call.source_text, "N0CALL /TST") == 0);
+}
+
+/* #391: the header CRC-16/X.25 is the D-STAR data path's only real check, and the SPS hunt
+ * now spends it. Corrupt one soft bit's worth of the CRC field and the decode must say so
+ * rather than publishing the callsigns it recovered anyway. */
+static void
+test_soft_header_decode_reports_a_failed_crc(void) {
+    static dsd_state state;
+    float soft_rx[DSD_DSTAR_HEADER_CODED_BITS];
+
+    DSD_MEMSET(&state, 0, sizeof state);
+    state.min = -1.0F;
+    state.center = 0.0F;
+    state.max = 1.0F;
+    build_encoded_header_fixture_ex(soft_rx, 0x78U, 1);
+
+    assert(dstar_header_decode_soft(&state, soft_rx) == 0);
+
+    /* Nothing was published either: a header whose CRC failed is not a call observation. */
+    dsd_call_snapshot call;
+    DSD_MEMSET(&call, 0, sizeof(call));
+    assert(dsd_call_state_get(&state, 0U, &call) != 1);
 }
 
 static void
@@ -180,10 +242,11 @@ test_slow_data_header_accepts_wire_crc_order(void) {
     pack_slow_data_bytes(bytes, bits);
     processDSTAR_SD(&opts, &state, bits);
 
-    assert(strcmp(state.dstar_rpt2, "RPT2TST ") == 0);
-    assert(strcmp(state.dstar_rpt1, "RPT1TST ") == 0);
-    assert(strcmp(state.dstar_dst, "CQCQCQ  ") == 0);
-    assert(strcmp(state.dstar_src, "N0CALL  /TST") == 0);
+    const dsd_call_snapshot call = get_dstar_call(&state);
+    assert(strcmp(call.route_text[1], "RPT2TST") == 0);
+    assert(strcmp(call.route_text[0], "RPT1TST") == 0);
+    assert(strcmp(call.target_text, "CQCQCQ") == 0);
+    assert(strcmp(call.source_text, "N0CALL /TST") == 0);
 }
 
 static void
@@ -306,6 +369,8 @@ int
 main(void) {
     test_soft_decode_pipeline();
     test_soft_header_decode_extracts_callsigns();
+    test_soft_data_header_preserves_callsigns();
+    test_soft_header_decode_reports_a_failed_crc();
     test_crc16();
     test_slow_data_header_accepts_wire_crc_order();
     test_slow_data_text_keeps_byte_after_marker();

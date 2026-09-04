@@ -218,6 +218,35 @@ int rtl_stream_get_symbol_profile_full(int* out_symbol_rate_hz, int* out_levels,
  */
 int rtl_stream_set_symbol_profile(int symbol_rate_hz, int levels, int channel_profile);
 
+/**
+ * @brief Queue a demod profile change for the demod thread to apply.
+ *
+ * Unlike calling rtl_stream_toggle_cqpsk()/rtl_stream_set_symbol_profile()
+ * directly, this is safe while the demod thread is running: parameters are
+ * validated and queued, and the demod thread applies them between blocks
+ * (a newer request overwrites an unconsumed older one). Application is
+ * therefore deferred by up to one demod block; a rejected symbol profile is
+ * logged by the demod thread rather than returned to the caller. When the
+ * stream pipeline is not running there is no thread to race with, so the
+ * request is applied immediately.
+ *
+ * @param cqpsk_enable 1/0 to switch the demod family, -1 to leave unchanged.
+ * @param symbol_rate_hz Symbol rate in Hz (e.g. 4800, 6000, 2400); <=0 leaves
+ *                       the symbol profile (rate/levels/channel) unchanged.
+ * @param levels Number of FSK levels (2 or 4); ignored when symbol_rate_hz<=0.
+ * @param channel_profile rtl_stream_channel_profile profile id; ignored when
+ *                        symbol_rate_hz<=0.
+ * @param ted_sps Timing SPS: >0 clears the override then applies the value,
+ *                0 clears the override only, <0 leaves timing untouched.
+ * @param ted_sps_is_override When ted_sps>0: nonzero applies it as a sticky
+ *                            override (rtl_stream_set_ted_sps), zero applies
+ *                            it without override so later rate changes may
+ *                            recalculate SPS.
+ * @return 0 on success, negative on invalid input.
+ */
+int rtl_stream_request_demod_profile(int cqpsk_enable, int symbol_rate_hz, int levels, int channel_profile, int ted_sps,
+                                     int ted_sps_is_override);
+
 typedef struct rtl_stream_retune_gain_profile {
     int tuner_gain_is_set;
     int tuner_gain_tenth_db;
@@ -666,6 +695,47 @@ int rtl_stream_spectrum_get(float* out_db, int max_bins, int* out_rate);
 int rtl_stream_spectrum_set_size(int n);
 /** @brief Get current spectrum FFT size. */
 int rtl_stream_spectrum_get_size(void);
+
+/**
+ * @brief Get a snapshot of the wideband power spectrum across the capture span.
+ *
+ * Unlike rtl_stream_spectrum_get(), which reports the narrow post-decimation
+ * span used for tuner diagnostics, this covers the full SDR capture bandwidth
+ * (typically ~1.536 MHz) so a UI can draw a panorama around the tuned
+ * frequency. Bins are DC-centered: out_db[0] ~ center - span/2, the middle bin
+ * ~ center, and the last ~ center + span/2. Values are smoothed and
+ * approximately in dBFS.
+ *
+ * Production is off by default and costs nothing until
+ * rtl_stream_wideband_spectrum_set_enabled(1) is called. The center, span and
+ * serial number are published atomically with the bins, so the axis always
+ * matches the data.
+ *
+ * Every frame is exactly DSD_WIDEBAND_SPECTRUM_BINS wide. A buffer shorter than
+ * that is refused rather than filled with a prefix, which would be the low end
+ * of the span carrying a label for the whole of it.
+ *
+ * @param out_db Destination buffer, at least DSD_WIDEBAND_SPECTRUM_BINS floats
+ *               (from <dsd-neo/core/wideband_spectrum.h>). Must not be NULL.
+ * @param max_bins Capacity of @p out_db in floats.
+ * @param out_center_freq_hz Optional pointer to receive the tuned center in Hz.
+ * @param out_span_hz Optional pointer to receive the covered span in Hz.
+ * @param out_frame_serial Optional pointer to receive the frame's serial number.
+ *                         It changes only when the producer publishes a new
+ *                         frame, so a consumer polling on its own clock can tell
+ *                         a fresh frame from a re-read of the last one.
+ * @return Number of bins written; 0 when disabled, not yet published,
+ *         invalidated by a retune, or when @p out_db is too small. On 0 the
+ *         buffer is left exactly as the caller passed it, so a consumer that
+ *         holds its last frame across a gap is holding the frame it drew.
+ */
+int rtl_stream_wideband_spectrum_get(float* out_db, int max_bins, uint32_t* out_center_freq_hz, uint32_t* out_span_hz,
+                                     uint32_t* out_frame_serial);
+
+/** @brief Enable or disable wideband spectrum production (off = zero DSP cost). */
+void rtl_stream_wideband_spectrum_set_enabled(int on);
+/** @brief Return 1 when wideband spectrum production is enabled. */
+int rtl_stream_wideband_spectrum_enabled(void);
 
 /* Carrier/Costas diagnostics and control */
 /** Return current NCO frequency used for carrier rotation (Costas/FLL), in Hz. */

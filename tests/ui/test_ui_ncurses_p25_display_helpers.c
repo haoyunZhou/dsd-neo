@@ -10,6 +10,7 @@
 #include <curses.h>
 #include <dsd-neo/core/safe_api.h>
 #include <dsd-neo/core/state.h>
+#include <dsd-neo/core/state_ext.h>
 #include <dsd-neo/core/synctype_ids.h>
 #include <dsd-neo/platform/timing.h>
 #include <dsd-neo/protocol/p25/p25_cc_candidates.h>
@@ -22,8 +23,10 @@
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include "dsd-neo/core/call_state.h"
 #include "dsd-neo/platform/platform.h"
 
 int ncurses_last_synctype;
@@ -34,6 +37,7 @@ static char g_printw_capture[4096];
 static size_t g_printw_capture_len;
 static int g_test_rows = 24;
 static int g_test_cols = 80;
+static uint64_t g_monotonic_ns;
 
 static void
 reset_printw_capture(void) {
@@ -103,6 +107,11 @@ assert_capture_lines_fit(int max_cols) {
 
 uint64_t
 dsd_time_monotonic_ns(void) { // NOLINT(misc-use-internal-linkage)
+    return g_monotonic_ns;
+}
+
+uint64_t
+dsd_time_monotonic_ms(void) { // NOLINT(misc-use-internal-linkage)
     return 0;
 }
 
@@ -131,6 +140,18 @@ p25_iden_vu_bandwidth_hz(uint8_t bw_vu) { // NOLINT(misc-use-internal-linkage)
         return 12500;
     }
     return 0;
+}
+
+/* The key form only: the real helper (P25_FREQUENCY tests) adds the TDMA
+ * FDMA/slot tail, which needs an IDEN table this test does not build. */
+void
+p25_format_chan_suffix(const dsd_state* state, uint16_t chan, int slot_hint, char* out,
+                       size_t outsz) { // NOLINT(misc-use-internal-linkage)
+    (void)state;
+    (void)slot_hint;
+    if (out && outsz > 0) {
+        DSD_SNPRINTF(out, outsz, " (%d-%d)", (chan >> 12) & 0xF, chan & 0xFFF);
+    }
 }
 
 size_t
@@ -345,14 +366,48 @@ run_active_vc_cases(void) {
 
     state.trunk_vc_freq[0] = 0;
     state.p25_vc_freq[0] = 0;
-    DSD_SNPRINTF(state.active_channel[2], sizeof(state.active_channel[2]), "TG 123 Ch: 123A slot 1");
-    state.trunk_chan_map[0x123A] = 853012500L;
+    dsd_call_observation recent = {
+        .protocol = DSD_SYNC_P25P2_POS,
+        .slot = 0U,
+        .kind = DSD_CALL_KIND_GROUP_VOICE,
+        .ota_target_id = 123U,
+        .channel = 0x123AU,
+        .frequency_hz = 853012500L,
+    };
+    g_monotonic_ns = UINT64_C(10000000000);
+    const uint64_t now_ms = dsd_time_monotonic_ns() / UINT64_C(1000000);
+    assert(dsd_recent_activity_publish(&state, 2U, &recent, "TG 123 Ch: 123A slot 1", now_ms) == 1);
     assert(ui_guess_active_vc_freq(&state) == 853012500L);
+    assert(dsd_recent_activity_publish(&state, 2U, &recent, "TG 123 Ch: 123A slot 1",
+                                       now_ms - DSD_RECENT_ACTIVITY_TTL_MS - 1U)
+           == 1);
+    assert(ui_guess_active_vc_freq(&state) == 0);
+    dsd_state_ext_free_all(&state);
+    g_monotonic_ns = 0U;
 
-    DSD_MEMSET(&state, 0, sizeof(state));
-    DSD_SNPRINTF(state.active_channel[0], sizeof(state.active_channel[0]), "TG 456 Ch: 1234");
-    state.trunk_chan_map[1234] = 854012500L;
-    assert(ui_guess_active_vc_freq(&state) == 854012500L);
+    dsd_state* canonical = (dsd_state*)calloc(1U, sizeof(*canonical));
+    assert(canonical != NULL);
+    canonical->synctype = DSD_SYNC_P25P2_POS;
+    canonical->p25_vc_freq[0] = 855012500L;
+    canonical->trunk_chan_map[1234] = 856012500L;
+    dsd_call_observation observation = {0};
+    observation.protocol = DSD_SYNC_P25P2_POS;
+    observation.slot = 0U;
+    observation.kind = DSD_CALL_KIND_GROUP_VOICE;
+    observation.ota_target_id = 1U;
+    observation.frequency_hz = 857012500L;
+    observation.observed_m = 1.0;
+    assert(dsd_call_state_observe(canonical, &observation, DSD_CALL_BOUNDARY_BEGIN) == 1);
+    assert(ui_guess_active_vc_freq(canonical) == 857012500L);
+    assert(dsd_call_state_end(canonical, 0U, 2.0) == 1);
+    assert(ui_guess_active_vc_freq(canonical) == 855012500L);
+    canonical->trunk_vc_freq[0] = 858012500L;
+    assert(ui_guess_active_vc_freq(canonical) == 858012500L);
+    observation.observed_m = 3.0;
+    assert(dsd_call_state_observe(canonical, &observation, DSD_CALL_BOUNDARY_BEGIN) == 1);
+    assert(ui_guess_active_vc_freq(canonical) == 857012500L);
+    dsd_state_ext_free_all(canonical);
+    free(canonical);
 
     return 0;
 }
@@ -453,7 +508,8 @@ run_neighbor_helper_cases(void) {
     state.p25_secondary_cc_entries[0].ssc = 0xA0;
     state.p25_secondary_cc_entries[0].last_seen = 180;
     assert(ui_format_secondary_cc_line(&state, 0, (time_t)200, line, sizeof(line)) > 0);
-    assert(strstr(line, "853.012500 MHz [C] CH:1234 R:004 S:005 SSC:A0 age:20s") != NULL);
+    // #403: the channel key (<iden>-<chan>) rides beside the raw hex.
+    assert(strstr(line, "853.012500 MHz [C] CH:1234 (1-564) R:004 S:005 SSC:A0 age:20s") != NULL);
 
     return 0;
 }
@@ -494,6 +550,39 @@ run_trunk_sm_helper_cases(void) {
     char full[4] = "ABC";
     assert(ui_append_sm_path_symbol(full, sizeof(full), 1, 'Z') == 1);
     assert(strcmp(full, "ABC") == 0);
+
+    // An empty buffer with room for the three-byte arrow and the symbol but not
+    // for the terminator: the append has to be refused. The guard used to count
+    // only the four payload bytes and then wrote a fifth, one past the end - a
+    // stack overflow the 64-byte production buffer escapes only because the tag
+    // count is capped. The canary catches the write; ASan would not, the buffer
+    // being a member rather than a whole object.
+    struct {
+        char buf[4];
+        char canary[4];
+    } tight;
+
+    DSD_MEMSET(&tight, 0, sizeof(tight));
+    DSD_MEMSET(tight.canary, '#', sizeof(tight.canary));
+    assert(ui_append_sm_path_symbol(tight.buf, sizeof(tight.buf), 1, 'Z') == 1);
+    assert(tight.buf[0] == '\0');
+    for (size_t i = 0; i < sizeof(tight.canary); i++) {
+        assert(tight.canary[i] == '#');
+    }
+
+    // One more byte is all it takes, and then the append goes through.
+    struct {
+        char buf[5];
+        char canary[4];
+    } room;
+
+    DSD_MEMSET(&room, 0, sizeof(room));
+    DSD_MEMSET(room.canary, '#', sizeof(room.canary));
+    assert(ui_append_sm_path_symbol(room.buf, sizeof(room.buf), 1, 'Z') == 2);
+    assert(strcmp(room.buf, "\xE2\x86\x92Z") == 0);
+    for (size_t i = 0; i < sizeof(room.canary); i++) {
+        assert(room.canary[i] == '#');
+    }
 
     return 0;
 }
@@ -579,11 +668,19 @@ run_p25_frequency_display_cases(void) {
 
     DSD_MEMSET(&state, 0, sizeof(state));
     state.p25_cc_freq = 853012500L;
-    DSD_SNPRINTF(state.active_channel[3], sizeof(state.active_channel[3]), "Active Group Ch: 123A TG: 100;");
-    state.trunk_chan_map[0x123A] = 854012500L;
+    dsd_call_observation observation = {
+        .protocol = DSD_SYNC_P25P2_POS,
+        .slot = 0U,
+        .kind = DSD_CALL_KIND_GROUP_VOICE,
+        .ota_target_id = 100U,
+        .channel = 0x123AU,
+        .frequency_hz = 854012500L,
+    };
+    assert(dsd_call_state_observe(&state, &observation, DSD_CALL_BOUNDARY_BEGIN) == 1);
     reset_printw_capture();
     assert(ui_print_p25_cc_vc_metric(&state) == 1);
     assert_capture_contains("| CC/VC: CC:853.012500 MHz VC:854.012500 MHz");
+    dsd_state_ext_free_all(&state);
 
     DSD_MEMSET(&state, 0, sizeof(state));
     reset_printw_capture();
@@ -669,6 +766,79 @@ run_p2_gate_helper_cases(void) {
     return 0;
 }
 
+/*
+ * These four rows report counters that the decode path has always maintained but
+ * that nothing rendered. Each is gated on its own family being non-zero, so the
+ * zero case -- a clean signal, or a run that never decoded P25 -- must stay
+ * silent rather than print a row of zeros.
+ */
+static int
+run_soft_fec_and_nid_display_cases(void) {
+    static dsd_state state;
+    DSD_MEMSET(&state, 0, sizeof(state));
+
+    /* Nothing decoded yet: every new row stays silent. */
+    reset_printw_capture();
+    assert(ui_print_p1_soft_fec_metric(&state, 1) == 0);
+    assert(ui_print_p1_nid_metric(&state, 1) == 0);
+    assert(ui_print_p1_voice_frame_metric(&state, 1) == 0);
+    assert(ui_print_p1_tail_erasure_metric(&state, 1) == 0);
+    assert(ui_print_p2_soft_fec_metric(&state) == 0);
+    assert(g_printw_capture[0] == '\0');
+
+    state.p25_p1_soft_hamming_ok = 3U;
+    state.p25_p1_soft_golay_ok = 5U;
+    state.p25_p1_soft_rs_ok = 7U;
+    state.p25_p1_soft_combined_ok = 9U;
+    reset_printw_capture();
+    assert(ui_print_p1_soft_fec_metric(&state, 1) == 1);
+    assert_capture_contains("| P1 Soft FEC: Ham 3 Golay 5 RS 7 Comb 9");
+    assert_capture_lines_fit(g_test_cols);
+
+    /* Not P25 Phase 1 right now: the row belongs to the P1 section only. */
+    reset_printw_capture();
+    assert(ui_print_p1_soft_fec_metric(&state, 0) == 0);
+    assert(g_printw_capture[0] == '\0');
+
+    state.nid_corrections_total = 11U;
+    state.nid_failures_total = 2U;
+    state.nid_parity_overrides = 1U;
+    reset_printw_capture();
+    assert(ui_print_p1_nid_metric(&state, 1) == 1);
+    assert_capture_contains("| P1 NID: corr 11 fail 2 parity 1");
+    assert_capture_lines_fit(g_test_cols);
+
+    state.p25_p1_accepted_frames = 4000U;
+    state.p25_p1_clean_frames = 3800U;
+    state.p25_p1_corrected_frames = 150U;
+    state.p25_p1_concealed_frames = 50U;
+    state.p25_p1_accepted_corrections = 900U;
+    reset_printw_capture();
+    assert(ui_print_p1_voice_frame_metric(&state, 1) == 1);
+    assert_capture_contains("| P1 Frames (session): acc 4000 (cln 3800 cor 150 cnc 50) fix 900");
+    assert_capture_lines_fit(g_test_cols);
+
+    /* Tail suppression is rare, so it earns a row only once it has fired. */
+    reset_printw_capture();
+    assert(ui_print_p1_tail_erasure_metric(&state, 1) == 0);
+    state.p25_p1_suppressed_tail_frames = 6U;
+    state.p25_p1_excluded_tail_corrections = 72U;
+    reset_printw_capture();
+    assert(ui_print_p1_tail_erasure_metric(&state, 1) == 1);
+    assert_capture_contains("| P1 Tail (session): supp 6 excl 72");
+    assert_capture_lines_fit(g_test_cols);
+
+    state.p25_p2_soft_erasure_ok = 12U;
+    state.p25_p2_soft_ess_ok = 4U;
+    state.p25_p2_soft_ess_max_depth = 5U;
+    reset_printw_capture();
+    assert(ui_print_p2_soft_fec_metric(&state) == 1);
+    assert_capture_contains("| P2 Soft FEC: erasure 12 ESS 4 (max depth 5)");
+    assert_capture_lines_fit(g_test_cols);
+
+    return 0;
+}
+
 int
 main(void) {
     run_iden_match_cases();
@@ -681,6 +851,7 @@ main(void) {
     run_p25_frequency_display_cases();
     run_service_metric_display_cases();
     run_p2_gate_helper_cases();
+    run_soft_fec_and_nid_display_cases();
     printf("UI_NCURSES_P25_DISPLAY_HELPERS: OK\n");
     return 0;
 }

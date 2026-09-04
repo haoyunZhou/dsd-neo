@@ -4,6 +4,7 @@ target_sources(
     dsd-neo_proto_dmr
     PRIVATE
         dmr_34_viterbi.c
+        dmr_ars.c
         dmr_block.c
         dmr_block_crypto.c
         dmr_bs.c
@@ -15,11 +16,14 @@ target_sources(
         dmr_trunk_sm.c
         dmr_data.c
         dmr_dburst.c
+        dmr_enc_class.c
         dmr_flco.c
         dmr_hytera.c
         dmr_le.c
         dmr_ms.c
         dmr_pdu.c
+        dmr_rc.c
+        dmr_rc_notify.c
         dmr_text.c
         dmr_pi.c
         dmr_utils.c

@@ -7,155 +7,21 @@
 #include <dsd-neo/core/state.h>
 #include <dsd-neo/core/sync_patterns.h>
 #include <dsd-neo/core/synctype_ids.h>
-#include <dsd-neo/core/time_format.h>
 #include <dsd-neo/dsp/frame_sync.h>
 #include <dsd-neo/io/rtl_stream_c.h>
-#include <dsd-neo/platform/sockets.h>
 #include <dsd-neo/runtime/rtl_stream_io_hooks.h>
 #include <dsd-neo/runtime/rtl_stream_metrics_hooks.h>
 #include <stdint.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
-#include <time.h>
-#include "dsd-neo/core/dibit.h"
 #include "dsd-neo/core/opts_fwd.h"
 #include "dsd-neo/core/safe_api.h"
 #include "dsd-neo/core/state_fwd.h"
-
-#if defined(__GNUC__) && !defined(__cplusplus)
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wmissing-prototypes"
-#endif
+#include "frame_sync_state_buffers.h"
 
 static size_t g_sample_index;
 static const char* g_sync_pattern = M17_PRE;
 static char g_fill_symbol = '1';
-
-dsd_socket_t
-Connect(char* hostname, int portno) { // NOLINT(misc-use-internal-linkage)
-    (void)hostname;
-    (void)portno;
-    return (dsd_socket_t)0;
-}
-
-int
-openAudioInput(dsd_opts* opts) { // NOLINT(misc-use-internal-linkage)
-    (void)opts;
-    return -1;
-}
-
-int
-dsd_audio_reconfigure_output_for_input_policy(dsd_opts* opts) { // NOLINT(misc-use-internal-linkage)
-    (void)opts;
-    return 0;
-}
-
-void
-dsd_request_shutdown(dsd_opts* opts, dsd_state* state) { // NOLINT(misc-use-internal-linkage)
-    (void)opts;
-    (void)state;
-}
-
-void
-// NOLINTNEXTLINE(misc-use-internal-linkage)
-dsd_audio_rescale_symbol_timing(dsd_state* state, int old_rate_hz, int new_rate_hz) {
-    (void)state;
-    (void)old_rate_hz;
-    (void)new_rate_hz;
-}
-
-int
-dsd_format_local_datetime(time_t timestamp, dsd_local_datetime_format format, char* out,
-                          size_t out_size) { // NOLINT(misc-use-internal-linkage)
-    (void)timestamp;
-    (void)format;
-    return out ? DSD_SNPRINTF(out, out_size, "%s", "00:00:00") >= 0 : 0;
-}
-
-void
-printFrameInfo(dsd_opts* opts, dsd_state* state) { // NOLINT(misc-use-internal-linkage)
-    (void)opts;
-    (void)state;
-}
-
-void
-dsd_mark_cc_sync(dsd_state* state) { // NOLINT(misc-use-internal-linkage)
-    (void)state;
-}
-
-void
-watchdog_event_history(dsd_opts* opts, dsd_state* state, uint8_t slot) { // NOLINT(misc-use-internal-linkage)
-    (void)opts;
-    (void)state;
-    (void)slot;
-}
-
-void
-watchdog_event_current(const dsd_opts* opts, dsd_state* state, uint8_t slot) { // NOLINT(misc-use-internal-linkage)
-    (void)opts;
-    (void)state;
-    (void)slot;
-}
-
-void
-write_symbol_capture_record(dsd_opts* opts, dsd_state* state, int dibit, float symbol, const dsd_dibit_soft_t* soft) {
-    (void)opts;
-    (void)state;
-    (void)dibit;
-    (void)symbol;
-    (void)soft;
-}
-
-uint8_t
-dmr_compute_reliability(const dsd_state* st, float sym) {
-    (void)st;
-    (void)sym;
-    return 255;
-}
-
-double
-pwr_to_dB(double mean_power) { // NOLINT(misc-use-internal-linkage)
-    (void)mean_power;
-    return 0.0;
-}
-
-void
-lpf_f(dsd_state* state, float* input, int len) { // NOLINT(misc-use-internal-linkage)
-    (void)state;
-    (void)input;
-    (void)len;
-}
-
-void
-hpf_f(dsd_state* state, float* input, int len) { // NOLINT(misc-use-internal-linkage)
-    (void)state;
-    (void)input;
-    (void)len;
-}
-
-void
-pbf_f(dsd_state* state, float* input, int len) { // NOLINT(misc-use-internal-linkage)
-    (void)state;
-    (void)input;
-    (void)len;
-}
-
-void
-analog_gain_f(const dsd_opts* opts, dsd_state* state, float* input, int len) { // NOLINT(misc-use-internal-linkage)
-    (void)opts;
-    (void)state;
-    (void)input;
-    (void)len;
-}
-
-void
-agsm_f(dsd_opts* opts, dsd_state* state, float* input, int len) { // NOLINT(misc-use-internal-linkage)
-    (void)opts;
-    (void)state;
-    (void)input;
-    (void)len;
-}
 
 static float
 symbol_level_for_m17(char dibit) {
@@ -225,28 +91,6 @@ fake_cqpsk_status(int* out_cqpsk_enable, int* out_cqpsk_timing_active) {
         *out_cqpsk_timing_active = 0;
     }
     return 0;
-}
-
-static void
-free_state_buffers(dsd_state* state) {
-    free(state->dibit_buf);
-    free(state->dmr_payload_buf);
-    free(state->dmr_soft_buf);
-}
-
-static int
-init_state_buffers(dsd_state* state) {
-    state->dibit_buf = (int*)calloc(1000000U, sizeof(int));
-    state->dmr_payload_buf = (int*)calloc(1000000U, sizeof(int));
-    state->dmr_soft_buf = (dsd_dibit_soft_t*)calloc(1000000U, sizeof(dsd_dibit_soft_t));
-    if (!state->dibit_buf || !state->dmr_payload_buf || !state->dmr_soft_buf) {
-        free_state_buffers(state);
-        return 0;
-    }
-    state->dibit_buf_p = state->dibit_buf + 200;
-    state->dmr_payload_p = state->dmr_payload_buf + 200;
-    state->dmr_soft_p = state->dmr_soft_buf + 200;
-    return 1;
 }
 
 static void
@@ -330,9 +174,12 @@ run_one_on_state(dsd_opts* opts, dsd_state* state, const char* pattern, int expe
     return 0;
 }
 
+/* Frames after the first one in a chain are earned: a stream or packet that follows another
+ * needs the transmission to have produced a clean LICH or a CRC, and a BERT chain needs its
+ * PRBS9 lock (#399). A case that starts mid-chain has to stand where a real one would. */
 static int
-run_m17_sync_case(int initial_last, uint8_t initial_polarity, const char* pattern, int expected_sync,
-                  const char* label) {
+run_m17_chain_case(int initial_last, uint8_t initial_polarity, const char* pattern, int expected_sync,
+                   const char* label, int evidence, int bert_locked) {
     static dsd_opts opts;
     static dsd_state state;
     static int fake_rtl_context;
@@ -343,6 +190,8 @@ run_m17_sync_case(int initial_last, uint8_t initial_polarity, const char* patter
     }
     state.lastsynctype = initial_last;
     state.m17_polarity = initial_polarity;
+    state.m17_confirm_weak_streak = (uint8_t)(evidence ? 1 : 0);
+    state.m17_bert_locked = (uint8_t)(bert_locked ? 1 : 0);
 
     install_hooks();
     const int rc = run_one_on_state(&opts, &state, pattern, expected_sync, label);
@@ -352,48 +201,33 @@ run_m17_sync_case(int initial_last, uint8_t initial_polarity, const char* patter
 }
 
 static int
-run_m17_two_step_case(const char* first_pattern, int first_expected, const char* second_pattern, int second_expected,
-                      const char* label) {
-    static dsd_opts opts;
-    static dsd_state state;
-    static int fake_rtl_context;
-
-    dsd_frame_sync_reset_mod_state();
-    if (!init_m17_sync_case(&opts, &state, &fake_rtl_context)) {
-        return 1;
-    }
-
-    install_hooks();
-    int rc = run_one_on_state(&opts, &state, first_pattern, first_expected, label);
-    if (rc == 0) {
-        rc = run_one_on_state(&opts, &state, second_pattern, second_expected, label);
-    }
-    clear_hooks();
-    free_state_buffers(&state);
-    return rc;
+run_m17_sync_case(int initial_last, uint8_t initial_polarity, const char* pattern, int expected_sync,
+                  const char* label) {
+    return run_m17_chain_case(initial_last, initial_polarity, pattern, expected_sync, label, 1, 1);
 }
 
 int
 main(void) {
     int rc = 0;
-    rc |= run_m17_two_step_case(M17_PRE M17_PRE, DSD_SYNC_M17_PRE_POS, M17_LSF, DSD_SYNC_M17_LSF_POS,
-                                "M17 preamble to LSF");
+    /* The preamble candidate itself is covered in tests/dsp/test_frame_sync_internal_helpers.c,
+     * which drives one window at a time: this harness pads a pattern with a single repeated
+     * symbol, and a uniform run is within one error of both M17_BRT and M17_PKT, so a run-length
+     * pattern here would be measuring the padding. What it can pin is the chain behind the
+     * candidate. */
     rc |= run_m17_sync_case(DSD_SYNC_M17_LSF_POS, 1U, M17_STR, DSD_SYNC_M17_STR_POS, "M17 LSF to stream");
     rc |= run_m17_sync_case(DSD_SYNC_M17_LSF_POS, 1U, M17_PKT, DSD_SYNC_M17_PKT_POS, "M17 LSF to packet");
-    rc |= run_m17_two_step_case(M17_PRE M17_PRE, DSD_SYNC_M17_PRE_POS, M17_BRT, DSD_SYNC_M17_BRT_POS,
-                                "M17 preamble to BERT");
     rc |= run_m17_sync_case(DSD_SYNC_M17_BRT_POS, 1U, M17_BRT, DSD_SYNC_M17_BRT_POS, "M17 BERT to BERT");
     rc |= run_m17_sync_case(DSD_SYNC_M17_STR_POS, 1U, M17_STR, DSD_SYNC_M17_STR_POS, "M17 stream to stream");
     rc |= run_m17_sync_case(DSD_SYNC_M17_PKT_POS, 1U, M17_PKT, DSD_SYNC_M17_PKT_POS, "M17 packet to packet");
     rc |= run_m17_sync_case(DSD_SYNC_M17_STR_POS, 1U, M17_EOT, DSD_SYNC_M17_EOT_POS, "M17 stream to EOT");
     rc |= run_m17_sync_case(DSD_SYNC_NONE, 0U, M17_EOT, -1, "M17 rejects cold EOT");
-    rc |=
-        run_m17_two_step_case(M17_PRE M17_PRE, DSD_SYNC_M17_PRE_POS, M17_STR, -1, "M17 rejects stream after preamble");
-    rc |=
-        run_m17_two_step_case(M17_PRE M17_PRE, DSD_SYNC_M17_PRE_POS, M17_PKT, -1, "M17 rejects packet after preamble");
+
+    /* Frames after the first in a chain are earned: a stream or packet following another needs
+     * the transmission to have produced a clean LICH or a CRC, a BERT chain needs its PRBS9
+     * lock, and a terminator needs a transmission to terminate (#399). */
+    rc |= run_m17_chain_case(DSD_SYNC_M17_STR_POS, 1U, M17_STR, -1, "M17 stream chain needs evidence", 0, 1);
+    rc |= run_m17_chain_case(DSD_SYNC_M17_PKT_POS, 1U, M17_PKT, -1, "M17 packet chain needs evidence", 0, 1);
+    rc |= run_m17_chain_case(DSD_SYNC_M17_BRT_POS, 1U, M17_BRT, -1, "M17 BERT chain needs a PRBS9 lock", 1, 0);
+    rc |= run_m17_chain_case(DSD_SYNC_M17_STR_POS, 1U, M17_EOT, -1, "M17 EOT needs a transmission to end", 0, 1);
     return rc;
 }
-
-#if defined(__GNUC__) && !defined(__cplusplus)
-#pragma GCC diagnostic pop
-#endif

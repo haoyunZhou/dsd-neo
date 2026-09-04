@@ -3,14 +3,17 @@
  * Copyright (C) 2026 by arancormonk <180709949+arancormonk@users.noreply.github.com>
  */
 
+#include <dsd-neo/core/enc_lockout.h>
 #include <dsd-neo/core/events.h>
 #include <dsd-neo/core/init.h>
+#include <dsd-neo/core/keyring.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/p25_cqpsk_dibit.h>
 #include <dsd-neo/core/power.h>
 #include <dsd-neo/core/state.h>
 #include <dsd-neo/core/state_ext.h>
 #include <dsd-neo/core/synctype_ids.h>
+#include <dsd-neo/dsp/symbol_timing_debug.h>
 #include <dsd-neo/dsp/sync_calibration.h>
 #include <dsd-neo/platform/posix_compat.h>
 #include <dsd-neo/runtime/log.h>
@@ -19,6 +22,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <time.h>
+#include "dsd-neo/core/call_state.h"
 #include "dsd-neo/core/dibit.h"
 #include "dsd-neo/core/frontend_types.h"
 #include "dsd-neo/core/opts_fwd.h"
@@ -69,7 +73,6 @@ init_opts_display_and_audio_defaults(dsd_opts* opts) {
     opts->show_keys = 0;                                 // redact radio keys/keystreams unless CLI explicitly opts in
     opts->p25_afc_status_gate_enable = 0;     // advisory by default; status-derived direction is not always reliable
     opts->frontend_display.show_channels = 0; // hide Channels section by default
-    opts->symboltiming = 0;
     opts->verbose = 2;
     opts->p25enc = 0;
     opts->p25lc = 0;
@@ -110,6 +113,8 @@ init_opts_output_defaults(dsd_opts* opts) {
     opts->group_in_file[0] = 0;
     opts->chan_in_file[0] = 0;
     opts->key_in_file[0] = 0;
+    opts->p25_bandplan_in_file[0] = 0;
+    opts->p25_bandplan_export_file[0] = 0;
     //end import filenames
     opts->szNumbers[0] = 0;
     opts->symbol_out_f = NULL;
@@ -194,6 +199,7 @@ init_opts_decoder_and_input_defaults(dsd_opts* opts) {
     opts->soapy_clock[0] = '\0';
     opts->soapy_settings[0] = '\0';
     opts->soapy_gains[0] = '\0';
+    opts->digital_resample_mode = 0; // DSD_DIGITAL_RESAMPLE_AUTO
     opts->rtl_started = 0;
     opts->rtl_needs_restart = 0;
     opts->rtl_pwr = 0;                // mean power approximation level on rtl input signal
@@ -237,11 +243,13 @@ init_opts_runtime_and_network_defaults(dsd_opts* opts) {
 #endif
     opts->payload = 0;
     opts->inverted_dpmr = 0;
+    opts->dmr_mono = 0;
     opts->dmr_stereo = 1;
     opts->aggressive_framesync = 1;
     /* DMR: strict CRC gating by default (use -F to relax, like other protocols). */
     opts->dmr_crc_relaxed_default = 0;
     opts->dmr_debug_burst = 0;
+    opts->dmr_debug_unsynced = 0;
     opts->iq_capture_requested = 0;
     opts->iq_replay_requested = 0;
     opts->iq_replay_loop = 0;
@@ -256,6 +264,8 @@ init_opts_runtime_and_network_defaults(dsd_opts* opts) {
     opts->audio_out_type = 0;
 
     opts->lrrp_file_output = 0;
+    opts->lrrp_extra_port_count = 0;
+    DSD_MEMSET(opts->lrrp_extra_ports, 0, sizeof(opts->lrrp_extra_ports));
 
     opts->dmr_mute_encL = 1;
     opts->dmr_mute_encR = 1;
@@ -306,6 +316,10 @@ init_opts_runtime_and_network_defaults(dsd_opts* opts) {
     opts->udp_in_packets = 0ULL;
     opts->udp_in_bytes = 0ULL;
     opts->udp_in_drops = 0ULL;
+
+    // RadioReference account mirrors (see include/dsd-neo/app_control/rr_import_apply.h)
+    opts->rr_username[0] = '\0';
+    opts->rr_app_key[0] = '\0';
 }
 
 static void
@@ -320,6 +334,9 @@ init_opts_trunking_and_filter_defaults(dsd_opts* opts) {
     opts->trunk_scan_targets_csv[0] = '\0';
     opts->trunk_scan_idle_dwell_ms = 3000;
     opts->trunk_scan_activity_hold_ms = 1200;
+    opts->scan_voice_only = 0;
+    opts->scan_voice_qualify_ms = 1000;
+    opts->scan_voice_hold_ms = 2000;
     opts->trunk_cli_seen = 0;
 
     //reverse mute
@@ -432,6 +449,26 @@ init_state_core_buffers(dsd_state* state) {
     }
     state->symbol_history_head = 0;
     state->symbol_history_count = 0;
+
+    // Post-filter sample trace for the symbol-timing diagnostic. Sized for the template the
+    // measurement correlates over plus a symbol of shift room; see dsp/symbol_timing_debug.h.
+    const size_t timing_sample_bytes = (size_t)DSD_SYMBOL_TIMING_SPAN_SAMPLES * sizeof(float);
+    const size_t timing_span_bytes = (size_t)DSD_SYMBOL_TIMING_TEMPLATE_SYMS * sizeof(uint8_t);
+    state->timing_trace.samples = dsd_aligned_alloc(64, timing_sample_bytes);
+    if (state->timing_trace.samples) {
+        DSD_MEMSET(state->timing_trace.samples, 0, timing_sample_bytes);
+    }
+    state->timing_trace.spans = dsd_aligned_alloc(64, timing_span_bytes);
+    if (state->timing_trace.spans) {
+        DSD_MEMSET(state->timing_trace.spans, 0, timing_span_bytes);
+    }
+    state->timing_trace.sample_head = 0;
+    state->timing_trace.sample_count = 0;
+    state->timing_trace.span_head = 0;
+    state->timing_trace.span_count = 0;
+
+    // The matched filter the symbol grid reads through starts as "none", with no history behind it.
+    DSD_MEMSET(&state->matched_filter, 0, sizeof(state->matched_filter));
 
     state->repeat = 0;
 
@@ -555,12 +592,6 @@ init_state_sync_and_stream_defaults(dsd_state* state) {
         }
     }
     state->tgcount = 0;
-    state->lasttg = 0;
-    state->lastsrc = 0;
-    state->lasttgR = 0;
-    state->lastsrcR = 0;
-    state->gi[0] = -1;
-    state->gi[1] = -1;
     state->eh_index = 0;
     state->eh_slot = 2;
     state->nac = 0;
@@ -667,6 +698,20 @@ init_state_vendor_crypto_defaults(dsd_state* state) {
     state->vertex_ks_counter[1] = 0;
     state->vertex_ks_warned[0] = 0;
     state->vertex_ks_warned[1] = 0;
+    keyring_dmr_tg_map_reset(state);
+}
+
+/* What the current dPMR transmission has proved: whether a CCH CRC-7 has passed on it at all,
+ * and how recently, for the identity gate and the SPS hunt respectively (#407). Cleared
+ * directly rather than through dpmr_confirm_reset(): core must not call into protocol
+ * modules. */
+static void
+init_state_dpmr_confirmation(dsd_state* state) {
+    state->dpmr_confirmed = 0;
+    state->dpmr_confirm_weak_streak = 0;
+    state->dpmr_confirm_frame_evidence = 0;
+    state->dpmr_cch_evidence = 0;
+    state->dpmr_cch_evidence_symbolcnt = 0;
 }
 
 static void
@@ -676,11 +721,6 @@ init_state_protocol_defaults_a(dsd_state* state) {
     DSD_MEMSET(state->p25_nb_entries, 0, sizeof(state->p25_nb_entries));
     state->p25_src_nid = 0;
     // Clear P25 call flags
-    state->p25_call_emergency[0] = state->p25_call_emergency[1] = 0;
-    state->p25_call_priority[0] = state->p25_call_priority[1] = 0;
-    state->p25_call_is_packet[0] = state->p25_call_is_packet[1] = 0;
-    state->p25_service_options_valid[0] = state->p25_service_options_valid[1] = 0;
-    state->p25_policy_tg[0] = state->p25_policy_tg[1] = 0;
 
     // Initialize P25 Phase 1 metrics counters (also reset on retune)
     state->p25_p1_fec_ok = 0;
@@ -705,15 +745,21 @@ init_state_protocol_defaults_a(dsd_state* state) {
     state->debug_mode = 0;
 
     state->nxdn_last_ran = -1;
-    state->nxdn_last_rid = 0;
-    state->nxdn_last_tg = 0;
+    state->nxdn_confirmed = 0;
+    state->nxdn_confirm_weak_streak = 0;
+    state->nxdn_confirm_frame_evidence = 0;
     state->nxdn_cipher_type = 0;
+    /* Cleared directly rather than through nxdn_cipher_class_reset(): core must not call into
+     * protocol modules. */
+    state->nxdn_cipher_class = 0;
+    state->nxdn_cipher_class_est = 0;
+    state->nxdn_cipher_class_pending = 0;
     state->nxdn_key = 0;
     state->nxdn_pn95_seed = 228;
-    state->nxdn_call_type[0] = '\0';
     state->payload_miN = 0;
 
     state->dpmr_color_code = -1;
+    init_state_dpmr_confirmation(state);
 
     state->payload_mi = 0;
     state->payload_miR = 0;
@@ -745,9 +791,10 @@ init_state_protocol_defaults_a(dsd_state* state) {
     state->hytera_key_segments = 0U;
     state->M = 0; // Force key priority over settings from fid/so
 
-    state->dmr_stereo = 0; //1, or 0?
-    state->dmrburstL = 17; //initialize at higher value than possible
-    state->dmrburstR = 17; //17 in char array is set for ERR
+    state->dmr_stereo = 0;    //1, or 0?
+    state->dmr_mono_slot = 0; //single-slot DMR defaults to TS1
+    state->dmrburstL = 17;    //initialize at higher value than possible
+    state->dmrburstR = 17;    //17 in char array is set for ERR
     state->dmr_so = 0;
     state->dmr_soR = 0;
     state->dmr_fid = 0;
@@ -785,6 +832,12 @@ init_state_protocol_defaults_b(dsd_state* state) {
     //NXDN, when a new IV has arrived
     state->nxdn_new_iv = 0;
 
+    /* Cleared directly rather than through provoice_confirm_reset(): core must not call into
+     * protocol modules. */
+    state->provoice_confirmed = 0;
+    state->provoice_confirm_weak_streak = 0;
+    state->provoice_confirm_frame_evidence = 0;
+
     state->p25vc = 0;
     state->payload_miP = 0;
     state->payload_miN = 0;
@@ -794,6 +847,10 @@ init_state_protocol_defaults_b(dsd_state* state) {
     state->dmr_lrrp_source[1] = 0;
     state->dmr_lrrp_target[0] = 0;
     state->dmr_lrrp_target[1] = 0;
+    //qualifies dmr_lrrp_target, so it has to be cleared with it: a stale group flag left behind a
+    //cleared target would qualify whatever target is written next
+    state->dmr_data_target_is_group[0] = 0;
+    state->dmr_data_target_is_group[1] = 0;
 
     //initialize data header bits
     state->data_header_blocks[0] = 1; //initialize with 1, otherwise we may end up segfaulting when no/bad data header
@@ -845,12 +902,35 @@ init_state_p25_patch_defaults(dsd_state* state) {
     }
 }
 
+/* What a decoded P25p1 NID has taught this session, and nothing else has any way to know:
+ * which demodulator carried the frame (#423), and that the symbol profile under it is
+ * carrying P25p1 at all (#400). Both start out untaught. */
 static void
-init_state_p25_encrypted_call_cache_defaults(dsd_state* state) {
-    DSD_MEMSET(state->p25_enc_tg_cache_until, 0, sizeof(state->p25_enc_tg_cache_until));
-    DSD_MEMSET(state->p25_enc_tg_cache_tg, 0, sizeof(state->p25_enc_tg_cache_tg));
-    DSD_MEMSET(state->p25_enc_tg_cache_is_group, 0, sizeof(state->p25_enc_tg_cache_is_group));
-    state->p25_enc_tg_cache_next = 0;
+init_state_p25p1_nid_learning(dsd_state* state) {
+    state->p25_p1_validated_rf_mod = -1;
+    state->p25_p1_validated_symbolcnt = 0;
+    state->p25_p1_nid_evidence = 0;
+    state->p25_p1_nid_evidence_symbolcnt = 0;
+}
+
+/* Trunk-scan publication for the frontends. Reset here so a re-initialised state
+ * cannot keep advertising the target the previous run was parked on. */
+static void
+init_state_trunk_scan_publication(dsd_state* state) {
+    DSD_MEMSET(state->trunk_scan_active_id, 0, sizeof(state->trunk_scan_active_id));
+    state->trunk_scan_active_ordinal = 0;
+    state->trunk_scan_target_count = 0;
+    state->lcn_scan_hold = 0;
+    state->lcn_avoid_count = 0;
+    state->trunk_scan_hold = 0;
+    state->trunk_scan_active_avoided = 0;
+    state->trunk_scan_avoided_count = 0;
+    state->scan_voice_gate_arrive_m = -1.0;
+    state->scan_voice_gate_sync_m = -1.0;
+    state->scan_voice_gate_voice_m = -1.0;
+    state->scan_voice_gate_roll_seen = 0;
+    state->scan_voice_gate_hold_seen = 0;
+    state->scan_voice_gate_phase = (uint8_t)DSD_SCAN_VOICE_GATE_OFF;
 }
 
 static void
@@ -882,6 +962,7 @@ init_state_p25_and_trunk_defaults(dsd_state* state) {
     state->p25_p1_soft_combined_ok = 0;
     state->p25_p2_active_slot = -1;
     state->p25_p1_identity_pending = 0;
+    state->p25_p1_identity_epoch_started = 0;
     state->p25_p1_hdu_crypto_fresh = 0;
     DSD_MEMSET(&state->p25_p1_crypto_conflict, 0, sizeof(state->p25_p1_crypto_conflict));
     DSD_MEMSET(state->p25_p2_media_rejected, 0, sizeof(state->p25_p2_media_rejected));
@@ -891,6 +972,7 @@ init_state_p25_and_trunk_defaults(dsd_state* state) {
     state->p25_sys_is_tdma = 0;
     state->p25_vc_cqpsk_pref = -1;
     state->p25_vc_cqpsk_override = -1;
+    init_state_p25p1_nid_learning(state);
 
     state->use_throttle = 0;
     state->symbol_replay_next_deadline_ns = 0;
@@ -909,18 +991,16 @@ init_state_p25_and_trunk_defaults(dsd_state* state) {
     state->p25_vc_freq[1] = 0;
 
     init_state_p25_patch_defaults(state);
-    init_state_p25_encrypted_call_cache_defaults(state);
+    dsd_enc_lockout_init(state);
 
     //edacs - may need to make these user configurable instead for stability on non-ea systems
-    state->ea_mode = -1; //init on -1, 0 is standard, 1 is ea
-    state->edacs_vc_call_type = 0;
+    state->ea_mode = -1;   //init on -1, 0 is standard, 1 is ea
     state->esk_mask = 0x0; //esk mask value
     state->edacs_site_id = 0;
     state->edacs_sys_id = 0;
     state->edacs_area_code = 0;
     state->edacs_lcn_count = 0;
     state->edacs_cc_lcn = 0;
-    state->edacs_vc_lcn = 0;
     state->edacs_tuned_lcn = -1;
     state->edacs_a_bits = 4;   //  Agency Significant Bits
     state->edacs_f_bits = 4;   //   Fleet Significant Bits
@@ -933,6 +1013,11 @@ init_state_p25_and_trunk_defaults(dsd_state* state) {
 
     //trunking
     DSD_MEMSET(state->trunk_lcn_freq, 0, sizeof(state->trunk_lcn_freq));
+    // Keep initState() idempotent with respect to the scan-list heap tail: re-initialising a
+    // state that already imported a >26-entry list would otherwise orphan the allocation, and a
+    // state that was not zero-initialised would leave reserve() calling realloc() on garbage.
+    dsd_state_trunk_lcn_free(state);
+    init_state_trunk_scan_publication(state);
     DSD_MEMSET(state->trunk_chan_map, 0, sizeof(state->trunk_chan_map));
     DSD_MEMSET(state->trunk_chan_map_used, 0, sizeof(state->trunk_chan_map_used));
     state->trunk_chan_map_used_count = 0;
@@ -945,7 +1030,6 @@ init_state_p25_and_trunk_defaults(dsd_state* state) {
     state->rtl_fsk_reacquire_last_sync_m = 0.0;
     state->rtl_fsk_reacquire_gap_start_m = 0.0;
     state->rtl_fsk_reacquire_last_request_m = 0.0;
-    state->last_active_time = time(NULL);
     state->last_t3_tune_time = time(NULL);
     state->is_con_plus = 0;
 }
@@ -955,7 +1039,6 @@ init_state_nxdn_and_dmr_defaults(dsd_state* state) {
     //dmr trunking/ncurses stuff
     state->dmr_rest_channel = -1; //init on -1
     state->dmr_mfid = -1;         //
-    state->dmr_cc_lpcn = 0;
     state->tg_hold = 0;
 
     //new nxdn stuff
@@ -989,8 +1072,6 @@ init_state_nxdn_and_dmr_defaults(dsd_state* state) {
     state->keyloader = 0; //keyloader off
 
     //Remus DMR End Call Alert Beep
-    state->dmr_end_alert[0] = 0;
-    state->dmr_end_alert[1] = 0;
 
     state->dmr_branding[0] = '\0';
     state->dmr_branding_sub[0] = '\0';
@@ -1023,59 +1104,49 @@ init_state_nxdn_and_dmr_defaults(dsd_state* state) {
     DSD_MEMSET(state->dmr_alias_block_segment, 0, sizeof(state->dmr_alias_block_segment));
     DSD_MEMSET(state->dmr_embedded_gps, 0, sizeof(state->dmr_embedded_gps));
     DSD_MEMSET(state->dmr_lrrp_gps, 0, sizeof(state->dmr_lrrp_gps));
-    DSD_MEMSET(state->active_channel, 0, sizeof(state->active_channel));
 }
 
 static void
 init_state_string_and_m17_defaults(dsd_state* state) {
     //Generic Talker Alias String
     DSD_MEMSET(state->generic_talker_alias, 0, sizeof(state->generic_talker_alias));
-    state->generic_talker_alias_src[0] = 0;
-    state->generic_talker_alias_src[1] = 0;
-
-    //REMUS! multi-purpose call_string
-    set_spaces(state->call_string[0], 21);
-    set_spaces(state->call_string[1], 21);
 
     //late entry mi fragments
     DSD_MEMSET(state->late_entry_mi_fragment, 0, sizeof(state->late_entry_mi_fragment));
 
-    state->dPMRVoiceFS2Frame.CalledIDOk = 0;
-    state->dPMRVoiceFS2Frame.CallingIDOk = 0;
-    DSD_MEMSET(state->dPMRVoiceFS2Frame.CalledID, 0, 8);
-    DSD_MEMSET(state->dPMRVoiceFS2Frame.CallingID, 0, 8);
     DSD_MEMSET(state->dPMRVoiceFS2Frame.Version, 0, 8);
 
-    set_spaces(state->dpmr_caller_id, 6);
-    set_spaces(state->dpmr_target_id, 6);
-
     //YSF Fusion Call Strings
-    set_spaces(state->ysf_tgt, 10); //10 spaces
-    set_spaces(state->ysf_src, 10); //10 spaces
-    set_spaces(state->ysf_upl, 10); //10 spaces
-    set_spaces(state->ysf_dnl, 10); //10 spaces
-    set_spaces(state->ysf_rm1, 5);  //5 spaces
-    set_spaces(state->ysf_rm2, 5);  //5 spaces
-    set_spaces(state->ysf_rm3, 5);  //5 spaces
-    set_spaces(state->ysf_rm4, 5);  //5 spaces
+    set_spaces(state->ysf_rm1, 5); //5 spaces
+    set_spaces(state->ysf_rm2, 5); //5 spaces
+    set_spaces(state->ysf_rm3, 5); //5 spaces
+    set_spaces(state->ysf_rm4, 5); //5 spaces
     DSD_MEMSET(state->ysf_txt, 0, sizeof(state->ysf_txt));
     state->ysf_dt = 9;
     state->ysf_fi = 9;
     state->ysf_cm = 9;
+    state->ysf_fich_confirmed = 0;
 
     //DSTAR Call Strings
-    set_spaces(state->dstar_rpt1, 8); //8 spaces
-    set_spaces(state->dstar_rpt2, 8); //8 spaces
-    set_spaces(state->dstar_dst, 8);  //8 spaces
-    set_spaces(state->dstar_src, 8);  //8 spaces
-    set_spaces(state->dstar_txt, 8);  //8 spaces
-    set_spaces(state->dstar_gps, 8);  //8 spaces
+    set_spaces(state->dstar_txt, 8); //8 spaces
+    set_spaces(state->dstar_gps, 8); //8 spaces
+    /* Cleared directly rather than through dstar_confirm_reset(): core must not call into
+     * protocol modules. */
+    state->dstar_confirmed = 0;
+    state->dstar_confirm_weak_streak = 0;
+    state->dstar_confirm_frame_evidence = 0;
 
     //M17 Storage
     DSD_MEMSET(state->m17_lsf, 0, sizeof(state->m17_lsf));
     DSD_MEMSET(state->m17_pkt, 0, sizeof(state->m17_pkt));
     state->m17_pbc_ct = 0;
     state->m17_str_dt = 9;
+    state->m17_pre_run = 0;
+    state->m17_pre_candidate = 0;
+    state->m17_pre_candidate_ttl = 0;
+    state->m17_confirmed = 0;
+    state->m17_confirm_weak_streak = 0;
+    state->m17_confirm_frame_evidence = 0;
     state->m17_bert_locked = 0;
     state->m17_bert_lfsr = 1;
     state->m17_bert_lock_count = 0;
@@ -1091,16 +1162,10 @@ init_state_string_and_m17_defaults(dsd_state* state) {
     DSD_MEMSET(state->m17sms, 0, sizeof(state->m17sms));
     state->m17dat[0] = '\0';
 
-    state->m17_dst = 0;
-    state->m17_src = 0;
     state->m17_can = 0;      //can value that was decoded from signal
     state->m17_can_en = -1;  //can value supplied to the encoding side
     state->m17_rate = 48000; //sampling rate for audio input
     state->m17_vox = 0;      //vox mode enabled on M17 encoder
-    DSD_MEMSET(state->m17_dst_csd, 0, sizeof(state->m17_dst_csd));
-    DSD_MEMSET(state->m17_src_csd, 0, sizeof(state->m17_src_csd));
-    state->m17_dst_str[0] = '\0';
-    state->m17_src_str[0] = '\0';
 
     state->m17_enc = 0;
     state->m17_enc_st = 0;
@@ -1170,6 +1235,7 @@ initState(dsd_state* state) {
     init_state_nxdn_and_dmr_defaults(state);
     init_state_string_and_m17_defaults(state);
     init_state_codec2_and_events(state);
+    (void)dsd_call_state_ensure(state);
 
 } //init_state
 
@@ -1180,6 +1246,7 @@ freeState(dsd_state* state) {
     }
 
     dsd_state_ext_free_all(state);
+    dsd_state_trunk_lcn_free(state);
 
 #ifdef USE_CODEC2
     if (state->codec2_3200) {
@@ -1239,6 +1306,18 @@ freeState(dsd_state* state) {
     state->symbol_history_size = 0;
     state->symbol_history_head = 0;
     state->symbol_history_count = 0;
+
+    dsd_aligned_free(state->timing_trace.samples);
+    dsd_aligned_free(state->timing_trace.spans);
+    state->timing_trace.samples = NULL;
+    state->timing_trace.spans = NULL;
+    state->timing_trace.sample_head = 0;
+    state->timing_trace.sample_count = 0;
+    state->timing_trace.span_head = 0;
+    state->timing_trace.span_count = 0;
+
+    // The matched filter the symbol grid reads through starts as "none", with no history behind it.
+    DSD_MEMSET(&state->matched_filter, 0, sizeof(state->matched_filter));
 
     dsd_aligned_free(state->dibit_buf);
     state->dibit_buf = NULL;

@@ -10,6 +10,7 @@
 
 #include "menu_callbacks.h"
 #include <dsd-neo/app_control/commands.h>
+#include <dsd-neo/app_control/rr_import_apply.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/parse.h>
 #include <dsd-neo/core/state.h>
@@ -82,6 +83,35 @@ cb_event_log_set(void* v, const char* path) {
     }
 }
 
+static void
+rr_post_account(const UiCtx* c, const char* username, const char* app_key) {
+    dsd_app_rr_account_payload account;
+    DSD_MEMSET(&account, 0, sizeof account);
+    DSD_SNPRINTF(account.username, sizeof account.username, "%s", username ? username : "");
+    DSD_SNPRINTF(account.app_key, sizeof account.app_key, "%s", app_key ? app_key : "");
+    (void)c;
+    (void)dsd_app_command_set_rr_account(&account);
+    ui_statusf("Applying RadioReference account...");
+}
+
+void
+cb_rr_account_user(void* v, const char* text) {
+    const UiCtx* c = mutable_ui_ctx_from_callback(v);
+    if (!c || !c->opts || text == NULL) {
+        return; /* NULL is a cancel (ui_prompt_close_all delivers it); leave opts alone. */
+    }
+    rr_post_account(c, text, c->opts->rr_app_key);
+}
+
+void
+cb_rr_account_key(void* v, const char* text) {
+    const UiCtx* c = mutable_ui_ctx_from_callback(v);
+    if (!c || !c->opts || text == NULL) {
+        return;
+    }
+    rr_post_account(c, c->opts->rr_username, text);
+}
+
 void
 cb_static_wav(void* v, const char* path) {
     const UiCtx* c = mutable_ui_ctx_from_callback(v);
@@ -139,6 +169,30 @@ cb_import_group(void* v, const char* p) {
     if (p && *p) {
         (void)dsd_app_command_set_string(DSD_APP_CMD_IMPORT_GROUP_LIST, p);
         ui_statusf("Importing group list...");
+    }
+}
+
+void
+cb_import_p25_bandplan(void* v, const char* p) {
+    const UiCtx* c = mutable_ui_ctx_from_callback(v);
+    if (!c) {
+        return;
+    }
+    if (p && *p) {
+        (void)dsd_app_command_set_string(DSD_APP_CMD_IMPORT_P25_BANDPLAN, p);
+        ui_statusf("Importing P25 band plan...");
+    }
+}
+
+void
+cb_export_p25_bandplan(void* v, const char* p) {
+    const UiCtx* c = mutable_ui_ctx_from_callback(v);
+    if (!c) {
+        return;
+    }
+    if (p && *p) {
+        (void)dsd_app_command_set_string(DSD_APP_CMD_EXPORT_P25_BANDPLAN, p);
+        ui_statusf("Exporting P25 band plan...");
     }
 }
 
@@ -278,6 +332,38 @@ cb_setmod_bw(void* v, int ok, int bw) {
 }
 
 void
+cb_scan_voice_qualify(void* v, int ok, int ms) {
+    const UiCtx* c = mutable_ui_ctx_from_callback(v);
+    if (!c) {
+        return;
+    }
+    if (ok) {
+        int adjusted = 0;
+        int32_t vms = (int32_t)clamp_int_with_notice("Voice qualify", ms, 100, 600000, &adjusted);
+        (void)dsd_app_command_set_i32(DSD_APP_CMD_SCAN_VOICE_QUALIFY_MS_SET, vms);
+        if (!adjusted) {
+            ui_statusf("Applying voice qualify: %d ms", (int)vms);
+        }
+    }
+}
+
+void
+cb_scan_voice_hold(void* v, int ok, int ms) {
+    const UiCtx* c = mutable_ui_ctx_from_callback(v);
+    if (!c) {
+        return;
+    }
+    if (ok) {
+        int adjusted = 0;
+        int32_t vms = (int32_t)clamp_int_with_notice("Voice hold", ms, 100, 600000, &adjusted);
+        (void)dsd_app_command_set_i32(DSD_APP_CMD_SCAN_VOICE_HOLD_MS_SET, vms);
+        if (!adjusted) {
+            ui_statusf("Applying voice hold: %d ms", (int)vms);
+        }
+    }
+}
+
+void
 cb_tg_hold(void* v, int ok, int tg) {
     const UiCtx* c = mutable_ui_ctx_from_callback(v);
     if (!c) {
@@ -328,22 +414,6 @@ cb_slot_pref(void* v, int ok, int p) {
         (void)dsd_app_command_set_i32(DSD_APP_CMD_SLOT_PREF_SET, pref01);
         if (!adjusted) {
             ui_statusf("Applying slot preference: %d", p);
-        }
-    }
-}
-
-void
-cb_slots_on(void* v, int ok, int m) {
-    const UiCtx* c = mutable_ui_ctx_from_callback(v);
-    if (!c) {
-        return;
-    }
-    if (ok) {
-        int adjusted = 0;
-        int32_t mask = (int32_t)clamp_int_with_notice("Slot mask", m, 0, 3, &adjusted);
-        (void)dsd_app_command_set_i32(DSD_APP_CMD_SLOTS_ONOFF_SET, mask);
-        if (!adjusted) {
-            ui_statusf("Applying slot mask: %d", (int)mask);
         }
     }
 }
@@ -652,18 +722,6 @@ cb_io_save_symbol_capture(void* v, const char* path) {
 }
 
 void
-cb_io_read_symbol_bin(void* v, const char* path) {
-    const UiCtx* c = mutable_ui_ctx_from_callback(v);
-    if (!c) {
-        return;
-    }
-    if (path && *path) {
-        (void)dsd_app_command_set_string(DSD_APP_CMD_SYMBOL_IN_OPEN, path);
-        ui_statusf("Symbol input open requested");
-    }
-}
-
-void
 cb_udp_out_port(void* u, int ok, int port) {
     UdpOutCtx* ctx = (UdpOutCtx*)u;
     if (!ctx) {
@@ -838,13 +896,20 @@ cb_switch_to_symbol(void* v, const char* path) {
         return;
     }
     if (path && *path) {
-        size_t len = strlen(path);
-        if (len >= 4 && dsd_strcasecmp(path + len - 4, ".bin") == 0) {
-            (void)dsd_app_command_set_string(DSD_APP_CMD_SYMBOL_IN_OPEN, path);
-            ui_statusf("Symbol input open requested");
-        } else {
+        /* The stream types are the named exceptions; everything else is a dibit
+           capture. Testing for ".bin" instead sent any capture the operator had
+           named without that suffix -- nothing appends it, including the "Record
+           symbols..." prompt -- to the symbol-stream reader, which parses it as a
+           different format and decodes nothing, with no error. */
+        const size_t len = strlen(path);
+        const int is_stream = (len >= 4 && dsd_strcasecmp(path + len - 4, ".raw") == 0)
+                              || (len >= 4 && dsd_strcasecmp(path + len - 4, ".sym") == 0);
+        if (is_stream) {
             (void)dsd_app_command_set_string(DSD_APP_CMD_INPUT_SYM_STREAM_SET, path);
             ui_statusf("Symbol stream input requested");
+        } else {
+            (void)dsd_app_command_set_string(DSD_APP_CMD_SYMBOL_IN_OPEN, path);
+            ui_statusf("Symbol input open requested");
         }
     }
 }
