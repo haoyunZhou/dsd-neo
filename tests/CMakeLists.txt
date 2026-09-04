@@ -2,6 +2,16 @@ set(DSD_NEO_TEST_MATH_LIB $<$<NOT:$<PLATFORM_ID:Windows>>:m>)
 
 link_libraries(dsd-neo_warnings)
 
+# Test fixtures intentionally provide local stand-ins for curses entry points.
+# PDCurses declares those symbols as dllimport and the Windows SDK also defines
+# MOUSE_MOVED; suppress only these fixture-specific MSVC diagnostics.
+add_compile_options(
+    $<$<C_COMPILER_ID:MSVC>:/wd4005>
+    $<$<C_COMPILER_ID:MSVC>:/wd4028>
+    $<$<C_COMPILER_ID:MSVC>:/wd4273>
+)
+add_link_options($<$<C_COMPILER_ID:MSVC>:/ignore:4217>)
+
 add_library(dsd-neo_test_support INTERFACE)
 target_include_directories(
     dsd-neo_test_support
@@ -807,19 +817,19 @@ target_include_directories(
 target_link_libraries(
     dsd-neo_test_ysf_dch_decode
     PRIVATE
-        "-Wl,--start-group"
         dsd-neo_proto_ysf
         ${_DSD_RUNTIME_CLI_PARSE_LIBS}
-        "-Wl,--end-group"
         ${LIBS}
 )
-target_link_options(
-    dsd-neo_test_ysf_dch_decode
-    PRIVATE
-        -Wl,--wrap=get_dibit_and_analog_signal
-        -Wl,--wrap=processMbeFrame
-        -Wl,--wrap=mbe_processAmbe2450Dataf
-)
+if(NOT MSVC)
+    target_link_options(
+        dsd-neo_test_ysf_dch_decode
+        PRIVATE
+            -Wl,--wrap=get_dibit_and_analog_signal
+            -Wl,--wrap=processMbeFrame
+            -Wl,--wrap=mbe_processAmbe2450Dataf
+    )
+endif()
 add_test(NAME YSF_DCH_DECODE COMMAND dsd-neo_test_ysf_dch_decode)
 
 add_executable(
@@ -965,12 +975,10 @@ target_include_directories(
 target_link_libraries(
     dsd-neo_test_nxdn_deperm_primitives
     PRIVATE
-        "-Wl,--start-group"
         dsd-neo_proto_nxdn
         dsd-neo_proto_dmr
         dsd-neo_proto_p25
         dsd-neo_core
-        "-Wl,--end-group"
         ${LIBS}
 )
 add_test(
@@ -1085,9 +1093,9 @@ add_executable(
 )
 target_include_directories(
     dsd-neo_test_runtime_worker_pool
-    PRIVATE ${PROJECT_SOURCE_DIR}/include
+    PRIVATE ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/tests/test_support
 )
-target_link_libraries(dsd-neo_test_runtime_worker_pool PRIVATE dsd-neo_runtime)
+target_link_libraries(dsd-neo_test_runtime_worker_pool PRIVATE dsd-neo_runtime dsd-neo_test_support)
 add_test(NAME RUNTIME_WORKER_POOL COMMAND dsd-neo_test_runtime_worker_pool)
 
 add_executable(
@@ -1216,13 +1224,17 @@ if(DSD_ENABLE_TERMINAL_UI)
     )
     target_compile_definitions(
         dsd-neo_test_ui_async_lifecycle
-        PRIVATE DSD_NEO_THREADING_NO_INLINE_CREATE DSD_NEO_TEST_HOOKS
+        PRIVATE
+            DSD_NEO_THREADING_NO_INLINE_CREATE
+            DSD_NEO_TEST_HOOKS
+            $<$<C_COMPILER_ID:MSVC>:CURSES_LIBRARY>
     )
     target_include_directories(
         dsd-neo_test_ui_async_lifecycle
         PRIVATE
             ${PROJECT_SOURCE_DIR}/include
             ${PROJECT_SOURCE_DIR}/src/ui/terminal
+            ${CURSES_INCLUDE_DIRS}
     )
     add_test(NAME UI_ASYNC_LIFECYCLE COMMAND dsd-neo_test_ui_async_lifecycle)
 endif()
@@ -1345,6 +1357,7 @@ if(DSD_ENABLE_TERMINAL_UI)
         PRIVATE
             ${PROJECT_SOURCE_DIR}/include
             ${PROJECT_SOURCE_DIR}/src/ui/terminal
+            ${CURSES_INCLUDE_DIRS}
     )
     add_test(NAME UI_MENU_DEFS COMMAND dsd-neo_test_ui_menu_defs)
 
@@ -1461,10 +1474,12 @@ if(DSD_ENABLE_TERMINAL_UI)
             ${PROJECT_SOURCE_DIR}/src/ui/terminal
             ${CURSES_INCLUDE_DIRS}
     )
-    target_compile_options(
-        dsd-neo_test_ui_ncurses_printer_helpers
-        PRIVATE -Wno-unused-function
-    )
+    if(NOT MSVC)
+        target_compile_options(
+            dsd-neo_test_ui_ncurses_printer_helpers
+            PRIVATE -Wno-unused-function
+        )
+    endif()
     target_link_libraries(
         dsd-neo_test_ui_ncurses_printer_helpers
         PRIVATE ${CURSES_LIBRARIES} ${DSD_NEO_TEST_MATH_LIB}
@@ -1485,6 +1500,7 @@ if(DSD_ENABLE_TERMINAL_UI)
             ${PROJECT_SOURCE_DIR}/include
             ${PROJECT_SOURCE_DIR}/src/app_control
             ${PROJECT_SOURCE_DIR}/src/ui/terminal
+            ${CURSES_INCLUDE_DIRS}
     )
     add_test(NAME UI_MENU_CALLBACKS COMMAND dsd-neo_test_ui_menu_callbacks)
 
@@ -1499,6 +1515,7 @@ if(DSD_ENABLE_TERMINAL_UI)
             ${PROJECT_SOURCE_DIR}/include
             ${PROJECT_SOURCE_DIR}/src/app_control
             ${PROJECT_SOURCE_DIR}/src/ui/terminal
+            ${CURSES_INCLUDE_DIRS}
     )
     add_test(NAME UI_MENU_ACTIONS COMMAND dsd-neo_test_ui_menu_actions)
 
@@ -2552,9 +2569,14 @@ add_test(NAME CORE_AUDIO_INPUT_RATE COMMAND dsd-neo_test_core_audio_input_rate)
 add_executable(dsd-neo_test_core_audio_gain core/test_core_audio_gain.c)
 target_include_directories(
     dsd-neo_test_core_audio_gain
-    PRIVATE ${PROJECT_SOURCE_DIR}/include
+    PRIVATE
+        ${PROJECT_SOURCE_DIR}/include
+        ${PROJECT_SOURCE_DIR}/tests/test_support
 )
-target_link_libraries(dsd-neo_test_core_audio_gain PRIVATE dsd-neo_core)
+target_link_libraries(
+    dsd-neo_test_core_audio_gain
+    PRIVATE dsd-neo_core dsd-neo_test_support
+)
 if(NOT APPLE AND NOT WIN32 AND (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang"))
     target_compile_definitions(
         dsd-neo_test_core_audio_gain
@@ -2593,10 +2615,16 @@ target_compile_definitions(
 )
 target_compile_options(
     dsd-neo_test_core_audio2_helpers
-    PRIVATE -ffunction-sections -fdata-sections
+    PRIVATE $<$<NOT:$<C_COMPILER_ID:MSVC>>:-ffunction-sections;-fdata-sections>
 )
-target_link_options(dsd-neo_test_core_audio2_helpers PRIVATE -Wl,--gc-sections)
-target_link_libraries(dsd-neo_test_core_audio2_helpers PRIVATE m)
+target_link_options(
+    dsd-neo_test_core_audio2_helpers
+    PRIVATE $<$<NOT:$<C_COMPILER_ID:MSVC>>:-Wl,--gc-sections>
+)
+target_link_libraries(
+    dsd-neo_test_core_audio2_helpers
+    PRIVATE ${DSD_NEO_TEST_MATH_LIB}
+)
 add_test(NAME CORE_AUDIO2_HELPERS COMMAND dsd-neo_test_core_audio2_helpers)
 
 add_executable(
@@ -3470,9 +3498,12 @@ target_link_libraries(
 )
 target_compile_options(
     dsd-neo_test_p25_p1_tsbk_handlers
-    PRIVATE -ffunction-sections -fdata-sections
+    PRIVATE $<$<NOT:$<C_COMPILER_ID:MSVC>>:-ffunction-sections;-fdata-sections>
 )
-target_link_options(dsd-neo_test_p25_p1_tsbk_handlers PRIVATE -Wl,--gc-sections)
+target_link_options(
+    dsd-neo_test_p25_p1_tsbk_handlers
+    PRIVATE $<$<NOT:$<C_COMPILER_ID:MSVC>>:-Wl,--gc-sections>
+)
 add_test(NAME P25_P1_TSBK_HANDLERS COMMAND dsd-neo_test_p25_p1_tsbk_handlers)
 
 # P25 P1 FEC boundaries: Hamming, Golay, RS correction limits
@@ -3501,9 +3532,9 @@ target_include_directories(
 )
 target_compile_options(
     dsd-neo_test_p25_p1_hdu_helpers
-    PRIVATE -ffunction-sections -fdata-sections
+    PRIVATE $<$<NOT:$<C_COMPILER_ID:MSVC>>:-ffunction-sections;-fdata-sections>
 )
-target_link_options(dsd-neo_test_p25_p1_hdu_helpers PRIVATE -Wl,--gc-sections)
+target_link_options(dsd-neo_test_p25_p1_hdu_helpers PRIVATE $<$<NOT:$<C_COMPILER_ID:MSVC>>:-Wl,--gc-sections>)
 add_test(NAME P25_P1_HDU_HELPERS COMMAND dsd-neo_test_p25_p1_hdu_helpers)
 
 # P25 P1 common LDU IMBE/status and Hamming helpers
@@ -3517,9 +3548,9 @@ target_include_directories(
 )
 target_compile_options(
     dsd-neo_test_p25_p1_ldu_helpers
-    PRIVATE -ffunction-sections -fdata-sections
+    PRIVATE $<$<NOT:$<C_COMPILER_ID:MSVC>>:-ffunction-sections;-fdata-sections>
 )
-target_link_options(dsd-neo_test_p25_p1_ldu_helpers PRIVATE -Wl,--gc-sections)
+target_link_options(dsd-neo_test_p25_p1_ldu_helpers PRIVATE $<$<NOT:$<C_COMPILER_ID:MSVC>>:-Wl,--gc-sections>)
 add_test(NAME P25_P1_LDU_HELPERS COMMAND dsd-neo_test_p25_p1_ldu_helpers)
 
 # P25 P1 LDU1 LCW/LSD packing and soft RS reliability helpers
@@ -3533,9 +3564,9 @@ target_include_directories(
 )
 target_compile_options(
     dsd-neo_test_p25_p1_ldu1_helpers
-    PRIVATE -ffunction-sections -fdata-sections
+    PRIVATE $<$<NOT:$<C_COMPILER_ID:MSVC>>:-ffunction-sections;-fdata-sections>
 )
-target_link_options(dsd-neo_test_p25_p1_ldu1_helpers PRIVATE -Wl,--gc-sections)
+target_link_options(dsd-neo_test_p25_p1_ldu1_helpers PRIVATE $<$<NOT:$<C_COMPILER_ID:MSVC>>:-Wl,--gc-sections>)
 add_test(NAME P25_P1_LDU1_HELPERS COMMAND dsd-neo_test_p25_p1_ldu1_helpers)
 
 # P25 P1 LDU2 ESS/LSD packing and soft RS reliability helpers
@@ -3549,9 +3580,9 @@ target_include_directories(
 )
 target_compile_options(
     dsd-neo_test_p25_p1_ldu2_helpers
-    PRIVATE -ffunction-sections -fdata-sections
+    PRIVATE $<$<NOT:$<C_COMPILER_ID:MSVC>>:-ffunction-sections;-fdata-sections>
 )
-target_link_options(dsd-neo_test_p25_p1_ldu2_helpers PRIVATE -Wl,--gc-sections)
+target_link_options(dsd-neo_test_p25_p1_ldu2_helpers PRIVATE $<$<NOT:$<C_COMPILER_ID:MSVC>>:-Wl,--gc-sections>)
 add_test(NAME P25_P1_LDU2_HELPERS COMMAND dsd-neo_test_p25_p1_ldu2_helpers)
 
 # P25 P1 MDPU header, candidate, and CRC assembly helpers
@@ -3565,9 +3596,9 @@ target_include_directories(
 )
 target_compile_options(
     dsd-neo_test_p25_p1_mdpu_helpers
-    PRIVATE -ffunction-sections -fdata-sections
+    PRIVATE $<$<NOT:$<C_COMPILER_ID:MSVC>>:-ffunction-sections;-fdata-sections>
 )
-target_link_options(dsd-neo_test_p25_p1_mdpu_helpers PRIVATE -Wl,--gc-sections)
+target_link_options(dsd-neo_test_p25_p1_mdpu_helpers PRIVATE $<$<NOT:$<C_COMPILER_ID:MSVC>>:-Wl,--gc-sections>)
 target_link_libraries(
     dsd-neo_test_p25_p1_mdpu_helpers
     PRIVATE dsd-neo_proto_p25 dsd-neo_proto_dmr
@@ -6264,7 +6295,7 @@ target_include_directories(
 )
 target_link_libraries(
     dsd-neo_test_io_rigctl_control
-    PRIVATE ${DSD_NEO_TEST_MATH_LIB}
+    PRIVATE ${DSD_NEO_TEST_MATH_LIB} ${DSD_PLATFORM_LIBS}
 )
 add_test(NAME IO_RIGCTL_CONTROL COMMAND dsd-neo_test_io_rigctl_control)
 
@@ -6279,6 +6310,7 @@ target_include_directories(
     dsd-neo_test_io_udp_socket_backends
     PRIVATE ${PROJECT_SOURCE_DIR}/include
 )
+target_link_libraries(dsd-neo_test_io_udp_socket_backends PRIVATE ${DSD_PLATFORM_LIBS})
 add_test(
     NAME IO_UDP_SOCKET_BACKENDS
     COMMAND dsd-neo_test_io_udp_socket_backends
@@ -6328,8 +6360,9 @@ target_compile_definitions(
 )
 target_include_directories(
     dsd-neo_test_io_rtl_perf
-    PRIVATE ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src/io/radio
+    PRIVATE ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src/io/radio ${PROJECT_SOURCE_DIR}/tests/test_support
 )
+target_link_libraries(dsd-neo_test_io_rtl_perf PRIVATE dsd-neo_test_support)
 add_test(NAME IO_RTL_PERF COMMAND dsd-neo_test_io_rtl_perf)
 
 add_executable(
