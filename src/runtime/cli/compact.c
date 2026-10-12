@@ -60,6 +60,7 @@ static const char* const k_skip_exact_no_arg[] = {
     "--auto-ppm",
     "--rtltcp-autotune",
     "--iq-loop",
+    "--tetra-uplink",
     "--rdio-api-delete-after-upload",
     "--enc-lockout",
     "--enc-follow",
@@ -150,6 +151,7 @@ static const char* const k_skip_exact_next_nonnull[] = {
 
 static const char* const k_skip_exact_next_nonopt[] = {
     "--lrrp-extra-port", "--rtl-udp-control", "--rtl-udp-control-bind", "--config", "--validate-config",
+    "--tetra-net",
 };
 
 static const char* const k_skip_prefix[] = {
@@ -175,6 +177,7 @@ static const char* const k_skip_prefix[] = {
     "--iq-replay=",
     "--iq-replay-rate=",
     "--iq-info=",
+    "--tetra-net=",
     "--dmr-baofeng-pc5=",
     "--dmr-csi-ee72=",
     "--dmr-vertex-ks-csv=",

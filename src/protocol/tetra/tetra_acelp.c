@@ -134,6 +134,20 @@ void tetra_acelp_reorder(const uint8_t* in, uint8_t* out, int len) {
     }
 }
 
+/* Half-slot speech (frame stealing): one frame, same class order as table 6 of
+ * EN 300 395-2 (51 class 0, 56 class 1, 30 class 2), no A/B interleave. */
+static void tetra_acelp_reorder_half(const uint8_t* in, uint8_t* out) {
+    const uint8_t *cur = in;
+    for (int bit = 0; bit < NUM_ACELP_CLASS0_BITS; bit++)
+        out[class0_positions[bit] - 1] = cur[bit];
+    cur += NUM_ACELP_CLASS0_BITS;
+    for (int bit = 0; bit < NUM_ACELP_CLASS1_BITS; bit++)
+        out[class1_positions[bit] - 1] = cur[bit];
+    cur += NUM_ACELP_CLASS1_BITS;
+    for (int bit = 0; bit < NUM_ACELP_CLASS2_BITS; bit++)
+        out[class2_positions[bit] - 1] = cur[bit];
+}
+
 /* =========================================================================
  * Persistent external vocoder subprocess
  *
@@ -553,9 +567,26 @@ void tetra_acelp_decode(const uint8_t* bits, int len) {
  * @block_idx  : 0 for combined TCH/FS (informational)
  * @opts/state : standard dsd-neo context
  * ------------------------------------------------------------------------- */
+static void tetra_acelp_process_impl(const uint8_t *type2_bits, int type2_len,
+                                     int block_idx, int half,
+                                     dsd_opts *opts, dsd_state *state);
+
 void tetra_acelp_process_tch(const uint8_t *type2_bits, int type2_len,
                               int block_idx,
                               dsd_opts *opts, dsd_state *state)
+{
+    tetra_acelp_process_impl(type2_bits, type2_len, block_idx, 0, opts, state);
+}
+
+void tetra_acelp_process_tch_half(const uint8_t *type2_bits, int type2_len,
+                                  dsd_opts *opts, dsd_state *state)
+{
+    tetra_acelp_process_impl(type2_bits, type2_len, 0, 1, opts, state);
+}
+
+static void tetra_acelp_process_impl(const uint8_t *type2_bits, int type2_len,
+                                     int block_idx, int half,
+                                     dsd_opts *opts, dsd_state *state)
 {
     static int warned_gate = 0;
     static int warned_missing_cmd = 0;
@@ -591,10 +622,11 @@ void tetra_acelp_process_tch(const uint8_t *type2_bits, int type2_len,
         return;
     }
 
-    if (type2_len < 274) {
+    const int need_bits = half ? TETRA_TCH_FRAME_BITS : 2 * TETRA_TCH_FRAME_BITS;
+    if (type2_len < need_bits) {
         fprintf(stderr,
-            "[TETRA TCH] B%d: only %d type-2 bits (need 274), skipping\n",
-            block_idx, type2_len);
+            "[TETRA TCH] B%d: only %d type-2 bits (need %d), skipping\n",
+            block_idx, type2_len, need_bits);
         return;
     }
 
@@ -605,7 +637,10 @@ void tetra_acelp_process_tch(const uint8_t *type2_bits, int type2_len,
     /* —— Step 1: class reorder → 2 codec frames —— */
     uint8_t codec[2 * TETRA_TCH_FRAME_BITS];  /* 274 bytes */
     memset(codec, 0, sizeof(codec));
-    tetra_acelp_reorder(type2_bits, codec, type2_len);
+    if (half)
+        tetra_acelp_reorder_half(type2_bits, codec);
+    else
+        tetra_acelp_reorder(type2_bits, codec, type2_len);
 
     /* —— Step 2: vocoder + audio routing for each frame —— */
     if (!voc_ensure_open()) {
@@ -667,7 +702,7 @@ void tetra_acelp_process_tch(const uint8_t *type2_bits, int type2_len,
         last_live_audio_time = now;
     }
 
-    for (int f = 0; f < 2; f++) {
+    for (int f = 0; f < (half ? 1 : 2); f++) {
         const uint8_t *frame = codec + f * TETRA_TCH_FRAME_BITS;
 
         int16_t pcm[TETRA_TCH_FRAME_SAMPLES];

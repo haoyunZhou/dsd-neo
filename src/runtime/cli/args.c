@@ -25,6 +25,7 @@
 #include <dsd-neo/io/iq_replay.h>
 #include <dsd-neo/io/iq_types.h>
 #include <dsd-neo/platform/audio.h>
+#include <dsd-neo/protocol/tetra/tetra_fec.h>
 #include <dsd-neo/platform/file_compat.h>
 #include <dsd-neo/platform/platform.h>
 #include <dsd-neo/platform/posix_compat.h>
@@ -793,6 +794,41 @@ cli_parse_airspy_option(int argc, char** argv, int i, dsd_opts* opts) {
         }                                                                                                              \
         if (strcmp(argv[i], "--iq-loop") == 0) {                                                                       \
             iq_loop_cli = 1;                                                                                           \
+            continue;                                                                                                  \
+        }                                                                                                              \
+        if (strcmp(argv[i], "--tetra-uplink") == 0) {                                                                  \
+            state->tetra_uplink = 1;                                                                                   \
+            LOG_INFO("NOTICE: TETRA uplink bursts enabled\n");                                                         \
+            continue;                                                                                                  \
+        }                                                                                                              \
+        if (strcmp(argv[i], "--tetra-net") == 0 || strncmp(argv[i], "--tetra-net=", 12) == 0) {                        \
+            const char* net = (argv[i][11] == '=') ? argv[i] + 12 : NULL;                                             \
+            unsigned mcc = 0;                                                                                          \
+            unsigned mnc = 0;                                                                                          \
+            int colour = 0;                                                                                            \
+            if (net == NULL) {                                                                                         \
+                if (i + 1 >= argc) {                                                                                   \
+                    LOG_ERROR("--tetra-net requires mcc,mnc,colour\n");                                                \
+                    cli_set_exit_rc(out_exit_rc, 1);                                                                   \
+                    return DSD_PARSE_ERROR;                                                                            \
+                }                                                                                                      \
+                net = DSD_PARSE_ARGS_NEXT_ARG();                                                                       \
+            }                                                                                                          \
+            if (!state->tetra_net_known) {                                                                             \
+                if (sscanf(net, "%u,%u,%i", &mcc, &mnc, &colour) != 3) {                                               \
+                    LOG_ERROR("--tetra-net requires mcc,mnc,colour (for example 86,28,0x19)\n");                       \
+                    cli_set_exit_rc(out_exit_rc, 1);                                                                   \
+                    return DSD_PARSE_ERROR;                                                                            \
+                }                                                                                                      \
+                state->tetra_mcc = (uint16_t)(mcc & 0x3FFu);                                                           \
+                state->tetra_mnc = (uint16_t)(mnc & 0x3FFFu);                                                          \
+                state->tetra_colour = (uint8_t)(colour & 0x3Fu);                                                       \
+                state->tetra_lfsr_seed =                                                                               \
+                    tetra_compute_scramb_seed(state->tetra_mcc, state->tetra_mnc, state->tetra_colour);                \
+                state->tetra_net_known = 1;                                                                            \
+                LOG_INFO("NOTICE: TETRA network MCC=%u MNC=%u colour=%u\n", mcc & 0x3FFu, mnc & 0x3FFFu,               \
+                         (unsigned)(colour & 0x3F));                                                                   \
+            }                                                                                                          \
             continue;                                                                                                  \
         }                                                                                                              \
         if (strcmp(argv[i], "--iq-info") == 0) {                                                                       \

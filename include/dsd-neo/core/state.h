@@ -1871,6 +1871,13 @@ struct dsd_state {
      * mapping; 1..3 correct a Costas phase that still correlates the training
      * word but not against the unrotated pattern. */
     uint8_t tetra_phase_rot;
+    /* tetra_uplink: 1 when TETRA_UPLINK is set. Normal bursts are then NUBs
+     * (EN 300 392-2 table 9.5): the same training sequence as a downlink NDB,
+     * but block 1 sits directly against it (no AACH). Scrambling stays the
+     * TMO colour code, from a BSCH or from TETRA_NET=mcc,mnc,colour.
+     * tetra_cb: this sync is a control uplink burst (extended training). */
+    uint8_t tetra_uplink;
+    uint8_t tetra_cb;
 
     /* tetra_sb1_dibuf: 60 hard dibits of the BSCH block captured from the
      * synchronisation burst (SB) scan window at SSB detection.
@@ -1896,6 +1903,32 @@ struct dsd_state {
     uint16_t tetra_mnc;
     uint8_t  tetra_colour;
     uint32_t tetra_lfsr_seed;
+
+    /* ───────────────────────────────────────────────────────────────────────
+     * TETRA Direct Mode Operation (DMO, EN 300 396-2/-3).
+     *
+     * tetra_dmo:           1 once a DSB (SCH/S with a DMO system code) has been
+     *                      decoded; selects DNB block layout (no AACH) and the
+     *                      DM colour code scrambler. Cleared by a TMO BSCH.
+     * tetra_dmo_dcc_valid: 1 when tetra_dmo_dcc_seed was derived from a
+     *                      DM-SETUP / DM-CONNECT ACK / DM-OCCUPIED DMAC-SYNC.
+     * tetra_dmo_dcc_seed:  LFSR seed for SCH/F, STCH and TCH.
+     * tetra_dmo_since_sync: DNBs processed since the last DSB (staleness).
+     * ───────────────────────────────────────────────────────────────────────── */
+    uint8_t  tetra_dmo;
+    uint8_t  tetra_dmo_dcc_valid;
+    uint8_t  tetra_dmo_slot;
+    uint8_t  tetra_dmo_frame;
+    uint8_t  tetra_dmo_comm_type;
+    uint8_t  tetra_dmo_ab_usage;
+    uint8_t  tetra_dmo_enc_state;
+    uint8_t  tetra_dmo_msg_type;
+    uint16_t tetra_dmo_since_sync;
+    uint32_t tetra_dmo_dcc_seed;
+    uint32_t tetra_dmo_mni;
+    uint32_t tetra_dmo_src;
+    uint32_t tetra_dmo_dst;
+    uint32_t tetra_dmo_sync_count;
 
     /* ───────────────────────────────────────────────────────────────────────
      * TETRA network parameters — populated by MAC-BROADCAST/SYSINFO (MLE).

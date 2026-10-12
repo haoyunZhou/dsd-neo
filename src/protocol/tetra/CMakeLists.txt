@@ -11,6 +11,7 @@ target_sources(dsd-neo_proto_tetra PRIVATE
   tetra_trunk_sm.c
   tetra_tch_slot_gate.c
   tetra_bsch.c
+  tetra_dmo.c
   tetra_bsch_fmt.c
   tetra_channel_info.c
   osmo_sources/tetra_conv_enc.c

@@ -82,6 +82,14 @@ void tetra_acelp_process_tch(const uint8_t *type2_bits, int type2_len,
                              struct dsd_opts *opts, struct dsd_state *state);
 
 /*
+ * Half-slot speech (the other half of the slot was stolen for signalling):
+ * one 137-bit frame, 51 class-0 + 56 class-1 + 30 class-2 bits in the order of
+ * EN 300 395-2 table 6. Produces one 30 ms PCM frame.
+ */
+void tetra_acelp_process_tch_half(const uint8_t *type2_bits, int type2_len,
+                                  struct dsd_opts *opts, struct dsd_state *state);
+
+/*
  * Close the persistent vocoder subprocess if it is running.
  * Call on protocol reset, channel change, or application exit.
  */

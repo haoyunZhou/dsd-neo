@@ -88,6 +88,23 @@ void tetra_speech_deinterleave_soft(const uint16_t* in_costs, uint16_t* out_cost
  * ACELP bits for two 30 ms speech frames. Returns 274 or -1. */
 int tetra_speech_channel_decode(const uint16_t* deinterleaved, uint8_t* out_bits, int out_len);
 
+/* Same decode, also reporting how many of the 330 received channel bits
+ * disagree with a re-encode of the decoded bits (-1 on error). */
+int tetra_speech_channel_decode_q(const uint16_t* deinterleaved, uint8_t* out_bits, int out_len, int* mismatches);
+
+/* SCH/HU (EN 300 392-2 8.3.1.4.3): 168 descrambled type-4 soft costs to 92
+ * MAC bits. Returns 1 when the CRC-16 passes. */
+int tetra_sch_hu_decode(const uint16_t* type4, uint8_t* out_bits);
+
+/* Decode one half-slot TCH/S block (EN 300 395-2 5.6; one 137-bit speech frame
+ * in 216 type-3 bits). `deinterleaved` is the 216 type-3 soft costs after the
+ * (216,101) block deinterleaver. `out_bits` receives 137 sensitivity-ordered
+ * bits (51 class 0, 56 class 1, 30 class 2). `crc_ok` is set when the 4-bit
+ * class-2 CRC matches; `mismatches` counts received-vs-re-encoded channel-bit
+ * disagreements out of 51-less 165 coded bits (-1 on error).
+ * Returns 137 or -1. */
+int tetra_speech_half_decode(const uint16_t* deinterleaved, uint8_t* out_bits, int* crc_ok, int* mismatches);
+
 /* Helper: select interleaver dimensions for a given puncturer/frame length.
  * Returns 0 on success, -1 on unknown mapping.
  */

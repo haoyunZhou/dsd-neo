@@ -24,6 +24,8 @@
 #include <dsd-neo/protocol/tetra/tetra_acelp.h>
 #include <dsd-neo/protocol/tetra/tetra_sync.h>
 #include <dsd-neo/protocol/tetra/tetra_bsch.h>
+#include <dsd-neo/protocol/tetra/tetra_dmo.h>
+#include <dsd-neo/protocol/tetra/tetra_bits.h>
 #include <dsd-neo/protocol/tetra/tetra_fec.h>
 #include <dsd-neo/protocol/tetra/tetra_mac.h>
 #include <dsd-neo/protocol/tetra/tetra_trunk_sm.h>
@@ -79,9 +81,9 @@ static uint32_t tetra_lfsr_seed_for(const dsd_state *state, int cc)
  * half-slot (SCH/HD) restarts the LFSR, but NTS1 is one 432-bit scrambled
  * block and must be descrambled only after the two halves are joined.
  * ------------------------------------------------------------------------- */
-static void tetra_prepare_block(const uint8_t *dibuf, const float *soft_in,
-                                int cc, dsd_state *state,
-                                uint16_t *out_soft, int descramble)
+static void tetra_prepare_block_seed(const uint8_t *dibuf, const float *soft_in,
+                                     uint32_t seed, dsd_state *state,
+                                     uint16_t *out_soft, int descramble)
 {
     uint8_t  hard_bits [TETRA_NDB_BLOCK_BITS];
     uint16_t soft_costs[TETRA_NDB_BLOCK_BITS];
@@ -115,9 +117,17 @@ static void tetra_prepare_block(const uint8_t *dibuf, const float *soft_in,
     }
 
     if (descramble)
-        tetra_descramble_soft(soft_costs, TETRA_NDB_BLOCK_BITS, tetra_lfsr_seed_for(state, cc));
+        tetra_descramble_soft(soft_costs, TETRA_NDB_BLOCK_BITS, seed);
 
     memcpy(out_soft, soft_costs, sizeof(uint16_t) * TETRA_NDB_BLOCK_BITS);
+}
+
+static void tetra_prepare_block(const uint8_t *dibuf, const float *soft_in,
+                                int cc, dsd_state *state,
+                                uint16_t *out_soft, int descramble)
+{
+    tetra_prepare_block_seed(dibuf, soft_in, tetra_lfsr_seed_for(state, cc),
+                             state, out_soft, descramble);
 }
 
 /* -------------------------------------------------------------------------
@@ -126,34 +136,40 @@ static void tetra_prepare_block(const uint8_t *dibuf, const float *soft_in,
  * SCH-HD path: depuncture a single 216-bit block with rate 2/3,
  * Viterbi decode, and dispatch to MAC parser.
  * ------------------------------------------------------------------------- */
-static void tetra_decode_schd(const uint16_t *soft, int cc, int block_idx,
-                              dsd_opts *opts, dsd_state *state)
+/* Shared SCH/HD (and STCH) FEC: one descrambled 216-bit block -> 124 type-1
+ * bits. Returns 1 when the CRC-16 passes; `decoded` needs 256 bytes. */
+static int tetra_hd_decode_bits(const uint16_t *soft, uint8_t *decoded)
 {
-    const int punct_id   = TETRA_RCPC_PUNCT_2_3;
     const int type1_len  = 124;
     const int type2_len  = 144; /* 124 payload + 16 CRC + 4 zero tail */
     const int depunc_len = type2_len * 4;
 
     uint16_t *depunc = (uint16_t *)malloc(sizeof(uint16_t) * (size_t)depunc_len);
-    if (!depunc) {
-        fprintf(stderr, "[TETRA SCH B%d] depunc malloc failed\n", block_idx);
-        return;
-    }
+    if (!depunc)
+        return 0;
     uint16_t deint_soft[TETRA_NDB_BLOCK_BITS];
     tetra_block_deinterleave_soft(soft, deint_soft,
                                   TETRA_NDB_BLOCK_BITS,
                                   TETRA_BLOCK_ROWS, TETRA_BLOCK_COLS);
-    tetra_rcpc_depuncture_by_id(punct_id, deint_soft, TETRA_NDB_BLOCK_BITS,
+    tetra_rcpc_depuncture_by_id(TETRA_RCPC_PUNCT_2_3, deint_soft, TETRA_NDB_BLOCK_BITS,
                                 depunc, depunc_len);
 
-    uint8_t decoded[256];
-    memset(decoded, 0, sizeof(decoded));
-    int dec_len = tetra_viterbi_decode_soft(depunc, depunc_len,
-                                            decoded, (int)sizeof(decoded));
+    memset(decoded, 0, 256);
+    int dec_len = tetra_viterbi_decode_soft(depunc, depunc_len, decoded, 256);
     free(depunc);
 
-    const int crc_ok = dec_len >= type2_len
-                       && tetra_crc16_ccitt_bits(decoded, type1_len + 16) == 0x1D0Fu;
+    return dec_len >= type2_len
+           && tetra_crc16_ccitt_bits(decoded, type1_len + 16) == 0x1D0Fu;
+}
+
+static int tetra_decode_schd(const uint16_t *soft, int cc, int block_idx,
+                             dsd_opts *opts, dsd_state *state)
+{
+    const int type1_len  = 124;
+    uint8_t decoded[256];
+    (void)block_idx;
+
+    const int crc_ok = tetra_hd_decode_bits(soft, decoded);
     if (crc_ok)
         state->tetra_decode_ok++;
     else
@@ -161,7 +177,10 @@ static void tetra_decode_schd(const uint16_t *soft, int cc, int block_idx,
 
     if (crc_ok)
         tetra_mac_parse_schd(decoded, type1_len, cc, opts, state);
+    return crc_ok;
 }
+
+static int tetra_decode_tch_half(const uint16_t *soft_block, dsd_opts *opts, dsd_state *state);
 
 /* -------------------------------------------------------------------------
  * TCH/FS combined decode constants
@@ -172,6 +191,11 @@ static void tetra_decode_schd(const uint16_t *soft, int cc, int block_idx,
  *
  * ETSI EN 300 392-2 §8.3 Table 8.7 / EN 300 395-2 §6
  * ------------------------------------------------------------------------- */
+/* Max received-vs-re-encoded channel-bit disagreements (of 330) for a DMO
+ * speech burst to be passed to the vocoder. Valid bursts measured 0..16 on
+ * real air; wrong-scrambler/noise bursts 36..44. */
+#define TETRA_DMO_TCH_MAX_MISMATCH 28
+
 #define TETRA_TCH_FS_CODED_BITS   432  /* 2 × 216 = combined blocks       */
 #define TETRA_TCH_FS_TYPE2_BITS   274  /* two complete 137-bit frames */
 
@@ -210,7 +234,19 @@ static void tetra_decode_tch_fs(const uint16_t *soft_b1, const uint16_t *soft_b2
     /* Step 2: Decode the speech-specific class-0 / rate-1/3 RCPC layout. */
     uint8_t decoded[TETRA_TCH_FS_TYPE2_BITS];
     memset(decoded, 0, sizeof(decoded));
-    int dec_len = tetra_speech_channel_decode(deint, decoded, (int)sizeof(decoded));
+    int mismatches = -1;
+    int dec_len = tetra_speech_channel_decode_q(deint, decoded, (int)sizeof(decoded), &mismatches);
+
+    /* DMO: the speech code has no CRC, but with the right DM colour code a
+     * burst re-encodes to within a few bits of what was received, while a
+     * wrong-seed or noise burst disagrees in ~40 of 330 bits. Drop those
+     * instead of feeding noise to the vocoder. TMO keeps its old behaviour. */
+    if ((state->tetra_dmo || state->tetra_uplink) && mismatches > TETRA_DMO_TCH_MAX_MISMATCH) {
+        state->tetra_decode_errors++;
+        if (opts->errorbars)
+            fprintf(stderr, "[TETRA TCH/S] dropped: %d channel-bit mismatches\n", mismatches);
+        return;
+    }
 
     if (dec_len > 0)
         state->tetra_decode_ok++;
@@ -253,14 +289,42 @@ static void tetra_decode_tch_fs(const uint16_t *soft_b1, const uint16_t *soft_b2
     }
 }
 
+/* Half-slot TCH/S (EN 300 395-2 5.6): one speech frame in a 216-bit block while
+ * the other half of the slot carried STCH. Returns 1 when a frame was passed
+ * to the vocoder. The 4-bit class-2 CRC alone passes 1 in 16 random blocks, so
+ * it is combined with the re-encode mismatch count (of 165 coded bits; random
+ * blocks average ~23). */
+#define TETRA_DMO_HALF_MAX_MISMATCH 16
+
+static int tetra_decode_tch_half(const uint16_t *soft_block, dsd_opts *opts, dsd_state *state)
+{
+    uint16_t deint[TETRA_NDB_BLOCK_BITS];
+    uint8_t  bits[137];
+    int crc_ok = 0, mismatches = -1;
+
+    tetra_block_deinterleave_soft(soft_block, deint, TETRA_NDB_BLOCK_BITS,
+                                  TETRA_BLOCK_ROWS, TETRA_BLOCK_COLS);
+    if (tetra_speech_half_decode(deint, bits, &crc_ok, &mismatches) != 137)
+        return 0;
+
+    if (!crc_ok || mismatches > TETRA_DMO_HALF_MAX_MISMATCH) {
+        state->tetra_decode_errors++;
+        return 0;
+    }
+    state->tetra_decode_ok++;
+    snprintf(state->fsubtype, sizeof(state->fsubtype), " STCH+TCH     ");
+    if (opts->payload || opts->errorbars)
+        fprintf(stderr, "[TETRA TCH/H] crc=%d mismatches=%d\n", crc_ok, mismatches);
+    tetra_acelp_process_tch_half(bits, 137, opts, state);
+    return 1;
+}
+
 /* SCH/F uses the same 432 descrambled bits as TCH/FS, then a different
  * interleaver (a=103) and rate-2/3 code. A matching CRC-16 means this NTS1
  * burst is signalling: dispatch its MAC payload instead of discarding it. */
-static int tetra_decode_schf(const uint16_t *type4, int cc,
-                             dsd_opts *opts, dsd_state *state)
+static int tetra_schf_decode_bits(const uint16_t *type4, uint8_t *decoded)
 {
     uint16_t deint[TETRA_SCHF_BITS];
-    uint8_t decoded[TETRA_SCHF_TYPE2];
     uint16_t *depunc = (uint16_t *)malloc(sizeof(uint16_t) * TETRA_SCHF_DEPUNC);
     if (!depunc)
         return 0;
@@ -268,13 +332,22 @@ static int tetra_decode_schf(const uint16_t *type4, int cc,
     tetra_block_deinterleave_soft(type4, deint, TETRA_SCHF_BITS, TETRA_SCHF_A, 0);
     tetra_rcpc_depuncture_by_id(TETRA_RCPC_PUNCT_2_3, deint, TETRA_SCHF_BITS,
                                 depunc, TETRA_SCHF_DEPUNC);
-    memset(decoded, 0, sizeof(decoded));
+    memset(decoded, 0, TETRA_SCHF_TYPE2);
     int dec_len = tetra_viterbi_decode_soft(depunc, TETRA_SCHF_DEPUNC,
-                                            decoded, (int)sizeof(decoded));
+                                            decoded, TETRA_SCHF_TYPE2);
     free(depunc);
     if (dec_len < TETRA_SCHF_TYPE2)
         return 0;
     if (tetra_crc16_ccitt_bits(decoded, TETRA_SCHF_TYPE1 + 16) != TETRA_CRC_OK)
+        return 0;
+    return 1;
+}
+
+static int tetra_decode_schf(const uint16_t *type4, int cc,
+                             dsd_opts *opts, dsd_state *state)
+{
+    uint8_t decoded[TETRA_SCHF_TYPE2];
+    if (!tetra_schf_decode_bits(type4, decoded))
         return 0;
     tetra_mac_parse_schd(decoded, TETRA_SCHF_TYPE1, cc, opts, state);
     return 1;
@@ -286,9 +359,283 @@ static int tetra_decode_schf(const uint16_t *type4, int cc,
  * Called by the engine after NDB NTS sync is confirmed.
  * Phase 4: decode Block 1 (from scan-window capture) then Block 2 (live).
  * ------------------------------------------------------------------------- */
+/* -------------------------------------------------------------------------
+ * DMO normal burst (DNB), EN 300 396-2 clause 9.4.3.2.1.
+ *
+ * No AACH: block 1 is the 108 dibits right before the training sequence (the
+ * frame-sync capture already picked those up for DMO) and block 2 starts
+ * right after it. NTS1 (preamble P1) carries TCH or SCH/F in one 432-bit
+ * block; NTS2 (P2) carries STCH + STCH or STCH + TCH in two 216-bit halves.
+ * Everything except the DSB is scrambled with the DM colour code that
+ * tetra_dmo_apply_sync() derived from the call's DMAC-SYNC.
+ * ------------------------------------------------------------------------- */
+#define TETRA_DMO_DCC_STALE_BURSTS 200u
+
+static void tetra_dmo_process_ndb(dsd_opts *opts, dsd_state *state)
+{
+    uint8_t b2_dibuf[TETRA_NDB_BLOCK_DIBITS];
+    float   b2_soft_in[TETRA_NDB_BLOCK_DIBITS];
+    const int b1_valid = state->tetra_b1_valid;
+
+    for (int i = 0; i < TETRA_NDB_BLOCK_DIBITS; i++)
+        b2_dibuf[i] = (uint8_t)getDibitAndSoftSymbol(opts, state, &b2_soft_in[i]);
+
+    snprintf(state->fsubtype, sizeof(state->fsubtype),
+             state->tetra_nts2 ? " DNB NTS2     " : " DNB NTS1     ");
+    snprintf(state->ftype, sizeof(state->ftype), " TETRA DMO");
+
+    if (state->tetra_dmo_since_sync < 0xFFFFu)
+        state->tetra_dmo_since_sync++;
+    if (state->tetra_dmo_dcc_valid && state->tetra_dmo_since_sync > TETRA_DMO_DCC_STALE_BURSTS)
+        state->tetra_dmo_dcc_valid = 0;
+
+    if (opts->errorbars) {
+        fprintf(stderr, " [TETRA DNB  NTS%d  pol=%d rot=%d dcc=%d]",
+                state->tetra_nts2 ? 2 : 1, (int)state->tetra_polarity,
+                (int)(state->tetra_phase_rot & 3), (int)state->tetra_dmo_dcc_valid);
+    }
+
+    if (state->tetra_dmo_dcc_valid && b1_valid) {
+        const uint32_t seed = state->tetra_dmo_dcc_seed;
+        uint16_t b1_soft[TETRA_NDB_BLOCK_BITS];
+        uint16_t b2_soft[TETRA_NDB_BLOCK_BITS];
+        uint8_t  decoded[TETRA_SCHF_TYPE2];
+        const float *b1_soft_in = state->tetra_b1_soft_valid ? state->tetra_b1_soft : NULL;
+
+        if (state->tetra_nts2) {
+            /* Each half-slot restarts the scrambler. */
+            tetra_prepare_block_seed(state->tetra_b1_dibuf, b1_soft_in, seed, state, b1_soft, 1);
+            if (tetra_hd_decode_bits(b1_soft, decoded)) {
+                state->tetra_decode_ok++;
+                tetra_dmo_log_dnb_pdu(decoded, 124, "STCH-1", state);
+            } else {
+                state->tetra_decode_errors++;
+            }
+            tetra_prepare_block_seed(b2_dibuf, b2_soft_in, seed, state, b2_soft, 1);
+            if (tetra_hd_decode_bits(b2_soft, decoded)) {
+                state->tetra_decode_ok++;
+                tetra_dmo_log_dnb_pdu(decoded, 124, "STCH-2", state);
+            } else {
+                /* Not STCH: the other half of a stolen slot is half-slot TCH/S. */
+                (void)tetra_decode_tch_half(b2_soft, opts, state);
+            }
+        } else {
+            uint16_t type4[TETRA_SCHF_BITS];
+            tetra_prepare_block_seed(state->tetra_b1_dibuf, b1_soft_in, seed, state, b1_soft, 0);
+            tetra_prepare_block_seed(b2_dibuf, b2_soft_in, seed, state, b2_soft, 0);
+            memcpy(type4, b1_soft, sizeof(b1_soft));
+            memcpy(type4 + TETRA_NDB_BLOCK_BITS, b2_soft, sizeof(b2_soft));
+            /* One LFSR run covers block 1 and block 2 (EN 300 396-2 8.3.1.3, 8.3.2.4). */
+            tetra_descramble_soft(type4, TETRA_SCHF_BITS, seed);
+
+            if (tetra_schf_decode_bits(type4, decoded)) {
+                state->tetra_decode_ok++;
+                snprintf(state->fsubtype, sizeof(state->fsubtype), " DNB SCH/F     ");
+                tetra_dmo_log_dnb_pdu(decoded, TETRA_SCHF_TYPE1, "SCH/F", state);
+            } else {
+                tetra_decode_tch_fs(type4, type4 + TETRA_NDB_BLOCK_BITS, 0, opts, state);
+            }
+        }
+    }
+
+    state->tetra_b1_valid = 0;
+    state->tetra_b1_soft_valid = 0;
+
+    tetra_sm_tick(opts, state);
+    if (dsd_opts_frontend_active(opts))
+        dsd_telemetry_publish_both_and_redraw(opts, state);
+    watchdog_event_history(opts, state, 0);
+    watchdog_event_current(opts, state, 0);
+}
+
+void tetra_uplink_configure(dsd_state* state)
+{
+    static int once = 0;
+    const char* net;
+    unsigned mcc = 0, mnc = 0;
+    int colour = 0;
+    if (once || !state)
+        return;
+    once = 1;
+
+    net = getenv("TETRA_UPLINK");
+    if (net && (net[0] == '1' || net[0] == 'y' || net[0] == 'Y'))
+        state->tetra_uplink = 1;
+
+    /* Uplink-only reception never sees a BSCH, so the colour code has to be
+     * supplied. Decimal or 0x colour: TETRA_NET=86,28,0x19. A later BSCH
+     * overwrites this. */
+    net = getenv("TETRA_NET");
+    if (!net || state->tetra_net_known || sscanf(net, "%u,%u,%i", &mcc, &mnc, &colour) != 3)
+        return;
+    state->tetra_mcc = (uint16_t)(mcc & 0x3FFu);
+    state->tetra_mnc = (uint16_t)(mnc & 0x3FFFu);
+    state->tetra_colour = (uint8_t)(colour & 0x3F);
+    state->tetra_lfsr_seed = tetra_compute_scramb_seed(state->tetra_mcc, state->tetra_mnc, state->tetra_colour);
+    state->tetra_net_known = 1;
+}
+
+/* Expand `count` dibits with the same phase and polarity correction as a
+ * downlink block. Descrambling is left to the caller. */
+static void tetra_expand_dibits(const uint8_t* dibuf, const float* soft_in, int count,
+                                dsd_state* state, uint16_t* out_soft)
+{
+    const int phase_rot = state->tetra_phase_rot & 3;
+    if (phase_rot != 0)
+        soft_in = NULL;
+    for (int i = 0; i < count; i++) {
+        const uint8_t d = (uint8_t)((tetra_dibit_derotate(dibuf[i], phase_rot)
+                                     ^ (state->tetra_polarity ? 2u : 0u)) & 3u);
+        const uint8_t b0 = (d >> 1) & 1u;
+        const uint8_t b1 = d & 1u;
+        if (soft_in) {
+            out_soft[i * 2 + 0] = soft_symbol_to_viterbi_cost(soft_in[i], state, 0);
+            out_soft[i * 2 + 1] = soft_symbol_to_viterbi_cost(soft_in[i], state, 1);
+            if (state->tetra_polarity)
+                out_soft[i * 2 + 0] = (uint16_t)(0xFFFFu - out_soft[i * 2 + 0]);
+        } else {
+            out_soft[i * 2 + 0] = b0 ? 0xFFFFu : 0x0000u;
+            out_soft[i * 2 + 1] = b1 ? 0xFFFFu : 0x0000u;
+        }
+    }
+}
+
+/* Control uplink burst: 42 dibits, 15-dibit extended training, 42 dibits.
+ * The 168 bits are one SCH/HU codeword (EN 300 392-2 8.3.1.4.3, table 9.3). */
+static void tetra_uplink_process_cb(dsd_opts* opts, dsd_state* state)
+{
+    enum { HALF = 42, BITS = 168 };
+    uint8_t b2[HALF];
+    float b2_soft_in[HALF];
+    uint16_t type4[BITS];
+    uint8_t mac[92];
+    static int warned = 0;
+
+    for (int i = 0; i < HALF; i++)
+        b2[i] = (uint8_t)getDibitAndSoftSymbol(opts, state, &b2_soft_in[i]);
+
+    snprintf(state->ftype, sizeof(state->ftype), " TETRA UL");
+    snprintf(state->fsubtype, sizeof(state->fsubtype), " CB SCH/HU    ");
+    if (!state->tetra_net_known) {
+        if (!warned) {
+            fprintf(stderr, "[TETRA UL] no colour code yet; set TETRA_NET=mcc,mnc,colour\n");
+            warned = 1;
+        }
+        return;
+    }
+    if (!state->tetra_b1_valid)
+        return;
+
+    tetra_expand_dibits(state->tetra_b1_dibuf, state->tetra_b1_soft_valid ? state->tetra_b1_soft : NULL,
+                        HALF, state, type4);
+    tetra_expand_dibits(b2, b2_soft_in, HALF, state, type4 + HALF * 2);
+    tetra_descramble_soft(type4, BITS, state->tetra_lfsr_seed);
+    state->tetra_b1_valid = 0;
+    state->tetra_b1_soft_valid = 0;
+
+    if (!tetra_sch_hu_decode(type4, mac)) {
+        state->tetra_decode_errors++;
+        return;
+    }
+    state->tetra_decode_ok++;
+    if (opts->payload || opts->errorbars) {
+        if ((mac[0] & 1u) == 0) {
+            const unsigned addr_type = (unsigned)tetra_bits_to_uint(mac, 3, 2);
+            const int addr_len = addr_type == 1u ? 10 : 24;
+            fprintf(stderr, "[TETRA SCH/HU] MAC-ACCESS enc=%u addr=%u\n", mac[2] & 1u,
+                    tetra_bits_to_uint(mac, 5, addr_len));
+        } else {
+            fprintf(stderr, "[TETRA SCH/HU] MAC-END-HU\n");
+        }
+    }
+}
+
+/* Normal uplink burst (table 9.5). Same logical channels as a downlink NDB,
+ * scrambled with the same colour code, but with no AACH between the blocks. */
+static void tetra_uplink_process_nub(dsd_opts* opts, dsd_state* state)
+{
+    uint8_t b2_dibuf[TETRA_NDB_BLOCK_DIBITS];
+    float b2_soft_in[TETRA_NDB_BLOCK_DIBITS];
+    const int b1_valid = state->tetra_b1_valid;
+    const int cc = 0;
+    static int warned = 0;
+
+    for (int i = 0; i < TETRA_NDB_BLOCK_DIBITS; i++)
+        b2_dibuf[i] = (uint8_t)getDibitAndSoftSymbol(opts, state, &b2_soft_in[i]);
+
+    snprintf(state->ftype, sizeof(state->ftype), " TETRA UL");
+    snprintf(state->fsubtype, sizeof(state->fsubtype),
+             state->tetra_nts2 ? " NUB NTS2     " : " NUB NTS1     ");
+    if (opts->errorbars)
+        fprintf(stderr, " [TETRA NUB  NTS%d  pol=%d rot=%d]",
+                state->tetra_nts2 ? 2 : 1, (int)state->tetra_polarity,
+                (int)(state->tetra_phase_rot & 3));
+
+    if (!state->tetra_net_known) {
+        if (!warned) {
+            fprintf(stderr, "[TETRA UL] no colour code yet; set TETRA_NET=mcc,mnc,colour\n");
+            warned = 1;
+        }
+    } else if (state->tetra_nts2) {
+        uint16_t block_soft[TETRA_NDB_BLOCK_BITS];
+        if (b1_valid) {
+            tetra_prepare_block(state->tetra_b1_dibuf,
+                                state->tetra_b1_soft_valid ? state->tetra_b1_soft : NULL,
+                                cc, state, block_soft, 1);
+            tetra_decode_schd(block_soft, cc, 1, opts, state);
+        }
+        tetra_prepare_block(b2_dibuf, b2_soft_in, cc, state, block_soft, 1);
+        if (!tetra_decode_schd(block_soft, cc, 2, opts, state))
+            (void)tetra_decode_tch_half(block_soft, opts, state);
+    } else if (b1_valid) {
+        uint16_t b1_soft[TETRA_NDB_BLOCK_BITS];
+        uint16_t b2_soft[TETRA_NDB_BLOCK_BITS];
+        uint16_t type4[TETRA_SCHF_BITS];
+        uint8_t decoded[TETRA_SCHF_TYPE2];
+
+        tetra_prepare_block(state->tetra_b1_dibuf,
+                            state->tetra_b1_soft_valid ? state->tetra_b1_soft : NULL,
+                            cc, state, b1_soft, 0);
+        tetra_prepare_block(b2_dibuf, b2_soft_in, cc, state, b2_soft, 0);
+        memcpy(type4, b1_soft, sizeof(b1_soft));
+        memcpy(type4 + TETRA_NDB_BLOCK_BITS, b2_soft, sizeof(b2_soft));
+        tetra_descramble_soft(type4, TETRA_SCHF_BITS, tetra_lfsr_seed_for(state, cc));
+
+        if (tetra_schf_decode_bits(type4, decoded)) {
+            state->tetra_decode_ok++;
+            snprintf(state->fsubtype, sizeof(state->fsubtype), " NUB SCH/F     ");
+            tetra_mac_parse_schd(decoded, TETRA_SCHF_TYPE1, cc, opts, state);
+        } else {
+            tetra_decode_tch_fs(type4, type4 + TETRA_NDB_BLOCK_BITS, cc, opts, state);
+        }
+    }
+
+    state->tetra_b1_valid = 0;
+    state->tetra_b1_soft_valid = 0;
+    tetra_sm_tick(opts, state);
+    if (dsd_opts_frontend_active(opts))
+        dsd_telemetry_publish_both_and_redraw(opts, state);
+    watchdog_event_history(opts, state, 0);
+    watchdog_event_current(opts, state, 0);
+}
+
 void processTetraFrame(dsd_opts* opts, dsd_state* state)
 {
     soft_symbol_frame_begin(state);
+    tetra_uplink_configure(state);
+    if (state->tetra_cb) {
+        state->tetra_cb = 0;
+        tetra_uplink_process_cb(opts, state);
+        return;
+    }
+    if (state->tetra_uplink && !state->tetra_dmo) {
+        tetra_uplink_process_nub(opts, state);
+        return;
+    }
+    if (state->tetra_dmo) {
+        tetra_dmo_process_ndb(opts, state);
+        return;
+    }
     tetra_tdma_advance_ndb(state);
 
     /* AACH half 2 sits between the training sequence and Block 2. */
@@ -331,7 +678,11 @@ void processTetraFrame(dsd_opts* opts, dsd_state* state)
             tetra_decode_schd(block_soft, cc, 1, opts, state);
         }
         tetra_prepare_block(b2_dibuf, b2_soft_in, cc, state, block_soft, 1);
-        tetra_decode_schd(block_soft, cc, 2, opts, state);
+        if (!tetra_decode_schd(block_soft, cc, 2, opts, state)) {
+            /* Not signalling: the second half of a stolen slot can carry one
+             * half-slot speech frame (EN 300 395-2 5.6). */
+            (void)tetra_decode_tch_half(block_soft, opts, state);
+        }
     }
 
     /* NTS1 carries one 432-bit logical channel. Scrambling runs across
@@ -401,27 +752,94 @@ void processTetraFrame(dsd_opts* opts, dsd_state* state)
 #define TETRA_SB_TYPE1_BITS    60
 #define TETRA_SB_DEPUNC_LEN    (TETRA_SB_TYPE2_BITS * 4)
 
-void processTetraSBFrame(dsd_opts *opts, dsd_state *state)
+/* DMO DSB: the SCH/S block was already decoded (CRC ok, DMO system code).
+ * Block 2 (SCH/H) follows the SSB immediately - there is no 15-dibit broadcast
+ * block as in a TMO SB. It is scrambled with an all-zero colour code. The
+ * same 123 dibits as the TMO path are consumed so burst timing is unchanged. */
+static void tetra_dmo_process_dsb(dsd_opts *opts, dsd_state *state, const uint8_t *sch_s)
 {
-    soft_symbol_frame_begin(state);
+    uint8_t  b2_dibuf[TETRA_SB_BKN2_DIBITS];
+    float    b2_soft_in[TETRA_SB_BKN2_DIBITS];
+    uint16_t b2_soft[TETRA_NDB_BLOCK_BITS];
+    uint8_t  sch_h[256];
+    tetra_dmo_sync_s_t s;
+    tetra_dmo_sync_h_t h;
 
-    /* ------------------------------------------------------------------
-     * Step 1: Consume remaining SB burst bits after SSB detection point.
-     * ------------------------------------------------------------------ */
+    for (int i = 0; i < TETRA_SB_BKN2_DIBITS; i++)
+        b2_dibuf[i] = (uint8_t)getDibitAndSoftSymbol(opts, state, &b2_soft_in[i]);
+    skipDibit(opts, state, TETRA_SB_BB_DIBITS);
+
+    tetra_dmo_parse_sync_s(sch_s, &s);
+
+    tetra_prepare_block_seed(b2_dibuf, b2_soft_in, TETRA_SB_SCRAMB_SEED, state, b2_soft, 1);
+    const int h_ok = tetra_hd_decode_bits(b2_soft, sch_h);
+    if (h_ok)
+        state->tetra_decode_ok++;
+    else
+        state->tetra_decode_errors++;
+
+    if (s.sync_pdu_type == 1) {
+        /* DM-REP presence signal. Its SCH/H is not a DMAC-SYNC, so it must not
+         * be allowed to invent a call colour code. */
+        tetra_dmo_pres_t pres;
+        char desc[120];
+        if (tetra_dmo_parse_presence(sch_s, h_ok ? sch_h : NULL, &s, &pres)) {
+            tetra_dmo_apply_sync(state, &s, NULL);
+            tetra_dmo_describe_presence(&pres, desc, (int)sizeof(desc));
+            tetra_dmo_publish_presence(state, desc);
+            fprintf(stderr, "[TETRA DMO PRES] sys=%u slot=%u frame=%u | %s\n",
+                    s.system_code, s.slot, s.frame, desc);
+        } else {
+            state->tetra_dmo = 1;
+            fprintf(stderr, "[TETRA DMO PRES] sys=%u comm=%u | presence layout not parsed\n",
+                    s.system_code, s.comm_type);
+        }
+    } else {
+        if (h_ok)
+            tetra_dmo_parse_sync_h(sch_h, s.comm_type, &h);
+        tetra_dmo_apply_sync(state, &s, h_ok ? &h : NULL);
+
+        fprintf(stderr,
+                "[TETRA DMO DSB] sys=%u comm=%u ch=%u slot=%u frame=%u enc=%u",
+                s.system_code, s.comm_type, s.ab_usage, s.slot, s.frame, s.enc_state);
+        if (h_ok && h.has_relay)
+            fprintf(stderr, " rep=%u %s", h.relay_addr, s.ms_link_flag ? "master" : "slave");
+        if (h_ok && h.has_addrs) {
+            char desc[160];
+            tetra_dmo_describe_elems(&h, desc, (int)sizeof(desc));
+            tetra_dmo_publish(state, h.msg_type, h.src, h.dst, desc);
+            fprintf(stderr, " | %s src=%u dst=%u MNI=%u/%u cd=%u%s%s%s",
+                    tetra_dmo_msg_name(h.msg_type), h.src, h.dst, (h.mni >> 14) & 0x3FFu, h.mni & 0x3FFFu,
+                    h.frame_countdown, state->tetra_dmo_dcc_valid ? " dcc=ok" : "", desc[0] ? " | " : "", desc);
+        } else {
+            fprintf(stderr, " | SCH/H %s", h_ok ? "ok" : "CRC fail");
+        }
+        fprintf(stderr, "\n");
+    }
+
+    snprintf(state->fsubtype, sizeof(state->fsubtype), " DSB           ");
+    snprintf(state->ftype,    sizeof(state->ftype),    " TETRA DMO");
+
+    tetra_sm_tick(opts, state);
+    if (dsd_opts_frontend_active(opts))
+        dsd_telemetry_publish_both_and_redraw(opts, state);
+    watchdog_event_history(opts, state, 0);
+    watchdog_event_current(opts, state, 0);
+}
+
+static void tetra_sb_skip_tail(dsd_opts *opts, dsd_state *state)
+{
     skipDibit(opts, state, TETRA_SB_BB_DIBITS);    /* BB / AACH (15 dibits) */
     skipDibit(opts, state, TETRA_SB_BKN2_DIBITS);  /* BKN2 block (108 dibits) */
+}
 
-    /* ------------------------------------------------------------------
-     * Step 2: Process SB1 (BSCH) block from scan-window cache.
-     * ------------------------------------------------------------------ */
-    if (!state->tetra_sb1_valid) {
-        fprintf(stderr, "[TETRA SB] no SB1 capture available\n");
-        state->tetra_sb1_soft_valid = 0;
-        tetra_sm_tick(opts, state);
-        return;
-    }
-    state->tetra_sb1_valid = 0; /* consume */
-
+/* Decode the 60 captured BSCH / SCH-S dibits into 80 type-2 bits.
+ *
+ * use_soft = 0 forces the hard-decision input, which depends only on the
+ * captured dibits and therefore has no dependence on the live symbol-tracking
+ * thresholds. Returns the Viterbi length, or -1 if memory is unavailable. */
+static int tetra_sb_decode_block(dsd_state *state, int use_soft, uint8_t *decoded, int decoded_len)
+{
     /* Expand 60 dibits → 120 bits. Prefer the analog decisions captured from
      * symbol history; retain the hard-decision fallback for symbol replay and
      * callers which do not populate history. */
@@ -434,7 +852,7 @@ void processTetraSBFrame(dsd_opts *opts, dsd_state *state)
         hard[i * 2 + 0] = (d >> 1) & 1u;
         hard[i * 2 + 1] =  d       & 1u;
     }
-    if (phase_rot == 0 && state->tetra_sb1_soft_valid) {
+    if (use_soft && phase_rot == 0 && state->tetra_sb1_soft_valid) {
         for (int i = 0; i < TETRA_SB_BSCH_DIBITS; i++) {
             soft[i * 2 + 0] = soft_symbol_to_viterbi_cost(state->tetra_sb1_soft[i], state, 0);
             soft[i * 2 + 1] = soft_symbol_to_viterbi_cost(state->tetra_sb1_soft[i], state, 1);
@@ -444,7 +862,6 @@ void processTetraSBFrame(dsd_opts *opts, dsd_state *state)
     } else {
         tetra_hard_bits_to_soft(hard, soft, TETRA_SB_BSCH_BITS);
     }
-    state->tetra_sb1_soft_valid = 0;
 
     /* ------------------------------------------------------------------
      * Step 3: Descramble type-5 bits back to type-4.  Scrambling follows
@@ -466,22 +883,81 @@ void processTetraSBFrame(dsd_opts *opts, dsd_state *state)
      * Step 5: RCPC depuncture (rate-2/3 → 240 mother bits).
      * ------------------------------------------------------------------ */
     uint16_t *depunc = (uint16_t *)malloc(sizeof(uint16_t) * TETRA_SB_DEPUNC_LEN);
-    if (!depunc) {
-        fprintf(stderr, "[TETRA SB] depunc malloc failed\n");
-        tetra_sm_tick(opts, state);
-        return;
-    }
+    if (!depunc)
+        return -1;
     tetra_rcpc_depuncture_by_id(TETRA_RCPC_PUNCT_2_3, deint_soft, TETRA_SB_BSCH_BITS,
                                 depunc, TETRA_SB_DEPUNC_LEN);
 
     /* ------------------------------------------------------------------
      * Step 6: Viterbi decode → 60 type-2 bits.
      * ------------------------------------------------------------------ */
-    uint8_t decoded[128];
-    memset(decoded, 0, sizeof(decoded));
+    memset(decoded, 0, (size_t)decoded_len);
     int dec_len = tetra_viterbi_decode_soft(depunc, TETRA_SB_DEPUNC_LEN,
-                                            decoded, (int)sizeof(decoded));
+                                            decoded, decoded_len);
     free(depunc);
+    return dec_len;
+}
+
+static int tetra_sb_crc_ok(const uint8_t *decoded, int dec_len)
+{
+    return dec_len >= TETRA_SB_TYPE2_BITS
+           && tetra_crc16_ccitt_bits(decoded, TETRA_SB_TYPE1_BITS + 16) == TETRA_CRC_OK;
+}
+
+void processTetraSBFrame(dsd_opts *opts, dsd_state *state)
+{
+    soft_symbol_frame_begin(state);
+
+    if (!state->tetra_sb1_valid) {
+        tetra_sb_skip_tail(opts, state);
+        fprintf(stderr, "[TETRA SB] no SB1 capture available\n");
+        state->tetra_sb1_soft_valid = 0;
+        tetra_sm_tick(opts, state);
+        return;
+    }
+    state->tetra_sb1_valid = 0; /* consume */
+
+    /* ------------------------------------------------------------------
+     * DMO pre-check. A DMO DSB shares the SCH/S coding with the TMO BSCH but
+     * its system code is 1xxx (EN 300 396-3 clause 9.3.29). Its second block
+     * (SCH/H) follows the SSB directly and must be read live, whereas a TMO SB
+     * just skips it. The pre-check uses hard decisions only, so it neither
+     * consumes symbols nor depends on the live slicer thresholds; TMO bursts
+     * then take exactly the same path as before.
+     * ------------------------------------------------------------------ */
+    {
+        uint8_t pre[128];
+        const int pre_len = tetra_sb_decode_block(state, 0, pre, (int)sizeof(pre));
+        if (pre_len > 0 && tetra_sb_crc_ok(pre, pre_len) && tetra_dmo_system_code_is_dmo(pre)) {
+            state->tetra_sb1_soft_valid = 0;
+            state->tetra_decode_ok++;
+            if (opts->errorbars) {
+                fprintf(stderr, " [TETRA SB  dec=%d rot=%d first12=", pre_len, (int)(state->tetra_phase_rot & 3));
+                for (int i = 0; i < 12; i++)
+                    fprintf(stderr, "%d", pre[i] & 1);
+                fprintf(stderr, "]");
+            }
+            tetra_dmo_process_dsb(opts, state, pre);
+            return;
+        }
+    }
+
+    /* ------------------------------------------------------------------
+     * Step 1: Consume remaining SB burst bits after SSB detection point.
+     * ------------------------------------------------------------------ */
+    tetra_sb_skip_tail(opts, state);
+
+    /* ------------------------------------------------------------------
+     * Step 2-6: BSCH FEC from the scan-window cache.
+     * ------------------------------------------------------------------ */
+    uint8_t decoded[128];
+    const int dec_len = tetra_sb_decode_block(state, 1, decoded, (int)sizeof(decoded));
+    state->tetra_sb1_soft_valid = 0;
+    if (dec_len < 0) {
+        fprintf(stderr, "[TETRA SB] depunc malloc failed\n");
+        tetra_sm_tick(opts, state);
+        return;
+    }
 
     if (opts->errorbars) {
         fprintf(stderr, " [TETRA SB  dec=%d rot=%d first12=", dec_len, (int)(state->tetra_phase_rot & 3));
@@ -491,8 +967,7 @@ void processTetraSBFrame(dsd_opts *opts, dsd_state *state)
     }
 
     /* Phase 39: quality counters (SB1 decode also counts). */
-    const int crc_ok = dec_len >= TETRA_SB_TYPE2_BITS
-                       && tetra_crc16_ccitt_bits(decoded, TETRA_SB_TYPE1_BITS + 16) == TETRA_CRC_OK;
+    const int crc_ok = tetra_sb_crc_ok(decoded, dec_len);
     if (crc_ok)
         state->tetra_decode_ok++;
     else
@@ -501,8 +976,19 @@ void processTetraSBFrame(dsd_opts *opts, dsd_state *state)
     /* ------------------------------------------------------------------
      * Step 7: Parse BSCH PDU (60 type-1 bits) → update network identity.
      * ------------------------------------------------------------------ */
-    if (crc_ok)
+    if (crc_ok && tetra_dmo_system_code_is_dmo(decoded)) {
+        /* Only the soft decode passed (the hard pre-check above did not), so
+         * this DSB's SCH/H has already been consumed: take the timing and
+         * mode from SCH/S alone. */
+        tetra_dmo_sync_s_t s;
+        tetra_dmo_parse_sync_s(decoded, &s);
+        tetra_dmo_apply_sync(state, &s, NULL);
+        fprintf(stderr, "[TETRA DMO DSB] sys=%u comm=%u ch=%u slot=%u frame=%u enc=%u | SCH/H skipped\n",
+                s.system_code, s.comm_type, s.ab_usage, s.slot, s.frame, s.enc_state);
+    } else if (crc_ok) {
+        state->tetra_dmo = 0;
         tetra_bsch_parse(decoded, TETRA_SB_TYPE1_BITS, opts, state);
+    }
 
     /* ------------------------------------------------------------------
      * Housekeeping.

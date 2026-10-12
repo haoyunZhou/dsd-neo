@@ -36,6 +36,7 @@
 #include <dsd-neo/core/synctype_ids.h>
 #include <dsd-neo/core/talkgroup_policy.h>
 #include <dsd-neo/protocol/edacs/edacs_afs.h>
+#include <dsd-neo/protocol/tetra/tetra_dmo.h>
 #include <dsd-neo/protocol/m17/m17_parse.h>
 #include <dsd-neo/protocol/p25/p25_callsign.h>
 #include <dsd-neo/protocol/p25/p25_crypto.h>
@@ -3418,6 +3419,18 @@ ui_render_call_info_channel_line(const dsd_opts* opts, const dsd_state* state) {
 /* Decoder summaries are copied into the published state snapshot. Keep raw
  * per-frame diagnostics on stderr; rendering them here would flood the UI. */
 static void
+ui_render_tetra_mode(const dsd_state* state) {
+    char line[96];
+    if (!DSD_SYNC_IS_TETRA(ncurses_last_synctype)) {
+        return;
+    }
+    if (tetra_dmo_format_mode(state, line, (int)sizeof(line)) <= 0) {
+        return;
+    }
+    printw("| Mode: %s\n", line);
+}
+
+static void
 ui_render_tetra_messages(const dsd_state* state) {
     if (!DSD_SYNC_IS_TETRA(ncurses_last_synctype) || state->tetra_message_sequence == 0) {
         return;
@@ -3512,6 +3525,7 @@ ui_render_call_info_and_history(const dsd_opts* opts, dsd_state* state) {
 
     ui_render_call_info_patches(state);
 
+    ui_render_tetra_mode(state);
     ui_render_tetra_messages(state);
 
     // Bottom border for Call Info section

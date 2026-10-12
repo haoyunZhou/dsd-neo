@@ -329,6 +329,25 @@ int tetra_viterbi_decode_soft(const uint16_t* depunc, int depunc_len, uint8_t* o
     return symbols;
 }
 
+int tetra_sch_hu_decode(const uint16_t* type4, uint8_t* out_bits) {
+    enum { K = 168, TYPE2 = 112, TYPE1 = 92, A = 13 };
+    uint16_t deint[K];
+    uint16_t depunc[TYPE2 * 4];
+    uint8_t decoded[TYPE2];
+    if (!type4 || !out_bits) return 0;
+
+    tetra_block_deinterleave_soft(type4, deint, K, A, 0);
+    if (tetra_rcpc_depuncture_by_id(TETRA_RCPC_PUNCT_2_3, deint, K, depunc, TYPE2 * 4) < 0)
+        return 0;
+    memset(decoded, 0, sizeof(decoded));
+    if (tetra_viterbi_decode_soft(depunc, TYPE2 * 4, decoded, TYPE2) < TYPE2)
+        return 0;
+    if (tetra_crc16_ccitt_bits(decoded, TYPE1 + 16) != 0x1D0Fu)
+        return 0;
+    memcpy(out_bits, decoded, TYPE1);
+    return 1;
+}
+
 int tetra_rcpc_depuncture_soft(const uint16_t* in_costs, int info_bits_len, const uint8_t* punct, int p_len,
                                uint16_t* out_costs, int out_len) {
     if (!in_costs || !out_costs) return -1;
@@ -421,7 +440,8 @@ static uint8_t parity5(uint8_t value) {
     return value & 1u;
 }
 
-int tetra_speech_channel_decode(const uint16_t* deinterleaved, uint8_t* out_bits, int out_len) {
+int tetra_speech_channel_decode_q(const uint16_t* deinterleaved, uint8_t* out_bits, int out_len, int* mismatches) {
+    if (mismatches) *mismatches = -1;
     if (!deinterleaved || !out_bits || out_len < 274) return -1;
     for (int i = 0; i < 102; i++)
         out_bits[i] = deinterleaved[i] > 0x7fffu;
@@ -483,7 +503,142 @@ int tetra_speech_channel_decode(const uint16_t* deinterleaved, uint8_t* out_bits
         state = predecessor[pos][state];
     }
     memcpy(out_bits + 102, decoded, 172);
+
+    /* Re-encode the decoded class-1/2 bits and count how many received
+     * (unpunctured) channel bits disagree. A real speech burst decoded with the
+     * right scrambler leaves a handful; wrong-seed or noise bursts leave about
+     * 12% of the 330 bits (random input never drops below ~35). */
+    if (mismatches) {
+        int bad = 0;
+        int enc_state = 0;
+        input = 102;
+        for (int pos = 0; pos < 184; pos++) {
+            const uint8_t involved = (uint8_t)((decoded[pos] << 4) | enc_state);
+            const uint8_t expected[3] = {
+                parity5(involved & 0x1fu),
+                parity5(involved & 0x1bu),
+                parity5(involved & 0x15u)
+            };
+            const uint8_t (*pattern)[8] = pos < 112 ? a1 : a2;
+            const int phase = pos < 112 ? pos : pos - 112;
+            for (int lane = 0; lane < 3; lane++) {
+                if (!pattern[lane][phase & 7]) continue;
+                const int got = deinterleaved[input++] > 0x7fffu;
+                if (got != expected[lane]) bad++;
+            }
+            enc_state = (decoded[pos] << 3) | (enc_state >> 1);
+        }
+        *mismatches = bad;
+    }
     return 274;
+}
+
+int tetra_speech_channel_decode(const uint16_t* deinterleaved, uint8_t* out_bits, int out_len) {
+    return tetra_speech_channel_decode_q(deinterleaved, out_bits, out_len, NULL);
+}
+
+/* Half-slot speech CRC: G(X) = 1 + X + X^4 over the 30 class-2 bits
+ * (EN 300 395-2 5.6.1). Returns the 4-bit remainder, b1 = X^0. The bit order
+ * (last class-2 bit fed first, parity b1 = lowest degree) was verified on the
+ * 7-bit full-slot CRC of 195 real DMO speech bursts (194 matched). */
+static uint8_t tetra_half_crc4(const uint8_t* bits, int len) {
+    uint8_t reg = 0;
+    for (int i = len - 1; i >= 0; i--) {
+        const uint8_t fb = (uint8_t)(((reg >> 3) & 1u) ^ (bits[i] & 1u));
+        reg = (uint8_t)((reg << 1) & 0xFu);
+        if (fb) reg ^= 0x3u;
+    }
+    return reg;
+}
+
+int tetra_speech_half_decode(const uint16_t* deinterleaved, uint8_t* out_bits, int* crc_ok, int* mismatches) {
+    enum { C0 = 51, C1 = 56, C2 = 38, N = C1 + C2 };
+    if (crc_ok) *crc_ok = 0;
+    if (mismatches) *mismatches = -1;
+    if (!deinterleaved || !out_bits) return -1;
+
+    for (int i = 0; i < C0; i++)
+        out_bits[i] = deinterleaved[i] > 0x7fffu;
+
+    /* Class 1: rate 2/3 (same pattern as the full slot). Class 2: rate 8/17,
+     * P = 1,2,3,4,5,7,8,10,11,13,14,16,17,19,20,22,23 of every 24 mother bits,
+     * i.e. all three lanes on the first bit of each 8 and two lanes otherwise. */
+    static const uint8_t a1[3][8] = {{1,1,1,1,1,1,1,1}, {1,0,1,0,1,0,1,0}, {0,0,0,0,0,0,0,0}};
+    static const uint8_t a2[3][8] = {{1,1,1,1,1,1,1,1}, {1,1,1,1,1,1,1,1}, {1,0,0,0,0,0,0,0}};
+
+    uint16_t symbols[N][3];
+    int input = C0;
+    for (int pos = 0; pos < N; pos++) {
+        const uint8_t (*pattern)[8] = pos < C1 ? a1 : a2;
+        const int phase = pos < C1 ? pos : pos - C1;
+        for (int lane = 0; lane < 3; lane++)
+            symbols[pos][lane] = pattern[lane][phase & 7] ? deinterleaved[input++] : 0x7fffu;
+    }
+    if (input != 216) return -1;
+
+    uint64_t prev[16], next[16];
+    uint8_t predecessor[N][16], decision[N][16];
+    const uint64_t inf = UINT64_MAX / 4u;
+    for (int state = 0; state < 16; state++) prev[state] = state == 0 ? 0 : inf;
+    for (int pos = 0; pos < N; pos++) {
+        for (int state = 0; state < 16; state++) next[state] = inf;
+        for (int state = 0; state < 16; state++) {
+            if (prev[state] == inf) continue;
+            for (int bit = 0; bit <= 1; bit++) {
+                const uint8_t involved = (uint8_t)((bit << 4) | state);
+                const uint8_t expected[3] = {parity5(involved & 0x1fu), parity5(involved & 0x1bu),
+                                             parity5(involved & 0x15u)};
+                uint64_t branch = 0;
+                for (int lane = 0; lane < 3; lane++) {
+                    const uint16_t target = expected[lane] ? 0xffffu : 0u;
+                    const uint16_t got = symbols[pos][lane];
+                    branch += target > got ? target - got : got - target;
+                }
+                const int next_state = (bit << 3) | (state >> 1);
+                const uint64_t metric = prev[state] + branch;
+                if (metric < next[next_state]) {
+                    next[next_state] = metric;
+                    predecessor[pos][next_state] = (uint8_t)state;
+                    decision[pos][next_state] = (uint8_t)bit;
+                }
+            }
+        }
+        memcpy(prev, next, sizeof(prev));
+    }
+
+    uint8_t decoded[N];
+    int state = 0; /* the four class-2 tail bits are zero */
+    for (int pos = N - 1; pos >= 0; pos--) {
+        decoded[pos] = decision[pos][state];
+        state = predecessor[pos][state];
+    }
+    memcpy(out_bits + C0, decoded, C1 + 30);
+
+    if (crc_ok) {
+        const uint8_t r = tetra_half_crc4(decoded + C1, 30);
+        const uint8_t* p = decoded + C1 + 30; /* b1..b4 */
+        const uint8_t got = (uint8_t)(p[0] | (p[1] << 1) | (p[2] << 2) | (p[3] << 3));
+        *crc_ok = r == got;
+    }
+
+    if (mismatches) {
+        int bad = 0, enc_state = 0;
+        input = C0;
+        for (int pos = 0; pos < N; pos++) {
+            const uint8_t involved = (uint8_t)((decoded[pos] << 4) | enc_state);
+            const uint8_t expected[3] = {parity5(involved & 0x1fu), parity5(involved & 0x1bu),
+                                         parity5(involved & 0x15u)};
+            const uint8_t (*pattern)[8] = pos < C1 ? a1 : a2;
+            const int phase = pos < C1 ? pos : pos - C1;
+            for (int lane = 0; lane < 3; lane++) {
+                if (!pattern[lane][phase & 7]) continue;
+                if ((deinterleaved[input++] > 0x7fffu) != expected[lane]) bad++;
+            }
+            enc_state = (decoded[pos] << 3) | (enc_state >> 1);
+        }
+        *mismatches = bad;
+    }
+    return C0 + C1 + 30;
 }
 
 int tetra_get_interleaver_dims(int punct_id, int bits_len, int *out_rows, int *out_cols) {

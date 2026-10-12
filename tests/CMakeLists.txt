@@ -9371,6 +9371,9 @@ set(_dsd_tetra_test_sources
     tetra_phase85
     tetra_phase86
     tetra_phase87
+    tetra_dmo
+    tetra_speech_half
+    tetra_sch_hu
     tetra_sm_hangtime
     tetra_tch_slot_gate
     tetra_trunk_sm
