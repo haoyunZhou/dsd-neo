@@ -22,6 +22,7 @@
 #include <dsd-neo/core/synctype_ids.h>
 #include <dsd-neo/protocol/tetra/tetra.h>
 #include <dsd-neo/protocol/tetra/tetra_acelp.h>
+#include <dsd-neo/protocol/tetra/tetra_sync.h>
 #include <dsd-neo/protocol/tetra/tetra_bsch.h>
 #include <dsd-neo/protocol/tetra/tetra_fec.h>
 #include <dsd-neo/protocol/tetra/tetra_mac.h>
@@ -85,12 +86,20 @@ static void tetra_prepare_block(const uint8_t *dibuf, const float *soft_in,
     uint8_t  hard_bits [TETRA_NDB_BLOCK_BITS];
     uint16_t soft_costs[TETRA_NDB_BLOCK_BITS];
 
+    /* A non-zero Costas phase still correlates the training word, but the
+     * soft amplitude was sliced in that rotated phase. Hard dibits are
+     * derotated below; the soft costs would vote for the wrong bits. */
+    const int phase_rot = state->tetra_phase_rot & 3;
+    if (phase_rot != 0)
+        soft_in = NULL;
+
     for (int i = 0; i < TETRA_NDB_BLOCK_DIBITS; i++) {
         /* An inverted discriminator swaps the positive and negative symbol
          * pairs, which is exactly dibit XOR 2: the MSB changes and the LSB
          * does not. Frame sync records that polarity; normalize it before
          * either hard- or soft-decision FEC sees the block. */
-        const uint8_t d = (uint8_t)((dibuf[i] ^ (state->tetra_polarity ? 2u : 0u)) & 3u);
+        const uint8_t d = (uint8_t)((tetra_dibit_derotate(dibuf[i], phase_rot)
+                                     ^ (state->tetra_polarity ? 2u : 0u)) & 3u);
         hard_bits[i * 2 + 0] = (d >> 1) & 1u;
         hard_bits[i * 2 + 1] =  d       & 1u;
 
@@ -305,8 +314,9 @@ void processTetraFrame(dsd_opts* opts, dsd_state* state)
     snprintf(state->ftype, sizeof(state->ftype), " TETRA");
 
     if (opts->errorbars) {
-        fprintf(stderr, " [TETRA NDB  NTS%d  pol=%d]",
-                state->tetra_nts2 ? 2 : 1, (int)state->tetra_polarity);
+        fprintf(stderr, " [TETRA NDB  NTS%d  pol=%d rot=%d]",
+                state->tetra_nts2 ? 2 : 1, (int)state->tetra_polarity,
+                (int)(state->tetra_phase_rot & 3));
     }
 
     /* NTS2 carries two independently scrambled half-slot channels. Try the
@@ -417,13 +427,14 @@ void processTetraSBFrame(dsd_opts *opts, dsd_state *state)
      * callers which do not populate history. */
     uint8_t  hard[TETRA_SB_BSCH_BITS];
     uint16_t soft[TETRA_SB_BSCH_BITS];
+    const int phase_rot = state->tetra_phase_rot & 3;
     for (int i = 0; i < TETRA_SB_BSCH_DIBITS; i++) {
-        uint8_t d = (uint8_t)((state->tetra_sb1_dibuf[i]
+        uint8_t d = (uint8_t)((tetra_dibit_derotate(state->tetra_sb1_dibuf[i], phase_rot)
                                ^ (state->tetra_polarity ? 2u : 0u)) & 3u);
         hard[i * 2 + 0] = (d >> 1) & 1u;
         hard[i * 2 + 1] =  d       & 1u;
     }
-    if (state->tetra_sb1_soft_valid) {
+    if (phase_rot == 0 && state->tetra_sb1_soft_valid) {
         for (int i = 0; i < TETRA_SB_BSCH_DIBITS; i++) {
             soft[i * 2 + 0] = soft_symbol_to_viterbi_cost(state->tetra_sb1_soft[i], state, 0);
             soft[i * 2 + 1] = soft_symbol_to_viterbi_cost(state->tetra_sb1_soft[i], state, 1);
@@ -473,7 +484,7 @@ void processTetraSBFrame(dsd_opts *opts, dsd_state *state)
     free(depunc);
 
     if (opts->errorbars) {
-        fprintf(stderr, " [TETRA SB  dec=%d  first12=", dec_len);
+        fprintf(stderr, " [TETRA SB  dec=%d rot=%d first12=", dec_len, (int)(state->tetra_phase_rot & 3));
         for (int i = 0; i < 12 && i < dec_len; i++)
             fprintf(stderr, "%d", decoded[i] & 1);
         fprintf(stderr, "]");

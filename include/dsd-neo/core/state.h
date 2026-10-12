@@ -1867,6 +1867,10 @@ struct dsd_state {
     uint8_t tetra_b1_soft_valid;
     uint8_t tetra_polarity;
     uint8_t tetra_nts2;
+    /* How many 90° slicer steps to undo before FEC. 0 keeps the historical
+     * mapping; 1..3 correct a Costas phase that still correlates the training
+     * word but not against the unrotated pattern. */
+    uint8_t tetra_phase_rot;
 
     /* tetra_sb1_dibuf: 60 hard dibits of the BSCH block captured from the
      * synchronisation burst (SB) scan window at SSB detection.

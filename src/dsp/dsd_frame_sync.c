@@ -37,6 +37,7 @@
 #include <dsd-neo/dsp/symbol_timing_debug.h>
 #include <dsd-neo/dsp/sync_calibration.h>
 #include <dsd-neo/dsp/sync_hamming.h>
+#include <dsd-neo/protocol/tetra/tetra_sync.h>
 #include <dsd-neo/platform/atomic_compat.h>
 #include <dsd-neo/runtime/colors.h>
 #include <dsd-neo/runtime/config.h>
@@ -1000,12 +1001,15 @@ frame_sync_try_tetra(frame_sync_match_ctx* ctx) {
 
     if (frame_sync_match_window_ready(ctx, 119)) {
         const char* sync = ctx->synctest119 + 108;
-        int inverted = strcmp(sync, INV_TETRA_NDB_NTS_SYNC) == 0;
-        if (strcmp(sync, TETRA_NDB_NTS_SYNC) == 0 || inverted) {
+        int phase_rot = 0;
+        int inverted = 0;
+        if (tetra_training_derotation(sync, TETRA_NDB_NTS_SYNC, INV_TETRA_NDB_NTS_SYNC, 11, &phase_rot, &inverted)) {
             frame_sync_set_basic_lock(ctx);
             DSD_SNPRINTF(state->ftype, sizeof(state->ftype), "TETRA");
             /* NTS2 aliases inverted NTS1. Keep the polarity learned from the
-             * synchronisation burst and only record which training matched. */
+             * synchronisation burst and only record which training matched.
+             * phase_rot undoes a Costas 90° step before the payload is sliced. */
+            state->tetra_phase_rot = (uint8_t)(phase_rot & 3);
             state->tetra_nts2 = (uint8_t)(inverted ^ (state->tetra_polarity ? 1 : 0));
             /* Training occupies ages 0..10. AACH half 1 is ages 11..17.
              * Block 1 is the 108 dibits at ages 18..125. */
@@ -1029,11 +1033,13 @@ frame_sync_try_tetra(frame_sync_match_ctx* ctx) {
 
     if (frame_sync_match_window_ready(ctx, 79)) {
         const char* sync = ctx->synctest79 + 60;
-        int inverted = strcmp(sync, INV_TETRA_SB_SSB_SYNC) == 0;
-        if (strcmp(sync, TETRA_SB_SSB_SYNC) == 0 || inverted) {
+        int phase_rot = 0;
+        int inverted = 0;
+        if (tetra_training_derotation(sync, TETRA_SB_SSB_SYNC, INV_TETRA_SB_SSB_SYNC, 19, &phase_rot, &inverted)) {
             frame_sync_set_basic_lock(ctx);
             DSD_SNPRINTF(state->ftype, sizeof(state->ftype), "TETRA");
-            state->tetra_polarity = inverted;
+            state->tetra_phase_rot = (uint8_t)(phase_rot & 3);
+            state->tetra_polarity = (uint8_t)inverted;
             frame_sync_capture_tetra_dibits(ctx->synctest79, state->tetra_sb1_dibuf, 60);
             state->tetra_sb1_soft_valid = (uint8_t)frame_sync_capture_tetra_soft(
                 state, state->tetra_sb1_soft, 60, 19);
