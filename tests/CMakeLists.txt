@@ -150,6 +150,7 @@ function(dsd_neo_link_dsp_test target_name)
             "$<TARGET_LINKER_FILE:dsd-neo_runtime>"
             "$<TARGET_LINKER_FILE:dsd-neo_io_iq>"
             "$<TARGET_LINKER_FILE:dsd-neo_platform>"
+            "$<TARGET_LINKER_FILE:dsd-neo_proto_tetra>"
         )
         target_link_options(
             ${target_name}
@@ -176,6 +177,7 @@ function(dsd_neo_link_dsp_test target_name)
             dsd-neo_runtime
             dsd-neo_io_iq
             dsd-neo_platform
+            dsd-neo_proto_tetra
         )
         if(DSD_AUDIO_BACKEND STREQUAL "portaudio")
             target_link_libraries(
@@ -184,7 +186,11 @@ function(dsd_neo_link_dsp_test target_name)
             )
         endif()
     else()
-        target_link_libraries(${target_name} PRIVATE dsd-neo_dsp)
+        target_link_libraries(
+            ${target_name}
+            PRIVATE dsd-neo_dsp "$<TARGET_LINKER_FILE:dsd-neo_proto_tetra>"
+        )
+        add_dependencies(${target_name} dsd-neo_proto_tetra)
     endif()
 
     if(ARGN)
@@ -2284,6 +2290,27 @@ if(DSD_ENABLE_TERMINAL_UI)
             dsd-neo_test_call_state_support
             ${CURSES_LIBRARIES}
             ${DSD_NEO_TEST_MATH_LIB}
+    )
+    # The printer is compiled into this executable and formats a TETRA mode line.
+    # Link the protocol archive directly: that target also exposes the core
+    # library, whose symbols this test stubs. Crypto is linked as a target so
+    # its TEA import libraries stay on the link line.
+    target_link_options(
+        dsd-neo_test_ui_ncurses_printer_helpers
+        PRIVATE "$<TARGET_LINKER_FILE:dsd-neo_proto_tetra>"
+    )
+    set_property(
+        TARGET dsd-neo_test_ui_ncurses_printer_helpers
+        APPEND
+        PROPERTY LINK_DEPENDS "$<TARGET_LINKER_FILE:dsd-neo_proto_tetra>"
+    )
+    target_link_libraries(
+        dsd-neo_test_ui_ncurses_printer_helpers
+        PRIVATE dsd-neo_crypto
+    )
+    add_dependencies(
+        dsd-neo_test_ui_ncurses_printer_helpers
+        dsd-neo_proto_tetra
     )
     add_test(
         NAME UI_NCURSES_PRINTER_HELPERS
@@ -4809,6 +4836,8 @@ set(_DSD_RUNTIME_CLI_PARSE_LIBS
     dsd-neo_proto_provoice
     dsd-neo_proto_x2tdma
     dsd-neo_proto_ysf
+    dsd-neo_proto_tetra
+    dsd-neo_crypto
 )
 
 if(NOT APPLE AND (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang"))
@@ -9360,7 +9389,6 @@ set(_dsd_tetra_test_sources
     mle_cmce
     mm_dispatch
     osmo_shim
-    osmo_viterbi_backend
     rcpc_map
     real_air_bit_trace
     sds_reference_mac

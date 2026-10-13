@@ -3,6 +3,7 @@ add_library(dsd-neo_proto_tetra)
 
 target_sources(dsd-neo_proto_tetra PRIVATE
   tetra.c
+  tetra_uplink.c
   tetra_fec.c
   tetra_acelp.c
   tetra_mac.c

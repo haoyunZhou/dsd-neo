@@ -41,7 +41,7 @@ Thumbs.db
 /third_party/tetra_acelp/reference/
 /tools/tetra/etsi/
 /tools/tetra/acelp_adapter/C-CODE/
-# Local Midnight Blue checkouts and the headers/libs built from them.
+# Leftover local Midnight Blue checkouts. The libraries are vcpkg ports.
 /tools/tetra/TETRA_crypto/
 /tools/tetra/TETRA_etee/
 /third_party/TETRA_crypto/

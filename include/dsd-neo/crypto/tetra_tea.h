@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 /* Air-interface TEA1/2/3. The ciphers and frame-number packing come from
- * third_party/TETRA_crypto. This wrapper does not unwrap OTAR keys. */
+ * the tetracrypto vcpkg port. This wrapper does not unwrap OTAR keys. */
 #ifndef DSD_NEO_CRYPTO_TETRA_TEA_H
 #define DSD_NEO_CRYPTO_TETRA_TEA_H
 

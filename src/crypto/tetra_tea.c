@@ -4,10 +4,10 @@
 #include <stdint.h>
 #include <string.h>
 
-#include "common.h"
-#include "tea1.h"
-#include "tea2.h"
-#include "tea3.h"
+#include <tetracrypto/common.h>
+#include <tetracrypto/tea1.h>
+#include <tetracrypto/tea2.h>
+#include <tetracrypto/tea3.h>
 
 void
 tetra_tea_keystream(int alg, const uint8_t key[10], uint32_t iv, uint8_t* out, int nbytes) {

@@ -1,4 +1,4 @@
-/* End-to-end TETRA crypto via third_party/TETRA_etee.
+/* End-to-end TETRA crypto via the tetraetee vcpkg port.
  * Callers supply the key. This wrapper does not search for one. */
 #ifndef DSD_NEO_CRYPTO_TETRA_ETEE_H
 #define DSD_NEO_CRYPTO_TETRA_ETEE_H

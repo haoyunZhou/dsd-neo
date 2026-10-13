@@ -1,6 +1,6 @@
 #include <dsd-neo/crypto/tetra_etee.h>
 
-#include "etee.h"
+#include <tetraetee/etee.h>
 
 int
 tetra_etee_library_ready(void) {

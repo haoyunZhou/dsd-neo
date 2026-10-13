@@ -451,33 +451,6 @@ static void tetra_dmo_process_ndb(dsd_opts *opts, dsd_state *state)
     watchdog_event_current(opts, state, 0);
 }
 
-void tetra_uplink_configure(dsd_state* state)
-{
-    static int once = 0;
-    const char* net;
-    unsigned mcc = 0, mnc = 0;
-    int colour = 0;
-    if (once || !state)
-        return;
-    once = 1;
-
-    net = getenv("TETRA_UPLINK");
-    if (net && (net[0] == '1' || net[0] == 'y' || net[0] == 'Y'))
-        state->tetra_uplink = 1;
-
-    /* Uplink-only reception never sees a BSCH, so the colour code has to be
-     * supplied. Decimal or 0x colour: TETRA_NET=86,28,0x19. A later BSCH
-     * overwrites this. */
-    net = getenv("TETRA_NET");
-    if (!net || state->tetra_net_known || sscanf(net, "%u,%u,%i", &mcc, &mnc, &colour) != 3)
-        return;
-    state->tetra_mcc = (uint16_t)(mcc & 0x3FFu);
-    state->tetra_mnc = (uint16_t)(mnc & 0x3FFFu);
-    state->tetra_colour = (uint8_t)(colour & 0x3F);
-    state->tetra_lfsr_seed = tetra_compute_scramb_seed(state->tetra_mcc, state->tetra_mnc, state->tetra_colour);
-    state->tetra_net_known = 1;
-}
-
 /* Expand `count` dibits with the same phase and polarity correction as a
  * downlink block. Descrambling is left to the caller. */
 static void tetra_expand_dibits(const uint8_t* dibuf, const float* soft_in, int count,

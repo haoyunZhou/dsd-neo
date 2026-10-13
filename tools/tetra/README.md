@@ -20,35 +20,27 @@ ETSI does not make those sources redistributable here.
   value 0 or 1), 480 bytes out (240 PCM16LE samples at 8 kHz). Write diagnostics
   to stderr.
 
-## Crypto library checkouts
+## Crypto libraries
 
-Air-interface and end-to-end crypto stay as local checkouts in this directory.
-Clone them here. Do not copy the sources into the library directories.
+Air-interface and end-to-end crypto are vcpkg overlay ports, the same way
+`mbe-neo` and `codec2` are. Do not clone them into this directory. A leftover
+checkout under `tools/tetra/TETRA_crypto/` or `tools/tetra/TETRA_etee/` is
+gitignored and is not used.
 
-```bash
-git clone --depth 1 https://github.com/MidnightBlueLabs/TETRA_crypto.git tools/tetra/TETRA_crypto
-git clone --depth 1 https://github.com/MidnightBlueLabs/TETRA_etee.git tools/tetra/TETRA_etee
-```
+| Port | Upstream | Role |
+| --- | --- | --- |
+| `vcpkg-ports/tetracrypto` | MidnightBlueLabs/TETRA_crypto | TEA1, TEA2, TEA3, HURDLE, TAA1 |
+| `vcpkg-ports/tetraetee` | MidnightBlueLabs/TETRA_etee | End-to-end E-functions; links OpenSSL |
 
-Both repositories are Apache-2.0. `TETRA_crypto` is the air-interface library
-(TEA1, TEA2, TEA3, HURDLE, TAA1). `TETRA_etee` is the end-to-end library and
-needs OpenSSL when it is built.
-
-The built libraries contain headers and binaries only. Headers are shared.
-Libraries are split by operating system and build type so a Windows `.lib`
-does not replace a Linux `.a`, and Debug does not replace Release:
-
-```
-third_party/TETRA_crypto/include
-third_party/TETRA_crypto/lib/<windows|linux|macos>/<debug|release>
-third_party/TETRA_etee/include
-third_party/TETRA_etee/lib/<windows|linux|macos>/<debug|release>
-```
-
-Compile from `tools/tetra/TETRA_crypto` and `tools/tetra/TETRA_etee`. CMake
-force-includes `tools/tetra/gcc_compat.h` so the endian macros resolve on MSVC,
-GCC, and Clang. `TETRA_etee` needs GNU C (`-std=gnu11`); on Windows that
-compilation uses Clang. Leave the `.c` sources in the checkout.
+Both upstream repositories are Apache-2.0. Windows and Android presets install
+the ports from `vcpkg.json`. Linux and macOS builds that do not use vcpkg
+install the same CMake projects with `tools/install_tetra_crypto_deps.sh`.
+Commits and archive hashes are pinned in `tools/ci-dependency-pins.env`.
+The `tetracrypto` port force-includes a small endian compatibility header so
+those sources stay unchanged on MSVC. The `tetraetee` port replaces the unused
+GNU `min()` macro and the variable-length arrays with fixed buffers before
+compiling, because MSVC rejects both. Linux and macOS builds keep the upstream
+sources.
 
 Vocoder stub and testing
 
