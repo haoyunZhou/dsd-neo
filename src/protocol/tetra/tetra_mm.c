@@ -7,6 +7,7 @@
  */
 
 #include <dsd-neo/protocol/tetra/tetra_mm.h>
+#include <dsd-neo/protocol/tetra/tetra_air.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/state.h>
 
@@ -762,6 +763,23 @@ static void mm_parse_otar(const uint8_t *bits, int nbits, int cc,
         state->tetra_mm_otar_dm_sck_hyperframe = dm_sck_hyperframe;
         state->tetra_mm_otar_dm_sck_network_time = dm_sck_network_time;
         state->tetra_mm_otar_valid = 1;
+        if (subtype == 2 || subtype == 4) {
+            uint16_t net_mcc = 0;
+            uint16_t net_mnc = 0;
+            int have_net = 0;
+            if (address_valid) {
+                net_mcc = mcc;
+                net_mnc = mnc;
+                have_net = 1;
+            } else if (state->tetra_net_known) {
+                net_mcc = state->tetra_mcc;
+                net_mnc = state->tetra_mnc;
+                have_net = 1;
+            }
+            if (have_net) {
+                tetra_air_ksg_remember(state, net_mcc, net_mnc, ksg);
+            }
+        }
     }
     return;
 

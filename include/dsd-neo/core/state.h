@@ -2605,6 +2605,20 @@ struct dsd_state {
     uint8_t  tetra_mm_otar_reject_reason[7];
     uint8_t  tetra_mm_otar_ksg;
     uint8_t  tetra_mm_otar_retry_interval;
+    /* KSG 0..3 remembered from D-OTAR SCK/GCK Provide, keyed by MCC/MNC.
+     * tetra_hyperframe is the SYSINFO value from a burst whose CCK flag is clear,
+     * kept apart from tetra_cck_id so a later CCK identifier does not erase it.
+     * tetra_air_key is the operator 80-bit key, not an unwrapped OTAR key. */
+    uint8_t  tetra_air_ksg_valid[4];
+    uint16_t tetra_air_ksg_mcc[4];
+    uint16_t tetra_air_ksg_mnc[4];
+    uint8_t  tetra_air_ksg[4];
+    uint8_t  tetra_hyperframe_valid;
+    uint16_t tetra_hyperframe;
+    uint8_t  tetra_air_key_valid[4];
+    uint16_t tetra_air_key_mcc[4];
+    uint16_t tetra_air_key_mnc[4];
+    uint8_t  tetra_air_key[4][10];
     uint8_t  tetra_mm_otar_address_valid;
     uint16_t tetra_mm_otar_mcc;
     uint16_t tetra_mm_otar_mnc;

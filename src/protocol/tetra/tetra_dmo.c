@@ -6,8 +6,10 @@
  */
 
 #include <dsd-neo/core/state.h>
+#include <dsd-neo/crypto/tetra_etee.h>
 #include <dsd-neo/protocol/tetra/tetra_bits.h>
 #include <dsd-neo/protocol/tetra/tetra_dmo.h>
+#include <dsd-neo/protocol/tetra/tetra_air.h>
 #include <dsd-neo/protocol/tetra/tetra_messages.h>
 
 #include <stdio.h>
@@ -1093,6 +1095,9 @@ tetra_dmo_describe_elems(const tetra_dmo_sync_h_t* h, char* buf, int buf_len) {
         return 0;
     }
     buf[0] = '\0';
+    if (h->e2ee) {
+        (void)tetra_etee_library_ready();
+    }
     tetra_dmo_timing_text(h, timing, (int)sizeof(timing));
     if (h->elems & TETRA_DMO_ELEMS_CALL) {
         n = snprintf(buf, (size_t)buf_len, "%s %s prio=%s pwr=%u%s%s", h->group_call ? "group" : "individual",
@@ -1233,6 +1238,19 @@ tetra_dmo_format_mode(const dsd_state* state, char* buf, int buf_len) {
                      state->tetra_colour);
     } else {
         n = snprintf(buf, (size_t)buf_len, "TMO downlink");
+    }
+    if (n > 0 && n < buf_len && !state->tetra_dmo && state->tetra_net_known) {
+        const char* extra = tetra_air_ksg_name(tetra_air_ksg_lookup(state, state->tetra_mcc, state->tetra_mnc));
+        int extra_n;
+        if (!extra && (state->tetra_enc_mode == 1 || state->tetra_enc_mode == 2)) {
+            extra = "encrypted";
+        }
+        if (extra) {
+            extra_n = snprintf(buf + n, (size_t)(buf_len - n), "  %s", extra);
+            if (extra_n > 0) {
+                n += extra_n;
+            }
+        }
     }
     return n < 0 ? 0 : n;
 }

@@ -12,6 +12,7 @@ target_sources(dsd-neo_proto_tetra PRIVATE
   tetra_tch_slot_gate.c
   tetra_bsch.c
   tetra_dmo.c
+  tetra_air.c
   tetra_bsch_fmt.c
   tetra_channel_info.c
   osmo_sources/tetra_conv_enc.c
@@ -22,7 +23,7 @@ target_include_directories(dsd-neo_proto_tetra
   PUBLIC ${PROJECT_SOURCE_DIR}/include
 )
 
-target_link_libraries(dsd-neo_proto_tetra PUBLIC dsd-neo_core)
+target_link_libraries(dsd-neo_proto_tetra PUBLIC dsd-neo_core dsd-neo_crypto)
 
 # Small test executable to validate RCPC depuncture mapping (build with CMake)
 add_executable(dsd-neo_tetra_depunct_test tetra_fec.c)

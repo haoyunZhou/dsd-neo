@@ -598,6 +598,10 @@ static void parse_mac_sysinfo(const uint8_t *bits, int nbits, int cc,
         /* Phase 20-22: cache remaining SYSINFO fields */
         state->tetra_cck_valid          = (uint8_t)(cck_valid & 1u);
         state->tetra_cck_id             = (uint16_t)(cck_or_hf & 0xFFFFu);
+        if (!cck_valid) {
+            state->tetra_hyperframe       = (uint16_t)(cck_or_hf & 0xFFFFu);
+            state->tetra_hyperframe_valid = 1;
+        }
         state->tetra_duplex_spacing     = (uint8_t)(duplex_spacing & 0x07u);
         state->tetra_num_csch           = (uint8_t)(num_csch & 0x03u);
         state->tetra_ms_txpwr_max       = (uint8_t)(ms_txpwr & 0x07u);

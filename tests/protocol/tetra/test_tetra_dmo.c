@@ -6,6 +6,7 @@
 
 #include <dsd-neo/core/state.h>
 #include <dsd-neo/protocol/tetra/tetra_dmo.h>
+#include <dsd-neo/protocol/tetra/tetra_air.h>
 #include <dsd-neo/protocol/tetra/tetra_fec.h>
 
 #include <stdint.h>
@@ -685,6 +686,14 @@ main(void) {
                   && strstr(mode, "TMO downlink") != NULL && strstr(mode, "MCC=86") != NULL
                   && strstr(mode, "CC=0x19") != NULL,
               "TMO downlink names the network");
+        mode_state.tetra_enc_mode = 1;
+        CHECK(tetra_dmo_format_mode(&mode_state, mode, (int)sizeof(mode)) > 0 && strstr(mode, "encrypted") != NULL
+                  && strstr(mode, "TEA") == NULL,
+              "encrypted trunked call without a KSG stays unnamed");
+        tetra_air_ksg_remember(&mode_state, 86, 28, 1);
+        CHECK(tetra_dmo_format_mode(&mode_state, mode, (int)sizeof(mode)) > 0 && strstr(mode, "TEA2") != NULL,
+              "remembered KSG is shown beside the working mode");
+        mode_state.tetra_enc_mode = 0;
         mode_state.tetra_uplink = 1;
         mode_state.tetra_cb = 1;
         CHECK(tetra_dmo_format_mode(&mode_state, mode, (int)sizeof(mode)) > 0 && strstr(mode, "TMO uplink control") != NULL,
@@ -696,7 +705,8 @@ main(void) {
         mode_state.tetra_dmo_slot = 1;
         mode_state.tetra_dmo_frame = 3;
         CHECK(tetra_dmo_format_mode(&mode_state, mode, (int)sizeof(mode)) > 0 && strstr(mode, "DMO direct") != NULL
-                  && strstr(mode, "ch A") != NULL && strstr(mode, "clear") != NULL && strstr(mode, "slot 1") != NULL,
+                  && strstr(mode, "ch A") != NULL && strstr(mode, "clear") != NULL && strstr(mode, "slot 1") != NULL
+                  && strstr(mode, "TEA") == NULL,
               "DMO direct working mode");
         mode_state.tetra_dmo_comm_type = 2;
         mode_state.tetra_dmo_enc_state = 1;

@@ -41,6 +41,11 @@ Thumbs.db
 /third_party/tetra_acelp/reference/
 /tools/tetra/etsi/
 /tools/tetra/acelp_adapter/C-CODE/
+# Local Midnight Blue checkouts and the headers/libs built from them.
+/tools/tetra/TETRA_crypto/
+/tools/tetra/TETRA_etee/
+/third_party/TETRA_crypto/
+/third_party/TETRA_etee/
 
 # Scratch content under tmp is ignored; the two tracked ETSI reference files
 # remain versioned because ignore rules do not affect tracked files.

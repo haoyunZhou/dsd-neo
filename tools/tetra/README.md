@@ -20,6 +20,36 @@ ETSI does not make those sources redistributable here.
   value 0 or 1), 480 bytes out (240 PCM16LE samples at 8 kHz). Write diagnostics
   to stderr.
 
+## Crypto library checkouts
+
+Air-interface and end-to-end crypto stay as local checkouts in this directory.
+Clone them here. Do not copy the sources into the library directories.
+
+```bash
+git clone --depth 1 https://github.com/MidnightBlueLabs/TETRA_crypto.git tools/tetra/TETRA_crypto
+git clone --depth 1 https://github.com/MidnightBlueLabs/TETRA_etee.git tools/tetra/TETRA_etee
+```
+
+Both repositories are Apache-2.0. `TETRA_crypto` is the air-interface library
+(TEA1, TEA2, TEA3, HURDLE, TAA1). `TETRA_etee` is the end-to-end library and
+needs OpenSSL when it is built.
+
+The built libraries contain headers and binaries only. Headers are shared.
+Libraries are split by operating system and build type so a Windows `.lib`
+does not replace a Linux `.a`, and Debug does not replace Release:
+
+```
+third_party/TETRA_crypto/include
+third_party/TETRA_crypto/lib/<windows|linux|macos>/<debug|release>
+third_party/TETRA_etee/include
+third_party/TETRA_etee/lib/<windows|linux|macos>/<debug|release>
+```
+
+Compile from `tools/tetra/TETRA_crypto` and `tools/tetra/TETRA_etee`. CMake
+force-includes `tools/tetra/gcc_compat.h` so the endian macros resolve on MSVC,
+GCC, and Clang. `TETRA_etee` needs GNU C (`-std=gnu11`); on Windows that
+compilation uses Clang. Leave the `.c` sources in the checkout.
+
 Vocoder stub and testing
 
 Quick test for `TETRA_VOCODER_CMD` integration

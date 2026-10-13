@@ -7,6 +7,7 @@
  */
 
 #include <dsd-neo/protocol/tetra/tetra_mm.h>
+#include <dsd-neo/protocol/tetra/tetra_air.h>
 #include <dsd-neo/core/state.h>
 #include <dsd-neo/core/opts.h>
 
@@ -715,6 +716,7 @@ static void test_otar_sck_and_gsko(void)
           && state->tetra_mm_otar_mcc == 460
           && state->tetra_mm_otar_mnc == 4242,
           "SCK Provide KSG, retry and address retained");
+    CHECK(tetra_air_ksg_lookup(state, 460, 4242) == 2, "SCK Provide KSG remembered for the network");
 
     tetra_mm_dispatch(bits, off - 1, 3, opts, state);
     CHECK(state->tetra_mm_otar_subtype == 2

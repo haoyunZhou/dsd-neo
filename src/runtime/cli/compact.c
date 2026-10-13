@@ -152,6 +152,7 @@ static const char* const k_skip_exact_next_nonnull[] = {
 static const char* const k_skip_exact_next_nonopt[] = {
     "--lrrp-extra-port", "--rtl-udp-control", "--rtl-udp-control-bind", "--config", "--validate-config",
     "--tetra-net",
+    "--tetra-key",
 };
 
 static const char* const k_skip_prefix[] = {
@@ -178,6 +179,7 @@ static const char* const k_skip_prefix[] = {
     "--iq-replay-rate=",
     "--iq-info=",
     "--tetra-net=",
+    "--tetra-key=",
     "--dmr-baofeng-pc5=",
     "--dmr-csi-ee72=",
     "--dmr-vertex-ks-csv=",

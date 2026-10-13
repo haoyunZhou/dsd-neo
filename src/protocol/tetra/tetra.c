@@ -25,6 +25,7 @@
 #include <dsd-neo/protocol/tetra/tetra_sync.h>
 #include <dsd-neo/protocol/tetra/tetra_bsch.h>
 #include <dsd-neo/protocol/tetra/tetra_dmo.h>
+#include <dsd-neo/protocol/tetra/tetra_air.h>
 #include <dsd-neo/protocol/tetra/tetra_bits.h>
 #include <dsd-neo/protocol/tetra/tetra_fec.h>
 #include <dsd-neo/protocol/tetra/tetra_mac.h>
@@ -278,6 +279,7 @@ static void tetra_decode_tch_fs(const uint16_t *soft_b1, const uint16_t *soft_b2
                 fflush(dump_fp);
             }
         }
+        tetra_air_decrypt_voice(state, decoded, dec_len, 0);
         tetra_acelp_process_tch(decoded, dec_len, 0, opts, state);
     }
 
@@ -315,6 +317,7 @@ static int tetra_decode_tch_half(const uint16_t *soft_block, dsd_opts *opts, dsd
     snprintf(state->fsubtype, sizeof(state->fsubtype), " STCH+TCH     ");
     if (opts->payload || opts->errorbars)
         fprintf(stderr, "[TETRA TCH/H] crc=%d mismatches=%d\n", crc_ok, mismatches);
+    tetra_air_decrypt_voice(state, bits, 137, 137);
     tetra_acelp_process_tch_half(bits, 137, opts, state);
     return 1;
 }
