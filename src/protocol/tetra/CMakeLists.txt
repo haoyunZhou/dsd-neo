@@ -26,6 +26,71 @@ target_include_directories(dsd-neo_proto_tetra
 
 target_link_libraries(dsd-neo_proto_tetra PUBLIC dsd-neo_core dsd-neo_crypto)
 
+# Local ETSI EN 300 395-2 C-CODE is optional and is never fetched by the build.
+# When it is present, speech is decoded in-process. TETRA_VOCODER_CMD remains
+# an explicit override for tests and alternate codecs.
+set(_DSD_TETRA_C_CODE_DEFAULT "")
+if(EXISTS "${PROJECT_SOURCE_DIR}/third_party/tetra_acelp/reference/C-CODE/SOURCE.H")
+    set(_DSD_TETRA_C_CODE_DEFAULT
+        "${PROJECT_SOURCE_DIR}/third_party/tetra_acelp/reference/C-CODE"
+    )
+endif()
+set(ETSI_TETRA_C_CODE
+    "${_DSD_TETRA_C_CODE_DEFAULT}"
+    CACHE PATH
+    "Local ETSI EN 300 395-2 C-CODE directory. Empty leaves speech on TETRA_VOCODER_CMD."
+)
+if(EXISTS "${ETSI_TETRA_C_CODE}/SOURCE.H")
+    set(_DSD_TETRA_ACELP_SOURCES
+        tetra_acelp_builtin.c
+        "${ETSI_TETRA_C_CODE}/SDEC_TET.C"
+        "${ETSI_TETRA_C_CODE}/SUB_SC_D.C"
+        "${ETSI_TETRA_C_CODE}/SUB_DSP.C"
+        "${ETSI_TETRA_C_CODE}/FBAS_TET.C"
+        "${ETSI_TETRA_C_CODE}/FEXP_TET.C"
+        "${ETSI_TETRA_C_CODE}/FMAT_TET.C"
+        "${ETSI_TETRA_C_CODE}/TETRA_OP.C"
+    )
+    # Shared library so the codec's generic symbols (add, round, ...) stay
+    # inside this module instead of colliding with the rest of the link.
+    add_library(dsd-neo_tetra_acelp SHARED ${_DSD_TETRA_ACELP_SOURCES})
+    set_source_files_properties(
+        ${_DSD_TETRA_ACELP_SOURCES} PROPERTIES LANGUAGE C
+    )
+    set_target_properties(dsd-neo_tetra_acelp PROPERTIES OUTPUT_NAME tetra_acelp)
+    target_include_directories(
+        dsd-neo_tetra_acelp PRIVATE "${ETSI_TETRA_C_CODE}"
+    )
+    if(MSVC)
+        target_compile_definitions(
+            dsd-neo_tetra_acelp PRIVATE _CRT_SECURE_NO_WARNINGS
+        )
+    else()
+        target_compile_options(dsd-neo_tetra_acelp PRIVATE -fvisibility=hidden)
+    endif()
+    target_compile_definitions(
+        dsd-neo_proto_tetra PRIVATE DSD_HAVE_TETRA_ACELP_BUILTIN=1
+    )
+    target_link_libraries(dsd-neo_proto_tetra PUBLIC dsd-neo_tetra_acelp)
+    message(STATUS "TETRA ACELP: in-process decoder from ${ETSI_TETRA_C_CODE}")
+else()
+    message(STATUS "TETRA ACELP: no local C-CODE; speech uses TETRA_VOCODER_CMD")
+endif()
+
+function(dsd_neo_copy_tetra_acelp_runtime target)
+    if(NOT TARGET dsd-neo_tetra_acelp)
+        return()
+    endif()
+    add_custom_command(
+        TARGET ${target}
+        POST_BUILD
+        COMMAND
+            ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:dsd-neo_tetra_acelp>
+            $<TARGET_FILE_DIR:${target}>
+        VERBATIM
+    )
+endfunction()
+
 # Small test executable to validate RCPC depuncture mapping (build with CMake)
 add_executable(dsd-neo_tetra_depunct_test tetra_fec.c)
 target_compile_definitions(dsd-neo_tetra_depunct_test PRIVATE TETRA_FEC_TEST_MAIN)

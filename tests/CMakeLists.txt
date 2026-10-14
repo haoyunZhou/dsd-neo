@@ -9506,6 +9506,7 @@ if(Python3_Interpreter_FOUND)
         dsd-neo_test_tetra_acelp_pipeline
         PRIVATE dsd-neo_proto_tetra dsd-neo_fec
     )
+    dsd_neo_copy_tetra_acelp_runtime(dsd-neo_test_tetra_acelp_pipeline)
     add_test(
         NAME TETRA_ACELP_PIPELINE
         COMMAND dsd-neo_test_tetra_acelp_pipeline
@@ -9530,6 +9531,7 @@ if(Python3_Interpreter_FOUND)
         dsd-neo_test_tetra_acelp_short_output
         PRIVATE dsd-neo_proto_tetra dsd-neo_fec
     )
+    dsd_neo_copy_tetra_acelp_runtime(dsd-neo_test_tetra_acelp_short_output)
     add_test(
         NAME TETRA_ACELP_SHORT_OUTPUT
         COMMAND dsd-neo_test_tetra_acelp_short_output
@@ -9563,7 +9565,7 @@ if(Python3_Interpreter_FOUND)
         TETRA_ACELP_MISSING_COMMAND
         PROPERTIES
             LABELS "protocol;tetra;audio"
-            ENVIRONMENT "TETRA_VOCODER_CMD="
+            ENVIRONMENT "TETRA_VOCODER_CMD=;TETRA_ACELP_DISABLE_BUILTIN=1"
     )
 endif()
 

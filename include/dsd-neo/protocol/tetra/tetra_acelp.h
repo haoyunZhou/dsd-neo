@@ -63,8 +63,11 @@ void tetra_acelp_decode(const uint8_t *bits, int len);
  * from both NDB blocks (Block 1 + Block 2 = 432 coded bits):
  *
  *   type-2 bits → class reorder → 2 × 137-bit ACELP codec frames
- *               → external vocoder subprocess (TETRA_VOCODER_CMD)
+ *               → in-process ETSI decoder, or TETRA_VOCODER_CMD when set
  *               → PCM16 audio routing (PA / UDP / raw FD / WAV)
+ *
+ * A local C-CODE tree configured as ETSI_TETRA_C_CODE is linked into the
+ * decoder. Set TETRA_VOCODER_CMD only to force the external pipe instead.
  *
  * TETRA_VOCODER_CMD protocol (synchronous, persistent subprocess):
  *   send : TETRA_TCH_FRAME_BITS bytes  (one byte per coded bit, values 0/1)

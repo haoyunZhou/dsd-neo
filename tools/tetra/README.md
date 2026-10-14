@@ -1,17 +1,22 @@
 TETRA speech codec
 
-dsd-neo stops at a 137-bit speech frame and plays PCM from whatever command
-`TETRA_VOCODER_CMD` names. The ETSI ACELP codec is not in this repository, and
-the top-level CMake build does not compile one. Downloading the standard from
-ETSI does not make those sources redistributable here.
+dsd-neo stops at a 137-bit speech frame. When CMake is given a local ETSI
+`C-CODE` directory (`ETSI_TETRA_C_CODE`, or
+`third_party/tetra_acelp/reference/C-CODE` after `prepare.ps1`), that decoder
+is linked into the process and no vocoder command is required. The sources are
+not fetched or redistributed by this repository.
+
+`TETRA_VOCODER_CMD` still forces the older pipe protocol. Use it for the test
+stub or for a separately built adapter. Downloading the standard from ETSI
+does not make those sources redistributable here.
 
 - Automated tests point `TETRA_VOCODER_CMD` at `vocoder_stub.py` below. The stub
   returns silence and checks the pipe, not speech quality.
-- For real speech, configure `acelp_adapter/` as its own CMake build with
-  `-DETSI_TETRA_C_CODE` set to a local `C-CODE` directory, then set
-  `TETRA_VOCODER_CMD` to the resulting `tetra-acelp-adapter` executable.
-  A local preparation helper is in `third_party/tetra_acelp/`; build
-  instructions are in `acelp_adapter/README.md`.
+- For real speech, point the top-level build at the same `C-CODE` directory
+  with `-DETSI_TETRA_C_CODE`. dsd-neo then decodes in-process. A local
+  preparation helper is in `third_party/tetra_acelp/`. The separate
+  `acelp_adapter/` executable remains available when a pipe is required;
+  its build instructions are in `acelp_adapter/README.md`.
 - Do not commit the ETSI archive, the `C-CODE` tree, or the adapter binary.
   A local checkout dropped under `tools/tetra/etsi/` or
   `acelp_adapter/C-CODE/` is gitignored.

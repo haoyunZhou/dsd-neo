@@ -96,6 +96,32 @@ typedef enum {
 } tetra_voc_status_t;
 
 static int s_voc_last_timeout = 0;
+static int s_voc_builtin = 0;
+
+#ifndef DSD_HAVE_TETRA_ACELP_BUILTIN
+#define DSD_HAVE_TETRA_ACELP_BUILTIN 0
+#endif
+
+#if DSD_HAVE_TETRA_ACELP_BUILTIN
+extern void tetra_acelp_builtin_reset(void);
+extern int tetra_acelp_builtin_decode(const uint8_t *bits, int nbits, int16_t *pcm, int nsamples);
+#endif
+
+/* TETRA_VOCODER_CMD forces the external process. Otherwise a decoder that was
+ * linked from a local ETSI C-CODE tree runs in this process. */
+static int voc_builtin_selected(void) {
+#if !DSD_HAVE_TETRA_ACELP_BUILTIN
+    return 0;
+#else
+    const char *off = getenv("TETRA_ACELP_DISABLE_BUILTIN");
+    const char *cmd = getenv("TETRA_VOCODER_CMD");
+    if (off && off[0] && strcmp(off, "0") != 0)
+        return 0;
+    if (cmd && cmd[0])
+        return 0;
+    return 1;
+#endif
+}
 
 /* Convert decoded TYPE2 bits (at least 274 bits) into two consecutive codec frames.
  * Each frame occupies TETRA_TCH_FRAME_BITS (137) bytes in the output buffer.
@@ -323,6 +349,14 @@ static int voc_send_recv(const uint8_t *bits, int nbits, int16_t *pcm, int nsamp
 }
 
 void tetra_vocoder_close(void) {
+    if (s_voc_builtin) {
+#if DSD_HAVE_TETRA_ACELP_BUILTIN
+        tetra_acelp_builtin_reset();
+#endif
+        s_voc_builtin = 0;
+        s_voc_status = TETRA_VOC_STATUS_UNKNOWN;
+        return;
+    }
     if (!s_voc.open) return;
     CloseHandle(s_voc.h_write);
     CloseHandle(s_voc.h_read);
@@ -462,6 +496,14 @@ static int voc_send_recv(const uint8_t *bits, int nbits, int16_t *pcm, int nsamp
 }
 
 void tetra_vocoder_close(void) {
+    if (s_voc_builtin) {
+#if DSD_HAVE_TETRA_ACELP_BUILTIN
+        tetra_acelp_builtin_reset();
+#endif
+        s_voc_builtin = 0;
+        s_voc_status = TETRA_VOC_STATUS_UNKNOWN;
+        return;
+    }
     if (!s_voc.open) return;
     close(s_voc.fd_write);
     close(s_voc.fd_read);
@@ -488,7 +530,13 @@ void tetra_vocoder_close(void) {
 
 /* Ensure the vocoder subprocess is running.  Returns 1 if open. */
 static int voc_ensure_open(void) {
-    if (s_voc.open) return 1;
+    if (s_voc_builtin || s_voc.open) return 1;
+    if (voc_builtin_selected()) {
+        s_voc_builtin = 1;
+        s_voc_status = TETRA_VOC_STATUS_OPEN;
+        fprintf(stderr, "[TETRA] ACELP decoder linked in-process\n");
+        return 1;
+    }
     const char *cmd = getenv("TETRA_VOCODER_CMD");
     if (!cmd || !cmd[0]) {
         s_voc_status = TETRA_VOC_STATUS_MISSING_CMD;
@@ -707,8 +755,19 @@ static void tetra_acelp_process_impl(const uint8_t *type2_bits, int type2_len,
 
         int16_t pcm[TETRA_TCH_FRAME_SAMPLES];
         memset(pcm, 0, sizeof(pcm));
-        int nsamples = voc_send_recv(frame, TETRA_TCH_FRAME_BITS,
+        int nsamples;
+        if (s_voc_builtin) {
+#if DSD_HAVE_TETRA_ACELP_BUILTIN
+            s_voc_last_timeout = 0;
+            nsamples = tetra_acelp_builtin_decode(frame, TETRA_TCH_FRAME_BITS,
+                                                  pcm, TETRA_TCH_FRAME_SAMPLES);
+#else
+            nsamples = 0;
+#endif
+        } else {
+            nsamples = voc_send_recv(frame, TETRA_TCH_FRAME_BITS,
                                      pcm, TETRA_TCH_FRAME_SAMPLES);
+        }
         if (nsamples != TETRA_TCH_FRAME_SAMPLES) {
             if (state) {
                 state->tetra_vocoder_status = s_voc_last_timeout
