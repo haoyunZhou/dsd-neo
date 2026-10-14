@@ -393,8 +393,8 @@ dsd_infer_decode_mode_preset(const dsd_opts* opts) {
    lets the test see which preset landed on which row. */
 const char*
 dsd_decode_mode_display_name(dsdneoUserDecodeMode mode) {
-    static const char* const names[] = {"m0", "m1",  "m2",  "m3",  "m4",  "m5",  "m6",  "m7", "m8",
-                                        "m9", "m10", "m11", "m12", "m13", "m14", "m15", "m16"};
+    static const char* const names[] = {"m0", "m1",  "m2",  "m3",  "m4",  "m5",  "m6",  "m7",  "m8",
+                                        "m9", "m10", "m11", "m12", "m13", "m14", "m15", "m16", "m17"};
     const int i = (int)mode;
     return (i >= 0 && i < (int)(sizeof names / sizeof names[0])) ? names[i] : "m?";
 }
@@ -1971,7 +1971,7 @@ test_signal_chain_rows(void) {
     rc |= expect_str("decode mode second row is p25 both phases", g_chooser.labels[1], "m13");
     rc |= expect_str("decode mode fifth row is dmr", g_chooser.labels[4], "m4");
     rc |= expect_str("decode mode analog row", g_chooser.labels[14], "m14");
-    rc |= expect_str("decode mode last row is AM, after analog", g_chooser.labels[15], "m16");
+    rc |= expect_str("decode mode last row is AM, after analog", g_chooser.labels[15], "m17");
     rc |= expect_int("decode mode opens without posting", g_cmd.calls, 0);
     g_chooser.on_done(g_chooser.user, 4);
     rc |= expect_int("decode mode set command", g_cmd.id, DSD_APP_CMD_DECODE_MODE_SET);
@@ -2023,7 +2023,7 @@ test_signal_chain_rows(void) {
     reset_capture();
     dsd_test_scan_labels_input_type(AUDIO_IN_RTL);
     act_decode_mode(&mode_ctx);
-    rc |= expect_str("decode mode on a radio offers AM", g_chooser.labels[15], "m16");
+    rc |= expect_str("decode mode on a radio offers AM", g_chooser.labels[15], "m17");
     g_chooser.on_done(g_chooser.user, 15);
     rc |= expect_int("decode mode on a radio AM posts AM",
                      g_cmd.id == DSD_APP_CMD_DECODE_MODE_SET && cmd_i32() == DSDCFG_MODE_AM, 1);

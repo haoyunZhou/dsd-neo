@@ -3080,67 +3080,6 @@ test_replay_read_failure_mid_chunk_delivers_what_was_read(void) {
     return rc;
 }
 
-/* A sidecar written by hand, for a sample format or capture stage the capture writer does not produce, over
- * @p payload_bytes of data. */
-static int
-make_hand_written_replay_fixture(char* out_metadata_path, size_t out_metadata_path_size, const char* sample_format,
-                                 const char* endianness, const char* capture_stage, size_t payload_bytes) {
-    char temp_dir[DSD_TEST_PATH_MAX];
-    if (!dsd_test_mkdtemp(temp_dir, sizeof(temp_dir), "dsdneo_replay_format")) {
-        DSD_FPRINTF(stderr, "FAIL: could not create a fixture directory\n");
-        return 1;
-    }
-    track_fixture_dir(temp_dir, "format.iq", "format.iq.json");
-    char data_path[DSD_TEST_PATH_MAX];
-    if (dsd_test_path_join(data_path, sizeof(data_path), temp_dir, "format.iq") != 0
-        || dsd_test_path_join(out_metadata_path, out_metadata_path_size, temp_dir, "format.iq.json") != 0) {
-        return 1;
-    }
-    std::vector<uint8_t> payload(payload_bytes);
-    for (size_t i = 0; i < payload.size(); i++) {
-        payload[i] = static_cast<uint8_t>((i * 7U) & 0xFFU);
-    }
-    if (write_bytes_file(data_path, payload.data(), payload.size()) != 0) {
-        return 1;
-    }
-    char json[2048];
-    DSD_SNPRINTF(json, sizeof(json),
-                 "{\n"
-                 "  \"format\": \"dsd-neo-iq\",\n"
-                 "  \"version\": 1,\n"
-                 "  \"sample_format\": \"%s\",\n"
-                 "  \"iq_order\": \"IQ\",\n"
-                 "  \"endianness\": \"%s\",\n"
-                 "  \"capture_stage\": \"%s\",\n"
-                 "  \"sample_rate_hz\": 1536000,\n"
-                 "  \"center_frequency_hz\": 851375000,\n"
-                 "  \"capture_center_frequency_hz\": 851759000,\n"
-                 "  \"ppm\": 0,\n"
-                 "  \"tuner_gain_tenth_db\": 270,\n"
-                 "  \"rtl_dsp_bw_khz\": 48,\n"
-                 "  \"base_decimation\": 32,\n"
-                 "  \"post_downsample\": 1,\n"
-                 "  \"demod_rate_hz\": 48000,\n"
-                 "  \"offset_tuning_enabled\": false,\n"
-                 "  \"fs4_shift_enabled\": false,\n"
-                 "  \"combine_rotate_enabled\": true,\n"
-                 "  \"muted_bytes_excluded\": true,\n"
-                 "  \"contains_retunes\": false,\n"
-                 "  \"capture_retune_count\": 0,\n"
-                 "  \"source_backend\": \"soapy\",\n"
-                 "  \"source_args\": \"driver=x\",\n"
-                 "  \"capture_started_utc\": \"2026-04-12T00:00:00Z\",\n"
-                 "  \"data_file\": \"format.iq\",\n"
-                 "  \"data_bytes\": %zu,\n"
-                 "  \"capture_drops\": 0,\n"
-                 "  \"capture_drop_blocks\": 0,\n"
-                 "  \"input_ring_drops\": 0,\n"
-                 "  \"notes\": \"\"\n"
-                 "}\n",
-                 sample_format, endianness, capture_stage, payload_bytes);
-    return write_text_file(out_metadata_path, json);
-}
-
 /* Start a replay of @p metadata_path, with --iq-loop when @p loop, without reporting a refused start: 0 when it
  * started, 1 when it was refused. */
 static int

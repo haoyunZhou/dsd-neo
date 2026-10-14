@@ -6832,9 +6832,8 @@ test_skip_commands(uint8_t slot) {
     rc |= expect_int("export seed skip", dsd_tg_policy_call_skip_arm(&state, 123, 1, 0, dsd_decode_now_mono_s()), 0);
 
     union {
-        dsd_app_tg_export_payload alignment;
-        unsigned char bytes[1200];
         dsd_app_tg_export_payload alignment; /* MSVC's C <stddef.h> has no max_align_t. */
+        unsigned char bytes[1200];
     } storage = {{0}};
 
     dsd_app_tg_export_payload* export = (dsd_app_tg_export_payload*)storage.bytes;

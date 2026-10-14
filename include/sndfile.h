@@ -24,6 +24,7 @@ typedef struct SF_INFO {
 SNDFILE* sf_open(const char* path, int mode, SF_INFO* info);
 SNDFILE* sf_open_fd(int fd, int mode, SF_INFO* info, int close_desc);
 sf_count_t sf_read_short(SNDFILE* sndfile, short* ptr, sf_count_t items);
+sf_count_t sf_readf_short(SNDFILE* sndfile, short* ptr, sf_count_t frames);
 sf_count_t sf_write_short(SNDFILE* sndfile, const short* ptr, sf_count_t items);
 sf_count_t sf_seek(SNDFILE* sndfile, sf_count_t frames, int whence);
 int sf_write_sync(SNDFILE* sndfile);
