@@ -17,7 +17,6 @@
  */
 
 #include <dsd-neo/core/dibit.h>
-#include <dsd-neo/core/dsd_time.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/state.h>
 #include <dsd-neo/protocol/p25/p25.h>
@@ -30,6 +29,7 @@
 #include <dsd-neo/protocol/p25/p25p1_hdu.h>
 #include <dsd-neo/protocol/p25/p25p1_soft.h>
 #include <dsd-neo/runtime/colors.h>
+#include <dsd-neo/runtime/decode_clock.h>
 #include <stdint.h>
 #include <stdio.h>
 #include "dsd-neo/core/opts_fwd.h"
@@ -240,8 +240,8 @@ static void
 tdulc_finalize_tail_symbols(dsd_opts* opts, dsd_state* state, int* status_count) {
     read_zeros(opts, state, 20, status_count);
 
-    state->p25_p1_last_tdu_m = dsd_time_now_monotonic_s();
-    state->last_vc_sync_time_m = dsd_time_now_monotonic_s();
+    state->p25_p1_last_tdu_m = dsd_decode_now_mono_s();
+    state->last_vc_sync_time_m = dsd_decode_now_mono_s();
     if (*status_count != 35) {
         DSD_FPRINTF(stderr, "%s", KRED);
         DSD_FPRINTF(stderr, "*** SYNC ERROR\n");
@@ -295,6 +295,7 @@ processTDULC(dsd_opts* opts, dsd_state* state) {
     uint8_t LCW_bits[72];
     int soft_dibit_index = 0;
     int status_count = 21;
+    const uint32_t carrier_seq = state->carrier_seq;
     tdulc_read_data_and_parity_words(opts, state, dodeca_data, dodeca_parity, &status_count, soft_dibits,
                                      &soft_dibit_index);
 
@@ -306,7 +307,12 @@ processTDULC(dsd_opts* opts, dsd_state* state) {
     // initialize the next call's crypto classification and must survive TDULC.
     p25_crypto_reset_slot(state, 0);
 
-    if (irrecoverable_errors == 0) {
+    if (state->carrier_seq != carrier_seq) {
+        /* The carrier boundary moved the carrier count while the TDULC was read (issue #575). Its link control decodes
+           before the trailing symbols but dispatches only after them, so a grant read whole before the move would
+           retune for the carrier left after the boundary: it is dropped, as on a sync loss. */
+        DSD_FPRINTF(stderr, "\n");
+    } else if (irrecoverable_errors == 0) {
         DSD_FPRINTF(stderr, "%s", KYEL);
         p25_lcw_from_tdulc(opts, state, LCW_bits, 0);
         DSD_FPRINTF(stderr, "%s", KNRM);
@@ -316,8 +322,5 @@ processTDULC(dsd_opts* opts, dsd_state* state) {
         DSD_FPRINTF(stderr, "%s\n", KNRM);
     }
     tdulc_print_lcw_payload(opts, LCW_bytes);
-    if (opts->floating_point == 1) {
-        state->aout_gain = opts->audio_gain;
-    }
     p25_status_accum_classify(state);
 }

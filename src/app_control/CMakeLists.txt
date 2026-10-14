@@ -7,6 +7,7 @@ target_sources(
         actions/actions_logging.c
         actions/actions_radio.c
         actions/actions_trunk.c
+        access_code_view.c
         analog_width_view.c
         app_command_queue.c
         key_commands.c
@@ -19,13 +20,19 @@ target_sources(
         frontend_snr.c
         menu_services.c
         notification_status.c
+        rigctl_connect.c
+        rigctl_passband.c
         rr_import_apply.c
+        rtl_gain_view.c
         rx_tone_view.c
+        scan_row_edit.c
+        scan_row_view.c
         scan_timing_view.c
         squelch_view.c
         symbol_profile.c
         tcp_audio_connect.c
         telemetry_hooks_install.c
+        telemetry_observers.c
         ui_history.c
         ui_opts_snapshot.c
         ui_snapshot.c

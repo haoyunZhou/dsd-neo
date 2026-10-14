@@ -4,10 +4,11 @@
  */
 
 #include <assert.h>
+#include <dsd-neo/core/access_code.h>
 #include <dsd-neo/core/call_state.h>
 #include <dsd-neo/core/constants.h>
+#include <dsd-neo/core/crc_provenance.h>
 #include <dsd-neo/core/csv_import.h>
-#include <dsd-neo/core/dsd_time.h>
 #include <dsd-neo/core/events.h>
 #include <dsd-neo/core/file_io.h>
 #include <dsd-neo/core/opts.h>
@@ -22,6 +23,8 @@
 #include <dsd-neo/platform/threading.h>
 #include <dsd-neo/protocol/edacs/edacs_afs.h>
 #include <dsd-neo/runtime/call_alert.h>
+#include <dsd-neo/runtime/decode_clock.h>
+#include <dsd-neo/runtime/rdio_export.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stddef.h>
@@ -43,9 +46,11 @@ _Static_assert(offsetof(Event_History_I, push_seq) == sizeof(Event_History) * 25
                "event history push sequence must follow the revision");
 _Static_assert(offsetof(Event_History_I, commit_rev) == sizeof(Event_History) * 255U + (2U * sizeof(uint64_t)),
                "event history commit revision must follow the push sequence");
+_Static_assert(offsetof(Event_History_I, instance) == sizeof(Event_History) * 255U + (3U * sizeof(uint64_t)),
+               "event history ring identity must follow the commit revision");
 _Static_assert(sizeof(Event_History_I)
-                   == sizeof(Event_History) * 255U + (3U * sizeof(uint64_t)) + sizeof(Event_History_Staged),
-               "event history appends three counters and a separate staged data payload");
+                   == sizeof(Event_History) * 255U + (4U * sizeof(uint64_t)) + sizeof(Event_History_Staged),
+               "event history appends three counters, the ring identity and a separate staged data payload");
 
 #if defined(__GNUC__) && !defined(__cplusplus)
 #pragma GCC diagnostic push
@@ -139,6 +144,82 @@ static int g_close_wav_export_count;
 static void* g_open_wav_result;
 static double g_observed_m;
 
+// What each WAV close saw: the last activity of the staged row the rename and the rdio-scanner export read, and, once a
+// test arms g_close_wav_export_dir, the sidecar the real exporter wrote from that row at that moment.
+#define CLOSE_WAV_CAPTURE_MAX 8
+#define CLOSE_WAV_SECONDS     2
+
+typedef struct {
+    time_t event_time;
+    char sidecar[1024];
+} close_wav_capture;
+
+static close_wav_capture g_close_wav_captures[CLOSE_WAV_CAPTURE_MAX];
+static int g_close_wav_capture_count;
+static char g_close_wav_export_dir[DSD_TEST_PATH_MAX];
+
+// A mono 16-bit WAV of @p seconds of silence, written as raw bytes: the alt-tag build of this file has no libsndfile.
+static int
+write_silent_pcm16_wav(const char* path, uint32_t sample_rate, uint32_t seconds) {
+    FILE* fp = dsd_fopen_private(path, "wb");
+    if (fp == NULL) {
+        return -1;
+    }
+    const uint32_t data_bytes = sample_rate * seconds * 2U;
+    const uint32_t fields[] = {36U + data_bytes, 16U,         0x00010001U, sample_rate,
+                               sample_rate * 2U, 0x00100002U, data_bytes};
+    unsigned char header[44];
+    DSD_MEMCPY(header, "RIFF", 4);
+    DSD_MEMCPY(header + 8, "WAVEfmt ", 8);
+    DSD_MEMCPY(header + 36, "data", 4);
+    const size_t offsets[] = {4U, 16U, 20U, 24U, 28U, 32U, 40U};
+    for (size_t i = 0; i < sizeof offsets / sizeof offsets[0]; i++) {
+        for (size_t b = 0; b < 4U; b++) {
+            header[offsets[i] + b] = (unsigned char)((fields[i] >> (8U * b)) & 0xFFU);
+        }
+    }
+    int rc = fwrite(header, 1, sizeof header, fp) == sizeof header ? 0 : -1;
+    const unsigned char zeros[1024] = {0};
+    for (uint32_t left = data_bytes; rc == 0 && left > 0U;) {
+        const size_t chunk = left < sizeof zeros ? (size_t)left : sizeof zeros;
+        rc = fwrite(zeros, 1, chunk, fp) == chunk ? 0 : -1;
+        left -= (uint32_t)chunk;
+    }
+    if (fclose(fp) != 0) {
+        rc = -1;
+    }
+    return rc;
+}
+
+// Export the closing recording through the real rdio-scanner exporter, as close_and_rename_wav_file_ex() does, and
+// keep the sidecar it wrote.
+static void
+close_wav_export_sidecar(const dsd_opts* opts, const Event_History_I* event_struct, time_t opened, int index,
+                         close_wav_capture* capture) {
+    char name[32];
+    char wav_path[DSD_TEST_PATH_MAX];
+    char json_path[DSD_TEST_PATH_MAX];
+    DSD_SNPRINTF(name, sizeof name, "close_%d.wav", index);
+    if (dsd_test_path_join(wav_path, sizeof wav_path, g_close_wav_export_dir, name) != 0) {
+        return;
+    }
+    DSD_SNPRINTF(name, sizeof name, "close_%d.json", index);
+    if (dsd_test_path_join(json_path, sizeof json_path, g_close_wav_export_dir, name) != 0) {
+        return;
+    }
+    if (write_silent_pcm16_wav(wav_path, 8000U, CLOSE_WAV_SECONDS) == 0
+        && dsd_rdio_export_call(opts, event_struct, wav_path, opened) == 0) {
+        FILE* f = fopen(json_path, "rb");
+        if (f != NULL) {
+            const size_t n = fread(capture->sidecar, 1, sizeof capture->sidecar - 1U, f);
+            capture->sidecar[n] = '\0';
+            (void)fclose(f);
+        }
+    }
+    (void)remove(json_path);
+    (void)remove(wav_path);
+}
+
 SNDFILE*
 open_wav_file(char* dir, char* temp_filename, size_t temp_filename_size, uint16_t sample_rate, uint8_t ext) {
     UNUSED(dir);
@@ -152,15 +233,22 @@ open_wav_file(char* dir, char* temp_filename, size_t temp_filename_size, uint16_
 
 SNDFILE*
 close_and_rename_wav_file_ex(SNDFILE* wav_file, const dsd_opts* opts, const char* wav_out_filename, const char* dir,
-                             const Event_History_I* event_struct, int export_call) {
+                             const Event_History_I* event_struct, time_t opened, int export_call) {
     UNUSED(wav_file);
-    UNUSED(opts);
     UNUSED(wav_out_filename);
     UNUSED(dir);
-    UNUSED(event_struct);
     g_close_wav_count++;
     if (export_call) {
         g_close_wav_export_count++;
+    }
+    if (event_struct != NULL && g_close_wav_capture_count < CLOSE_WAV_CAPTURE_MAX) {
+        const int index = g_close_wav_capture_count++;
+        close_wav_capture* capture = &g_close_wav_captures[index];
+        capture->event_time = event_struct->Event_History_Items[0].event_time;
+        capture->sidecar[0] = '\0';
+        if (export_call && opts != NULL && g_close_wav_export_dir[0] != '\0') {
+            close_wav_export_sidecar(opts, event_struct, opened, index, capture);
+        }
     }
     return NULL;
 }
@@ -246,6 +334,9 @@ reset_fixture(dsd_opts* opts, dsd_state* state, Event_History_I event_history[2]
     g_close_wav_count = 0;
     g_open_wav_result = NULL;
     g_observed_m = 1.0;
+    DSD_MEMSET(g_close_wav_captures, 0, sizeof g_close_wav_captures);
+    g_close_wav_capture_count = 0;
+    g_close_wav_export_dir[0] = '\0';
 }
 
 static int
@@ -310,6 +401,8 @@ emit_test_data_notice(dsd_opts* opts, dsd_state* state, uint64_t source_id, uint
     return dsd_event_emit_data_notice(opts, state, slot, &observation, notice);
 }
 
+// Once a test's temp file exists, its checks count failures with these helpers rather than assert(), so the test
+// still removes the file when a check fails.
 static int
 expect_int(const char* label, int got, int want) {
     if (got != want) {
@@ -383,7 +476,8 @@ expect_every_line_stamped(const char* label, const char* buf, const char* stamp)
 static int
 event_history_item_equal(const Event_History* lhs, const Event_History* rhs) {
     return lhs->write == rhs->write && lhs->color_pair == rhs->color_pair && lhs->severity == rhs->severity
-           && lhs->category == rhs->category && lhs->systype == rhs->systype && lhs->subtype == rhs->subtype
+           && lhs->category == rhs->category && lhs->crc_invalid == rhs->crc_invalid && lhs->systype == rhs->systype
+           && lhs->subtype == rhs->subtype && lhs->emergency == rhs->emergency && lhs->priority == rhs->priority
            && lhs->sys_id1 == rhs->sys_id1 && lhs->sys_id2 == rhs->sys_id2 && lhs->sys_id3 == rhs->sys_id3
            && lhs->sys_id4 == rhs->sys_id4 && lhs->sys_id5 == rhs->sys_id5 && lhs->gi == rhs->gi && lhs->enc == rhs->enc
            && lhs->enc_alg == rhs->enc_alg && lhs->enc_key == rhs->enc_key && lhs->mi == rhs->mi && lhs->svc == rhs->svc
@@ -396,7 +490,9 @@ event_history_item_equal(const Event_History* lhs, const Event_History* rhs) {
            && memcmp(lhs->s_mode, rhs->s_mode, sizeof lhs->s_mode) == 0
            && memcmp(lhs->channel_label, rhs->channel_label, sizeof lhs->channel_label) == 0
            && lhs->channel_label_resolved == rhs->channel_label_resolved && lhs->channel == rhs->channel
-           && lhs->event_time == rhs->event_time && memcmp(lhs->pdu, rhs->pdu, sizeof lhs->pdu) == 0
+           && lhs->freq_hz == rhs->freq_hz && lhs->access_code_kind == rhs->access_code_kind
+           && lhs->access_code == rhs->access_code && lhs->event_time == rhs->event_time
+           && lhs->event_start_time == rhs->event_start_time && memcmp(lhs->pdu, rhs->pdu, sizeof lhs->pdu) == 0
            && memcmp(lhs->sysid_string, rhs->sysid_string, sizeof lhs->sysid_string) == 0
            && memcmp(lhs->alias, rhs->alias, sizeof lhs->alias) == 0
            && memcmp(lhs->gps_s, rhs->gps_s, sizeof lhs->gps_s) == 0
@@ -492,9 +588,11 @@ test_watchdog_current_marks_only_semantic_changes(void) {
     watchdog_event_current(&opts, &state, 0);
     rc |= expect_u64("identical watchdog update leaves revision unchanged", event_history[0].revision, first_revision);
 
-    assert(observe_test_call(&state, 0U, DSD_SYNC_DMR_BS_VOICE_POS, DSD_CALL_KIND_GROUP_VOICE, 5678U, 4321U, 0U, 0U,
+    // A change within the same epoch (the call turns emergency). A different source would open a new epoch, whose
+    // render first commits the outgoing row.
+    assert(observe_test_call(&state, 0U, DSD_SYNC_DMR_BS_VOICE_POS, DSD_CALL_KIND_GROUP_VOICE, 5678U, 1234U, 0x80U, 0U,
                              DSD_CALL_BOUNDARY_CONTINUE)
-           == 1);
+           == 0);
     watchdog_event_current(&opts, &state, 0);
     rc |= expect_u64("semantic watchdog update advances revision", event_history[0].revision, first_revision + 1U);
     rc |= expect_u64("watchdog slot update leaves other slot unchanged", event_history[1].revision, 1U);
@@ -602,6 +700,552 @@ test_nonfinalizing_call_notice_defers_call_end_side_effects(void) {
         expect_int("later call end commits rebuilt row", (int)event_history[0].Event_History_Items[1].target_id, 1234);
     rc |= expect_has_substr("nonfinalizing notice remains in history",
                             event_history[0].Event_History_Items[2].internal_str, "Target: 1234");
+    return rc;
+}
+
+// A notice for a call that is not the slot's canonical one -- the P25 encryption lockout builds a synthetic snapshot
+// for a grant the slot's call does not match -- renders against the staged row of another epoch. That row's
+// frequency and code describe the other call: the notice must read its own (here none) or the live receiver instead.
+// The case: a canonical call pins the tuner on one voice channel, the trunking receiver follows a new grant to
+// another, and the encrypted header there raises the lockout notice before the new call is published.
+static int
+test_noncanonical_notice_takes_no_staged_frequency_or_code(void) {
+    static dsd_opts opts;
+    static dsd_state state;
+    static Event_History_I event_history[2];
+    const char* detail = "Target: 200; has been locked out; Encryption Lock Out Enabled.";
+    int rc = 0;
+
+    for (int variant = 0; variant < 2; variant++) {
+        reset_fixture(&opts, &state, event_history);
+        opts.audio_in_type = AUDIO_IN_RTL;
+        opts.rtlsdr_center_freq = 851012500U;
+        state.lastsynctype = DSD_SYNC_P25P1_POS;
+        state.nac = 0x293;
+        assert(observe_test_call(&state, 0U, DSD_SYNC_P25P1_POS, DSD_CALL_KIND_GROUP_VOICE, 100U, 0U, 0U, 0U,
+                                 DSD_CALL_BOUNDARY_BEGIN)
+               == 1);
+        dsd_event_sync_slot(&opts, &state, 0U);
+        const Event_History* staged = &event_history[0].Event_History_Items[0];
+        rc |= expect_int("canonical call pins the first channel", staged->freq_hz == 851012500 ? 1 : 0, 1);
+        rc |= expect_int("canonical call records its NAC",
+                         staged->access_code_kind == (uint8_t)DSD_ACCESS_CODE_NAC && staged->access_code == 0x293U, 1);
+
+        dsd_call_snapshot canonical;
+        assert(dsd_call_state_get(&state, 0U, &canonical) == 1);
+        opts.rtlsdr_center_freq = 852000000U;
+        // Variant 1: the new carrier's NID decoded NAC 0x000 or 0xFFF, which leave nac at 0.
+        state.nac = variant == 0 ? 0x3A1 : 0;
+
+        dsd_call_snapshot synthetic;
+        DSD_MEMSET(&synthetic, 0, sizeof synthetic);
+        synthetic.epoch = canonical.epoch + 1U;
+        synthetic.phase = DSD_CALL_PHASE_ACTIVE;
+        synthetic.protocol = DSD_SYNC_P25P1_POS;
+        synthetic.slot = 0U;
+        synthetic.kind = DSD_CALL_KIND_GROUP_VOICE;
+        synthetic.ota_target_id = 200U;
+        synthetic.policy_target_id = 200U;
+        synthetic.crypto = DSD_CALL_CRYPTO_ENCRYPTED;
+        rc |= expect_int("noncanonical notice commits",
+                         dsd_event_emit_call_notice_nonfinalizing(&opts, &state, 0U, &synthetic, detail), 1);
+
+        const Event_History* notice = &event_history[0].Event_History_Items[1];
+        rc |= expect_int("notice row is the synthetic call's", (int)notice->target_id, 200);
+        if (notice->freq_hz != 852000000) {
+            DSD_FPRINTF(stderr, "noncanonical notice (variant %d) took freq %lld, want the live 852000000\n", variant,
+                        (long long)notice->freq_hz);
+            rc = 1;
+        }
+        const uint8_t want_kind = variant == 0 ? (uint8_t)DSD_ACCESS_CODE_NAC : (uint8_t)DSD_ACCESS_CODE_NONE;
+        const uint16_t want_code = variant == 0 ? 0x3A1U : 0U;
+        if (notice->access_code_kind != want_kind || notice->access_code != want_code) {
+            DSD_FPRINTF(stderr, "noncanonical notice (variant %d) took code kind %u 0x%X, want kind %u 0x%X\n", variant,
+                        (unsigned)notice->access_code_kind, (unsigned)notice->access_code, (unsigned)want_kind,
+                        (unsigned)want_code);
+            rc = 1;
+        }
+        dsd_state_ext_free_all(&state);
+    }
+    return rc;
+}
+
+// The same holds for the scan-channel label: a notice for a call that is not the slot's canonical one names the
+// channel it was heard on now, as a data notice does, never the label another epoch's staged row resolved on an
+// earlier channel.
+static int
+test_noncanonical_notice_resolves_its_channel_label_live(void) {
+    static dsd_opts opts;
+    static dsd_state state;
+    static Event_History_I event_history[2];
+    reset_fixture(&opts, &state, event_history);
+    opts.trunk_scan_enabled = 1;
+    DSD_SNPRINTF(state.trunk_scan_active_id, sizeof state.trunk_scan_active_id, "%s", "North");
+    state.lastsynctype = DSD_SYNC_P25P1_POS;
+    state.nac = 0x293;
+
+    assert(observe_test_call(&state, 0U, DSD_SYNC_P25P1_POS, DSD_CALL_KIND_GROUP_VOICE, 100U, 0U, 0U, 0U,
+                             DSD_CALL_BOUNDARY_BEGIN)
+           == 1);
+    dsd_event_sync_slot(&opts, &state, 0U);
+    int rc = expect_str_eq("canonical call is labelled with its channel",
+                           event_history[0].Event_History_Items[0].channel_label, "North");
+
+    dsd_call_snapshot canonical;
+    assert(dsd_call_state_get(&state, 0U, &canonical) == 1);
+    DSD_SNPRINTF(state.trunk_scan_active_id, sizeof state.trunk_scan_active_id, "%s", "South");
+
+    dsd_call_snapshot synthetic;
+    DSD_MEMSET(&synthetic, 0, sizeof synthetic);
+    synthetic.epoch = canonical.epoch + 1U;
+    synthetic.phase = DSD_CALL_PHASE_ACTIVE;
+    synthetic.protocol = DSD_SYNC_P25P1_POS;
+    synthetic.slot = 0U;
+    synthetic.kind = DSD_CALL_KIND_GROUP_VOICE;
+    synthetic.ota_target_id = 200U;
+    synthetic.policy_target_id = 200U;
+    synthetic.crypto = DSD_CALL_CRYPTO_ENCRYPTED;
+    rc |=
+        expect_int("noncanonical notice commits",
+                   dsd_event_emit_call_notice_nonfinalizing(
+                       &opts, &state, 0U, &synthetic, "Target: 200; has been locked out; Encryption Lock Out Enabled."),
+                   1);
+
+    const Event_History* notice = &event_history[0].Event_History_Items[1];
+    rc |= expect_int("notice row is the synthetic call's", (int)notice->target_id, 200);
+    rc |= expect_str_eq("noncanonical notice names the channel it was heard on", notice->channel_label, "South");
+    rc |= expect_int("noncanonical notice resolved its label", notice->channel_label_resolved, 1);
+    rc |= expect_has_substr("noncanonical notice renders the live label", notice->event_string, "[South] TEST");
+    rc |=
+        expect_no_substr("noncanonical notice does not adopt the other call's label", notice->event_string, "[North]");
+    dsd_state_ext_free_all(&state);
+    return rc;
+}
+
+// And for the row's start stamp, which a render takes once per epoch from the staged row: a notice for a call that is
+// not the slot's canonical one starts when that call did, never when the other epoch's staged call did.
+static int
+test_noncanonical_notice_stamps_its_own_start(void) {
+    static dsd_opts opts;
+    static dsd_state state;
+    static Event_History_I event_history[2];
+    // A decode instant far from any wall-clock reading, so the stamps below can only come from the decode clock.
+    const uint64_t t0_ns = 1000000000000000000ULL;
+    const time_t t0_s = (time_t)1000000000;
+    reset_fixture(&opts, &state, event_history);
+    dsd_decode_clock_use_test(t0_ns);
+    state.lastsynctype = DSD_SYNC_P25P1_POS;
+    state.nac = 0x293;
+
+    // Call A, observed on the decode clock's own timeline (observed_m 0), starts at t0.
+    const dsd_call_observation observation = {
+        .protocol = DSD_SYNC_P25P1_POS,
+        .slot = 0U,
+        .kind = DSD_CALL_KIND_GROUP_VOICE,
+        .ota_target_id = 100U,
+        .policy_target_id = 100U,
+    };
+    assert(dsd_call_state_observe(&state, &observation, DSD_CALL_BOUNDARY_BEGIN) == 1);
+    dsd_event_sync_slot(&opts, &state, 0U);
+    int rc = expect_u64("canonical call is stamped with its start",
+                        (uint64_t)event_history[0].Event_History_Items[0].event_start_time, (uint64_t)t0_s);
+
+    // Seven seconds later call B, which the slot's call does not match, raises a notice.
+    dsd_call_snapshot canonical;
+    assert(dsd_call_state_get(&state, 0U, &canonical) == 1);
+    dsd_decode_clock_test_set_ns(t0_ns + 7000000000ULL);
+    dsd_call_snapshot synthetic;
+    DSD_MEMSET(&synthetic, 0, sizeof synthetic);
+    synthetic.epoch = canonical.epoch + 1U;
+    synthetic.phase = DSD_CALL_PHASE_ACTIVE;
+    synthetic.protocol = DSD_SYNC_P25P1_POS;
+    synthetic.slot = 0U;
+    synthetic.kind = DSD_CALL_KIND_GROUP_VOICE;
+    synthetic.ota_target_id = 200U;
+    synthetic.policy_target_id = 200U;
+    synthetic.crypto = DSD_CALL_CRYPTO_ENCRYPTED;
+    synthetic.started_m = dsd_decode_now_mono_s();
+    synthetic.updated_m = synthetic.started_m;
+    rc |=
+        expect_int("noncanonical notice commits",
+                   dsd_event_emit_call_notice_nonfinalizing(
+                       &opts, &state, 0U, &synthetic, "Target: 200; has been locked out; Encryption Lock Out Enabled."),
+                   1);
+
+    const Event_History* notice = &event_history[0].Event_History_Items[1];
+    rc |= expect_int("notice row is the synthetic call's", (int)notice->target_id, 200);
+    rc |= expect_u64("noncanonical notice starts when its own call did", (uint64_t)notice->event_start_time,
+                     (uint64_t)(t0_s + 7));
+    rc |= expect_u64("noncanonical notice's end is anchored to its own start", (uint64_t)notice->event_time,
+                     (uint64_t)(t0_s + 7));
+
+    // A call whose own start is unknown is not given the other call's either.
+    reset_fixture(&opts, &state, event_history);
+    dsd_decode_clock_test_set_ns(t0_ns);
+    state.lastsynctype = DSD_SYNC_P25P1_POS;
+    assert(dsd_call_state_observe(&state, &observation, DSD_CALL_BOUNDARY_BEGIN) == 1);
+    dsd_event_sync_slot(&opts, &state, 0U);
+    assert(dsd_call_state_get(&state, 0U, &canonical) == 1);
+    synthetic.epoch = canonical.epoch + 1U;
+    synthetic.started_m = 0.0;
+    synthetic.updated_m = 0.0;
+    rc |=
+        expect_int("unstarted noncanonical notice commits",
+                   dsd_event_emit_call_notice_nonfinalizing(
+                       &opts, &state, 0U, &synthetic, "Target: 200; has been locked out; Encryption Lock Out Enabled."),
+                   1);
+    rc |= expect_u64("noncanonical notice with no start of its own has none",
+                     (uint64_t)event_history[0].Event_History_Items[1].event_start_time, 0U);
+
+    dsd_decode_clock_use_system();
+    dsd_state_ext_free_all(&state);
+    return rc;
+}
+
+static int committed_history_rows(const Event_History_I* history);
+
+// A notice for a call that is not the slot's canonical one leaves the canonical call's staged row exactly as it was.
+// It used to render over that row and retire it: the notice row inherited the canonical call's talker alias, and the
+// canonical call -- whose end P25 handle_enc() raises right after the lockout notice -- then rendered for the first
+// time after its end, so its row committed with no access code, no tuned frequency and no alias.
+static int
+test_noncanonical_notice_leaves_the_canonical_staged_row_alone(void) {
+    static dsd_opts opts;
+    static dsd_state state;
+    static Event_History_I event_history[2];
+    static Event_History before;
+    reset_fixture(&opts, &state, event_history);
+    opts.audio_in_type = AUDIO_IN_RTL;
+    opts.rtlsdr_center_freq = 851012500U;
+    state.lastsynctype = DSD_SYNC_P25P1_POS;
+    state.nac = 0x293;
+
+    assert(observe_test_call(&state, 0U, DSD_SYNC_P25P1_POS, DSD_CALL_KIND_GROUP_VOICE, 100U, 101U, 0U, 0U,
+                             DSD_CALL_BOUNDARY_BEGIN)
+           == 1);
+    dsd_event_sync_slot(&opts, &state, 0U);
+    dsd_call_snapshot canonical;
+    assert(dsd_call_state_get(&state, 0U, &canonical) == 1);
+    int rc =
+        expect_int("canonical call takes its alias", dsd_event_enrich_alias(&state, 0U, canonical.epoch, "Unit 7"), 1);
+    DSD_MEMCPY(&before, &event_history[0].Event_History_Items[0], sizeof before);
+
+    opts.rtlsdr_center_freq = 852000000U;
+    state.nac = 0;
+    dsd_call_snapshot synthetic;
+    DSD_MEMSET(&synthetic, 0, sizeof synthetic);
+    synthetic.epoch = canonical.epoch + 1U;
+    synthetic.phase = DSD_CALL_PHASE_ACTIVE;
+    synthetic.protocol = DSD_SYNC_P25P1_POS;
+    synthetic.slot = 0U;
+    synthetic.kind = DSD_CALL_KIND_GROUP_VOICE;
+    synthetic.ota_target_id = 200U;
+    synthetic.policy_target_id = 200U;
+    synthetic.crypto = DSD_CALL_CRYPTO_ENCRYPTED;
+    rc |=
+        expect_int("noncanonical notice commits",
+                   dsd_event_emit_call_notice_nonfinalizing(
+                       &opts, &state, 0U, &synthetic, "Target: 200; has been locked out; Encryption Lock Out Enabled."),
+                   1);
+    const Event_History* notice = &event_history[0].Event_History_Items[1];
+    rc |= expect_int("notice row is the synthetic call's", (int)notice->target_id, 200);
+    rc |= expect_str_eq("notice row does not inherit the canonical call's alias", notice->alias, "");
+    rc |= expect_int("canonical staged row is untouched by the notice",
+                     event_history_item_equal(&before, &event_history[0].Event_History_Items[0]), 1);
+
+    // The canonical call ends, as handle_enc() ends it right after the notice.
+    assert(end_test_call(&state, 0U, DSD_CALL_END_EXPLICIT) == 1);
+    dsd_event_sync_slot(&opts, &state, 0U);
+    const Event_History* committed = &event_history[0].Event_History_Items[1];
+    rc |= expect_int("canonical call commits its own row", (int)committed->target_id, 100);
+    rc |=
+        expect_int("canonical row keeps its NAC",
+                   committed->access_code_kind == (uint8_t)DSD_ACCESS_CODE_NAC && committed->access_code == 0x293U, 1);
+    rc |= expect_int("canonical row keeps the frequency it was heard on", committed->freq_hz == 851012500 ? 1 : 0, 1);
+    rc |= expect_str_eq("canonical row keeps its alias", committed->alias, "Unit 7");
+    rc |= expect_int("notice and call leave two rows", committed_history_rows(&event_history[0]), 2);
+    dsd_state_ext_free_all(&state);
+    return rc;
+}
+
+// Committed rows (index >= 1) naming a target.
+static int
+committed_rows_for_target(const Event_History_I* history, uint32_t target_id) {
+    int rows = 0;
+    for (int i = 1; i < 255; i++) {
+        const Event_History* item = &history->Event_History_Items[i];
+        if (item->event_string[0] != '\0' && item->target_id == target_id) {
+            rows++;
+        }
+    }
+    return rows;
+}
+
+// A render outside dsd_event_sync_slot() -- the DMR and NXDN lockout notes, an operator's slot lockout or skip pumped
+// between frames, the DMR P_CLEAR release -- can run after a protocol observed a new epoch but before any sync opened
+// it: DMR's prepare_dmr_bs_voice_slot() observes the tuned call through the trunk SM's voice sync, a burst can end the
+// superframe before its post-skip sync, and the control pump runs between processFrame() and the next getFrameSync().
+// (D-STAR's header is not such a window: processDSTAR() syncs after every voice frame.) Rendering the new call over
+// the outgoing epoch's staged row let the next sync commit that row as the outgoing epoch's: the new call got two rows,
+// and an outgoing call still staged lost its own. One transmission leaves one row, the outgoing call keeps its own,
+// and a note for the new call lands on the new call's row.
+static int
+test_lone_render_before_the_epoch_opens_keeps_one_row_per_call(void) {
+    static dsd_opts opts;
+    static dsd_state state;
+    static Event_History_I event_history[2];
+    int rc = 0;
+
+    for (int variant = 0; variant < 4; variant++) {
+        const int outgoing_still_staged = (variant & 1) != 0;
+        const int with_note = (variant & 2) != 0;
+        reset_fixture(&opts, &state, event_history);
+        assert(observe_test_call(&state, 0U, DSD_SYNC_DMR_BS_VOICE_POS, DSD_CALL_KIND_GROUP_VOICE, 100U, 101U, 0U, 0U,
+                                 DSD_CALL_BOUNDARY_BEGIN)
+               == 1);
+        dsd_event_sync_slot(&opts, &state, 0U);
+        if (!outgoing_still_staged) {
+            assert(end_test_call(&state, 0U, DSD_CALL_END_EXPLICIT) == 1);
+            dsd_event_sync_slot(&opts, &state, 0U);
+        }
+
+        // Call B is observed with no sync after it, then rendered alone, with or without a note.
+        assert(observe_test_call(&state, 0U, DSD_SYNC_DMR_BS_VOICE_POS, DSD_CALL_KIND_GROUP_VOICE, 200U, 201U, 0U, 0U,
+                                 DSD_CALL_BOUNDARY_BEGIN)
+               == 1);
+        if (with_note) {
+            dsd_event_note_current_call(&opts, &state, 0U, "Target: 200; call skipped.");
+        } else {
+            watchdog_event_current(&opts, &state, 0U);
+        }
+
+        // The next frame's sync, then B ends.
+        dsd_event_sync_slot(&opts, &state, 0U);
+        assert(end_test_call(&state, 0U, DSD_CALL_END_EXPLICIT) == 1);
+        dsd_event_sync_slot(&opts, &state, 0U);
+
+        char label[128];
+        const char* name = outgoing_still_staged ? (with_note ? "staged, note" : "staged, render")
+                                                 : (with_note ? "committed, note" : "committed, render");
+        DSD_SNPRINTF(label, sizeof label, "%s: the outgoing call keeps one row", name);
+        rc |= expect_int(label, committed_rows_for_target(&event_history[0], 100U), 1);
+        DSD_SNPRINTF(label, sizeof label, "%s: the new call leaves one row", name);
+        rc |= expect_int(label, committed_rows_for_target(&event_history[0], 200U), 1);
+        const Event_History* newest = &event_history[0].Event_History_Items[1];
+        DSD_SNPRINTF(label, sizeof label, "%s: the newest row is the new call's", name);
+        rc |= expect_int(label, (int)newest->target_id, 200);
+        DSD_SNPRINTF(label, sizeof label, "%s: the new call's row carries the note", name);
+        rc |= expect_str_eq(label, newest->internal_str, with_note ? "Target: 200; call skipped." : "");
+        DSD_SNPRINTF(label, sizeof label, "%s: the outgoing row carries no note", name);
+        rc |= expect_str_eq(label, event_history[0].Event_History_Items[2].internal_str, "");
+        dsd_state_ext_free_all(&state);
+    }
+    return rc;
+}
+
+// Rows pushed into the slot's ring since the fixture reset: every call commit, merge excepted, and every notice.
+static uint64_t
+pushed_rows(const Event_History_I* history) {
+    return history->push_seq;
+}
+
+// Detail decoded for a call that has not been observed yet -- a D-STAR text or APRS block whose RF header failed its
+// CRC, an NXDN alias ahead of the VCALL -- has no row to go to. Written into the blank staged row anyway, it was
+// committed at the next epoch open as a detail-only row with no summary (a blank history entry with a Text:/GPS:
+// line, an empty -J line followed by unstamped detail lines), and the call it belonged to lacked it. Detail now
+// reaches a row only through an open, active call; the slow data or alias repeats, and lands once the call is open.
+static int
+test_detail_before_the_call_opens_leaves_no_orphan_row(void) {
+    static dsd_opts opts;
+    static dsd_state state;
+    static Event_History_I event_history[2];
+    reset_fixture(&opts, &state, event_history);
+
+    // Call A is committed, which blanks the staged row.
+    assert(observe_test_call(&state, 0U, DSD_SYNC_DMR_BS_VOICE_POS, DSD_CALL_KIND_GROUP_VOICE, 100U, 101U, 0U, 0U,
+                             DSD_CALL_BOUNDARY_BEGIN)
+           == 1);
+    dsd_event_sync_slot(&opts, &state, 0U);
+    assert(end_test_call(&state, 0U, DSD_CALL_END_EXPLICIT) == 1);
+    dsd_event_sync_slot(&opts, &state, 0U);
+    int rc = expect_u64("call A commits one row", pushed_rows(&event_history[0]), 1U);
+
+    // No call is open: a protocol's detail is declined.
+    rc |= expect_int("text with no open call is declined",
+                     dsd_event_set_open_call_detail(&state, 0U, DSD_EVENT_DETAIL_TEXT, "CQ CQ"), 0);
+    rc |= expect_int("GPS with no open call is declined",
+                     dsd_event_set_open_call_detail(&state, 0U, DSD_EVENT_DETAIL_GPS, "APRS - Lat: 41d"), 0);
+    rc |= expect_int("alias with no open call is declined",
+                     dsd_event_set_open_call_detail(&state, 0U, DSD_EVENT_DETAIL_ALIAS, "CSM 123; "), 0);
+    rc |= expect_str_eq("the staged row stays blank", event_history[0].Event_History_Items[0].text_message, "");
+
+    // Call B is observed but no sync has opened its epoch: enrichment for B is declined too.
+    assert(observe_test_call(&state, 0U, DSD_SYNC_DMR_BS_VOICE_POS, DSD_CALL_KIND_GROUP_VOICE, 200U, 201U, 0U, 0U,
+                             DSD_CALL_BOUNDARY_BEGIN)
+           == 1);
+    dsd_call_snapshot call_b;
+    assert(dsd_call_state_get(&state, 0U, &call_b) == 1);
+    rc |= expect_int("enrichment before the epoch opens is declined",
+                     dsd_event_enrich_gps(&state, 0U, call_b.epoch, "APRS - Lat: 41d"), 0);
+    rc |= expect_int("direct detail before the epoch opens is declined",
+                     dsd_event_set_open_call_detail(&state, 0U, DSD_EVENT_DETAIL_TEXT, "CQ CQ"), 0);
+
+    // The sync opens B's epoch and leaves no detail-only row behind.
+    dsd_event_sync_slot(&opts, &state, 0U);
+    rc |= expect_u64("opening B pushes no orphan row", pushed_rows(&event_history[0]), 1U);
+
+    // The detail repeats once B is open and lands on B's own row.
+    rc |= expect_int("enrichment of the open call lands",
+                     dsd_event_enrich_gps(&state, 0U, call_b.epoch, "APRS - Lat: 41d"), 1);
+    rc |= expect_int("direct detail for the open call lands",
+                     dsd_event_set_open_call_detail(&state, 0U, DSD_EVENT_DETAIL_TEXT, "CQ CQ"), 1);
+    assert(end_test_call(&state, 0U, DSD_CALL_END_EXPLICIT) == 1);
+    dsd_event_sync_slot(&opts, &state, 0U);
+    const Event_History* row_b = &event_history[0].Event_History_Items[1];
+    rc |= expect_u64("A and B leave two rows", pushed_rows(&event_history[0]), 2U);
+    rc |= expect_int("the newest row is B's", (int)row_b->target_id, 200);
+    rc |= expect_str_eq("B's row carries its GPS", row_b->gps_s, "APRS - Lat: 41d");
+    rc |= expect_str_eq("B's row carries its text", row_b->text_message, "CQ CQ");
+    rc |= expect_int("A's row is next", (int)event_history[0].Event_History_Items[2].target_id, 100);
+    rc |= expect_str_eq("A's row carries none of B's detail", event_history[0].Event_History_Items[2].gps_s, "");
+
+    // Enrichment still reaches the call's committed row once it ended and committed.
+    rc |= expect_int("late enrichment reaches B's committed row", dsd_event_enrich_text(&state, 0U, call_b.epoch, "73"),
+                     1);
+    rc |= expect_str_eq("late text on the committed row", event_history[0].Event_History_Items[1].text_message, "73");
+    dsd_state_ext_free_all(&state);
+    return rc;
+}
+
+// Enrichment that names a call whose epoch no sync has opened yet is declined even when the staged row is not blank:
+// that row is still the outgoing call's, and taking the new call's alias or position would commit them on the
+// outgoing call's row. Covered with the outgoing call ended but not yet committed, and with it still active when the
+// new call's identity forks the epoch.
+static int
+test_enrichment_before_the_epoch_opens_spares_the_outgoing_row(void) {
+    static dsd_opts opts;
+    static dsd_state state;
+    static Event_History_I event_history[2];
+    int rc = 0;
+
+    for (int outgoing_ended = 0; outgoing_ended < 2; outgoing_ended++) {
+        const char* name = outgoing_ended ? "outgoing ended" : "outgoing active";
+        char label[128];
+        reset_fixture(&opts, &state, event_history);
+        assert(observe_test_call(&state, 0U, DSD_SYNC_DMR_BS_VOICE_POS, DSD_CALL_KIND_GROUP_VOICE, 100U, 101U, 0U, 0U,
+                                 DSD_CALL_BOUNDARY_BEGIN)
+               == 1);
+        dsd_event_sync_slot(&opts, &state, 0U);
+        if (outgoing_ended) {
+            assert(end_test_call(&state, 0U, DSD_CALL_END_EXPLICIT) == 1);
+        }
+        const Event_History* staged = &event_history[0].Event_History_Items[0];
+        DSD_SNPRINTF(label, sizeof label, "%s: the staged row is the outgoing call's", name);
+        rc |= expect_int(label, (int)staged->target_id, 100);
+
+        // Call B, with a different identity, is observed with no sync after it.
+        assert(observe_test_call(&state, 0U, DSD_SYNC_DMR_BS_VOICE_POS, DSD_CALL_KIND_GROUP_VOICE, 200U, 201U, 0U, 0U,
+                                 DSD_CALL_BOUNDARY_BEGIN)
+               == 1);
+        dsd_call_snapshot call_b;
+        assert(dsd_call_state_get(&state, 0U, &call_b) == 1);
+        DSD_SNPRINTF(label, sizeof label, "%s: B's alias is declined", name);
+        rc |= expect_int(label, dsd_event_enrich_alias(&state, 0U, call_b.epoch, "Unit 201"), 0);
+        DSD_SNPRINTF(label, sizeof label, "%s: B's position is declined", name);
+        rc |= expect_int(label, dsd_event_enrich_gps(&state, 0U, call_b.epoch, "LIP: 22.5S 45.0W"), 0);
+        DSD_SNPRINTF(label, sizeof label, "%s: the outgoing staged alias stays empty", name);
+        rc |= expect_str_eq(label, staged->alias, "");
+        DSD_SNPRINTF(label, sizeof label, "%s: the outgoing staged GPS stays empty", name);
+        rc |= expect_str_eq(label, staged->gps_s, "");
+
+        // The sync opens B's epoch and commits the outgoing row.
+        dsd_event_sync_slot(&opts, &state, 0U);
+        const Event_History* row_a = &event_history[0].Event_History_Items[1];
+        DSD_SNPRINTF(label, sizeof label, "%s: the outgoing call commits its row", name);
+        rc |= expect_int(label, (int)row_a->target_id, 100);
+        DSD_SNPRINTF(label, sizeof label, "%s: the outgoing row carries none of B's alias", name);
+        rc |= expect_str_eq(label, row_a->alias, "");
+        DSD_SNPRINTF(label, sizeof label, "%s: the outgoing row carries none of B's GPS", name);
+        rc |= expect_str_eq(label, row_a->gps_s, "");
+        dsd_state_ext_free_all(&state);
+    }
+    return rc;
+}
+
+// Direct detail goes only to an active call's row. A call that has ended but not committed yet -- its finalize pass
+// still to run -- is over: detail decoded now belongs to whatever keyed up next, not to the ended call's row. While
+// the ended call is still active, detail cannot be told apart from the next transmission's, since neither the D-STAR
+// slow data nor the NXDN alias names its call; that window closes when the next call is observed.
+static int
+test_direct_detail_skips_an_ended_call(void) {
+    static dsd_opts opts;
+    static dsd_state state;
+    static Event_History_I event_history[2];
+    reset_fixture(&opts, &state, event_history);
+
+    assert(observe_test_call(&state, 0U, DSD_SYNC_DMR_BS_VOICE_POS, DSD_CALL_KIND_GROUP_VOICE, 100U, 101U, 0U, 0U,
+                             DSD_CALL_BOUNDARY_BEGIN)
+           == 1);
+    dsd_event_sync_slot(&opts, &state, 0U);
+    assert(end_test_call(&state, 0U, DSD_CALL_END_EXPLICIT) == 1);
+    int rc = expect_int("detail after the call ended is declined",
+                        dsd_event_set_open_call_detail(&state, 0U, DSD_EVENT_DETAIL_GPS, "APRS - Lat: 41d"), 0);
+    dsd_event_sync_slot(&opts, &state, 0U);
+    rc |= expect_u64("the ended call commits one row", pushed_rows(&event_history[0]), 1U);
+    rc |= expect_str_eq("the ended call's row carries no later detail", event_history[0].Event_History_Items[1].gps_s,
+                        "");
+    dsd_state_ext_free_all(&state);
+    return rc;
+}
+
+// A note for the slot's call (a lockout, a skip) is declined when no call is there to carry it: no call at all, or a
+// call that ended and committed. Written into the blank staged row, it became a note-only row at the next epoch open.
+static int
+test_note_without_an_authoritative_call_leaves_no_orphan_row(void) {
+    static dsd_opts opts;
+    static dsd_state state;
+    static Event_History_I event_history[2];
+    int rc = 0;
+
+    // No call has ever been observed on the slot.
+    reset_fixture(&opts, &state, event_history);
+    dsd_event_note_current_call(&opts, &state, 0U, "Target: 100; call skipped.");
+    rc |= expect_str_eq("no call: the note is declined", event_history[0].Event_History_Items[0].internal_str, "");
+    assert(observe_test_call(&state, 0U, DSD_SYNC_DMR_BS_VOICE_POS, DSD_CALL_KIND_GROUP_VOICE, 300U, 301U, 0U, 0U,
+                             DSD_CALL_BOUNDARY_BEGIN)
+           == 1);
+    dsd_event_sync_slot(&opts, &state, 0U);
+    assert(end_test_call(&state, 0U, DSD_CALL_END_EXPLICIT) == 1);
+    dsd_event_sync_slot(&opts, &state, 0U);
+    rc |= expect_u64("no call: only the next call's row", pushed_rows(&event_history[0]), 1U);
+    rc |= expect_str_eq("no call: the next call's row carries no note",
+                        event_history[0].Event_History_Items[1].internal_str, "");
+
+    // The slot's call ended and committed.
+    reset_fixture(&opts, &state, event_history);
+    assert(observe_test_call(&state, 0U, DSD_SYNC_DMR_BS_VOICE_POS, DSD_CALL_KIND_GROUP_VOICE, 100U, 101U, 0U, 0U,
+                             DSD_CALL_BOUNDARY_BEGIN)
+           == 1);
+    dsd_event_sync_slot(&opts, &state, 0U);
+    assert(end_test_call(&state, 0U, DSD_CALL_END_EXPLICIT) == 1);
+    dsd_event_sync_slot(&opts, &state, 0U);
+    dsd_event_note_current_call(&opts, &state, 0U, "Target: 100; has been locked out; Session Only.");
+    rc |=
+        expect_str_eq("committed call: the note is declined", event_history[0].Event_History_Items[0].internal_str, "");
+    assert(observe_test_call(&state, 0U, DSD_SYNC_DMR_BS_VOICE_POS, DSD_CALL_KIND_GROUP_VOICE, 300U, 301U, 0U, 0U,
+                             DSD_CALL_BOUNDARY_BEGIN)
+           == 1);
+    dsd_event_sync_slot(&opts, &state, 0U);
+    rc |=
+        expect_u64("committed call: opening the next call pushes no note-only row", pushed_rows(&event_history[0]), 1U);
+
+    // An active call takes the note, as before.
+    dsd_event_note_current_call(&opts, &state, 0U, "Target: 300; call skipped.");
+    assert(end_test_call(&state, 0U, DSD_CALL_END_EXPLICIT) == 1);
+    dsd_event_sync_slot(&opts, &state, 0U);
+    rc |= expect_str_eq("active call: the note lands on its row", event_history[0].Event_History_Items[1].internal_str,
+                        "Target: 300; call skipped.");
+    dsd_state_ext_free_all(&state);
     return rc;
 }
 
@@ -1112,6 +1756,8 @@ test_p25_event_string_keeps_full_prefix_after_sprintf_hardening(void) {
 
     state.lastsynctype = DSD_SYNC_P25P2_POS;
     state.nac = 0x293;
+    state.p2_cc = 0x293ULL;    /* a Phase 2 call's NAC is the one its descrambler runs on, */
+    state.p2_cc_verified = 1U; /* proven on this carrier */
     state.p2_wacn = 0x45564U;
     state.p2_sysid = 0x006U;
     state.p2_rfssid = 10U;
@@ -1167,10 +1813,10 @@ test_event_log_writes_optional_metadata_lines(void) {
     static Event_History_I event_history[2];
     reset_fixture(&opts, &state, event_history);
 
-    char path[] = "/tmp/dsd-neo-events-XXXXXX";
-    int fd = mkstemp(path);
+    char path[DSD_TEST_PATH_MAX];
+    int fd = dsd_test_mkstemp(path, sizeof path, "dsd-neo-events");
     if (fd < 0) {
-        DSD_FPRINTF(stderr, "mkstemp failed for event log test\n");
+        DSD_FPRINTF(stderr, "dsd_test_mkstemp failed for event log test\n");
         return 1;
     }
     close(fd);
@@ -1221,10 +1867,10 @@ test_event_log_unstamped_row_keeps_bare_detail_lines(void) {
     static Event_History_I event_history[2];
     reset_fixture(&opts, &state, event_history);
 
-    char path[] = "/tmp/dsd-neo-events-XXXXXX";
-    int fd = mkstemp(path);
+    char path[DSD_TEST_PATH_MAX];
+    int fd = dsd_test_mkstemp(path, sizeof path, "dsd-neo-events");
     if (fd < 0) {
-        DSD_FPRINTF(stderr, "mkstemp failed for unstamped event log test\n");
+        DSD_FPRINTF(stderr, "dsd_test_mkstemp failed for unstamped event log test\n");
         return 1;
     }
     close(fd);
@@ -2151,10 +2797,10 @@ test_end_alert_deadline_matches_reacquire_window(void) {
                                        0U, 0U, DSD_CALL_BOUNDARY_BEGIN),
                      1);
     dsd_event_sync_slot(&opts, &state, 0U);
-    double before = dsd_time_now_monotonic_s();
+    double before = dsd_decode_now_mono_s();
     rc |= expect_int("sync loss ends it", end_test_call(&state, 0U, DSD_CALL_END_SYNC_LOSS), 1);
     dsd_event_sync_slot(&opts, &state, 0U);
-    double after = dsd_time_now_monotonic_s();
+    double after = dsd_decode_now_mono_s();
     rc |= expect_int("context snapshot copies", dsd_call_context_copy_snapshot(&state, &context) > 0, 1);
     rc |= expect_int("sync-loss end holds the alert", context.events[0].end_alert_pending, 1);
     rc |= expect_int("sync-loss deadline is not below its window",
@@ -2169,10 +2815,10 @@ test_end_alert_deadline_matches_reacquire_window(void) {
                                        0U, 0U, DSD_CALL_BOUNDARY_BEGIN),
                      1);
     dsd_event_sync_slot(&opts, &state, 0U);
-    before = dsd_time_now_monotonic_s();
+    before = dsd_decode_now_mono_s();
     rc |= expect_int("unverified terminator ends it", end_test_call(&state, 0U, DSD_CALL_END_UNVERIFIED_TERMINATOR), 1);
     dsd_event_sync_slot(&opts, &state, 0U);
-    after = dsd_time_now_monotonic_s();
+    after = dsd_decode_now_mono_s();
     rc |= expect_int("second context snapshot copies", dsd_call_context_copy_snapshot(&state, &context) > 0, 1);
     rc |= expect_int("unverified end holds the alert", context.events[0].end_alert_pending, 1);
     rc |= expect_int("terminator deadline is not below the heal window",
@@ -2447,13 +3093,16 @@ test_scanner_mode_row_carries_channel_label(void) {
 
     state.lastsynctype = DSD_SYNC_P25P2_POS;
     state.nac = 0x293;
+    state.p2_cc = 0x293ULL;    /* a Phase 2 call's NAC is the one its descrambler runs on, */
+    state.p2_cc_verified = 1U; /* proven on this carrier */
     state.p2_wacn = 0x45564U;
     state.p2_sysid = 0x006U;
     state.p2_rfssid = 10U;
     state.p2_siteid = 10U;
-    assert(observe_test_call(&state, 0U, DSD_SYNC_P25P2_POS, DSD_CALL_KIND_GROUP_VOICE, 50061U, 5790062U, 0U, 0U,
-                             DSD_CALL_BOUNDARY_BEGIN)
-           == 1);
+    rc |= expect_int("scanner call begins",
+                     observe_test_call(&state, 0U, DSD_SYNC_P25P2_POS, DSD_CALL_KIND_GROUP_VOICE, 50061U, 5790062U, 0U,
+                                       0U, DSD_CALL_BOUNDARY_BEGIN),
+                     1);
     dsd_event_sync_slot(&opts, &state, 0U);
 
     const Event_History* item = &state.event_history_s[0].Event_History_Items[0];
@@ -2462,7 +3111,7 @@ test_scanner_mode_row_carries_channel_label(void) {
                         "2026-04-30 00:00:00 [Fire Dispatch] TEST TGT: 00050061; SRC: 05790062; NAC: 293; "
                         "NET_STS: 45564:006:10.10; Group; ");
 
-    assert(end_test_call(&state, 0U, DSD_CALL_END_EXPLICIT) == 1);
+    rc |= expect_int("scanner call ends", end_test_call(&state, 0U, DSD_CALL_END_EXPLICIT), 1);
     dsd_event_sync_slot(&opts, &state, 0U);
 
     char log[4096];
@@ -2519,6 +3168,8 @@ test_channel_label_coexists_with_policy_label(void) {
 
     state.lastsynctype = DSD_SYNC_P25P2_POS;
     state.nac = 0x293;
+    state.p2_cc = 0x293ULL;    /* a Phase 2 call's NAC is the one its descrambler runs on, */
+    state.p2_cc_verified = 1U; /* proven on this carrier */
     state.p2_wacn = 0x45564U;
     state.p2_sysid = 0x006U;
     state.p2_rfssid = 10U;
@@ -2548,6 +3199,8 @@ test_unlabelled_row_string_is_unchanged(void) {
 
     state.lastsynctype = DSD_SYNC_P25P2_POS;
     state.nac = 0x293;
+    state.p2_cc = 0x293ULL;    /* a Phase 2 call's NAC is the one its descrambler runs on, */
+    state.p2_cc_verified = 1U; /* proven on this carrier */
     state.p2_wacn = 0x45564U;
     state.p2_sysid = 0x006U;
     state.p2_rfssid = 10U;
@@ -2646,6 +3299,1006 @@ test_channel_label_is_frozen_at_first_render(void) {
     rc |= expect_no_substr("finalize pass does not adopt the new channel", committed->event_string, "[PD Tac]");
 
     dsd_state_trunk_lcn_name_free(&state);
+    dsd_state_ext_free_all(&state);
+    return rc;
+}
+
+static int
+expect_i64(const char* label, int64_t got, int64_t want) {
+    if (got != want) {
+        DSD_FPRINTF(stderr, "%s: got %lld want %lld\n", label, (long long)got, (long long)want);
+        return 1;
+    }
+    return 0;
+}
+
+// A row's access code, kind and value together.
+static int
+expect_access_code(const char* label, const Event_History* item, dsd_access_code_kind kind, uint16_t value) {
+    if (item->access_code_kind != (uint8_t)kind || item->access_code != value) {
+        DSD_FPRINTF(stderr, "%s: got kind %u code 0x%X want kind %u code 0x%X\n", label,
+                    (unsigned)item->access_code_kind, (unsigned)item->access_code, (unsigned)kind, (unsigned)value);
+        return 1;
+    }
+    return 0;
+}
+
+// The receiver an RTL-family input puts behind the session, tuned to `center_hz`.
+static void
+arm_radio_input(dsd_opts* opts, uint32_t center_hz) {
+    opts->audio_in_type = AUDIO_IN_RTL;
+    opts->rtlsdr_center_freq = center_hz;
+}
+
+// A group voice observation carrying a frequency of its own, as a grant or a followed voice channel gives one.
+static int
+observe_test_call_freq(dsd_state* state, int protocol, uint64_t target_id, uint64_t source_id, int64_t frequency_hz,
+                       dsd_call_boundary boundary) {
+    const dsd_call_observation observation = {
+        .protocol = protocol,
+        .slot = 0U,
+        .kind = DSD_CALL_KIND_GROUP_VOICE,
+        .ota_target_id = target_id,
+        .policy_target_id = target_id,
+        .ota_source_id = source_id,
+        .frequency_hz = frequency_hz,
+        .observed_m = g_observed_m,
+    };
+    g_observed_m += 0.1;
+    return dsd_call_state_observe(state, &observation, boundary);
+}
+
+// A row records the frequency its call was heard on. With no frequency of its own the call takes the receiver's, and
+// takes it once, at the epoch's first active render, the way the channel label is pinned. Re-reading the tuner while
+// the call is live would label it with the next channel: a typed -Y row's queued tune writes rtlsdr_center_freq before
+// the scan commit ends the outgoing calls, and command handlers render the still-live call in between.
+static int
+test_row_frequency_is_pinned_at_first_active_render(void) {
+    static dsd_opts opts;
+    static dsd_state state;
+    static Event_History_I event_history[2];
+    reset_fixture(&opts, &state, event_history);
+    arm_radio_input(&opts, 851012500U);
+
+    assert(observe_test_call(&state, 0U, DSD_SYNC_DMR_BS_VOICE_POS, DSD_CALL_KIND_GROUP_VOICE, 100U, 201U, 0U, 0U,
+                             DSD_CALL_BOUNDARY_BEGIN)
+           == 1);
+    dsd_event_sync_slot(&opts, &state, 0U);
+    int rc = expect_i64("first active render takes the tuned frequency",
+                        event_history[0].Event_History_Items[0].freq_hz, 851012500);
+
+    // Still the same epoch: the observation continues the live call.
+    opts.rtlsdr_center_freq = 852000000U;
+    assert(observe_test_call(&state, 0U, DSD_SYNC_DMR_BS_VOICE_POS, DSD_CALL_KIND_GROUP_VOICE, 100U, 201U, 0U, 0U,
+                             DSD_CALL_BOUNDARY_CONTINUE)
+           == 0);
+    dsd_event_sync_slot(&opts, &state, 0U);
+    rc |= expect_i64("a later active render keeps the pinned frequency",
+                     event_history[0].Event_History_Items[0].freq_hz, 851012500);
+
+    assert(end_test_call(&state, 0U, DSD_CALL_END_EXPLICIT) == 1);
+    dsd_event_sync_slot(&opts, &state, 0U);
+    const Event_History* committed = &event_history[0].Event_History_Items[1];
+    rc |= expect_int("pinned frequency commits one row", committed_history_rows(&event_history[0]), 1);
+    rc |= expect_i64("committed row keeps the frequency it was heard on", committed->freq_hz, 851012500);
+
+    // A call first rendered after it ended takes no tuner reading: by then the receiver may be on the next channel,
+    // and unknown is safer than wrong.
+    reset_fixture(&opts, &state, event_history);
+    arm_radio_input(&opts, 852000000U);
+    assert(observe_test_call(&state, 0U, DSD_SYNC_DMR_BS_VOICE_POS, DSD_CALL_KIND_GROUP_VOICE, 100U, 201U, 0U, 0U,
+                             DSD_CALL_BOUNDARY_BEGIN)
+           == 1);
+    assert(end_test_call(&state, 0U, DSD_CALL_END_EXPLICIT) == 1);
+    dsd_event_sync_slot(&opts, &state, 0U);
+    rc |= expect_int("ended first render commits one row", committed_history_rows(&event_history[0]), 1);
+    rc |= expect_i64("ended first render takes no tuner reading", event_history[0].Event_History_Items[1].freq_hz, 0);
+
+    dsd_state_ext_free_all(&state);
+    return rc;
+}
+
+// The call's own frequency -- a grant's channel, the voice channel a trunking receiver followed -- names the carrier
+// exactly, so it outranks the tuner on every render, also when it is decoded after the tuner value was pinned and
+// when the first render is the ended one.
+static int
+test_call_frequency_outranks_the_tuner(void) {
+    static dsd_opts opts;
+    static dsd_state state;
+    static Event_History_I event_history[2];
+    reset_fixture(&opts, &state, event_history);
+    arm_radio_input(&opts, 851012500U);
+
+    assert(observe_test_call(&state, 0U, DSD_SYNC_DMR_BS_VOICE_POS, DSD_CALL_KIND_GROUP_VOICE, 100U, 201U, 0U, 0U,
+                             DSD_CALL_BOUNDARY_BEGIN)
+           == 1);
+    dsd_event_sync_slot(&opts, &state, 0U);
+    int rc =
+        expect_i64("tuner frequency before the call's own", event_history[0].Event_History_Items[0].freq_hz, 851012500);
+    assert(observe_test_call_freq(&state, DSD_SYNC_DMR_BS_VOICE_POS, 100U, 201U, 853037500, DSD_CALL_BOUNDARY_CONTINUE)
+           == 0);
+    dsd_event_sync_slot(&opts, &state, 0U);
+    rc |= expect_i64("a later call frequency replaces the pinned tuner value",
+                     event_history[0].Event_History_Items[0].freq_hz, 853037500);
+    assert(end_test_call(&state, 0U, DSD_CALL_END_EXPLICIT) == 1);
+    dsd_event_sync_slot(&opts, &state, 0U);
+    rc |= expect_i64("committed row keeps the call's frequency", event_history[0].Event_History_Items[1].freq_hz,
+                     853037500);
+
+    reset_fixture(&opts, &state, event_history);
+    arm_radio_input(&opts, 851012500U);
+    assert(observe_test_call_freq(&state, DSD_SYNC_DMR_BS_VOICE_POS, 100U, 201U, 853037500, DSD_CALL_BOUNDARY_BEGIN)
+           == 1);
+    assert(end_test_call(&state, 0U, DSD_CALL_END_EXPLICIT) == 1);
+    dsd_event_sync_slot(&opts, &state, 0U);
+    rc |= expect_i64("an ended first render still takes the call's frequency",
+                     event_history[0].Event_History_Items[1].freq_hz, 853037500);
+
+    dsd_state_ext_free_all(&state);
+    return rc;
+}
+
+// Off a radio input there is no tuner reading to take, rigctl on an audio input included: rtlsdr_center_freq then
+// holds a made-up 850 MHz default, or a frequency changed on the peer is invisible. A call's own frequency still
+// shows.
+static int
+test_audio_input_row_takes_no_tuner_value(void) {
+    static dsd_opts opts;
+    static dsd_state state;
+    static Event_History_I event_history[2];
+    int rc = 0;
+    const int audio_inputs[] = {AUDIO_IN_PULSE, AUDIO_IN_UDP};
+    for (size_t i = 0; i < sizeof audio_inputs / sizeof audio_inputs[0]; i++) {
+        reset_fixture(&opts, &state, event_history);
+        opts.audio_in_type = audio_inputs[i];
+        opts.use_rigctl = 1;
+        opts.rtlsdr_center_freq = 850000000U;
+        assert(observe_test_call(&state, 0U, DSD_SYNC_DMR_BS_VOICE_POS, DSD_CALL_KIND_GROUP_VOICE, 100U, 201U, 0U, 0U,
+                                 DSD_CALL_BOUNDARY_BEGIN)
+               == 1);
+        dsd_event_sync_slot(&opts, &state, 0U);
+        rc |= expect_i64("audio input row has no frequency", event_history[0].Event_History_Items[0].freq_hz, 0);
+        assert(end_test_call(&state, 0U, DSD_CALL_END_EXPLICIT) == 1);
+        dsd_event_sync_slot(&opts, &state, 0U);
+        rc |= expect_i64("audio input committed row has no frequency", event_history[0].Event_History_Items[1].freq_hz,
+                         0);
+
+        assert(observe_test_call_freq(&state, DSD_SYNC_DMR_BS_VOICE_POS, 300U, 401U, 853037500, DSD_CALL_BOUNDARY_BEGIN)
+               == 1);
+        dsd_event_sync_slot(&opts, &state, 0U);
+        rc |= expect_i64("audio input row still shows the call's frequency",
+                         event_history[0].Event_History_Items[0].freq_hz, 853037500);
+    }
+    dsd_state_ext_free_all(&state);
+    return rc;
+}
+
+// While the call is live a valid code replaces the row's, so a colour code that locks after the call opened still
+// lands. Once the call has ended the code is frozen: a finalize pass can run after a scan hop or a trunk-scan
+// snapshot restore, and must not label the call with the next carrier's code.
+static int
+test_access_code_refreshes_while_live_and_freezes_at_the_end(void) {
+    static dsd_opts opts;
+    static dsd_state state;
+    static Event_History_I event_history[2];
+    reset_fixture(&opts, &state, event_history);
+    state.dmr_color_code = 16U;
+
+    assert(observe_test_call(&state, 0U, DSD_SYNC_DMR_BS_VOICE_POS, DSD_CALL_KIND_GROUP_VOICE, 100U, 201U, 0U, 0U,
+                             DSD_CALL_BOUNDARY_BEGIN)
+           == 1);
+    dsd_event_sync_slot(&opts, &state, 0U);
+    int rc = expect_access_code("unlocked colour code is unknown", &event_history[0].Event_History_Items[0],
+                                DSD_ACCESS_CODE_NONE, 0U);
+
+    state.dmr_color_code = 3U;
+    dsd_event_sync_slot(&opts, &state, 0U);
+    rc |= expect_access_code("a colour code locked while live lands", &event_history[0].Event_History_Items[0],
+                             DSD_ACCESS_CODE_COLOR_CODE, 3U);
+
+    // A re-lock onto a different code while the call is still live -- the BS lock follows sustained evidence of a
+    // new colour code -- replaces the known one: refreshed, not filled once.
+    state.dmr_color_code = 5U;
+    dsd_event_sync_slot(&opts, &state, 0U);
+    rc |= expect_access_code("a different live code replaces a known one", &event_history[0].Event_History_Items[0],
+                             DSD_ACCESS_CODE_COLOR_CODE, 5U);
+
+    assert(end_test_call(&state, 0U, DSD_CALL_END_EXPLICIT) == 1);
+    state.dmr_color_code = 7U;
+    dsd_event_sync_slot(&opts, &state, 0U);
+    rc |= expect_int("frozen code commits one row", committed_history_rows(&event_history[0]), 1);
+    rc |= expect_access_code("ended render keeps the code the call was heard with",
+                             &event_history[0].Event_History_Items[1], DSD_ACCESS_CODE_COLOR_CODE, 5U);
+
+    dsd_state_ext_free_all(&state);
+    return rc;
+}
+
+// Frozen means frozen both ways: a call that ended with no code known keeps none, rather than taking whatever the
+// decoder locks onto next.
+static int
+test_unknown_access_code_stays_unknown_after_the_end(void) {
+    static dsd_opts opts;
+    static dsd_state state;
+    static Event_History_I event_history[2];
+    reset_fixture(&opts, &state, event_history);
+    state.dmr_color_code = 16U;
+
+    assert(observe_test_call(&state, 0U, DSD_SYNC_DMR_BS_VOICE_POS, DSD_CALL_KIND_GROUP_VOICE, 100U, 201U, 0U, 0U,
+                             DSD_CALL_BOUNDARY_BEGIN)
+           == 1);
+    dsd_event_sync_slot(&opts, &state, 0U);
+    assert(end_test_call(&state, 0U, DSD_CALL_END_EXPLICIT) == 1);
+    state.dmr_color_code = 5U;
+    dsd_event_sync_slot(&opts, &state, 0U);
+    int rc = expect_int("unknown code commits one row", committed_history_rows(&event_history[0]), 1);
+    rc |= expect_access_code("an ended call takes no code", &event_history[0].Event_History_Items[1],
+                             DSD_ACCESS_CODE_NONE, 0U);
+
+    // A call first rendered after it ended takes no code either, valid live reading or not: by then the decoder may
+    // hold the next carrier's code.
+    reset_fixture(&opts, &state, event_history);
+    state.dmr_color_code = 3U;
+    assert(observe_test_call(&state, 0U, DSD_SYNC_DMR_BS_VOICE_POS, DSD_CALL_KIND_GROUP_VOICE, 100U, 201U, 0U, 0U,
+                             DSD_CALL_BOUNDARY_BEGIN)
+           == 1);
+    assert(end_test_call(&state, 0U, DSD_CALL_END_EXPLICIT) == 1);
+    dsd_event_sync_slot(&opts, &state, 0U);
+    rc |= expect_int("ended first render commits one row", committed_history_rows(&event_history[0]), 1);
+    rc |= expect_access_code("an ended first render takes no code", &event_history[0].Event_History_Items[1],
+                             DSD_ACCESS_CODE_NONE, 0U);
+
+    dsd_state_ext_free_all(&state);
+    return rc;
+}
+
+// A staged code is this call's only when its kind is the one the call's protocol carries; a code of another kind is
+// treated as unknown, while the call is live and once it has ended. The canonical path never stages one (a protocol
+// family change opens a new epoch, and the row is cleared between epochs), so the test writes it into the staged row
+// directly, standing in for any row that reached the render from elsewhere.
+static int
+test_staged_access_code_of_another_kind_is_not_reused(void) {
+    static dsd_opts opts;
+    static dsd_state state;
+    static Event_History_I event_history[2];
+    reset_fixture(&opts, &state, event_history);
+    state.dmr_color_code = 16U;
+
+    assert(observe_test_call(&state, 0U, DSD_SYNC_DMR_BS_VOICE_POS, DSD_CALL_KIND_GROUP_VOICE, 100U, 201U, 0U, 0U,
+                             DSD_CALL_BOUNDARY_BEGIN)
+           == 1);
+    dsd_event_sync_slot(&opts, &state, 0U);
+    Event_History* staged = &event_history[0].Event_History_Items[0];
+    staged->access_code_kind = (uint8_t)DSD_ACCESS_CODE_NAC;
+    staged->access_code = 0x293U;
+    dsd_event_sync_slot(&opts, &state, 0U);
+    int rc = expect_access_code("a live render drops a staged code of another kind", staged, DSD_ACCESS_CODE_NONE, 0U);
+
+    staged->access_code_kind = (uint8_t)DSD_ACCESS_CODE_NAC;
+    staged->access_code = 0x293U;
+    assert(end_test_call(&state, 0U, DSD_CALL_END_EXPLICIT) == 1);
+    dsd_event_sync_slot(&opts, &state, 0U);
+    rc |= expect_int("kind-mismatch row commits", committed_history_rows(&event_history[0]), 1);
+    rc |= expect_access_code("an ended render drops a staged code of another kind",
+                             &event_history[0].Event_History_Items[1], DSD_ACCESS_CODE_NONE, 0U);
+
+    dsd_state_ext_free_all(&state);
+    return rc;
+}
+
+// The sentinels a carrier boundary writes -- DMR 16, P25 nac 0 on a no-carrier pass -- say "nothing decoded now",
+// not "no code", so they never erase a code the live call already has.
+static int
+test_invalid_live_access_code_never_erases_a_known_one(void) {
+    static dsd_opts opts;
+    static dsd_state state;
+    static Event_History_I event_history[2];
+    reset_fixture(&opts, &state, event_history);
+    state.dmr_color_code = 3U;
+    assert(observe_test_call(&state, 0U, DSD_SYNC_DMR_BS_VOICE_POS, DSD_CALL_KIND_GROUP_VOICE, 100U, 201U, 0U, 0U,
+                             DSD_CALL_BOUNDARY_BEGIN)
+           == 1);
+    dsd_event_sync_slot(&opts, &state, 0U);
+    state.dmr_color_code = 16U;
+    dsd_event_sync_slot(&opts, &state, 0U);
+    int rc = expect_access_code("DMR 16 keeps the known colour code", &event_history[0].Event_History_Items[0],
+                                DSD_ACCESS_CODE_COLOR_CODE, 3U);
+
+    reset_fixture(&opts, &state, event_history);
+    state.nac = 0x293;
+    assert(observe_test_call(&state, 0U, DSD_SYNC_P25P1_POS, DSD_CALL_KIND_GROUP_VOICE, 100U, 201U, 0U, 0U,
+                             DSD_CALL_BOUNDARY_BEGIN)
+           == 1);
+    dsd_event_sync_slot(&opts, &state, 0U);
+    state.nac = 0;
+    dsd_event_sync_slot(&opts, &state, 0U);
+    rc |= expect_access_code("P25 nac 0 keeps the known NAC", &event_history[0].Event_History_Items[0],
+                             DSD_ACCESS_CODE_NAC, 0x293U);
+    assert(end_test_call(&state, 0U, DSD_CALL_END_EXPLICIT) == 1);
+    dsd_event_sync_slot(&opts, &state, 0U);
+    rc |= expect_access_code("committed row keeps the known NAC", &event_history[0].Event_History_Items[1],
+                             DSD_ACCESS_CODE_NAC, 0x293U);
+
+    dsd_state_ext_free_all(&state);
+    return rc;
+}
+
+// A reacquired segment is the same transmission, so it may fill a frequency or code the first segment never learned,
+// but never replace one: by the time it merges the receiver may have moved on.
+static int
+test_reacquisition_merge_fills_frequency_and_code_only(void) {
+    static dsd_opts opts;
+    static dsd_state state;
+    static Event_History_I event_history[2];
+    reset_fixture(&opts, &state, event_history);
+    arm_radio_input(&opts, 851012500U);
+    state.dmr_color_code = 3U;
+
+    assert(observe_test_call(&state, 0U, DSD_SYNC_DMR_BS_VOICE_POS, DSD_CALL_KIND_GROUP_VOICE, 100U, 201U, 0U, 0U,
+                             DSD_CALL_BOUNDARY_BEGIN)
+           == 1);
+    dsd_event_sync_slot(&opts, &state, 0U);
+    assert(end_test_call(&state, 0U, DSD_CALL_END_SYNC_LOSS) == 1);
+    dsd_event_sync_slot(&opts, &state, 0U);
+
+    opts.rtlsdr_center_freq = 852000000U;
+    state.dmr_color_code = 5U;
+    assert(observe_test_call(&state, 0U, DSD_SYNC_DMR_BS_VOICE_POS, DSD_CALL_KIND_GROUP_VOICE, 100U, 201U, 0U, 0U,
+                             DSD_CALL_BOUNDARY_CONTINUE)
+           == 1);
+    dsd_event_sync_slot(&opts, &state, 0U);
+    assert(end_test_call(&state, 0U, DSD_CALL_END_SYNC_LOSS) == 1);
+    dsd_event_sync_slot(&opts, &state, 0U);
+
+    const Event_History* merged = &event_history[0].Event_History_Items[1];
+    int rc = expect_int("reacquired transmission stays one row", committed_history_rows(&event_history[0]), 1);
+    rc |= expect_i64("merge never overwrites a known frequency", merged->freq_hz, 851012500);
+    rc |= expect_access_code("merge never overwrites a known code", merged, DSD_ACCESS_CODE_COLOR_CODE, 3U);
+
+    // The other direction: a first segment that learned neither takes the reacquired segment's.
+    reset_fixture(&opts, &state, event_history);
+    state.dmr_color_code = 16U;
+    assert(observe_test_call(&state, 0U, DSD_SYNC_DMR_BS_VOICE_POS, DSD_CALL_KIND_GROUP_VOICE, 100U, 201U, 0U, 0U,
+                             DSD_CALL_BOUNDARY_BEGIN)
+           == 1);
+    dsd_event_sync_slot(&opts, &state, 0U);
+    assert(end_test_call(&state, 0U, DSD_CALL_END_SYNC_LOSS) == 1);
+    dsd_event_sync_slot(&opts, &state, 0U);
+    rc |= expect_i64("first segment learned no frequency", event_history[0].Event_History_Items[1].freq_hz, 0);
+
+    arm_radio_input(&opts, 852000000U);
+    state.dmr_color_code = 5U;
+    assert(observe_test_call(&state, 0U, DSD_SYNC_DMR_BS_VOICE_POS, DSD_CALL_KIND_GROUP_VOICE, 100U, 201U, 0U, 0U,
+                             DSD_CALL_BOUNDARY_CONTINUE)
+           == 1);
+    dsd_event_sync_slot(&opts, &state, 0U);
+    assert(end_test_call(&state, 0U, DSD_CALL_END_SYNC_LOSS) == 1);
+    dsd_event_sync_slot(&opts, &state, 0U);
+
+    merged = &event_history[0].Event_History_Items[1];
+    rc |= expect_int("filled reacquisition stays one row", committed_history_rows(&event_history[0]), 1);
+    rc |= expect_i64("merge fills an unknown frequency", merged->freq_hz, 852000000);
+    rc |= expect_access_code("merge fills an unknown code", merged, DSD_ACCESS_CODE_COLOR_CODE, 5U);
+
+    dsd_state_ext_free_all(&state);
+    return rc;
+}
+
+// Render one active call of `protocol` into the staged row with the decoder holding the given codes.
+static const Event_History*
+render_code_row(dsd_opts* opts, dsd_state* state, Event_History_I event_history[2], int protocol) {
+    assert(observe_test_call(state, 0U, protocol, DSD_CALL_KIND_GROUP_VOICE, 51002U, 41001U, 0U, 0U,
+                             DSD_CALL_BOUNDARY_BEGIN)
+           == 1);
+    watchdog_event_current(opts, state, 0);
+    return &event_history[0].Event_History_Items[0];
+}
+
+// A code the decoder never decoded reads as its sentinel -- DMR 16, NXDN (unsigned)-1, dPMR -1, which every carrier
+// boundary now leaves (issue #575) -- and the system identity string and the event line print "--" for it, as the
+// terminal does, rather than the sentinel. NXDN's stand-ins (an IDAS area bit or site type, DCR's fixed 7) are no RAN
+// either. The numeric sys ids keep the raw value: 0 is a code.
+static int
+test_unknown_access_codes_render_as_dashes(void) {
+    static dsd_opts opts;
+    static dsd_state state;
+    static Event_History_I event_history[2];
+    int rc = 0;
+
+    reset_fixture(&opts, &state, event_history);
+    state.dmr_color_code = 16U;
+    const Event_History* item = render_code_row(&opts, &state, event_history, DSD_SYNC_DMR_BS_VOICE_POS);
+    rc |= expect_str_eq("unknown DMR CC sysid", item->sysid_string, "DMR_CC_--");
+    rc |= expect_has_substr("unknown DMR CC event", item->event_string, "SRC: 00041001; CC: --; ");
+    rc |= expect_int("unknown DMR CC keeps its numeric id", (int)item->sys_id2, 16);
+
+    reset_fixture(&opts, &state, event_history);
+    state.dmr_color_code = 16U;
+    state.dmr_t3_syscode = 0xABCU;
+    item = render_code_row(&opts, &state, event_history, DSD_SYNC_DMR_MS_VOICE);
+    rc |= expect_str_eq("unknown DMR CC sysid with system code", item->sysid_string, "DMR_ABC_CC_--");
+    rc |= expect_has_substr("unknown DMR CC event with system code", item->event_string, "CC: --; SYS: ABC;");
+
+    reset_fixture(&opts, &state, event_history);
+    state.dmr_color_code = 0U;
+    item = render_code_row(&opts, &state, event_history, DSD_SYNC_DMR_BS_VOICE_POS);
+    rc |= expect_str_eq("DMR CC 0 sysid", item->sysid_string, "DMR_CC_0");
+    rc |= expect_has_substr("DMR CC 0 event", item->event_string, "CC: 00; ");
+
+    reset_fixture(&opts, &state, event_history);
+    state.nxdn_last_ran = (unsigned int)-1;
+    item = render_code_row(&opts, &state, event_history, DSD_SYNC_NXDN_POS);
+    rc |= expect_str_eq("unknown NXDN RAN sysid", item->sysid_string, "NXDN_RAN_--");
+    rc |= expect_has_substr("unknown NXDN RAN event", item->event_string, "SRC: 00041001; RAN: --; ");
+    rc |= expect_u64("unknown NXDN RAN keeps its numeric id", item->sys_id3, 0xFFFFFFFFU);
+
+    reset_fixture(&opts, &state, event_history);
+    state.nxdn_last_ran = (unsigned int)-1;
+    state.nxdn_location_site_code = 3U;
+    state.nxdn_location_sys_code = 12U;
+    item = render_code_row(&opts, &state, event_history, DSD_SYNC_NXDN_NEG);
+    rc |= expect_str_eq("unknown NXDN RAN sysid with site", item->sysid_string, "NXDN_12_3_RAN_--");
+    rc |= expect_has_substr("unknown NXDN RAN event with site", item->event_string, "RAN: --; SYS: 12.3; ");
+
+    reset_fixture(&opts, &state, event_history);
+    state.nxdn_last_ran = 7U;
+    state.nxdn_last_ran_stand_in = 1U;
+    item = render_code_row(&opts, &state, event_history, DSD_SYNC_NXDN_POS);
+    rc |= expect_str_eq("DCR stand-in sysid", item->sysid_string, "NXDN_RAN_--");
+    rc |= expect_has_substr("DCR stand-in event", item->event_string, "RAN: --; ");
+    rc |= expect_int("DCR stand-in keeps its numeric id", (int)item->sys_id3, 7);
+
+    reset_fixture(&opts, &state, event_history);
+    state.nxdn_last_ran = 0U;
+    item = render_code_row(&opts, &state, event_history, DSD_SYNC_NXDN_POS);
+    rc |= expect_str_eq("NXDN RAN 0 sysid", item->sysid_string, "NXDN_RAN_0");
+    rc |= expect_has_substr("NXDN RAN 0 event", item->event_string, "RAN: 00; ");
+
+    reset_fixture(&opts, &state, event_history);
+    state.dpmr_color_code = -1;
+    item = render_code_row(&opts, &state, event_history, DSD_SYNC_DPMR_FS2_POS);
+    rc |= expect_str_eq("unknown dPMR CC sysid", item->sysid_string, "DPMR_CC_--");
+    reset_fixture(&opts, &state, event_history);
+    state.dpmr_color_code = 0;
+    item = render_code_row(&opts, &state, event_history, DSD_SYNC_DPMR_FS2_POS);
+    rc |= expect_str_eq("dPMR CC 0 sysid", item->sysid_string, "DPMR_CC_0");
+
+    dsd_state_ext_free_all(&state);
+    return rc;
+}
+
+// The dPMR event line names the row's decoded colour code. It used to print the call's channel, which the protocol
+// sets to 0 when no colour code decoded, so an unknown code read as CC 0 (issue #575). The channel field is untouched.
+static int
+test_dpmr_event_line_prints_the_decoded_colour_code(void) {
+    static dsd_opts opts;
+    static dsd_state state;
+    static Event_History_I event_history[2];
+    int rc = 0;
+
+    reset_fixture(&opts, &state, event_history);
+    state.dpmr_color_code = -1;
+    const Event_History* item = render_code_row(&opts, &state, event_history, DSD_SYNC_DPMR_FS2_POS);
+    rc |= expect_has_substr("undecoded dPMR CC event", item->event_string, "TEST CC: --; TGT: ");
+    rc |= expect_no_substr("undecoded dPMR CC is not CC 0", item->event_string, "CC: 00");
+    rc |= expect_int("undecoded dPMR CC row channel", (int)item->channel, 0);
+
+    reset_fixture(&opts, &state, event_history);
+    state.dpmr_color_code = 0;
+    item = render_code_row(&opts, &state, event_history, DSD_SYNC_DPMR_FS2_POS);
+    rc |= expect_has_substr("dPMR CC 0 event", item->event_string, "TEST CC: 00; TGT: ");
+
+    reset_fixture(&opts, &state, event_history);
+    state.dpmr_color_code = 42;
+    item = render_code_row(&opts, &state, event_history, DSD_SYNC_DPMR_FS2_POS);
+    rc |= expect_has_substr("dPMR CC 42 event", item->event_string, "TEST CC: 42; TGT: ");
+    rc |= expect_int("dPMR row channel stays the call's", (int)item->channel, 0);
+
+    dsd_state_ext_free_all(&state);
+    return rc;
+}
+
+// Render one active call of `protocol` with the given service options into the staged row.
+static const Event_History*
+render_svc_row(dsd_opts* opts, dsd_state* state, Event_History_I event_history[2], int protocol, uint16_t svc,
+               uint8_t has_svc) {
+    const dsd_call_observation observation = {
+        .protocol = protocol,
+        .slot = 0U,
+        .kind = DSD_CALL_KIND_GROUP_VOICE,
+        .ota_target_id = 51002U,
+        .policy_target_id = 51002U,
+        .ota_source_id = 41001U,
+        .service_options = svc,
+        .has_service_metadata = has_svc,
+        .observed_m = g_observed_m,
+    };
+    g_observed_m += 0.1;
+    assert(dsd_call_state_observe(state, &observation, DSD_CALL_BOUNDARY_BEGIN) == 1);
+    watchdog_event_current(opts, state, 0);
+    return &event_history[0].Event_History_Items[0];
+}
+
+static void
+set_p25_site(dsd_state* state) {
+    state->p2_wacn = 0x45564U;
+    state->p2_sysid = 0x006U;
+    state->p2_rfssid = 10U;
+    state->p2_siteid = 10U;
+}
+
+// The P25 NAC and the M17 CAN in the system identity string and the event line follow the row's access code, as the
+// other protocols' codes do: a Phase 1 call takes nac only, so a p2_cc an earlier Phase 2 carrier left is no code of
+// its, and an M17 call names a CAN only once its service options were observed. An unknown NAC prints "---", three
+// wide like the hex code, so the long form keeps its field positions. The numeric sys ids keep the raw value.
+static int
+test_unknown_p25_and_m17_codes_render_as_dashes(void) {
+    static dsd_opts opts;
+    static dsd_state state;
+    static Event_History_I event_history[2];
+    int rc = 0;
+
+    reset_fixture(&opts, &state, event_history);
+    state.nac = 0;
+    state.p2_cc = 0x293ULL;
+    const Event_History* item = render_svc_row(&opts, &state, event_history, DSD_SYNC_P25P1_POS, 0U, 0U);
+    rc |= expect_access_code("P25p1 with nac 0 has no code", item, DSD_ACCESS_CODE_NONE, 0U);
+    rc |= expect_str_eq("P25p1 unknown NAC sysid", item->sysid_string, "P25_---");
+    rc |= expect_has_substr("P25p1 unknown NAC event", item->event_string, "SRC: 00041001; NAC: ---; ");
+    rc |= expect_int("P25p1 unknown NAC keeps its numeric id", (int)item->sys_id3, 0x293);
+
+    reset_fixture(&opts, &state, event_history);
+    state.nac = 0;
+    state.p2_cc = 0x293ULL;
+    set_p25_site(&state);
+    item = render_svc_row(&opts, &state, event_history, DSD_SYNC_P25P1_NEG, 0U, 0U);
+    rc |= expect_str_eq("P25p1 unknown NAC long sysid", item->sysid_string, "P25_45564006---_10_10");
+    rc |= expect_has_substr("P25p1 unknown NAC long event", item->event_string, "NAC: ---; NET_STS: 45564:006:10.10; ");
+
+    reset_fixture(&opts, &state, event_history);
+    state.nac = 0x293;
+    item = render_svc_row(&opts, &state, event_history, DSD_SYNC_P25P1_POS, 0U, 0U);
+    rc |= expect_str_eq("P25p1 NAC sysid", item->sysid_string, "P25_293");
+    rc |= expect_has_substr("P25p1 NAC event", item->event_string, "NAC: 293; ");
+
+    reset_fixture(&opts, &state, event_history);
+    state.p2_cc = 0x293ULL;
+    state.p2_cc_verified = 1U;
+    set_p25_site(&state);
+    item = render_svc_row(&opts, &state, event_history, DSD_SYNC_P25P2_POS, 0U, 0U);
+    rc |= expect_str_eq("P25p2 NAC long sysid", item->sysid_string, "P25_45564006293_10_10");
+    rc |= expect_has_substr("P25p2 NAC long event", item->event_string, "NAC: 293; NET_STS: 45564:006:10.10; ");
+    reset_fixture(&opts, &state, event_history);
+    state.p2_cc = 0x293ULL;
+    state.p2_cc_verified = 1U;
+    item = render_svc_row(&opts, &state, event_history, DSD_SYNC_P25P2_NEG, 0U, 0U);
+    rc |= expect_str_eq("P25p2 NAC sysid", item->sysid_string, "P25_293");
+    /* A seed no burst on this carrier has proven (-X, or another carrier's) is no NAC the call was heard with. */
+    reset_fixture(&opts, &state, event_history);
+    state.p2_cc = 0x293ULL;
+    item = render_svc_row(&opts, &state, event_history, DSD_SYNC_P25P2_POS, 0U, 0U);
+    rc |= expect_access_code("P25p2 unproven seed has no code", item, DSD_ACCESS_CODE_NONE, 0U);
+    rc |= expect_str_eq("P25p2 unproven seed sysid", item->sysid_string, "P25_---");
+    rc |= expect_has_substr("P25p2 unproven seed event", item->event_string, "NAC: ---; ");
+
+    reset_fixture(&opts, &state, event_history);
+    item = render_svc_row(&opts, &state, event_history, DSD_SYNC_M17_LSF_POS, 0x13U, 0U);
+    rc |= expect_str_eq("M17 without service options sysid", item->sysid_string, "M17_CAN_--");
+    rc |= expect_has_substr("M17 without service options event", item->event_string, " CAN: --;");
+
+    reset_fixture(&opts, &state, event_history);
+    item = render_svc_row(&opts, &state, event_history, DSD_SYNC_M17_LSF_POS, 0x13U, 1U);
+    rc |= expect_str_eq("M17 CAN sysid", item->sysid_string, "M17_CAN_3");
+    rc |= expect_has_substr("M17 CAN event", item->event_string, " CAN: 03;");
+
+    dsd_state_ext_free_all(&state);
+    return rc;
+}
+
+// One segment of a transmission whose access code rides in the observation or in the decoder state, then the
+// reacquired segment after a sync loss. Returns the merged row.
+static const Event_History*
+merge_observed_segments(dsd_opts* opts, dsd_state* state, Event_History_I event_history[2], int protocol,
+                        uint8_t first_has_svc, int first_nac, uint8_t second_has_svc, int second_nac) {
+    dsd_call_observation observation = {
+        .protocol = protocol,
+        .slot = 0U,
+        .kind = DSD_CALL_KIND_GROUP_VOICE,
+        .ota_target_id = 100U,
+        .policy_target_id = 100U,
+        .ota_source_id = 201U,
+        .service_options = 0x13U,
+        .has_service_metadata = first_has_svc,
+        .observed_m = g_observed_m,
+    };
+    g_observed_m += 0.1;
+    state->nac = first_nac;
+    assert(dsd_call_state_observe(state, &observation, DSD_CALL_BOUNDARY_BEGIN) == 1);
+    dsd_event_sync_slot(opts, state, 0U);
+    assert(end_test_call(state, 0U, DSD_CALL_END_SYNC_LOSS) == 1);
+    dsd_event_sync_slot(opts, state, 0U);
+
+    observation.has_service_metadata = second_has_svc;
+    observation.observed_m = g_observed_m;
+    g_observed_m += 0.1;
+    state->nac = second_nac;
+    assert(dsd_call_state_observe(state, &observation, DSD_CALL_BOUNDARY_CONTINUE) == 1);
+    dsd_event_sync_slot(opts, state, 0U);
+    assert(end_test_call(state, 0U, DSD_CALL_END_SYNC_LOSS) == 1);
+    dsd_event_sync_slot(opts, state, 0U);
+    assert(committed_history_rows(&event_history[0]) == 1);
+    return &event_history[0].Event_History_Items[1];
+}
+
+// A reacquired segment that decoded the NAC or the CAN fills the row's access code, and the system identity string and
+// the event line name it.
+static int
+test_reacquisition_merge_names_a_p25_or_m17_code(void) {
+    static dsd_opts opts;
+    static dsd_state state;
+    static Event_History_I event_history[2];
+    int rc = 0;
+
+    reset_fixture(&opts, &state, event_history);
+    state.p2_cc = 0x293ULL; /* left by an earlier Phase 2 carrier: no code of this Phase 1 call's */
+    const Event_History* merged =
+        merge_observed_segments(&opts, &state, event_history, DSD_SYNC_P25P1_POS, 1U, 0, 1U, 0x2A1);
+    rc |= expect_access_code("merge fills the NAC", merged, DSD_ACCESS_CODE_NAC, 0x2A1U);
+    rc |= expect_str_eq("merged P25 sysid names the NAC", merged->sysid_string, "P25_2A1");
+    rc |= expect_has_substr("merged P25 event names the NAC", merged->event_string, "NAC: 2A1; ");
+
+    reset_fixture(&opts, &state, event_history);
+    merged = merge_observed_segments(&opts, &state, event_history, DSD_SYNC_M17_STR_POS, 0U, 0, 1U, 0);
+    rc |= expect_access_code("merge fills the CAN", merged, DSD_ACCESS_CODE_CAN, 3U);
+    rc |= expect_str_eq("merged M17 sysid names the CAN", merged->sysid_string, "M17_CAN_3");
+    rc |= expect_has_substr("merged M17 event names the CAN", merged->event_string, " CAN: 03;");
+
+    dsd_state_ext_free_all(&state);
+    return rc;
+}
+
+// What one segment of a transmission decoded: its access code (DMR colour code, NXDN RAN or dPMR colour code, each
+// at its own sentinel when undecoded), NXDN's stand-in mark, and the system ids beside it.
+typedef struct {
+    int code;
+    uint8_t stand_in;
+    uint32_t dmr_syscode;
+    uint16_t nxdn_site_code;
+    uint32_t nxdn_sys_code;
+} code_segment;
+
+static void
+set_code_segment(dsd_state* state, int protocol, const code_segment* segment) {
+    if (DSD_SYNC_IS_NXDN(protocol)) {
+        state->nxdn_last_ran = (unsigned int)segment->code;
+        state->nxdn_last_ran_stand_in = segment->stand_in;
+        state->nxdn_location_site_code = segment->nxdn_site_code;
+        state->nxdn_location_sys_code = segment->nxdn_sys_code;
+    } else if (DSD_SYNC_IS_DPMR(protocol)) {
+        state->dpmr_color_code = segment->code;
+    } else {
+        state->dmr_color_code = (unsigned int)segment->code;
+        state->dmr_t3_syscode = segment->dmr_syscode;
+    }
+}
+
+// One transmission in two segments, the second reacquiring the first after a sync loss. Returns the merged row.
+static const Event_History*
+merge_segments(dsd_opts* opts, dsd_state* state, Event_History_I event_history[2], int protocol,
+               const code_segment* first, const code_segment* second) {
+    set_code_segment(state, protocol, first);
+    assert(
+        observe_test_call(state, 0U, protocol, DSD_CALL_KIND_GROUP_VOICE, 100U, 201U, 0U, 0U, DSD_CALL_BOUNDARY_BEGIN)
+        == 1);
+    dsd_event_sync_slot(opts, state, 0U);
+    assert(end_test_call(state, 0U, DSD_CALL_END_SYNC_LOSS) == 1);
+    dsd_event_sync_slot(opts, state, 0U);
+
+    set_code_segment(state, protocol, second);
+    assert(observe_test_call(state, 0U, protocol, DSD_CALL_KIND_GROUP_VOICE, 100U, 201U, 0U, 0U,
+                             DSD_CALL_BOUNDARY_CONTINUE)
+           == 1);
+    dsd_event_sync_slot(opts, state, 0U);
+    assert(end_test_call(state, 0U, DSD_CALL_END_SYNC_LOSS) == 1);
+    dsd_event_sync_slot(opts, state, 0U);
+    assert(committed_history_rows(&event_history[0]) == 1);
+    return &event_history[0].Event_History_Items[1];
+}
+
+// The same, for segments that differ only in their access code.
+static const Event_History*
+merge_code_segments(dsd_opts* opts, dsd_state* state, Event_History_I event_history[2], int protocol,
+                    unsigned int first_code, uint8_t first_stand_in, unsigned int second_code) {
+    const code_segment first = {.code = (int)first_code, .stand_in = first_stand_in};
+    const code_segment second = {.code = (int)second_code};
+    return merge_segments(opts, state, event_history, protocol, &first, &second);
+}
+
+// A dPMR row's system identity is its colour code. A reacquired segment that decoded the code the first one did not
+// fills the row's access code, and the system identity string follows it, as the event line does.
+static int
+test_reacquisition_merge_names_a_dpmr_code_in_the_system_identity(void) {
+    static dsd_opts opts;
+    static dsd_state state;
+    static Event_History_I event_history[2];
+    reset_fixture(&opts, &state, event_history);
+    const code_segment first = {.code = -1};
+    const code_segment second = {.code = 9};
+    const Event_History* merged = merge_segments(&opts, &state, event_history, DSD_SYNC_DPMR_FS2_POS, &first, &second);
+    int rc = expect_access_code("merge fills the dPMR colour code", merged, DSD_ACCESS_CODE_COLOR_CODE, 9U);
+    rc |= expect_has_substr("merged dPMR event names the code", merged->event_string, "TEST CC: 09; TGT: ");
+    rc |= expect_str_eq("merged dPMR sysid names the code", merged->sysid_string, "DPMR_CC_9");
+    dsd_state_ext_free_all(&state);
+    return rc;
+}
+
+// A reacquired segment can decode a system id the first one did not while missing the code the first one decoded.
+// The row keeps the code and takes the system id, and its system identity string names both.
+static int
+test_reacquisition_merge_keeps_the_code_and_takes_a_later_system_id(void) {
+    static dsd_opts opts;
+    static dsd_state state;
+    static Event_History_I event_history[2];
+    int rc = 0;
+
+    reset_fixture(&opts, &state, event_history);
+    const code_segment dmr_first = {.code = 3};
+    const code_segment dmr_second = {.code = 16, .dmr_syscode = 0xABCU};
+    const Event_History* merged =
+        merge_segments(&opts, &state, event_history, DSD_SYNC_DMR_BS_VOICE_POS, &dmr_first, &dmr_second);
+    rc |= expect_int("DMR merge keeps the colour code", (int)merged->sys_id2, 3);
+    rc |= expect_int("DMR merge takes the system code", (int)merged->sys_id1, 0xABC);
+    rc |= expect_str_eq("merged DMR sysid names both", merged->sysid_string, "DMR_ABC_CC_3");
+    rc |= expect_has_substr("merged DMR event names both", merged->event_string, "CC: 03; SYS: ABC;");
+
+    reset_fixture(&opts, &state, event_history);
+    const code_segment nxdn_first = {.code = 5};
+    const code_segment nxdn_second = {.code = -1, .nxdn_site_code = 3U, .nxdn_sys_code = 12U};
+    merged = merge_segments(&opts, &state, event_history, DSD_SYNC_NXDN_POS, &nxdn_first, &nxdn_second);
+    rc |= expect_int("NXDN merge keeps the RAN", (int)merged->sys_id3, 5);
+    rc |= expect_int("NXDN merge takes the site code", (int)merged->sys_id1, 3);
+    rc |= expect_str_eq("merged NXDN sysid names both", merged->sysid_string, "NXDN_12_3_RAN_5");
+    rc |= expect_has_substr("merged NXDN event names both", merged->event_string, "RAN: 05; SYS: 12.3;");
+
+    dsd_state_ext_free_all(&state);
+    return rc;
+}
+
+// An NXDN row names the RAN its call was heard with, the row's access code, as DMR, dPMR, P25 and M17 rows name theirs.
+// A call heard with RAN 5 whose last render runs once the live RAN moved on -- forgotten by a retune, or the next
+// carrier's RAN 9 -- commits RAN 5 in its system identity and event line; the live RAN would name another carrier's.
+static int
+test_nxdn_row_names_the_ran_it_was_heard_with(void) {
+    static dsd_opts opts;
+    static dsd_state state;
+    static Event_History_I event_history[2];
+    static const unsigned int later_rans[] = {(unsigned int)-1, 9U};
+    int rc = 0;
+    for (size_t i = 0; i < sizeof later_rans / sizeof later_rans[0]; i++) {
+        reset_fixture(&opts, &state, event_history);
+        state.nxdn_last_ran = 5U;
+        assert(observe_test_call(&state, 0U, DSD_SYNC_NXDN_POS, DSD_CALL_KIND_GROUP_VOICE, 100U, 201U, 0U, 0U,
+                                 DSD_CALL_BOUNDARY_BEGIN)
+               == 1);
+        dsd_event_sync_slot(&opts, &state, 0U);
+        state.nxdn_last_ran = later_rans[i];
+        assert(end_test_call(&state, 0U, DSD_CALL_END_SYNC_LOSS) == 1);
+        dsd_event_sync_slot(&opts, &state, 0U);
+        assert(committed_history_rows(&event_history[0]) == 1);
+        const Event_History* row = &event_history[0].Event_History_Items[1];
+        rc |= expect_access_code("NXDN row keeps the RAN it was heard with", row, DSD_ACCESS_CODE_RAN, 5U);
+        rc |= expect_str_eq("NXDN sysid names the row's RAN", row->sysid_string, "NXDN_RAN_5");
+        rc |= expect_has_substr("NXDN event names the row's RAN", row->event_string, "RAN: 05; ");
+    }
+    dsd_state_ext_free_all(&state);
+    return rc;
+}
+
+// A reacquired segment that decoded the code fills a system identity the first segment rendered without one, 0
+// included (a code for DMR and NXDN alike); a segment that decoded none never replaces one, 0 included.
+static int
+test_reacquisition_merge_upgrades_an_unknown_system_code(void) {
+    static dsd_opts opts;
+    static dsd_state state;
+    static Event_History_I event_history[2];
+    int rc = 0;
+
+    reset_fixture(&opts, &state, event_history);
+    const Event_History* merged =
+        merge_code_segments(&opts, &state, event_history, DSD_SYNC_DMR_BS_VOICE_POS, 16U, 0U, 5U);
+    rc |= expect_int("merge fills an unknown DMR CC", (int)merged->sys_id2, 5);
+    rc |= expect_str_eq("merged DMR sysid names the code", merged->sysid_string, "DMR_CC_5");
+    rc |= expect_has_substr("merged DMR event names the code", merged->event_string, "CC: 05; ");
+
+    reset_fixture(&opts, &state, event_history);
+    merged = merge_code_segments(&opts, &state, event_history, DSD_SYNC_DMR_BS_VOICE_POS, 16U, 0U, 0U);
+    rc |= expect_int("merge fills an unknown DMR CC with 0", (int)merged->sys_id2, 0);
+    rc |= expect_str_eq("merged DMR sysid names CC 0", merged->sysid_string, "DMR_CC_0");
+    rc |= expect_has_substr("merged DMR event names CC 0", merged->event_string, "CC: 00; ");
+
+    reset_fixture(&opts, &state, event_history);
+    merged = merge_code_segments(&opts, &state, event_history, DSD_SYNC_DMR_BS_VOICE_POS, 0U, 0U, 16U);
+    rc |= expect_int("an undecoded segment keeps DMR CC 0", (int)merged->sys_id2, 0);
+    rc |= expect_str_eq("an undecoded segment keeps the DMR sysid", merged->sysid_string, "DMR_CC_0");
+    rc |= expect_has_substr("an undecoded segment keeps the DMR event code", merged->event_string, "CC: 00; ");
+
+    reset_fixture(&opts, &state, event_history);
+    merged = merge_code_segments(&opts, &state, event_history, DSD_SYNC_NXDN_POS, (unsigned int)-1, 0U, 0U);
+    rc |= expect_int("merge fills an unknown NXDN RAN with 0", (int)merged->sys_id3, 0);
+    rc |= expect_str_eq("merged NXDN sysid names RAN 0", merged->sysid_string, "NXDN_RAN_0");
+    rc |= expect_has_substr("merged NXDN event names RAN 0", merged->event_string, "RAN: 00; ");
+
+    reset_fixture(&opts, &state, event_history);
+    merged = merge_code_segments(&opts, &state, event_history, DSD_SYNC_NXDN_POS, 0U, 0U, (unsigned int)-1);
+    rc |= expect_int("an undecoded segment keeps NXDN RAN 0", (int)merged->sys_id3, 0);
+    rc |= expect_str_eq("an undecoded segment keeps the NXDN sysid", merged->sysid_string, "NXDN_RAN_0");
+
+    // The first segment's stand-in mark was left by an earlier DCR transmission beside an undecoded RAN; the RAN the
+    // reacquired segment decoded is one.
+    reset_fixture(&opts, &state, event_history);
+    merged = merge_code_segments(&opts, &state, event_history, DSD_SYNC_NXDN_POS, (unsigned int)-1, 1U, 5U);
+    rc |= expect_int("merge fills an unknown NXDN RAN", (int)merged->sys_id3, 5);
+    rc |= expect_str_eq("merged NXDN sysid names the RAN", merged->sysid_string, "NXDN_RAN_5");
+    rc |= expect_has_substr("merged NXDN event names the RAN", merged->event_string, "RAN: 05; ");
+
+    dsd_state_ext_free_all(&state);
+    return rc;
+}
+
+// A data notice is rendered once, while the receiver is still on the carrier that delivered it, so it reads the
+// frequency and code live: its own frequency when the PDU named one, else the tuner's.
+static int
+test_data_notice_carries_frequency_and_access_code(void) {
+    static dsd_opts opts;
+    static dsd_state state;
+    static Event_History_I event_history[2];
+    reset_fixture(&opts, &state, event_history);
+    arm_radio_input(&opts, 851012500U);
+    state.lastsynctype = DSD_SYNC_DMR_BS_DATA_POS;
+    state.dmr_color_code = 9U;
+
+    assert(emit_test_data_notice(&opts, &state, 1234U, 5678U, "Data SRC: 1234; TGT: 5678;", 0U) == 0);
+    const Event_History* row = &event_history[0].Event_History_Items[1];
+    int rc = expect_i64("data notice takes the tuned frequency", row->freq_hz, 851012500);
+    rc |= expect_access_code("data notice takes the live colour code", row, DSD_ACCESS_CODE_COLOR_CODE, 9U);
+    rc |= expect_str_eq("data notice string is unchanged", row->event_string,
+                        "2026-04-30 00:00:00 Data SRC: 1234; TGT: 5678;");
+
+    dsd_call_observation observation = dsd_call_observation_data(DSD_SYNC_P25P1_POS, 0U, 1234U, 5678U);
+    observation.frequency_hz = 853037500;
+    state.nac = 0x293;
+    assert(dsd_event_emit_data_notice(&opts, &state, 0U, &observation, "P25 data;") == 0);
+    row = &event_history[0].Event_History_Items[1];
+    rc |= expect_i64("data notice's own frequency outranks the tuner", row->freq_hz, 853037500);
+    rc |= expect_access_code("data notice takes the live NAC", row, DSD_ACCESS_CODE_NAC, 0x293U);
+
+    observation = dsd_call_observation_data(DSD_SYNC_M17_PKT_POS, 0U, 1234U, 5678U);
+    observation.service_options = 0x13U;
+    observation.has_service_metadata = 1U;
+    assert(dsd_event_emit_data_notice(&opts, &state, 0U, &observation, "M17 packet;") == 0);
+    rc |= expect_access_code("M17 data notice takes its CAN", &event_history[0].Event_History_Items[1],
+                             DSD_ACCESS_CODE_CAN, 3U);
+
+    // Off a radio input, nothing to take but the codes.
+    reset_fixture(&opts, &state, event_history);
+    state.lastsynctype = DSD_SYNC_DMR_BS_DATA_POS;
+    state.dmr_color_code = 16U;
+    assert(emit_test_data_notice(&opts, &state, 1234U, 5678U, "Data;", 0U) == 0);
+    rc |= expect_i64("audio input data notice has no frequency", event_history[0].Event_History_Items[1].freq_hz, 0);
+    rc |= expect_access_code("unlocked colour code leaves the notice without one",
+                             &event_history[0].Event_History_Items[1], DSD_ACCESS_CODE_NONE, 0U);
+
+    dsd_state_ext_free_all(&state);
+    return rc;
+}
+
+// Playing back files (--playfiles), the decoder state describes no carrier: the SDRTrunk JSON reader writes
+// dmr_color_code = 0 per file, and the tuner is not what the recording was heard on. Rows take neither; a call's own
+// frequency still shows.
+static int
+test_playfiles_rows_take_no_tuner_value_or_code(void) {
+    static dsd_opts opts;
+    static dsd_state state;
+    static Event_History_I event_history[2];
+    reset_fixture(&opts, &state, event_history);
+    opts.playfiles = 1;
+    arm_radio_input(&opts, 851012500U);
+    state.dmr_color_code = 0U;
+
+    assert(observe_test_call(&state, 0U, DSD_SYNC_DMR_BS_VOICE_POS, DSD_CALL_KIND_GROUP_VOICE, 100U, 201U, 0U, 0U,
+                             DSD_CALL_BOUNDARY_BEGIN)
+           == 1);
+    dsd_event_sync_slot(&opts, &state, 0U);
+    assert(end_test_call(&state, 0U, DSD_CALL_END_EXPLICIT) == 1);
+    dsd_event_sync_slot(&opts, &state, 0U);
+    const Event_History* row = &event_history[0].Event_History_Items[1];
+    int rc = expect_int("playfiles row commits", committed_history_rows(&event_history[0]), 1);
+    rc |= expect_i64("playfiles row takes no tuner value", row->freq_hz, 0);
+    rc |= expect_access_code("playfiles row takes no code", row, DSD_ACCESS_CODE_NONE, 0U);
+    // Issue #575: the text names the row's code too, so the reader's fabricated 0 prints as no code, not CC 0.
+    rc |= expect_str_eq("playfiles row sysid names no code", row->sysid_string, "DMR_CC_--");
+    rc |= expect_has_substr("playfiles row event names no code", row->event_string, "SRC: 00000201; CC: --; ");
+    rc |= expect_no_substr("playfiles row event is not CC 0", row->event_string, "CC: 00");
+
+    state.lastsynctype = DSD_SYNC_DMR_BS_DATA_POS;
+    assert(emit_test_data_notice(&opts, &state, 1234U, 5678U, "Data;", 0U) == 0);
+    row = &event_history[0].Event_History_Items[1];
+    rc |= expect_i64("playfiles data notice takes no tuner value", row->freq_hz, 0);
+    rc |= expect_access_code("playfiles data notice takes no code", row, DSD_ACCESS_CODE_NONE, 0U);
+
+    assert(observe_test_call_freq(&state, DSD_SYNC_DMR_BS_VOICE_POS, 300U, 401U, 853037500, DSD_CALL_BOUNDARY_BEGIN)
+           == 1);
+    dsd_event_sync_slot(&opts, &state, 0U);
+    rc |= expect_i64("playfiles row still shows the call's frequency", event_history[0].Event_History_Items[0].freq_hz,
+                     853037500);
+
+    dsd_state_ext_free_all(&state);
+    return rc;
+}
+
+// An NXDN row names only its own channel and frequency. The last grant decoded is global: a duplicate assignment for
+// another call decoded while tuned, or a -Y control-channel row's last grant carried onto a conventional row, would
+// otherwise put another call's channel on this row.
+static int
+test_nxdn_row_names_only_its_own_channel(void) {
+    static dsd_opts opts;
+    static dsd_state state;
+    static Event_History_I event_history[2];
+    reset_fixture(&opts, &state, event_history);
+    state.lastsynctype = DSD_SYNC_NXDN_POS;
+    state.nxdn_last_ran = 23U;
+    state.nxdn_grant_chan = 198U;
+    state.nxdn_grant_freq = 453212500;
+
+    assert(observe_test_call(&state, 0U, DSD_SYNC_NXDN_POS, DSD_CALL_KIND_GROUP_VOICE, 51002U, 41001U, 0U, 0U,
+                             DSD_CALL_BOUNDARY_BEGIN)
+           == 1);
+    dsd_event_sync_slot(&opts, &state, 0U);
+    const Event_History* item = &event_history[0].Event_History_Items[0];
+    int rc = expect_str_eq("conventional NXDN row does not name an unrelated grant", item->event_string,
+                           "2026-04-30 00:00:00 TEST TGT: 00051002; SRC: 00041001; RAN: 23; Group; ");
+    rc |= expect_access_code("conventional NXDN row records its RAN", item, DSD_ACCESS_CODE_RAN, 23U);
+
+    // A followed grant: the call carries the channel and frequency it was granted. A later grant for another call,
+    // decoded while tuned, moves the globals but not the receiver.
+    reset_fixture(&opts, &state, event_history);
+    state.lastsynctype = DSD_SYNC_NXDN_POS;
+    state.nxdn_last_ran = 23U;
+    const dsd_call_observation observation = {
+        .protocol = DSD_SYNC_NXDN_POS,
+        .slot = 0U,
+        .kind = DSD_CALL_KIND_GROUP_VOICE,
+        .ota_target_id = 51002U,
+        .policy_target_id = 51002U,
+        .ota_source_id = 41001U,
+        .channel = 198U,
+        .frequency_hz = 453212500,
+    };
+    assert(dsd_call_state_observe(&state, &observation, DSD_CALL_BOUNDARY_BEGIN) == 1);
+    state.nxdn_grant_chan = 77U;
+    state.nxdn_grant_freq = 451000000;
+    dsd_event_sync_slot(&opts, &state, 0U);
+    item = &event_history[0].Event_History_Items[0];
+    rc |= expect_str_eq("followed NXDN grant names its own channel and frequency", item->event_string,
+                        "2026-04-30 00:00:00 TEST TGT: 00051002; SRC: 00041001; RAN: 23; CH: 198; "
+                        "FREQ: 453.212500 MHz; Group; ");
+
+    // A conventional NXDN carrier on a radio input: the frequency it was heard on, with no channel to name.
+    reset_fixture(&opts, &state, event_history);
+    arm_radio_input(&opts, 453212500U);
+    state.lastsynctype = DSD_SYNC_NXDN_POS;
+    state.nxdn_last_ran = 23U;
+    state.nxdn_grant_chan = 198U;
+    state.nxdn_grant_freq = 451000000;
+    assert(observe_test_call(&state, 0U, DSD_SYNC_NXDN_POS, DSD_CALL_KIND_GROUP_VOICE, 51002U, 41001U, 0U, 0U,
+                             DSD_CALL_BOUNDARY_BEGIN)
+           == 1);
+    dsd_event_sync_slot(&opts, &state, 0U);
+    rc |= expect_str_eq("conventional NXDN row on a radio names its frequency only",
+                        event_history[0].Event_History_Items[0].event_string,
+                        "2026-04-30 00:00:00 TEST TGT: 00051002; SRC: 00041001; RAN: 23; FREQ: 453.212500 MHz; "
+                        "Group; ");
+
     dsd_state_ext_free_all(&state);
     return rc;
 }
@@ -2940,6 +4593,264 @@ test_merged_row_start_stamp_is_frozen(void) {
     return rc;
 }
 
+// A decode instant far from any platform clock reading (1e9 s), so a due time or a row stamp taken
+// from the platform clocks instead of the decode clock could not come out at the expected value.
+#define ALERT_TEST_DECODE_T0_NS 1000000000000000000ULL
+#define ALERT_TEST_DECODE_T0_S  1000000000.0
+
+static void
+alert_decode_clock_at_ms(uint64_t offset_ms) {
+    dsd_decode_clock_test_set_ns(ALERT_TEST_DECODE_T0_NS + (offset_ms * 1000000ULL));
+}
+
+// Observe on the store's own clock (observed_m 0), as the vocoder's media mark and the engine's
+// no-carrier end do. A zero target is the vocoder's identity-less BEGIN.
+static int
+observe_unstamped_call(dsd_state* state, uint64_t target_id, uint64_t source_id) {
+    const dsd_call_observation observation = {
+        .protocol = DSD_SYNC_DMR_BS_VOICE_POS,
+        .slot = 0U,
+        .kind = target_id != 0U ? DSD_CALL_KIND_GROUP_VOICE : DSD_CALL_KIND_VOICE,
+        .ota_target_id = target_id,
+        .policy_target_id = target_id,
+        .ota_source_id = source_id,
+    };
+    return dsd_call_state_observe(state, &observation, DSD_CALL_BOUNDARY_BEGIN);
+}
+
+// The VOICE_END alert a sync-loss end holds open is due one reacquisition window after the end on
+// the decode clock, and is released by decode time alone: the real clock does not move here.
+static int
+test_end_alert_due_runs_on_the_decode_clock(void) {
+    static dsd_opts opts;
+    static dsd_state state;
+    static Event_History_I event_history[2];
+    reset_fixture(&opts, &state, event_history);
+    opts.call_alert_events = DSD_CALL_ALERT_EVENT_VOICE_START | DSD_CALL_ALERT_EVENT_VOICE_END;
+    state.lastsynctype = DSD_SYNC_DMR_BS_VOICE_POS;
+    dsd_decode_clock_use_test(ALERT_TEST_DECODE_T0_NS);
+
+    int rc = expect_int("identified call begins", observe_unstamped_call(&state, 1234U, 5678U), 1);
+    dsd_event_sync_slot(&opts, &state, 0U);
+    alert_decode_clock_at_ms(2000U);
+    rc |= expect_int("sync loss ends it", dsd_call_state_end_ex(&state, 0U, 0.0, DSD_CALL_END_SYNC_LOSS), 1);
+    dsd_event_sync_slot(&opts, &state, 0U);
+    alert_decode_clock_at_ms(2400U);
+    dsd_event_sync_slot(&opts, &state, 0U);
+    rc |= expect_int("END alert still held 0.4 s after the end", g_beeper_count, 1);
+    dsd_call_context_snapshot context;
+    rc |= expect_int("context snapshot copies", dsd_call_context_copy_snapshot(&state, &context) > 0, 1);
+    rc |= expect_int("sync-loss end holds the alert", context.events[0].end_alert_pending, 1);
+    rc |= expect_int(
+        "alert is due one window after the decode-time end",
+        same_instant(context.events[0].end_alert_due_m, ALERT_TEST_DECODE_T0_S + 2.0 + DSD_CALL_REACQUIRE_GAP_S), 1);
+    alert_decode_clock_at_ms(2600U);
+    dsd_event_sync_slot(&opts, &state, 0U);
+    rc |= expect_int("END alert fires 0.6 s after the end", g_beeper_count, 2);
+
+    dsd_decode_clock_use_system();
+    dsd_state_ext_free_all(&state);
+    return rc;
+}
+
+// Observe the slot's call again within its epoch, on the store's own clock.
+static int
+continue_unstamped_call(dsd_state* state, uint64_t target_id, uint64_t source_id) {
+    const dsd_call_observation observation = {
+        .protocol = DSD_SYNC_DMR_BS_VOICE_POS,
+        .slot = 0U,
+        .kind = DSD_CALL_KIND_GROUP_VOICE,
+        .ota_target_id = target_id,
+        .policy_target_id = target_id,
+        .ota_source_id = source_id,
+    };
+    return dsd_call_state_observe(state, &observation, DSD_CALL_BOUNDARY_CONTINUE);
+}
+
+static int
+expect_close_sidecar(const char* label, const close_wav_capture* capture, uint32_t talkgroup, time_t start) {
+    char want[96];
+    DSD_SNPRINTF(want, sizeof want, "\"start_time\": %lld,", (long long)start);
+    int rc = expect_has_substr(label, capture->sidecar, want);
+    DSD_SNPRINTF(want, sizeof want, "\"stop_time\": %lld,", (long long)start + CLOSE_WAV_SECONDS);
+    rc |= expect_has_substr(label, capture->sidecar, want);
+    DSD_SNPRINTF(want, sizeof want, "\"talkgroup\": %u,", talkgroup);
+    rc |= expect_has_substr(label, capture->sidecar, want);
+    return rc;
+}
+
+// The rdio-scanner sidecar is written as the WAV closes, from the row the closing segment staged, and files the
+// recording at the segment's start. The row's event_time is its last activity, which by then is the end (#673). Driven
+// through the real event layer for each way a recording closes: a call's end, a reacquired segment merged into the
+// transmission's row, and a new call taking the slot from one still running. Offsets are quarter seconds so the decode
+// clock's seconds are exact.
+static int
+test_rdio_sidecar_files_each_recording_at_its_start(void) {
+    static dsd_opts opts;
+    static dsd_state state;
+    static Event_History_I event_history[2];
+    static max_align_t wav_sentinel;
+    reset_fixture(&opts, &state, event_history);
+    state.lastsynctype = DSD_SYNC_DMR_BS_VOICE_POS;
+    opts.wav_out_f = (SNDFILE*)&wav_sentinel;
+    g_open_wav_result = &wav_sentinel;
+    opts.rdio_mode = DSD_RDIO_MODE_DIRWATCH;
+    if (!dsd_test_mkdtemp(g_close_wav_export_dir, sizeof g_close_wav_export_dir, "dsdneo_rdio_close")) {
+        DSD_FPRINTF(stderr, "dsd_test_mkdtemp failed for the rdio sidecar test\n");
+        return 1;
+    }
+    const time_t t0_s = (time_t)ALERT_TEST_DECODE_T0_S;
+    dsd_decode_clock_use_test(ALERT_TEST_DECODE_T0_NS);
+
+    // Call A runs 4.75 s and fades.
+    int rc = expect_int("call A begins", observe_unstamped_call(&state, 100U, 200U), 1);
+    dsd_event_sync_slot(&opts, &state, 0U);
+    alert_decode_clock_at_ms(4750U);
+    rc |= expect_int("call A fades", dsd_call_state_end_ex(&state, 0U, 0.0, DSD_CALL_END_SYNC_LOSS), 1);
+    dsd_event_sync_slot(&opts, &state, 0U);
+    rc |= expect_int("call A's end closes its recording", g_close_wav_capture_count, 1);
+    rc |= expect_u64("call A's row ends at its last activity", (uint64_t)g_close_wav_captures[0].event_time,
+                     (uint64_t)(t0_s + 4));
+    rc |= expect_close_sidecar("call end", &g_close_wav_captures[0], 100U, t0_s);
+
+    // A quarter second later, inside the reacquisition window, the transmission resumes for 3 s.
+    alert_decode_clock_at_ms(5000U);
+    rc |= expect_int("segment reacquires the transmission", observe_unstamped_call(&state, 0U, 0U), 1);
+    dsd_event_sync_slot(&opts, &state, 0U);
+    alert_decode_clock_at_ms(8000U);
+    rc |= expect_int("segment fades", dsd_call_state_end_ex(&state, 0U, 0.0, DSD_CALL_END_SYNC_LOSS), 1);
+    dsd_event_sync_slot(&opts, &state, 0U);
+    rc |= expect_int("segment merges into the transmission's row", committed_history_rows(&event_history[0]), 1);
+    rc |= expect_u64("merged row keeps the transmission's start",
+                     (uint64_t)event_history[0].Event_History_Items[1].event_start_time, (uint64_t)t0_s);
+    rc |= expect_int("segment closes its own recording", g_close_wav_capture_count, 2);
+    rc |= expect_u64("segment's row ends at its last activity", (uint64_t)g_close_wav_captures[1].event_time,
+                     (uint64_t)(t0_s + 8));
+    rc |= expect_close_sidecar("reacquired segment", &g_close_wav_captures[1], 100U, t0_s + 5);
+
+    // Call B takes the slot after the window and runs 4 s; it is still running when call C begins. The epoch change
+    // commits B's row as last rendered, so B is rendered again after it has run.
+    alert_decode_clock_at_ms(10000U);
+    rc |= expect_int("call B begins", observe_unstamped_call(&state, 300U, 400U), 1);
+    dsd_event_sync_slot(&opts, &state, 0U);
+    alert_decode_clock_at_ms(14000U);
+    rc |= expect_int("call B continues", continue_unstamped_call(&state, 300U, 400U), 0);
+    dsd_event_sync_slot(&opts, &state, 0U);
+    alert_decode_clock_at_ms(15000U);
+    rc |= expect_int("call C begins", observe_unstamped_call(&state, 500U, 600U), 1);
+    dsd_event_sync_slot(&opts, &state, 0U);
+    rc |= expect_int("call C closes call B's recording", g_close_wav_capture_count, 3);
+    rc |= expect_u64("call B's row ends at its last render", (uint64_t)g_close_wav_captures[2].event_time,
+                     (uint64_t)(t0_s + 14));
+    rc |= expect_close_sidecar("epoch transition", &g_close_wav_captures[2], 300U, t0_s + 10);
+    // Each close reopens the slot's WAV and stamps when it did.
+    rc |= expect_u64("the reopened WAV is stamped with its open time", (uint64_t)opts.wav_out_open_time,
+                     (uint64_t)(t0_s + 15));
+
+    // With recording off, call D takes the slot from C (no recording to close), and recording is switched on 3 s in,
+    // stamped as svc_enable_per_call_wav() stamps it (UI_MENU_SERVICES pins that). The WAV holds only what followed,
+    // so its sidecar starts when it opened, not when D did.
+    alert_decode_clock_at_ms(20000U);
+    opts.wav_out_f = NULL;
+    rc |= expect_int("call D begins", observe_unstamped_call(&state, 700U, 800U), 1);
+    dsd_event_sync_slot(&opts, &state, 0U);
+    alert_decode_clock_at_ms(23000U);
+    opts.wav_out_f = (SNDFILE*)&wav_sentinel;
+    opts.wav_out_open_time = dsd_decode_time();
+    alert_decode_clock_at_ms(26000U);
+    rc |= expect_int("call D ends", dsd_call_state_end_ex(&state, 0U, 0.0, DSD_CALL_END_TERMINATOR), 1);
+    dsd_event_sync_slot(&opts, &state, 0U);
+    rc |= expect_int("call D's end closes the late recording", g_close_wav_capture_count, 4);
+    rc |= expect_close_sidecar("recording switched on mid-call", &g_close_wav_captures[3], 700U, t0_s + 23);
+
+    dsd_decode_clock_use_system();
+    (void)dsd_test_rmdir(g_close_wav_export_dir);
+    g_close_wav_export_dir[0] = '\0';
+    dsd_state_ext_free_all(&state);
+    return rc;
+}
+
+// An identity-less audible row faded by a sync loss is held, not dropped, for one reacquisition
+// window on the decode clock, and dropped once decode time alone has passed its due time.
+static int
+test_drop_hold_due_runs_on_the_decode_clock(void) {
+    static dsd_opts opts;
+    static dsd_state state;
+    static Event_History_I event_history[2];
+    reset_fixture(&opts, &state, event_history);
+    state.lastsynctype = DSD_SYNC_DMR_BS_VOICE_POS;
+    dsd_decode_clock_use_test(ALERT_TEST_DECODE_T0_NS);
+
+    int rc = expect_int("audible identity-less epoch starts", observe_unstamped_call(&state, 0U, 0U), 1);
+    rc |= expect_int("voice media runs", dsd_call_state_update_media(&state, 0U, 1, 0.0), 1);
+    dsd_event_sync_slot(&opts, &state, 0U);
+    alert_decode_clock_at_ms(1000U);
+    rc |= expect_int("carrier fades", dsd_call_state_end_ex(&state, 0U, 0.0, DSD_CALL_END_SYNC_LOSS), 1);
+    dsd_event_sync_slot(&opts, &state, 0U);
+    alert_decode_clock_at_ms(1400U);
+    dsd_event_sync_slot(&opts, &state, 0U);
+    dsd_call_context_snapshot context;
+    rc |= expect_int("context snapshot copies", dsd_call_context_copy_snapshot(&state, &context) > 0, 1);
+    rc |= expect_int("verdict still held 0.4 s after the fade", context.events[0].drop_hold_pending, 1);
+    rc |= expect_int("held row is not finalized", context.events[0].ended_committed, 0);
+    rc |= expect_int(
+        "hold is due one window after the decode-time fade",
+        same_instant(context.events[0].drop_hold_due_m, ALERT_TEST_DECODE_T0_S + 1.0 + DSD_CALL_REACQUIRE_GAP_S), 1);
+    alert_decode_clock_at_ms(1600U);
+    dsd_event_sync_slot(&opts, &state, 0U);
+    rc |= expect_int("second context snapshot copies", dsd_call_context_copy_snapshot(&state, &context) > 0, 1);
+    rc |= expect_int("hold released 0.6 s after the fade", context.events[0].drop_hold_pending, 0);
+    rc |= expect_int("released verdict finalizes the epoch", context.events[0].ended_committed, 1);
+    rc |= expect_int("the unexplained row is dropped", committed_history_rows(&event_history[0]), 0);
+
+    dsd_decode_clock_use_system();
+    dsd_state_ext_free_all(&state);
+    return rc;
+}
+
+// A transmission faded and reacquired twice commits one row whose span is the decode-time span of
+// the whole transmission: the start of the first segment to the end of the last, 9.25 s here,
+// which the whole-second stamps carry as 9. The real clock does not move here.
+static int
+test_merged_history_duration_runs_on_the_decode_clock(void) {
+    static dsd_opts opts;
+    static dsd_state state;
+    static Event_History_I event_history[2];
+    reset_fixture(&opts, &state, event_history);
+    state.lastsynctype = DSD_SYNC_DMR_BS_VOICE_POS;
+    dsd_decode_clock_use_test(ALERT_TEST_DECODE_T0_NS);
+
+    int rc = expect_int("first segment begins", observe_unstamped_call(&state, 100U, 200U), 1);
+    dsd_event_sync_slot(&opts, &state, 0U);
+    alert_decode_clock_at_ms(2000U);
+    rc |= expect_int("first segment fades", dsd_call_state_end_ex(&state, 0U, 0.0, DSD_CALL_END_SYNC_LOSS), 1);
+    dsd_event_sync_slot(&opts, &state, 0U);
+    alert_decode_clock_at_ms(2250U);
+    rc |= expect_int("second segment reacquires", observe_unstamped_call(&state, 0U, 0U), 1);
+    dsd_event_sync_slot(&opts, &state, 0U);
+    alert_decode_clock_at_ms(5000U);
+    rc |= expect_int("second segment fades", dsd_call_state_end_ex(&state, 0U, 0.0, DSD_CALL_END_SYNC_LOSS), 1);
+    dsd_event_sync_slot(&opts, &state, 0U);
+    alert_decode_clock_at_ms(5250U);
+    rc |= expect_int("third segment reacquires", observe_unstamped_call(&state, 0U, 0U), 1);
+    dsd_event_sync_slot(&opts, &state, 0U);
+    alert_decode_clock_at_ms(9250U);
+    rc |= expect_int("third segment fades", dsd_call_state_end_ex(&state, 0U, 0.0, DSD_CALL_END_SYNC_LOSS), 1);
+    dsd_event_sync_slot(&opts, &state, 0U);
+
+    const Event_History* row = &event_history[0].Event_History_Items[1];
+    rc |= expect_int("the transmission commits one row", committed_history_rows(&event_history[0]), 1);
+    rc |= expect_int("the row names the first segment's call", (int)row->target_id, 100);
+    rc |=
+        expect_u64("merged duration is the decode-time span", (uint64_t)(row->event_time - row->event_start_time), 9U);
+    rc |= expect_u64("row starts at the first segment's decode start", (uint64_t)row->event_start_time,
+                     (uint64_t)ALERT_TEST_DECODE_T0_S);
+
+    dsd_decode_clock_use_system();
+    dsd_state_ext_free_all(&state);
+    return rc;
+}
+
 // commit_rev is the committed-rows-only change counter frontends gate their ring rescans on:
 // staged-row renders must leave it alone, while commits, merges and late enrichment advance it.
 static int
@@ -3217,7 +5128,7 @@ test_route_identity_reacquisition_still_coalesces(void) {
 
 // The gap test compares an end against a reopen on one clock, but only one side of that comparison
 // reads the clock itself: every production end site passes a timeline derived from
-// dsd_time_now_monotonic_s(), while a reopening observation usually passes 0.0 and takes the
+// dsd_decode_now_mono_s(), while a reopening observation usually passes 0.0 and takes the
 // fallback. If the fallback truncates to whole milliseconds it can land *behind* an end stamped at
 // nanosecond resolution moments earlier, and the reacquisition is rejected for going backwards --
 // committing a second row and a spurious START for one transmission.
@@ -3237,10 +5148,10 @@ test_observed_fallback_matches_end_site_clock_resolution(void) {
            == 1);
     dsd_event_sync_slot(&opts, &state, 0U);
 
-    const double before = dsd_time_now_monotonic_s();
+    const double before = dsd_decode_now_mono_s();
     // observed_m of 0.0 is what the protocol end paths pass, so this takes the fallback.
     assert(dsd_call_state_end_ex(&state, 0U, 0.0, DSD_CALL_END_SYNC_LOSS) == 1);
-    const double after = dsd_time_now_monotonic_s();
+    const double after = dsd_decode_now_mono_s();
 
     dsd_call_snapshot ended;
     assert(dsd_call_state_get(&state, 0U, &ended) > 0);
@@ -3778,25 +5689,22 @@ test_history_reset_clears_staged_environment(void) {
     static Event_History_I event_history[2];
     reset_fixture(&opts, &state, event_history);
 
-    state.nxdn_grant_chan = 12U;
-    state.nxdn_grant_freq = 851012500;
-    assert(observe_test_call(&state, 0U, DSD_SYNC_NXDN_POS, DSD_CALL_KIND_GROUP_VOICE, 100U, 0U, 0U, 0U,
+    state.dmr_fid = 0x10U;
+    assert(observe_test_call(&state, 0U, DSD_SYNC_DMR_BS_VOICE_POS, DSD_CALL_KIND_GROUP_VOICE, 100U, 0U, 0U, 0U,
                              DSD_CALL_BOUNDARY_BEGIN)
            == 1);
     dsd_event_sync_slot(&opts, &state, 0U);
 
     dsd_call_context_snapshot before;
     assert(dsd_call_context_copy_snapshot(&state, &before) > 0);
-    assert(before.events[0].staged_env.nxdn_grant_chan == 12U);
+    assert(before.events[0].staged_env.mfid == 0x10U);
 
     dsd_event_history_reset(&state);
 
     dsd_call_context_snapshot after;
     assert(dsd_call_context_copy_snapshot(&state, &after) > 0);
-    int rc =
-        expect_int("reset clears the staged render environment", (int)after.events[0].staged_env.nxdn_grant_chan, 0);
-    rc |= expect_int("reset clears the committed render environment",
-                     (int)after.events[0].committed_env.nxdn_grant_chan, 0);
+    int rc = expect_int("reset clears the staged render environment", (int)after.events[0].staged_env.mfid, 0);
+    rc |= expect_int("reset clears the committed render environment", (int)after.events[0].committed_env.mfid, 0);
     dsd_state_ext_free_all(&state);
     return rc;
 }
@@ -3950,10 +5858,10 @@ test_merge_logs_continuation_only_when_render_changes(void) {
     static Event_History_I event_history[2];
     reset_fixture(&opts, &state, event_history);
 
-    char path[] = "/tmp/dsd-neo-reacquire-events-XXXXXX";
-    int fd = mkstemp(path);
+    char path[DSD_TEST_PATH_MAX];
+    int fd = dsd_test_mkstemp(path, sizeof path, "dsd-neo-reacquire-events");
     if (fd < 0) {
-        DSD_FPRINTF(stderr, "mkstemp failed for reacquisition event log test\n");
+        DSD_FPRINTF(stderr, "dsd_test_mkstemp failed for reacquisition event log test\n");
         return 1;
     }
     close(fd);
@@ -3961,26 +5869,29 @@ test_merge_logs_continuation_only_when_render_changes(void) {
     DSD_SNPRINTF(opts.event_out_file, sizeof opts.event_out_file, "%s", path);
 
     // Segment 1 knows the talkgroup only; segment 2 decodes the source, so the render changes.
-    assert(observe_test_call(&state, 0U, DSD_SYNC_DMR_BS_VOICE_POS, DSD_CALL_KIND_GROUP_VOICE, 100U, 0U, 0U, 0U,
-                             DSD_CALL_BOUNDARY_BEGIN)
-           == 1);
+    int rc = expect_int("segment 1 begins",
+                        observe_test_call(&state, 0U, DSD_SYNC_DMR_BS_VOICE_POS, DSD_CALL_KIND_GROUP_VOICE, 100U, 0U,
+                                          0U, 0U, DSD_CALL_BOUNDARY_BEGIN),
+                        1);
     dsd_event_sync_slot(&opts, &state, 0U);
-    assert(end_test_call(&state, 0U, DSD_CALL_END_SYNC_LOSS) == 1);
+    rc |= expect_int("segment 1 ends", end_test_call(&state, 0U, DSD_CALL_END_SYNC_LOSS), 1);
     dsd_event_sync_slot(&opts, &state, 0U);
 
-    assert(observe_test_call(&state, 0U, DSD_SYNC_DMR_BS_VOICE_POS, DSD_CALL_KIND_GROUP_VOICE, 100U, 201U, 0U, 0U,
-                             DSD_CALL_BOUNDARY_CONTINUE)
-           == 1);
+    rc |= expect_int("segment 2 continues",
+                     observe_test_call(&state, 0U, DSD_SYNC_DMR_BS_VOICE_POS, DSD_CALL_KIND_GROUP_VOICE, 100U, 201U, 0U,
+                                       0U, DSD_CALL_BOUNDARY_CONTINUE),
+                     1);
     dsd_event_sync_slot(&opts, &state, 0U);
-    assert(end_test_call(&state, 0U, DSD_CALL_END_SYNC_LOSS) == 1);
+    rc |= expect_int("segment 2 ends", end_test_call(&state, 0U, DSD_CALL_END_SYNC_LOSS), 1);
     dsd_event_sync_slot(&opts, &state, 0U);
 
     // Segment 3 adds nothing the row does not already say.
-    assert(observe_test_call(&state, 0U, DSD_SYNC_DMR_BS_VOICE_POS, DSD_CALL_KIND_GROUP_VOICE, 100U, 201U, 0U, 0U,
-                             DSD_CALL_BOUNDARY_CONTINUE)
-           == 1);
+    rc |= expect_int("segment 3 continues",
+                     observe_test_call(&state, 0U, DSD_SYNC_DMR_BS_VOICE_POS, DSD_CALL_KIND_GROUP_VOICE, 100U, 201U, 0U,
+                                       0U, DSD_CALL_BOUNDARY_CONTINUE),
+                     1);
     dsd_event_sync_slot(&opts, &state, 0U);
-    assert(end_test_call(&state, 0U, DSD_CALL_END_SYNC_LOSS) == 1);
+    rc |= expect_int("segment 3 ends", end_test_call(&state, 0U, DSD_CALL_END_SYNC_LOSS), 1);
     dsd_event_sync_slot(&opts, &state, 0U);
 
     FILE* f = fopen(path, "rb");
@@ -4001,7 +5912,7 @@ test_merge_logs_continuation_only_when_render_changes(void) {
         reacquired_lines++;
     }
 
-    int rc = expect_int("merged transmission commits one row", committed_history_rows(&event_history[0]), 1);
+    rc |= expect_int("merged transmission commits one row", committed_history_rows(&event_history[0]), 1);
     rc |= expect_has_substr("first segment logged its own line", buf, "SRC: 00000000;");
     rc |= expect_has_substr("continuation reports the learned source", buf, " Reacquired: ");
     rc |= expect_has_substr("continuation marker follows the row's stamp", buf, "\n2026-04-30 00:00:00 Reacquired: ");
@@ -4022,10 +5933,10 @@ test_merge_continuation_annotates_from_the_row(void) {
     static Event_History_I event_history[2];
     reset_fixture(&opts, &state, event_history);
 
-    char path[] = "/tmp/dsd-neo-continuation-slot-XXXXXX";
-    int fd = mkstemp(path);
+    char path[DSD_TEST_PATH_MAX];
+    int fd = dsd_test_mkstemp(path, sizeof path, "dsd-neo-continuation-slot");
     if (fd < 0) {
-        DSD_FPRINTF(stderr, "mkstemp failed for continuation slot test\n");
+        DSD_FPRINTF(stderr, "dsd_test_mkstemp failed for continuation slot test\n");
         return 1;
     }
     close(fd);
@@ -4034,20 +5945,22 @@ test_merge_continuation_annotates_from_the_row(void) {
 
     // Slot 1 of a DMR-BS call: the first commit is annotated "Slot 2;".
     state.lastsynctype = DSD_SYNC_DMR_BS_VOICE_POS;
-    assert(observe_test_call(&state, 1U, DSD_SYNC_DMR_BS_VOICE_POS, DSD_CALL_KIND_GROUP_VOICE, 100U, 0U, 0U, 0U,
-                             DSD_CALL_BOUNDARY_BEGIN)
-           == 1);
+    int rc = expect_int("slot 2 segment begins",
+                        observe_test_call(&state, 1U, DSD_SYNC_DMR_BS_VOICE_POS, DSD_CALL_KIND_GROUP_VOICE, 100U, 0U,
+                                          0U, 0U, DSD_CALL_BOUNDARY_BEGIN),
+                        1);
     dsd_event_sync_slot(&opts, &state, 1U);
-    assert(end_test_call(&state, 1U, DSD_CALL_END_SYNC_LOSS) == 1);
+    rc |= expect_int("slot 2 segment ends", end_test_call(&state, 1U, DSD_CALL_END_SYNC_LOSS), 1);
     dsd_event_sync_slot(&opts, &state, 1U);
 
     // The decoder loses the system entirely across the gap, as noCarrier() leaves it.
     state.lastsynctype = DSD_SYNC_NONE;
-    assert(observe_test_call(&state, 1U, DSD_SYNC_DMR_BS_VOICE_POS, DSD_CALL_KIND_GROUP_VOICE, 100U, 201U, 0U, 0U,
-                             DSD_CALL_BOUNDARY_CONTINUE)
-           == 1);
+    rc |= expect_int("reacquired slot 2 segment continues",
+                     observe_test_call(&state, 1U, DSD_SYNC_DMR_BS_VOICE_POS, DSD_CALL_KIND_GROUP_VOICE, 100U, 201U, 0U,
+                                       0U, DSD_CALL_BOUNDARY_CONTINUE),
+                     1);
     dsd_event_sync_slot(&opts, &state, 1U);
-    assert(end_test_call(&state, 1U, DSD_CALL_END_SYNC_LOSS) == 1);
+    rc |= expect_int("reacquired slot 2 segment ends", end_test_call(&state, 1U, DSD_CALL_END_SYNC_LOSS), 1);
     dsd_event_sync_slot(&opts, &state, 1U);
 
     FILE* f = fopen(path, "rb");
@@ -4063,7 +5976,7 @@ test_merge_continuation_annotates_from_the_row(void) {
     buf[n] = '\0';
 
     const char* continuation = strstr(buf, " Reacquired: ");
-    int rc = expect_int("the reacquired segment merged into one row", committed_history_rows(&event_history[1]), 1);
+    rc |= expect_int("the reacquired segment merged into one row", committed_history_rows(&event_history[1]), 1);
     if (continuation == NULL) {
         DSD_FPRINTF(stderr, "expected a continuation line in the event log\n");
         rc |= 1;
@@ -4086,34 +5999,39 @@ test_merge_logs_metadata_the_segment_added(void) {
     // Two-slot system, so commits carry a "Slot N;" annotation.
     state.lastsynctype = DSD_SYNC_DMR_BS_VOICE_POS;
 
-    char path[] = "/tmp/dsd-neo-reacquire-meta-XXXXXX";
-    int fd = mkstemp(path);
+    char path[DSD_TEST_PATH_MAX];
+    int fd = dsd_test_mkstemp(path, sizeof path, "dsd-neo-reacquire-meta");
     if (fd < 0) {
-        DSD_FPRINTF(stderr, "mkstemp failed for reacquisition metadata log test\n");
+        DSD_FPRINTF(stderr, "dsd_test_mkstemp failed for reacquisition metadata log test\n");
         return 1;
     }
     close(fd);
     (void)remove(path);
     DSD_SNPRINTF(opts.event_out_file, sizeof opts.event_out_file, "%s", path);
 
-    assert(observe_test_call(&state, 0U, DSD_SYNC_DMR_BS_VOICE_POS, DSD_CALL_KIND_GROUP_VOICE, 100U, 200U, 0U, 0U,
-                             DSD_CALL_BOUNDARY_BEGIN)
-           == 1);
+    int rc = expect_int("first segment begins",
+                        observe_test_call(&state, 0U, DSD_SYNC_DMR_BS_VOICE_POS, DSD_CALL_KIND_GROUP_VOICE, 100U, 200U,
+                                          0U, 0U, DSD_CALL_BOUNDARY_BEGIN),
+                        1);
     dsd_event_sync_slot(&opts, &state, 0U);
-    assert(end_test_call(&state, 0U, DSD_CALL_END_SYNC_LOSS) == 1);
+    rc |= expect_int("first segment ends", end_test_call(&state, 0U, DSD_CALL_END_SYNC_LOSS), 1);
     dsd_event_sync_slot(&opts, &state, 0U);
 
     // The reacquired segment adds an alias and a GPS fix but no new identity, so the rendered
     // row is unchanged and only the metadata lines have anything to report.
-    assert(observe_test_call(&state, 0U, DSD_SYNC_DMR_BS_VOICE_POS, DSD_CALL_KIND_GROUP_VOICE, 100U, 200U, 0U, 0U,
-                             DSD_CALL_BOUNDARY_CONTINUE)
-           == 1);
+    rc |= expect_int("reacquired segment continues",
+                     observe_test_call(&state, 0U, DSD_SYNC_DMR_BS_VOICE_POS, DSD_CALL_KIND_GROUP_VOICE, 100U, 200U, 0U,
+                                       0U, DSD_CALL_BOUNDARY_CONTINUE),
+                     1);
     dsd_call_snapshot reacquired;
-    assert(dsd_call_state_get(&state, 0U, &reacquired) > 0);
+    DSD_MEMSET(&reacquired, 0, sizeof reacquired);
+    rc |= expect_int("reacquired segment has a call snapshot", dsd_call_state_get(&state, 0U, &reacquired) > 0, 1);
     dsd_event_sync_slot(&opts, &state, 0U);
-    assert(dsd_event_enrich_alias(&state, 0U, reacquired.epoch, "UNIT 12 FIRE") == 1);
-    assert(dsd_event_enrich_gps(&state, 0U, reacquired.epoch, "lat 3.0 lon 4.0") == 1);
-    assert(end_test_call(&state, 0U, DSD_CALL_END_SYNC_LOSS) == 1);
+    rc |= expect_int("reacquired segment takes the alias",
+                     dsd_event_enrich_alias(&state, 0U, reacquired.epoch, "UNIT 12 FIRE"), 1);
+    rc |= expect_int("reacquired segment takes the gps fix",
+                     dsd_event_enrich_gps(&state, 0U, reacquired.epoch, "lat 3.0 lon 4.0"), 1);
+    rc |= expect_int("reacquired segment ends", end_test_call(&state, 0U, DSD_CALL_END_SYNC_LOSS), 1);
     dsd_event_sync_slot(&opts, &state, 0U);
 
     FILE* f = fopen(path, "rb");
@@ -4128,7 +6046,7 @@ test_merge_logs_metadata_the_segment_added(void) {
     (void)remove(path);
     buf[n] = '\0';
 
-    int rc = expect_int("metadata-only merge commits one row", committed_history_rows(&event_history[0]), 1);
+    rc |= expect_int("metadata-only merge commits one row", committed_history_rows(&event_history[0]), 1);
     rc |= expect_has_substr("merged alias reaches the log", buf, "\n2026-04-30 00:00:00 Talker Alias: UNIT 12 FIRE \n");
     rc |= expect_has_substr("merged gps reaches the log", buf, "\n2026-04-30 00:00:00 GPS: lat 3.0 lon 4.0 \n");
     rc |= expect_every_line_stamped("detail-only continuation carries the row's stamp", buf, "2026-04-30 00:00:00 ");
@@ -4340,10 +6258,10 @@ test_x2tdma_voice_commits_a_row(void) {
     reset_fixture(&opts, &state, event_history);
     state.lastsynctype = DSD_SYNC_X2TDMA_VOICE_POS;
 
-    char path[] = "/tmp/dsd-neo-x2tdma-events-XXXXXX";
-    int fd = mkstemp(path);
+    char path[DSD_TEST_PATH_MAX];
+    int fd = dsd_test_mkstemp(path, sizeof path, "dsd-neo-x2tdma-events");
     if (fd < 0) {
-        DSD_FPRINTF(stderr, "mkstemp failed for x2tdma event log test\n");
+        DSD_FPRINTF(stderr, "dsd_test_mkstemp failed for x2tdma event log test\n");
         return 1;
     }
     close(fd);
@@ -4351,11 +6269,12 @@ test_x2tdma_voice_commits_a_row(void) {
     DSD_SNPRINTF(opts.event_out_file, sizeof opts.event_out_file, "%s", path);
 
     // Slot 1 and identity-less, exactly as x2tdma_voice.c publishes it.
-    assert(observe_test_call(&state, 1U, DSD_SYNC_X2TDMA_VOICE_POS, DSD_CALL_KIND_VOICE, 0U, 0U, 0U, 0U,
-                             DSD_CALL_BOUNDARY_CONTINUE)
-           == 1);
+    int rc = expect_int("x2tdma voice is observed",
+                        observe_test_call(&state, 1U, DSD_SYNC_X2TDMA_VOICE_POS, DSD_CALL_KIND_VOICE, 0U, 0U, 0U, 0U,
+                                          DSD_CALL_BOUNDARY_CONTINUE),
+                        1);
     dsd_event_sync_slot(&opts, &state, 1U);
-    assert(end_test_call(&state, 1U, DSD_CALL_END_EXPLICIT) == 1);
+    rc |= expect_int("x2tdma voice ends", end_test_call(&state, 1U, DSD_CALL_END_EXPLICIT), 1);
     dsd_event_sync_slot(&opts, &state, 1U);
 
     FILE* f = fopen(path, "rb");
@@ -4371,7 +6290,7 @@ test_x2tdma_voice_commits_a_row(void) {
     buf[n] = '\0';
 
     const Event_History* committed = &event_history[1].Event_History_Items[1];
-    int rc = expect_int("x2tdma voice commits a row", committed_history_rows(&event_history[1]), 1);
+    rc |= expect_int("x2tdma voice commits a row", committed_history_rows(&event_history[1]), 1);
     // The protocol name itself comes from dsd_synctype_to_string(), stubbed here for every
     // protocol; what matters is that the builder rendered at all rather than leaving the row blank.
     rc |= expect_int("x2tdma row is not blank", committed->event_string[0] != '\0', 1);
@@ -4446,9 +6365,11 @@ test_merge_without_event_time_keeps_the_row_timestamp(void) {
     return rc;
 }
 
-// The per-protocol builders read decoder state the history row does not carry. A merge must
-// re-render against the values captured when the row was committed, not against a decoder that
-// has since retuned -- otherwise a committed row is rewritten with a channel the call never used.
+// The per-protocol builders read decoder state the history row does not carry -- here the DMR
+// manufacturer feature id that decides whether service options render as TXI and PRIORITY. A merge
+// must re-render against the values captured when the row was committed, not against a decoder
+// that has since retuned -- otherwise a committed row is rewritten with a context the call never
+// ran under.
 static int
 test_merge_rerenders_against_committed_environment(void) {
     static dsd_opts opts;
@@ -4456,22 +6377,20 @@ test_merge_rerenders_against_committed_environment(void) {
     static Event_History_I event_history[2];
     reset_fixture(&opts, &state, event_history);
 
-    state.nxdn_grant_chan = 12U;
-    state.nxdn_grant_freq = 851012500;
-    assert(observe_test_call(&state, 0U, DSD_SYNC_NXDN_POS, DSD_CALL_KIND_GROUP_VOICE, 100U, 0U, 0U, 0U,
+    state.dmr_fid = 0x10U;
+    assert(observe_test_call(&state, 0U, DSD_SYNC_DMR_BS_VOICE_POS, DSD_CALL_KIND_GROUP_VOICE, 100U, 0U, 0x30U, 0U,
                              DSD_CALL_BOUNDARY_BEGIN)
            == 1);
     dsd_event_sync_slot(&opts, &state, 0U);
     assert(end_test_call(&state, 0U, DSD_CALL_END_SYNC_LOSS) == 1);
     dsd_event_sync_slot(&opts, &state, 0U);
-    assert(expect_has_substr("first segment renders its granted channel",
-                             event_history[0].Event_History_Items[1].event_string, "CH: 12;")
+    assert(expect_has_substr("first segment renders under its feature id",
+                             event_history[0].Event_History_Items[1].event_string, "TXI;")
            == 0);
 
-    // The trunk SM retunes before the segment is reacquired.
-    state.nxdn_grant_chan = 44U;
-    state.nxdn_grant_freq = 852000000;
-    assert(observe_test_call(&state, 0U, DSD_SYNC_NXDN_POS, DSD_CALL_KIND_GROUP_VOICE, 100U, 201U, 0U, 0U,
+    // The receiver moves to a system with another manufacturer before the segment is reacquired.
+    state.dmr_fid = 0x00U;
+    assert(observe_test_call(&state, 0U, DSD_SYNC_DMR_BS_VOICE_POS, DSD_CALL_KIND_GROUP_VOICE, 100U, 201U, 0x30U, 0U,
                              DSD_CALL_BOUNDARY_CONTINUE)
            == 1);
     dsd_event_sync_slot(&opts, &state, 0U);
@@ -4480,7 +6399,7 @@ test_merge_rerenders_against_committed_environment(void) {
 
     const Event_History* merged = &event_history[0].Event_History_Items[1];
     int rc = expect_int("retuned merge commits one row", committed_history_rows(&event_history[0]), 1);
-    rc |= expect_has_substr("merged row keeps the channel it was committed under", merged->event_string, "CH: 12;");
+    rc |= expect_has_substr("merged row keeps the context it was committed under", merged->event_string, "TXI;");
     rc |= expect_int("merged row still gained the source", (int)merged->source_id, 201);
     dsd_state_ext_free_all(&state);
     return rc;
@@ -4489,8 +6408,8 @@ test_merge_rerenders_against_committed_environment(void) {
 // The test above commits the first segment's row from its own end, while the decoder still
 // describes it. A row is also committed from the other direction -- the next epoch opening finds
 // a staged row and pushes it -- and by then the canonical layer has already moved to the incoming
-// call. Capturing the environment at that moment reads the new call's channel, so the row is
-// re-rendered under a channel the transmission it describes never used.
+// call. Capturing the environment at that moment reads the new call's context, so the row is
+// re-rendered under a context the transmission it describes never ran under.
 static int
 test_epoch_change_commit_keeps_staged_environment(void) {
     static dsd_opts opts;
@@ -4498,9 +6417,8 @@ test_epoch_change_commit_keeps_staged_environment(void) {
     static Event_History_I event_history[2];
     reset_fixture(&opts, &state, event_history);
 
-    state.nxdn_grant_chan = 12U;
-    state.nxdn_grant_freq = 851012500;
-    assert(observe_test_call(&state, 0U, DSD_SYNC_NXDN_POS, DSD_CALL_KIND_GROUP_VOICE, 100U, 0U, 0U, 0U,
+    state.dmr_fid = 0x10U;
+    assert(observe_test_call(&state, 0U, DSD_SYNC_DMR_BS_VOICE_POS, DSD_CALL_KIND_GROUP_VOICE, 100U, 0U, 0x30U, 0U,
                              DSD_CALL_BOUNDARY_BEGIN)
            == 1);
     dsd_event_sync_slot(&opts, &state, 0U);
@@ -4509,26 +6427,25 @@ test_epoch_change_commit_keeps_staged_environment(void) {
     // is the path watchdog_event_history_authoritative() takes.
     assert(end_test_call(&state, 0U, DSD_CALL_END_SYNC_LOSS) == 1);
 
-    // The decoder retunes before the segment is reacquired, so the live grant channel now
+    // The decoder moves on before the segment is reacquired, so the live feature id now
     // describes the incoming call rather than the staged row.
-    state.nxdn_grant_chan = 44U;
-    state.nxdn_grant_freq = 852000000;
-    assert(observe_test_call(&state, 0U, DSD_SYNC_NXDN_POS, DSD_CALL_KIND_GROUP_VOICE, 100U, 201U, 0U, 0U,
+    state.dmr_fid = 0x00U;
+    assert(observe_test_call(&state, 0U, DSD_SYNC_DMR_BS_VOICE_POS, DSD_CALL_KIND_GROUP_VOICE, 100U, 201U, 0x30U, 0U,
                              DSD_CALL_BOUNDARY_CONTINUE)
            == 1);
     dsd_event_sync_slot(&opts, &state, 0U);
 
-    int rc = expect_has_substr("row committed at the epoch change keeps its own channel",
-                               event_history[0].Event_History_Items[1].event_string, "CH: 12;");
+    int rc = expect_has_substr("row committed at the epoch change keeps its own context",
+                               event_history[0].Event_History_Items[1].event_string, "TXI;");
 
     // Ending the reacquired segment merges it into that row and re-renders it. The environment
-    // the merge renders against is the one captured with the row, not the retuned decoder.
+    // the merge renders against is the one captured with the row, not the moved decoder.
     assert(end_test_call(&state, 0U, DSD_CALL_END_SYNC_LOSS) == 1);
     dsd_event_sync_slot(&opts, &state, 0U);
 
     const Event_History* merged = &event_history[0].Event_History_Items[1];
     rc |= expect_int("epoch-change merge commits one row", committed_history_rows(&event_history[0]), 1);
-    rc |= expect_has_substr("merged row keeps the channel it was staged under", merged->event_string, "CH: 12;");
+    rc |= expect_has_substr("merged row keeps the context it was staged under", merged->event_string, "TXI;");
     rc |= expect_int("merged row still gained the source", (int)merged->source_id, 201);
     dsd_state_ext_free_all(&state);
     return rc;
@@ -4875,7 +6792,18 @@ test_history_reset_drops_pending_end_alert(void) {
     return rc;
 }
 
-static void
+/* Writes @p text to the temp file @p path; returns 0, or -1 when a write failed. */
+static int
+write_alias_file(const char* path, const char* text) {
+    FILE* fp = dsd_fopen_private(path, "w");
+    if (!fp) {
+        return -1;
+    }
+    int ok = fputs(text, fp) >= 0;
+    return fclose(fp) == 0 && ok ? 0 : -1;
+}
+
+static int
 test_source_alias_collision(int protocol) {
     dsd_opts* opts = calloc(1, sizeof(*opts));
     dsd_state* state = calloc(1, sizeof(*state));
@@ -4885,21 +6813,29 @@ test_source_alias_collision(int protocol) {
     char group_path[DSD_TEST_PATH_MAX], source_path[DSD_TEST_PATH_MAX];
     int fd = dsd_test_mkstemp(group_path, sizeof(group_path), "alias-collision-group");
     assert(fd >= 0);
-    assert(dsd_close(fd) == 0);
+    int failed = expect_int("group alias file closes", dsd_close(fd), 0);
     fd = dsd_test_mkstemp(source_path, sizeof(source_path), "alias-collision-source");
-    assert(fd >= 0);
-    assert(dsd_close(fd) == 0);
-    FILE* fp = dsd_fopen_private(group_path, "w");
-    assert(fp);
-    assert(fputs("id,mode,name\n1201,A,Talkgroup 1201\n", fp) >= 0);
-    assert(fclose(fp) == 0);
-    fp = dsd_fopen_private(source_path, "w");
-    assert(fp);
-    assert(fputs("id,name\n1201,Radio 1201\n1202,Unit X\n", fp) >= 0);
-    assert(fclose(fp) == 0);
-    assert(csvGroupImportPath(group_path, state) == 0);
-    assert(csvSrcImportPath(source_path, state) == 0);
-    assert(remove(group_path) == 0 && remove(source_path) == 0);
+    if (fd < 0) {
+        DSD_FPRINTF(stderr, "dsd_test_mkstemp failed for alias collision source file\n");
+        failed = 1;
+    } else {
+        failed |= expect_int("source alias file closes", dsd_close(fd), 0);
+        failed |= expect_int("group alias file written",
+                             write_alias_file(group_path, "id,mode,name\n1201,A,Talkgroup 1201\n"), 0);
+        failed |= expect_int("source alias file written",
+                             write_alias_file(source_path, "id,name\n1201,Radio 1201\n1202,Unit X\n"), 0);
+        failed |= expect_int("group aliases import", csvGroupImportPath(group_path, state), 0);
+        failed |= expect_int("source aliases import", csvSrcImportPath(source_path, state), 0);
+        failed |= expect_int("source alias file removed", remove(source_path), 0);
+    }
+    failed |= expect_int("group alias file removed", remove(group_path), 0);
+    if (failed) {
+        dsd_state_ext_free_all(state);
+        free(history);
+        free(state);
+        free(opts);
+        return 1;
+    }
     state->lastsynctype = protocol;
     assert(observe_test_call(state, 0U, protocol, DSD_CALL_KIND_GROUP_VOICE, 1201, 1201, 0, 0, DSD_CALL_BOUNDARY_BEGIN)
            == 1);
@@ -4922,6 +6858,7 @@ test_source_alias_collision(int protocol) {
     free(history);
     free(state);
     free(opts);
+    return 0;
 }
 
 static int
@@ -4933,7 +6870,7 @@ test_crc_invalid_data_notice_isolation(void) {
     char path[DSD_TEST_PATH_MAX];
     int fd = dsd_test_mkstemp(path, sizeof path, "crc-events");
     assert(fd >= 0);
-    assert(dsd_close(fd) == 0);
+    int rc = expect_int("crc event log closes", dsd_close(fd), 0);
     DSD_SNPRINTF(opts.event_out_file, sizeof opts.event_out_file, "%s", path);
     dsd_event_stage_text(&state, 0, "decoded text");
     dsd_event_stage_gps(&state, 0, "decoded position");
@@ -4942,19 +6879,17 @@ test_crc_invalid_data_notice_isolation(void) {
     notice[sizeof notice - 1U] = '\0';
     dsd_call_observation data = dsd_call_observation_data(DSD_SYNC_DMR_BS_DATA_POS, 0U, 100U, 200U);
     state.event_crc_invalid[0] = 1U;
-    assert(dsd_event_emit_data_notice(&opts, &state, 0U, &data, notice) == 0);
-    int rc = expect_has_substr("long failed notice retains prefix",
-                               event_history[0].Event_History_Items[1].event_string, " [CRC ERR] ");
+    rc |= expect_int("failed data notice emits", dsd_event_emit_data_notice(&opts, &state, 0U, &data, notice), 0);
+    rc |= expect_has_substr("long failed notice retains prefix", event_history[0].Event_History_Items[1].event_string,
+                            " [CRC ERR] ");
     rc |= expect_int("failed data warns", event_history[0].Event_History_Items[1].severity, DSD_EVENT_SEVERITY_WARNING);
-    assert(dsd_event_emit_data_notice_with_gps(&opts, &state, 0U, &data, "GPS packet", "explicit position") == 0);
+    rc |=
+        expect_int("failed GPS notice emits",
+                   dsd_event_emit_data_notice_with_gps(&opts, &state, 0U, &data, "GPS packet", "explicit position"), 0);
     rc |= expect_has_substr("GPS variant marks history", event_history[0].Event_History_Items[1].event_string,
                             "[CRC ERR]");
-    FILE* f = fopen(path, "rb");
-    assert(f != NULL);
-    char buf[8192];
-    size_t n = fread(buf, 1U, sizeof buf - 1U, f);
-    fclose(f);
-    buf[n] = '\0';
+    char buf[8192] = {0};
+    rc |= expect_int("crc event log reads", read_event_log(path, buf, sizeof buf), 0);
     rc |= expect_has_substr("failed text detail marked", buf, "[CRC ERR] Text: decoded text");
     rc |= expect_has_substr("failed GPS detail marked", buf, "[CRC ERR] GPS: decoded position");
     rc |= expect_has_substr("explicit GPS detail marked", buf, "[CRC ERR] GPS: explicit position");
@@ -4968,12 +6903,12 @@ test_crc_invalid_data_notice_isolation(void) {
         line = end + 1;
     }
     data.slot = 1U;
-    assert(dsd_event_emit_data_notice(&opts, &state, 1U, &data, "other slot") == 0);
+    rc |= expect_int("other slot notice emits", dsd_event_emit_data_notice(&opts, &state, 1U, &data, "other slot"), 0);
     rc |= expect_int("other slot not tainted",
                      strstr(event_history[1].Event_History_Items[1].event_string, "[CRC ERR]") != NULL, 0);
     state.event_crc_invalid[0] = 0U;
     data.slot = 0U;
-    assert(dsd_event_emit_data_notice(&opts, &state, 0U, &data, "clean next") == 0);
+    rc |= expect_int("clean notice emits", dsd_event_emit_data_notice(&opts, &state, 0U, &data, "clean next"), 0);
     rc |= expect_int("next notice not tainted",
                      strstr(event_history[0].Event_History_Items[1].event_string, "[CRC ERR]") != NULL, 0);
     rc |= expect_int("next notice informational", event_history[0].Event_History_Items[1].severity,
@@ -5109,20 +7044,208 @@ test_crc_invalid_enrichment_marks_voice(void) {
     return rc;
 }
 
+static int
+count_substr(const char* haystack, const char* needle) {
+    int count = 0;
+    const size_t step = strlen(needle);
+    for (const char* at = strstr(haystack, needle); at != NULL; at = strstr(at + step, needle)) {
+        count++;
+    }
+    return count;
+}
+
+static int
+count_lines(const char* text) {
+    int lines = 0;
+    for (const char* at = text; *at != '\0'; at++) {
+        lines += *at == '\n';
+    }
+    return lines;
+}
+
+// RAS provenance (discussion #602): a RAS-accepted call is marked [RAS] at its ordinary severity, and a failure later
+// in the same transmission swaps that for [CRC ERR] -- on the staged row by re-rendering, on a committed row in place.
+static int
+test_crc_ras_marker_and_escalation(void) {
+    static dsd_opts opts;
+    static dsd_state state;
+    static Event_History_I event_history[2];
+    reset_fixture(&opts, &state, event_history);
+    char path[DSD_TEST_PATH_MAX];
+    int fd = dsd_test_mkstemp(path, sizeof path, "crc-ras-events");
+    assert(fd >= 0);
+    int rc = expect_int("ras event log closes", dsd_close(fd), 0);
+    DSD_SNPRINTF(opts.event_out_file, sizeof opts.event_out_file, "%s", path);
+    const int both = DSD_CRC_FAILED | DSD_CRC_RAS_UNVERIFIED;
+    const Event_History* staged = &event_history[0].Event_History_Items[0];
+    Event_History* committed = &event_history[0].Event_History_Items[1];
+    dsd_call_snapshot call;
+
+    // A RAS-accepted call: [RAS] on the staged row, informational, so the terminal keeps the voice colour.
+    state.event_crc_invalid[0] = DSD_CRC_RAS_UNVERIFIED;
+    assert(observe_test_call(&state, 0U, DSD_SYNC_DMR_BS_VOICE_POS, DSD_CALL_KIND_GROUP_VOICE, 100U, 200U, 0U, 0U,
+                             DSD_CALL_BOUNDARY_BEGIN)
+           == 1);
+    state.event_crc_invalid[0] = 0U;
+    dsd_event_sync_slot(&opts, &state, 0U);
+    rc |= expect_has_substr("RAS call marks its staged row", staged->event_string, "00:00:00 [RAS] ");
+    rc |= expect_int("RAS staged row is not a failure", strstr(staged->event_string, "[CRC ERR]") != NULL, 0);
+    rc |= expect_int("RAS staged row informational", staged->severity, DSD_EVENT_SEVERITY_INFO);
+    rc |= expect_int("RAS staged row bits", staged->crc_invalid, DSD_CRC_RAS_UNVERIFIED);
+
+    // A failed check on the same transmission -- here a repeated crypto header that adds only the failure bit --
+    // must land on a RAS-only call and escalate the row.
+    const dsd_call_crypto_update crypto = {
+        .classification = DSD_CALL_CRYPTO_ENCRYPTED, .algid = 0x24, .kid = 7, .mi = 0x12345678};
+    assert(dsd_call_state_update_crypto(&state, 0U, &crypto) == 1);
+    state.event_crc_invalid[0] = DSD_CRC_RAS_UNVERIFIED;
+    assert(dsd_call_state_update_crypto(&state, 0U, &crypto) == 1);
+    state.event_crc_invalid[0] = DSD_CRC_FAILED;
+    assert(dsd_call_state_update_crypto(&state, 0U, &crypto) == 1);
+    state.event_crc_invalid[0] = 0U;
+    assert(dsd_call_state_get(&state, 0U, &call) == 1);
+    rc |= expect_int("failure lands on a RAS call", call.crc_invalid, both);
+    dsd_event_sync_slot(&opts, &state, 0U);
+    rc |= expect_int("escalated staged row has one failure marker", count_substr(staged->event_string, "[CRC ERR]"), 1);
+    rc |= expect_int("escalated staged row drops RAS marker", strstr(staged->event_string, "[RAS]") != NULL, 0);
+    rc |= expect_int("escalated staged row warns", staged->severity, DSD_EVENT_SEVERITY_WARNING);
+    assert(end_test_call(&state, 0U, DSD_CALL_END_TERMINATOR) == 1);
+    dsd_event_sync_slot(&opts, &state, 0U);
+    rc |= expect_int("escalated row commits failed", committed->crc_invalid, both);
+    rc |= expect_int("escalated committed row has one failure marker",
+                     count_substr(committed->event_string, "[CRC ERR]"), 1);
+
+    // A committed [RAS] row: its -J entry and detail lines say [RAS]. A later failure swaps the history row's marker
+    // in place; -J keeps what was written when the row committed and gains no line.
+    state.event_crc_invalid[0] = DSD_CRC_RAS_UNVERIFIED;
+    assert(observe_test_call(&state, 0U, DSD_SYNC_DMR_BS_VOICE_POS, DSD_CALL_KIND_GROUP_VOICE, 500U, 900U, 0U, 0U,
+                             DSD_CALL_BOUNDARY_BEGIN)
+           == 1);
+    dsd_event_sync_slot(&opts, &state, 0U);
+    assert(dsd_call_state_get(&state, 0U, &call) == 1);
+    assert(dsd_event_enrich_gps(&state, 0U, call.epoch, "ras position") == 1);
+    state.event_crc_invalid[0] = 0U;
+    assert(end_test_call(&state, 0U, DSD_CALL_END_SYNC_LOSS) == 1);
+    dsd_event_sync_slot(&opts, &state, 0U);
+    rc |= expect_has_substr("RAS row commits marked", committed->event_string, "00:00:00 [RAS] ");
+    rc |= expect_int("RAS committed row informational", committed->severity, DSD_EVENT_SEVERITY_INFO);
+    char log[16384] = {0};
+    rc |= expect_int("ras event log reads", read_event_log(path, log, sizeof log), 0);
+    rc |= expect_has_substr("-J marks the RAS row", log, "00:00:00 [RAS] TEST TGT: 00000500");
+    rc |= expect_has_substr("-J marks the RAS detail line", log, "[RAS] GPS: ras position");
+    const int lines_before = count_lines(log);
+    state.event_crc_invalid[0] = DSD_CRC_FAILED;
+    assert(dsd_event_enrich_gps(&state, 0U, call.epoch, "failed position") == 1);
+    state.event_crc_invalid[0] = 0U;
+    rc |= expect_int("late failure swaps the committed marker", count_substr(committed->event_string, "[CRC ERR]"), 1);
+    rc |= expect_int("late failure leaves no RAS marker", strstr(committed->event_string, "[RAS]") != NULL, 0);
+    rc |= expect_has_substr("late failure keeps the stamp first", committed->event_string, "00:00:00 [CRC ERR] TEST");
+    rc |= expect_int("late failure warns", committed->severity, DSD_EVENT_SEVERITY_WARNING);
+    rc |= expect_int("late failure accumulates bits", committed->crc_invalid, both);
+    DSD_MEMSET(log, 0, sizeof log);
+    rc |= expect_int("ras event log rereads", read_event_log(path, log, sizeof log), 0);
+    rc |= expect_int("late escalation appends nothing to -J", count_lines(log), lines_before);
+
+    // A RAS transmission that drops and is reacquired with a failed check merges into its row as a failure, and the
+    // continuation -J appends for the reacquired segment carries the merged row's [CRC ERR].
+    state.event_crc_invalid[0] = DSD_CRC_RAS_UNVERIFIED;
+    assert(observe_test_call(&state, 0U, DSD_SYNC_DMR_BS_VOICE_POS, DSD_CALL_KIND_GROUP_VOICE, 800U, 903U, 0U, 0U,
+                             DSD_CALL_BOUNDARY_BEGIN)
+           == 1);
+    state.event_crc_invalid[0] = 0U;
+    dsd_event_sync_slot(&opts, &state, 0U);
+    assert(end_test_call(&state, 0U, DSD_CALL_END_SYNC_LOSS) == 1);
+    dsd_event_sync_slot(&opts, &state, 0U);
+    state.event_crc_invalid[0] = DSD_CRC_FAILED;
+    assert(observe_test_call(&state, 0U, DSD_SYNC_DMR_BS_VOICE_POS, DSD_CALL_KIND_GROUP_VOICE, 800U, 903U, 0U, 0U,
+                             DSD_CALL_BOUNDARY_BEGIN)
+           == 1);
+    state.event_crc_invalid[0] = 0U;
+    dsd_event_sync_slot(&opts, &state, 0U);
+    assert(end_test_call(&state, 0U, DSD_CALL_END_TERMINATOR) == 1);
+    dsd_event_sync_slot(&opts, &state, 0U);
+    rc |= expect_has_substr("reacquired failure merges into the RAS row", committed->event_string,
+                            "00:00:00 [CRC ERR] TEST TGT: 00000800");
+    rc |= expect_int(
+        "merged row has one marker",
+        count_substr(committed->event_string, "[CRC ERR]") + count_substr(committed->event_string, "[RAS]"), 1);
+    rc |= expect_int("merged row warns", committed->severity, DSD_EVENT_SEVERITY_WARNING);
+    rc |= expect_int("merged row bits", committed->crc_invalid, both);
+    DSD_MEMSET(log, 0, sizeof log);
+    rc |= expect_int("reacquired event log reads", read_event_log(path, log, sizeof log), 0);
+    rc |= expect_has_substr("-J first segment stays [RAS]", log, "00:00:00 [RAS] TEST TGT: 00000800");
+    rc |=
+        expect_has_substr("-J continuation carries the merged marker", log, "Reacquired: [CRC ERR] TEST TGT: 00000800");
+
+    // At full capacity the swap keeps the stamp and the terminator and truncates the tail.
+    state.event_crc_invalid[0] = DSD_CRC_RAS_UNVERIFIED;
+    assert(observe_test_call(&state, 0U, DSD_SYNC_DMR_BS_VOICE_POS, DSD_CALL_KIND_GROUP_VOICE, 600U, 901U, 0U, 0U,
+                             DSD_CALL_BOUNDARY_BEGIN)
+           == 1);
+    state.event_crc_invalid[0] = 0U;
+    dsd_event_sync_slot(&opts, &state, 0U);
+    assert(dsd_call_state_get(&state, 0U, &call) == 1);
+    assert(end_test_call(&state, 0U, DSD_CALL_END_SYNC_LOSS) == 1);
+    dsd_event_sync_slot(&opts, &state, 0U);
+    const size_t cap = sizeof committed->event_string;
+    static const char ras_prefix[] = "2026-04-30 00:00:00 [RAS] ";
+    DSD_SNPRINTF(committed->event_string, cap, "%s", ras_prefix);
+    DSD_MEMSET(committed->event_string + sizeof ras_prefix - 1U, 'Y', cap - sizeof ras_prefix);
+    committed->event_string[cap - 1U] = '\0';
+    state.event_crc_invalid[0] = DSD_CRC_FAILED;
+    assert(dsd_event_enrich_gps(&state, 0U, call.epoch, "full row position") == 1);
+    state.event_crc_invalid[0] = 0U;
+    rc |= expect_int("full row swaps the marker",
+                     strncmp(committed->event_string, "2026-04-30 00:00:00 [CRC ERR] YYYY", 34) == 0, 1);
+    rc |= expect_int("full row stays terminated at capacity", (int)strnlen(committed->event_string, cap),
+                     (int)(cap - 1U));
+    rc |= expect_int("full row leaves no RAS marker", strstr(committed->event_string, "[RAS]") != NULL, 0);
+
+    // A scan channel named "RAS" renders where the marker goes; an unmarked row's label is never taken for one.
+    assert(observe_test_call(&state, 0U, DSD_SYNC_DMR_BS_VOICE_POS, DSD_CALL_KIND_GROUP_VOICE, 700U, 902U, 0U, 0U,
+                             DSD_CALL_BOUNDARY_BEGIN)
+           == 1);
+    dsd_event_sync_slot(&opts, &state, 0U);
+    assert(dsd_call_state_get(&state, 0U, &call) == 1);
+    assert(end_test_call(&state, 0U, DSD_CALL_END_SYNC_LOSS) == 1);
+    dsd_event_sync_slot(&opts, &state, 0U);
+    rc |= expect_int("labelled row starts clean", committed->crc_invalid, 0);
+    DSD_SNPRINTF(committed->event_string, cap, "%s", "2026-04-30 00:00:00 [RAS] DMR TGT: 00000700; ");
+    state.event_crc_invalid[0] = DSD_CRC_FAILED;
+    assert(dsd_event_enrich_gps(&state, 0U, call.epoch, "labelled position") == 1);
+    state.event_crc_invalid[0] = 0U;
+    rc |= expect_has_substr("channel label survives the marker", committed->event_string,
+                            "00:00:00 [CRC ERR] [RAS] DMR TGT: 00000700;");
+
+    remove(path);
+    dsd_state_ext_free_all(&state);
+    return rc;
+}
+
 int
 main(void) {
-    test_source_alias_collision(DSD_SYNC_NXDN_POS);
-    test_source_alias_collision(DSD_SYNC_P25P1_POS);
-    test_source_alias_collision(DSD_SYNC_DMR_BS_VOICE_POS);
     int rc = 0;
+    rc |= test_source_alias_collision(DSD_SYNC_NXDN_POS);
+    rc |= test_source_alias_collision(DSD_SYNC_P25P1_POS);
+    rc |= test_source_alias_collision(DSD_SYNC_DMR_BS_VOICE_POS);
     rc |= test_crc_invalid_data_notice_isolation();
     rc |= test_crc_invalid_voice_delayed_and_reacquired();
     rc |= test_crc_invalid_enrichment_marks_voice();
+    rc |= test_crc_ras_marker_and_escalation();
 
     rc |= test_event_history_revision_primitives();
     rc |= test_watchdog_current_marks_only_semantic_changes();
     rc |= test_voice_row_carries_call_start_time();
     rc |= test_nonfinalizing_call_notice_defers_call_end_side_effects();
+    rc |= test_noncanonical_notice_takes_no_staged_frequency_or_code();
+    rc |= test_noncanonical_notice_resolves_its_channel_label_live();
+    rc |= test_noncanonical_notice_stamps_its_own_start();
+    rc |= test_noncanonical_notice_leaves_the_canonical_staged_row_alone();
+    rc |= test_lone_render_before_the_epoch_opens_keeps_one_row_per_call();
+    rc |= test_detail_before_the_call_opens_leaves_no_orphan_row();
+    rc |= test_enrichment_before_the_epoch_opens_spares_the_outgoing_row();
+    rc |= test_direct_detail_skips_an_ended_call();
+    rc |= test_note_without_an_authoritative_call_leaves_no_orphan_row();
     rc |= test_event_state_snapshot_copy_accepts_aliased_state();
     rc |= test_end_only_data_call_does_not_emit_voice_end_alert();
     rc |= test_data_only_data_call_emits_one_data_alert();
@@ -5157,6 +7280,25 @@ main(void) {
     rc |= test_unlabelled_row_string_is_unchanged();
     rc |= test_channel_label_survives_push_and_merge();
     rc |= test_channel_label_is_frozen_at_first_render();
+    rc |= test_row_frequency_is_pinned_at_first_active_render();
+    rc |= test_call_frequency_outranks_the_tuner();
+    rc |= test_audio_input_row_takes_no_tuner_value();
+    rc |= test_access_code_refreshes_while_live_and_freezes_at_the_end();
+    rc |= test_unknown_access_code_stays_unknown_after_the_end();
+    rc |= test_staged_access_code_of_another_kind_is_not_reused();
+    rc |= test_invalid_live_access_code_never_erases_a_known_one();
+    rc |= test_reacquisition_merge_fills_frequency_and_code_only();
+    rc |= test_unknown_access_codes_render_as_dashes();
+    rc |= test_dpmr_event_line_prints_the_decoded_colour_code();
+    rc |= test_reacquisition_merge_upgrades_an_unknown_system_code();
+    rc |= test_reacquisition_merge_names_a_dpmr_code_in_the_system_identity();
+    rc |= test_reacquisition_merge_keeps_the_code_and_takes_a_later_system_id();
+    rc |= test_nxdn_row_names_the_ran_it_was_heard_with();
+    rc |= test_unknown_p25_and_m17_codes_render_as_dashes();
+    rc |= test_reacquisition_merge_names_a_p25_or_m17_code();
+    rc |= test_data_notice_carries_frequency_and_access_code();
+    rc |= test_playfiles_rows_take_no_tuner_value_or_code();
+    rc |= test_nxdn_row_names_only_its_own_channel();
     rc |= test_unnamed_channel_epoch_is_not_relabelled_by_a_hop();
     rc |= test_unlabelled_row_is_not_relabelled_by_a_reacquired_segment();
     rc |= test_channel_label_does_not_rescue_identityless_row();
@@ -5172,6 +7314,9 @@ main(void) {
     rc |= test_dstar_sync_loss_after_media_keeps_identityless_row();
     rc |= test_unreliable_terminator_modes_keep_audible_identityless_rows();
     rc |= test_end_alert_deadline_matches_reacquire_window();
+    rc |= test_end_alert_due_runs_on_the_decode_clock();
+    rc |= test_rdio_sidecar_files_each_recording_at_its_start();
+    rc |= test_drop_hold_due_runs_on_the_decode_clock();
     rc |= test_unverified_terminator_heal_window_is_tight();
     rc |= test_crypto_only_voice_epoch_commits_row();
     rc |= test_route_text_only_row_survives_epoch_change_commit();
@@ -5180,6 +7325,7 @@ main(void) {
     rc |= test_reacquired_transmission_commits_one_row();
     rc |= test_merged_row_end_stamp_advances();
     rc |= test_merged_row_start_stamp_is_frozen();
+    rc |= test_merged_history_duration_runs_on_the_decode_clock();
     rc |= test_commit_rev_tracks_committed_rows_only();
     rc |= test_terminator_after_sync_loss_end_blocks_reacquisition();
     rc |= test_end_reason_upgrade_is_one_directional();

@@ -5,7 +5,16 @@ set -euo pipefail
 # This mirrors the local pre-push targeting rules: changed source files are
 # analyzed directly, and changed headers expand to representative C and C++ TUs
 # (capped per tree and language) for the slower analyzers, and to every includer
-# for IWYU, whose verdict depends on the header's types and is cheap to run.
+# for IWYU, whose verdict depends on the header's types and is cheap to run. A
+# change to a pinned or vendored dependency sets analysis_full_scan instead, and
+# the per-TU analyzers then take the whole tree.
+
+# Needs bash 4.4: `mapfile -d` reads git's NUL-separated names, and expanding an
+# empty array under `set -u` is an error before 4.4.
+if ((BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4))); then
+  echo "ci-changed-files: needs bash 4.4 or later (this is ${BASH_VERSION})" >&2
+  exit 2
+fi
 
 ROOT_DIR=$(git rev-parse --show-toplevel 2> /dev/null || pwd)
 cd "$ROOT_DIR"
@@ -97,14 +106,27 @@ if ! git rev-parse --verify "$HEAD_REF^{commit}" > /dev/null 2>&1; then
   exit 2
 fi
 
+# Write each list to a fresh file and rename it into place. The default output
+# directory is inside the checkout, so a pull request can put a symlink (to
+# /dev/null, say) where a list goes; the rename replaces the link instead of
+# writing through it, and the jobs read the list this script wrote. A directory
+# there (or a link to one) would take the file inside it and leave the path
+# reading as an empty list, so that fails instead.
 write_list() {
   local path="$1"
   shift
-  mkdir -p "$(dirname "$path")"
-  : > "$path"
-  if [[ $# -gt 0 ]]; then
-    printf '%s\n' "$@" > "$path"
+  local dir tmp
+  if [[ -d "$path" ]]; then
+    echo "ci-changed-files: ${path} is a directory; refusing to write the list there" >&2
+    exit 1
   fi
+  dir=$(dirname "$path")
+  mkdir -p "$dir"
+  tmp=$(mktemp "$dir/.list.XXXXXX")
+  if [[ $# -gt 0 ]]; then
+    printf '%s\n' "$@" > "$tmp"
+  fi
+  mv -f "$tmp" "$path"
 }
 
 sort_unique_array() {
@@ -173,10 +195,36 @@ limit_includers() {
 
 mkdir -p "$OUT_DIR"
 
-mapfile -t changed_paths < <(
-  git diff --name-only --diff-filter=ACMR "${BASE_REF}...${HEAD_REF}" ||
-    git diff --name-only --diff-filter=ACMR "$BASE_REF" "$HEAD_REF"
-)
+# The raw diff goes through a private temporary file outside the checkout: anything
+# under the checkout comes from the pull request, which could put a symlink to
+# /dev/null where the diff is written and empty the lists.
+DIFF_RAW=$(mktemp "${TMPDIR:-/tmp}/ci-changed-files.XXXXXX")
+trap 'rm -f "$DIFF_RAW"' EXIT
+
+# Read the paths changed between BASE_REF and HEAD_REF, raw (-z): git otherwise
+# quotes a name with non-ASCII bytes, quotes or tabs, and a quoted name matches no
+# pattern below and fails the existence check, so it dropped out of every list. A
+# diff that fails ends the run, because an empty list reads as "nothing changed" and
+# would let every job that consumes it skip its work and pass.
+# --no-renames: a rename is listed as its deletion and its addition, so a file
+# moved out of a dependency (src/third_party, say) still counts as a change to it.
+if ! git diff -z --name-only --no-renames --diff-filter=ACMRD "${BASE_REF}...${HEAD_REF}" > "$DIFF_RAW"; then
+  if ! git diff -z --name-only --no-renames --diff-filter=ACMRD "$BASE_REF" "$HEAD_REF" > "$DIFF_RAW"; then
+    echo "ci-changed-files: git diff between ${BASE_REF} and ${HEAD_REF} failed" >&2
+    exit 1
+  fi
+fi
+mapfile -d '' -t changed_paths < "$DIFF_RAW"
+
+# The lists are one path per line, so a name with a newline in it cannot be
+# listed; it would split into two paths that do not exist and drop out. Fail
+# rather than report fewer changes.
+for p in "${changed_paths[@]}"; do
+  if [[ "$p" == *$'\n'* ]]; then
+    printf 'ci-changed-files: a changed path contains a newline, which the line-based lists cannot hold: %q\n' "$p" >&2
+    exit 1
+  fi
+done
 
 if [[ ${#changed_paths[@]} -eq 0 ]]; then
   write_list "$OUT_DIR/changed_paths.txt"
@@ -196,11 +244,27 @@ changed_headers=()
 format_files=()
 semgrep_targets=()
 semgrep_full_scan=0
+analysis_full_scan=0
 cmake_format_files=()
 workflow_security_targets=()
 dependency_scan_targets=()
 
 for p in "${changed_paths[@]}"; do
+  case "$p" in
+    .github/dependabot.yml | .github/requirements/* | vcpkg.json | vcpkg-configuration.json | vcpkg-ports/* | vcpkg-triplets/* | tools/osv_scan.sh | tools/ci-dependency-pins.env | cmake/Pffft.cmake | tools/update_pffft.py | tools/update_aur_pffft.py | tools/pffft_metadata.py | CMakeLists.txt)
+      dependency_scan_targets+=("$p")
+      ;;
+  esac
+  # Our sources compile against these, so a change to one can move a finding into a
+  # file the pull request did not touch: #690's PFFFT fork took a const setup, and the
+  # header that calls it became a cppcheck finding only the push to main reported.
+  # The per-TU analyzers then take the whole tree, as on push. Matched before the
+  # vendored snapshots are dropped below.
+  case "$p" in
+    tools/ci-dependency-pins.env | cmake/Pffft.cmake | src/third_party/* | android/third_party/libusb/* | android/third_party/librtlsdr/* | android/third_party/libairspy/*)
+      analysis_full_scan=1
+      ;;
+  esac
   case "$p" in
     # Vendored upstream snapshots are excluded from every repository tool. Listed
     # per library rather than as the whole android/third_party subtree, so the build
@@ -237,12 +301,6 @@ for p in "${changed_paths[@]}"; do
   case "$p" in
     .github/workflows/*.yml | .github/workflows/*.yaml | .github/dependabot.yml | .github/zizmor.yml)
       workflow_security_targets+=("$p")
-      ;;
-  esac
-
-  case "$p" in
-    .github/dependabot.yml | .github/requirements/* | vcpkg.json | vcpkg-configuration.json | vcpkg-ports/* | vcpkg-triplets/* | tools/osv_scan.sh)
-      dependency_scan_targets+=("$p")
       ;;
   esac
 
@@ -339,7 +397,7 @@ echo "ci-changed-files: base=${BASE_REF} head=${HEAD_REF}"
 echo "ci-changed-files: changed=${#changed_paths[@]} format=${#format_files[@]}" \
   "tus=${#analysis_tus[@]} iwyu=${#iwyu_tus[@]} cppcheck=${#cppcheck_sources[@]} semgrep=${#semgrep_targets[@]}" \
   "cmake=${#cmake_format_files[@]} workflows=${#workflow_security_targets[@]}" \
-  "deps=${#dependency_scan_targets[@]} semgrep_full=${semgrep_full_scan}"
+  "deps=${#dependency_scan_targets[@]} semgrep_full=${semgrep_full_scan} analysis_full=${analysis_full_scan}"
 
 if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
   {
@@ -351,6 +409,7 @@ if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
     echo "cppcheck_sources=${#cppcheck_sources[@]}"
     echo "semgrep_targets=${#semgrep_targets[@]}"
     echo "semgrep_full_scan=${semgrep_full_scan}"
+    echo "analysis_full_scan=${analysis_full_scan}"
     echo "cmake_format_files=${#cmake_format_files[@]}"
     echo "workflow_security_targets=${#workflow_security_targets[@]}"
     echo "dependency_scan_targets=${#dependency_scan_targets[@]}"

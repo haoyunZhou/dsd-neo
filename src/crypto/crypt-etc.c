@@ -345,9 +345,13 @@ ken_dmr_scrambler_keystream_creation(dsd_state* state, char* input, int show_key
     int lfsr = 0;
     {
         uint32_t parsed = 0U;
-        if (parse_decimal_u32_strict(trim_ascii_ws(input), &parsed)) {
-            lfsr = (int)parsed;
+        if (!parse_decimal_u32_strict(trim_ascii_ws(input), &parsed)) {
+            /* As the other stream-key loaders do: a key that does not parse is refused, never taken as 0. */
+            DSD_FPRINTF(stderr, "DMR Kenwood scrambler key parse failed: expected a decimal key\n");
+            state->ken_sc = 0;
+            return;
         }
+        lfsr = (int)parsed;
     }
     char key_text[16];
     DSD_FPRINTF(stderr, "DMR Kenwood 15-bit scrambler key loaded with forced application: %s\n",
@@ -368,7 +372,12 @@ anytone_bp_keystream_creation(dsd_state* state, char* input, int show_keys) {
     uint16_t key = 0;
     uint16_t kperm = 0;
 
-    (void)parse_hex_u16_truncating_strict(trim_ascii_ws(input), &key);
+    if (!parse_hex_u16_truncating_strict(trim_ascii_ws(input), &key)) {
+        /* As the other stream-key loaders do: a key that does not parse is refused, never taken as 0. */
+        DSD_FPRINTF(stderr, "DMR Anytone BP key parse failed: expected a hexadecimal key\n");
+        state->any_bp = 0;
+        return;
+    }
     key &= 0xFFFF; //truncate to 16-bits
 
     //calculate key permutation using simple operations
@@ -606,7 +615,8 @@ dmr_ambe49_should_skip_crypto(const char ambe_d[49]) {
 }
 
 int
-dmr_voice_stream_apply_frame49(const uint8_t* ks_bits, long int* bit_counter, int algid, char ambe_d[49]) {
+dmr_voice_stream_apply_frame49(const uint8_t* ks_bits, size_t ks_bit_count, long int* bit_counter, int algid,
+                               char ambe_d[49]) {
     if (ks_bits == NULL || bit_counter == NULL || ambe_d == NULL) {
         return 0;
     }
@@ -615,21 +625,27 @@ dmr_voice_stream_apply_frame49(const uint8_t* ks_bits, long int* bit_counter, in
         *bit_counter = 0;
     }
 
+    // Each frame owns 49 keystream bits, plus 7 unused ones for every ALG ID but Hytera Enhanced. Past the generated
+    // keystream there is nothing to decrypt with: wrapping or reading on would only hide a wrong keystream.
+    const size_t step = (algid != 0x02) ? 56U : 49U;
+    const size_t pos = (size_t)*bit_counter;
+    if (pos > ks_bit_count) {
+        return -1;
+    }
+
     if (dmr_ambe49_should_skip_crypto(ambe_d) == 1) {
-        *bit_counter += 49;
-        if (algid != 0x02) {
-            *bit_counter += 7;
-        }
+        // Silence reads no keystream; past the end the counter stays at the end.
+        *bit_counter = (long int)((ks_bit_count - pos < step) ? ks_bit_count : pos + step);
         return 0;
     }
 
-    for (int i = 0; i < 49; i++) {
-        ambe_d[i] ^= (char)(ks_bits[*bit_counter] & 1U);
-        (*bit_counter)++;
+    if (ks_bit_count - pos < 49U) {
+        return -1;
     }
-    if (algid != 0x02) {
-        *bit_counter += 7;
+    for (size_t i = 0; i < 49U; i++) {
+        ambe_d[i] ^= (char)(ks_bits[pos + i] & 1U);
     }
+    *bit_counter = (long int)((ks_bit_count - pos < step) ? ks_bit_count : pos + step);
     return 1;
 }
 

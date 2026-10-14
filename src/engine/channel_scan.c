@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 /* Copyright (C) 2026 by arancormonk <180709949+arancormonk@users.noreply.github.com> */
 
+#include <dsd-neo/core/analog_tone.h>
+#include <dsd-neo/core/audio.h>
 #include <dsd-neo/core/call_state.h>
 #include <dsd-neo/core/channel_mode.h>
 #include <dsd-neo/core/dmr_key_map.h>
-#include <dsd-neo/core/dsd_time.h>
 #include <dsd-neo/core/enc_lockout.h>
 #include <dsd-neo/core/events.h>
 #include <dsd-neo/core/key_set.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/opts_fwd.h>
+#include <dsd-neo/core/power.h>
+#include <dsd-neo/core/safe_api.h>
 #include <dsd-neo/core/scan_profile.h>
 #include <dsd-neo/core/state.h>
 #include <dsd-neo/core/state_ext.h>
@@ -22,15 +25,26 @@
 #include <dsd-neo/engine/scan_voice_gate.h>
 #include <dsd-neo/engine/trunk_tuning.h>
 #include <dsd-neo/runtime/analog_channel.h>
+#include <dsd-neo/runtime/analog_tones.h>
+#include <dsd-neo/runtime/decode_clock.h>
 #include <dsd-neo/runtime/decode_mode.h>
 #include <dsd-neo/runtime/log.h>
 #include <dsd-neo/runtime/rtl_stream_metrics_hooks.h>
 #include <dsd-neo/runtime/scan_mode.h>
 #include <dsd-neo/runtime/scan_options.h>
+#include <dsd-neo/runtime/scan_row_edit.h>
+#include <dsd-neo/runtime/squelch.h>
 #include <dsd-neo/runtime/trunk_tuning_hooks.h>
 #include <stdint.h>
 #include <stdlib.h>
-#include <time.h>
+
+#include "scan_analog_internal.h"
+
+/* One row's session edit (issue #518). */
+typedef struct {
+    int row;
+    dsd_scan_row_edit edit;
+} channel_scan_row_edit;
 
 typedef struct {
     uint64_t request;
@@ -39,12 +53,52 @@ typedef struct {
     int retry;
     int needs_commit;
     dsd_scan_mode mode;
+    /* The analog kind (dsd_analog_demod) the staged tune's settings run: an nfm row's FM, an am row's AM, or on a
+     * blank row the configured kind (issue #524). It says which configured width that tune carries. */
+    int row_kind;
     dsd_scan_settings configured;
     dsd_scan_key_change keys;
     uint64_t key_epoch;
-    /* The map generation whose row squelch was last checked against the input (issue #521). */
-    uint64_t squelch_checked_map;
-    int squelch_checked;
+    /* The live receive-family requests the front end had accepted when the staged tune was queued
+     * (dsd_engine_scan_family_requests(); issue #526), and whether that tune attached a receive family, which any later
+     * request supersedes (dsd_engine_scan_retune_attaches_family()). A tune that attached none (a typed digital row on
+     * an analog session) only a later analog request supersedes while the scan runs (a scan leave, which supersedes
+     * it too, ends the scan), which the stream's count of such supersedes says
+     * (dsd_engine_scan_familyless_retune_supersedes(); issue #582). */
+    uint32_t family_requests;
+    uint32_t familyless_supersedes;
+    int family_attached;
+    /* The map generation whose rows were last checked against the input (issues #521, #526), and the DSP rate its
+     * analog row widths were last held to, with the configured NFM and AM widths a row without its own runs (issue
+     * #526). */
+    uint64_t rows_checked_map;
+    int rows_checked;
+    int widths_checked_rate_hz;
+    int widths_checked_nfm_hz;
+    int widths_checked_am_hz;
+    int widths_checked;
+    /* The row whose frequency the receiver last landed on, and the map it belongs to (issue #527): a failed start moves
+     * lcn_freq_roll past a row the receiver never reached, so only a completed tune says where the receiver is. */
+    int tuned;
+    int tuned_row;
+    uint64_t tuned_map;
+    /* The row whose scope is installed, its options in force (the last row committed), or -1 before the first. */
+    int committed_row;
+    /* The operator's session edits of rows' own settings ("this channel", issue #518), one per edited row, laid over the
+     * row's options wherever they are read (channel_scan_row_values()). They go with this extension when the scanner
+     * leaves, and so never outlive the map they were made on: a map change leaves first. edits_epoch moves with every
+     * change, and a tune staged before one restages (channel_scan_staged_stale()), so it lands what the row now runs.
+     * session names this scan to the editors (dsd_state::scan_row_session). */
+    channel_scan_row_edit* edits;
+    size_t edit_count;
+    size_t edit_capacity;
+    uint32_t edits_epoch;
+    uint32_t staged_edits_epoch;
+    uint32_t session;
+    /* The options the staged row was prepared with (its session edit merged), which its tune's rigctl leg reads
+     * (dsd_engine_scan_tuning_row_options()); staged_has_values 0 for a row with none. */
+    dsd_scan_option_values staged_values;
+    int staged_has_values;
 } channel_scan;
 
 static void
@@ -54,12 +108,81 @@ channel_scan_free(void* ptr) {
         return;
     }
     dsd_scan_key_change_clear(&scan->keys);
+    free(scan->edits);
     free(scan);
 }
 
 static channel_scan*
 channel_scan_get(const dsd_state* state) {
     return DSD_STATE_EXT_GET_AS(channel_scan, state, DSD_STATE_EXT_ENGINE_CHANNEL_SCAN);
+}
+
+static channel_scan_row_edit*
+channel_scan_find_edit(const channel_scan* scan, int row) {
+    for (size_t i = 0; scan && i < scan->edit_count; i++) {
+        if (scan->edits[i].row == row) {
+            return &scan->edits[i];
+        }
+    }
+    return NULL;
+}
+
+/* The options @p row runs: its profile's, with the operator's session edit laid over them (issue #518). NULL for a row
+   with neither; @p scratch holds the merged copy when there is an edit. */
+static const dsd_scan_option_values*
+channel_scan_row_values(const dsd_state* state, int row, dsd_scan_option_values* scratch) {
+    const dsd_scan_row_profile* profile = dsd_channel_profile_get(state, (size_t)row);
+    const dsd_scan_option_values* base = profile ? &profile->values : NULL;
+    const channel_scan_row_edit* entry = channel_scan_find_edit(channel_scan_get(state), row);
+    if (!entry || dsd_scan_row_edit_fields_edited(&entry->edit) == 0U) {
+        return base;
+    }
+    dsd_scan_row_edit_apply(base, &entry->edit, dsd_channel_mode_get(state, (size_t)row), scratch);
+    return scratch;
+}
+
+const dsd_scan_option_values*
+dsd_engine_channel_scan_row_values(const dsd_state* state, int row, dsd_scan_option_values* scratch) {
+    return (state && scratch && row >= 0) ? channel_scan_row_values(state, row, scratch) : NULL;
+}
+
+/* Publish the row whose scope is in force for the "this channel" editors. */
+static void
+channel_scan_publish_row(dsd_state* state, const channel_scan* scan) {
+    const int row = scan->committed_row;
+    const dsd_scan_row_profile* profile = dsd_channel_profile_get(state, (size_t)row);
+    const channel_scan_row_edit* entry = channel_scan_find_edit(scan, row);
+    state->scan_row_session = scan->session;
+    state->scan_row_index = row;
+    state->scan_row_scanner = (uint8_t)DSD_SCAN_ROW_SCANNER_CHANNEL_SCAN;
+    state->scan_row_editable = (uint8_t)dsd_scan_row_edit_fields(dsd_channel_mode_get(state, (size_t)row), 0);
+    state->scan_row_edited = (uint8_t)dsd_scan_row_edit_fields_edited(entry ? &entry->edit : NULL);
+    state->scan_row_listed = (uint8_t)dsd_scan_row_edit_fields_listed(profile ? &profile->values : NULL, 0);
+}
+
+static void
+channel_scan_clear_published_row(dsd_state* state) {
+    if (state->scan_row_scanner != (uint8_t)DSD_SCAN_ROW_SCANNER_CHANNEL_SCAN) {
+        return;
+    }
+    state->scan_row_session = 0U;
+    state->scan_row_index = -1;
+    state->scan_row_scanner = (uint8_t)DSD_SCAN_ROW_SCANNER_NONE;
+    state->scan_row_editable = 0U;
+    state->scan_row_edited = 0U;
+    state->scan_row_listed = 0U;
+}
+
+const dsd_scan_option_values*
+dsd_engine_scan_tuning_row_options(const dsd_opts* opts, const dsd_state* state) {
+    if (!opts || !state) {
+        return NULL;
+    }
+    const channel_scan* scan = channel_scan_get(state);
+    if (scan && opts->trunk_scan_enabled != 1) {
+        return scan->staged_has_values ? &scan->staged_values : NULL;
+    }
+    return dsd_scan_mode_row_options(state);
 }
 
 int
@@ -77,7 +200,7 @@ channel_scan_row_is_current(const dsd_opts* opts, const dsd_state* state, const 
 
 static void
 channel_scan_end_calls(dsd_opts* opts, dsd_state* state) {
-    const double now = dsd_time_now_monotonic_s();
+    const double now = dsd_decode_now_mono_s();
     for (int slot = 0; slot < DSD_CALL_STATE_SLOT_COUNT; slot++) {
         if (dsd_call_state_end(state, (uint8_t)slot, now) > 0) {
             dsd_event_sync_slot(opts, state, (uint8_t)slot);
@@ -85,6 +208,67 @@ channel_scan_end_calls(dsd_opts* opts, dsd_state* state) {
     }
     (void)dsd_recent_activity_clear_all(state);
     opts->trunk_is_tuned = 0;
+}
+
+/* Whether the tune staged for the row carries a configured channel width (issue #526): an untyped row's does on the
+ * analog family the configured options select, and an analog row's unless it sets a width of its own, whatever the
+ * configured family. A typed digital row filters with its own channel profile. */
+static int
+channel_scan_row_runs_configured_width(const dsd_state* state, const channel_scan* scan) {
+    if (scan->mode == DSD_SCAN_MODE_INHERIT) {
+        return scan->configured.analog_only == 1;
+    }
+    if (!dsd_scan_mode_is_analog(scan->mode)) {
+        return 0;
+    }
+    dsd_scan_option_values scratch;
+    const dsd_scan_option_values* values = channel_scan_row_values(state, scan->row, &scratch);
+    return !(values && (values->present & DSD_SCAN_OPT_BANDWIDTH));
+}
+
+/* Whether a configured setting the staged tune was prepared from changed while it was outstanding. A configured channel
+ * width counts only where the tune carries it (channel_scan_row_runs_configured_width()), and only the width of the
+ * analog kind the row runs (issue #524): an nfm row's NFM width, an am row's AM width, a blank row's width of the
+ * configured kind. That is not always the one dsd_scan_settings_equal() compares, the configured kind's whenever the
+ * configured family is analog (an nfm row on an AM session carries the NFM width). */
+static int
+channel_scan_configured_changed(const dsd_state* state, const dsd_scan_settings* latest, const channel_scan* scan) {
+    dsd_scan_settings others = *latest;
+    others.analog_nfm_bandwidth_hz = scan->configured.analog_nfm_bandwidth_hz;
+    others.analog_am_bandwidth_hz = scan->configured.analog_am_bandwidth_hz;
+    if (!dsd_scan_settings_equal(&others, &scan->configured, 1)) {
+        return 1;
+    }
+    if (!channel_scan_row_runs_configured_width(state, scan)) {
+        return 0;
+    }
+    if (scan->row_kind == DSD_ANALOG_DEMOD_AM) {
+        return latest->analog_am_bandwidth_hz != scan->configured.analog_am_bandwidth_hz;
+    }
+    return latest->analog_nfm_bandwidth_hz != scan->configured.analog_nfm_bandwidth_hz;
+}
+
+/* Whether the tune staged for the row no longer describes what it should land: a configured setting or the keyring it
+ * was prepared from changed while it was outstanding, or a live receive-family request superseded the family its
+ * retune carries. That request acts for the row still in scope (a width edit or a config apply republishing the
+ * outgoing analog row's monitor), yet the front end takes it as the newer word on the family and lands the staged
+ * retune with neither its family nor its symbol profile (rtl_stream_prepare_retune_analog_profile_for_target()): a
+ * digital row would otherwise commit on the analog monitor, or an nfm or am row on the digital family (issue #526). A
+ * retune that carries no family (a typed digital row on an analog session) lands its symbol profile whatever the
+ * digital requests, but a later analog request asked for the monitor, and the front end lands that retune with its
+ * centre only (issue #582): the row would commit on the monitor, so it is restaged for that request alone. */
+static int
+channel_scan_staged_stale(const dsd_opts* opts, const dsd_state* state, const channel_scan* scan) {
+    dsd_scan_settings latest;
+    dsd_scan_mode_configured(opts, state, &latest);
+    if (channel_scan_configured_changed(state, &latest, scan) || scan->key_epoch != state->enc_lockout_key_epoch
+        || scan->staged_edits_epoch != scan->edits_epoch) {
+        return 1;
+    }
+    if (scan->family_attached) {
+        return scan->family_requests != dsd_engine_scan_family_requests(opts);
+    }
+    return scan->familyless_supersedes != dsd_engine_scan_familyless_retune_supersedes(opts);
 }
 
 static int
@@ -95,17 +279,20 @@ channel_scan_commit(dsd_opts* opts, dsd_state* state, channel_scan* scan) {
     /* Hardware has moved. Even if a later retry rolls back, frames cannot use
      * the outgoing profile until a row is successfully committed. */
     scan->needs_commit = 1;
-    dsd_scan_settings latest;
-    dsd_scan_mode_configured(opts, state, &latest);
-    if (!dsd_scan_settings_equal(&latest, &scan->configured, 1) || scan->key_epoch != state->enc_lockout_key_epoch) {
-        /* A configured setting changed while tuning. Stage the new effective
-         * profile in a fresh request before any frame can use it. */
+    scan->tuned = 1;
+    scan->tuned_row = scan->row;
+    scan->tuned_map = scan->map_sequence;
+    if (channel_scan_staged_stale(opts, state, scan)) {
+        /* Stage the new effective profile in a fresh request before any frame
+         * can use it. */
         scan->request = 0;
         scan->retry = 1;
         return 0;
     }
     const int outgoing_force = state->M;
-    /* End calls with the outgoing row's keys and label still installed. */
+    /* The next row is another carrier: the carrier boundary (issue #575) ends the calls with the outgoing row's keys and
+       label still installed, and forgets what that carrier left. */
+    dsd_engine_carrier_boundary(opts, state, DSD_CARRIER_BOUNDARY_SCAN_STEP, 0);
     channel_scan_end_calls(opts, state);
     dsd_engine_reset_no_carrier_state(opts, state);
     if (dsd_scan_mode_enter(opts, state, scan->mode) != 0) {
@@ -114,7 +301,11 @@ channel_scan_commit(dsd_opts* opts, dsd_state* state, channel_scan* scan) {
     }
     state->lcn_freq_roll = scan->row + 1;
     const dsd_scan_row_profile* profile = dsd_channel_profile_get(state, (size_t)scan->row);
-    (void)dsd_scan_mode_options(opts, state, profile ? &profile->values : NULL);
+    dsd_scan_option_values values_scratch;
+    (void)dsd_scan_mode_options(opts, state, channel_scan_row_values(state, scan->row, &values_scratch));
+    scan->committed_row = scan->row;
+    channel_scan_publish_row(state, scan);
+    dsd_engine_scan_ensure_output(opts);
     dsd_scan_groups_enter(state, profile);
     const int maps_changed = dsd_scan_maps_enter(state, profile);
     const int keys_changed = dsd_scan_key_change_commit(state, &scan->keys);
@@ -122,8 +313,8 @@ channel_scan_commit(dsd_opts* opts, dsd_state* state, channel_scan* scan) {
         dsd_enc_lockout_bump_key_epoch(state);
     }
     dsd_frame_sync_reset_acquisition(opts, state, 1);
-    state->last_cc_sync_time = time(NULL);
-    state->last_cc_sync_time_m = dsd_time_now_monotonic_s();
+    state->last_cc_sync_time = dsd_decode_time();
+    state->last_cc_sync_time_m = dsd_decode_now_mono_s();
     state->nxdn_last_ran = -1;
     dsd_scan_voice_gate_note_retune(state, state->last_cc_sync_time_m);
     scan->request = 0;
@@ -197,28 +388,510 @@ channel_scan_next_row(const dsd_state* state) {
 
 /* A row squelch gates the RTL demodulator. Any other input has no demodulator for it to gate, so
  * it cannot gate digital acquisition; the threshold in dsd_opts only reaches the analog input
- * monitor (-8, with audio output on) and the carrier activity that monitor stamps. Say so once
- * per affected row when a scan (or a newly imported map) starts. */
+ * monitor (-8, with audio output on) and the carrier activity that monitor stamps. */
 static void
-channel_scan_check_row_squelch(const dsd_opts* opts, const dsd_state* state, channel_scan* scan) {
-    if (scan->squelch_checked && scan->squelch_checked_map == state->trunk_chan_map_seq) {
+channel_scan_warn_row_squelch(const dsd_opts* opts, int row, long freq, const dsd_scan_option_values* values) {
+    if (opts->audio_in_type == AUDIO_IN_RTL || !values || !(values->present & DSD_SCAN_OPT_SQUELCH)) {
         return;
     }
-    scan->squelch_checked = 1;
-    scan->squelch_checked_map = state->trunk_chan_map_seq;
-    if (opts->audio_in_type == AUDIO_IN_RTL) {
-        return;
-    }
+    LOG_WARN("WARNING: Scan channel %d (%.6lf MHz): --squelch-db %d cannot gate digital acquisition "
+             "without a radio input; here it gates only the analog input monitor (-8) and the carrier "
+             "activity it stamps.\n",
+             row + 1, (double)freq / 1000000.0, values->squelch_db);
+}
+
+static void
+channel_scan_row_label(const dsd_state* state, int row, char* label, size_t label_size) {
+    const long freq = *dsd_state_trunk_lcn_slot_const(state, row);
+    DSD_SNPRINTF(label, label_size, "Scan channel %d (%.6lf MHz)", row + 1, (double)freq / 1000000.0);
+}
+
+/* What the rows owe the operator about their squelch, said once per row when a scan (or a newly imported map)
+ * starts: a digital row's squelch that cannot gate digital acquisition on this input (issue #521), and an analog
+ * row's squelch that lets noise hold it (issue #526). Neither depends on the DSP rate. A placeholder row (frequency 0)
+ * is never tuned, so it owes nothing. */
+static void
+channel_scan_warn_rows_squelch(const dsd_opts* opts, const dsd_state* state) {
     for (int row = 0; row < state->lcn_freq_count; row++) {
-        const dsd_scan_row_profile* profile = dsd_channel_profile_get(state, (size_t)row);
-        if (profile && (profile->values.present & DSD_SCAN_OPT_SQUELCH)) {
-            LOG_WARN("WARNING: Scan channel %d (%.6lf MHz): --squelch-db %d cannot gate digital acquisition "
-                     "without a radio input; here it gates only the analog input monitor (-8) and the carrier "
-                     "activity it stamps.\n",
-                     row + 1, (double)*dsd_state_trunk_lcn_slot_const(state, row) / 1000000.0,
-                     profile->values.squelch_db);
+        if (*dsd_state_trunk_lcn_slot_const(state, row) == 0) {
+            continue;
+        }
+        dsd_scan_option_values scratch;
+        const dsd_scan_option_values* values = channel_scan_row_values(state, row, &scratch);
+        /* An analog row's squelch gates exactly what it is for on any input: its monitor and carrier. */
+        if (!dsd_scan_mode_is_analog(dsd_channel_mode_get(state, (size_t)row))) {
+            channel_scan_warn_row_squelch(opts, row, *dsd_state_trunk_lcn_slot_const(state, row), values);
+            continue;
+        }
+        char label[64];
+        channel_scan_row_label(state, row, label, sizeof label);
+        const int am = dsd_channel_mode_get(state, (size_t)row) == DSD_SCAN_MODE_AM;
+        (void)dsd_engine_scan_warn_analog_squelch(opts, state, values, am, label);
+    }
+}
+
+/* Whether @p row is an analog row the scanner visits: a placeholder row (frequency 0) is never tuned. */
+static int
+channel_scan_row_visited_analog(const dsd_state* state, int row) {
+    return *dsd_state_trunk_lcn_slot_const(state, row) != 0
+           && dsd_scan_mode_is_analog(dsd_channel_mode_get(state, (size_t)row));
+}
+
+/* The widths the analog rows run, held to @p dsp_rate_hz: every row's, or, after only configured widths changed
+ * (@p configured_changed, 1 << dsd_analog_demod per changed kind), those of the rows that run a changed one; any other
+ * row was named at this rate already, so it is counted without being named again
+ * (dsd_engine_scan_row_named_again()). Every row skipped at every visit reaches the status line, since a frontend
+ * without the log (Android) would otherwise never learn why a row is not visited. A placeholder row (frequency 0) is
+ * never tuned and is left out, as dsd_engine_channel_scan_refused_rows() leaves it out. */
+static void
+channel_scan_warn_rows_width(const dsd_opts* opts, dsd_state* state, int dsp_rate_hz, unsigned configured_changed) {
+    dsd_engine_scan_skipped skipped = {0};
+    for (int row = 0; row < state->lcn_freq_count; row++) {
+        if (!channel_scan_row_visited_analog(state, row)) {
+            continue;
+        }
+        const int kind = dsd_scan_mode_analog_kind(dsd_channel_mode_get(state, (size_t)row));
+        dsd_scan_option_values scratch;
+        const dsd_scan_option_values* values = channel_scan_row_values(state, row, &scratch);
+        char label[64];
+        char brief[DSD_ANALOG_ERROR_TEXT_MAX];
+        channel_scan_row_label(state, row, label, sizeof label);
+        const int row_skipped =
+            dsd_engine_scan_row_named_again(values, kind, configured_changed)
+                ? dsd_engine_scan_warn_analog_width(opts, state, values, kind, dsp_rate_hz, label, brief, sizeof brief)
+                      == DSD_ENGINE_SCAN_WIDTH_SKIPPED
+                : dsd_engine_scan_analog_width_skipped(opts, state, values, kind, dsp_rate_hz, brief, sizeof brief);
+        if (row_skipped) {
+            dsd_engine_scan_skipped_add(&skipped, label, brief);
         }
     }
+    dsd_engine_scan_note_skipped_rows(state, &skipped);
+}
+
+/* Once per map the rows' squelch, and the analog row widths once the DSP rate they must fit is known: an RTL stream
+ * that has published no rate yet leaves the widths to a later row start, and a changed rate (the operator changed the
+ * RTL DSP bandwidth) names them again, since a row whose width the rate cannot fit is skipped quietly at every visit
+ * (dsd_engine_scan_tune_to_freq()). A changed configured NFM or AM width (a width command, a config apply) names again
+ * the rows that run it. */
+static void
+channel_scan_check_rows(const dsd_opts* opts, dsd_state* state, channel_scan* scan) {
+    if (!scan->rows_checked || scan->rows_checked_map != state->trunk_chan_map_seq) {
+        scan->rows_checked = 1;
+        scan->rows_checked_map = state->trunk_chan_map_seq;
+        scan->widths_checked = 0;
+        channel_scan_warn_rows_squelch(opts, state);
+    }
+    const int dsp_rate_hz = dsd_engine_scan_dsp_rate_hz(opts, state);
+    const int nfm_hz = dsd_scan_mode_configured_analog_width(opts, state, DSD_ANALOG_DEMOD_FM);
+    const int am_hz = dsd_scan_mode_configured_analog_width(opts, state, DSD_ANALOG_DEMOD_AM);
+    if (opts->audio_in_type == AUDIO_IN_RTL && dsp_rate_hz <= 0) {
+        return;
+    }
+    const int same_rate = scan->widths_checked && scan->widths_checked_rate_hz == dsp_rate_hz;
+    const unsigned configured_changed = (scan->widths_checked_nfm_hz != nfm_hz ? 1U << DSD_ANALOG_DEMOD_FM : 0U)
+                                        | (scan->widths_checked_am_hz != am_hz ? 1U << DSD_ANALOG_DEMOD_AM : 0U);
+    if (same_rate && configured_changed == 0U) {
+        return;
+    }
+    scan->widths_checked = 1;
+    scan->widths_checked_rate_hz = dsp_rate_hz;
+    scan->widths_checked_nfm_hz = nfm_hz;
+    scan->widths_checked_am_hz = am_hz;
+    channel_scan_warn_rows_width(opts, state, dsp_rate_hz, same_rate ? configured_changed : 0U);
+}
+
+/* The squelch an analog row runs with: its own, else the configured one. */
+static dsd_squelch_setting
+channel_scan_analog_squelch(const dsd_opts* opts, const dsd_state* state, const dsd_scan_option_values* row) {
+    if (row && (row->present & DSD_SCAN_OPT_SQUELCH)) {
+        return dsd_squelch_mode_is_dynamic(row->squelch_mode)
+                   ? dsd_squelch_setting_dynamic(row->squelch_mode, row->squelch_margin_db)
+                   : dsd_squelch_setting_of_level(dsd_squelch_level_from_sql((double)row->squelch_db));
+    }
+    const dsd_scan_settings* configured = dsd_scan_mode_configured_view(state);
+    if (configured) {
+        return dsd_squelch_mode_is_dynamic(configured->rtl_squelch_mode)
+                   ? dsd_squelch_setting_dynamic(configured->rtl_squelch_mode, configured->rtl_squelch_margin_db)
+                   : dsd_squelch_setting_of_level(configured->rtl_squelch_level);
+    }
+    return dsd_squelch_setting_of_opts(opts);
+}
+
+/* Whether that squelch holds the row on noise: off, or at -100 dB and below, every block re-arms its carrier hold, so
+ * only the visit cap or a manual advance or avoid moves on. The -100 dB comparison allows for the rounding of the
+ * level's power. The auto and noise squelches close on noise on a radio input (issue #518 follow-up), and the noise
+ * squelch on audio input's FM rows too (issue #628; a source with nothing above voice says so when it finds out);
+ * elsewhere they are off. */
+static int
+channel_scan_analog_squelch_open(const dsd_opts* opts, const dsd_state* state, const dsd_scan_option_values* row,
+                                 int am) {
+    const dsd_squelch_setting squelch = channel_scan_analog_squelch(opts, state, row);
+    if (dsd_squelch_setting_is_dynamic(&squelch)) {
+        const int input = dsd_squelch_input_kind(opts);
+        if (input == DSD_SQUELCH_INPUT_RADIO) {
+            return 0;
+        }
+        return !(input == DSD_SQUELCH_INPUT_AUDIO && squelch.mode == DSD_SQUELCH_MODE_NOISE && !am);
+    }
+    const double floor_level = dsd_squelch_level_from_sql(-100.0);
+    return dsd_squelch_is_off(squelch.level) || squelch.level <= floor_level * (1.0 + 1e-9);
+}
+
+void
+dsd_engine_scan_ensure_output(dsd_opts* opts) {
+    if (!opts) {
+        return;
+    }
+    if (dsd_opts_is_analog_family(opts)) {
+        (void)dsd_audio_ensure_analog_output(opts);
+    } else {
+        (void)dsd_audio_ensure_digital_output(opts);
+    }
+}
+
+int
+dsd_engine_scan_warn_analog_squelch(const dsd_opts* opts, const dsd_state* state, const dsd_scan_option_values* row,
+                                    int am, const char* label) {
+    if (!opts || !state || !label || !channel_scan_analog_squelch_open(opts, state, row, am)) {
+        return 0;
+    }
+    LOG_WARN("WARNING: %s: the analog channel's squelch is off or at -100 dB or below, so noise holds it on air until "
+             "--scan-max-visit-ms or a manual advance or avoid moves on; give it --squelch noise (an nfm row), "
+             "--squelch auto (on a radio input) or --squelch-db, or set a squelch.\n",
+             label);
+    return 1;
+}
+
+int
+dsd_engine_scan_width_refused(const dsd_opts* opts, int kind, int width_hz, int dsp_rate_hz, char* why,
+                              size_t why_size) {
+    if (why && why_size > 0U) {
+        why[0] = '\0';
+    }
+    const int held_hz = dsd_engine_scan_held_width_hz(kind, width_hz);
+    if (!opts || held_hz <= 0 || opts->audio_in_type != AUDIO_IN_RTL) {
+        return 0;
+    }
+    char err[DSD_ANALOG_ERROR_TEXT_MAX];
+    if (dsd_analog_channel_lpf_off_check(kind, width_hz, dsd_engine_scan_channel_lpf_forced_off(), err, sizeof err)
+        != 0) {
+        if (why && why_size > 0U) {
+            DSD_SNPRINTF(why, why_size, "%s", err);
+        }
+        return 1;
+    }
+    /* Worded with the fix this input allows, as the stream start's refusal is (issue #525). */
+    return dsp_rate_hz > 0
+           && dsd_analog_width_check_at(kind, held_hz, dsp_rate_hz, dsd_opts_analog_rate_source(opts), why, why_size)
+                  != 0;
+}
+
+/* The status-line reason a refused width is skipped for (dsd_engine_scan_width_refused()): short, as the log line
+ * beside it carries the full text and the fix. @p width_hz 0 is the kind's default. */
+static void
+scan_width_refusal_brief(int kind, int width_hz, int dsp_rate_hz, char* brief, size_t brief_size) {
+    if (!brief || brief_size == 0U) {
+        return;
+    }
+    char width[DSD_ANALOG_WIDTH_TEXT_MAX];
+    char rate[DSD_ANALOG_WIDTH_TEXT_MAX];
+    (void)dsd_analog_width_format(dsd_analog_width_effective_hz(kind, width_hz), width, sizeof width);
+    if (dsd_engine_scan_channel_lpf_forced_off()) {
+        DSD_SNPRINTF(brief, brief_size, "%s %s needs the filter DSD_NEO_CHANNEL_LPF=0 turns off",
+                     dsd_analog_demod_label(kind), width);
+        return;
+    }
+    (void)dsd_analog_width_format(dsp_rate_hz, rate, sizeof rate);
+    DSD_SNPRINTF(brief, brief_size, "%s %s does not fit the %s DSP rate", dsd_analog_demod_label(kind), width, rate);
+}
+
+void
+dsd_engine_scan_skipped_add(dsd_engine_scan_skipped* skipped, const char* label, const char* brief) {
+    if (!skipped) {
+        return;
+    }
+    if (skipped->count++ == 0) {
+        DSD_SNPRINTF(skipped->label, sizeof skipped->label, "%s", label ? label : "");
+        DSD_SNPRINTF(skipped->brief, sizeof skipped->brief, "%s", brief ? brief : "");
+    }
+}
+
+void
+dsd_engine_scan_note_skipped_rows(dsd_state* state, const dsd_engine_scan_skipped* skipped) {
+    if (!state || !skipped || skipped->count <= 0) {
+        return;
+    }
+    if (skipped->count == 1) {
+        DSD_SNPRINTF(state->ui_msg, sizeof state->ui_msg, "Skipped at every visit: %s: %s", skipped->label,
+                     skipped->brief);
+    } else {
+        DSD_SNPRINTF(state->ui_msg, sizeof state->ui_msg, "Skipped at every visit: %s and %d more: %s", skipped->label,
+                     skipped->count - 1, skipped->brief);
+    }
+    state->ui_msg_expire = dsd_realtime_time() + 5;
+}
+
+/* A row without a width of its own runs the configured width of its kind @p kind. The width commands hold that width to
+ * the DSP rate while the scan has such a row (dsd_engine_scan_runs_configured_nfm_width(), _am_width()), but a list
+ * loaded over a width the rate cannot filter, or a rate a device forced, still leaves one the rate cannot filter: that
+ * skips the row at every visit as well. So can the AM default, which always runs its channel filter. Audio input
+ * filters nothing, so no DSP rate holds the configured width there: with a rigctl peer it is the passband the peer is
+ * asked for (issue #621), which the peer takes or refuses at the tune, and no row is named for it here. */
+static int
+scan_warn_configured_width(const dsd_opts* opts, const dsd_state* state, int kind, int dsp_rate_hz, const char* label,
+                           char* brief, size_t brief_size) {
+    const int width_hz = dsd_scan_mode_configured_analog_width(opts, state, kind);
+    char why[DSD_ANALOG_ERROR_TEXT_MAX];
+    if (dsp_rate_hz <= 0 || !dsd_engine_scan_width_refused(opts, kind, width_hz, dsp_rate_hz, why, sizeof why)) {
+        return DSD_ENGINE_SCAN_WIDTH_OK;
+    }
+    LOG_WARN("WARNING: %s: it sets no %s width of its own, and the configured %s; until then it is skipped at every "
+             "visit.\n",
+             label, dsd_analog_demod_label(kind), why);
+    scan_width_refusal_brief(kind, width_hz, dsp_rate_hz, brief, brief_size);
+    return DSD_ENGINE_SCAN_WIDTH_SKIPPED;
+}
+
+/* Whether an analog row of demodulator @p kind is one nothing receives as AM (issue #526): an am row on audio input with
+ * no rigctl peer. Audio input arrives demodulated by whatever produced it, and only a rigctl peer can be asked for AM
+ * (trunk_tuning.c); such an input tunes no row at all (dsd_engine_scan_tune_to_freq()), so the row is never on air. */
+static int
+scan_am_row_unreceivable(const dsd_opts* opts, int kind, char* brief, size_t brief_size) {
+    if (kind != DSD_ANALOG_DEMOD_AM || opts->audio_in_type == AUDIO_IN_RTL || opts->use_rigctl == 1) {
+        return 0;
+    }
+    if (brief && brief_size > 0U) {
+        DSD_SNPRINTF(brief, brief_size, "%s", "AM needs an I/Q input or a rigctl peer");
+    }
+    return 1;
+}
+
+int
+dsd_engine_scan_warn_analog_width(const dsd_opts* opts, const dsd_state* state, const dsd_scan_option_values* row,
+                                  int kind, int dsp_rate_hz, const char* label, char* brief, size_t brief_size) {
+    if (brief && brief_size > 0U) {
+        brief[0] = '\0';
+    }
+    if (!opts || !label || !dsd_analog_demod_is_valid(kind)) {
+        return DSD_ENGINE_SCAN_WIDTH_OK;
+    }
+    if (scan_am_row_unreceivable(opts, kind, brief, brief_size)) {
+        LOG_WARN("WARNING: %s: AM rows need an input DSD-neo demodulates (rtl, rtltcp, soapy, airspy) or a rigctl peer "
+                 "(-U) that demodulates AM; this audio input has neither, so it is skipped at every visit.\n",
+                 label);
+        return DSD_ENGINE_SCAN_WIDTH_SKIPPED;
+    }
+    if (!row || !(row->present & DSD_SCAN_OPT_BANDWIDTH)) {
+        return scan_warn_configured_width(opts, state, kind, dsp_rate_hz, label, brief, brief_size);
+    }
+    if (opts->audio_in_type != AUDIO_IN_RTL) {
+        /* A rigctl peer demodulates audio input, and takes the row's width as its passband (trunk_tuning.c). */
+        if (opts->use_rigctl == 1) {
+            return DSD_ENGINE_SCAN_WIDTH_OK;
+        }
+        LOG_WARN("WARNING: %s: --%s-bandwidth-hz %d has no effect on audio input, which arrives demodulated and has no "
+                 "rigctl peer to take it; set the demodulator's own passband.\n",
+                 label, kind == DSD_ANALOG_DEMOD_AM ? "am" : "nfm", row->channel_bw_hz);
+        return DSD_ENGINE_SCAN_WIDTH_NO_EFFECT;
+    }
+    /* The row's rate rule, and DSD_NEO_CHANNEL_LPF=0, which refuses the width at any rate; the text is the front
+     * end's. */
+    char why[DSD_ANALOG_ERROR_TEXT_MAX];
+    if (!dsd_engine_scan_width_refused(opts, kind, row->channel_bw_hz, dsp_rate_hz, why, sizeof why)) {
+        return DSD_ENGINE_SCAN_WIDTH_OK;
+    }
+    LOG_WARN("WARNING: %s: %s; until then it is skipped at every visit.\n", label, why);
+    scan_width_refusal_brief(kind, row->channel_bw_hz, dsp_rate_hz, brief, brief_size);
+    return DSD_ENGINE_SCAN_WIDTH_SKIPPED;
+}
+
+int
+dsd_engine_scan_analog_width_skipped(const dsd_opts* opts, const dsd_state* state, const dsd_scan_option_values* row,
+                                     int kind, int dsp_rate_hz, char* brief, size_t brief_size) {
+    if (brief && brief_size > 0U) {
+        brief[0] = '\0';
+    }
+    if (!opts || !dsd_analog_demod_is_valid(kind)) {
+        return 0;
+    }
+    if (scan_am_row_unreceivable(opts, kind, brief, brief_size)) {
+        return 1;
+    }
+    const int width_hz = (row && (row->present & DSD_SCAN_OPT_BANDWIDTH))
+                             ? row->channel_bw_hz
+                             : dsd_scan_mode_configured_analog_width(opts, state, kind);
+    if (!dsd_engine_scan_width_refused(opts, kind, width_hz, dsp_rate_hz, NULL, 0U)) {
+        return 0;
+    }
+    scan_width_refusal_brief(kind, width_hz, dsp_rate_hz, brief, brief_size);
+    return 1;
+}
+
+/* The analog rows the front end refuses at @p dsp_rate_hz, with the first one's index and status-line reason
+ * (dsd_engine_channel_scan_refused_rows()). */
+static int
+channel_scan_count_refused_rows(const dsd_opts* opts, const dsd_state* state, int dsp_rate_hz, int* first_row,
+                                char* brief, size_t brief_size) {
+    int refused = 0;
+    for (int row = 0; row < state->lcn_freq_count; row++) {
+        if (!channel_scan_row_visited_analog(state, row)) {
+            continue;
+        }
+        dsd_scan_option_values scratch;
+        const int kind = dsd_scan_mode_analog_kind(dsd_channel_mode_get(state, (size_t)row));
+        char row_brief[DSD_ANALOG_ERROR_TEXT_MAX];
+        if (!dsd_engine_scan_analog_width_skipped(opts, state, channel_scan_row_values(state, row, &scratch), kind,
+                                                  dsp_rate_hz, row_brief, sizeof row_brief)) {
+            continue;
+        }
+        if (refused++ == 0) {
+            *first_row = row;
+            DSD_SNPRINTF(brief, brief_size, "%s", row_brief);
+        }
+    }
+    return refused;
+}
+
+/* The row the receiver is on: the one whose tune last landed on this map (typed lists); else, for an untyped list or
+ * before the first landing, the one before lcn_freq_roll, since a step lands on the row after the one it last tuned;
+ * -1 before the first step. */
+static int
+channel_scan_on_air_row(const dsd_state* state) {
+    const channel_scan* scan = channel_scan_get(state);
+    if (scan && scan->tuned && scan->tuned_map == state->trunk_chan_map_seq
+        && scan->tuned_row < state->lcn_freq_count) {
+        return scan->tuned_row;
+    }
+    const int roll = state->lcn_freq_roll;
+    return (roll > 0 && roll <= state->lcn_freq_count) ? roll - 1 : -1;
+}
+
+/* Whether a step can land on @p row: it has a frequency, the operator has not avoided it, and it is not an analog row
+ * skipped at every visit before any backend moves: one whose width, of the kind its demodulator runs, the front end
+ * refuses at @p dsp_rate_hz, or an am row nothing demodulates (dsd_engine_scan_analog_width_skipped()). */
+static int
+channel_scan_row_reachable(const dsd_opts* opts, const dsd_state* state, int row, int dsp_rate_hz) {
+    if (*dsd_state_trunk_lcn_slot_const(state, row) == 0 || dsd_state_trunk_lcn_avoid_get(state, (size_t)row)) {
+        return 0;
+    }
+    if (!channel_scan_row_visited_analog(state, row)) {
+        return 1;
+    }
+    dsd_scan_option_values scratch;
+    const int kind = dsd_scan_mode_analog_kind(dsd_channel_mode_get(state, (size_t)row));
+    return !dsd_engine_scan_analog_width_skipped(opts, state, channel_scan_row_values(state, row, &scratch), kind,
+                                                 dsp_rate_hz, NULL, 0U);
+}
+
+/* A tone policy as it judges (dsd_analog_tone_policy_configure()): a list policy with a list, else none (OFF and an
+ * empty list). */
+static void
+scan_tone_policy_as_judged(int* mode, dsd_tone_set* set) {
+    if ((*mode != DSD_TONE_FILTER_ALLOW && *mode != DSD_TONE_FILTER_BLOCK) || dsd_tone_set_count(set) == 0) {
+        *mode = DSD_TONE_FILTER_OFF;
+        DSD_MEMSET(set, 0, sizeof(*set));
+    }
+}
+
+/* Whether list policy @p mode with @p set rejects the value the detectors hold locked in @p rx. */
+static int
+scan_tone_policy_rejects_locked(int mode, const dsd_tone_set* set, const dsd_analog_rx_publication* rx) {
+    int listed = 0;
+    if (rx->tone_kind == DSD_ANALOG_TONE_KIND_CTCSS) {
+        listed = dsd_tone_set_contains_ctcss(set, rx->ctcss_tenths_hz);
+    } else if (rx->tone_kind == DSD_ANALOG_TONE_KIND_DCS) {
+        listed = dsd_tone_set_contains_dcs(set, rx->dcs_code, rx->dcs_inverted);
+    }
+    return (mode == DSD_TONE_FILTER_ALLOW) ? !listed : listed;
+}
+
+/* Whether a row that runs received-tone detection and is tuned to the frequency on air would reject the traffic the
+ * CTCSS/DCS receive policy in force rejected (issue #527), so that a step to it would only end the reception and judge
+ * the same traffic again. Its policy is @p row's own (DSD_SCAN_OPT_TONE), else the configured one
+ * (dsd_scan_mode_configured_tone_policy()), each as it judges. It rejects the traffic when it is the policy in force
+ * (dsd_opts), which already did, its codes perhaps respelled (dsd_tone_set_same_signals()); otherwise when it is a list
+ * policy that rejects what the verdict rests on: the value the detectors hold locked (an allow list that does not list
+ * it, a block list that does), or, after a "no tone" verdict, no tone (an allow list). With neither in hand (the
+ * rejected value has since been lost) only the policy in force is known to reject it. A row with no policy passes
+ * everything. @p row may be NULL (no options). */
+static int
+channel_scan_tone_rejects_alike(const dsd_opts* opts, const dsd_state* state, const dsd_scan_option_values* row) {
+    int mode = DSD_TONE_FILTER_OFF;
+    dsd_tone_set set;
+    DSD_MEMSET(&set, 0, sizeof(set));
+    if (row && (row->present & DSD_SCAN_OPT_TONE)) {
+        mode = row->tone_filter;
+        set = row->tone_set;
+    } else {
+        dsd_scan_mode_configured_tone_policy(opts, state, &mode, &set);
+    }
+    scan_tone_policy_as_judged(&mode, &set);
+    int in_force_mode = opts->analog_tone_filter;
+    dsd_tone_set in_force_set = opts->analog_tone_set;
+    scan_tone_policy_as_judged(&in_force_mode, &in_force_set);
+    if (mode == in_force_mode && dsd_tone_set_same_signals(&set, &in_force_set)) {
+        return 1;
+    }
+    if (mode == DSD_TONE_FILTER_OFF) {
+        return 0;
+    }
+    const dsd_analog_rx_publication* rx = &state->analog_rx;
+    if (rx->tone_state == DSD_ANALOG_TONE_STATE_LOCKED) {
+        return scan_tone_policy_rejects_locked(mode, &set, rx);
+    }
+    return rx->gate_no_tone && mode == DSD_TONE_FILTER_ALLOW;
+}
+
+/* Whether a step to @p row, tuned to the frequency on air, would only judge the traffic the tone policy rejected again
+ * and reject it (issue #527): the row runs received-tone detection (dsd_channel_mode_hears_tones()), and its tone
+ * policy rejects that traffic too (channel_scan_tone_rejects_alike()). A row of another class -- a digital or am
+ * row, or one inheriting a decode mode other than the FM monitor -- or one whose policy passes the traffic is
+ * somewhere to go. */
+static int
+channel_scan_row_rejects_alike(const dsd_opts* opts, const dsd_state* state, int row) {
+    if (!dsd_channel_mode_hears_tones(state, (size_t)row, dsd_scan_mode_configured_fm_monitor(opts, state))) {
+        return 0;
+    }
+    dsd_scan_option_values scratch;
+    return channel_scan_tone_rejects_alike(opts, state, channel_scan_row_values(state, row, &scratch));
+}
+
+int
+dsd_engine_channel_scan_has_other_row(const dsd_opts* opts, const dsd_state* state) {
+    if (!opts || !state) {
+        return 0;
+    }
+    const int current = channel_scan_on_air_row(state);
+    const long current_freq = current >= 0 ? *dsd_state_trunk_lcn_slot_const(state, current) : 0L;
+    const int dsp_rate_hz = dsd_engine_scan_dsp_rate_hz(opts, state);
+    for (int row = 0; row < state->lcn_freq_count; row++) {
+        if (row == current || !channel_scan_row_reachable(opts, state, row, dsp_rate_hz)) {
+            continue;
+        }
+        if (*dsd_state_trunk_lcn_slot_const(state, row) != current_freq
+            || !channel_scan_row_rejects_alike(opts, state, row)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int
+dsd_engine_channel_scan_refused_rows(const dsd_opts* opts, const dsd_state* state, int dsp_rate_hz, int* first_row,
+                                     char* brief, size_t brief_size) {
+    int refused = 0;
+    int first = -1;
+    char first_brief[DSD_ANALOG_ERROR_TEXT_MAX] = "";
+    if (opts && state && opts->audio_in_type == AUDIO_IN_RTL) {
+        refused = channel_scan_count_refused_rows(opts, state, dsp_rate_hz, &first, first_brief, sizeof first_brief);
+    }
+    if (first_row) {
+        *first_row = first;
+    }
+    if (brief && brief_size > 0U) {
+        DSD_SNPRINTF(brief, brief_size, "%s", first_brief);
+    }
+    return refused;
 }
 
 static int
@@ -230,8 +903,8 @@ channel_scan_start_row(dsd_opts* opts, dsd_state* state, int row) {
     const long freq = *dsd_state_trunk_lcn_slot(state, row);
     if (!freq) {
         state->lcn_freq_roll = row + 1;
-        state->last_cc_sync_time = time(NULL);
-        state->last_cc_sync_time_m = dsd_time_now_monotonic_s();
+        state->last_cc_sync_time = dsd_decode_time();
+        state->last_cc_sync_time_m = dsd_decode_now_mono_s();
         dsd_scan_voice_gate_note_retune(state, state->last_cc_sync_time_m);
         return 0;
     }
@@ -240,18 +913,30 @@ channel_scan_start_row(dsd_opts* opts, dsd_state* state, int row) {
         if (!scan) {
             return -1;
         }
+        scan->committed_row = -1;
+        scan->session = dsd_scan_row_edit_new_session();
         (void)dsd_state_ext_set(state, DSD_STATE_EXT_ENGINE_CHANNEL_SCAN, scan, channel_scan_free);
     }
-    channel_scan_check_row_squelch(opts, state, scan);
+    channel_scan_check_rows(opts, state, scan);
     scan->row = row;
     scan->mode = dsd_channel_mode_get(state, (size_t)row);
     scan->map_sequence = state->trunk_chan_map_seq;
     dsd_scan_settings before;
     dsd_scan_settings next;
     dsd_scan_settings_capture(opts, state, &before);
-    if (dsd_scan_mode_prepare(opts, state, scan->mode, &next) != 0) {
+    /* The row's own acquisition options (its analog channel width, a session edit's included) are part of what the
+       tune queues. */
+    dsd_scan_option_values values_scratch;
+    const dsd_scan_option_values* staged = channel_scan_row_values(state, row, &values_scratch);
+    scan->staged_edits_epoch = scan->edits_epoch;
+    scan->staged_has_values = staged != NULL;
+    if (staged) {
+        scan->staged_values = *staged;
+    }
+    if (dsd_scan_mode_prepare(opts, state, scan->mode, staged, &next) != 0) {
         return -1;
     }
+    scan->row_kind = next.analog_demod;
     dsd_scan_mode_configured(opts, state, &scan->configured);
     if (dsd_scan_groups_begin(state)
         || dsd_scan_key_change_prepare(state, dsd_state_trunk_lcn_keys_get(state, (size_t)row), &scan->keys)) {
@@ -262,6 +947,9 @@ channel_scan_start_row(dsd_opts* opts, dsd_state* state, int row) {
      * closed through preparation failures; the new request takes over below. */
     scan->retry = 0;
     dsd_scan_settings_restore(&next, opts, state);
+    scan->family_requests = dsd_engine_scan_family_requests(opts);
+    scan->familyless_supersedes = dsd_engine_scan_familyless_retune_supersedes(opts);
+    scan->family_attached = dsd_engine_scan_retune_attaches_family(opts, state, state->samplesPerSymbol);
     const dsd_trunk_tune_result result =
         dsd_engine_scan_tune_to_freq(opts, state, freq, state->samplesPerSymbol, &scan->request);
     dsd_scan_settings_restore(&before, opts, state);
@@ -324,35 +1012,66 @@ dsd_engine_channel_scan_step_manual(dsd_opts* opts, dsd_state* state) {
 
 /* Put the RTL front end back on the configured receive family. Under -fA that is the configured analog profile
  * (demodulator and channel width, 0 meaning the default); otherwise the digital family and the symbol profile the
- * restored decoder runs on, in that order, so the demod thread switches family before it applies the profile.
+ * restored decoder runs on, in that order, so the demod thread switches family before it applies the profile. Returns
+ * what became of the analog profile request: 1 queued, -1 refused at once (dsd_engine_channel_scan_leave()); 0 when
+ * none was made (not RTL input, or the digital family).
  *
  * A front end still on the analog family (the -fA session whose configured mode was changed to a digital one while a
  * row ran) switches to digital only here, after the configured timing was saved for the analog family's output rate:
  * the monitor's resampled audio, or the rate a typed row's profile ran at. The decoder, and the profile it publishes,
  * are timed for the rate the digital family lands on instead, as svc_publish_symbol_profile() times a mode change
- * outside a row.
+ * outside a row. So they are when work still outstanding lands a family on a front end already digital (issue #583: a
+ * row's retune that carries the digital family, still in flight, or an analog row's), or when the row on air was timed
+ * for that landing: the leave decides once, as a republish does, with the configured mode digital and either the row's
+ * recorded decision (@p row_timed_digital_family, read from the scope before the leave removed it:
+ * dsd_scan_mode_timed_digital_family()) or the stream's answer
+ * (dsd_rtl_stream_metrics_hook_family_landing_after_pending(), which includes the live analog family). The row's
+ * decision stands when the stream's answer has fallen since (a scoped command's resume timed the row for the landing
+ * while its retune was outstanding, and that work failed before the scan stopped), so the configured decoder is not
+ * timed and published by a different answer than the row was. The digital family asked for then is the landing
+ * (dsd_rtl_stream_metrics_hook_request_digital_family_landing()), which puts the front end on that prediction whichever
+ * family it runs where it lands: the leave supersedes a retune still outstanding, which lands its centre only, and one
+ * that landed before it leaves the landing to put the configured decoder's profile where it is timed. The configured
+ * decoder is no target, so its CQPSK state is an open's, as DSD_NEO_CQPSK decides when set. With no decision for the
+ * landing on a digital front end the saved timing stands, and the plain request is a no-op there.
  *
- * A leave that switches the front end's family also drops the analog monitor block the decoder has part-collected
- * from the old family's output, as a decode-mode change between the families does. */
-static void
-channel_scan_restore_frontend(const dsd_opts* opts, dsd_state* state) {
+ * A leave that switches the front end's family, or its analog kind (an nfm row's FM monitor on an -fM session, issue
+ * #524), also drops the analog monitor block the decoder has part-collected from the old family's or kind's output, as
+ * a decode-mode change between them does. A leave from a typed digital row switches neither (the row kept the front
+ * end on the analog family, on the row's channel): getSymbol() drops that block itself, and collects nothing, until
+ * the monitor this requests is published (issue #582). Before any of its requests the leave supersedes the retunes
+ * queued with no family (a typed row's: dsd_engine_scan_supersede_familyless_retunes()), so one the controller lands
+ * late moves its centre only and does not undo the configured decoder's profile. */
+static int
+channel_scan_restore_frontend(const dsd_opts* opts, dsd_state* state, int row_timed_digital_family) {
     if (opts->audio_in_type != AUDIO_IN_RTL) {
-        return;
+        return 0;
     }
+    /* A typed row's retune still outstanding carries no family, so the requests below would not supersede it: the
+       controller could land it after the demod thread took them, and put the row's symbol profile back over the
+       configured decoder's for good. Superseded first, it lands its centre only (issue #582). */
+    dsd_engine_scan_supersede_familyless_retunes(opts);
     const int analog_family_active = dsd_rtl_stream_metrics_hook_analog_family_active();
     if (dsd_opts_is_analog_family(opts)) {
-        if (!analog_family_active) {
+        int running_kind = opts->analog_demod;
+        const int monitor_published = dsd_rtl_stream_metrics_hook_analog_profile(&running_kind, NULL, NULL) == 1;
+        if (!analog_family_active || (monitor_published && running_kind != opts->analog_demod)) {
             dsd_symbol_analog_block_reset(state);
         }
-        (void)dsd_rtl_stream_metrics_hook_apply_analog_profile(DSD_RX_FAMILY_ANALOG, opts->analog_demod,
-                                                               dsd_opts_analog_width_hz(opts));
-        return;
+        const int rc = dsd_rtl_stream_metrics_hook_apply_analog_profile(DSD_RX_FAMILY_ANALOG, opts->analog_demod,
+                                                                        dsd_opts_analog_width_hz(opts));
+        return rc == 0 ? 1 : -1;
     }
     const dsd_decode_mode_profile profile = dsd_scan_mode_effective_profile(opts, state);
     if (analog_family_active) {
         dsd_symbol_analog_block_reset(state);
+    }
+    const int lands_digital_family =
+        dsd_scan_mode_configured_digital(opts, state)
+        && (row_timed_digital_family || dsd_rtl_stream_metrics_hook_family_landing_after_pending());
+    if (lands_digital_family) {
         const unsigned int rate_hz = dsd_rtl_stream_metrics_hook_output_rate_for_family(
-            DSD_RX_FAMILY_DIGITAL, state->rf_mod == 1, profile.symbol_rate_hz);
+            DSD_RX_FAMILY_DIGITAL, state->rf_mod == 1, profile.symbol_rate_hz, 0);
         if (rate_hz > 0U) {
             state->samplesPerSymbol = dsd_opts_compute_sps_rate(opts, profile.symbol_rate_hz, (int)rate_hz);
             state->symbolCenter = dsd_opts_symbol_center(state->samplesPerSymbol);
@@ -361,15 +1080,20 @@ channel_scan_restore_frontend(const dsd_opts* opts, dsd_state* state) {
     const int filter = opts->analog_only || !dsd_opts_has_digital_decode_mode(opts)
                            ? DSD_RTL_STREAM_CHANNEL_PROFILE_WIDE
                            : dsd_rtl_channel_profile_for(opts, profile.symbol_rate_hz, profile.levels, state->rf_mod);
-    (void)dsd_rtl_stream_metrics_hook_apply_analog_profile(DSD_RX_FAMILY_DIGITAL, DSD_ANALOG_DEMOD_FM, 0);
+    if (lands_digital_family) {
+        (void)dsd_rtl_stream_metrics_hook_request_digital_family_landing(0);
+    } else {
+        (void)dsd_rtl_stream_metrics_hook_apply_analog_profile(DSD_RX_FAMILY_DIGITAL, DSD_ANALOG_DEMOD_FM, 0);
+    }
     (void)dsd_rtl_stream_metrics_hook_apply_demod_profile(state->rf_mod == 1, profile.symbol_rate_hz, profile.levels,
                                                           filter, state->samplesPerSymbol);
+    return 0;
 }
 
-void
+int
 dsd_engine_channel_scan_leave(dsd_opts* opts, dsd_state* state) {
     if (!opts || !state) {
-        return;
+        return 0;
     }
     const int active = channel_scan_get(state) != NULL || dsd_scan_mode_configured_view(state) != NULL
                        || dsd_scan_mode_updating(state);
@@ -377,11 +1101,182 @@ dsd_engine_channel_scan_leave(dsd_opts* opts, dsd_state* state) {
         channel_scan_end_calls(opts, state);
     }
     (void)dsd_state_ext_set(state, DSD_STATE_EXT_ENGINE_CHANNEL_SCAN, NULL, NULL);
+    channel_scan_clear_published_row(state);
     dsd_scan_groups_leave(state);
     dsd_scan_maps_leave(state);
+    /* The landing decision the row on air was timed with goes with its scope; the restore decides by it too. */
+    const int row_timed_digital_family = dsd_scan_mode_timed_digital_family(state);
     dsd_scan_mode_leave(opts, state);
+    int monitor_request = 0;
     if (active) {
         dsd_frame_sync_reset_acquisition(opts, state, opts->trunk_scan_enabled != 1);
-        channel_scan_restore_frontend(opts, state);
+        monitor_request = channel_scan_restore_frontend(opts, state, row_timed_digital_family);
+        /* A rigctl peer that demodulated an am row, or ran a row's own passband, goes back to what the configured
+         * session asks for: no later tune outside a scan would undo it (issue #526). It queues no receive request, so
+         * the analog profile request stays the leave's last. */
+        dsd_engine_scan_rigctl_restore(opts, state);
     }
+    return monitor_request;
+}
+
+/* Store @p next as @p row's session edit, dropping the entry once it edits nothing. Returns -1 when it cannot be
+   stored (no memory), with nothing changed. */
+static int
+channel_scan_store_edit(channel_scan* scan, int row, const dsd_scan_row_edit* next) {
+    channel_scan_row_edit* entry = channel_scan_find_edit(scan, row);
+    if (dsd_scan_row_edit_fields_edited(next) == 0U) {
+        if (entry) {
+            *entry = scan->edits[scan->edit_count - 1U];
+            scan->edit_count--;
+        }
+        return 0;
+    }
+    if (!entry) {
+        if (scan->edit_count == scan->edit_capacity) {
+            const size_t capacity = scan->edit_capacity ? scan->edit_capacity * 2U : 4U;
+            channel_scan_row_edit* grown =
+                (channel_scan_row_edit*)realloc(scan->edits, capacity * sizeof(*scan->edits));
+            if (!grown) {
+                return -1;
+            }
+            scan->edits = grown;
+            scan->edit_capacity = capacity;
+        }
+        entry = &scan->edits[scan->edit_count++];
+        entry->row = row;
+    }
+    entry->edit = *next;
+    return 0;
+}
+
+/* Install @p next as @p row's session edit: from its next visit when its scope is not the one in force, at once when it
+   is. A tune staged before the change restages (edits_epoch). */
+static int
+channel_scan_install_edit(dsd_opts* opts, dsd_state* state, channel_scan* scan, int row, const dsd_scan_row_edit* next,
+                          dsd_scan_row_edit_result* out) {
+    const channel_scan_row_edit* entry = channel_scan_find_edit(scan, row);
+    if (entry) {
+        out->previous = entry->edit;
+    }
+    const int width_before = dsd_opts_analog_width_hz(opts);
+    dsd_scan_option_values before_scratch;
+    const dsd_scan_option_values* before = channel_scan_row_values(state, row, &before_scratch);
+    if (channel_scan_store_edit(scan, row, next) != 0) {
+        DSD_SNPRINTF(out->err, sizeof out->err, "%s", "out of memory");
+        return DSD_SCAN_ROW_EDIT_REFUSED;
+    }
+    scan->edits_epoch++;
+    if (row != scan->committed_row) {
+        return DSD_SCAN_ROW_EDIT_STORED;
+    }
+    dsd_scan_option_values scratch;
+    const dsd_scan_option_values* values = channel_scan_row_values(state, row, &scratch);
+    (void)dsd_scan_mode_options(opts, state, values);
+    /* The row on air is the one its last tune staged: its staged options carry the edit too, for whatever reads the
+       tune's (dsd_engine_scan_tuning_row_options()). A live rigctl request reads the scope in force. */
+    if (row == scan->row) {
+        scan->staged_has_values = values != NULL;
+        if (values) {
+            scan->staged_values = *values;
+        }
+    }
+    /* A tune still outstanding restages with the new options and lands them itself. Otherwise the receiver's request
+       changed if the width the decoder runs did, or, for a rigctl peer, whether the row sets one of its own. */
+    out->publish_width =
+        dsd_scan_mode_is_analog(dsd_channel_mode_get(state, (size_t)row)) && scan->request == 0 && !scan->retry
+        && (dsd_opts_analog_width_hz(opts) != width_before || dsd_scan_row_edit_width_request_differs(before, values));
+    channel_scan_publish_row(state, scan);
+    return DSD_SCAN_ROW_EDIT_APPLIED;
+}
+
+/* The -Y scan @p session names, or the reason it is not this one. */
+static int
+channel_scan_edit_scan(const dsd_opts* opts, const dsd_state* state, uint32_t session, int row, channel_scan** out) {
+    *out = NULL;
+    if (!opts || !state || opts->scanner_mode != 1 || opts->trunk_scan_enabled == 1) {
+        return DSD_SCAN_ROW_EDIT_UNAVAILABLE;
+    }
+    channel_scan* scan = channel_scan_get(state);
+    if (!scan || session == 0U || session != scan->session || row < 0 || row >= state->lcn_freq_count) {
+        return DSD_SCAN_ROW_EDIT_STALE;
+    }
+    *out = scan;
+    return 0;
+}
+
+int
+dsd_engine_channel_scan_edit_row(dsd_opts* opts, dsd_state* state, uint32_t session, int row, uint32_t field,
+                                 int action, const dsd_scan_row_edit_value* value, dsd_scan_row_edit_result* out) {
+    dsd_scan_row_edit_result local;
+    dsd_scan_row_edit_result* result = out ? out : &local;
+    DSD_MEMSET(result, 0, sizeof(*result));
+    channel_scan* scan = NULL;
+    const int rc = channel_scan_edit_scan(opts, state, session, row, &scan);
+    if (rc != 0) {
+        return rc;
+    }
+    const dsd_scan_mode mode = dsd_channel_mode_get(state, (size_t)row);
+    if (!(dsd_scan_row_edit_fields(mode, 0) & field)) {
+        DSD_SNPRINTF(result->err, sizeof result->err, "%s", "this channel cannot take that setting");
+        return DSD_SCAN_ROW_EDIT_REFUSED;
+    }
+    if (action == DSD_SCAN_ROW_EDIT_SET
+        && !dsd_scan_row_edit_value_valid(mode, field, value, result->err, sizeof result->err)) {
+        return DSD_SCAN_ROW_EDIT_REFUSED;
+    }
+    const channel_scan_row_edit* entry = channel_scan_find_edit(scan, row);
+    dsd_scan_row_edit next;
+    if (entry) {
+        next = entry->edit;
+    } else {
+        DSD_MEMSET(&next, 0, sizeof(next));
+    }
+    if (dsd_scan_row_edit_change(&next, field, (dsd_scan_row_edit_action)action, value) != 0) {
+        DSD_SNPRINTF(result->err, sizeof result->err, "%s", "invalid edit");
+        return DSD_SCAN_ROW_EDIT_REFUSED;
+    }
+    /* A width the DSP rate cannot filter would only skip the row at every visit; the list's own width (RESET) was
+       named when the scan checked the map. */
+    const int rate_hz = dsd_engine_scan_dsp_rate_hz(opts, state);
+    if (field == DSD_SCAN_ROW_FIELD_WIDTH && action != DSD_SCAN_ROW_EDIT_RESET && rate_hz > 0) {
+        const dsd_scan_row_profile* profile = dsd_channel_profile_get(state, (size_t)row);
+        dsd_scan_option_values after;
+        dsd_scan_row_edit_apply(profile ? &profile->values : NULL, &next, mode, &after);
+        char brief[DSD_ANALOG_ERROR_TEXT_MAX] = {0};
+        if (dsd_engine_scan_analog_width_skipped(opts, state, &after, dsd_scan_mode_analog_kind(mode), rate_hz, brief,
+                                                 sizeof brief)) {
+            DSD_SNPRINTF(result->err, sizeof result->err, "%s",
+                         brief[0] ? brief : "the DSP rate cannot filter that width");
+            return DSD_SCAN_ROW_EDIT_REFUSED;
+        }
+    }
+    return channel_scan_install_edit(opts, state, scan, row, &next, result);
+}
+
+int
+dsd_engine_channel_scan_restore_row_edit(dsd_opts* opts, dsd_state* state, uint32_t session, int row, uint32_t fields,
+                                         const dsd_scan_row_edit* edit, dsd_scan_row_edit_result* out) {
+    dsd_scan_row_edit_result local;
+    dsd_scan_row_edit_result* result = out ? out : &local;
+    /* @p edit may be @p out's previous edit: take it before the result is cleared. */
+    dsd_scan_row_edit from = {0};
+    if (edit) {
+        from = *edit;
+    }
+    DSD_MEMSET(result, 0, sizeof(*result));
+    channel_scan* scan = NULL;
+    const int rc = channel_scan_edit_scan(opts, state, session, row, &scan);
+    if (rc != 0) {
+        return rc;
+    }
+    if (!edit) {
+        return DSD_SCAN_ROW_EDIT_UNAVAILABLE;
+    }
+    const channel_scan_row_edit* entry = channel_scan_find_edit(scan, row);
+    dsd_scan_row_edit next = {0};
+    if (entry) {
+        next = entry->edit;
+    }
+    dsd_scan_row_edit_take_fields(&next, &from, fields);
+    return channel_scan_install_edit(opts, state, scan, row, &next, result);
 }

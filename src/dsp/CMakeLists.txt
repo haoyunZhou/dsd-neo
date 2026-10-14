@@ -18,6 +18,8 @@ target_sources(
         simd_fir.cpp
         dsd_filters.c
         pcm_input_staging.c
+        rate_converter.c
+        analog_sink.c
         symbol_levels.c
         dsd_symbol.c
         frame_sync_level.c
@@ -30,6 +32,14 @@ target_sources(
         symbol_timing_debug.c
         analog_rx.c
         analog_ctcss.c
+        analog_dcs.c
+        analog_tone_policy.c
+        analog_voice.c
+        analog_audio.c
+        squelch_floor.c
+        noise_squelch_bank.c
+        nfm_noise_squelch.c
+        pcm_noise_squelch.c
 )
 
 set(_dsd_neo_dsp_target_arch "${CMAKE_SYSTEM_PROCESSOR}")
@@ -92,6 +102,52 @@ endif()
 if(_dsd_neo_dsp_target_arch MATCHES "aarch64|arm64|ARM64")
     target_sources(dsd-neo_dsp PRIVATE simd_fir_neon.cpp)
     target_sources(dsd-neo_dsp PRIVATE simd_widen_neon.cpp)
+endif()
+
+# The SNR estimator drops NaN and infinite samples and rejects a non-finite bias.
+# It runs once per demod block (metrics, not the sample path), and measures no
+# slower with IEEE semantics, so keep them even when global fast-math is on.
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    set_source_files_properties(
+        snr_estimator.cpp
+        PROPERTIES COMPILE_OPTIONS "-fno-fast-math"
+    )
+elseif(MSVC)
+    set_source_files_properties(
+        snr_estimator.cpp
+        PROPERTIES COMPILE_OPTIONS "/fp:precise"
+    )
+endif()
+
+# The analog voice band-pass and AGC (issue #518) turn NaN and infinite samples
+# into silence and keep them out of their filter and envelope state, which
+# fast-math would fold away. They run a few multiply-adds per audio sample, so
+# IEEE semantics cost nothing measurable. The auto squelch's floor tracker
+# promises the same gate for the same samples however they are cut into blocks;
+# fast-math could reassociate its running window sums across a vectorised loop,
+# making them depend on where a block starts. The NFM noise squelch makes the
+# same promise for its band-pass and window sums, on the band-pass bank it
+# shares with the PCM noise squelch, which promises it for its learner too.
+set(_dsd_neo_dsp_ieee_c_sources
+    rate_converter.c
+    analog_sink.c
+    analog_voice.c
+    analog_audio.c
+    squelch_floor.c
+    noise_squelch_bank.c
+    nfm_noise_squelch.c
+    pcm_noise_squelch.c
+)
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    set_source_files_properties(
+        ${_dsd_neo_dsp_ieee_c_sources}
+        PROPERTIES COMPILE_OPTIONS "-fno-fast-math;-fno-math-errno"
+    )
+elseif(MSVC)
+    set_source_files_properties(
+        ${_dsd_neo_dsp_ieee_c_sources}
+        PROPERTIES COMPILE_OPTIONS "/fp:precise"
+    )
 endif()
 
 target_include_directories(

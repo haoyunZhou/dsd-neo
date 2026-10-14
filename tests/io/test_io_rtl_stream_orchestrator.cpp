@@ -32,7 +32,7 @@ struct StubState {
     dsd_opts* last_registered_caller;
     dsd_opts* last_unregistered_active;
     dsd_opts* last_unregistered_caller;
-    long int last_tune_hz;
+    uint32_t last_tune_hz;
     uint64_t last_tune_request_id;
     size_t last_read_count;
 };
@@ -96,8 +96,9 @@ dsd_rtl_stream_open(dsd_opts* opts) {
 }
 
 extern "C" int
-dsd_rtl_stream_read(float* out, size_t count, dsd_opts* opts, const dsd_state* state) {
+dsd_rtl_stream_read_ex(float* out, uint8_t* flags, size_t count, dsd_opts* opts, const dsd_state* state) {
     (void)out;
+    (void)flags;
     (void)state;
     g_stub.read_calls++;
     g_stub.last_open_opts = opts;
@@ -114,7 +115,7 @@ rtl_stream_output_generation(void) {
 }
 
 extern "C" int
-dsd_rtl_stream_tune(dsd_opts* opts, long int frequency) {
+dsd_rtl_stream_tune(dsd_opts* opts, uint32_t frequency) {
     g_stub.tune_calls++;
     g_stub.last_open_opts = opts;
     g_stub.last_tune_hz = frequency;
@@ -122,7 +123,7 @@ dsd_rtl_stream_tune(dsd_opts* opts, long int frequency) {
 }
 
 extern "C" int
-dsd_rtl_stream_tune_tagged(dsd_opts* opts, long int frequency, uint64_t request_id) {
+dsd_rtl_stream_tune_tagged(dsd_opts* opts, uint32_t frequency, uint64_t request_id) {
     g_stub.tagged_tune_calls++;
     g_stub.last_open_opts = opts;
     g_stub.last_tune_hz = frequency;

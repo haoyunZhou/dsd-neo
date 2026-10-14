@@ -320,6 +320,7 @@ jobs:
             dsd-neo_test_ui_qt_call_history_merge \
             dsd-neo_test_ui_qt_call_line \
             dsd-neo_test_ui_qt_auto_start_policy \
+            dsd-neo_test_ui_qt_qml_gc_policy \
             dsd-neo_test_ui_qt_android_host \
             dsd-neo_test_ui_qt_session_state \
             dsd-neo_test_ui_qt_diagnostics_log \
@@ -574,8 +575,8 @@ jobs:
         shell: bash
         run: cmake --build --preset android-app -j
 
-      - name: Test location broker on the JVM
-        run: python3 tests/android/run_location_tests.py --require-tools
+      - name: Test the app's pure Kotlin on the JVM
+        run: python3 tests/android/run_jvm_tests.py --require-tools
 
       - name: Locate the APK
         id: apk
@@ -769,7 +770,8 @@ jobs:
             COPYRIGHT
             THIRD_PARTY.md
             licenses/ezpwd-LGPL-2.1-or-later.txt
-            licenses/pffft-FFTPACK.txt
+            licenses/pffft-LICENSE.txt
+            licenses/pffft-NOTICES.txt
             licenses/libusb-LGPL-2.1-or-later.txt
             licenses/librtlsdr-GPL-2.0-or-later.txt
             licenses/ibm-plex-OFL-1.1.txt
@@ -842,14 +844,34 @@ jobs:
 
       - name: Generate APK SBOM
         if: github.event_name != 'pull_request'
-        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
           file: ${{ steps.names.outputs.APK_PATH }}
           format: spdx-json
           output-file: ${{ steps.names.outputs.APK_PATH }}.spdx.json
           artifact-name: ${{ steps.names.outputs.ART_NAME }}.spdx.json
-          upload-artifact: true
+          upload-artifact: false
           upload-release-assets: false
+
+      - name: Record pinned PFFFT in SBOM
+        if: github.event_name != 'pull_request'
+        shell: bash
+        env:
+          SBOM_PATH: ${{ steps.names.outputs.APK_PATH }}.spdx.json
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            python tools/pffft_metadata.py --spdx "$SBOM_PATH"
+          else
+            python3 tools/pffft_metadata.py --spdx "$SBOM_PATH"
+          fi
+
+      - name: Upload enriched SBOM
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.names.outputs.ART_NAME }}.spdx.json
+          path: ${{ steps.names.outputs.APK_PATH }}.spdx.json
+          retention-days: 7
 
       - name: Attest APK provenance
         if: startsWith(github.ref, 'refs/tags/')
@@ -1017,14 +1039,38 @@ jobs:
         id: aab_sbom
         if: steps.aab.outputs.AAB_PATH != ''
         continue-on-error: true
-        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
           file: ${{ steps.aab.outputs.AAB_PATH }}
           format: spdx-json
           output-file: ${{ steps.aab.outputs.AAB_PATH }}.spdx.json
           artifact-name: ${{ steps.names.outputs.ART_NAME }}.aab.spdx.json
-          upload-artifact: true
+          upload-artifact: false
           upload-release-assets: false
+
+      - name: Record pinned PFFFT in SBOM
+        id: aab_sbom_metadata
+        if: steps.aab.outputs.AAB_PATH != ''
+        continue-on-error: true
+        shell: bash
+        env:
+          SBOM_PATH: ${{ steps.aab.outputs.AAB_PATH }}.spdx.json
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            python tools/pffft_metadata.py --spdx "$SBOM_PATH"
+          else
+            python3 tools/pffft_metadata.py --spdx "$SBOM_PATH"
+          fi
+
+      - name: Upload enriched SBOM
+        id: aab_sbom_upload
+        if: steps.aab.outputs.AAB_PATH != ''
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.names.outputs.ART_NAME }}.aab.spdx.json
+          path: ${{ steps.aab.outputs.AAB_PATH }}.spdx.json
+          retention-days: 7
 
       # The AAB is the artifact that actually reaches users through Play, so a
       # tag attests it exactly like the sideload APK; a maintainer verifies
@@ -1063,6 +1109,8 @@ jobs:
             ${{ steps.aab_verify.outcome }}
             ${{ steps.aab_upload.outcome }}
             ${{ steps.aab_sbom.outcome }}
+            ${{ steps.aab_sbom_metadata.outcome }}
+            ${{ steps.aab_sbom_upload.outcome }}
             ${{ steps.aab_attest.outcome }}
             ${{ steps.aab_attest_sbom.outcome }}
         run: |
@@ -1147,12 +1195,7 @@ jobs:
           name: ${{ needs.build-apk.outputs.art_name }}.spdx.json
           path: dist
 
-      - name: Normalize downloaded SBOM filename
-        shell: bash
-        run: |
-          set -euo pipefail
-          mv -f "dist/${ART_NAME}.spdx.json" "${APK_PATH}.spdx.json"
-
+      # upload-artifact preserves the SBOM basename, including the package extension.
       - name: Verify downloaded release files
         shell: bash
         run: |

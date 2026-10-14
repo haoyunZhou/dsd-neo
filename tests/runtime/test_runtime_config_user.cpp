@@ -10,15 +10,20 @@
  * without touching CLI or environment precedence.
  */
 
+#include <dsd-neo/core/analog_tone.h>
 #include <dsd-neo/core/frontend_types.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/power.h>
 #include <dsd-neo/core/state.h>
+#include <dsd-neo/runtime/analog_channel.h>
+#include <dsd-neo/runtime/analog_tones.h>
 #include <dsd-neo/runtime/config.h>
 #include <dsd-neo/runtime/decode_mode.h>
+#include <dsd-neo/runtime/input_spec.h>
 #include <dsd-neo/runtime/rdio_export.h>
 #include <dsd-neo/runtime/scan_mode.h>
 #include <dsd-neo/runtime/scan_options.h>
+#include <dsd-neo/runtime/squelch.h>
 #include <errno.h>
 #include <math.h>
 #include <memory>
@@ -42,6 +47,17 @@
 #include <unistd.h>
 #define DSD_TEST_RMDIR rmdir
 #endif
+
+/* Removes an empty temp directory with DSD_TEST_RMDIR, since remove() does not remove a directory on native Windows.
+ * Returns 1 and says why when the directory stays, so a test that leaves a file in it fails. */
+static int
+remove_test_dir(const char* dir) {
+    if (DSD_TEST_RMDIR(dir) != 0) {
+        DSD_FPRINTF(stderr, "could not remove temp directory %s: %s\n", dir, strerror(errno));
+        return 1;
+    }
+    return 0;
+}
 
 static int
 write_temp_config(const char* contents, char* out_path, size_t out_sz) {
@@ -734,8 +750,8 @@ test_render_input_variants_and_save_atomic(void) {
     }
 
     (void)remove(save_path);
-    (void)remove(save_subdir);
-    (void)remove(save_dir);
+    rc |= remove_test_dir(save_subdir);
+    rc |= remove_test_dir(save_dir);
     return rc;
 }
 
@@ -1247,6 +1263,39 @@ test_load_and_apply_rtl_digital_resample(void) {
     return rc;
 }
 
+/* Issue #634: the RTL-SDR row names its device "rtl" when no radio spec is to hand; an input switch names UDP, TCP and
+   Pulse inputs as -i and a saved config spell them. Each saves as the input it is. */
+static int
+test_snapshot_names_switched_inputs(void) {
+    static const struct {
+        const char* dev;
+        int source;
+    } cases[] = {
+        {"rtl", DSDCFG_INPUT_RTL},
+        {"rtltcp", DSDCFG_INPUT_RTLTCP},
+        {"udp:127.0.0.1:7360", DSDCFG_INPUT_UDP},
+        {"tcp:audio.example:7355", DSDCFG_INPUT_TCP},
+        {"pulse:mic", DSDCFG_INPUT_PULSE},
+        {"pulse", DSDCFG_INPUT_PULSE},
+    };
+
+    int rc = 0;
+    static dsd_opts opts;
+    static dsd_state state;
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        reset_opts_and_state(opts, state);
+        DSD_SNPRINTF(opts.audio_in_dev, sizeof opts.audio_in_dev, "%s", cases[i].dev);
+        dsdneoUserConfig snap;
+        dsd_snapshot_opts_to_user_config(&opts, &state, &snap);
+        if (!snap.has_input || snap.input_source != cases[i].source) {
+            DSD_FPRINTF(stderr, "snapshot of input %s: source %d, want %d\n", cases[i].dev, snap.input_source,
+                        cases[i].source);
+            rc |= 1;
+        }
+    }
+    return rc;
+}
+
 static int
 test_snapshot_digital_resample_mode(void) {
     static dsd_opts opts;
@@ -1473,6 +1522,83 @@ test_snapshot_roundtrip_zero_rtl_ppm(void) {
     return rc;
 }
 
+/* Issue #518 follow-up: AGC is gain 0, which a save used to leave out and a load could not tell from an omitted key, so
+ * a saved AGC session reloaded on whatever gain was running. 0 is now written and read back as a setting; an omitted
+ * key still keeps the running gain. */
+static int
+test_snapshot_roundtrip_agc_rtl_gain(void) {
+    static dsd_opts opts;
+    static dsd_state state;
+    reset_opts_and_state(opts, state);
+    DSD_SNPRINTF(opts.audio_in_dev, sizeof opts.audio_in_dev, "%s", "soapy:driver=rtlsdr");
+    opts.rtlsdr_center_freq = 155340000U;
+    opts.rtl_gain_value = 0;
+    opts.rtl_dsp_bw_khz = 12;
+    opts.rtl_volume_multiplier = 2;
+
+    dsdneoUserConfig snap;
+    dsd_snapshot_opts_to_user_config(&opts, &state, &snap);
+    int rc = 0;
+    if (!snap.rtl_gain_is_set || snap.rtl_gain != 0) {
+        DSD_FPRINTF(stderr, "snapshot AGC gain should be explicit, got is_set=%d gain=%d\n", snap.rtl_gain_is_set,
+                    snap.rtl_gain);
+        rc |= 1;
+    }
+    char rendered[4096];
+    if (render_config_to_buffer(&snap, rendered, sizeof rendered) != 0) {
+        return 1;
+    }
+    rc |= expect_contains("rendered AGC gain", rendered, "rtl_gain = 0\n");
+
+    char path[DSD_TEST_PATH_MAX];
+    if (write_temp_config(rendered, path, sizeof path) != 0) {
+        return 1;
+    }
+    dsdneoUserConfig cfg_reload;
+    if (dsd_user_config_load(path, &cfg_reload) != 0) {
+        DSD_FPRINTF(stderr, "dsd_user_config_load failed for rendered AGC config %s\n", path);
+        (void)remove(path);
+        return 1;
+    }
+    (void)remove(path);
+    if (!cfg_reload.rtl_gain_is_set || cfg_reload.rtl_gain != 0) {
+        DSD_FPRINTF(stderr, "reloaded AGC gain should stay explicit, got is_set=%d gain=%d\n",
+                    cfg_reload.rtl_gain_is_set, cfg_reload.rtl_gain);
+        rc |= 1;
+    }
+    static dsd_opts opts_reload;
+    static dsd_state state_reload;
+    reset_opts_and_state(opts_reload, state_reload);
+    opts_reload.rtl_gain_value = 30;
+    dsd_apply_user_config_to_opts(&cfg_reload, &opts_reload, &state_reload);
+    if (opts_reload.rtl_gain_value != 0) {
+        DSD_FPRINTF(stderr, "reloaded AGC gain should replace the running gain, got %d\n", opts_reload.rtl_gain_value);
+        rc |= 1;
+    }
+
+    /* An RTL-SDR [input] puts the gain in the spec it builds. */
+    dsdneoUserConfig rtl_cfg = cfg_reload;
+    rtl_cfg.input_source = DSDCFG_INPUT_RTL;
+    rtl_cfg.rtl_device = 0;
+    DSD_SNPRINTF(rtl_cfg.rtl_freq, sizeof rtl_cfg.rtl_freq, "%s", "155.34M");
+    char spec[256];
+    opts_reload.rtl_gain_value = 30;
+    if (dsd_user_config_radio_input_spec(&rtl_cfg, &opts_reload, spec, sizeof spec) != 0
+        || strncmp(spec, "rtl:0:155.34M:0:", strlen("rtl:0:155.34M:0:")) != 0) {
+        DSD_FPRINTF(stderr, "AGC RTL spec should carry gain 0, got %s\n", spec);
+        rc |= 1;
+    }
+    /* Omitted, the running gain stays. */
+    rtl_cfg.rtl_gain_is_set = 0;
+    rtl_cfg.rtl_gain = 0;
+    if (dsd_user_config_radio_input_spec(&rtl_cfg, &opts_reload, spec, sizeof spec) != 0
+        || strncmp(spec, "rtl:0:155.34M:30:", strlen("rtl:0:155.34M:30:")) != 0) {
+        DSD_FPRINTF(stderr, "omitted gain should keep the running gain, got %s\n", spec);
+        rc |= 1;
+    }
+    return rc;
+}
+
 static int
 test_snapshot_rtl_and_rtltcp_device_specs(void) {
     static dsd_opts opts;
@@ -1510,7 +1636,7 @@ test_snapshot_rtl_and_rtltcp_device_specs(void) {
     opts.rtl_gain_value = 28;
     opts.rtlsdr_ppm_error = 3;
     opts.rtl_dsp_bw_khz = 24;
-    opts.rtl_squelch_level = 1e-30;
+    opts.rtl_squelch_level = 1e-30; /* under pwr_to_dB()'s floor: saved at -120 dB, the key's lowest */
     opts.rtl_volume_multiplier = 5;
 
     dsd_snapshot_opts_to_user_config(&opts, &state, &snap);
@@ -1612,6 +1738,354 @@ test_snapshot_disabled_squelch_roundtrips_as_off(void) {
         rc |= 1;
     }
 
+    return rc;
+}
+
+/* [input] rtl_sql_mode / rtl_sql_margin_db (issue #518 follow-up): loaded, carried into an rtl: spec as auto+N (the
+ * level stays in rtl_sql), applied straight to opts on SoapySDR, saved back from the session, and rendered. */
+static int
+test_auto_squelch_keys_roundtrip(void) {
+    static const char* ini = "[input]\n"
+                             "source = \"rtl\"\n"
+                             "rtl_freq = \"162.475M\"\n"
+                             "rtl_sql = -50\n"
+                             "rtl_sql_mode = \"auto\"\n"
+                             "rtl_sql_margin_db = 6\n";
+    char path[DSD_TEST_PATH_MAX];
+    if (write_temp_config(ini, path, sizeof path) != 0) {
+        return 1;
+    }
+    dsdneoUserConfig cfg;
+    int rc = 0;
+    if (dsd_user_config_load(path, &cfg) != 0 || cfg.rtl_sql_mode != DSD_SQUELCH_MODE_AUTO || cfg.rtl_sql_margin_db != 6
+        || cfg.rtl_sql != -50) {
+        DSD_FPRINTF(stderr, "auto squelch keys not loaded (mode %d margin %d sql %d)\n", cfg.rtl_sql_mode,
+                    cfg.rtl_sql_margin_db, cfg.rtl_sql);
+        (void)remove(path);
+        return 1;
+    }
+    (void)remove(path);
+
+    static dsd_opts opts;
+    static dsd_state state;
+    reset_opts_and_state(opts, state);
+    dsd_apply_user_config_to_opts(&cfg, &opts, &state);
+    if (strstr(opts.audio_in_dev, ":auto+6:") == NULL) {
+        DSD_FPRINTF(stderr, "rtl spec without the auto squelch: %s\n", opts.audio_in_dev);
+        rc |= 1;
+    }
+    /* The spec's auto+6 carries no level: rtl_sql is the level beneath it, through the engine's reading of the spec and
+       back out in a save. */
+    (void)dsd_rtl_input_spec_apply(&opts);
+    if (opts.rtl_squelch_mode != DSD_SQUELCH_MODE_AUTO || opts.rtl_squelch_margin_db != 6
+        || fabs(opts.rtl_squelch_level - pow(10.0, -5.0)) > 1e-12) {
+        DSD_FPRINTF(stderr, "rtl load of auto+6 over -50: mode %d margin %d level %g\n", opts.rtl_squelch_mode,
+                    opts.rtl_squelch_margin_db, opts.rtl_squelch_level);
+        rc |= 1;
+    }
+    {
+        dsdneoUserConfig saved;
+        dsd_snapshot_opts_to_user_config(&opts, &state, &saved);
+        if (saved.rtl_sql != -50 || saved.rtl_sql_mode != DSD_SQUELCH_MODE_AUTO) {
+            DSD_FPRINTF(stderr, "rtl load then save: sql %d mode %d\n", saved.rtl_sql, saved.rtl_sql_mode);
+            rc |= 1;
+        }
+    }
+    /* --squelch keeps the level it set. */
+    reset_opts_and_state(opts, state);
+    opts.rtl_squelch_cli_set = 1;
+    opts.rtl_squelch_level = pow(10.0, -7.0);
+    dsd_apply_user_config_to_opts(&cfg, &opts, &state);
+    if (fabs(opts.rtl_squelch_level - pow(10.0, -7.0)) > 1e-15) {
+        DSD_FPRINTF(stderr, "a config's rtl_sql replaced the --squelch level: %g\n", opts.rtl_squelch_level);
+        rc |= 1;
+    }
+
+    /* SoapySDR: straight to opts. The level stays for a switch back. */
+    reset_opts_and_state(opts, state);
+    dsdneoUserConfig soapy = cfg;
+    soapy.input_source = DSDCFG_INPUT_SOAPY;
+    DSD_SNPRINTF(soapy.soapy_args, sizeof soapy.soapy_args, "%s", "driver=test");
+    dsd_apply_user_config_to_opts(&soapy, &opts, &state);
+    if (opts.rtl_squelch_mode != DSD_SQUELCH_MODE_AUTO || opts.rtl_squelch_margin_db != 6
+        || fabs(opts.rtl_squelch_level - pow(10.0, -5.0)) > 1e-12) {
+        DSD_FPRINTF(stderr, "soapy apply of auto+6: mode %d margin %d level %g\n", opts.rtl_squelch_mode,
+                    opts.rtl_squelch_margin_db, opts.rtl_squelch_level);
+        rc |= 1;
+    }
+    /* level, and an unset margin, read as the defaults. */
+    soapy.rtl_sql_mode = DSD_SQUELCH_MODE_LEVEL;
+    dsd_apply_user_config_to_opts(&soapy, &opts, &state);
+    if (opts.rtl_squelch_mode != DSD_SQUELCH_MODE_LEVEL) {
+        DSD_FPRINTF(stderr, "soapy apply of level kept auto\n");
+        rc |= 1;
+    }
+    soapy.rtl_sql_mode = DSD_SQUELCH_MODE_AUTO;
+    soapy.rtl_sql_margin_db = 0;
+    dsd_apply_user_config_to_opts(&soapy, &opts, &state);
+    if (opts.rtl_squelch_margin_db != DSD_SQUELCH_MARGIN_DEFAULT_DB) {
+        DSD_FPRINTF(stderr, "an unset margin read %d\n", opts.rtl_squelch_margin_db);
+        rc |= 1;
+    }
+
+    /* The save takes the session's setting and renders both keys; a level setting renders neither. */
+    reset_opts_and_state(opts, state);
+    DSD_SNPRINTF(opts.audio_in_dev, sizeof opts.audio_in_dev, "%s", "rtl:0:162.475M:22:-2:24:auto+6:2");
+    opts.rtlsdr_center_freq = 162475000U;
+    opts.rtl_squelch_level = pow(10.0, -5.0);
+    opts.rtl_squelch_mode = DSD_SQUELCH_MODE_AUTO;
+    opts.rtl_squelch_margin_db = 6;
+    dsdneoUserConfig snap;
+    dsd_snapshot_opts_to_user_config(&opts, &state, &snap);
+    char text[8192];
+    if (snap.rtl_sql_mode != DSD_SQUELCH_MODE_AUTO || snap.rtl_sql_margin_db != 6 || snap.rtl_sql != -50
+        || render_config_to_buffer(&snap, text, sizeof text) != 0) {
+        DSD_FPRINTF(stderr, "snapshot of auto+6: mode %d margin %d sql %d\n", snap.rtl_sql_mode, snap.rtl_sql_margin_db,
+                    snap.rtl_sql);
+        return 1;
+    }
+    rc |= expect_contains("auto render", text, "rtl_sql_mode = \"auto\"");
+    rc |= expect_contains("auto render", text, "rtl_sql_margin_db = 6");
+    rc |= expect_contains("auto render", text, "rtl_sql = -50");
+    opts.rtl_squelch_mode = DSD_SQUELCH_MODE_LEVEL;
+    dsd_snapshot_opts_to_user_config(&opts, &state, &snap);
+    if (render_config_to_buffer(&snap, text, sizeof text) != 0 || strstr(text, "rtl_sql_mode") != NULL
+        || strstr(text, "rtl_sql_margin_db") != NULL) {
+        DSD_FPRINTF(stderr, "a level setting rendered the auto keys:\n%s\n", text);
+        rc |= 1;
+    }
+    return rc;
+}
+
+/* rtl_sql_mode = noise (issue #518 follow-up): loaded, carried into an rtl: spec as noise+N over the level, applied
+ * straight to opts on SoapySDR, saved back from the session, and rendered. */
+static int
+test_noise_squelch_keys_roundtrip(void) {
+    static const char* ini = "[input]\n"
+                             "source = \"rtl\"\n"
+                             "rtl_freq = \"162.475M\"\n"
+                             "rtl_sql = -50\n"
+                             "rtl_sql_mode = \"noise\"\n"
+                             "rtl_sql_margin_db = 14\n";
+    char path[DSD_TEST_PATH_MAX];
+    if (write_temp_config(ini, path, sizeof path) != 0) {
+        return 1;
+    }
+    dsdneoUserConfig cfg;
+    int rc = 0;
+    if (dsd_user_config_load(path, &cfg) != 0 || cfg.rtl_sql_mode != DSD_SQUELCH_MODE_NOISE
+        || cfg.rtl_sql_margin_db != 14) {
+        DSD_FPRINTF(stderr, "noise squelch keys not loaded (mode %d margin %d)\n", cfg.rtl_sql_mode,
+                    cfg.rtl_sql_margin_db);
+        (void)remove(path);
+        return 1;
+    }
+    (void)remove(path);
+
+    static dsd_opts opts;
+    static dsd_state state;
+    reset_opts_and_state(opts, state);
+    dsd_apply_user_config_to_opts(&cfg, &opts, &state);
+    if (strstr(opts.audio_in_dev, ":noise+14:") == NULL) {
+        DSD_FPRINTF(stderr, "rtl spec without the noise squelch: %s\n", opts.audio_in_dev);
+        rc |= 1;
+    }
+    (void)dsd_rtl_input_spec_apply(&opts);
+    if (opts.rtl_squelch_mode != DSD_SQUELCH_MODE_NOISE || opts.rtl_squelch_margin_db != 14
+        || fabs(opts.rtl_squelch_level - pow(10.0, -5.0)) > 1e-12) {
+        DSD_FPRINTF(stderr, "rtl load of noise+14 over -50: mode %d margin %d level %g\n", opts.rtl_squelch_mode,
+                    opts.rtl_squelch_margin_db, opts.rtl_squelch_level);
+        rc |= 1;
+    }
+
+    reset_opts_and_state(opts, state);
+    dsdneoUserConfig soapy = cfg;
+    soapy.input_source = DSDCFG_INPUT_SOAPY;
+    DSD_SNPRINTF(soapy.soapy_args, sizeof soapy.soapy_args, "%s", "driver=test");
+    dsd_apply_user_config_to_opts(&soapy, &opts, &state);
+    if (opts.rtl_squelch_mode != DSD_SQUELCH_MODE_NOISE || opts.rtl_squelch_margin_db != 14) {
+        DSD_FPRINTF(stderr, "soapy apply of noise+14: mode %d margin %d\n", opts.rtl_squelch_mode,
+                    opts.rtl_squelch_margin_db);
+        rc |= 1;
+    }
+
+    dsdneoUserConfig snap;
+    dsd_snapshot_opts_to_user_config(&opts, &state, &snap);
+    char text[8192];
+    if (snap.rtl_sql_mode != DSD_SQUELCH_MODE_NOISE || snap.rtl_sql_margin_db != 14
+        || render_config_to_buffer(&snap, text, sizeof text) != 0) {
+        DSD_FPRINTF(stderr, "snapshot of noise+14: mode %d margin %d\n", snap.rtl_sql_mode, snap.rtl_sql_margin_db);
+        return 1;
+    }
+    rc |= expect_contains("noise render", text, "rtl_sql_mode = \"noise\"");
+    rc |= expect_contains("noise render", text, "rtl_sql_margin_db = 14");
+    return rc;
+}
+
+/* The [input] squelch keys on audio input (issue #628): a PCM source's rtl_sql / rtl_sql_mode / rtl_sql_margin_db apply
+ * to the session when they are present (the noise squelch runs there now, and the level always did), a PCM config
+ * without them (one saved before audio input had a squelch) leaves the session's squelch alone (a runtime load must not
+ * switch a live one off), --squelch wins, and a PCM session's save always writes the keys, off and the unset level
+ * included, as an RTL session's does. */
+static int
+test_pcm_squelch_keys_roundtrip(void) {
+    static const char* ini = "[input]\n"
+                             "source = \"tcp\"\n"
+                             "tcp_host = \"127.0.0.1\"\n"
+                             "tcp_port = 7355\n"
+                             "rtl_sql = -40\n"
+                             "rtl_sql_mode = \"noise\"\n"
+                             "rtl_sql_margin_db = 8\n";
+    char path[DSD_TEST_PATH_MAX];
+    if (write_temp_config(ini, path, sizeof path) != 0) {
+        return 1;
+    }
+    dsdneoUserConfig cfg;
+    int rc = 0;
+    if (dsd_user_config_load(path, &cfg) != 0 || !cfg.rtl_sql_is_set || cfg.rtl_sql_mode != DSD_SQUELCH_MODE_NOISE) {
+        DSD_FPRINTF(stderr, "tcp squelch keys not loaded (set %d mode %d)\n", cfg.rtl_sql_is_set, cfg.rtl_sql_mode);
+        (void)remove(path);
+        return 1;
+    }
+    (void)remove(path);
+
+    static dsd_opts opts;
+    static dsd_state state;
+    reset_opts_and_state(opts, state);
+    dsd_apply_user_config_to_opts(&cfg, &opts, &state);
+    if (opts.rtl_squelch_mode != DSD_SQUELCH_MODE_NOISE || opts.rtl_squelch_margin_db != 8
+        || fabs(opts.rtl_squelch_level - pow(10.0, -4.0)) > 1e-12) {
+        DSD_FPRINTF(stderr, "tcp apply of noise+8 over -40: mode %d margin %d level %g\n", opts.rtl_squelch_mode,
+                    opts.rtl_squelch_margin_db, opts.rtl_squelch_level);
+        rc |= 1;
+    }
+
+    /* A PCM config without the keys: the session's squelch stays. */
+    dsdneoUserConfig bare = cfg;
+    bare.rtl_sql_is_set = 0;
+    bare.rtl_sql = 0;
+    bare.rtl_sql_mode = DSD_SQUELCH_MODE_LEVEL;
+    const dsd_squelch_setting noise12 = dsd_squelch_setting_noise(12);
+    dsd_squelch_setting_store(&opts, &noise12);
+    dsd_apply_user_config_to_opts(&bare, &opts, &state);
+    if (opts.rtl_squelch_mode != DSD_SQUELCH_MODE_NOISE || opts.rtl_squelch_margin_db != 12) {
+        DSD_FPRINTF(stderr, "a PCM config without squelch keys changed the squelch: mode %d margin %d\n",
+                    opts.rtl_squelch_mode, opts.rtl_squelch_margin_db);
+        rc |= 1;
+    }
+
+    /* --squelch wins. */
+    reset_opts_and_state(opts, state);
+    opts.rtl_squelch_cli_set = 1;
+    opts.rtl_squelch_level = pow(10.0, -7.0);
+    dsd_apply_user_config_to_opts(&cfg, &opts, &state);
+    if (opts.rtl_squelch_mode != DSD_SQUELCH_MODE_LEVEL || fabs(opts.rtl_squelch_level - pow(10.0, -7.0)) > 1e-15) {
+        DSD_FPRINTF(stderr, "a PCM config replaced the --squelch setting: mode %d\n", opts.rtl_squelch_mode);
+        rc |= 1;
+    }
+
+    /* The save: a tcp session under noise+8 writes the keys, and one with the squelch off writes it off. */
+    reset_opts_and_state(opts, state);
+    DSD_SNPRINTF(opts.audio_in_dev, sizeof opts.audio_in_dev, "%s", "tcp:127.0.0.1:7355");
+    opts.audio_in_type = AUDIO_IN_TCP;
+    opts.rtl_squelch_level = pow(10.0, -4.0);
+    opts.rtl_squelch_mode = DSD_SQUELCH_MODE_NOISE;
+    opts.rtl_squelch_margin_db = 8;
+    dsdneoUserConfig snap;
+    dsd_snapshot_opts_to_user_config(&opts, &state, &snap);
+    char text[8192];
+    if (!snap.rtl_sql_is_set || render_config_to_buffer(&snap, text, sizeof text) != 0) {
+        DSD_FPRINTF(stderr, "snapshot of a tcp session's noise+8 not set\n");
+        return 1;
+    }
+    rc |= expect_contains("tcp noise render", text, "rtl_sql_mode = \"noise\"");
+    rc |= expect_contains("tcp noise render", text, "rtl_sql_margin_db = 8");
+    rc |= expect_contains("tcp noise render", text, "rtl_sql = -40");
+    opts.rtl_squelch_mode = DSD_SQUELCH_MODE_LEVEL;
+    opts.rtl_squelch_level = 0.0;
+    dsd_snapshot_opts_to_user_config(&opts, &state, &snap);
+    if (render_config_to_buffer(&snap, text, sizeof text) != 0) {
+        return 1;
+    }
+    rc |= expect_contains("tcp off render", text, "rtl_sql = 0");
+    /* Loaded back over a session running noise, that save switches the squelch off again. */
+    if (write_temp_config(text, path, sizeof path) != 0) {
+        return 1;
+    }
+    dsdneoUserConfig off;
+    const int loaded = dsd_user_config_load(path, &off);
+    (void)remove(path);
+    const dsd_squelch_setting noise10 = dsd_squelch_setting_noise(10);
+    dsd_squelch_setting_store(&opts, &noise10);
+    if (loaded != 0 || !off.rtl_sql_is_set) {
+        DSD_FPRINTF(stderr, "the saved off squelch did not load (rc %d set %d)\n", loaded, off.rtl_sql_is_set);
+        rc |= 1;
+    } else {
+        dsd_apply_user_config_to_opts(&off, &opts, &state);
+        if (opts.rtl_squelch_mode != DSD_SQUELCH_MODE_LEVEL || !dsd_squelch_is_off(opts.rtl_squelch_level)) {
+            DSD_FPRINTF(stderr, "reloading a saved off squelch left mode %d level %g\n", opts.rtl_squelch_mode,
+                        opts.rtl_squelch_level);
+            rc |= 1;
+        }
+    }
+    /* The unset level (-110 dB) saves as -110, inside the key's -120..0 range: a default Pulse session's save validates
+       without a range warning, and loads back the same threshold, so a level gate decides as it did before. */
+    DSD_SNPRINTF(opts.audio_in_dev, sizeof opts.audio_in_dev, "%s", "pulse");
+    opts.audio_in_type = AUDIO_IN_PULSE;
+    opts.rtl_squelch_mode = DSD_SQUELCH_MODE_LEVEL;
+    opts.rtl_squelch_level = pow(10.0, -11.0);
+    dsd_snapshot_opts_to_user_config(&opts, &state, &snap);
+    if (render_config_to_buffer(&snap, text, sizeof text) != 0) {
+        return 1;
+    }
+    rc |= expect_contains("pulse unset level render", text, "rtl_sql = -110");
+    if (write_temp_config(text, path, sizeof path) != 0) {
+        return 1;
+    }
+    dsdcfg_diagnostics_t diags;
+    DSD_MEMSET(&diags, 0, sizeof(diags));
+    const int validated = dsd_user_config_validate(path, &diags);
+    (void)remove(path);
+    for (int i = 0; i < diags.count; i++) {
+        if (strstr(diags.items[i].key, "rtl_sql") != NULL) {
+            DSD_FPRINTF(stderr, "a default Pulse save's %s does not validate: %s\n", diags.items[i].key,
+                        diags.items[i].message);
+            rc |= 1;
+        }
+    }
+    if (validated != 0 || diags.error_count != 0) {
+        DSD_FPRINTF(stderr, "a default Pulse save does not validate (rc %d, %d errors)\n", validated,
+                    diags.error_count);
+        rc |= 1;
+    }
+    dsdcfg_diags_free(&diags);
+    if (write_temp_config(text, path, sizeof path) != 0) {
+        return 1;
+    }
+    dsdneoUserConfig unset;
+    const int unset_loaded = dsd_user_config_load(path, &unset);
+    (void)remove(path);
+    opts.rtl_squelch_level = pow(10.0, -6.0);
+    if (unset_loaded != 0) {
+        DSD_FPRINTF(stderr, "the saved unset level did not load (rc %d)\n", unset_loaded);
+        rc |= 1;
+    } else {
+        dsd_apply_user_config_to_opts(&unset, &opts, &state);
+        const double want = pow(10.0, -11.0);
+        if (fabs(opts.rtl_squelch_level - want) > want * 1e-9) {
+            DSD_FPRINTF(stderr, "the saved unset level reloaded as %g, not %g\n", opts.rtl_squelch_level, want);
+            rc |= 1;
+        }
+    }
+    /* A WAV session's level is saved too. */
+    DSD_SNPRINTF(opts.audio_in_dev, sizeof opts.audio_in_dev, "%s", "capture.wav");
+    opts.audio_in_type = AUDIO_IN_WAV;
+    opts.rtl_squelch_level = pow(10.0, -6.0);
+    dsd_snapshot_opts_to_user_config(&opts, &state, &snap);
+    if (render_config_to_buffer(&snap, text, sizeof text) != 0) {
+        return 1;
+    }
+    rc |= expect_contains("wav level render", text, "rtl_sql = -60");
     return rc;
 }
 
@@ -2385,6 +2859,9 @@ test_persistence_gap_schema_rows(void) {
         {"trunking", "scan_voice_hold_ms"},
         {"trunking", "scan_max_visit_ms"},
         {"analog", "nfm_bandwidth_hz"},
+        {"analog", "am_bandwidth_hz"},
+        {"analog", "tone_filter"},
+        {"analog", "tone_list"},
     };
 
     for (size_t i = 0; i < sizeof expected / sizeof expected[0]; i++) {
@@ -2393,6 +2870,300 @@ test_persistence_gap_schema_rows(void) {
             rc |= 1;
         }
     }
+    return rc;
+}
+
+static int
+load_am_config_text(const char* ini, dsdneoUserConfig* cfg) {
+    char path[DSD_TEST_PATH_MAX];
+    if (write_temp_config(ini, path, sizeof path) != 0) {
+        return 1;
+    }
+    const int load_rc = dsd_user_config_load(path, cfg);
+    (void)remove(path);
+    return load_rc;
+}
+
+/*
+ * Issue #524: [mode] decode = am and [analog] am_bandwidth_hz ride INI -> cfg -> opts -> snapshot -> render. 0 in the
+ * options is the AM default, not a request, so a save writes the key only for an explicit width (6000 included); the
+ * section itself is always written, so a config saved at the default loads back as the default. A width outside
+ * 5000..20000, 0 or not whole Hz, is refused by the loader, which keeps the width it had loaded (the default, for a
+ * base file).
+ */
+static int
+test_am_mode_and_bandwidth_roundtrip(void) {
+    int rc = 0;
+    dsdneoUserConfig cfg;
+    if (load_am_config_text("[mode]\ndecode = am\n[analog]\nam_bandwidth_hz = 8000\n", &cfg) != 0) {
+        DSD_FPRINTF(stderr, "AM config failed to load\n");
+        return 1;
+    }
+    if (!cfg.has_mode || cfg.decode_mode != DSDCFG_MODE_AM || !cfg.has_analog || cfg.analog_am_bandwidth_hz != 8000) {
+        DSD_FPRINTF(stderr, "FAIL: AM config did not load: mode=%d has_analog=%d width=%d\n", (int)cfg.decode_mode,
+                    cfg.has_analog, cfg.analog_am_bandwidth_hz);
+        rc |= 1;
+    }
+    auto opts_storage = std::unique_ptr<dsd_opts>(new dsd_opts{});
+    auto state_storage = std::unique_ptr<dsd_state>(new dsd_state{});
+    dsd_opts& opts = *opts_storage;
+    dsd_state& state = *state_storage;
+    reset_opts_and_state(opts, state);
+    dsd_apply_user_config_to_opts(&cfg, &opts, &state);
+    if (opts.analog_am_bandwidth_hz != 8000 || opts.analog_demod != DSD_ANALOG_DEMOD_AM || opts.analog_only != 1
+        || dsd_infer_decode_mode_preset(&opts) != DSDCFG_MODE_AM) {
+        DSD_FPRINTF(stderr, "FAIL: AM config did not reach dsd_opts: width=%d kind=%d analog_only=%d\n",
+                    opts.analog_am_bandwidth_hz, opts.analog_demod, opts.analog_only);
+        rc |= 1;
+    }
+
+    dsdneoUserConfig snap;
+    dsd_snapshot_opts_to_user_config(&opts, &state, &snap);
+    char rendered[8192];
+    if (render_config_to_buffer(&snap, rendered, sizeof rendered) != 0) {
+        return 1;
+    }
+    rc |= expect_contains("AM decode mode", rendered, "decode = \"am\"\n");
+    rc |= expect_contains("explicit AM width", rendered, "[analog]\nam_bandwidth_hz = 8000\n");
+
+    opts.analog_am_bandwidth_hz = DSD_ANALOG_AM_WIDTH_DEFAULT_HZ;
+    dsd_snapshot_opts_to_user_config(&opts, &state, &snap);
+    if (render_config_to_buffer(&snap, rendered, sizeof rendered) != 0) {
+        return 1;
+    }
+    rc |= expect_contains("explicit default-valued AM width", rendered, "am_bandwidth_hz = 6000\n");
+
+    opts.analog_am_bandwidth_hz = 0;
+    dsd_snapshot_opts_to_user_config(&opts, &state, &snap);
+    if (render_config_to_buffer(&snap, rendered, sizeof rendered) != 0) {
+        return 1;
+    }
+    if (strstr(rendered, "am_bandwidth_hz") != NULL || !strstr(rendered, "[analog]\n")) {
+        DSD_FPRINTF(stderr, "FAIL: the default AM width was saved, or its section left out:\n%s\n", rendered);
+        rc |= 1;
+    }
+    if (load_am_config_text(rendered, &cfg) != 0 || !cfg.has_analog || cfg.analog_am_bandwidth_hz != 0) {
+        DSD_FPRINTF(stderr, "FAIL: a saved AM default did not load back as the default\n");
+        rc |= 1;
+    }
+    opts.analog_am_bandwidth_hz = 12000;
+    dsd_apply_user_config_to_opts(&cfg, &opts, &state);
+    if (opts.analog_am_bandwidth_hz != 0) {
+        DSD_FPRINTF(stderr, "FAIL: loading a config saved at the AM default kept width %d\n",
+                    opts.analog_am_bandwidth_hz);
+        rc |= 1;
+    }
+
+    /* Each invalid value follows a valid width in the same section: the loader refuses it and keeps that width, so a
+       value it took instead (0 as the default included) reads as a change. */
+    const char* invalid[] = {"25000", "6k", "4999", "0"};
+    for (const char* value : invalid) {
+        char ini[128];
+        DSD_SNPRINTF(ini, sizeof ini, "[analog]\nam_bandwidth_hz = 10000\nam_bandwidth_hz = %s\n", value);
+        if (load_am_config_text(ini, &cfg) != 0 || cfg.analog_am_bandwidth_hz != 10000) {
+            DSD_FPRINTF(stderr, "FAIL: invalid AM width %s was not refused (width %d)\n", value,
+                        cfg.analog_am_bandwidth_hz);
+            rc |= 1;
+        }
+    }
+    /* A config without [analog] leaves the configured width alone. */
+    reset_opts_and_state(opts, state);
+    opts.analog_am_bandwidth_hz = 15000;
+    if (load_am_config_text("[mode]\ndecode = \"am\"\n", &cfg) != 0) {
+        return 1;
+    }
+    dsd_apply_user_config_to_opts(&cfg, &opts, &state);
+    if (opts.analog_am_bandwidth_hz != 15000 || opts.analog_demod != DSD_ANALOG_DEMOD_AM) {
+        DSD_FPRINTF(stderr, "FAIL: a config without [analog] changed the AM width to %d\n",
+                    opts.analog_am_bandwidth_hz);
+        rc |= 1;
+    }
+    dsd_state_ext_free_all(&state);
+    return rc;
+}
+
+/*
+ * Issue #527: [analog] tone_filter and tone_list ride INI -> cfg -> opts -> snapshot -> render. The mode is written
+ * when it is on, the list whenever there is one (off keeps it), and both load back. A refused list, or a list policy
+ * with no list, applies as off. A scan row's own policy runs over dsd_opts while the row is on air and is never what a
+ * save writes: the configured one is.
+ */
+static int
+test_tone_policy_roundtrip(void) {
+    int rc = 0;
+    dsdneoUserConfig cfg;
+    if (load_am_config_text("[analog]\ntone_filter = allow\ntone_list = \"d023/100\"\n", &cfg) != 0) {
+        return 1;
+    }
+    char list[DSD_TONE_LIST_TEXT_MAX + 1] = "";
+    (void)dsd_tone_set_format(&cfg.analog_tone_set, list, sizeof list);
+    if (!cfg.has_analog || cfg.analog_tone_filter != DSD_TONE_FILTER_ALLOW || strcmp(list, "100.0/D023N") != 0) {
+        DSD_FPRINTF(stderr, "FAIL: tone policy did not load: mode=%d list=%s\n", cfg.analog_tone_filter, list);
+        rc |= 1;
+    }
+    auto opts_storage = std::unique_ptr<dsd_opts>(new dsd_opts{});
+    auto state_storage = std::unique_ptr<dsd_state>(new dsd_state{});
+    dsd_opts& opts = *opts_storage;
+    dsd_state& state = *state_storage;
+    reset_opts_and_state(opts, state);
+    dsd_apply_user_config_to_opts(&cfg, &opts, &state);
+    if (opts.analog_tone_filter != DSD_TONE_FILTER_ALLOW
+        || !dsd_tone_set_equal(&opts.analog_tone_set, &cfg.analog_tone_set)) {
+        DSD_FPRINTF(stderr, "FAIL: tone policy did not reach dsd_opts\n");
+        rc |= 1;
+    }
+    dsdneoUserConfig snap;
+    dsd_snapshot_opts_to_user_config(&opts, &state, &snap);
+    char rendered[8192];
+    if (render_config_to_buffer(&snap, rendered, sizeof rendered) != 0) {
+        return 1;
+    }
+    rc |= expect_contains("tone policy", rendered, "tone_filter = \"allow\"\ntone_list = \"100.0/D023N\"\n");
+
+    /* A row's own policy, on air: the save still writes the configured one. */
+    if (dsd_scan_mode_begin(&opts, &state) != 0 || dsd_scan_mode_enter(&opts, &state, DSD_SCAN_MODE_NFM) != 0) {
+        return 1;
+    }
+    dsd_scan_option_values row = {};
+    row.present = DSD_SCAN_OPT_TONE;
+    row.tone_filter = DSD_TONE_FILTER_BLOCK;
+    if (dsd_tone_set_parse("67.0", &row.tone_set, NULL, 0) != 0 || dsd_scan_mode_options(&opts, &state, &row) != 0
+        || opts.analog_tone_filter != DSD_TONE_FILTER_BLOCK) {
+        DSD_FPRINTF(stderr, "FAIL: the row policy did not go on air\n");
+        rc |= 1;
+    }
+    dsd_snapshot_opts_to_user_config(&opts, &state, &snap);
+    if (render_config_to_buffer(&snap, rendered, sizeof rendered) != 0) {
+        return 1;
+    }
+    rc |= expect_contains("configured policy under a row", rendered,
+                          "tone_filter = \"allow\"\ntone_list = \"100.0/D023N\"\n");
+    if (strstr(rendered, "tone_filter = \"block\"") || strstr(rendered, "tone_list = \"67.0\"")) {
+        DSD_FPRINTF(stderr, "FAIL: a row's tone policy was saved:\n%s\n", rendered);
+        rc |= 1;
+    }
+    dsd_scan_mode_leave(&opts, &state);
+
+    /* Off keeps the list; a saved off with a list loads back as off with the list. */
+    opts.analog_tone_filter = DSD_TONE_FILTER_OFF;
+    dsd_snapshot_opts_to_user_config(&opts, &state, &snap);
+    if (render_config_to_buffer(&snap, rendered, sizeof rendered) != 0) {
+        return 1;
+    }
+    if (strstr(rendered, "tone_filter") || !strstr(rendered, "[analog]\ntone_list = \"100.0/D023N\"\n")) {
+        DSD_FPRINTF(stderr, "FAIL: off should save the list alone:\n%s\n", rendered);
+        rc |= 1;
+    }
+    if (load_am_config_text(rendered, &cfg) != 0 || cfg.analog_tone_filter != DSD_TONE_FILTER_OFF
+        || dsd_tone_set_count(&cfg.analog_tone_set) != 2) {
+        DSD_FPRINTF(stderr, "FAIL: a saved off with a list did not load back\n");
+        rc |= 1;
+    }
+
+    /* A refused list, and a list policy without a list, apply as off. */
+    static const char* const off[] = {"[analog]\ntone_filter = allow\ntone_list = 100.0,67.0\n",
+                                      "[analog]\ntone_filter = block\n",
+                                      "[analog]\ntone_filter = allow\ntone_list = 161.0\n"};
+    for (const char* ini : off) {
+        opts.analog_tone_filter = DSD_TONE_FILTER_BLOCK;
+        if (load_am_config_text(ini, &cfg) != 0) {
+            return 1;
+        }
+        dsd_apply_user_config_to_opts(&cfg, &opts, &state);
+        if (opts.analog_tone_filter != DSD_TONE_FILTER_OFF) {
+            DSD_FPRINTF(stderr, "FAIL: %s did not apply as off\n", ini);
+            rc |= 1;
+        }
+    }
+    /* A refused mode keeps the one already loaded. */
+    if (load_am_config_text("[analog]\ntone_filter = block\ntone_filter = deny\n", &cfg) != 0
+        || cfg.analog_tone_filter != DSD_TONE_FILTER_BLOCK) {
+        DSD_FPRINTF(stderr, "FAIL: a refused tone_filter replaced the one loaded\n");
+        rc |= 1;
+    }
+    dsd_state_ext_free_all(&state);
+    return rc;
+}
+
+/*
+ * The live tone-filter editor (DSD_APP_CMD_TONE_FILTER_SET) edits the configured policy through
+ * dsd_scan_mode_set_configured_tone_policy(). Edited while an nfm row's own policy is on air, the edit is what a save
+ * writes and loads back, never the row's; edited outside a row it is in force at once and saved the same way, off with
+ * its list kept.
+ */
+static int
+test_tone_policy_edit_roundtrip(void) {
+    int rc = 0;
+    auto opts_storage = std::unique_ptr<dsd_opts>(new dsd_opts{});
+    auto state_storage = std::unique_ptr<dsd_state>(new dsd_state{});
+    dsd_opts& opts = *opts_storage;
+    dsd_state& state = *state_storage;
+    reset_opts_and_state(opts, state);
+    opts.analog_tone_filter = DSD_TONE_FILTER_ALLOW;
+    dsd_tone_set row_set = {};
+    dsd_tone_set edited = {};
+    if (dsd_tone_set_parse("100.0", &opts.analog_tone_set, NULL, 0) != 0
+        || dsd_tone_set_parse("67.0", &row_set, NULL, 0) != 0
+        || dsd_tone_set_parse("D023I/71.9", &edited, NULL, 0) != 0) {
+        return 1;
+    }
+    if (dsd_scan_mode_begin(&opts, &state) != 0 || dsd_scan_mode_enter(&opts, &state, DSD_SCAN_MODE_NFM) != 0) {
+        return 1;
+    }
+    dsd_scan_option_values row = {};
+    row.present = DSD_SCAN_OPT_TONE;
+    row.tone_filter = DSD_TONE_FILTER_BLOCK;
+    row.tone_set = row_set;
+    if (dsd_scan_mode_options(&opts, &state, &row) != 0) {
+        return 1;
+    }
+    if (dsd_scan_mode_set_configured_tone_policy(&opts, &state, DSD_TONE_FILTER_BLOCK, &edited) != 0
+        || opts.analog_tone_filter != DSD_TONE_FILTER_BLOCK
+        || dsd_tone_set_equal(&opts.analog_tone_set, &row_set) == 0) {
+        DSD_FPRINTF(stderr, "FAIL: the row's own policy should shadow the edit\n");
+        rc |= 1;
+    }
+    dsdneoUserConfig snap;
+    dsd_snapshot_opts_to_user_config(&opts, &state, &snap);
+    char rendered[8192];
+    if (render_config_to_buffer(&snap, rendered, sizeof rendered) != 0) {
+        return 1;
+    }
+    rc |=
+        expect_contains("edited policy under a row", rendered, "tone_filter = \"block\"\ntone_list = \"71.9/D023I\"\n");
+    if (strstr(rendered, "tone_list = \"67.0\"") != nullptr || strstr(rendered, "tone_list = \"100.0\"") != nullptr) {
+        DSD_FPRINTF(stderr, "FAIL: the row's or the old policy was saved:\n%s\n", rendered);
+        rc |= 1;
+    }
+    dsdneoUserConfig loaded;
+    if (load_am_config_text(rendered, &loaded) != 0 || loaded.analog_tone_filter != DSD_TONE_FILTER_BLOCK
+        || dsd_tone_set_equal(&loaded.analog_tone_set, &edited) == 0) {
+        DSD_FPRINTF(stderr, "FAIL: the edited policy did not load back\n");
+        rc |= 1;
+    }
+    dsd_scan_mode_leave(&opts, &state);
+    if (opts.analog_tone_filter != DSD_TONE_FILTER_BLOCK || dsd_tone_set_equal(&opts.analog_tone_set, &edited) == 0) {
+        DSD_FPRINTF(stderr, "FAIL: the row's departure did not restore the edited policy\n");
+        rc |= 1;
+    }
+
+    /* No row: the edit is in force at once; off keeps its list, and saves and loads back as off with the list. */
+    if (dsd_scan_mode_set_configured_tone_policy(&opts, &state, DSD_TONE_FILTER_OFF, &edited) != 1
+        || opts.analog_tone_filter != DSD_TONE_FILTER_OFF) {
+        DSD_FPRINTF(stderr, "FAIL: the edit outside a row is not in force\n");
+        rc |= 1;
+    }
+    dsd_snapshot_opts_to_user_config(&opts, &state, &snap);
+    if (render_config_to_buffer(&snap, rendered, sizeof rendered) != 0) {
+        return 1;
+    }
+    if (strstr(rendered, "tone_filter") != nullptr || strstr(rendered, "tone_list = \"71.9/D023I\"\n") == nullptr
+        || load_am_config_text(rendered, &loaded) != 0 || loaded.analog_tone_filter != DSD_TONE_FILTER_OFF
+        || dsd_tone_set_equal(&loaded.analog_tone_set, &edited) == 0) {
+        DSD_FPRINTF(stderr, "FAIL: an edited off did not save its list alone:\n%s\n", rendered);
+        rc |= 1;
+    }
+    dsd_state_ext_free_all(&state);
     return rc;
 }
 
@@ -2868,6 +3639,245 @@ test_squelch_snapshot_uses_configured_not_row_override(void) {
 }
 
 /*
+ * Issue #526: an nfm row's analog class and its --nfm-bandwidth-hz are effective state, not user defaults. Config->Save
+ * taken while such a row is on air keeps the configured decode mode and writes the row's width nowhere, and leaving
+ * the row puts the configured decoder and width back. The saved [analog] nfm_bandwidth_hz is the configured one, from
+ * the configured view, never the row's.
+ */
+static int
+test_nfm_row_snapshot_keeps_configured_mode_and_width(void) {
+    auto opts_storage = std::unique_ptr<dsd_opts>(new dsd_opts{});
+    auto state_storage = std::unique_ptr<dsd_state>(new dsd_state{});
+    dsd_opts& opts = *opts_storage;
+    dsd_state& state = *state_storage;
+    reset_opts_and_state(opts, state);
+    DSD_SNPRINTF(opts.audio_in_dev, sizeof opts.audio_in_dev, "%s", "rtl:0:851.375M:22:-2:24:-80:2");
+    opts.rtlsdr_center_freq = 851375000U;
+    opts.rtl_dsp_bw_khz = 24;
+    if (dsd_apply_decode_mode_preset(DSDCFG_MODE_DMR, DSD_DECODE_PRESET_PROFILE_CLI, &opts, &state) != 0
+        || dsd_scan_mode_enter(&opts, &state, DSD_SCAN_MODE_NFM) != 0) {
+        DSD_FPRINTF(stderr, "FAIL: could not open an nfm scan scope\n");
+        return 1;
+    }
+    int rc = 0;
+    dsd_scan_option_values row;
+    DSD_MEMSET(&row, 0, sizeof row);
+    row.present = DSD_SCAN_OPT_BANDWIDTH;
+    row.channel_bw_hz = 12500;
+    (void)dsd_scan_mode_options(&opts, &state, &row);
+    if (opts.analog_only != 1 || opts.analog_nfm_bandwidth_hz != 12500) {
+        DSD_FPRINTF(stderr, "FAIL: nfm row did not reach dsd_opts (analog_only=%d width=%d)\n", opts.analog_only,
+                    opts.analog_nfm_bandwidth_hz);
+        rc |= 1;
+    }
+    dsdneoUserConfig snap;
+    dsd_snapshot_opts_to_user_config(&opts, &state, &snap);
+    if (snap.decode_mode != DSDCFG_MODE_DMR) {
+        DSD_FPRINTF(stderr, "FAIL: save during an nfm row wrote decode mode %d, want the configured DMR\n",
+                    (int)snap.decode_mode);
+        rc |= 1;
+    }
+    char rendered[16384];
+    if (render_config_to_buffer(&snap, rendered, sizeof rendered) != 0) {
+        rc |= 1;
+    } else if (strstr(rendered, "12500") != NULL) {
+        DSD_FPRINTF(stderr, "FAIL: save during an nfm row wrote the row width:\n%s\n", rendered);
+        rc |= 1;
+    }
+    dsd_scan_mode_leave(&opts, &state);
+    if (opts.analog_only != 0 || opts.analog_nfm_bandwidth_hz != 0 || opts.frame_dmr != 1) {
+        DSD_FPRINTF(stderr, "FAIL: leaving the nfm row left analog_only=%d width=%d frame_dmr=%d\n", opts.analog_only,
+                    opts.analog_nfm_bandwidth_hz, opts.frame_dmr);
+        rc |= 1;
+    }
+
+    /* An explicit configured width is the one saved, not the row's that runs over it, and an edit made while the row
+       shadows it (the width command's path) is saved too. */
+    opts.analog_nfm_bandwidth_hz = 20000;
+    if (dsd_scan_mode_enter(&opts, &state, DSD_SCAN_MODE_NFM) != 0 || dsd_scan_mode_options(&opts, &state, &row) != 0
+        || opts.analog_nfm_bandwidth_hz != 12500) {
+        DSD_FPRINTF(stderr, "FAIL: nfm row width did not run over a configured 20 kHz (width=%d)\n",
+                    opts.analog_nfm_bandwidth_hz);
+        rc |= 1;
+    }
+    dsd_snapshot_opts_to_user_config(&opts, &state, &snap);
+    if (!snap.has_analog || snap.analog_nfm_bandwidth_hz != 20000) {
+        DSD_FPRINTF(stderr, "FAIL: save during an nfm row wrote nfm_bandwidth_hz %d, want the configured 20000\n",
+                    snap.analog_nfm_bandwidth_hz);
+        rc |= 1;
+    }
+    if (dsd_scan_mode_set_configured_nfm_bandwidth(&opts, &state, 11250) != 0) {
+        DSD_FPRINTF(stderr, "FAIL: the row width did not shadow a configured width edit\n");
+        rc |= 1;
+    }
+    dsd_snapshot_opts_to_user_config(&opts, &state, &snap);
+    if (render_config_to_buffer(&snap, rendered, sizeof rendered) != 0) {
+        rc |= 1;
+    } else if (strstr(rendered, "nfm_bandwidth_hz = 11250") == NULL || strstr(rendered, "12500") != NULL) {
+        DSD_FPRINTF(stderr, "FAIL: save after a shadowed width edit did not write the edited default:\n%s\n", rendered);
+        rc |= 1;
+    }
+    dsd_scan_mode_leave(&opts, &state);
+    if (opts.analog_nfm_bandwidth_hz != 11250) {
+        DSD_FPRINTF(stderr, "FAIL: leaving the nfm row put back width %d, want the edited 11250\n",
+                    opts.analog_nfm_bandwidth_hz);
+        rc |= 1;
+    }
+    dsd_state_ext_free_all(&state);
+    return rc;
+}
+
+/*
+ * Issue #524: the AM width follows the same configured-view rule as the NFM width. Config->Save taken while an nfm row
+ * runs over an -fM session keeps decode = am and writes the configured am_bandwidth_hz from the configured view, never
+ * the options in force; an AM width edit made under the row (the width command's path) is saved and survives the leave.
+ */
+static int
+test_am_session_row_snapshot_keeps_configured_am_width(void) {
+    auto opts_storage = std::unique_ptr<dsd_opts>(new dsd_opts{});
+    auto state_storage = std::unique_ptr<dsd_state>(new dsd_state{});
+    dsd_opts& opts = *opts_storage;
+    dsd_state& state = *state_storage;
+    reset_opts_and_state(opts, state);
+    DSD_SNPRINTF(opts.audio_in_dev, sizeof opts.audio_in_dev, "%s", "rtl:0:118.1M:22:-2:24:-80:2");
+    opts.rtlsdr_center_freq = 118100000U;
+    opts.rtl_dsp_bw_khz = 24;
+    if (dsd_apply_decode_mode_preset(DSDCFG_MODE_AM, DSD_DECODE_PRESET_PROFILE_CLI, &opts, &state) != 0) {
+        DSD_FPRINTF(stderr, "FAIL: could not apply the AM preset\n");
+        return 1;
+    }
+    opts.analog_am_bandwidth_hz = 8000;
+    int rc = 0;
+    dsd_scan_option_values row;
+    DSD_MEMSET(&row, 0, sizeof row);
+    row.present = DSD_SCAN_OPT_BANDWIDTH;
+    row.channel_bw_hz = 12500;
+    if (dsd_scan_mode_enter(&opts, &state, DSD_SCAN_MODE_NFM) != 0 || dsd_scan_mode_options(&opts, &state, &row) != 0
+        || opts.analog_demod != DSD_ANALOG_DEMOD_FM || opts.analog_nfm_bandwidth_hz != 12500) {
+        DSD_FPRINTF(stderr, "FAIL: the nfm row did not run over the AM session (demod=%d width=%d)\n",
+                    opts.analog_demod, opts.analog_nfm_bandwidth_hz);
+        dsd_state_ext_free_all(&state);
+        return 1;
+    }
+    dsdneoUserConfig snap;
+    dsd_snapshot_opts_to_user_config(&opts, &state, &snap);
+    if (snap.decode_mode != DSDCFG_MODE_AM || !snap.has_analog || snap.analog_am_bandwidth_hz != 8000
+        || snap.analog_nfm_bandwidth_hz != 0) {
+        DSD_FPRINTF(stderr, "FAIL: save during an nfm row on AM wrote mode %d am %d nfm %d, want am/8000/0\n",
+                    (int)snap.decode_mode, snap.analog_am_bandwidth_hz, snap.analog_nfm_bandwidth_hz);
+        rc |= 1;
+    }
+    /* The AM width command's path under the row: no row width shadows it, and the configured view takes it. */
+    if (dsd_scan_mode_set_configured_analog_width(&opts, &state, DSD_ANALOG_DEMOD_AM, 10000) != 1) {
+        DSD_FPRINTF(stderr, "FAIL: an AM width edit under the nfm row was shadowed\n");
+        rc |= 1;
+    }
+    /* The save reads the configured view, whatever dsd_opts holds meanwhile. */
+    opts.analog_am_bandwidth_hz = 5000;
+    dsd_snapshot_opts_to_user_config(&opts, &state, &snap);
+    char rendered[16384];
+    if (render_config_to_buffer(&snap, rendered, sizeof rendered) != 0) {
+        rc |= 1;
+    } else if (strstr(rendered, "am_bandwidth_hz = 10000") == NULL || strstr(rendered, "12500") != NULL) {
+        DSD_FPRINTF(stderr, "FAIL: save after an AM width edit under the row did not write the configured width:\n%s\n",
+                    rendered);
+        rc |= 1;
+    }
+    dsd_scan_mode_leave(&opts, &state);
+    if (dsd_infer_decode_mode_preset(&opts) != DSDCFG_MODE_AM || opts.analog_am_bandwidth_hz != 10000
+        || opts.analog_nfm_bandwidth_hz != 0) {
+        DSD_FPRINTF(stderr, "FAIL: leaving the nfm row left mode %d am %d nfm %d, want AM/10000/0\n",
+                    (int)dsd_infer_decode_mode_preset(&opts), opts.analog_am_bandwidth_hz,
+                    opts.analog_nfm_bandwidth_hz);
+        rc |= 1;
+    }
+    dsd_state_ext_free_all(&state);
+    return rc;
+}
+
+/*
+ * Issue #526: an am row's class and its --am-bandwidth-hz are effective state, not user defaults. Config->Save taken
+ * while such a row is on air over a DMR session keeps decode = dmr and writes the configured am_bandwidth_hz (none
+ * here), never the row's; an AM width edit made while the row's own width shadows it (the width command's path) is the
+ * one saved, and the leave puts the configured decoder and the edited width back.
+ */
+static int
+test_am_row_snapshot_keeps_configured_mode_and_width(void) {
+    auto opts_storage = std::unique_ptr<dsd_opts>(new dsd_opts{});
+    auto state_storage = std::unique_ptr<dsd_state>(new dsd_state{});
+    dsd_opts& opts = *opts_storage;
+    dsd_state& state = *state_storage;
+    reset_opts_and_state(opts, state);
+    DSD_SNPRINTF(opts.audio_in_dev, sizeof opts.audio_in_dev, "%s", "rtl:0:118.3M:22:-2:24:-80:2");
+    opts.rtlsdr_center_freq = 118300000U;
+    opts.rtl_dsp_bw_khz = 24;
+    if (dsd_apply_decode_mode_preset(DSDCFG_MODE_DMR, DSD_DECODE_PRESET_PROFILE_CLI, &opts, &state) != 0
+        || dsd_scan_mode_enter(&opts, &state, DSD_SCAN_MODE_AM) != 0) {
+        DSD_FPRINTF(stderr, "FAIL: could not open an am scan scope\n");
+        return 1;
+    }
+    int rc = 0;
+    dsd_scan_option_values row;
+    DSD_MEMSET(&row, 0, sizeof row);
+    row.present = DSD_SCAN_OPT_BANDWIDTH;
+    row.channel_bw_hz = 8333;
+    row.channel_bw_kind = DSD_ANALOG_DEMOD_AM;
+    (void)dsd_scan_mode_options(&opts, &state, &row);
+    if (opts.analog_only != 1 || opts.analog_demod != DSD_ANALOG_DEMOD_AM || opts.analog_am_bandwidth_hz != 8333) {
+        DSD_FPRINTF(stderr, "FAIL: am row did not reach dsd_opts (analog_only=%d demod=%d width=%d)\n",
+                    opts.analog_only, opts.analog_demod, opts.analog_am_bandwidth_hz);
+        rc |= 1;
+    }
+    dsdneoUserConfig snap;
+    dsd_snapshot_opts_to_user_config(&opts, &state, &snap);
+    char rendered[16384];
+    if (snap.decode_mode != DSDCFG_MODE_DMR || snap.analog_am_bandwidth_hz != 0) {
+        DSD_FPRINTF(stderr, "FAIL: save during an am row wrote decode mode %d am width %d, want DMR and none\n",
+                    (int)snap.decode_mode, snap.analog_am_bandwidth_hz);
+        rc |= 1;
+    }
+    if (render_config_to_buffer(&snap, rendered, sizeof rendered) != 0) {
+        rc |= 1;
+    } else if (strstr(rendered, "8333") != NULL || strstr(rendered, "decode = \"dmr\"\n") == NULL
+               || strstr(rendered, "decode = \"am\"") != NULL) {
+        DSD_FPRINTF(stderr, "FAIL: save during an am row wrote the row's class or width:\n%s\n", rendered);
+        rc |= 1;
+    }
+    /* The width command's path under the row: the row's own width shadows the edit (0), which the baseline keeps. */
+    if (dsd_scan_mode_set_configured_analog_width(&opts, &state, DSD_ANALOG_DEMOD_AM, 10000) != 0
+        || opts.analog_am_bandwidth_hz != 8333) {
+        DSD_FPRINTF(stderr, "FAIL: the am row width did not shadow a configured AM width edit (width=%d)\n",
+                    opts.analog_am_bandwidth_hz);
+        rc |= 1;
+    }
+    dsd_snapshot_opts_to_user_config(&opts, &state, &snap);
+    if (snap.decode_mode != DSDCFG_MODE_DMR || snap.analog_am_bandwidth_hz != 10000) {
+        DSD_FPRINTF(stderr,
+                    "FAIL: save after a shadowed AM width edit wrote decode mode %d am width %d, want DMR and "
+                    "10000\n",
+                    (int)snap.decode_mode, snap.analog_am_bandwidth_hz);
+        rc |= 1;
+    }
+    if (render_config_to_buffer(&snap, rendered, sizeof rendered) != 0) {
+        rc |= 1;
+    } else if (strstr(rendered, "am_bandwidth_hz = 10000") == NULL || strstr(rendered, "8333") != NULL
+               || strstr(rendered, "decode = \"dmr\"\n") == NULL || strstr(rendered, "decode = \"am\"") != NULL) {
+        DSD_FPRINTF(stderr, "FAIL: save after a shadowed AM width edit did not write the edited default:\n%s\n",
+                    rendered);
+        rc |= 1;
+    }
+    dsd_scan_mode_leave(&opts, &state);
+    if (opts.analog_only != 0 || opts.frame_dmr != 1 || opts.analog_demod != DSD_ANALOG_DEMOD_FM
+        || opts.analog_am_bandwidth_hz != 10000) {
+        DSD_FPRINTF(stderr, "FAIL: leaving the am row left analog_only=%d frame_dmr=%d demod=%d am width=%d\n",
+                    opts.analog_only, opts.frame_dmr, opts.analog_demod, opts.analog_am_bandwidth_hz);
+        rc |= 1;
+    }
+    dsd_state_ext_free_all(&state);
+    return rc;
+}
+
+/*
  * A parked row's own --scan-max-visit-ms is effective state, not a user default. The save path
  * has to read the configured baseline through dsd_scan_mode_configured_view(), or a
  * Config->Save taken while a row override is active would pin the row's value for every
@@ -3279,6 +4289,7 @@ test_imports_dir_follows_config_dir(void) {
 #endif
     if (dsd_test_setenv(cfg_env, scratch, 1) != 0) {
         DSD_FPRINTF(stderr, "dsd_test_setenv(%s) failed\n", cfg_env);
+        (void)DSD_TEST_RMDIR(scratch);
         return 1;
     }
 
@@ -3305,9 +4316,9 @@ test_imports_dir_follows_config_dir(void) {
     rc |= dsd_user_imports_dir_create() == 0 ? 0 : 1;
     rc |= strcmp(dsd_user_imports_dir(), expected) == 0 ? 0 : 1;
 
-    (void)DSD_TEST_RMDIR(expected);
-    (void)DSD_TEST_RMDIR(cfg_root);
-    (void)DSD_TEST_RMDIR(scratch);
+    rc |= remove_test_dir(expected);
+    rc |= remove_test_dir(cfg_root);
+    rc |= remove_test_dir(scratch);
     return rc;
 }
 
@@ -3522,10 +4533,15 @@ main(void) {
     rc |= test_load_and_apply_sddc_digital_resample();
     rc |= test_load_and_apply_rtl_digital_resample();
     rc |= test_snapshot_digital_resample_mode();
+    rc |= test_snapshot_names_switched_inputs();
     rc |= test_snapshot_roundtrip_soapy_args();
     rc |= test_snapshot_roundtrip_zero_rtl_ppm();
+    rc |= test_snapshot_roundtrip_agc_rtl_gain();
     rc |= test_snapshot_rtl_and_rtltcp_device_specs();
     rc |= test_snapshot_disabled_squelch_roundtrips_as_off();
+    rc |= test_auto_squelch_keys_roundtrip();
+    rc |= test_noise_squelch_keys_roundtrip();
+    rc |= test_pcm_squelch_keys_roundtrip();
     rc |= test_load_and_apply_rtltcp_regression();
     rc |= test_snapshot_roundtrip();
     rc |= test_apply_demod_lock();
@@ -3551,9 +4567,15 @@ main(void) {
     rc |= test_scan_max_visit_roundtrip();
     rc |= test_analog_nfm_bandwidth_roundtrip();
     rc |= test_radio_input_spec();
+    rc |= test_am_mode_and_bandwidth_roundtrip();
+    rc |= test_tone_policy_roundtrip();
+    rc |= test_tone_policy_edit_roundtrip();
     rc |= test_tg_lockout_persistence_roundtrip();
     rc |= test_scan_max_visit_snapshot_uses_configured_not_row_override();
     rc |= test_squelch_snapshot_uses_configured_not_row_override();
+    rc |= test_nfm_row_snapshot_keeps_configured_mode_and_width();
+    rc |= test_am_row_snapshot_keeps_configured_mode_and_width();
+    rc |= test_am_session_row_snapshot_keeps_configured_am_width();
     rc |= test_src_csv_roundtrip();
     rc |= test_p25_bandplan_csv_roundtrip();
     rc |= test_edacs_variant_roundtrip();

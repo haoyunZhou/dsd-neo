@@ -3,9 +3,10 @@
  * Copyright (C) 2026 by arancormonk <180709949+arancormonk@users.noreply.github.com>
  */
 
+#include <dsd-neo/core/audio.h>
 #include <dsd-neo/core/state.h>
 #include <dsd-neo/core/vocoder.h>
-#include <dsd-neo/runtime/p25_p2_audio_ring.h>
+#include <dsd-neo/core/voice_chain.h>
 #include <mbelib-neo/mbelib.h>
 
 #include "dsd-neo/core/safe_api.h"
@@ -30,14 +31,12 @@ dsd_mbe_purge_slot_audio(dsd_state* state, int slot) {
         return;
     }
 
-    p25_p2_audio_ring_reset(state, slot);
     dsd_mbe_reset_slot_parameters(state, slot);
-    state->voice_counter[slot] = 0;
+    dsd_audio_dmr_mix_media_discard(slot);
+    dsd_voice_hpf_reset(state, slot);
 
     if (slot == 0) {
         DSD_MEMSET(state->audio_out_temp_buf, 0, sizeof(state->audio_out_temp_buf));
-        DSD_MEMSET(state->f_l, 0, sizeof(state->f_l));
-        DSD_MEMSET(state->f_l4, 0, sizeof(state->f_l4));
         DSD_MEMSET(state->s_l, 0, sizeof(state->s_l));
         DSD_MEMSET(state->s_l4, 0, sizeof(state->s_l4));
         DSD_MEMSET(state->s_lu, 0, sizeof(state->s_lu));
@@ -57,8 +56,6 @@ dsd_mbe_purge_slot_audio(dsd_state* state, int slot) {
     }
 
     DSD_MEMSET(state->audio_out_temp_bufR, 0, sizeof(state->audio_out_temp_bufR));
-    DSD_MEMSET(state->f_r, 0, sizeof(state->f_r));
-    DSD_MEMSET(state->f_r4, 0, sizeof(state->f_r4));
     DSD_MEMSET(state->s_r, 0, sizeof(state->s_r));
     DSD_MEMSET(state->s_r4, 0, sizeof(state->s_r4));
     DSD_MEMSET(state->s_ru, 0, sizeof(state->s_ru));

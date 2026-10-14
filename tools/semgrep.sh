@@ -98,8 +98,11 @@ fi
 
 # Exercise the local guardrails before trusting a strict scan. Fixtures live
 # outside the scan targets because they intentionally contain violations.
+# semgrep --test takes one target, so each fixture runs on its own.
 if [[ $STRICT -eq 1 && $CUSTOM_CONFIGS -eq 0 ]]; then
-  semgrep --test --metrics=off --disable-version-check --config semgrep/dsd-neo.yml semgrep/dsd-neo.cpp
+  for fixture in semgrep/dsd-neo.c semgrep/dsd-neo.cpp semgrep/dsd-neo.js; do
+    semgrep --test --metrics=off --disable-version-check --config semgrep/dsd-neo.yml "$fixture"
+  done
 fi
 
 # Semgrep's default semgrepignore excludes test directories when they are
@@ -137,13 +140,13 @@ ARGS=(
   --disable-version-check
   --no-git-ignore
   --exclude .deps-arch-toolchain
-  --exclude .deps-arch-toolchain/**
+  --exclude ".deps-arch-toolchain/**"
   --exclude src/third_party
-  --exclude src/third_party/**
+  --exclude "src/third_party/**"
   --exclude vcpkg_installed
-  --exclude vcpkg_installed/**
+  --exclude "vcpkg_installed/**"
   --exclude build
-  --exclude build/**
+  --exclude "build/**"
 )
 if [[ $STRICT -eq 1 ]]; then
   ARGS+=(--error)
@@ -156,6 +159,16 @@ for config in "${CONFIGS[@]}"; do
 done
 if [[ -n "${DSD_SEMGREP_SARIF_OUT:-}" ]]; then
   ARGS+=(--sarif --output "$DSD_SEMGREP_SARIF_OUT")
+fi
+
+# Honor a local PFFFT checkout even when it lives inside the source tree.
+analysis_cache="${DSD_ANALYSIS_BUILD_DIR:-build/dev-debug}/CMakeCache.txt"
+if [[ -f "$analysis_cache" ]]; then
+  pffft_source=$(sed -n 's/^DSD_PFFFT_SOURCE_DIR:INTERNAL=//p' "$analysis_cache")
+  if [[ -n "$pffft_source" ]]; then
+    pffft_relative="${pffft_source#"$ROOT_DIR/"}"
+    ARGS+=(--exclude "$pffft_relative" --exclude "$pffft_relative/**")
+  fi
 fi
 
 set +e

@@ -11,9 +11,13 @@ target_sources(
         config_user_loader.cpp
         config_user_validation.cpp
         config_schema.c
+        decode_clock.c
         decode_mode.c
         scan_mode.c
         scan_options.c
+        scan_row_edit.c
+        squelch.c
+        rigctl_passband.c
         config_expand.c
         control_pump.c
         freq_parse.c
@@ -39,7 +43,6 @@ target_sources(
         radioreference/rr_provenance.c
         rdio_export.c
         p25_optional_hooks.c
-        p25_p2_audio_ring.c
         rigctl_query_hooks.c
         telemetry_hooks.c
         udp_audio_hooks.c
@@ -65,6 +68,35 @@ target_sources(
         ${CMAKE_CURRENT_BINARY_DIR}/radioreference/rr_app_key.c
 )
 
+# The decode clock's nanosecond-to-second conversions must stay correctly rounded
+# divisions: fast-math turns `ns / 1e9` into a multiply by an inexact 1e-9, which
+# puts every seconds stamp a rounding step off. It is not on a per-sample path.
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    set_source_files_properties(
+        decode_clock.c
+        PROPERTIES COMPILE_OPTIONS "-fno-fast-math"
+    )
+elseif(MSVC)
+    set_source_files_properties(
+        decode_clock.c
+        PROPERTIES COMPILE_OPTIONS "/fp:precise"
+    )
+endif()
+
+# The one-shot DMR Tier III calculator reads frequencies from a user file and
+# must reject "+nan" and "+inf" before rounding them; it runs once per command.
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    set_source_files_properties(
+        cli/oneshot_dmr_t3.c
+        PROPERTIES COMPILE_OPTIONS "-fno-fast-math"
+    )
+elseif(MSVC)
+    set_source_files_properties(
+        cli/oneshot_dmr_t3.c
+        PROPERTIES COMPILE_OPTIONS "/fp:precise"
+    )
+endif()
+
 # The SOAP parser uses NaN for missing coordinates and checks decimal overflow;
 # config parsing/comparisons and input-level metrics also check nonfinite values.
 # Preserve IEEE semantics even when the global fast-math option is enabled.
@@ -74,12 +106,41 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
         radioreference/rr_soap.c
         PROPERTIES COMPILE_OPTIONS "-fno-fast-math"
     )
+elseif(MSVC)
+    set_source_files_properties(
+        input_level.c
+        radioreference/rr_soap.c
+        PROPERTIES COMPILE_OPTIONS "/fp:precise"
+    )
 endif()
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     set_source_files_properties(
         config.cpp
         config_user.cpp
         PROPERTIES COMPILE_OPTIONS "-fno-fast-math"
+    )
+elseif(MSVC)
+    set_source_files_properties(
+        config.cpp
+        config_user.cpp
+        PROPERTIES COMPILE_OPTIONS "/fp:precise"
+    )
+endif()
+
+# Airspy input specs carry a squelch figure that must reject "nan"/"inf"; this is
+# parsed once per input spec, never per sample. The squelch grammar (squelch.c) does
+# the same for --squelch, every spec's sql field and a frontend's setting.
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    set_source_files_properties(
+        airspy_config.c
+        squelch.c
+        PROPERTIES COMPILE_OPTIONS "-fno-fast-math"
+    )
+elseif(MSVC)
+    set_source_files_properties(
+        airspy_config.c
+        squelch.c
+        PROPERTIES COMPILE_OPTIONS "/fp:precise"
     )
 endif()
 

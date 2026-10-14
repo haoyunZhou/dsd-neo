@@ -7,6 +7,7 @@
 #include <dsd-neo/engine/frame_processing.h>
 #include <dsd-neo/engine/protocol_dispatch.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #include "dsd-neo/core/opts_fwd.h"
 #include "dsd-neo/core/state_fwd.h"
@@ -47,7 +48,21 @@ processFrame(dsd_opts* opts, dsd_state* state) {
 
     const dsd_protocol_handler* handler = dsd_find_protocol_handler(state->synctype);
     if (handler != NULL && handler->handle_frame != NULL) {
+        const uint32_t carrier_seq = state->carrier_seq;
+        /* The frame's protocol and carrier, for the decoders' MBE capture: a decoder that borrows another protocol's
+           vocoder changes state->synctype, not this, and a frame read across a carrier boundary is captured nowhere
+           (issue #661). */
+        state->frame_dispatch_synctype = state->synctype;
+        state->frame_dispatch_carrier_seq = carrier_seq;
+        state->frame_dispatch_active = 1;
         state->sps_hunt_last_frame_verdict = (int)handler->handle_frame(opts, state);
+        state->frame_dispatch_active = 0;
+        /* A replay read that adopted a recorded retune ran the carrier boundary inside the frame (issue #575): its
+           decoder dropped what it read, as on a sync loss, so the frame validated nothing on either carrier, whatever
+           the handler reported for the symbols it read. */
+        if (state->carrier_seq != carrier_seq) {
+            state->sps_hunt_last_frame_verdict = DSD_FRAME_VERDICT_UNPRODUCTIVE;
+        }
     }
 }
 

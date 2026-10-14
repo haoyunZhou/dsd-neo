@@ -9,10 +9,12 @@
 #include <dsd-neo/core/events.h>
 #include <dsd-neo/core/keyring.h>
 #include <dsd-neo/core/opts.h>
+#include <dsd-neo/core/p25p2_playout.h>
 #include <dsd-neo/core/state.h>
 #include <dsd-neo/core/state_ext.h>
 #include <dsd-neo/core/synctype_ids.h>
 #include <dsd-neo/protocol/p25/p25_crypto.h>
+#include <dsd-neo/protocol/p25/p25_trunk_sm.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -335,8 +337,6 @@ test_begin_and_sticky_unknown(void) {
     reset_fixture(&opts, &state);
 
     state.p25_p2_audio_allowed[0] = 1;
-    state.p25_p2_audio_ring_count[0] = 2;
-    state.p25_p2_audio_ring_count[1] = 3;
     state.fourv_counter[0] = 2;
     state.ess_b[0][0] = 1;
     state.s_l4[0][0] = 111;
@@ -347,8 +347,6 @@ test_begin_and_sticky_unknown(void) {
     int rc = 0;
     rc |= expect_int("encrypted grant pending", state.p25_crypto_state[0], DSD_P25_CRYPTO_ENCRYPTED_PENDING);
     rc |= expect_int("encrypted grant gate", state.p25_p2_audio_allowed[0], 0);
-    rc |= expect_int("encrypted grant ring purged", state.p25_p2_audio_ring_count[0], 0);
-    rc |= expect_int("encrypted grant companion ring preserved", state.p25_p2_audio_ring_count[1], 3);
     rc |= expect_int("encrypted grant int16 tail purged", state.s_l4[0][0], 0);
     rc |= expect_int("encrypted grant companion tail preserved", state.s_r4[0][0], 222);
     rc |= expect_int("encrypted grant ESS index preserved", state.fourv_counter[0], 2);
@@ -827,18 +825,15 @@ test_slot_local_transition_purge_and_mi_refresh(void) {
     state.payload_algidR = 0x80;
     state.p25_p2_audio_allowed[0] = 1;
     state.p25_p2_audio_allowed[1] = 1;
-    state.p25_p2_audio_ring_count[0] = 2;
-    state.p25_p2_audio_ring_count[1] = 3;
     state.audio_out_temp_buf[0] = 1.0f;
     state.audio_out_temp_bufR[0] = 2.0f;
-    state.f_l4[0][0] = 3.0f;
-    state.f_r4[0][0] = 4.0f;
     state.s_l4[0][0] = 5;
     state.s_r4[0][0] = 6;
     state.s_l4u[0][0] = 7;
     state.s_r4u[0][0] = 8;
-    state.voice_counter[0] = 9;
-    state.voice_counter[1] = 10;
+    /* A frame the P25 Phase 2 playout already admitted on slot 1 (issue #651). */
+    const dsd_p25p2_playout_verdict admitted = {0U, 0U, 1U, 1U};
+    dsd_p25p2_playout_stage(&opts, &state, 0, 0, 1U, &admitted);
     state.fourv_counter[0] = 2;
     state.ess_b[0][0] = 1;
     state.audio_out_float_buf[0] = 9.0f;
@@ -850,16 +845,12 @@ test_slot_local_transition_purge_and_mi_refresh(void) {
     rc |= expect_int("clear-to-blocked transition",
                      p25_crypto_resolve(&opts, &state, DSD_P25_CRYPTO_PHASE2, 0, 0x81, 0x4000, 0x4444, 300),
                      DSD_P25_CRYPTO_BLOCKED);
-    rc |= expect_int("transition purges selected float ring", state.p25_p2_audio_ring_count[0], 0);
-    rc |= expect_int("transition preserves companion float ring", state.p25_p2_audio_ring_count[1], 3);
-    rc |= expect_int("transition purges selected float frame", state.f_l4[0][0] == 0.0f, 1);
-    rc |= expect_int("transition preserves companion float frame", state.f_r4[0][0] == 4.0f, 1);
     rc |= expect_int("transition purges selected int16 tail", state.s_l4[0][0], 0);
     rc |= expect_int("transition preserves companion int16 tail", state.s_r4[0][0], 6);
     rc |= expect_int("transition purges selected upsample tail", state.s_l4u[0][0], 0);
     rc |= expect_int("transition preserves companion upsample tail", state.s_r4u[0][0], 8);
-    rc |= expect_int("transition purges selected voice counter", state.voice_counter[0], 0);
-    rc |= expect_int("transition preserves companion voice counter", state.voice_counter[1], 10);
+    /* The purge resets the vocoder's working state; admitted playout audio and stream timing stay (issue #651). */
+    rc |= expect_int("transition keeps admitted playout audio", dsd_p25p2_playout_level(&state, 0), 1);
     rc |= expect_int("transition preserves ESS index", state.fourv_counter[0], 2);
     rc |= expect_int("transition preserves ESS bits", state.ess_b[0][0], 1);
     rc |= expect_int("transition purges selected dynamic float lead",
@@ -874,8 +865,6 @@ test_slot_local_transition_purge_and_mi_refresh(void) {
     state.payload_algid = 0x81;
     state.payload_keyid = 0x4000;
     state.payload_miP = 0x5000ULL;
-    state.p25_p2_audio_ring_count[0] = 2;
-    state.voice_counter[0] = 7;
     state.s_l4[0][0] = 13;
     state.DMRvcL = 14;
     state.bit_counterL = 15;
@@ -884,8 +873,7 @@ test_slot_local_transition_purge_and_mi_refresh(void) {
     rc |= expect_int("MI refresh remains decryptable",
                      p25_crypto_resolve(&opts, &state, DSD_P25_CRYPTO_PHASE2, 0, 0x81, 0x4000, 0x5001, 300),
                      DSD_P25_CRYPTO_DECRYPTABLE);
-    rc |= expect_int("MI refresh preserves queued ring", state.p25_p2_audio_ring_count[0], 2);
-    rc |= expect_int("MI refresh preserves voice cadence", state.voice_counter[0], 7);
+    rc |= expect_int("MI refresh keeps admitted playout audio", dsd_p25p2_playout_level(&state, 0), 1);
     rc |= expect_int("MI refresh preserves int16 audio", state.s_l4[0][0], 13);
     rc |= expect_int("P2 MI refresh preserves crypto voice counter", state.DMRvcL, 14);
     rc |= expect_int("P2 MI refresh preserves crypto bit counter", state.bit_counterL, 15);
@@ -904,18 +892,67 @@ test_slot_local_transition_purge_and_mi_refresh(void) {
     rc |= expect_int("P1 MI refresh resets RC4 position", state.dropL, 267);
     rc |= expect_int("P1 MI refresh clears keystream", state.ks_octetL[0], 0);
 
-    state.p25_p2_audio_ring_count[0] = 1;
     state.s_l4[0][0] = 14;
     rc |= expect_int("key identity change remains decryptable",
                      p25_crypto_resolve(&opts, &state, DSD_P25_CRYPTO_PHASE2, 0, 0x81, 0x4001, 0x5003, 300),
                      DSD_P25_CRYPTO_DECRYPTABLE);
-    rc |= expect_int("key identity change purges ring", state.p25_p2_audio_ring_count[0], 0);
     rc |= expect_int("key identity change purges int16 tail", state.s_l4[0][0], 0);
 
     free(state.audio_out_float_buf);
     free(state.audio_out_float_bufR);
     free(state.audio_out_buf);
     free(state.audio_out_bufR);
+    return rc;
+}
+
+/* Issue #575: an ESS that opens a Phase 1 call carries no frequency. With trunking off a grant's frequency belongs to
+ * the call whose target it named, and the ESS opens a call that names none: it takes neither a grant frequency another
+ * call's grant left in p25_vc_freq[] nor trunk_vc_freq[], which a DMR grant decoded with trunking off leaves behind for
+ * display, and its row falls back to the tuned frequency. A trunking receiver's call takes the voice channel it
+ * followed. */
+static int
+test_phase1_resolution_stamps_only_this_carriers_frequency(void) {
+    static dsd_opts opts;
+    static dsd_state state;
+    static p25_sm_ctx_t saved_ctx;
+    dsd_call_snapshot call;
+    int rc = 0;
+
+    reset_fixture(&opts, &state);
+    state.synctype = DSD_SYNC_P25P1_POS;
+    /* As a grant update naming another call, TG 0x4567, leaves them. */
+    state.p25_vc_freq[0] = 851012500L;
+    state.p25_conventional_grant_freq[0] = 851012500L;
+    state.p25_conventional_grant_target[0] = 0x4567U;
+    state.trunk_vc_freq[0] = 852012500L;
+    rc |= expect_int("trunking-off P1 ESS resolves clear",
+                     p25_crypto_resolve(&opts, &state, DSD_P25_CRYPTO_PHASE1, 0, 0x80, 0, 0, 0), DSD_P25_CRYPTO_CLEAR);
+    rc |= expect_int("trunking-off P1 ESS opens a call", dsd_call_state_get(&state, 0U, &call), 1);
+    rc |= expect_int("trunking-off P1 ESS takes no other call's grant frequency", call.frequency_hz, 0);
+
+    reset_fixture(&opts, &state);
+    state.synctype = DSD_SYNC_P25P1_POS;
+    state.trunk_vc_freq[0] = 852012500L;
+    rc |= expect_int("DMR-leftover P1 ESS resolves clear",
+                     p25_crypto_resolve(&opts, &state, DSD_P25_CRYPTO_PHASE1, 0, 0x80, 0, 0, 0), DSD_P25_CRYPTO_CLEAR);
+    rc |= expect_int("DMR-leftover P1 ESS opens a call", dsd_call_state_get(&state, 0U, &call), 1);
+    rc |= expect_int("DMR-leftover P1 ESS takes no frequency", call.frequency_hz, 0);
+
+    p25_sm_ctx_t* ctx = p25_sm_get_ctx();
+    saved_ctx = *ctx;
+    reset_fixture(&opts, &state);
+    opts.trunk_enable = 1;
+    opts.trunk_is_tuned = 1;
+    ctx->state = P25_SM_TUNED;
+    state.synctype = DSD_SYNC_P25P1_POS;
+    state.p25_vc_freq[0] = state.p25_vc_freq[1] = 851012500L;
+    state.trunk_vc_freq[0] = state.trunk_vc_freq[1] = 851012500L;
+    rc |= expect_int("followed P1 ESS resolves clear",
+                     p25_crypto_resolve(&opts, &state, DSD_P25_CRYPTO_PHASE1, 0, 0x80, 0, 0, 0), DSD_P25_CRYPTO_CLEAR);
+    rc |= expect_int("followed P1 ESS opens a call", dsd_call_state_get(&state, 0U, &call), 1);
+    rc |= expect_int("followed P1 ESS takes the voice channel", call.frequency_hz, 851012500L);
+    *ctx = saved_ctx;
+    dsd_state_ext_free_all(&state);
     return rc;
 }
 
@@ -935,5 +972,6 @@ main(void) {
     rc |= test_algorithm_and_manual_key_resolution();
     rc |= test_imported_key_activation_is_slot_aware();
     rc |= test_slot_local_transition_purge_and_mi_refresh();
+    rc |= test_phase1_resolution_stamps_only_this_carriers_frequency();
     return rc;
 }

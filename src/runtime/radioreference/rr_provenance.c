@@ -18,6 +18,7 @@
 #include <dsd-neo/core/safe_api.h>
 #include <dsd-neo/core/string_utils.h>
 #include <dsd-neo/platform/file_compat.h>
+#include <dsd-neo/runtime/decode_clock.h>
 #include <dsd-neo/runtime/path_policy.h>
 #include <dsd-neo/runtime/radioreference_generate.h>
 #include <dsd-neo/runtime/radioreference_import.h>
@@ -26,7 +27,6 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
-#include <time.h>
 
 static int
 rr_sidecar_path(const char* csv_path, char* out, size_t out_sz) {
@@ -51,7 +51,7 @@ rr_emit_text(FILE* fp, const char* key, const char* value) {
 /* Takes ownership of fp: closes it on every path. */
 static int
 rr_provenance_emit(FILE* fp, const dsd_rr_provenance* p) {
-    long long stamp = p->imported_at != 0 ? p->imported_at : (long long)time(NULL);
+    long long stamp = p->imported_at != 0 ? p->imported_at : (long long)dsd_realtime_time();
 
     DSD_FPRINTF(fp, "# dsd-neo RadioReference provenance. Regenerated on refresh; do not edit.\n");
     rr_emit_text(fp, "kind", p->kind);
@@ -197,9 +197,10 @@ rr_provenance_assign(dsd_rr_provenance* out, const char* key, const char* value)
     }
     if (strcmp(key, "tune_hz") == 0) {
         /* Parsed at the writer's width, not an int's. rr_provenance_emit() prints
-           %lld from a long long and rr_generate.c accepts sites up to
-           RR_FREQ_MAX_HZ (6 GHz), so an int-ranged parse would make this reader
-           reject a sidecar it wrote itself - and a rejected sidecar is not
+           %lld from a long long, and builds before rr_generate.c capped sites at
+           DSD_TRUNK_FREQ_MAX_HZ wrote them up to 6 GHz, so an int-ranged parse
+           would make this reader reject a sidecar such a build wrote - and a
+           rejected sidecar is not
            "no recipe", it drops the file out of the Imported Systems browser,
            out of the CSV picker and out of refresh entirely. Same uint64 parser
            imported_at uses, for the same "no long-long strict parser" reason.

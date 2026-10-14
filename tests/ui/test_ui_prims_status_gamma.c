@@ -26,6 +26,16 @@
 #undef getmaxx
 #undef getmaxy
 
+/* The stubs below follow the selected curses' prototypes: PDCurses (Windows) takes a non-const WINDOW in the position
+ * accessors and a short color pair, where ncurses takes a const WINDOW and NCURSES_PAIRS_T. */
+#if defined(DSD_USE_PDCURSES)
+#define STUB_WINDOW_CONST
+typedef short stub_pair_t;
+#else
+#define STUB_WINDOW_CONST const
+typedef NCURSES_PAIRS_T stub_pair_t;
+#endif
+
 static int g_fake_stdscr_storage;
 static int g_fake_window_storage;
 WINDOW* stdscr;
@@ -62,7 +72,7 @@ static int g_wattr_on_count;
 static attr_t g_last_attr_on;
 static int g_wattr_set_count;
 static attr_t g_last_attr_set;
-static NCURSES_PAIRS_T g_last_pair_set;
+static stub_pair_t g_last_pair_set;
 static WINDOW* g_newwin_result;
 
 static void
@@ -157,25 +167,25 @@ doupdate(void) {
 }
 
 int
-getmaxy(const WINDOW* win) {
+getmaxy(STUB_WINDOW_CONST WINDOW* win) {
     assert(win == stdscr);
     return g_rows;
 }
 
 int
-getmaxx(const WINDOW* win) {
+getmaxx(STUB_WINDOW_CONST WINDOW* win) {
     assert(win == stdscr);
     return g_cols;
 }
 
 int
-getcury(const WINDOW* win) {
+getcury(STUB_WINDOW_CONST WINDOW* win) {
     assert(win == stdscr);
     return g_cur_y;
 }
 
 int
-getcurx(const WINDOW* win) {
+getcurx(STUB_WINDOW_CONST WINDOW* win) {
     assert(win == stdscr);
     return g_cur_x;
 }
@@ -226,60 +236,12 @@ waddnstr(WINDOW* win, const char* str, int n) {
 }
 
 int
-box(WINDOW* win, chtype verch, chtype horch) {
-    return wborder(win, verch, verch, horch, horch, 0, 0, 0, 0);
-}
-
-int
-addch(const chtype ch) {
-    return waddch(stdscr, ch);
-}
-
-int
-addnstr(const char* str, int n) {
-    return waddnstr(stdscr, str, n);
-}
-
-int
-addstr(const char* str) {
-    return waddnstr(stdscr, str, -1);
-}
-
-int
-move(int y, int x) {
-    return wmove(stdscr, y, x);
-}
-
-int
-hline(chtype ch, int n) {
-    return whline(stdscr, ch, n);
-}
-
-int
-mvhline(int y, int x, chtype ch, int n) {
-    int rc = wmove(stdscr, y, x);
-    return rc == OK ? whline(stdscr, ch, n) : rc;
-}
-
-int
-mvwhline(WINDOW* win, int y, int x, chtype ch, int n) {
-    int rc = wmove(win, y, x);
-    return rc == OK ? whline(win, ch, n) : rc;
-}
-
-int
-mvwaddnstr(WINDOW* win, int y, int x, const char* str, int n) {
-    int rc = wmove(win, y, x);
-    return rc == OK ? waddnstr(win, str, n) : rc;
-}
-
-int
-wattr_get(WINDOW* win, attr_t* attrs, NCURSES_PAIRS_T* pair, void* opts) {
+wattr_get(WINDOW* win, attr_t* attrs, stub_pair_t* pair, void* opts) {
     (void)opts;
     assert(win == stdscr);
     g_wattr_get_count++;
     *attrs = (attr_t)0x1234;
-    *pair = (NCURSES_PAIRS_T)9;
+    *pair = (stub_pair_t)9;
     return OK;
 }
 
@@ -301,7 +263,7 @@ wattr_off(WINDOW* win, attr_t attrs, void* opts) {
 }
 
 int
-wattr_set(WINDOW* win, attr_t attrs, NCURSES_PAIRS_T pair, void* opts) {
+wattr_set(WINDOW* win, attr_t attrs, stub_pair_t pair, void* opts) {
     (void)opts;
     assert(win == stdscr);
     g_wattr_set_count++;
@@ -310,6 +272,9 @@ wattr_set(WINDOW* win, attr_t attrs, NCURSES_PAIRS_T pair, void* opts) {
     return OK;
 }
 
+#if defined(DSD_USE_PDCURSES)
+/* PDCurses (Windows) implements these as functions, where ncurses defines them as macros over the w* calls stubbed
+ * above; here they are stubbed as those macros expand, so the counters see the same calls on both. */
 int
 wattron(WINDOW* win, chtype attrs) {
     return wattr_on(win, (attr_t)attrs, NULL);
@@ -322,23 +287,54 @@ wattroff(WINDOW* win, chtype attrs) {
 
 int
 attron(chtype attrs) {
-    return wattr_on(stdscr, (attr_t)attrs, NULL);
+    return wattron(stdscr, attrs);
 }
 
 int
-attroff(chtype attrs) {
-    return wattr_off(stdscr, (attr_t)attrs, NULL);
-}
-
-int
-attr_get(attr_t* attrs, NCURSES_PAIRS_T* pair, void* opts) {
+attr_get(attr_t* attrs, short* pair, void* opts) {
     return wattr_get(stdscr, attrs, pair, opts);
 }
 
 int
-attr_set(attr_t attrs, NCURSES_PAIRS_T pair, void* opts) {
+attr_set(attr_t attrs, short pair, void* opts) {
     return wattr_set(stdscr, attrs, pair, opts);
 }
+
+int
+addch(const chtype ch) {
+    return waddch(stdscr, ch);
+}
+
+int
+addstr(const char* str) {
+    return waddnstr(stdscr, str, -1);
+}
+
+int
+move(int y, int x) {
+    return wmove(stdscr, y, x);
+}
+
+int
+box(WINDOW* win, chtype verch, chtype horch) {
+    return wborder(win, verch, verch, horch, horch, 0, 0, 0, 0);
+}
+
+int
+mvwhline(WINDOW* win, int y, int x, chtype ch, int n) {
+    return wmove(win, y, x) == ERR ? ERR : whline(win, ch, n);
+}
+
+int
+mvhline(int y, int x, chtype ch, int n) {
+    return mvwhline(stdscr, y, x, ch, n);
+}
+
+int
+mvwaddnstr(WINDOW* win, int y, int x, const char* str, int n) {
+    return wmove(win, y, x) == ERR ? ERR : waddnstr(win, str, n);
+}
+#endif
 
 #include "../../src/ui/terminal/ui_prims.c"
 
@@ -599,7 +595,7 @@ test_border_helpers_restore_saved_attributes(void) {
     assert(g_last_addch == '|');
     assert(g_wattr_set_count == 1);
     assert(g_last_attr_set == (attr_t)0x1234);
-    assert(g_last_pair_set == (NCURSES_PAIRS_T)9);
+    assert(g_last_pair_set == (stub_pair_t)9);
 
     reset_curses_stubs();
     ui_print_lborder_green();
@@ -607,7 +603,7 @@ test_border_helpers_restore_saved_attributes(void) {
     assert(g_last_attr_on == COLOR_PAIR(3));
     assert(g_wattr_set_count == 1);
     assert(g_last_attr_set == (attr_t)0x1234);
-    assert(g_last_pair_set == (NCURSES_PAIRS_T)9);
+    assert(g_last_pair_set == (stub_pair_t)9);
 }
 
 int

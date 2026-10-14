@@ -26,6 +26,7 @@ dsd_frame_verdict dsd_dispatch_handle_dpmr(dsd_opts* opts, dsd_state* state);
 static int g_close_calls;
 static int g_open_calls;
 static int g_voice_calls;
+static int g_close_protocol_synctype = DSD_SYNC_NONE;
 
 /* How many CCH halves the next processdPMRvoice() reports passing their CRC-7. */
 static int g_voice_crc_halves = 2;
@@ -37,11 +38,26 @@ closeMbeOutFile(dsd_opts* opts, dsd_state* state) {
     g_close_calls++;
 }
 
+/* The capture opener the dispatcher called on every FS2 sync before issue #661, kept with its counter so this harness
+   also links and runs against that revision: the dispatcher opens nothing now, the first frame written creates it. */
+// NOLINTNEXTLINE(misc-use-internal-linkage): main's dispatcher links against this stub.
+void openMbeOutFile(dsd_opts* opts, dsd_state* state);
+
 void
 openMbeOutFile(dsd_opts* opts, dsd_state* state) {
     (void)opts;
     (void)state;
     g_open_calls++;
+}
+
+/* dPMR closes only its own capture (issue #661); the owner filter is tested in CORE_MBE_FILE_IO. This records the
+   protocol the dispatcher names and counts the close as the closer above does. */
+void
+dsd_mbe_out_close_protocol(dsd_opts* opts, dsd_state* state, int slot_mask, int synctype) {
+    g_close_protocol_synctype = synctype;
+    if ((slot_mask & DSD_MBE_OUT_SLOT1) != 0 && opts->mbe_out_f != NULL) {
+        closeMbeOutFile(opts, state);
+    }
 }
 
 int
@@ -102,6 +118,7 @@ test_dispatch_close_only_syncs(void) {
     dsd_dispatch_handle_dpmr(&opts, &state);
     assert(state.currentslot == 0);
     assert(g_close_calls == 1);
+    assert(DSD_SYNC_IS_DPMR(g_close_protocol_synctype));
     assert(g_voice_calls == 0);
 
     state.synctype = DSD_SYNC_DPMR_FS3_NEG;
@@ -129,7 +146,8 @@ test_dispatch_voice_sync_continues_a_confirmed_call_and_processes_voice(void) {
 
     dsd_dispatch_handle_dpmr(&opts, &state);
 
-    assert(g_open_calls == 1);
+    /* The voice decoder creates the capture with the first frame it records; the sync opens nothing (issue #661). */
+    assert(g_open_calls == 0);
     assert(g_voice_calls == 1);
     assert(state.nac == 0);
     dsd_call_snapshot call;
@@ -139,6 +157,26 @@ test_dispatch_voice_sync_continues_a_confirmed_call_and_processes_voice(void) {
     assert(call.ota_source_id == 0U);
     assert(call.ota_target_id == 0U);
     assert(strcmp(state.fsubtype, " VOICE        ") == 0);
+}
+
+/* Issue #661: an FS2 sync on noise, before any CCH has passed its CRC, leaves no capture file behind. */
+static void
+test_dispatch_unconfirmed_voice_sync_opens_no_capture(void) {
+    static dsd_opts opts;
+    static dsd_state state;
+    DSD_MEMSET(&opts, 0, sizeof(opts));
+    DSD_MEMSET(&state, 0, sizeof(state));
+    g_open_calls = 0;
+
+    DSD_SNPRINTF(opts.mbe_out_dir, sizeof(opts.mbe_out_dir), "%s", "captures");
+    state.synctype = DSD_SYNC_DPMR_FS2_POS;
+    g_voice_crc_halves = 0;
+    dsd_dispatch_handle_dpmr(&opts, &state);
+    g_voice_crc_halves = 2;
+
+    assert(state.dpmr_confirmed == 0);
+    assert(g_open_calls == 0);
+    assert(opts.mbe_out_f == NULL);
 }
 
 // An FS3 end frame decoding after a sync-loss end must still reach the canonical retract path:
@@ -246,6 +284,31 @@ test_dispatch_voice_sync_alone_opens_no_call(void) {
     g_voice_crc_halves = 2;
 }
 
+/* Issue #655: a CRC-failed half is played by the scrambling the transmission's last verified half signalled, so every
+   transmission boundary the dispatcher sees (FS1 header, FS3 end, FS4) forgets it before the next call. */
+static void
+test_dispatch_boundaries_forget_the_scrambling(void) {
+    static dsd_opts opts;
+    static dsd_state state;
+    static const int boundaries[] = {DSD_SYNC_DPMR_FS1_POS, DSD_SYNC_DPMR_FS1_NEG, DSD_SYNC_DPMR_FS3_POS,
+                                     DSD_SYNC_DPMR_FS3_NEG, DSD_SYNC_DPMR_FS4_POS, DSD_SYNC_DPMR_FS4_NEG};
+    for (size_t i = 0; i < sizeof(boundaries) / sizeof(boundaries[0]); i++) {
+        DSD_MEMSET(&opts, 0, sizeof(opts));
+        DSD_MEMSET(&state, 0, sizeof(state));
+        state.dpmr_scrambled = 2U;
+        state.synctype = boundaries[i];
+        (void)dsd_dispatch_handle_dpmr(&opts, &state);
+        assert(state.dpmr_scrambled == 0U);
+    }
+    // A voice frame keeps the transmission's verdict.
+    DSD_MEMSET(&opts, 0, sizeof(opts));
+    DSD_MEMSET(&state, 0, sizeof(state));
+    state.dpmr_scrambled = 2U;
+    state.synctype = DSD_SYNC_DPMR_FS2_POS;
+    (void)dsd_dispatch_handle_dpmr(&opts, &state);
+    assert(state.dpmr_scrambled == 2U);
+}
+
 int
 main(void) {
     test_sync_pattern_lengths();
@@ -253,9 +316,11 @@ main(void) {
     test_synctype_helpers();
     test_dispatch_close_only_syncs();
     test_dispatch_voice_sync_continues_a_confirmed_call_and_processes_voice();
+    test_dispatch_unconfirmed_voice_sync_opens_no_capture();
     test_dispatch_end_sync_tightens_sync_loss_end();
     test_dispatch_voice_verdicts_follow_the_cch_crc();
     test_dispatch_voice_sync_alone_opens_no_call();
+    test_dispatch_boundaries_forget_the_scrambling();
     printf("DPMR_SYNC_DISPATCH: OK\n");
     return 0;
 }

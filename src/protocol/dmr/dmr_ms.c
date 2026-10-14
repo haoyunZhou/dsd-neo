@@ -26,10 +26,10 @@
 #include <dsd-neo/platform/file_compat.h>
 #include <dsd-neo/protocol/dmr/dmr.h>
 #include <dsd-neo/protocol/dmr/dmr_trunk_sm.h>
+#include <dsd-neo/runtime/decode_clock.h>
 #include <dsd-neo/runtime/telemetry.h>
 #include <stdint.h>
 #include <stdio.h>
-#include <time.h>
 #include "dsd-neo/core/opts_fwd.h"
 #include "dsd-neo/core/safe_api.h"
 #include "dsd-neo/core/state_fwd.h"
@@ -196,8 +196,7 @@ dmr_ms_apply_keystream(dsd_state* state, dmr_ms_voice_frames* frames) {
 
 static void
 dmr_ms_process_single_mbe(dsd_opts* opts, dsd_state* state, char ambe_fr[4][24], size_t frame_idx) {
-    processMbeFrame(opts, state, NULL, ambe_fr, NULL);
-    DSD_MEMCPY(state->f_l4[frame_idx], state->audio_out_temp_buf, sizeof(state->audio_out_temp_buf));
+    processMbeFrame(opts, state, DSD_VOICE_PROTOCOL_DMR, NULL, ambe_fr, NULL);
     DSD_MEMCPY(state->s_l4[frame_idx], state->s_l, sizeof(state->s_l));
     DSD_MEMCPY(state->s_l4u[frame_idx], state->s_lu, sizeof(state->s_lu));
 }
@@ -214,11 +213,7 @@ dmr_ms_play_voice(dsd_opts* opts, dsd_state* state) {
     if (opts->pulse_digi_out_channels != 1 && opts->pulse_digi_out_channels != 2) {
         return;
     }
-    if (opts->floating_point == 0) {
-        playSynthesizedVoiceSS3(opts, state);
-    } else if (opts->floating_point == 1) {
-        playSynthesizedVoiceFS3(opts, state);
-    }
+    playSynthesizedVoiceSS3(opts, state);
 }
 
 static void
@@ -323,7 +318,7 @@ dmr_ms_print_bootstrap_sync(const dsd_opts* opts, dsd_state* state, const char t
 void
 dmrMS(dsd_opts* opts, dsd_state* state) {
     char timestr[9];
-    (void)dsd_format_local_datetime(time(NULL), DSD_LOCAL_DATETIME_TIME_COLON, timestr, sizeof timestr);
+    (void)dsd_format_local_datetime(dsd_decode_time(), DSD_LOCAL_DATETIME_TIME_COLON, timestr, sizeof timestr);
     UNUSED(timestr);
 
     dmr_ms_voice_frames frames;
@@ -341,7 +336,15 @@ dmrMS(dsd_opts* opts, dsd_state* state) {
 
     state->currentslot = 0;
 
+    /* The superframe's bursts belong to one carrier (issue #575): the sixth assembles the embedded LC from the four
+       before it. When the carrier boundary moves the carrier count while the superframe is collected (a replay read
+       adopting a recorded retune), inside a burst or in the other slot's burst skipped before one, the burst read
+       across or after the move is dropped with the rest of the superframe, as on a sync loss. */
+    const uint32_t carrier_seq = state->carrier_seq;
     for (int j = 0; j < 6; j++) {
+        if (state->carrier_seq != carrier_seq) {
+            break;
+        }
         state->dmrburstL = 16;
         dmr_sm_emit_voice_sync(opts, state, 0);
 
@@ -355,6 +358,9 @@ dmrMS(dsd_opts* opts, dsd_state* state) {
         uint8_t power = dmr_ms_decode_embedded_color_code(state, syncdata, emb_pdu);
         dmr_ms_fill_ambe_from_stream(opts, state, frames.ambe_fr2, 90, 18, 18);
         dmr_ms_fill_ambe_from_stream(opts, state, frames.ambe_fr3, 108, 36, 0);
+        if (state->carrier_seq != carrier_seq) {
+            break;
+        }
         dmr_debug_dump_burst(opts, state, state->currentslot, 0x10);
         dmr_ms_dump_dsp_output(opts, state);
 
@@ -367,9 +373,7 @@ dmrMS(dsd_opts* opts, dsd_state* state) {
         if (vc == 6) {
             dmr_ms_handle_vc6_ops(opts, state, power, dummy_bits);
         }
-        if (opts->dmr_le != 2) {
-            dmr_late_entry_mi_fragment(opts, state, vc, frames.m1, frames.m2, frames.m3);
-        }
+        dmr_late_entry_mi_fragment(opts, state, vc, frames.m1, frames.m2, frames.m3);
         if (!dmr_ms_advance_voice_cycle(opts, state, &vc)) {
             break;
         }
@@ -384,7 +388,7 @@ dmrMS(dsd_opts* opts, dsd_state* state) {
 void
 dmrMSBootstrap(dsd_opts* opts, dsd_state* state) {
     char timestr[9];
-    (void)dsd_format_local_datetime(time(NULL), DSD_LOCAL_DATETIME_TIME_COLON, timestr, sizeof timestr);
+    (void)dsd_format_local_datetime(dsd_decode_time(), DSD_LOCAL_DATETIME_TIME_COLON, timestr, sizeof timestr);
 
     dmr_ms_voice_frames frames;
     char cachdata[25];
@@ -398,7 +402,14 @@ dmrMSBootstrap(dsd_opts* opts, dsd_state* state) {
 
     dmr_ms_prepare_bootstrap_payload(state);
     dmr_ms_collect_bootstrap_cach(opts, state, cachdata);
+    const uint32_t carrier_seq = state->carrier_seq;
     dmr_ms_decode_bootstrap_voice(opts, state, &frames);
+    if (state->carrier_seq != carrier_seq) {
+        /* The burst's live half came after the carrier boundary (issue #575): it is dropped, as on a sync loss, and
+           the voice cycle does not start on it. */
+        dmr_ms_clear_mode_flags(state);
+        return;
+    }
     dmr_ms_dump_bootstrap_debug_burst(opts, state);
     dmr_ms_dump_dsp_output(opts, state);
     dmr_ms_print_bootstrap_sync(opts, state, timestr);
@@ -408,9 +419,7 @@ dmrMSBootstrap(dsd_opts* opts, dsd_state* state) {
     dmr_ms_process_audio_frames(opts, state, &frames);
     dmr_ms_play_voice(opts, state);
 
-    if (opts->dmr_le != 2) {
-        dmr_late_entry_mi_fragment(opts, state, 1, frames.m1, frames.m2, frames.m3);
-    }
+    dmr_late_entry_mi_fragment(opts, state, 1, frames.m1, frames.m2, frames.m3);
 
     skipDibit(opts, state, 144); //skip to next TDMA slot
     dmrMS(opts, state);          //bootstrap into full TDMA frame
@@ -421,12 +430,13 @@ void
 dmrMSData(dsd_opts* opts, dsd_state* state) {
 
     char timestr[9];
-    (void)dsd_format_local_datetime(time(NULL), DSD_LOCAL_DATETIME_TIME_COLON, timestr, sizeof timestr);
+    (void)dsd_format_local_datetime(dsd_decode_time(), DSD_LOCAL_DATETIME_TIME_COLON, timestr, sizeof timestr);
 
     int i;
     int dibit;
     const int* dibit_p;
     const dsd_dibit_soft_t* soft_p = NULL;
+    const uint32_t carrier_seq = state->carrier_seq;
 
     if (state->dmr_soft_buf != NULL && state->dmr_soft_p != NULL && state->dmr_soft_p >= state->dmr_soft_buf + 90) {
         soft_p = state->dmr_soft_p - 90;
@@ -470,11 +480,16 @@ dmrMSData(dsd_opts* opts, dsd_state* state) {
     DSD_SNPRINTF(state->slot1light, sizeof(state->slot1light), "%s", "");
     DSD_SNPRINTF(state->slot2light, sizeof(state->slot2light), "%s", "");
 
-    //process data
-    state->dmr_stereo = 1;
-    state->dmr_ms_mode = 1;
-
-    dmr_data_sync(opts, state);
+    /* Process the data, unless the carrier boundary moved the carrier count while the live half was read (issue #575):
+       everything decodes only after that read, so a slot type read whole before the move would publish the colour code
+       of the carrier left after the boundary forgot it. The burst is dropped, as on a sync loss. */
+    if (state->carrier_seq == carrier_seq) {
+        state->dmr_stereo = 1;
+        state->dmr_ms_mode = 1;
+        dmr_data_sync(opts, state);
+    } else {
+        DSD_FPRINTF(stderr, "\n");
+    }
 
     state->dmr_stereo = 0;
     state->dmr_ms_mode = 0;

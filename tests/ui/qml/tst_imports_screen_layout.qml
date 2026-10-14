@@ -102,6 +102,91 @@ Item {
             }
         }
 
+        // Issue #526: the channel-map review reports an analog row's own width by its kind (an nfm
+        // row's --nfm-bandwidth-hz, an am row's --am-bandwidth-hz), an analog row without one says
+        // it inherits, and a digital row says nothing about it. Only a digital row lists keys and
+        // identifiers: the parser refuses them on an analog row.
+        function test_channel_review_shows_row_bandwidth() {
+            var map = testContext.writeFixtureCsv("bandwidth-map.csv",
+                "channel,frequency,mode,options\n"
+                + "1,154430000,nfm,--nfm-bandwidth-hz 12500\n"
+                + "2,155100000,nfm,\n"
+                + "3,853012500,dmr,\n"
+                + "4,118300000,am,--am-bandwidth-hz 8333\n"
+                + "5,121500000,am,\n");
+            var result = importedFiles.importFile(map, "bandwidth-map.csv", "chan");
+            verify(result.ok, result.detail || "the channel map did not import");
+            var row = importedFiles.rowForPath(result.path);
+            try {
+                var profiles = importedFiles.channelProfiles(row);
+                verify(profiles.ok);
+                var sheet = findChild(tc.screen, "channelReviewSheet");
+                verify(sheet !== null, "the channel review is missing");
+                sheet.rows = profiles.rows;
+                sheet.valid = profiles.ok;
+                sheet.visible = true;
+                var rows = findChild(tc.screen, "channelReviewRows");
+                verify(rows !== null);
+                tryVerify(function() { return rows.count === 5 && rows.itemAtIndex(4) !== null; });
+                verify(rows.itemAtIndex(0).text.indexOf("NFM bandwidth: 12.5 kHz") >= 0, rows.itemAtIndex(0).text);
+                verify(rows.itemAtIndex(1).text.indexOf("NFM bandwidth: inherit") >= 0, rows.itemAtIndex(1).text);
+                verify(rows.itemAtIndex(2).text.indexOf("NFM bandwidth") < 0, rows.itemAtIndex(2).text);
+                verify(rows.itemAtIndex(3).text.indexOf("AM bandwidth: 8.333 kHz") >= 0, rows.itemAtIndex(3).text);
+                verify(rows.itemAtIndex(4).text.indexOf("AM bandwidth: inherit") >= 0, rows.itemAtIndex(4).text);
+                for (var i = 0; i < 5; ++i) {
+                    var text = rows.itemAtIndex(i).text;
+                    var analog = i !== 2;
+                    verify((text.indexOf("Keys:") >= 0) === !analog, text);
+                    verify((text.indexOf("Identifier") >= 0) === !analog, text);
+                    if (i >= 3)
+                        verify(text.indexOf("NFM") < 0, text);
+                }
+                sheet.visible = false;
+            } finally {
+                importedFiles.remove(importedFiles.rowForPath(result.path));
+                tryCompare(tc.list, "count", 2);
+            }
+        }
+
+        // Issue #527: the channel-map review reports an nfm row's own tone policy with its list, an
+        // nfm row without one says it runs the configured policy, and an am or digital row, which
+        // cannot set one, says nothing about it.
+        function test_channel_review_shows_row_tone_filter() {
+            var map = testContext.writeFixtureCsv("tone-map.csv",
+                "channel,frequency,mode,options\n"
+                + "1,154430000,nfm,--tone-allow 100.0/D023N\n"
+                + "2,155475000,nfm,--tone-block 67.0\n"
+                + "3,155520000,nfm,--no-tone-filter\n"
+                + "4,155535000,nfm,\n"
+                + "5,118300000,am,\n"
+                + "6,853012500,dmr,\n");
+            var result = importedFiles.importFile(map, "tone-map.csv", "chan");
+            verify(result.ok, result.detail || "the channel map did not import");
+            var row = importedFiles.rowForPath(result.path);
+            try {
+                var profiles = importedFiles.channelProfiles(row);
+                verify(profiles.ok);
+                var sheet = findChild(tc.screen, "channelReviewSheet");
+                verify(sheet !== null, "the channel review is missing");
+                sheet.rows = profiles.rows;
+                sheet.valid = profiles.ok;
+                sheet.visible = true;
+                var rows = findChild(tc.screen, "channelReviewRows");
+                verify(rows !== null);
+                tryVerify(function() { return rows.count === 6 && rows.itemAtIndex(5) !== null; });
+                var want = ["Tone filter: allow 100.0 Hz/D023N", "Tone filter: block 67.0 Hz", "Tone filter: off",
+                            "Tone filter: inherit"];
+                for (var i = 0; i < 4; ++i)
+                    verify(rows.itemAtIndex(i).text.indexOf(want[i]) >= 0, rows.itemAtIndex(i).text);
+                verify(rows.itemAtIndex(4).text.indexOf("Tone filter") < 0, rows.itemAtIndex(4).text);
+                verify(rows.itemAtIndex(5).text.indexOf("Tone filter") < 0, rows.itemAtIndex(5).text);
+                sheet.visible = false;
+            } finally {
+                importedFiles.remove(importedFiles.rowForPath(result.path));
+                tryCompare(tc.list, "count", 2);
+            }
+        }
+
         function test_cancel_import_cleanup_data() {
             return [{tag: "primary"}, {tag: "sheet"}];
         }

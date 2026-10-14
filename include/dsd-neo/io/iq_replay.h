@@ -21,7 +21,15 @@ extern "C" {
 
 /* Largest base decimation a replay chain may request. The demodulator keeps one half-band
  * history buffer per pass (demod_state::hb_hist_i), so 2^10 is the hard ceiling. */
-#define DSD_IQ_REPLAY_MAX_BASE_DECIMATION 1024U
+#define DSD_IQ_REPLAY_MAX_BASE_DECIMATION     1024U
+
+/* A replay hands the demodulator one capture chunk per block (issue #572), so the chunk is the replay's demod block. It
+ * is at most one live RTL-SDR transfer, DEFAULT_BUF_LENGTH bytes of cu8 (8192 complex samples), and no longer than such
+ * a transfer lasts at the default 1.536 Msps capture rate (16/3 ms): every per-block decision (the level squelch, the
+ * squelch envelope, the published channel power, adaptive loop gains, metrics, the input level) then runs at a live
+ * receiver's cadence (issue #626). */
+#define DSD_IQ_REPLAY_CHUNK_MAX_SAMPLES       8192U
+#define DSD_IQ_REPLAY_CHUNK_REFERENCE_RATE_HZ 1536000U
 
 typedef struct {
     uint32_t metadata_version;
@@ -85,12 +93,32 @@ int dsd_iq_replay_read_metadata(const char* path, dsd_iq_replay_config* out_cfg,
 int dsd_iq_replay_open(const char* path, dsd_iq_replay_config* out_cfg, dsd_iq_replay_source** out, char* err_buf,
                        size_t err_buf_size);
 /**
+ * @brief Seconds since the Unix epoch of a sidecar's `capture_started_utc`.
+ *
+ * Takes the form the capture writer stamps, `YYYY-MM-DDTHH:MM:SSZ`, and nothing looser. An I/Q replay decodes on the
+ * capture's clock from this instant (issue #572).
+ *
+ * @param text The field's text.
+ * @param out_s [out] The instant; set only on success.
+ * @return DSD_IQ_OK; DSD_IQ_ERR_INVALID_META for text in any other form or out of range; DSD_IQ_ERR_INVALID_ARG for a
+ *         NULL argument.
+ */
+int dsd_iq_replay_parse_utc_seconds(const char* text, int64_t* out_s);
+
+/**
  * @brief Release owned replay config allocations and reset the struct to zero.
  *
  * Only call this on a zero-initialized config or a config returned by a
  * successful replay metadata/open call.
  */
 void dsd_iq_replay_config_clear(dsd_iq_replay_config* cfg);
+
+/**
+ * @brief Read up to @p max_bytes of the capture's data into @p out.
+ *
+ * @p out_bytes gets the bytes read, 0 with DSD_IQ_OK once every byte the open measured for the capture is read.
+ * DSD_IQ_ERR_IO for a failed read, and for a data file that ends before those bytes (cut short after the open).
+ */
 int dsd_iq_replay_read(dsd_iq_replay_source* src, void* out, size_t max_bytes, size_t* out_bytes);
 int dsd_iq_replay_rewind(dsd_iq_replay_source* src);
 void dsd_iq_replay_close(dsd_iq_replay_source* src);
@@ -105,6 +133,17 @@ int dsd_iq_replay_compute_effective_bytes(uint64_t data_bytes, uint64_t actual_f
  * @brief Validate effective replay bytes for replay (not info-only paths).
  */
 int dsd_iq_replay_validate_effective_bytes_for_replay(uint64_t effective_bytes, int loop);
+
+/**
+ * @brief Bytes the replay reader reads as one chunk, the replay's demod block.
+ *
+ * min(DSD_IQ_REPLAY_CHUNK_MAX_SAMPLES, sample_rate_hz x DSD_IQ_REPLAY_CHUNK_MAX_SAMPLES /
+ * DSD_IQ_REPLAY_CHUNK_REFERENCE_RATE_HZ) complex samples, at least one, in the format's bytes. An event or the
+ * capture's end can cut a chunk shorter.
+ *
+ * @return The chunk in bytes, or 0 for a sample rate of 0 or a format with no sample size.
+ */
+size_t dsd_iq_replay_chunk_bytes(dsd_iq_sample_format format, uint32_t sample_rate_hz);
 
 /**
  * @brief Estimate capture duration from bytes and sample rate.

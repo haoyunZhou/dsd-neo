@@ -2,6 +2,7 @@
 /* Copyright (C) 2026 by arancormonk <180709949+arancormonk@users.noreply.github.com> */
 
 #include <dsd-neo/core/opts.h>
+#include <dsd-neo/core/p25p2_playout.h>
 #include <dsd-neo/core/safe_api.h>
 #include <dsd-neo/core/state.h>
 #include <dsd-neo/core/state_ext.h>
@@ -44,6 +45,7 @@ p25_sm_forget_selected_site(p25_sm_ctx_t* ctx, dsd_state* state) {
     if (!state->p2_hardset) {
         state->p2_cc = 0;
     }
+    state->p2_cc_verified = 0U; // proven on the site being forgotten (issue #575)
     state->p2_rfssid = 0;
     state->p2_siteid = 0;
     state->p25_site_lra_valid = 0;
@@ -109,6 +111,8 @@ p25_sm_select_control_channel(p25_sm_ctx_t* ctx, dsd_opts* opts, dsd_state* stat
         p25_sm_clear_manual_selection_calls(ctx, opts, state);
         dsd_mbe_purge_slot_audio(state, 0);
         dsd_mbe_purge_slot_audio(state, 1);
+        // The user left the channel: what the Phase 2 playout queued there is dropped, not played (issue #651).
+        dsd_p25p2_playout_discard(opts, state);
         p25_p2_frame_reset();
         p25_sm_forget_selected_site(ctx, state);
         selection->require_site_cache = 1;
@@ -132,7 +136,12 @@ p25_sm_select_control_channel(p25_sm_ctx_t* ctx, dsd_opts* opts, dsd_state* stat
         if (result == DSD_TRUNK_TUNE_RESULT_PENDING) {
             (void)p25_sm_await_pending_cc_tune(ctx, opts, state, request_id, "manual-cc");
         } else {
-            (void)p25_sm_restart_pending_cc_acquisition(ctx, opts, state, 0.0, "manual-cc");
+            // Acquisition starts at the request's completion stamp, not at this later point: the tuner was on
+            // the new channel from the moment it completed, however long the work above took. The restart
+            // falls back to now only when the request carries no stamp.
+            double completed_m = 0.0;
+            (void)dsd_trunk_tuning_request_status(request_id, &completed_m);
+            (void)p25_sm_restart_pending_cc_acquisition(ctx, opts, state, completed_m, "manual-cc");
         }
     }
     p25_sm_tick_guard_leave();

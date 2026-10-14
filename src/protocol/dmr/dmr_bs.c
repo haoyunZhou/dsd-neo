@@ -13,7 +13,6 @@
 #include <dsd-neo/core/ambe_interleave.h>
 #include <dsd-neo/core/audio.h>
 #include <dsd-neo/core/dibit.h>
-#include <dsd-neo/core/dsd_time.h>
 #include <dsd-neo/core/events.h>
 #include <dsd-neo/core/file_io.h>
 #include <dsd-neo/core/opts.h>
@@ -29,6 +28,7 @@
 #include <dsd-neo/protocol/dmr/dmr.h>
 #include <dsd-neo/protocol/dmr/dmr_trunk_sm.h>
 #include <dsd-neo/runtime/colors.h>
+#include <dsd-neo/runtime/decode_clock.h>
 #include <dsd-neo/runtime/exitflag.h>
 #include <dsd-neo/runtime/frame_sync_hooks.h>
 #include <dsd-neo/runtime/shutdown.h>
@@ -90,14 +90,6 @@ typedef struct {
     uint8_t internalslot;
     char timestr[9];
 } dmr_bs_bootstrap_ctx;
-
-static int
-dmr_bs_output_slot_enabled(const dsd_opts* opts, const dsd_state* state, int slot) {
-    if (opts->dmr_mono != 1 || !DSD_SYNC_IS_DMR(state->synctype)) {
-        return 1;
-    }
-    return state->dmr_mono_slot == slot;
-}
 
 /*
  * Mark dmrBS helper roots used by the public decoder entrypoint. CodeQL's
@@ -294,15 +286,11 @@ handle_dmr_bs_data_sync(dsd_opts* opts, dsd_state* state, dmr_bs_ctx* ctx) {
 
     if (ctx->internalslot == 0) {
         ctx->vc1 = 7;
-        if (opts->mbe_out_f != NULL) {
-            closeMbeOutFile(opts, state);
-        }
+        dsd_mbe_out_close_protocol(opts, state, DSD_MBE_OUT_SLOT1, DSD_SYNC_DMR_BS_DATA_POS);
     }
     if (ctx->internalslot == 1) {
         ctx->vc2 = 7;
-        if (opts->mbe_out_fR != NULL) {
-            closeMbeOutFileR(opts, state);
-        }
+        dsd_mbe_out_close_protocol(opts, state, DSD_MBE_OUT_SLOT2, DSD_SYNC_DMR_BS_DATA_POS);
     }
 
     dmr_data_sync(opts, state);
@@ -405,17 +393,11 @@ prepare_dmr_bs_voice_slot(dsd_opts* opts, dsd_state* state, const dmr_bs_ctx* ct
         vc = ctx->vc1;
         DSD_SNPRINTF(light, 18, "%s", " [SLOT1]  slot2  ");
         dmr_sm_emit_voice_sync(opts, state, 0);
-        if (dmr_bs_output_slot_enabled(opts, state, 0) && (opts->mbe_out_dir[0] != 0) && (opts->mbe_out_f == NULL)) {
-            openMbeOutFile(opts, state);
-        }
     } else {
         state->dmrburstR = 16;
         vc = ctx->vc2;
         DSD_SNPRINTF(light, 18, "%s", "  slot1  [SLOT2] ");
         dmr_sm_emit_voice_sync(opts, state, 1);
-        if (dmr_bs_output_slot_enabled(opts, state, 1) && (opts->mbe_out_dir[0] != 0) && (opts->mbe_out_fR == NULL)) {
-            openMbeOutFileR(opts, state);
-        }
     }
 
     if (opts->inverted_dmr == 0) {
@@ -472,11 +454,9 @@ apply_dmr_bs_voice_keystream(dsd_state* state, char ambe_fr[4][24], char ambe_fr
 static void
 store_dmr_bs_processed_audio(dsd_state* state, uint8_t internalslot, uint8_t frame_index) {
     if (internalslot == 0) {
-        DSD_MEMCPY(state->f_l4[frame_index], state->audio_out_temp_buf, sizeof(state->audio_out_temp_buf));
         DSD_MEMCPY(state->s_l4[frame_index], state->s_l, sizeof(state->s_l));
         DSD_MEMCPY(state->s_l4u[frame_index], state->s_lu, sizeof(state->s_lu));
     } else {
-        DSD_MEMCPY(state->f_r4[frame_index], state->audio_out_temp_bufR, sizeof(state->audio_out_temp_bufR));
         DSD_MEMCPY(state->s_r4[frame_index], state->s_r, sizeof(state->s_r));
         DSD_MEMCPY(state->s_r4u[frame_index], state->s_ru, sizeof(state->s_ru));
     }
@@ -485,7 +465,7 @@ store_dmr_bs_processed_audio(dsd_state* state, uint8_t internalslot, uint8_t fra
 static void
 process_dmr_bs_voice_frame(dsd_opts* opts, dsd_state* state, uint8_t internalslot, char frame[4][24],
                            uint8_t frame_index) {
-    processMbeFrame(opts, state, NULL, frame, NULL);
+    processMbeFrame(opts, state, DSD_VOICE_PROTOCOL_DMR, NULL, frame, NULL);
     store_dmr_bs_processed_audio(state, internalslot, frame_index);
 }
 
@@ -547,8 +527,8 @@ run_dmr_bs_slot_vc6_post_voice(dsd_opts* opts, dsd_state* state, const dmr_bs_ct
 static void
 update_dmr_bs_sync_times_if_tuned(const dsd_opts* opts, dsd_state* state) {
     if (opts->trunk_is_tuned == 1) {
-        time_t now = time(NULL);
-        double nowm = dsd_time_now_monotonic_s();
+        time_t now = dsd_decode_time();
+        double nowm = dsd_decode_now_mono_s();
         state->last_vc_sync_time = now;
         state->last_vc_sync_time_m = nowm;
         state->last_cc_sync_time = now;
@@ -556,11 +536,10 @@ update_dmr_bs_sync_times_if_tuned(const dsd_opts* opts, dsd_state* state) {
     }
 }
 
+// dmr_late_entry_mi_fragment() skips a slot whose call is Hytera Enhanced (issue #657).
 static void
-collect_dmr_bs_late_entry_if_needed(dsd_opts* opts, dsd_state* state, dmr_bs_ctx* ctx) {
-    if (opts->dmr_le != 2) {
-        dmr_late_entry_mi_fragment(opts, state, current_dmr_bs_vc(ctx) % 7, ctx->m1, ctx->m2, ctx->m3);
-    }
+collect_dmr_bs_late_entry(dsd_opts* opts, dsd_state* state, dmr_bs_ctx* ctx) {
+    dmr_late_entry_mi_fragment(opts, state, current_dmr_bs_vc(ctx) % 7, ctx->m1, ctx->m2, ctx->m3);
 }
 
 static dmr_bs_action
@@ -607,7 +586,7 @@ process_dmr_bs_voice_burst(dsd_opts* opts, dsd_state* state, dmr_bs_ctx* ctx) {
     }
 
     run_dmr_bs_slot_vc6_post_voice(opts, state, ctx);
-    collect_dmr_bs_late_entry_if_needed(opts, state, ctx);
+    collect_dmr_bs_late_entry(opts, state, ctx);
     increment_dmr_bs_slot_vc(ctx);
     update_dmr_bs_sync_times_if_tuned(opts, state);
 
@@ -622,13 +601,7 @@ process_dmr_bs_voice_burst(dsd_opts* opts, dsd_state* state, dmr_bs_ctx* ctx) {
 
 static dmr_bs_action
 run_dmr_bs_post_skip(dsd_opts* opts, dsd_state* state, dmr_bs_ctx* ctx) {
-    if (dmr_confidence_any_voice_open(state) && ctx->internalslot == 1 && opts->floating_point == 1
-        && opts->pulse_digi_rate_out == 8000) {
-        playSynthesizedVoiceFS3(opts, state);
-    }
-
-    if (dmr_confidence_any_voice_open(state) && ctx->internalslot == 1 && opts->floating_point == 0
-        && opts->pulse_digi_rate_out == 8000) {
+    if (dmr_confidence_any_voice_open(state) && ctx->internalslot == 1 && opts->pulse_digi_rate_out == 8000) {
         playSynthesizedVoiceSS3(opts, state);
     }
 
@@ -657,17 +630,12 @@ finalize_dmr_bs(dsd_opts* opts, dsd_state* state, const dmr_bs_ctx* ctx) {
     state->errs2R = 0;
     state->errs2 = 0;
 
-    if (opts->mbe_out_f != NULL) {
-        closeMbeOutFile(opts, state);
-    }
-    if (opts->mbe_out_fR != NULL) {
-        closeMbeOutFileR(opts, state);
-    }
+    dsd_mbe_out_close_protocol(opts, state, DSD_MBE_OUT_BOTH, DSD_SYNC_DMR_BS_DATA_POS);
 
-    DSD_MEMSET(state->f_l4, 0.0f, sizeof(state->f_l4));
-    DSD_MEMSET(state->f_r4, 0.0f, sizeof(state->f_r4));
     DSD_MEMSET(state->s_l4, 0, sizeof(state->s_l4));
     DSD_MEMSET(state->s_r4, 0, sizeof(state->s_r4));
+    dsd_audio_dmr_mix_media_discard(0);
+    dsd_audio_dmr_mix_media_discard(1);
 
     if (ctx->tact_okay != 1 || ctx->emb_ok != 1) {
         DSD_FPRINTF(stderr, "%s ", ctx->timestr);
@@ -697,7 +665,8 @@ static void
 init_dmr_bs_bootstrap_ctx(dmr_bs_bootstrap_ctx* ctx) {
     DSD_MEMSET(ctx, 0, sizeof(*ctx));
     ctx->sync_okay = 1;
-    (void)dsd_format_local_datetime(time(NULL), DSD_LOCAL_DATETIME_TIME_COLON, ctx->timestr, sizeof ctx->timestr);
+    (void)dsd_format_local_datetime(dsd_decode_time(), DSD_LOCAL_DATETIME_TIME_COLON, ctx->timestr,
+                                    sizeof ctx->timestr);
 }
 
 static void
@@ -756,18 +725,11 @@ collect_dmr_bs_bootstrap_prefetched_voice(const dsd_state* state, dmr_bs_bootstr
 }
 
 static void
-prepare_dmr_bs_bootstrap_slot_output(dsd_opts* opts, dsd_state* state, uint8_t internalslot, char light[18],
-                                     char polarity[3]) {
+prepare_dmr_bs_bootstrap_slot_output(const dsd_opts* opts, uint8_t internalslot, char light[18], char polarity[3]) {
     if (internalslot == 0) {
         DSD_SNPRINTF(light, 18, "%s", " [SLOT1]  slot2  ");
-        if (dmr_bs_output_slot_enabled(opts, state, 0) && (opts->mbe_out_dir[0] != 0) && (opts->mbe_out_f == NULL)) {
-            openMbeOutFile(opts, state);
-        }
     } else {
         DSD_SNPRINTF(light, 18, "%s", "  slot1  [SLOT2] ");
-        if (dmr_bs_output_slot_enabled(opts, state, 1) && (opts->mbe_out_dir[0] != 0) && (opts->mbe_out_fR == NULL)) {
-            openMbeOutFileR(opts, state);
-        }
     }
 
     if (opts->inverted_dmr == 0) {
@@ -786,7 +748,7 @@ process_dmr_bs_bootstrap_voice_if_open(dsd_opts* opts, dsd_state* state, dmr_bs_
 
     char polarity[3];
     char light[18];
-    prepare_dmr_bs_bootstrap_slot_output(opts, state, ctx->internalslot, light, polarity);
+    prepare_dmr_bs_bootstrap_slot_output(opts, ctx->internalslot, light, polarity);
 
     DSD_FPRINTF(stderr, "%s ", ctx->timestr);
     if (state->dmr_color_code != 16) {
@@ -804,9 +766,7 @@ process_dmr_bs_bootstrap_voice_if_open(dsd_opts* opts, dsd_state* state, dmr_bs_
 
     process_dmr_bs_three_voice_frames(opts, state, ctx->internalslot, ctx->ambe_fr, ctx->ambe_fr2, ctx->ambe_fr3);
 
-    if (opts->dmr_le != 2) {
-        dmr_late_entry_mi_fragment(opts, state, 1, ctx->m1, ctx->m2, ctx->m3);
-    }
+    dmr_late_entry_mi_fragment(opts, state, 1, ctx->m1, ctx->m2, ctx->m3);
 
     (void)dmr_cach(opts, state, ctx->cachdata);
     if (opts->payload == 0) {
@@ -814,23 +774,30 @@ process_dmr_bs_bootstrap_voice_if_open(dsd_opts* opts, dsd_state* state, dmr_bs_
     }
 
     if (opts->trunk_is_tuned == 1) {
-        state->last_vc_sync_time = time(NULL);
-        state->last_vc_sync_time_m = dsd_time_now_monotonic_s();
+        state->last_vc_sync_time = dsd_decode_time();
+        state->last_vc_sync_time_m = dsd_decode_now_mono_s();
     }
 
-    if (ctx->internalslot == 1 && opts->floating_point == 1 && opts->pulse_digi_rate_out == 8000) {
-        playSynthesizedVoiceFS3(opts, state);
-    }
-
-    if (ctx->internalslot == 1 && opts->floating_point == 0 && opts->pulse_digi_rate_out == 8000) {
+    if (ctx->internalslot == 1 && opts->pulse_digi_rate_out == 8000) {
         playSynthesizedVoiceSS3(opts, state);
     }
 }
 
+/* The carrier boundary moved state->carrier_seq while a burst was read (issue #575): the burst straddles two carriers,
+   and what it carries from the carrier left (the first AMBE frames, the EMB colour code, a CACH fragment that may
+   complete a short LC, the embedded LC the sixth burst assembles) would decode after the boundary ended that carrier's
+   calls. Nothing in it decodes; what earlier bursts gathered (data blocks, CACH fragments) goes, as on a sync loss. */
+static void
+drop_dmr_bs_carrier_left(dsd_opts* opts, dsd_state* state) {
+    dmr_reset_blocks(opts, state);
+}
+
 static dmr_bs_action DSD_ATTR_USED
 process_dmr_bs_iteration(dsd_opts* opts, dsd_state* state, dmr_bs_ctx* ctx) {
-    (void)dsd_format_local_datetime(time(NULL), DSD_LOCAL_DATETIME_TIME_COLON, ctx->timestr, sizeof ctx->timestr);
+    (void)dsd_format_local_datetime(dsd_decode_time(), DSD_LOCAL_DATETIME_TIME_COLON, ctx->timestr,
+                                    sizeof ctx->timestr);
     reset_dmr_bs_loop_buffers(ctx);
+    const uint32_t carrier_seq = state->carrier_seq;
 
     if (!collect_dmr_bs_cach_and_tact(opts, state, ctx)) {
         return DMR_BS_ACTION_END;
@@ -847,6 +814,13 @@ process_dmr_bs_iteration(dsd_opts* opts, dsd_state* state, dmr_bs_ctx* ctx) {
     build_dmr_bs_emb_pdu(ctx);
     read_dmr_bs_ambe_segment_stream(opts, state, ctx->ambe_fr2, 90, 18, 18, NULL);
     read_dmr_bs_ambe_segment_stream(opts, state, ctx->ambe_fr3, 108, 36, 0, NULL);
+    if (state->carrier_seq != carrier_seq) {
+        drop_dmr_bs_carrier_left(opts, state);
+        /* A carrier left is not a CACH/EMB decode failure. */
+        ctx->tact_okay = 1;
+        ctx->emb_ok = 1;
+        return DMR_BS_ACTION_END;
+    }
 
     note_dmr_bs_voice_sync(state, ctx);
 
@@ -931,8 +905,15 @@ dmrBSBootstrap(dsd_opts* opts, dsd_state* state) {
 
     dmr_sm_emit_voice_sync(opts, state, ctx.internalslot);
 
+    const uint32_t carrier_seq = state->carrier_seq;
     read_dmr_bs_ambe_segment_stream(opts, state, ctx.ambe_fr2, 90, 18, 18, NULL);
     read_dmr_bs_ambe_segment_stream(opts, state, ctx.ambe_fr3, 108, 36, 0, NULL);
+    if (state->carrier_seq != carrier_seq) {
+        /* The burst's second half came after the carrier boundary (issue #575): the burst is dropped, as in the loop. */
+        drop_dmr_bs_carrier_left(opts, state);
+        dmr_confidence_reset(state);
+        return;
+    }
 
     if (opts->use_dsp_output == 1) {
         write_dmr_bs_dsp_output(opts, state, ctx.internalslot);

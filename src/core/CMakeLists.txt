@@ -8,12 +8,18 @@ target_compile_definitions(
 target_sources(
     dsd-neo_core
     PRIVATE
+        audio/audio_activity.c
+        audio/audio_sink.c
+        audio/dmr_mix_media.c
         audio/dsd_audio.c
+        audio/dsd_audio_input_switch.c
         audio/dsd_audio2.c
         audio/dispatch.c
         audio/dsd_audio_gate.c
+        audio/voice_crypto.c
         audio/gain.c
         audio/mix.c
+        audio/p25p2_playout.c
         audio/convert.c
         audio/dsd_upsample.c
         vocoder/keyring.c
@@ -23,16 +29,19 @@ target_sources(
         vocoder/dsd_vocoder_type.c
         frames/dsd_frame.c
         frames/dsd_dibit.c
+        frames/dsd_dibit_reliability.c
         time/dsd_time.c
         time/dsd_time_state.c
         util/dsd_misc.c
         util/bit_packing.c
         util/dsd_init.c
         util/dsd_state_trunk_lcn.c
+        util/channel_modes_rigctl.c
         util/dsd_state_p25_bandplan.c
         util/key_set.c
         util/scan_profile.c
         util/channel_label.c
+        util/access_code.c
         util/enc_lockout.c
         util/dsd_events.c
         util/dsd_event_staging.c
@@ -49,6 +58,22 @@ target_sources(
         file/p25_sm_log.c
         gps/dsd_gps.c
 )
+
+# The two-level reliability rejects NaN and infinite symbols, which fast-math would
+# fold away. It runs per voice symbol, so keep math-errno off as well: lrintf()
+# then stays an inline conversion, and the arithmetic compiles as it does under
+# fast-math.
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    set_source_files_properties(
+        frames/dsd_dibit_reliability.c
+        PROPERTIES COMPILE_OPTIONS "-fno-fast-math;-fno-math-errno"
+    )
+elseif(MSVC)
+    set_source_files_properties(
+        frames/dsd_dibit_reliability.c
+        PROPERTIES COMPILE_OPTIONS "/fp:precise"
+    )
+endif()
 
 target_include_directories(
     dsd-neo_core

@@ -15,6 +15,7 @@
 #include <stdint.h>
 #include <utility>
 #include "metrics_model.h"
+#include "realtime_clock.h"
 
 #include <QStringList>
 #include <algorithm>
@@ -22,16 +23,17 @@
 #include <tuple>
 
 #include <QChar>
-#include <QDateTime>
 #include <QtGlobal>
+#include <cmath>
 #include <dsd-neo/app_control/analog_width_view.h>
 #include <dsd-neo/app_control/call_view.h>
 #include <dsd-neo/app_control/frontend.h>
+#include <dsd-neo/app_control/rtl_gain_view.h>
 #include <dsd-neo/app_control/rx_tone_view.h>
+#include <dsd-neo/app_control/scan_row_view.h>
 #include <dsd-neo/app_control/scan_timing_view.h>
 #include <dsd-neo/app_control/squelch_view.h>
 #include <dsd-neo/core/audio.h>
-#include <dsd-neo/core/dsd_time.h>
 #include <dsd-neo/core/enc_lockout.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/power.h>
@@ -41,8 +43,11 @@
 #include <dsd-neo/protocol/tetra/tetra_acelp.h>
 #include <dsd-neo/protocol/tetra/tetra_mm.h>
 #include <dsd-neo/protocol/tetra/tetra_trunk_sm.h>
+#include <dsd-neo/runtime/analog_channel.h>
+#include <dsd-neo/runtime/decode_clock.h>
 #include <dsd-neo/runtime/decode_mode.h>
 #include <dsd-neo/runtime/scan_mode.h>
+#include <dsd-neo/runtime/squelch.h>
 
 #include <dsd-neo/core/opts_fwd.h>
 #include <dsd-neo/core/state_fwd.h>
@@ -263,9 +268,11 @@ MetricsModel::fillDmrSite(SiteView& site, const dsd_state* snapshot) {
 QStringList
 MetricsModel::fillNxdnSite(SiteView& site, const dsd_state* snapshot) {
     QStringList parts;
-    site.nxdnRan = snapshot->nxdn_last_ran <= 63 ? static_cast<int>(snapshot->nxdn_last_ran) : -1;
     site.nxdnLocationCategory = siteText(snapshot->nxdn_location_category);
     const bool idas = site.nxdnLocationCategory == QStringLiteral("Type-D");
+    // Outside IDAS, whose area shows under its own label, a stand-in is DCR's fixed 7, which is no RAN (issue #575).
+    const bool ran_stand_in = !idas && snapshot->nxdn_last_ran_stand_in != 0U;
+    site.nxdnRan = (snapshot->nxdn_last_ran <= 63 && !ran_stand_in) ? static_cast<int>(snapshot->nxdn_last_ran) : -1;
     site.siteProtocol = idas ? QStringLiteral("IDAS") : QStringLiteral("NXDN");
     site.nxdnSiteCode = snapshot->nxdn_location_site_code;
     // As in the terminal, a decoded site code establishes location validity.
@@ -334,8 +341,8 @@ MetricsModel::fillSiteView(View& next, const dsd_state* snapshot) const {
 }
 
 MetricsModel::MetricsModel(QObject* parent) : QObject(parent) {
-    /* The configured tone policy is configuration, so it reads as configured -- "off" until
-       #527 -- before the first frame too; the app-control view owns that text. */
+    /* The tone policy is configuration, so it reads as configured ("off" before the first
+       frame) too; the app-control view owns that text. */
     dsd_app_rx_tone policy;
     (void)dsd_app_rx_tone_view(nullptr, nullptr, 0.0, &policy);
     m_view.rx_tone_configured_text = QString::fromUtf8(policy.configured_text);
@@ -354,7 +361,7 @@ MetricsModel::View::operator==(const View& other) const {
     return site == other.site && qualityEquals(other) && tunerEquals(other) && slot_call[0] == other.slot_call[0]
            && slot_call[1] == other.slot_call[1] && lead_slot == other.lead_slot && controlEquals(other)
            && scanTimingEquals(other) && rxToneEquals(other) && rx_tone_configured_text == other.rx_tone_configured_text
-           && ui_message == other.ui_message;
+           && toneFilterEquals(other) && toneFilterSettingEquals(other) && ui_message == other.ui_message;
 }
 
 void
@@ -372,6 +379,8 @@ MetricsModel::publish(const View& next) {
     const bool scanTimingMoved = !next.scanTimingEquals(m_view);
     const bool rxToneMoved = !next.rxToneEquals(m_view);
     const bool rxToneConfiguredMoved = next.rx_tone_configured_text != m_view.rx_tone_configured_text;
+    const bool toneFilterMoved = !next.toneFilterEquals(m_view);
+    const bool toneFilterSettingMoved = !next.toneFilterSettingEquals(m_view);
     const bool messageMoved = next.ui_message != m_view.ui_message;
     m_view = next;
     if (siteMoved) {
@@ -398,14 +407,27 @@ MetricsModel::publish(const View& next) {
     if (scanTimingMoved) {
         Q_EMIT scanTimingChanged();
     }
-    if (rxToneMoved) {
-        Q_EMIT rxToneChanged();
-    }
-    if (rxToneConfiguredMoved) {
-        Q_EMIT rxToneConfiguredTextChanged();
-    }
+    emitRxToneSignals(rxToneMoved, rxToneConfiguredMoved, toneFilterMoved, toneFilterSettingMoved);
     if (messageMoved) {
         Q_EMIT uiMessageChanged();
+    }
+}
+
+/* The received tone, the policy, its verdict and the editor's setting each have their own signal: none of them
+   announces another (#527). */
+void
+MetricsModel::emitRxToneSignals(bool received, bool configured, bool verdict, bool setting) {
+    if (received) {
+        Q_EMIT rxToneChanged();
+    }
+    if (configured) {
+        Q_EMIT rxToneConfiguredTextChanged();
+    }
+    if (verdict) {
+        Q_EMIT toneFilterChanged();
+    }
+    if (setting) {
+        Q_EMIT toneFilterSettingChanged();
     }
 }
 
@@ -418,8 +440,11 @@ MetricsModel::clear() {
     m_sync_type_here = DSD_SYNC_NONE;
     m_sync_seen_m = 0.0;
     View cleared;
-    /* The configured tone policy is not session state: stopping leaves it as configured. */
+    /* The configured tone policy is not session state: stopping leaves it as configured, for the text and the
+       editor. */
     cleared.rx_tone_configured_text = m_view.rx_tone_configured_text;
+    cleared.tone_filter_configured_mode = m_view.tone_filter_configured_mode;
+    cleared.tone_filter_configured_list = m_view.tone_filter_configured_list;
     publish(cleared);
 }
 
@@ -437,7 +462,7 @@ MetricsModel::fillListeningControlView(View& next, const dsd_opts* opts_snapshot
     next.enc_lockout_count = dsd_enc_lockout_active_count(snapshot);
     next.persist_tg_lockouts = opts_snapshot->persist_tg_lockouts != 0;
     next.temporary_tg_avoid_count = dsd_tg_policy_session_avoid_count(snapshot, 0, UINT32_MAX);
-    next.call_skip_count = dsd_tg_policy_call_skip_count(snapshot, dsd_time_now_monotonic_s());
+    next.call_skip_count = dsd_tg_policy_call_skip_count(snapshot, dsd_decode_now_mono_s());
     uint64_t tg_context = 0;
     dsd_tg_policy_table_version(snapshot, &tg_context, nullptr);
     next.tg_policy_context = QString::number(tg_context);
@@ -503,19 +528,23 @@ MetricsModel::fillScanTimingView(View& next, const dsd_opts* opts_snapshot, cons
 }
 
 /**
- * @brief The received sub-audible tone, and the configured policy beside it (#522).
+ * @brief The received sub-audible tone or code, and the configured policy beside it (#522, #523).
  *
  * The phrase and the visibility rule are app-control's (rx_tone_view), shared with the
- * terminal. Only the words are translated here; a tone value is a number and stays as the
- * view wrote it. The configured text comes from its own field of the view and nothing
- * received is ever copied into it. @p now_m is the frame's one clock reading, which ages the
- * publication of an input that has gone quiet.
+ * terminal. Only the words are translated here; a tone or code is a value and stays as the
+ * view wrote it ("CTCSS 100.0 Hz", "DCS D023N / D047I"). The configured text comes from its
+ * own field of the view and nothing received is ever copied into it. @p now_m is real monotonic
+ * seconds (dsd_realtime_mono_s()), which ages the publication of an input that has gone quiet
+ * against the real-time deadline the tap stamped.
  */
 void
 MetricsModel::fillRxToneView(View& next, const dsd_opts* opts_snapshot, const dsd_state* snapshot, double now_m) const {
     dsd_app_rx_tone view;
     const int shown = dsd_app_rx_tone_view(opts_snapshot, snapshot, now_m, &view);
     next.rx_tone_configured_text = QString::fromUtf8(view.configured_text);
+    fillToneFilterView(next, view.policy_visible != 0U, view.gate, view.gate_no_tone != 0U);
+    next.tone_filter_editable = view.policy_editable != 0U;
+    fillToneFilterSetting(next, opts_snapshot, snapshot);
     if (shown != 1) {
         return;
     }
@@ -523,12 +552,49 @@ MetricsModel::fillRxToneView(View& next, const dsd_opts* opts_snapshot, const ds
     next.rx_tone_status = view.status;
     next.rx_tone_kind = view.kind;
     next.rx_tone_tenths_hz = view.ctcss_tenths_hz;
+    next.rx_tone_dcs_code = view.dcs_code;
+    next.rx_tone_dcs_inverted = view.dcs_inverted != 0U;
+    next.rx_tone_dcs_alias_code = view.dcs_alias_code;
+    next.rx_tone_dcs_alias_inverted = view.dcs_alias_inverted != 0U;
     next.rx_tone_carrier = view.carrier_open != 0U;
     switch (view.status) {
         case DSD_APP_RX_TONE_DETECTING: next.rx_tone_text = tr("detecting"); break;
         case DSD_APP_RX_TONE_NONE: next.rx_tone_text = tr("none"); break;
         default: next.rx_tone_text = QString::fromUtf8(view.text); break;
     }
+}
+
+/**
+ * @brief The tone policy's row (#527): whether it is on screen, and its verdict on the carrier on air in translated
+ * words. The policy text itself is the configured reading above; neither is ever derived from the received tone.
+ */
+void
+MetricsModel::fillToneFilterView(View& next, bool visible, int gate, bool no_tone) {
+    next.tone_filter_visible = visible;
+    next.tone_filter_gate = gate;
+    switch (gate) {
+        case DSD_ANALOG_TONE_GATE_PENDING: next.tone_filter_status_text = tr("muted: checking tone"); break;
+        case DSD_ANALOG_TONE_GATE_ALLOWED: next.tone_filter_status_text = tr("passing"); break;
+        case DSD_ANALOG_TONE_GATE_REJECTED:
+            next.tone_filter_status_text = no_tone ? tr("muted: no tone") : tr("muted: not allowed");
+            break;
+        default: next.tone_filter_status_text.clear(); break;
+    }
+}
+
+/**
+ * @brief What the live tone-filter editor (#527) opens on: the configured policy from app-control
+ * (dsd_app_tone_filter_setting_get()), never a scan row's own, and whether a row's own shadows an edit.
+ */
+void
+MetricsModel::fillToneFilterSetting(View& next, const dsd_opts* opts_snapshot, const dsd_state* snapshot) {
+    dsd_app_tone_filter_setting setting;
+    if (dsd_app_tone_filter_setting_get(opts_snapshot, snapshot, &setting) != 0) {
+        return;
+    }
+    next.tone_filter_configured_mode = setting.mode;
+    next.tone_filter_configured_list = QString::fromUtf8(setting.list);
+    next.tone_filter_row_override = setting.row_override != 0U;
 }
 
 namespace {
@@ -783,13 +849,15 @@ MetricsModel::fillDecoderView(View& next, const dsd_opts* opts_snapshot, const d
      * never applied, and publishing them would put three plausible tuner
      * readings on screen for a session that has no tuner. */
     next.tuner_gain_db = next.radio_input ? opts_snapshot->rtl_gain_value : 0;
+    fillTunerGain(next, opts_snapshot, snapshot);
     /* rtl_squelch_level is a mean-power threshold, not decibels — the same
      * conversion the engine's own status line uses. Publishing the raw value
      * would put "0" on screen for a squelch of -120 dB. A level that gates
      * nothing is published separately, because pwr_to_dB() renders it as -120
      * too and the panel would otherwise show a threshold that is not in force. */
-    next.squelch_db = next.radio_input ? pwr_to_dB(opts_snapshot->rtl_squelch_level) : 0.0;
-    next.squelch_off = next.radio_input && dsd_squelch_is_off(opts_snapshot->rtl_squelch_level);
+    const bool squelch_input = next.radio_input || next.squelch_audio_input;
+    next.squelch_db = squelch_input ? pwr_to_dB(opts_snapshot->rtl_squelch_level) : 0.0;
+    next.squelch_off = squelch_input && dsd_squelch_is_off(opts_snapshot->rtl_squelch_level);
     next.ppm = next.radio_input ? opts_snapshot->rtlsdr_ppm_error : 0;
     next.tetra_network_known = snapshot->tetra_net_known != 0;
     if (next.tetra_network_known) {
@@ -832,21 +900,57 @@ MetricsModel::fillDecoderView(View& next, const dsd_opts* opts_snapshot, const d
     next.tetra_vocoder_status_text =
         next.tetra_vocoder_status_known ? formatTetraVocoderStatusText(snapshot) : QString();
     fillSquelchOverride(next, opts_snapshot, snapshot);
+    fillScanRow(next, opts_snapshot, snapshot);
+}
+
+/* Issue #518: the scan row on air as every frontend's "this channel" editor sees it (the app-control scan row view). */
+void
+MetricsModel::fillScanRow(View& next, const dsd_opts* opts_snapshot, const dsd_state* snapshot) {
+    dsd_app_scan_row_view row{};
+    (void)dsd_app_scan_row_view_get(opts_snapshot, snapshot, &row);
+    next.scan_row_active = row.active != 0;
+    next.scan_row_label = row.active ? QString::fromUtf8(row.label) : QString();
+    next.scan_row_key =
+        row.active ? QStringLiteral("%1:%2:%3").arg(row.scanner).arg(row.session).arg(row.row) : QString();
+    next.scan_row_editable = row.active ? static_cast<int>(row.editable) : 0;
+    next.scan_row_edited = row.active ? static_cast<int>(row.edited) : 0;
+    next.scan_row_listed = row.active ? static_cast<int>(row.listed) : 0;
+    next.scan_row_synced = row.active && row.opts_match != 0;
+}
+
+/* Under --trunk-scan the buttons edit the configured gain beneath a target's own rtl_gain, as the terminal's Gain... row
+ * does, from the same app_control view (issue #518 follow-up). */
+void
+MetricsModel::fillTunerGain(View& next, const dsd_opts* opts_snapshot, const dsd_state* snapshot) {
+    dsd_app_rtl_gain_view gain{};
+    const bool gain_view = next.radio_input && dsd_app_rtl_gain_view_get(opts_snapshot, snapshot, &gain) == 0;
+    next.tuner_gain_configured_db = gain_view ? gain.configured_gain : next.tuner_gain_db;
+    next.tuner_gain_row_override = gain_view && gain.row_override != 0U;
 }
 
 /* Issue #521: the configured/effective pair, the off decisions, the row badge and the readout
  * text all come from the same app_control view the terminal's SQL readout uses, so the two
- * frontends cannot disagree about a row. */
+ * frontends cannot disagree about a row. On radio and audio input alike (issue #628). */
 void
 MetricsModel::fillSquelchOverride(View& next, const dsd_opts* opts_snapshot, const dsd_state* snapshot) {
     dsd_app_squelch_view squelch{};
-    if (!next.radio_input || dsd_app_squelch_view_get(opts_snapshot, snapshot, &squelch) != 0) {
+    if ((!next.radio_input && !next.squelch_audio_input)
+        || dsd_app_squelch_view_get(opts_snapshot, snapshot, &squelch) != 0) {
         next.configured_squelch_db = 0.0;
         next.effective_squelch_db = 0.0;
         next.configured_squelch_off = false;
         next.effective_squelch_off = false;
         next.squelch_row_override = false;
         next.squelch_readout.clear();
+        next.configured_squelch_auto = false;
+        next.effective_squelch_auto = false;
+        next.configured_squelch_noise = false;
+        next.effective_squelch_noise = false;
+        next.squelch_noise_offered = false;
+        next.configured_squelch_margin_db = 0;
+        next.effective_squelch_margin_db = 0;
+        next.configured_squelch_level_off = false;
+        next.squelch_auto_status.clear();
         return;
     }
     next.configured_squelch_db = dsd_app_squelch_db_or_off(squelch.configured_level);
@@ -857,23 +961,61 @@ MetricsModel::fillSquelchOverride(View& next, const dsd_opts* opts_snapshot, con
     char readout[96];
     (void)dsd_app_squelch_view_format(&squelch, readout, sizeof readout);
     next.squelch_readout = QString::fromUtf8(readout);
+    next.configured_squelch_auto = squelch.configured_auto != 0U;
+    next.effective_squelch_auto = squelch.effective_auto != 0U;
+    next.configured_squelch_noise = squelch.configured_noise != 0U;
+    next.effective_squelch_noise = squelch.effective_noise != 0U;
+    next.squelch_noise_offered = dsd_squelch_noise_has_no_fm(opts_snapshot) == 0;
+    /* A level setting keeps the margin it had, which Auto or Noise starts from again. */
+    next.configured_squelch_margin_db = squelch.configured_margin_db;
+    next.effective_squelch_margin_db = squelch.effective_margin_db;
+    next.configured_squelch_level_off = dsd_squelch_is_off(squelch.configured_level);
+    char status[40];
+    (void)dsd_app_squelch_view_dynamic_status(&squelch, status, sizeof status);
+    next.squelch_auto_status = QString::fromUtf8(status);
 }
 
 /* Issue #525: the analog width the Radio sheet shows and the configured one its control edits, as app_control's analog
- * width view decides them for every frontend (the terminal's "Analog:" status field too). */
+ * width view decides them for every frontend (the terminal's "Analog:" status field too). Issue #526: an analog scan
+ * row on air shows its width on any session, and one that sets its own flags the row override the sheet badges.
+ * Issue #621: on audio input with a rigctl peer the same readings are the peer's passband, which the monitor's
+ * Passband sheet edits. */
 void
 MetricsModel::fillAnalogChannel(View& next, const dsd_opts* opts_snapshot, const dsd_state* snapshot,
                                 const dsd_frontend_metrics& metrics) {
     dsd_app_analog_width_view view;
     (void)dsd_app_analog_width_view_get(opts_snapshot, snapshot, &metrics, &view);
-    /* The view leaves the width, its bound and the flag at 0 outside the analog preset. */
+    /* The view leaves the width and the flag at 0 outside the analog preset, with no analog scan row on air, and the
+     * bound at 0 off a radio. */
     next.analog_bandwidth_configured_hz = view.configured_hz;
+    next.analog_bandwidth_setting_hz = opts_snapshot ? dsd_opts_analog_width_hz(opts_snapshot) : 0;
+    next.nfm_bandwidth_configured_hz =
+        dsd_scan_mode_configured_analog_width(opts_snapshot, snapshot, DSD_ANALOG_DEMOD_FM);
+    next.am_bandwidth_configured_hz =
+        dsd_scan_mode_configured_analog_width(opts_snapshot, snapshot, DSD_ANALOG_DEMOD_AM);
     next.analog_bandwidth_hz = view.width_hz;
     next.analog_bandwidth_max_hz = view.max_hz;
     next.analog_bandwidth_dsp_limited = view.dsp_limited != 0U;
+    next.analog_bandwidth_row_active = view.row_analog != 0U;
+    next.analog_bandwidth_row_override = view.row_override != 0U;
+    next.analog_bandwidth_am = view.kind == DSD_ANALOG_DEMOD_AM;
+    next.nfm_bandwidth_offered = dsd_app_analog_width_offered(opts_snapshot, snapshot, &view, DSD_ANALOG_DEMOD_FM) != 0;
+    next.am_bandwidth_offered = dsd_app_analog_width_offered(opts_snapshot, snapshot, &view, DSD_ANALOG_DEMOD_AM) != 0;
     char reading[DSD_APP_ANALOG_WIDTH_TEXT_MAX];
     (void)dsd_app_analog_width_view_format(&view, reading, sizeof reading);
     next.analog_bandwidth_reading = QString::fromUtf8(reading);
+    /* Issue #621: on audio input with a rigctl peer the width is the passband the peer is asked for, and an unset NFM
+     * setting stands for -B (or the peer's own passband), which the Passband sheet shows and steps an unset width
+     * from. Both kinds from the one snapshot, as the view decides them. */
+    next.peer_passband = view.peer_passband != 0U;
+    next.passband_in_force = view.passband_in_force != 0U;
+    char unset[DSD_APP_ANALOG_WIDTH_TEXT_MAX];
+    (void)dsd_app_analog_width_setting_text(&view, DSD_ANALOG_DEMOD_FM, 0, unset, sizeof unset);
+    next.nfm_bandwidth_unset_text = QString::fromUtf8(unset);
+    (void)dsd_app_analog_width_setting_text(&view, DSD_ANALOG_DEMOD_AM, 0, unset, sizeof unset);
+    next.am_bandwidth_unset_text = QString::fromUtf8(unset);
+    next.nfm_bandwidth_unset_hz = dsd_app_analog_width_unset_hz(&view, DSD_ANALOG_DEMOD_FM);
+    next.am_bandwidth_unset_hz = dsd_app_analog_width_unset_hz(&view, DSD_ANALOG_DEMOD_AM);
 }
 
 void
@@ -939,6 +1081,29 @@ MetricsModel::airspyView(const dsd_opts* opts_snapshot) {
     return native;
 }
 
+QString
+MetricsModel::tunerGainText(const dsd_frontend_metrics& metrics) {
+    if (metrics.tuner_gain_is_auto != 0) {
+        return QStringLiteral("auto");
+    }
+    if (metrics.tuner_gain_valid != 0) {
+        return QStringLiteral("%1 dB").arg(metrics.tuner_gain_tenth_db / 10.0, 0, 'f', 1);
+    }
+    return QStringLiteral("—");
+}
+
+void
+MetricsModel::fillUiMessage(View& next, const dsd_state* snapshot) {
+    /* The engine's command acknowledgement, shown until its own expiry stamp. The
+     * timer takes an expired message down without waiting for another publish —
+     * an idle engine may not raise the redraw flag again for minutes. */
+    const qint64 message_remaining_s = static_cast<qint64>(snapshot->ui_msg_expire) - realtimeSecsSinceEpoch();
+    if (snapshot->ui_msg[0] != '\0' && message_remaining_s > 0) {
+        next.ui_message = QString::fromUtf8(snapshot->ui_msg);
+        m_messageTimer.start(static_cast<int>(qMin<qint64>(message_remaining_s, 30) * 1000) + 100);
+    }
+}
+
 void
 MetricsModel::refresh(const dsd_opts* opts_snapshot, const dsd_state* snapshot) {
     dsd_frontend_metrics metrics;
@@ -968,6 +1133,9 @@ MetricsModel::refresh(const dsd_opts* opts_snapshot, const dsd_state* snapshot) 
      * the running session was configured with, which is the same authority the
      * metrics fetch above uses to decide whether any of them mean anything. */
     next.radio_input = dsd_opts_input_is_radio(opts_snapshot) != 0;
+    /* Audio input (Pulse, a file, stdin, TCP, UDP) takes a squelch too: a level, or the noise squelch it learns from
+     * the input itself (issue #628). */
+    next.squelch_audio_input = dsd_squelch_input_kind(opts_snapshot) == DSD_SQUELCH_INPUT_AUDIO;
 
     next.carrier_lock = metrics.carrier_lock != 0;
     next.cfo_hz = metrics.cfo_hz;
@@ -976,8 +1144,10 @@ MetricsModel::refresh(const dsd_opts* opts_snapshot, const dsd_state* snapshot) 
      * is pointing it. Both come from the same options snapshot as radio_input,
      * so a frame never mixes a center from one generation with a gate from
      * another. Scanner mode counts alongside trunking: it owns the tuner too,
-     * stepping the channel map once the hangtime expires. */
-    next.center_freq_hz = next.radio_input ? static_cast<double>(opts_snapshot->rtlsdr_center_freq) : 0.0;
+     * stepping the channel map once the hangtime expires. The centre follows an
+     * I/Q replay's recorded retunes (issue #575), and reads 0 off a radio input,
+     * as radio_input does (dsd_opts_tuned_freq_hz()). */
+    next.center_freq_hz = static_cast<double>(dsd_opts_tuned_freq_hz(opts_snapshot));
     next.channel_bandwidth_hz = next.radio_input ? metrics.channel_bandwidth_hz : 0;
     fillAnalogChannel(next, opts_snapshot, snapshot, metrics);
     next.trunking_enabled = opts_snapshot->trunk_enable != 0;
@@ -986,11 +1156,16 @@ MetricsModel::refresh(const dsd_opts* opts_snapshot, const dsd_state* snapshot) 
      * it steps targets from the engine loop and a release cannot clear it, so an
      * affordance gated only on the other two offers a tune the scan then undoes. */
     next.tuner_controlled = next.trunking_enabled || next.scanner_mode || (opts_snapshot->trunk_scan_enabled != 0);
+    /* An I/Q replay refuses every tune and the tuner release (issue #575): the predicate app-control refuses on, read
+     * from the same snapshot as radio_input, so a view never offers a tune the command queue then turns down. */
+    next.replay_input = dsd_opts_input_is_iq_replay(opts_snapshot) != 0;
 
     /* Sync is held for a moment after the last synced frame rather than sampled;
      * the hold decays on its own rather than being cleared on a retune. See
-     * fillDecoderView(), which documents why a one-shot reset was a race. */
-    fillDecoderView(next, opts_snapshot, snapshot, dsd_time_now_monotonic_s());
+     * fillDecoderView(), which documents why a one-shot reset was a race. The hold
+     * smooths what this poll sees, so it runs on real time: it has to decay while a
+     * stalled input leaves the decode clock where it stopped. */
+    fillDecoderView(next, opts_snapshot, snapshot, dsd_realtime_mono_s());
 
     /* Selected by modulation, not by cqpsk_enable: the C4FM estimator reads nothing on
      * a GFSK stream. Nothing reads at all on an input with no demodulator behind it
@@ -1001,15 +1176,11 @@ MetricsModel::refresh(const dsd_opts* opts_snapshot, const dsd_state* snapshot) 
     next.snr_valid = snr.valid != 0;
     next.snr_db = next.snr_valid ? snr.snr_db : 0.0;
 
-    if (metrics.tuner_gain_is_auto != 0) {
-        next.tuner_gain_text = QStringLiteral("auto");
-    } else if (metrics.tuner_gain_valid != 0) {
-        next.tuner_gain_text = QStringLiteral("%1 dB").arg(metrics.tuner_gain_tenth_db / 10.0, 0, 'f', 1);
-    } else {
-        next.tuner_gain_text = QStringLiteral("—");
-    }
+    next.tuner_gain_text = tunerGainText(metrics);
 
-    const double now_m = dsd_time_now_monotonic_s();
+    /* Decode time: the call lines and the scan countdown age stamps the decoder took
+     * from the decode clock. */
+    const double now_m = dsd_decode_now_mono_s();
     fillSlotCalls(next, snapshot, now_m);
     fillQualityView(next, snapshot);
     fillSiteView(next, snapshot);
@@ -1020,23 +1191,32 @@ MetricsModel::refresh(const dsd_opts* opts_snapshot, const dsd_state* snapshot) 
      * assume a fresh session's defaults. */
     fillListeningControlView(next, opts_snapshot, snapshot);
     fillScanControlView(next, opts_snapshot, snapshot);
-    /* The same monotonic reading the call lines were aged against, not a second
-     * clock read: one frame has to describe one instant, or the countdown and the
-     * call durations beside it would come from moments either side of the poll. */
+    /* The same decode reading the call lines were aged against, not a second clock
+     * read: one frame has to describe one instant, or the countdown and the call
+     * durations beside it would come from moments either side of the poll. The
+     * received tone is aged against its input-pause deadline, which the tap stamps
+     * in real time. */
     fillScanTimingView(next, opts_snapshot, snapshot, now_m);
-    fillRxToneView(next, opts_snapshot, snapshot, now_m);
+    fillRxToneView(next, opts_snapshot, snapshot, dsd_realtime_mono_s());
 
-    /* The engine's command acknowledgement, shown until its own expiry stamp. The
-     * timer takes an expired message down without waiting for another publish —
-     * an idle engine may not raise the redraw flag again for minutes. */
-    const qint64 message_remaining_s =
-        static_cast<qint64>(snapshot->ui_msg_expire) - QDateTime::currentSecsSinceEpoch();
-    if (snapshot->ui_msg[0] != '\0' && message_remaining_s > 0) {
-        next.ui_message = QString::fromUtf8(snapshot->ui_msg);
-        m_messageTimer.start(static_cast<int>(qMin<qint64>(message_remaining_s, 30) * 1000) + 100);
-    }
+    fillUiMessage(next, snapshot);
 
     publish(next);
+    notifyDecodeNow();
+}
+
+qlonglong
+MetricsModel::decodeNowMs() const {
+    return static_cast<qlonglong>(std::floor(dsd_decode_now_realtime_s() * 1000.0));
+}
+
+void
+MetricsModel::notifyDecodeNow() {
+    const qlonglong now_s = decodeNowMs() / 1000;
+    if (now_s != m_decode_now_notified_s) {
+        m_decode_now_notified_s = now_s;
+        Q_EMIT decodeNowMsChanged();
+    }
 }
 
 } // namespace dsd_qt

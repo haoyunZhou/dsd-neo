@@ -61,6 +61,39 @@ described under [Analog Monitor Path](#analog-monitor-path).
   - P25 Phase 2 CQPSK: 8 SPS at 48 kHz, 4 SPS at 24 kHz.
 - FSK discriminator output uses `getSymbol()` sample-domain timing. That path
   needs capture bandwidth wide enough to avoid shaving deviation energy.
+- The half-band decimators and the channel LPF stream (issue #572): each
+  carries its look-ahead from one block to the next, as a `pending` count of
+  inputs taken but not yet filtered past with the newest inputs in its history,
+  and the half-band its decimation phase too, so their output does not depend on
+  where the blocks are cut. The call contracts are in
+  `<dsd-neo/dsp/simd_fir.h>`: the channel FIR counts complex samples, the
+  complex half-band floats (two a sample), the real half-band samples; an
+  invalid call, or an output capacity below what the call would make, returns
+  -1 and touches nothing.
+  - Latency: a filter emits an output only once it holds the c = (taps - 1) / 2
+    samples after it. On the default 1.536 Msps chain that is about 74 samples,
+    1.54 ms, at 48 kHz: about 7 in the five-pass cascade and 67 in the 135-tap
+    channel filter.
+  - Capacity: the channel history holds 287 complex samples whatever the taps,
+    so a tap-count change reconciles through `pending` without a reset, making
+    up to N + c_old - c_new outputs from N inputs; the work buffers it writes
+    hold a maximum block plus 287. A half-band call makes at most (N + 1) / 2.
+  - Reset: `dsd_demod_reset_filter_state()` is the one reset, zeroed histories
+    and `pending` 0, so each filter's next output is centred on its next input
+    and what it held is dropped. An open, a retune, a replay `RESET` or loop
+    rewind, a family switch and an FM <-> AM switch run it; a width-only edit
+    does not (see Live Switching). Nothing flushes the filters at the end of a
+    capture, so its last 1.5 ms or so is never decoded. On a real P25 Phase 2
+    capture the tail each `RESET` drops costs about 4 of 677 syncs: frames that
+    straddle a dwell's closing `RESET`, and about one call-opening `MAC_ACTIVE`
+    a run at a dwell's start (`docs/iq-capture-replay.md`, "Replay Pacing And
+    The Decode Clock").
+  - Per-block decisions: the stages after the filters still decide per block,
+    so `full_demod()` as a whole does not stream: channel power and the squelch
+    decision, the squelch envelope, I/Q balance, the AM detector's warm start,
+    CQPSK's adaptive Gardner gain, the rounding of a squelched block's
+    zero-symbol count, the metrics, and the block a profile request is consumed
+    on. `docs/code_map.md` ("Streaming linear front end") has the rest.
 
 ## Analog Monitor Path
 
@@ -72,9 +105,97 @@ switching do not apply to it, and it keeps the fixed WIDE/FM path. The State
 Hygiene rules key on the output kind, so they cover every monitor stream, the
 M17 encoder's included.
 
-Per block: half-band decimation, channel LPF, carrier squelch, FM
-discrimination, de-emphasis, optional audio LPF, DC block, and the squelch
-envelope.
+Per block: half-band decimation, channel LPF (both streaming across blocks,
+see Filter And Rate Guardrails), carrier squelch, FM discrimination,
+de-emphasis, optional audio LPF, DC block, and the squelch envelope.
+
+`-fM` (native AM, issue #524) is the same family with the AM kind: the envelope
+detector (`dsd_am_demod`) takes the discriminator's place, and the chain runs
+without de-emphasis and without the I/Q DC blocker or I/Q balance.
+
+### AM Detector
+
+- Output = 0.25 x clamp(|z| / C - 1, -2, 2), after the channel LPF, where C is
+  the carrier estimate `demod_state::am_carrier`: a one-pole average of |z| with
+  a 50 ms time constant (`DSD_AM_CARRIER_TAU_MS`), its coefficient recomputed
+  each block from the rate the detector runs at (`rate_out`; AM never runs on a
+  replay that decimates after the demodulator, see below). Below 1e-9 there is
+  no carrier and the output is silence.
+- Carrier normalisation makes the level the modulation depth, independent of RF
+  level, tuner gain and input scaling (x and x/pi give the same audio), and a
+  carrier offset inside the channel changes nothing (the envelope has no phase).
+  The 0.25 gain puts 100% modulation where live FM sits at about 6 kHz
+  deviation, so the decoder's monitor filters and gain stage see the level they
+  see for FM.
+- The estimate holds while the channel squelch mutes a block (the detector
+  writes silence rather than the -0.25 a zero envelope would read as), so audio
+  resumes at its level when the squelch opens after a fade. A squelch closed
+  longer than `DSD_AM_CARRIER_HOLD_MS` (100 ms, twice the time constant,
+  counted in `demod_state::am_squelched_samples`) ended the transmission: the
+  next unsquelched block starts the estimate over, so another station 10x
+  stronger or weaker is at its level from its first sample instead of clamping
+  at +0.5 or stepping to about -0.225. Every monitor audio reset (open,
+  retune, family or FM <-> AM switch; `rtl_demod_reset_audio_monitor_state()`)
+  sets it to 0, and the next unsquelched block warm-starts it from that block's
+  mean magnitude rather than dividing the new channel by the old one's carrier.
+- `iq_dc_block()` never runs under the AM detector
+  (`dsd_demod_iq_dc_block_active()`): after tuning, an AM carrier sits at 0 Hz
+  (centred I/Q, offset tuning), where the blocker would notch it out. The
+  configured setting is kept and applies again to FM; the first time it is
+  bypassed, per process, a note is logged (`rtl_demod_note_am_iq_dc_bypass()`).
+  The DC spike of a centred-I/Q device (Airspy, offset tuning) then adds to the
+  carrier: a hardware check is open below.
+- I/Q balance (`full_demod_apply_iq_balance()`) never runs under the AM detector
+  either (`dsd_demod_iq_balance_active()`): its image estimate is the block's
+  second moment over its power, which a carrier at 0 Hz, a fixed phasor, drives
+  to full scale, so the correction would subtract the carrier and its sidebands
+  (the 1 kHz tone at 50% comes out about 30 dB down). The setting is kept for
+  FM, with its own one-time note (`rtl_demod_note_am_iq_balance_bypass()`).
+- The output scale is not applied to AM (see Output Scale), and de-emphasis is
+  off at open and on every switch to AM (its coefficient cleared), restored from
+  the config on the way back to FM.
+- The detector runs only while the monitor is on its own (WIDE) channel. A typed
+  digital scan row's symbol profile on an AM session keeps the monitor output
+  with the row's channel profile, as under `-fA`, and its signal is
+  FM-demodulated there, with the I/Q DC blocker, I/Q balance and the output
+  scale applied as for FM; the carrier estimate is untouched, and the row's leave (a family
+  switch) resets it. The audio chain after the discriminator is the session's,
+  though: an AM session runs no de-emphasis, so the row's discriminator output
+  reaches the decoder un-de-emphasized, as a digital open delivers it, where
+  under `-fA` the FM monitor's de-emphasis (75 us by default) still filters it.
+  The same typed row can therefore decode slightly differently under `-fA` and
+  `-fM`; the `-fA` side predates AM and is left as it was.
+- Measured on the deterministic fixtures through the replay host: a 1 kHz tone at
+  50% depth with noise 30 dB below the carrier reads 31.7 dB tone SNR and
+  50.4 dB in-band ratio through the default monitor chain
+  (`DECODE_IQ_ANALOG_AM_TONE`); with the voice filters off at the fixed gain
+  (`-v 0 -n 50`), an unmodulated neighbour 8.333 kHz up at -6 dB beats at
+  -103.5 dBc through the default 6 kHz channel and +0.3 dBc through a 20 kHz
+  one (`DECODE_IQ_ANALOG_AM_ADJ_6K`/`_20K`). The
+  detector alone keeps the 0.125 tone level within 0.05% from carrier 0.01 to
+  1.0 and at 1/pi of each, THD -62 dB (`DSP_AM_DEMOD`).
+- Paired replays of `am_airband_real` (`tools/replay_ab.sh --metric analog`, 12
+  realtime repeats, `-fM -v 0`, run on the final detector, sample-deterministic:
+  an A-vs-A control reads +0.00 with no differing repeat): at the 6 kHz default
+  the excerpt is audible for 6780 ms at -27.1 dBFS RMS with a 30.9 dB in-band
+  ratio (300-3000 Hz against 3.4-6 kHz), no clipping. The width moves the
+  in-band ratio as a channel filter should and leaves the level alone (within
+  0.02 dB): 39.3 dB at 5 kHz (which also trims the top of the voice band: 120 ms
+  less audible), 27.2, 26.8 and 26.6 dB at 8, 10 and 20 kHz. The per-block AGC
+  of the time (`-n 0`; issue #518 replaced it, see Monitor Gain Stage) lowered
+  the level by 6.0 dB, as it did for FM. The FM monitor is
+  unchanged against main on `nfm_ctcss_real`, `nfm_tone_synth` and
+  `am_airband_real` under `-fA` (every column +0.00, no differing repeat).
+- The carrier time constant was paired at 25 and 100 ms against the 50 ms
+  default (builds differing only in `DSD_AM_CARRIER_TAU_MS`). On the excerpt the
+  in-band ratio moves by at most 0.06 dB and the level by 0.04 dB, and on
+  `am_tone_synth` the tone SNR by 0.01 dB; only the audible time follows it
+  (6460, 6780 and 6960 ms at 25, 50 and 100 ms), since a shorter average tracks
+  more of the slow speech envelope as carrier and takes it out of the audio. The
+  replay metrics therefore do not choose the constant. 50 ms, which follows a
+  fade within a syllable or two without following the speech, and the 0.25 gain,
+  which scales every level alike and leaves every ratio metric alone, are design
+  values. The maintainer's on-air listen check below decides them.
 
 ### Channel Width
 
@@ -118,7 +239,8 @@ Enable rule and validation:
   the rate (about 78.5 kHz at 128 kHz), rather than the whole DSP span.
 - An explicit width turns the channel LPF on. With `DSD_NEO_CHANNEL_LPF=0` it
   is refused. The unset AM default is held to the same rules as an explicit
-  width (AM itself is refused until the front end can demodulate it).
+  width: AM always runs its channel filter, so it is refused at a rate that
+  cannot fit 6 kHz (6 kHz and below) and with `DSD_NEO_CHANNEL_LPF=0`.
 - The check that counts runs at stream start once the rate chain is final,
   including a rate the device forced; a refusal fails the start. A runtime
   request is checked against the running stream's rate; with no stream running
@@ -134,11 +256,13 @@ Enable rule and validation:
 - The design uses `rate_out`, which is the complex rate the channel filter runs
   at only while `post_downsample` is 1. Live sources always run that way; only
   IQ replay sidecars can set a larger post-demod decimation, and there a
-  requested width (explicit, or the AM default) is refused at start and on
-  every runtime request, since the filter would run at `rate_out` x
-  `post_downsample`. The unset NFM default keeps the legacy design, and is
-  published as DSP-limited at the width that design passes at the rate it
-  really runs at (its width at `rate_out` times `post_downsample`).
+  requested width (explicit, or the AM default) is refused at start and on every
+  runtime request, since the filter would run at `rate_out` x `post_downsample`.
+  NFM can drop its explicit width; AM cannot run on such a capture at all
+  (`AM needs a capture with post_downsample 1`). The unset NFM default keeps the
+  legacy design, and is published as DSP-limited at the width that design passes
+  at the rate it really runs at (its width at `rate_out` times
+  `post_downsample`).
 - Device-forced rates above ~51.4 kHz (for example Airspy at 2.5 MS/s, demod
   rate 78,125 Hz) used to fall back to the 63-tap prototype designed for 24 kHz.
   They now get a real design (219 taps at 78,125 Hz).
@@ -157,8 +281,11 @@ The configured NFM width (`dsd_opts::analog_nfm_bandwidth_hz`, 0 for the
 default) comes from `--nfm-bandwidth-hz`, `[analog] nfm_bandwidth_hz`, the
 terminal's NFM bandwidth row and the Qt Radio sheet, the last two through
 `DSD_APP_CMD_NFM_BANDWIDTH_SET` (user docs: `docs/cli.md`, Analog reception).
-Every entry point refuses rather than clamps, and the checks sit where the rate
-is known:
+The AM width (`analog_am_bandwidth_hz`, issue #524) comes the same ways, through
+`--am-bandwidth-hz`, `am_bandwidth_hz`, the AM bandwidth row, the sheet under
+the AM preset and `DSD_APP_CMD_AM_BANDWIDTH_SET`, and every check below holds
+its unset default (6 kHz) as it holds an explicit width. Every entry point
+refuses rather than clamps, and the checks sit where the rate is known:
 
 - The CLI and the INI loader take whole Hz in range only
   (`dsd_analog_width_parse()`); `--validate-config` reports the same text as an
@@ -179,22 +306,28 @@ is known:
   leaving the width unset, which runs at any rate.
 - `DSD_NEO_CHANNEL_LPF=0` refuses every explicit width at any rate
   (`dsd_analog_channel_lpf_off_check()`) on a radio input (PCM input runs no
-  channel filter, so a width there is only stored), at stream start and,
-  first, in every change that would commit to a start with one: a width with
-  no stream running, a config reopen at an RTL DSP bandwidth or a device's
-  rate, a DSP bandwidth change and Input > Switch source > RTL-SDR, so the
-  running input is not torn down for a start that cannot open.
+  channel filter, so a width there is only stored, or with a rigctl peer asked
+  of the peer as its passband), at stream start and, first, in every change
+  that would commit to a start with one: a width with no stream running, a
+  config reopen at an RTL DSP bandwidth or a device's rate, a DSP bandwidth
+  change and Input > Switch source > RTL-SDR, so the running input is not torn
+  down for a start that cannot open.
 - The command checks a width the analog preset uses against the running
   stream (`rtl_stream_check_analog_profile()`), or with no stream against an
   RTL-SDR/rtl_tcp input's DSP bandwidth, and requests it live from a running
   front end whose options in force are `-fA` (`rtl_stream_request_analog_profile()`):
   a width-only change on the monitor, or the width a queued switch onto the
-  analog family carries. The width is not a scan row setting, so the command
-  edits it in place rather than suspending a row's scope (which would read a
-  row's live acquisition as a change); under a typed digital scan row it is
+  analog family carries. The command edits the configured width without
+  suspending a row's scope (which would read a row's live acquisition as a
+  change), through `dsd_scan_mode_set_configured_nfm_bandwidth()`; an `nfm`
+  scan row's own `--nfm-bandwidth-hz` (issue #526) stays in force over the
+  edit until the row leaves; under a typed digital scan row it is
   stored and applied when the row's leave republishes the analog profile;
   with CQPSK toggled on under `-fA` it is stored, and turning CQPSK off
-  returns to the monitor through the analog profile with it. Whether CQPSK
+  returns to the monitor through the analog profile alone, which turns CQPSK
+  off as it enters the monitor (a return the front end refuses, at once or
+  where it lands, for an explicit width or the AM default, leaves CQPSK on
+  instead of the FSK profile on the monitor output). Whether CQPSK
   holds the front end off the monitor is read from the requests queued, not
   only from the published state, which lags them until the demod thread takes
   them: the stream notes the CQPSK state each numbered request leaves it on,
@@ -216,7 +349,11 @@ is known:
   drain puts back that width and says why (`svc_take_monitor_request_outcome()`),
   so the configured width never stays one the filter does not run, even when
   an earlier width request landed in between. A stream open forgets a refusal
-  its predecessor recorded: it opens on the options as they are.
+  its predecessor recorded: it opens on the options as they are. An analog
+  request the demod thread never took, because a later request replaced it in
+  the queue or a retune's family retired it, reads replaced
+  (`RTL_STREAM_RX_REQUEST_REPLACED`), not settled like one it ran, and the
+  drain leaves it to what replaced it.
 - A switch to Analog (a decode-mode change, a config's `[mode]`) holds an
   explicit width to the rate first, under a scan row too. A retune that moves
   the rate after that check gets the switch refused at once or where it lands,
@@ -237,7 +374,11 @@ is known:
   naming both; the width is never adjusted to fit the new rate.
 
 The channel squelch measures power after the channel filter, so its noise
-floor moves with the width (about 3 dB per halving).
+floor moves with the width (about 3 dB per halving). The auto squelch
+(`--squelch auto`) rescales the floor it learned by the new filter's noise
+gain, so a width change needs no relearning and no new threshold; the noise
+squelch (`--squelch noise`) designs and calibrates its band on the new
+filter's taps.
 
 ### State Hygiene
 
@@ -246,8 +387,8 @@ floor moves with the width (about 3 dB per halving).
   finalized, so they follow the rate the device actually delivers. At unforced
   rates this is bit-identical.
 - A retune on any `AUDIO_MONITOR` stream resets the de-emphasis, DC, audio-LPF
-  and squelch-envelope state and the channel, half-band and resampler histories
-  to their fresh-open values.
+  and squelch-envelope state, the channel, half-band and resampler histories
+  and a replay's post-demod decimator to their fresh-open values.
 - When a retune leaves the stream on a different demod rate (a device that
   settles on another rate than it delivered before), the analog channel is
   resolved again for that rate: the unset default moves between the 16 kHz
@@ -286,9 +427,15 @@ dropped: the analog family has no symbol clock, and a digital family lands on
 the symbol profile queued after it, never on an older one (a CQPSK toggle
 drained in the same pass of the command queue as the mode change):
 
-- width-only change: new filter plan from empty channel and half-band
-  histories, with the output ring, the generation and the monitor audio state
-  left alone (a request for the width already running changes nothing);
+- width-only change: a new filter plan, the channel and half-band histories
+  and pending counts kept (issue #572), so the new taps run over the true past
+  and no sample is lost or repeated at the edit, with the output ring, the
+  generation and the monitor audio state left alone (a request for the width
+  already running changes nothing). The exception is an NFM edit between an
+  explicit width and the unset default when `channel_lpf_default_enable` is 0
+  (`DSD_NEO_CHANNEL_LPF=0`, or `rate_in` below 20 kHz): it turns the channel
+  filter off, whose bypass drops the pending samples, or on, over a zeroed
+  history;
 - analog <-> digital: the new family's fresh-open defaults (output kind,
   demodulator, de-emphasis, channel filter, resampler), carrier and timing loops
   restarted as on an open (Costas, band-edge FLL, Gardner TED), the I/Q DC and
@@ -312,7 +459,22 @@ drained in the same pass of the command queue as the mode change):
   P25 C4FM for a 4800 sym/s P25 CQPSK request turned onto the discriminator) and
   the open's enable rule: while the channel filter is off (`DSD_NEO_CHANNEL_LPF=0`,
   or a DSP rate below 20 kHz by default) an open on the discriminator keeps the
-  WIDE profile, and so does the switch, whatever profile the mode names. The
+  WIDE profile, and so does the switch, whatever profile the mode names. One
+  exception (issue #583): a trunk-scan target's retune out of the analog family
+  (after an `nfm-conventional` or `am-conventional` target) whose digital family
+  says the symbol profile's CQPSK state is the target's own choice
+  (`cqpsk_explicit`: a P25 target with a `modulation` value, `auto` included,
+  and every DMR or NXDN target, which runs FSK). That state stands over the
+  override, with the channel filter the profile names under the same enable
+  rule, as on a retune that stays on the digital family
+  (`rtl_demod_landing_cqpsk()`); the output-rate prediction follows it too.
+  `-Y` rows and P25 targets without a modulation still land where an open of
+  the mode would. A retune that carries the digital family lands its symbol
+  profile this way even when the front end already runs the digital family
+  where it lands (an analog retune refused there, or a request replaced, left
+  it digital): the decoder was timed for the switch's landing when the family
+  was attached, so the CQPSK state, channel filter, output rate and TED are
+  the switch's, without the switch's family record or loop resets. The
   override does not reach the analog family: a `-fA` open runs the FM monitor
   under `DSD_NEO_CQPSK=1` (or a QPSK modulation), as the switch to analog does.
   The family request
@@ -330,8 +492,16 @@ drained in the same pass of the command queue as the mode change):
   not from the rate the decoder read when it queued the profile: a retune can
   settle the device on another rate first (a CQPSK profile queued at 48 kHz and
   landing at a forced 78,125 Hz runs 16 samples per symbol, not 10);
-- FM <-> AM: demodulator and de-emphasis swap with a monitor-state reset (AM is
-  refused until the front end can demodulate it).
+- FM <-> AM: the detector and de-emphasis swap with a monitor-state reset (the
+  AM carrier estimate included) and the I/Q DC estimate starts over (AM leaves
+  it where FM had it); the channel and half-band filters start over from empty
+  histories whatever the width, so the switch lands where a fresh open of the
+  new kind does (the raw I/Q they hold is the same under either kind), and a
+  changed width redesigns the channel filter. The output ring and the resampler
+  history hold the old detector's audio, so the switch clears the ring with a
+  generation bump and resets the resampler, as a family switch does, and the
+  decoder drops the monitor block it had part-collected; a width-only change
+  keeps all three.
 
 The decoder keeps reading the output ring while the demod thread clears it for a
 switch. A read holds the ring's `ready_m` from its tail snapshot to its tail
@@ -396,18 +566,55 @@ leaving analog.
 
 ### Output Scale
 
-Live radio sets `output_scale = 1/pi` in `optimal_settings()`; IQ replay never
-calls it. `output_scale` belongs to the process-wide demod state and nothing
-resets it, so a replay in a process that has not run a live stream (the CLI's
-`--iq-replay`, the replay tests) leaves the discriminator output unscaled, and
-replayed FM monitor audio is about pi times louder than live; a replay opened
-after a live session in the same process keeps the 1/pi that session set. The
-scale applies to monitor audio only: `demod_write_output_block()` skips it for
-FSK discriminator and CQPSK symbol output, so digital decoding and the digital
-`DECODE_IQ_*` baselines do not depend on it. The analog replay checks
-(`DECODE_IQ_ANALOG_*`) do: their level bounds (RMS, peak and audible thresholds
-in dBFS) were measured at the replay scale. Ratio-based audio metrics are
-invariant to it, so it is left as is.
+Live radio sets `output_scale = 1/pi` in `optimal_settings()`, and IQ replay
+sets the same value on every open (`controller_apply_replay_settings()`), so a
+replayed signal reaches the monitor at the level it reaches it live.
+`output_scale` belongs to the process-wide demod state, and before replay set
+it, a replay in a process that had not run a live stream (the CLI's
+`--iq-replay`, the replay tests) left the discriminator output unscaled, pi
+times (9.9 dB) louder than live, while one opened after a live session kept the
+1/pi that session set. 1/pi is the scale at a 48 kHz demod rate: the
+discriminator's output is the phase step per sample, 2 pi f_dev / rate, so the
+applied scale is 1/pi x rate / 48000 (`monitor_output_scale()`), at the rate
+the discriminator actually runs at (rate_out x post_downsample, the rate a
+device delivers: a fixed-grid device such as an Airspy at 2.5 MS/s forces
+78,125 Hz while rate_in keeps the requested bandwidth), and a given deviation
+plays at one level whatever the rate (before, 6 dB louder at 24 kHz and 4.2 dB
+quieter at the Airspy's 78,125 Hz). The scale applies to monitor audio only:
+`demod_write_output_block()` skips it for FSK discriminator and CQPSK symbol
+output, so digital decoding and the digital `DECODE_IQ_*` baselines do not
+depend on it. The analog replay checks (`DECODE_IQ_ANALOG_*`) do: their level
+bounds (RMS, peak and audible thresholds in dBFS) are measured at the live
+scale. Ratio-based audio metrics are invariant to it. The AM detector
+normalises its own level and is exempt (`dsd_demod_am_active()`), so AM monitor
+audio is the same live and in replay; the `DECODE_IQ_ANALOG_AM_*` level bounds
+hold on both.
+`IO_RTL_ANALOG_FAMILY_SWITCH` holds that exemption on the live path, which replay
+never exercises: it writes one block through `demod_write_output_block()` with
+the live scale and without (`rtl_stream_test_monitor_output_scale()`), and
+expects FM monitor audio scaled by 1/pi at 48 kHz, by 1/(2 pi) at 24 kHz and by
+1/pi x 78125/48000 on a device forced to 78,125 Hz, and AM monitor audio and
+digital discriminator output unchanged. It
+also opens a replay on an output scale of 0 and of 0.5, as a process that never
+ran a live stream or an earlier session leaves it, and expects the replay to run
+1/pi from either (`rtl_stream_test_replay_output_scale()`).
+
+### Monitor Gain Stage
+
+Downstream of the front end, the decoder runs the monitor audio through the
+voice band-pass and a gain stage (`dsd_analog_audio_process_f()`, issue #518;
+`docs/code_map.md` has the chain). The gain stage scales each source's reference
+signal to -12 dBFS peak at `-n 50`: FM at 3 kHz deviation and AM at 50% both
+reach the decoder at 0.125 (FM after the 1/pi output scale above, AM from the
+detector's 0.25 gain), 0.25 after the default `vol` of 2, and take a gain of
+32924. The FSK discriminator output a digital front end delivers (+/-30000,
+read by the `-8` source monitor and EDACS analog voice) takes 8231/30000 instead:
+scaled as monitor audio it used to clip every sample. The default `-n 0` is a
+per-sample AGC that brings FM and AM speech to the level digital voice plays at.
+The FM and AM tone fixtures measure -15.9 and -15.0 dBFS RMS at `-n 50`
+(`DECODE_IQ_ANALOG_NFM_TONE_FIXED50`, `_AM_TONE_FIXED50`), and real NFM and AM
+speech -23.9 dBFS each under the AGC, against -24.9 for DMR voice
+(`DECODE_IQ_ANALOG_PARITY_*`).
 
 ## Regression Coverage
 
@@ -428,46 +635,59 @@ invariant to it, so it is left as is.
   design at forced rates, that unrealizable widths fail rather than clamp, and
   that the width reported for the legacy WIDE plan is the passband that plan
   has, the 63-tap fallback included.
+- `DSP_FIR_SEGMENTATION` holds every backend's channel FIR and half-band
+  decimators to the streaming contract (issue #572): their count formulas, a
+  double-precision reference and their own whole-stream output over many block
+  splits, tap switches, invalid calls, capacity and exact-size buffers, and the
+  pipeline's reset rules. `DSP_DEMOD_SEGMENTATION` runs `full_demod()` over the
+  1.536 Msps chain with the per-block stages held still and requires every
+  split to give what one block does.
 - `RUNTIME_ANALOG_CHANNEL` covers the width ranges, parser and validator text
   across DSP rates.
 - `IO_RTL_DEMOD_CONFIG` covers the analog enable rule at 12/16/24/48 kHz, the
   explicit-width and `DSD_NEO_CHANNEL_LPF=0` cases, the unchanged M17 encoder, a
-  `-fA` open under `DSD_NEO_CQPSK=1` (FM monitor) and the AM refusal; `IO_RTL_RETUNE_PREPARE` covers the analog retune resets, the
-  coefficient refresh after a forced rate change, the channel a rate change
-  resolves (the fallback prototype's width published past the tap capacity),
-  the retune refused when its rate cannot realize an explicit width (the
-  capture, centre, rate and width put back, and the retune completing as
-  failed, a retune to the running centre included), the stop when the device does not
-  return to a rate that fits it, and analog retune profiles;
-  `IO_RTL_ANALOG_FAMILY_SWITCH` checks that digital -> analog -> digital ends on
-  a fresh open for P25 C4FM/CQPSK, DMR, NXDN48 and dPMR, at unforced rates and at
-  forced 78,125 and 60,000 Hz rates, under `DSD_NEO_CQPSK=0`/`=1` and with the
-  channel filter off (`DSD_NEO_CHANNEL_LPF=0`, a 12 kHz DSP rate), with loop state, monitor audio state, the
-  I/Q corrections, the post-demod decimator and the channel, half-band and
-  resampler histories and the squelch dwell included, a typed digital row on a
-  `-fA` session and on a
-  DMR session switched to analog, a `-fA` session a CQPSK toggle or a typed
-  digital row had moved off the monitor output switched to digital, and one
-  whose CQPSK toggle was still queued when the digital mode was picked (each
-  equal to a fresh open too, the DSP menu's CQPSK toggle after the switch
-  included, D-STAR among the modes), and covers width-only
-  changes, requests made with no stream running, and live requests and retune
-  profiles a running stream's rate or post-demod decimation cannot realize
-  (refused before anything is queued, or at the rate a retune moved the stream
-  to before the demod thread consumed it), a DMR session's switch onto the
-  monitor refused the same ways (at its rate, at the rate a retune landed
+  `-fA` open under `DSD_NEO_CQPSK=1` (FM monitor), AM opens (the detector, no
+  de-emphasis, the filter forced on at 8 to 48 kHz), AM rate refusals, the I/Q
+  DC bypass and live FM <-> AM switches; `IO_RTL_RETUNE_PREPARE` covers the
+  analog retune resets (an AM retune included), the coefficient refresh after a
+  forced rate change, the channel a rate change resolves (the fallback
+  prototype's width published past the tap capacity), the retune refused when
+  its rate cannot realize an explicit width (the capture, centre, rate and width
+  put back, and the retune completing as failed, a retune to the running centre
+  included), the stop when the device does not return to a rate that fits it,
+  analog retune profiles, and a trunk-scan target's own CQPSK choice landing
+  after an analog target under `DSD_NEO_CQPSK=0` and `=1` (CQPSK, C4FM and DMR
+  FSK, and profiles that are not the target's own, at a forced 78,125 Hz with
+  the predicted output rate); `IO_RTL_DEMOD_CONFIG` also holds
+  `rtl_demod_landing_cqpsk()`'s truth table; `IO_RTL_ANALOG_FAMILY_SWITCH` checks that digital
+  -> analog -> digital ends on a fresh open for P25 C4FM/CQPSK, DMR, NXDN48 and
+  dPMR, at unforced rates and at forced 78,125 and 60,000 Hz rates, under
+  `DSD_NEO_CQPSK=0`/`=1` and with the channel filter off
+  (`DSD_NEO_CHANNEL_LPF=0`, a 12 kHz DSP rate), with loop state, monitor audio
+  state, the I/Q corrections, the post-demod decimator and the channel,
+  half-band and resampler histories and the squelch dwell included, a typed
+  digital row on a `-fA` session and on a DMR session switched to analog, a
+  `-fA` session a CQPSK toggle or a typed digital row had moved off the monitor
+  output switched to digital, and one whose CQPSK toggle was still queued when
+  the digital mode was picked (each equal to a fresh open too, the DSP menu's
+  CQPSK toggle after the switch included, D-STAR among the modes), and covers
+  width-only changes, requests made with no stream running, and live requests
+  and retune profiles a running stream's rate or post-demod decimation cannot
+  realize (refused before anything is queued, or at the rate a retune moved the
+  stream to before the demod thread consumed it), a DMR session's switch onto
+  the monitor refused the same ways (at its rate, at the rate a retune landed
   before the switch was consumed, and when requested after a retune moved the
   rate its check accepted), with the unset default switching at a rate that
-  cannot fit 16 kHz instead, all with the stream keeping the
-  options snapshot it opened with, a switch whose ring clear meets a decoder
-  read between its copy and its tail store (`RUNTIME_RINGS` holds the replay
-  reader to the same contract), and one whose clear a read loading the bumped
-  generation reaches the ring before; `IO_RTL_ANALOG_OPEN` opens IQ
-  replays whose demod rate differs from their DSP bandwidth and checks the
-  start-time channel decision and refusal, the width a post-demod decimating
-  replay publishes, that a tone captured at 78,125 Hz reaches the output once,
-  at 48 kHz and at its own frequency, and that a `-fA` replay switched to DMR
-  through the stream API runs the FSK discriminator and returns to the monitor.
+  cannot fit 16 kHz instead, all with the stream keeping the options snapshot it
+  opened with, a switch whose ring clear meets a decoder read between its copy
+  and its tail store (`RUNTIME_RINGS` holds the replay reader to the same
+  contract), and one whose clear a read loading the bumped generation reaches
+  the ring before; `IO_RTL_ANALOG_OPEN` opens IQ replays whose demod rate
+  differs from their DSP bandwidth and checks the start-time channel decision
+  and refusal, the width a post-demod decimating replay publishes, that a tone
+  captured at 78,125 Hz reaches the output once, at 48 kHz and at its own
+  frequency, and that a `-fA` replay switched to DMR through the stream API runs
+  the FSK discriminator and returns to the monitor.
 - The configured width (issue #525): `RUNTIME_CLI_PARSE`, `CONFIG_VALIDATION`
   and `RUNTIME_CONFIG_USER` cover the option, the `[analog]` key and their
   refusals; `RUNTIME_ANALOG_WIDTH_RATE_REFUSED` the startup refusal of a width
@@ -481,20 +701,49 @@ invariant to it, so it is left as is.
   input the stream opens as an RTL-SDR whatever its device string;
   `IO_RTL_DEMOD_CONFIG` the stream-start refusal's fix on a forced rate. `DECODE_IQ_ANALOG_NFM_TONE_8K`,
   `_16K` and `_25K` show the 1 kHz tone keeping its level through each width
-  (-36.1 dBFS, bounded to -37.5..-34.5 dBFS; the explicit 16 kHz measuring the
-  same as the default) and, at 8 and 25 kHz, a demodulator noise level at
-  12.5 kHz the default does not reach (-80.4 and -48.9 dBc against -66.7),
-  `DECODE_IQ_ANALOG_NFM_BW_8K`
-  and `_25K` that the neighbour 12.5 kHz away is rejected at 8 kHz (-79.5 dBc)
-  and inside the passband at 25 kHz (-8.2 dBc), and
+  with the voice filters off at the fixed gain (`-v 0 -n 50`: -15.9 dBFS,
+  bounded to -17.5..-14.5 dBFS; the explicit 16 kHz measuring the same as the
+  default) and, at 8 and 25 kHz, a demodulator noise level at 12.5 kHz the
+  default does not reach (-92.8 and -60.6 dBc against -78.4),
+  `DECODE_IQ_ANALOG_NFM_BW_8K` and `_25K` that the neighbour 12.5 kHz away is
+  rejected at 8 kHz (-92.6 dBc against -76.6 at the default) and inside the
+  passband at 25 kHz (-19.9 dBc), and
   `DECODE_IQ_ANALOG_CTCSS_1000_NFM_8K` and `_NFM_25K` that received-tone
   detection (issue #522) still reports the 100.0 Hz tone through both widths.
+- AM (issue #524): `DSP_AM_DEMOD` holds the detector to its level, distortion,
+  DC, offset, reset and squelch contract and runs it through `full_demod()` with
+  the 6 kHz channel and the I/Q DC blocker and I/Q balance configured (the
+  squelch hold and the start-over past it included);
+  `IO_RTL_ANALOG_FAMILY_SWITCH` checks digital ->
+  AM -> digital and an AM start switched to digital and back to AM on the same
+  stream against fresh opens (the carrier estimate and its closed-squelch run
+  included), live FM <-> AM switches against a fresh open of the new kind (the
+  ring cleared, the generation bumped and the resampler reset), the live output
+  scale (1/pi for FM monitor audio, none for AM), AM widths held to a running
+  stream's rate, and the AM detector kept through every CQPSK-off profile (a
+  toggle, a failed tune's restore, a typed digital row's profile, then the
+  analog profile a row running the analog family queues for its retune), and
+  the DSP menu's return from CQPSK to the FM or AM monitor as the analog
+  request alone (taken, and refused where it lands, CQPSK kept on);
+  `IO_RTL_RETUNE_PREPARE` retunes while AM runs;
+  `ENGINE_TRUNK_RETUNE_REGRESSION` that such a `-Y` row queues the analog
+  profile and no symbol profile. `APP_COMMAND_QUEUE` and `UI_MENU_SERVICES` hold
+  the AM width, its default included, to the rate through the shared width
+  services (on a radio input; no rate holds a width on PCM input, so an AM
+  session switched to TCP audio falls back to Analog whatever its NFM width),
+  and cover a switch between FM and AM the front end refuses (by the request and
+  where it lands, which the stream's refusal record tells from a refused width
+  by the kind it kept), an AM width refused where it lands (put back, the
+  default as the default) and AM under `DSD_NEO_CHANNEL_LPF=0`;
+  `RUNTIME_ANALOG_AM_WIDTH_RATE_REFUSED`, `_RTL`,
+  `RUNTIME_ANALOG_AM_DEFAULT_RATE_REFUSED` and
+  `RUNTIME_ANALOG_AM_WIDTH_FITS_LOW_RATE` the startup check.
 
 Run the focused audit checks with:
 
 ```bash
 ctest --preset dev-debug --output-on-failure \
-  -R '^(IO_RTL_DEMOD_CONFIG|RTL_SYMBOL_PIPELINE|DSP_FSK_MODEM|DSP_DEMOD_MISC|DSP_CHANNEL_FILTERS|IO_RTL_ANALOG_FAMILY_SWITCH|IO_RTL_ANALOG_OPEN|RUNTIME_ANALOG_CHANNEL|IO_RTL_RETUNE_PREPARE)$'
+  -R '^(IO_RTL_DEMOD_CONFIG|RTL_SYMBOL_PIPELINE|DSP_FSK_MODEM|DSP_DEMOD_MISC|DSP_CHANNEL_FILTERS|DSP_AM_DEMOD|IO_RTL_ANALOG_FAMILY_SWITCH|IO_RTL_ANALOG_OPEN|RUNTIME_ANALOG_CHANNEL|IO_RTL_RETUNE_PREPARE)$'
 ```
 
 For release readiness, run the full suite:
@@ -509,9 +758,11 @@ ctest --preset dev-debug --output-on-failure
   signals once representative captures are available.
 - Any future change to channel LPF cutoffs, default RTL DSP bandwidth, CQPSK
   loop gains, or FSK normalization must update the mode matrix tests first.
-- The live (1/pi) versus cold-start replay (unscaled) analog output scale
-  difference is documented above and left in place; aligning it moves replayed
-  monitor audio levels, so the analog replay checks' dBFS bounds would need new
-  baselines (digital output never takes the scale).
 - The forced-rate analog channel filter (Airspy 2.5 MS/s -> 78,125 Hz) needs a
   hardware listen check.
+- AM (issue #524): the 50 ms carrier time constant and the 0.25 gain are design
+  values. The replay A/B above holds the fixtures and the `am_airband_real`
+  excerpt flat from 25 to 100 ms, so it cannot choose between them, and
+  they need an on-air listen check. So do the 100 ms squelch hold that starts the
+  estimate over, and the DC spike of a centred-I/Q device (Airspy, offset
+  tuning), which the bypassed I/Q DC blocker leaves on the AM carrier.

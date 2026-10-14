@@ -14,14 +14,15 @@
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/state.h>
 #include <dsd-neo/core/sync_patterns.h>
+#include <dsd-neo/core/synctype_ids.h>
 #include <dsd-neo/core/time_format.h>
 #include <dsd-neo/core/vocoder.h>
 #include <dsd-neo/crypto/dmr_keystream.h>
 #include <dsd-neo/fec/block_codes.h>
 #include <dsd-neo/platform/file_compat.h>
-#include <dsd-neo/platform/timing.h>
 #include <dsd-neo/protocol/dmr/dmr.h>
 #include <dsd-neo/protocol/dmr/dmr_trunk_sm.h>
+#include <dsd-neo/runtime/decode_clock.h>
 #include <dsd-neo/runtime/exitflag.h>
 #include <dsd-neo/runtime/frame_sync_hooks.h>
 #include <dsd-neo/runtime/shutdown.h>
@@ -41,34 +42,30 @@ volatile uint8_t exitflag = 0;
 static uint8_t g_dibits[512];
 static int g_bootstrap_payload[90];
 static size_t g_dibit_index = 0;
+/* The read that adopts a retune its capture recorded, where the carrier boundary moves the carrier count
+   (dsd_engine_carrier_boundary(), issue #575); SIZE_MAX for none. */
+static size_t g_boundary_at = SIZE_MAX;
 static int g_continuous_voice;
 static unsigned int g_open_left_calls;
 static unsigned int g_open_right_calls;
 static unsigned int g_close_left_calls;
 static unsigned int g_close_right_calls;
 static unsigned int g_process_mbe_calls;
-static unsigned int g_play_fs3_calls;
 static unsigned int g_play_ss3_calls;
 static unsigned int g_ui_redraw_calls;
 static unsigned int g_history_calls[2];
 static unsigned int g_current_calls[2];
 static unsigned int g_data_sync_calls;
 static uint8_t g_data_sync_reliability[144];
-static unsigned int g_data_burst_calls;
-static uint8_t g_data_burst_last;
 static unsigned int g_debug_dump_calls;
 static uint8_t g_debug_dump_last_slot;
 static uint8_t g_debug_dump_last_type;
 static unsigned int g_cach_calls;
 static unsigned int g_reset_blocks_calls;
-static unsigned int g_alg_refresh_calls;
 static unsigned int g_alg_reset_calls;
 static unsigned int g_refresh_error_calls;
-static unsigned int g_hytera_refresh_calls;
 static unsigned int g_late_entry_calls;
 static uint8_t g_late_entry_last_vc;
-static unsigned int g_sbrc_calls;
-static uint8_t g_sbrc_last_power;
 static unsigned int g_sm_voice_sync_calls;
 static unsigned int g_sm_voice_sync_calls_at_first_mbe;
 static int g_sm_voice_sync_last_slot;
@@ -81,17 +78,20 @@ static unsigned int g_confidence_voice_burst_calls;
 static dmr_confidence_result g_confidence_result = DMR_CONFIDENCE_LOCKED;
 static int g_voice_slot_open = 1;
 static int g_any_voice_open = 0;
+/* Whether the vocoder stub stages decoded media for the stereo mixes, as the vocoder does while the audible-audio stamp
+   is armed (issue #574). */
+static int g_stage_mix_media = 0;
 
 static void
 reset_spies(void) {
     g_dibit_index = 0;
+    g_boundary_at = SIZE_MAX;
     g_continuous_voice = 0;
     g_open_left_calls = 0;
     g_open_right_calls = 0;
     g_close_left_calls = 0;
     g_close_right_calls = 0;
     g_process_mbe_calls = 0;
-    g_play_fs3_calls = 0;
     g_play_ss3_calls = 0;
     g_ui_redraw_calls = 0;
     g_history_calls[0] = 0;
@@ -100,21 +100,15 @@ reset_spies(void) {
     g_current_calls[1] = 0;
     g_data_sync_calls = 0;
     DSD_MEMSET(g_data_sync_reliability, 0, sizeof(g_data_sync_reliability));
-    g_data_burst_calls = 0;
-    g_data_burst_last = 0;
     g_debug_dump_calls = 0;
     g_debug_dump_last_slot = 0xFFU;
     g_debug_dump_last_type = 0;
     g_cach_calls = 0;
     g_reset_blocks_calls = 0;
-    g_alg_refresh_calls = 0;
     g_alg_reset_calls = 0;
     g_refresh_error_calls = 0;
-    g_hytera_refresh_calls = 0;
     g_late_entry_calls = 0;
     g_late_entry_last_vc = 0;
-    g_sbrc_calls = 0;
-    g_sbrc_last_power = 0;
     g_sm_voice_sync_calls = 0;
     g_sm_voice_sync_calls_at_first_mbe = 0;
     g_sm_voice_sync_last_slot = -1;
@@ -127,6 +121,7 @@ reset_spies(void) {
     g_confidence_result = DMR_CONFIDENCE_LOCKED;
     g_voice_slot_open = 1;
     g_any_voice_open = 0;
+    g_stage_mix_media = 0;
     exitflag = 0;
 }
 
@@ -202,7 +197,9 @@ get_dibit_and_analog_signal(dsd_opts* opts, dsd_state* state, int* out_analog_si
 int
 getDibitSoft(dsd_opts* opts, dsd_state* state, dsd_dibit_soft_t* out_soft) {
     (void)opts;
-    (void)state;
+    if (g_dibit_index == g_boundary_at && state != NULL) {
+        state->carrier_seq++;
+    }
     if (g_continuous_voice) {
         if (out_soft != NULL) {
             DSD_MEMSET(out_soft, 0, sizeof(*out_soft));
@@ -238,11 +235,6 @@ QR_16_7_6_decode(unsigned char* rxBits) {
     return true;
 }
 
-uint64_t
-dsd_time_monotonic_ns(void) {
-    return 1234567890ULL;
-}
-
 void
 dsd_request_shutdown(dsd_opts* opts, dsd_state* state) {
     (void)opts;
@@ -264,6 +256,13 @@ dsd_fopen_private(const char* path, const char* mode) {
     (void)mode;
     return NULL;
 }
+
+/* The capture openers of the revision before issue #661, kept with their counters so this harness also links and runs
+   against it: the first frame written creates the capture now, so a voice burst opens nothing here. */
+// NOLINTNEXTLINE(misc-use-internal-linkage): main's dispatcher links against this stub.
+void openMbeOutFile(dsd_opts* opts, dsd_state* state);
+// NOLINTNEXTLINE(misc-use-internal-linkage): main's dispatcher links against this stub.
+void openMbeOutFileR(dsd_opts* opts, dsd_state* state);
 
 void
 openMbeOutFile(dsd_opts* opts, dsd_state* state) {
@@ -293,10 +292,31 @@ closeMbeOutFileR(dsd_opts* opts, dsd_state* state) {
     opts->mbe_out_fR = NULL;
 }
 
+/* DMR closes only its own captures, named as DMR whatever state->synctype holds (issue #661); the owner filter is
+   tested in CORE_MBE_FILE_IO, and this counts the closes as the closers above do. */
 void
-processMbeFrame(dsd_opts* opts, dsd_state* state, char imbe_fr[8][23], char ambe_fr[4][24], char imbe7100_fr[7][24]) {
-    (void)opts;
-    (void)state;
+dsd_mbe_out_close_protocol(dsd_opts* opts, dsd_state* state, int slot_mask, int synctype) {
+    assert(DSD_SYNC_IS_DMR(synctype));
+    if ((slot_mask & DSD_MBE_OUT_SLOT1) != 0 && opts->mbe_out_f != NULL) {
+        closeMbeOutFile(opts, state);
+    }
+    if ((slot_mask & DSD_MBE_OUT_SLOT2) != 0 && opts->mbe_out_fR != NULL) {
+        closeMbeOutFileR(opts, state);
+    }
+}
+
+/* The vocoder's writer creates a slot's capture with the first frame it records (issue #661). */
+void
+processMbeFrame(dsd_opts* opts, dsd_state* state, dsd_voice_protocol protocol, char imbe_fr[8][23], char ambe_fr[4][24],
+                char imbe7100_fr[7][24]) {
+    assert(protocol == DSD_VOICE_PROTOCOL_DMR);
+    if (opts->mbe_out_dir[0] != 0) {
+        if (state->currentslot == 1 && opts->mbe_out_fR == NULL) {
+            opts->mbe_out_fR = (FILE*)(uintptr_t)1;
+        } else if (state->currentslot == 0 && opts->mbe_out_f == NULL) {
+            opts->mbe_out_f = (FILE*)(uintptr_t)1;
+        }
+    }
     (void)imbe_fr;
     (void)ambe_fr;
     (void)imbe7100_fr;
@@ -304,13 +324,9 @@ processMbeFrame(dsd_opts* opts, dsd_state* state, char imbe_fr[8][23], char ambe
         g_sm_voice_sync_calls_at_first_mbe = g_sm_voice_sync_calls;
     }
     g_process_mbe_calls++;
-}
-
-void
-playSynthesizedVoiceFS3(dsd_opts* opts, dsd_state* state) {
-    (void)opts;
-    (void)state;
-    g_play_fs3_calls++;
+    if (g_stage_mix_media) {
+        dsd_audio_dmr_mix_media_staged(state->currentslot, DSD_DMR_MIX_MEDIA_SHORT);
+    }
 }
 
 void
@@ -367,8 +383,7 @@ dmr_data_burst_handler(dsd_opts* opts, dsd_state* state, uint8_t info[196], uint
     (void)state;
     (void)info;
     (void)reliab98;
-    g_data_burst_calls++;
-    g_data_burst_last = databurst;
+    (void)databurst;
 }
 
 void
@@ -400,7 +415,6 @@ void
 dmr_alg_refresh(dsd_opts* opts, dsd_state* state) {
     (void)opts;
     (void)state;
-    g_alg_refresh_calls++;
 }
 
 void
@@ -420,7 +434,6 @@ dmr_refresh_algids_on_error(dsd_opts* opts, dsd_state* state) {
 void
 hytera_enhanced_alg_refresh(dsd_state* state) {
     (void)state;
-    g_hytera_refresh_calls++;
 }
 
 void
@@ -440,8 +453,7 @@ void
 dmr_sbrc(dsd_opts* opts, dsd_state* state, uint8_t power) {
     (void)opts;
     (void)state;
-    g_sbrc_calls++;
-    g_sbrc_last_power = power;
+    (void)power;
 }
 
 void
@@ -539,6 +551,8 @@ test_bs_slot2_voice_routes_right_channel_and_post_skip_hooks(void) {
     opts.pulse_digi_rate_out = 8000;
     opts.frontend_kind = DSD_FRONTEND_TERMINAL;
     DSD_SNPRINTF(opts.mbe_out_dir, sizeof(opts.mbe_out_dir), "%s", "captures");
+    /* No capture is open: the burst opens nothing, its first frame creates the slot 2 capture, and the end of the stream
+       closes it (issue #661). */
     state.currentslot = 1;
     state.dmr_color_code = 16;
     load_single_burst_stream(1, DMR_BS_VOICE_SYNC);
@@ -547,12 +561,13 @@ test_bs_slot2_voice_routes_right_channel_and_post_skip_hooks(void) {
     dmrBS(&opts, &state);
 
     assert(state.dmrburstR == 16);
-    assert(g_open_right_calls == 1U);
+    assert(g_open_right_calls == 0U);
     assert(g_open_left_calls == 0U);
     assert(g_close_right_calls == 1U);
+    assert(g_close_left_calls == 0U);
     assert(g_process_mbe_calls == 3U);
-    assert(g_play_fs3_calls == 1U);
-    assert(g_play_ss3_calls == 0U);
+    // Float output (-y) plays through the same DMR stereo mix as 16-bit output (#652).
+    assert(g_play_ss3_calls == 1U);
     assert(g_ui_redraw_calls == 1U);
     assert(g_history_calls[0] == 1U);
     assert(g_history_calls[1] == 1U);
@@ -588,7 +603,6 @@ test_bs_slot2_voice_integer_output_uses_ss3_playback(void) {
     dmrBS(&opts, &state);
 
     assert(state.dmrburstR == 16);
-    assert(g_play_fs3_calls == 0U);
     assert(g_play_ss3_calls == 1U);
     assert(g_process_mbe_calls == 3U);
     assert(g_sm_voice_sync_last_slot == 1);
@@ -686,6 +700,7 @@ test_bs_bootstrap_prefetched_voice_runs_first_frame_path(void) {
     opts.floating_point = 1;
     opts.pulse_digi_rate_out = 8000;
     DSD_SNPRINTF(opts.mbe_out_dir, sizeof(opts.mbe_out_dir), "%s", "captures");
+    /* No capture is open: the bootstrap opens nothing, and its first frame creates the slot 2 capture (issue #661). */
     state.currentslot = 1;
     state.dmr_color_code = 16;
     state.dmr_payload_p = g_bootstrap_payload + 90U;
@@ -702,11 +717,108 @@ test_bs_bootstrap_prefetched_voice_runs_first_frame_path(void) {
     assert(g_sm_voice_sync_last_slot == 1);
     assert(g_cach_calls >= 1U);
     assert(g_late_entry_calls >= 1U);
-    assert(g_open_right_calls == 1U);
+    assert(g_open_right_calls == 0U);
     assert(g_close_right_calls >= 1U);
-    assert(g_play_fs3_calls >= 1U);
+    assert(g_play_ss3_calls >= 1U);
     assert(state.last_vc_sync_time > 0);
     assert(state.last_vc_sync_time_m > 0.0);
+}
+
+/* Issue #575: the carrier boundary moved the carrier count while a burst was read (a replay read adopting a recorded
+   retune). The burst straddles two carriers, and what it carries from the carrier left (the first AMBE frames, the EMB
+   colour code, the CACH fragment that may complete a short LC) would decode after the boundary ended that carrier's
+   calls: nothing in it decodes, what earlier bursts gathered goes, and the loop ends as on a sync loss, without
+   reporting a decode error. */
+static void
+test_bs_burst_split_by_a_carrier_boundary_is_dropped(void) {
+    static dsd_opts opts;
+    static dsd_state state;
+    DSD_MEMSET(&opts, 0, sizeof(opts));
+    DSD_MEMSET(&state, 0, sizeof(state));
+
+    opts.floating_point = 1;
+    opts.pulse_digi_rate_out = 8000;
+    state.currentslot = 0;
+    state.dmr_color_code = 16;
+    load_voice_burst_stream();
+    g_any_voice_open = 1;
+    g_boundary_at = 100U; /* AMBE frame 2's second half: the EMB and frame 1 were read before it */
+
+    dmrBS(&opts, &state);
+
+    assert(state.carrier_seq == 1U);
+    assert(g_dibit_index == 144U);
+    assert(g_process_mbe_calls == 0U);
+    assert(g_confidence_voice_burst_calls == 0U);
+    assert(g_cach_calls == 0U);
+    assert(g_late_entry_calls == 0U);
+    assert(g_sm_voice_sync_calls == 0U);
+    assert(g_debug_dump_calls == 0U);
+    assert(g_reset_blocks_calls == 1U);
+    assert(g_refresh_error_calls == 0U);
+    assert(g_confidence_reset_calls == 1U);
+    assert(state.dmr_stereo == 0);
+}
+
+/* The same for the burst the frame sync found: its second half is read after the boundary moved. */
+static void
+test_bs_bootstrap_split_by_a_carrier_boundary_is_dropped(void) {
+    static dsd_opts opts;
+    static dsd_state state;
+    DSD_MEMSET(&opts, 0, sizeof(opts));
+    DSD_MEMSET(&state, 0, sizeof(state));
+
+    opts.floating_point = 1;
+    opts.pulse_digi_rate_out = 8000;
+    state.currentslot = 1;
+    state.dmr_color_code = 16;
+    state.dmr_payload_p = g_bootstrap_payload + 90U;
+    load_bootstrap_voice_stream(1);
+    g_any_voice_open = 1;
+    g_boundary_at = 120U;
+
+    dmrBSBootstrap(&opts, &state);
+
+    assert(state.carrier_seq == 1U);
+    assert(g_dibit_index == 144U);
+    assert(g_process_mbe_calls == 0U);
+    assert(g_cach_calls == 0U);
+    assert(g_late_entry_calls == 0U);
+    assert(g_play_ss3_calls == 0U);
+    assert(g_reset_blocks_calls == 1U);
+    assert(g_refresh_error_calls == 0U);
+    assert(g_confidence_reset_calls == 1U);
+}
+
+/* Issue #574: the loop's end drops the audio staged for the stereo mixes, and with it each slot's fresh-media mark. The
+   slot 1 burst decoded here never reached a mix (the mixes follow slot 2's bursts), and slot 2 still held a mark from
+   before the loop: the first mix of the next loop, a skipped burst's with nothing decoded yet, would otherwise stamp
+   audible audio for buffers that now hold zeros. A mix stamps only for the marks it takes
+   (dsd_audio_dmr_mix_media_take()); the mixes themselves are stubs here. */
+static void
+test_bs_loop_end_discards_the_mix_media(void) {
+    static dsd_opts opts;
+    static dsd_state state;
+    DSD_MEMSET(&opts, 0, sizeof(opts));
+    DSD_MEMSET(&state, 0, sizeof(state));
+
+    opts.floating_point = 1;
+    opts.pulse_digi_rate_out = 8000;
+    state.currentslot = 0;
+    state.dmr_color_code = 16;
+    load_single_burst_stream(0, DMR_BS_VOICE_SYNC);
+    g_any_voice_open = 1;
+    g_stage_mix_media = 1;
+    dsd_audio_dmr_mix_media_discard(0);
+    dsd_audio_dmr_mix_media_staged(1, DSD_DMR_MIX_MEDIA_SHORT);
+
+    dmrBS(&opts, &state);
+
+    assert(g_process_mbe_calls == 3U);
+    assert(g_play_ss3_calls == 0U);
+    assert(dsd_audio_dmr_mix_media_take(0) == 0U);
+    assert(dsd_audio_dmr_mix_media_take(1) == 0U);
+    g_stage_mix_media = 0;
 }
 
 static int
@@ -745,6 +857,7 @@ test_continuous_voice_yields_at_burst_boundary(void) {
 
 int
 main(void) {
+    dsd_decode_clock_use_test(1234567890ULL);
     test_continuous_voice_yields_at_burst_boundary();
     test_bs_voice_sync_refreshes_when_trunk_tuned();
     test_bs_slot2_voice_routes_right_channel_and_post_skip_hooks();
@@ -753,6 +866,10 @@ main(void) {
     test_bs_confidence_reject_resets_slot_without_voice_decode();
     test_bs_voice_gate_closed_skips_decode_but_keeps_loop_hooks();
     test_bs_bootstrap_prefetched_voice_runs_first_frame_path();
+    test_bs_burst_split_by_a_carrier_boundary_is_dropped();
+    test_bs_bootstrap_split_by_a_carrier_boundary_is_dropped();
+    test_bs_loop_end_discards_the_mix_media();
+    dsd_decode_clock_use_system();
     printf("DMR BS sync times: OK\n");
     return 0;
 }

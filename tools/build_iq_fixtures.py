@@ -16,6 +16,8 @@ Two source kinds feed the same output format:
            frequency and integrated back into a complex baseband signal. The
            result exercises the same demodulation chain, but carries none of the
            original RF impairments (noise, fading, adjacent-channel energy).
+           Where the recording is a receiver's de-emphasized audio rather than
+           the discriminator's own output, AUDIO_DEEMPHASIS_US undoes that first.
 
 The analog excerpts (ANALOG_EXCERPTS) are a third, raw kind: two-channel u8 or s16
 PCM WAV files holding off-air I/Q. They are read sample-exact with the wave module
@@ -35,6 +37,7 @@ Usage:
 
 import argparse
 import hashlib
+import json
 import math
 import os
 import subprocess
@@ -66,6 +69,7 @@ SOURCES = {
     "dstar": "https://www.sigidwiki.com/images/2/2e/DStar_Sound.mp3",
     "ysf": "https://www.sigidwiki.com/images/2/26/Yaesu_sys_fusion.wav",
     "edacs": "https://www.sigidwiki.com/images/a/a8/EDACS96_Sound.mp3",
+    "provoice": "https://www.sigidwiki.com/images/e/e9/Provoice.mp3",
     "m17": "https://raw.githubusercontent.com/lwvmobile/m17-fme/main/samples/m17_clear_voice_wav.wav",
     # Off-air analog I/Q for the analog receive checks (issue #518): AM airband voice
     # (u8, 64 kHz), two NFM voice channels 12.5 kHz apart with CTCSS (s16, 156.25 kHz),
@@ -104,6 +108,7 @@ SHA256SUMS = {
     "dstar": "b419679d20bd31ab9738be2b3e300b98ec762ec05d2a93683df86ae3a9946001",
     "ysf": "607b9f9789cecc9ab1c7c204f869d10879a0d69b7b4ae60a132694e88d5476e0",
     "edacs": "c043bdbf7f8dfec2063cf8c98f87b6b6fc6f97a0a516cff2d971e2c46fdfd99f",
+    "provoice": "cf66b798a0f6449f7720a14db3e864a0269dfa1de494080f1d6ff1c6b78b86e2",
     "m17": "e841be537491fd6a71264bf8d4c5b54667c80a0be278d6332bb49156d7f1b4f7",
     "dmr_t3_ras_cc": "4950da56e384b939675744a70ac12ca38fe6d6e35a74870717ab56ffc8e3e23c",
     "am_iq_zip": "85cfb629f9555a3f3f2afcfc2c86d061d9f0eb2d9b024cb587083dee7d0a3f54",
@@ -139,12 +144,29 @@ FIXTURES = [
     ("dstar", "dstar", "audio", 0, 4, 0.35),
     ("ysf", "ysf", "audio", 0, 6, 0.35),
     ("edacs", "edacs", "audio", 0, 2, 0.35),
+    # ProVoice voice (issue #588): the whole 3.5 s clip, a single transmission. Its receiver's
+    # de-emphasis is undone first (AUDIO_DEEMPHASIS_US), and it is remodulated at a lower
+    # deviation than the default, chosen in the same sweep.
+    ("provoice", "provoice", "audio", 0, 3.5, 0.25),
     # The upstream sample is mostly impaired test transmissions; the clean voice
     # stream occupies only the final seconds, so cut the fixture from there. The
     # deviation stays near M17's real +/-2.4 kHz so the synthetic FM signal fits
     # the 12.5 kHz channel filter profile (0.15 * 24 kHz Nyquist = 3.6 kHz peak).
     ("m17", "m17", "audio", 19, 4.3, 0.15),
 ]
+
+# Audio sources recorded after a receiver's de-emphasis, and the single-pole time constant
+# (microseconds) undone before remodulating them (undo_deemphasis). A discriminator's output is
+# flat; a receiver's speaker path rolls it off above 1/(2 pi tau), which leaves speech intact but
+# smears a data signal's transitions across its neighbours. The sigidwiki ProVoice clip is such a
+# recording: its 9600 baud clock line is there, but as recorded it gives no frame sync at all.
+# The constant is not published, so it was measured (issue #588): swept over 150-500 us with the
+# remodulation deviation over 0.2-0.35, 225 us at 0.25 decoded 160 IMBE frames at 0.93 corrections
+# a frame under hard decisions, where 200 us decoded more frames with more corrections and 250-300 us
+# fewer frames.
+AUDIO_DEEMPHASIS_US = {
+    "provoice": 225.0,
+}
 
 # Off-air analog excerpts (issue #518), read raw from the two-channel WAV members above.
 #
@@ -209,6 +231,23 @@ NFM_SYNTH_TONE_HZ = 1000.0
 NFM_SYNTH_DEVIATION_HZ = 3000.0
 NFM_SYNTH_NOISE_DB = -30.0
 
+# Synthetic AM (issue #524), deterministic from the seed: a steady 1 kHz test tone at 50% modulation depth on a
+# carrier centred at 0 Hz, the reference the analog replay host scores tone SNR against, plus complex Gaussian noise
+# 30 dB below the carrier across the whole 48 kHz span. am_adjacent_synth adds an unmodulated carrier 8.333 kHz up at
+# -6 dB -- the next channel of the 8.33 kHz airband plan -- whose beat with the wanted carrier the replay host's probe
+# measures at 8333 Hz. It lies beyond the default 6 kHz AM channel filter's stopband edge (4.5 kHz from the centre) and
+# inside a 20 kHz one.
+#
+# name, seed, interferer offset Hz (None = none), interferer level dB re carrier
+AM_SYNTH = [
+    ("am_tone_synth", 5241, None, None),
+    ("am_adjacent_synth", 5242, 8333.0, -6.0),
+]
+AM_SYNTH_DURATION_S = 1.5
+AM_SYNTH_TONE_HZ = 1000.0
+AM_SYNTH_DEPTH = 0.5
+AM_SYNTH_NOISE_DB = -30.0
+
 # Derived fixtures synthesized from already-committed fixtures (no network or
 # ffmpeg needed; run with --derived-only to regenerate just these).
 #
@@ -247,6 +286,70 @@ DERIVED_NOISE = [
     ("noise_floor", 398, 10.0, 16.0),
 ]
 
+# A capture whose input level reaches the cu8 rails only in its last replay chunk (issues #572, #626).
+# A replay hands the demod chunks of one live transfer's time, 256 pairs (5.33 ms) at 48 kHz, and
+# publishes each chunk's raw input level as the demod starts it; the decoder polls the level every
+# 64 symbols. The lead-in is a tone at a quarter of full scale (in range: no CLIP, HOT or LOW), two
+# chunks of it, and the last chunk is the same two rail bytes in every pair, which read 100 % CLIP.
+# Under -f1 -mq the decoder's one poll after its first (symbol 64 of 70) lands while it decodes the
+# last chunk, after the read that took the last samples. A replay that reported its end on that
+# read, rather than on the read after it, cleared the level under the poll, and no leg printed the
+# CLIP advisory. Integer bytes, so the data is the same on every numpy version.
+CLIP_LEAD_TONE = (128, 143, 156, 165, 168, 165, 156, 143, 128, 113, 100, 91, 88, 91, 100, 113)
+
+# name, lead-in I/Q pairs, clipped I/Q pairs, I byte, Q byte
+DERIVED_CLIP = [
+    ("rf_clip", 512, 256, 0, 255),
+]
+
+# A call heard after a scan retune (issue #572): a scanner sits on an idle channel (the lead-in,
+# receiver noise), retunes, and lands on a channel with a call on air. The sidecar is a version 2
+# capture with the event timeline a real RTL-SDR scan retune records at the boundary: RETUNE, the
+# samples muted while the tuner settles, RESET as the front end starts over, and the post-reset
+# mute. Muted bytes are left out of the data file (muted_bytes_excluded), so the call's bytes
+# follow the lead-in's directly and the MUTE events only advance the media clock. The mute lengths
+# are a real 1.536 Msps scan capture's (475,136 and 76,800 bytes at base_decimation 32) scaled to
+# 48 kHz. Both pieces are committed 48 kHz cu8 fixtures, concatenated byte for byte rather than
+# requantized.
+#
+# The lead-in length was chosen by a sweep under -fa (1.5-9.5 s in 0.5 s steps, then 6.0-9.0 s in
+# 0.1 s steps). Whether -fa catches the call depends on where the SPS hunt is when the call starts.
+# Lead-ins of 6.7-8.1 s all reach the RESET after the same five hunt steps (20, 5, 8, 10 and 10 sps,
+# one whole rotation) and decode the call alike. At 8.4 s and most lengths past it, the hunt reaches
+# 2400 baud just before the RESET, its dwell runs out early in the call, and -fa misses it. 7.5 s
+# keeps 0.5 s either side inside the band, so the fixture pins the decode rather than one hunt phase.
+# That sweep ran with 64 KiB replay blocks (683 ms here). Re-run once a block became one live
+# transfer (issue #626), -fa decodes the call at every lead-in from 1.5 to 9.5 s: the hunt's
+# requests land within a 5.33 ms block, so neither edge of that band exists any more.
+#
+# name, lead-in fixture, lead-in s, lead-in centre Hz, call fixture, call centre Hz
+DERIVED_RETUNE = [
+    ("nxdn48_after_retune", "noise_floor", 7.5, 467087500, "nxdn48", 467756250),
+]
+RETUNE_MUTE_BYTES = 14848
+RESET_MUTE_BYTES = 2400
+# A fixed start after 2000-01-01, where the decode clock stops flooring the anchor: replays of
+# the fixture read the capture's own time, the same in every run.
+RETUNE_CAPTURE_STARTED_UTC = "2026-01-01T00:00:00Z"
+
+# A call with a gap in its capture (issue #572): the samples stop for longer than the input-level
+# warning's 10 s cooldown, then go on, as a driver overflow that drops them leaves a capture. The gap
+# is one MUTE event. Muted bytes are left out of the data file (muted_bytes_excluded), so the data
+# is the source fixture's bytes unchanged and only the media clock, and with it the decode clock,
+# moves through the gap. The fixture is a sidecar alone: its data_file names the source's data, which
+# replay resolves beside the sidecar, so it adds no data bytes. ysf is normalized near full scale and
+# RF HOT throughout: its peak reaches -1 dBFS in every 512-byte (5.33 ms) block a replay hands the
+# demod (issue #626), as in every 64 KiB one before, while nxdn48, the first source, does in only 6 of
+# its 1125 such blocks, so the decoder's level polls missed it. The decoder warns as the replay starts
+# and again right after the gap: the cooldown runs out at 10 s, so the gap, which ends at 16 s, clears
+# it by 6 s. Every replay, fast or realtime, must print both warnings at the same capture time.
+#
+# name, source fixture, gap start s, gap length s, MUTE reason
+DERIVED_GAP = [
+    ("ysf_gap", "ysf", 4.0, 12.0, "driver_overflow"),
+]
+GAP_CAPTURE_STARTED_UTC = "2026-07-30T00:00:00Z"
+
 # A dPMR signal synthesized from the CCH reference vectors (issue #407).
 #
 # The one off-air dPMR recording available to this project carries no recoverable
@@ -267,6 +370,132 @@ DPMR_SYNTH_LEAD_IN_S = 0.25
 DPMR_SYNTH_FRAME_REPEATS = 30
 DPMR_SYNTH_NOISE_SIGMA = 0.02
 DPMR_DIBIT_TO_LEVEL = {1: 3.0, 0: 1.0, 2: -1.0, 3: -3.0}
+
+# Synthetic analog NFM carrying a CTCSS tone, for received-tone detection (issue #522).
+#
+# Each is an FM signal built through remodulate(): voice-band audio (noise band-limited to
+# 300-3000 Hz and gated into syllables, the way a transmitter's voice filter leaves speech)
+# plus a sub-audible sine at a usual CTCSS deviation, with receiver noise added at baseband.
+# The voice peaks near 4 kHz of deviation, inside a 12.5 kHz NFM channel; the tone sits at
+# 600 Hz, the usual 10-15% of system deviation. The tone runs from the start and, for the
+# drop case, stops partway while the carrier and the voice carry on. Deterministic from the
+# seed; replayed under -fA, the "Received tone:" log line is what DECODE_IQ_ANALOG_* assert.
+#
+# name, seed, duration_s, tone_hz (None = no tone), tone_stop_s (None = never)
+ANALOG_CTCSS_SYNTH = [
+    ("nfm_ctcss_synth_1000", 5221000, 2.0, 100.0, None),
+    ("nfm_ctcss_synth_670", 5220670, 2.0, 67.0, None),
+    # A transmitter 0.4 % high on 150.0 Hz, within its encoder's 0.5 % (issue #643): reads 150.0.
+    ("nfm_ctcss_synth_1506", 5221506, 2.0, 150.6, None),
+    ("nfm_ctcss_synth_drop", 5221001, 2.5, 100.0, 1.2),
+    ("nfm_notone_synth", 5220000, 2.0, None, None),
+]
+# Synthetic analog NFM carrying DCS, for received-code detection (issue #523).
+#
+# The same voice-band audio and receiver noise as the CTCSS fixtures, with a DCS word in place of
+# the tone: the code's 23-bit Golay word (dcs_word(), the layout runtime/analog_tones.h documents)
+# repeated at 134.4 bit/s, bit 0 first, as NRZ at 600 Hz deviation, a one as positive deviation
+# in normal polarity and the complement in inverted polarity, low-passed below 300 Hz the way a
+# transmitter keeps its signalling out of the voice band. The words are correct by construction:
+# RUNTIME_ANALOG_TONES and DSP_ANALOG_DCS_GOLAY_XCHECK pin the encoder against published words.
+# There is no public off-air DCS recording to excerpt; a real accept fixture waits for one
+# (LOCAL_SOURCES).
+#
+# name, seed, duration_s, code (octal value; None = no code), inverted, stop_s (None = never),
+# wrong bits per word (at seeded positions, the same in every repetition)
+ANALOG_DCS_SYNTH = [
+    # D023N, the most common code.
+    ("nfm_dcs_synth_023n", 5230023, 2.0, 0o023, False, None, 0),
+    # The same code in inverted polarity: the signal of D047N, which reads "DCS D047N / D023I".
+    ("nfm_dcs_synth_023i", 5231023, 2.0, 0o023, True, None, 0),
+    # Malformed: D023N's word sent two bits wrong, the same two in every repetition. That is two
+    # bits from D023N and, the code's words being at least 7 bits apart, at least 5 from every
+    # other code's, so it is no code at all. It must read "none".
+    ("nfm_dcs_synth_noisy", 5232023, 2.0, 0o023, False, None, 2),
+    # The code stops at 1.2 s with no turn-off tone while the carrier and the voice carry on.
+    ("nfm_dcs_synth_drop", 5233023, 2.0, 0o023, False, 1.2, 0),
+]
+# Synthetic squelch bursts for the auto squelch (issue #518), deterministic from the seed: receiver noise alone for
+# 0.3 s, then a carrier keyed for 0.25 s (2 ms raised-cosine ramps), then noise again until 0.75 s, so the squelch learns
+# the floor before the carrier comes and has to close after it. nfm_burst_synth carries the 1 kHz test tone at 3 kHz
+# deviation, am_burst_synth the same tone at 50% depth. The noise is complex Gaussian at 3 LSB a component; the carrier
+# sits 16 dB (FM) or 12 dB (AM, whose 50% peaks reach 1.5 times the carrier) over the noise power of the whole 48 kHz
+# span, about 20 dB over the noise in each default channel. Neither is normalised: the analog replay host's
+# --analog-iq-gain-db replays each 10 dB hotter, the same air as a receiver with more gain hears it, and both copies stay
+# within the cu8 rails.
+#
+# name, seed, kind ("fm" or "am"), carrier dB over the noise across the span
+SQUELCH_BURST = [
+    ("nfm_burst_synth", 5311, "fm", 16.0),
+    ("am_burst_synth", 5312, "am", 12.0),
+]
+SQUELCH_BURST_DURATION_S = 0.75
+SQUELCH_BURST_KEY_S = 0.30
+SQUELCH_BURST_UNKEY_S = 0.55
+SQUELCH_BURST_RAMP_S = 0.002
+SQUELCH_BURST_NOISE_LSB = 3.0
+DCS_BAUD = 134.4
+DCS_WORD_BITS = 23
+# Golay (23,12) generator x^11 + x^10 + x^6 + x^5 + x^4 + x^2 + 1, bit i the coefficient of x^i.
+DCS_GOLAY_GENERATOR = 0xC75
+ANALOG_SYNTH_DCS_DEVIATION_HZ = 600.0
+ANALOG_SYNTH_DCS_BAND_HZ = (250.0, 350.0)  # raised-cosine roll-off of the NRZ's low-pass
+ANALOG_SYNTH_TONE_DEVIATION_HZ = 600.0
+ANALOG_SYNTH_VOICE_PEAK_DEVIATION_HZ = 4000.0
+ANALOG_SYNTH_VOICE_BAND_HZ = (300.0, 3000.0)
+ANALOG_SYNTH_SYLLABLE_S = (0.08, 0.35)
+ANALOG_SYNTH_GAP_LEVEL = 0.2
+ANALOG_SYNTH_NOISE_SIGMA = 0.05
+
+METADATA_TEMPLATE = """{{
+  "format": "dsd-neo-iq",
+  "version": {version},
+  "sample_format": "cu8",
+  "iq_order": "IQ",
+  "endianness": "none",
+  "capture_stage": "post_mute_pre_widen",
+  "sample_rate_hz": {sample_rate},
+  "center_frequency_hz": {center_frequency_hz},
+  "capture_center_frequency_hz": {capture_center_frequency_hz},
+  "ppm": 0,
+  "tuner_gain_tenth_db": 270,
+  "rtl_dsp_bw_khz": {bw_khz},
+  "base_decimation": 1,
+  "post_downsample": 1,
+  "demod_rate_hz": {demod_rate},
+  "offset_tuning_enabled": false,
+  "fs4_shift_enabled": false,
+  "combine_rotate_enabled": false,
+  "muted_bytes_excluded": true,
+  "contains_retunes": {contains_retunes},
+  "capture_retune_count": {capture_retune_count},
+  "source_backend": "rtl",
+  "source_args": "fixture",
+  "capture_started_utc": "{capture_started_utc}",
+  "data_file": "{data_file}",
+  "data_bytes": {data_bytes},
+  "capture_drops": 0,
+  "capture_drop_blocks": 0,
+  "input_ring_drops": 0,
+  "notes": "generated by tools/build_iq_fixtures.py"{events}
+}}
+"""
+
+# The sidecar fields write_capture() lets a fixture set; these defaults write the version 1
+# sidecar every fixture without events has.
+SIDECAR_DEFAULTS = {
+    "version": 1,
+    "center_frequency_hz": 851375000,
+    "capture_center_frequency_hz": 851375000,
+    "contains_retunes": False,
+    "capture_retune_count": 0,
+    "capture_started_utc": "1970-01-01T00:00:00Z",
+    "events": (),
+}
+
+# The replay reader's cu8 alignment: one I/Q pair (src/io/iq/iq_replay.c).
+CU8_ALIGN_BYTES = 2
+
 
 # Deterministic TETRA Synchronisation Bursts carrying one valid BSCH. The
 # physical channel runs at 18 ksym/s pi/4-DQPSK; the selected identity is
@@ -357,7 +586,6 @@ METADATA_TEMPLATE = """{{
   "notes": "generated by tools/build_iq_fixtures.py"
 }}
 """
-
 
 def verify_sha256(key, path):
     """Check path against the pinned hash in SHA256SUMS (which must exist)."""
@@ -535,6 +763,41 @@ def build_nfm_synth(out_dir):
     return total
 
 
+def am_synth_samples(seed, interferer_hz, interferer_db):
+    """AM-modulate the test tone on a 0 Hz carrier, then add the optional adjacent carrier and the noise floor."""
+    count = int(round(AM_SYNTH_DURATION_S * SAMPLE_RATE_HZ))
+    t = np.arange(count) / SAMPLE_RATE_HZ
+    samples = (1.0 + AM_SYNTH_DEPTH * np.cos(2.0 * math.pi * AM_SYNTH_TONE_HZ * t)).astype(np.complex128)
+    if interferer_hz is not None:
+        amplitude = 10.0 ** (interferer_db / 20.0)
+        samples = samples + amplitude * np.exp(2j * math.pi * interferer_hz * t)
+    rng = np.random.default_rng(seed)
+    sigma = math.sqrt(10.0 ** (AM_SYNTH_NOISE_DB / 10.0) / 2.0)
+    return samples + rng.normal(0.0, sigma, count) + 1j * rng.normal(0.0, sigma, count)
+
+
+def build_am_synth(out_dir):
+    """Write the deterministic AM test-tone fixtures (issue #524)."""
+    total = 0
+    for name, seed, interferer_hz, interferer_db in AM_SYNTH:
+        written = write_fixture(out_dir, name, am_synth_samples(seed, interferer_hz, interferer_db))
+        total += written
+        print(f"{name:28s} synth   {written // 1024:6d} KiB")
+    return total
+
+
+def undo_deemphasis(audio, tau_us):
+    """Invert a single-pole de-emphasis y[n] = (1 - a) x[n] + a y[n - 1], a = exp(-1 / (fs tau)).
+
+    The inverse is a one-tap FIR with a large high-frequency gain, so it runs before
+    remodulate() normalizes the level. The first sample is taken as settled (its predecessor
+    equal to itself) rather than preceded by silence, which would add a spike.
+    """
+    a = math.exp(-1.0 / (SAMPLE_RATE_HZ * tau_us * 1e-6))
+    previous = np.concatenate((audio[:1], audio[:-1]))
+    return (audio - a * previous) / (1.0 - a)
+
+
 def remodulate(audio, deviation):
     """Integrate discriminator audio back into complex baseband (inverse FM demod)."""
     audio = audio - np.mean(audio)
@@ -566,22 +829,126 @@ def to_cu8(samples, headroom=0.9, normalize=True):
     return np.clip(np.round(interleaved * 127.5 + 127.5), 0, 255).astype(np.uint8)
 
 
-def write_fixture(out_dir, name, samples, normalize=True, sample_rate=SAMPLE_RATE_HZ, dsp_bw_khz=DSP_BW_KHZ):
-    payload = to_cu8(samples, normalize=normalize)
-    data_name = name + ".iq"
-    data_path = os.path.join(out_dir, data_name)
-    with open(data_path, "wb") as handle:
-        handle.write(payload.tobytes())
+def check_replay_events(fields, data_bytes):
+    """Refuse a sidecar the replay reader would reject, with the reader's own rules.
+
+    The rules are validate_replay_events_metadata() and the event parser in
+    src/io/iq/iq_replay.c, for a cu8 capture of this script's sample rate.
+    """
+    events = fields["events"]
+    if events and fields["version"] != 2:
+        raise ValueError("events require metadata version 2")
+    previous_offset = 0
+    retunes = 0
+    retune_needs_reset = False
+    for index, event in enumerate(events):
+        kind = event["kind"]
+        offset = event["byte_offset"]
+        reason = event["reason"]
+        if not isinstance(reason, str) or any(ord(ch) < 0x20 for ch in reason):
+            raise ValueError(f"event {index}: reason must be a string without control characters")
+        if offset < previous_offset:
+            raise ValueError(f"event {index}: events are not sorted by byte_offset")
+        previous_offset = offset
+        if offset > data_bytes:
+            raise ValueError(f"event {index}: byte_offset {offset} exceeds data_bytes {data_bytes}")
+        if offset % CU8_ALIGN_BYTES:
+            raise ValueError(f"event {index}: byte_offset {offset} is not aligned to an I/Q pair")
+        if kind == "MUTE":
+            duration = event["duration_bytes"]
+            if duration <= 0 or duration % CU8_ALIGN_BYTES:
+                raise ValueError(f"event {index}: MUTE duration_bytes must be positive and pair-aligned")
+            continue
+        if kind not in ("RETUNE", "RESET"):
+            raise ValueError(f"event {index}: unsupported kind {kind!r}")
+        if not event["center_frequency_hz"] or not event["capture_center_frequency_hz"]:
+            raise ValueError(f"event {index}: {kind} needs non-zero centre frequencies")
+        if event["sample_rate_hz"] != SAMPLE_RATE_HZ:
+            raise ValueError(f"event {index}: replay does not support a sample-rate change")
+        if kind == "RETUNE":
+            if retune_needs_reset:
+                raise ValueError(f"event {index}: RETUNE before the previous RETUNE's RESET")
+            retunes += 1
+            retune_needs_reset = True
+        else:
+            retune_needs_reset = False
+    if retune_needs_reset:
+        raise ValueError("the last RETUNE has no RESET after it")
+    if fields["capture_retune_count"] != retunes:
+        raise ValueError(f"capture_retune_count {fields['capture_retune_count']} != {retunes} RETUNE events")
+    if fields["contains_retunes"] != (retunes > 0):
+        raise ValueError("contains_retunes must be true exactly when there are RETUNE events")
+
+
+def format_events(events):
+    """The sidecar's events array in the capture writer's layout (src/io/iq/iq_capture.c), or ""."""
+    if not events:
+        return ""
+    blocks = []
+    for event in events:
+        lines = [f'"kind": {json.dumps(event["kind"])}', f'"byte_offset": {event["byte_offset"]}']
+        if event["kind"] == "MUTE":
+            lines.append(f'"duration_bytes": {event["duration_bytes"]}')
+        else:
+            lines.append(f'"center_frequency_hz": {event["center_frequency_hz"]}')
+            lines.append(f'"capture_center_frequency_hz": {event["capture_center_frequency_hz"]}')
+            lines.append(f'"sample_rate_hz": {event["sample_rate_hz"]}')
+        lines.append(f'"reason": {json.dumps(event["reason"])}')
+        blocks.append("    {\n" + ",\n".join("      " + line for line in lines) + "\n    }")
+    return ',\n  "events": [\n' + ",\n".join(blocks) + "\n  ]"
+
+
+def write_capture(out_dir, name, payload, data_file=None, sample_rate=None, dsp_bw_khz=None, **sidecar):
+    """Write a cu8 payload and its sidecar; keywords override SIDECAR_DEFAULTS.
+
+    With data_file, a path relative to out_dir that already holds the payload byte for byte, only the
+    sidecar is written, and it names that file: the fixture shares the data and adds none. Returns the
+    data bytes written (0 for a shared file).
+    """
+    unknown = sorted(set(sidecar) - set(SIDECAR_DEFAULTS))
+    if unknown:
+        raise TypeError(f"write_capture: unknown sidecar field(s) {', '.join(unknown)}")
+    fields = dict(SIDECAR_DEFAULTS, **sidecar)
+    rate = SAMPLE_RATE_HZ if sample_rate is None else sample_rate
+    bw_khz = DSP_BW_KHZ if dsp_bw_khz is None else dsp_bw_khz
+    payload = bytes(payload)
+    if len(payload) % CU8_ALIGN_BYTES:
+        raise ValueError(f"{name}: {len(payload)} bytes is not a whole number of I/Q pairs")
+    check_replay_events(fields, len(payload))
+    written = len(payload)
+    if data_file is None:
+        data_name = name + ".iq"
+        with open(os.path.join(out_dir, data_name), "wb") as handle:
+            handle.write(payload)
+    else:
+        data_name = data_file
+        with open(os.path.join(out_dir, data_name), "rb") as handle:
+            if handle.read() != payload:
+                raise ValueError(f"{name}: {data_name} does not hold the payload the sidecar describes")
+        written = 0
     metadata = METADATA_TEMPLATE.format(
-        sample_rate=sample_rate,
-        bw_khz=dsp_bw_khz,
-        demod_rate=sample_rate,
+        version=fields["version"],
+        sample_rate=rate,
+        center_frequency_hz=fields["center_frequency_hz"],
+        capture_center_frequency_hz=fields["capture_center_frequency_hz"],
+        bw_khz=bw_khz,
+        demod_rate=rate,
+        contains_retunes="true" if fields["contains_retunes"] else "false",
+        capture_retune_count=fields["capture_retune_count"],
+        capture_started_utc=fields["capture_started_utc"],
         data_file=data_name,
         data_bytes=len(payload),
+        events=format_events(fields["events"]),
     )
-    with open(data_path + ".json", "w", encoding="utf-8") as handle:
+    with open(os.path.join(out_dir, name + ".iq.json"), "w", encoding="utf-8") as handle:
         handle.write(metadata)
-    return len(payload)
+    return written
+
+
+def write_fixture(out_dir, name, samples, normalize=True, sample_rate=None, dsp_bw_khz=None):
+    return write_capture(
+        out_dir, name, to_cu8(samples, normalize=normalize).tobytes(),
+        sample_rate=sample_rate, dsp_bw_khz=dsp_bw_khz)
 
 
 def load_cu8_fixture(path):
@@ -613,6 +980,138 @@ def build_noise(out_dir):
         written = write_fixture(out_dir, name, samples, normalize=False)
         total += written
         print(f"{name:28s} noise   {written // 1024:6d} KiB")
+    return total
+
+
+def build_clip(out_dir):
+    """Write the fixtures clipped to the rails in their last replay chunk (issues #572, #626; see DERIVED_CLIP)."""
+    total = 0
+    for name, lead_pairs, clip_pairs, i_byte, q_byte in DERIVED_CLIP:
+        tone = len(CLIP_LEAD_TONE)
+        lead = bytes(b for i in range(lead_pairs) for b in (CLIP_LEAD_TONE[i % tone], CLIP_LEAD_TONE[(i + 4) % tone]))
+        written = write_capture(out_dir, name, lead + bytes([i_byte, q_byte]) * clip_pairs)
+        total += written
+        print(f"{name:28s} clip    {written // 1024:6d} KiB")
+    return total
+
+
+def read_committed_capture(src_dir, name):
+    """Read a committed fixture's cu8 bytes, refusing one that is not an event-free 48 kHz cu8 capture."""
+    data_path = os.path.join(src_dir, name + ".iq")
+    with open(data_path + ".json", encoding="utf-8") as handle:
+        metadata = json.load(handle)
+    with open(data_path, "rb") as handle:
+        payload = handle.read()
+    if (
+        metadata.get("sample_format") != "cu8"
+        or metadata.get("sample_rate_hz") != SAMPLE_RATE_HZ
+        or metadata.get("base_decimation") != 1
+        or metadata.get("events")
+    ):
+        raise ValueError(f"{name}: not an event-free {SAMPLE_RATE_HZ} Hz cu8 capture at base_decimation 1")
+    if metadata.get("data_bytes") != len(payload):
+        raise ValueError(f"{name}: data_bytes {metadata.get('data_bytes')} != file size {len(payload)}")
+    return payload
+
+
+def build_retune_fixture(
+    out_dir,
+    src_dir,
+    name,
+    lead_s,
+    lead_fixture,
+    lead_center_hz,
+    call_fixture,
+    call_center_hz,
+    capture_started_utc=RETUNE_CAPTURE_STARTED_UTC,
+):
+    """Write name: the first lead_s seconds of lead_fixture, a scan retune, then all of call_fixture.
+
+    The sources are committed fixtures read from src_dir; their bytes are concatenated as they
+    are, so nothing is requantized. The sidecar starts on lead_center_hz and the RETUNE/RESET
+    pair at the boundary moves it to call_center_hz (see DERIVED_RETUNE). Importable, so a
+    lead-in sweep can write candidates into a scratch directory. Returns the bytes written.
+    """
+    if name in (lead_fixture, call_fixture):
+        raise ValueError(f"{name}: would overwrite its own source")
+    lead = read_committed_capture(src_dir, lead_fixture)
+    call = read_committed_capture(src_dir, call_fixture)
+    lead_bytes = round(lead_s * SAMPLE_RATE_HZ) * CU8_ALIGN_BYTES
+    if lead_bytes <= 0 or lead_bytes > len(lead):
+        raise ValueError(f"{name}: a {lead_s} s lead-in needs {lead_bytes} bytes and {lead_fixture} has {len(lead)}")
+    landing = {
+        "byte_offset": lead_bytes,
+        "center_frequency_hz": call_center_hz,
+        "capture_center_frequency_hz": call_center_hz,
+        "sample_rate_hz": SAMPLE_RATE_HZ,
+        "reason": "frequency",
+    }
+    events = (
+        dict(landing, kind="RETUNE"),
+        {"kind": "MUTE", "byte_offset": lead_bytes, "duration_bytes": RETUNE_MUTE_BYTES, "reason": "retune_mute"},
+        dict(landing, kind="RESET"),
+        {"kind": "MUTE", "byte_offset": lead_bytes, "duration_bytes": RESET_MUTE_BYTES, "reason": "retune_mute"},
+    )
+    return write_capture(
+        out_dir,
+        name,
+        lead[:lead_bytes] + call,
+        version=2,
+        center_frequency_hz=lead_center_hz,
+        capture_center_frequency_hz=lead_center_hz,
+        contains_retunes=True,
+        capture_retune_count=1,
+        capture_started_utc=capture_started_utc,
+        events=events,
+    )
+
+
+def build_derived_retune(out_dir):
+    """Write the scan-retune fixtures (issue #572) from the committed fixtures in out_dir."""
+    total = 0
+    for name, lead_fixture, lead_s, lead_center_hz, call_fixture, call_center_hz in DERIVED_RETUNE:
+        written = build_retune_fixture(
+            out_dir, out_dir, name, lead_s, lead_fixture, lead_center_hz, call_fixture, call_center_hz
+        )
+        total += written
+        print(f"{name:28s} retune  {written // 1024:6d} KiB")
+    return total
+
+
+def build_gap_fixture(out_dir, src_dir, name, source, gap_at_s, gap_s, reason):
+    """Write name: all of source, a committed fixture read from src_dir, with a gap_s MUTE at gap_at_s.
+
+    Only the version 2 sidecar is written. Its data_file names the source's data file, relative to
+    out_dir, and its one MUTE event moves only the media clock (see DERIVED_GAP). Returns the data
+    bytes written, 0.
+    """
+    if name == source:
+        raise ValueError(f"{name}: would overwrite its own source")
+    payload = read_committed_capture(src_dir, source)
+    gap_at = round(gap_at_s * SAMPLE_RATE_HZ) * CU8_ALIGN_BYTES
+    gap_bytes = round(gap_s * SAMPLE_RATE_HZ) * CU8_ALIGN_BYTES
+    if gap_at <= 0 or gap_at >= len(payload):
+        raise ValueError(f"{name}: a gap at {gap_at_s} s needs samples on both sides of byte {gap_at}")
+    event = {"kind": "MUTE", "byte_offset": gap_at, "duration_bytes": gap_bytes, "reason": reason}
+    data_file = os.path.relpath(os.path.join(src_dir, source + ".iq"), out_dir)
+    return write_capture(
+        out_dir,
+        name,
+        payload,
+        data_file=data_file,
+        version=2,
+        capture_started_utc=GAP_CAPTURE_STARTED_UTC,
+        events=(event,),
+    )
+
+
+def build_derived_gap(out_dir):
+    """Write the capture-gap fixtures (issue #572) from the committed fixtures in out_dir."""
+    total = 0
+    for name, source, gap_at_s, gap_s, reason in DERIVED_GAP:
+        written = build_gap_fixture(out_dir, out_dir, name, source, gap_at_s, gap_s, reason)
+        total += written
+        print(f"{name:28s} gap     sidecar on {source}.iq")
     return total
 
 
@@ -1065,11 +1564,100 @@ def analog_ctcss_signal(seed, duration_s, tone_hz, tone_stop_s):
     return samples + noise
 
 
+def dcs_word(code, inverted):
+    """The 23-bit DCS word of a 9-bit code: code, then 100, then the Golay check bits; bit 0 first.
+
+    The word d(x) + x^12 p(x) is a multiple of the generator g(x), and since g(x) divides
+    x^23 + 1, the check bits are p(x) = x^11 d(x) mod g(x).
+    """
+    data = code | 0x800
+    rem = data << 11
+    for bit in range(DCS_WORD_BITS - 1, 10, -1):
+        if (rem >> bit) & 1:
+            rem ^= DCS_GOLAY_GENERATOR << (bit - 11)
+    word = data | (rem << 12)
+    return (~word & ((1 << DCS_WORD_BITS) - 1)) if inverted else word
+
+
+def dcs_bits(rng, word, count_bits, wrong_bits):
+    """count_bits bits of the repeated word, with wrong_bits of it flipped at seeded positions."""
+    for pos in rng.choice(DCS_WORD_BITS, size=wrong_bits, replace=False):
+        word ^= 1 << int(pos)
+    return np.array([(word >> (k % DCS_WORD_BITS)) & 1 for k in range(count_bits)], dtype=np.int8)
+
+
+def low_pass_fft(signal, band_hz):
+    """Low-pass a whole signal in the frequency domain with a raised-cosine edge over band_hz."""
+    spectrum = np.fft.rfft(signal)
+    freqs = np.fft.rfftfreq(len(signal), 1.0 / SAMPLE_RATE_HZ)
+    low, high = band_hz
+    mask = np.ones_like(freqs)
+    edge = (freqs > low) & (freqs < high)
+    mask[edge] = 0.5 * (1.0 + np.cos(math.pi * (freqs[edge] - low) / (high - low)))
+    mask[freqs >= high] = 0.0
+    return np.fft.irfft(spectrum * mask, len(signal))
+
+
+def analog_dcs_signal(seed, duration_s, code, inverted, stop_s, wrong_bits):
+    """Complex baseband NFM: voice-band audio plus an optional DCS word, with receiver noise."""
+    rng = np.random.default_rng(seed)
+    count = int(round(duration_s * SAMPLE_RATE_HZ))
+    deviation_hz = ANALOG_SYNTH_VOICE_PEAK_DEVIATION_HZ * analog_voice_band(rng, count)
+    if code is not None:
+        # The transmitter's word clock starts anywhere in a word.
+        offset_bits = rng.uniform(0.0, float(DCS_WORD_BITS))
+        positions = offset_bits + np.arange(count) * (DCS_BAUD / SAMPLE_RATE_HZ)
+        bits = dcs_bits(rng, dcs_word(code, inverted), int(positions[-1]) + 1, wrong_bits)
+        nrz = np.where(bits[positions.astype(np.int64)] == 1, 1.0, -1.0)
+        dcs = ANALOG_SYNTH_DCS_DEVIATION_HZ * low_pass_fft(nrz, ANALOG_SYNTH_DCS_BAND_HZ)
+        if stop_s is not None:
+            dcs[int(round(stop_s * SAMPLE_RATE_HZ)) :] = 0.0
+        deviation_hz = deviation_hz + dcs
+    centered = deviation_hz - np.mean(deviation_hz)
+    samples = remodulate(deviation_hz, np.percentile(np.abs(centered), 99.5) / (SAMPLE_RATE_HZ / 2.0))
+    noise = rng.normal(0.0, ANALOG_SYNTH_NOISE_SIGMA, count) + 1j * rng.normal(0.0, ANALOG_SYNTH_NOISE_SIGMA, count)
+    return samples + noise
+
+
 def build_analog_synth(out_dir):
-    """Write the synthetic NFM fixtures for received-tone detection (#522)."""
+    """Write the synthetic NFM fixtures for received-tone detection (#522) and received DCS (#523)."""
     total = 0
     for name, seed, duration_s, tone_hz, tone_stop_s in ANALOG_CTCSS_SYNTH:
         written = write_fixture(out_dir, name, analog_ctcss_signal(seed, duration_s, tone_hz, tone_stop_s))
+        total += written
+        print(f"{name:28s} synth   {written // 1024:6d} KiB")
+    for name, seed, duration_s, code, inverted, stop_s, errors in ANALOG_DCS_SYNTH:
+        signal = analog_dcs_signal(seed, duration_s, code, inverted, stop_s, errors)
+        written = write_fixture(out_dir, name, signal)
+        total += written
+        print(f"{name:28s} synth   {written // 1024:6d} KiB")
+    return total
+
+
+def squelch_burst_samples(seed, kind, carrier_db):
+    """Noise, a keyed carrier with the test tone (FM or AM), noise again; see SQUELCH_BURST."""
+    count = int(round(SQUELCH_BURST_DURATION_S * SAMPLE_RATE_HZ))
+    t = np.arange(count) / SAMPLE_RATE_HZ
+    key = np.minimum(t - SQUELCH_BURST_KEY_S, SQUELCH_BURST_UNKEY_S - t) / SQUELCH_BURST_RAMP_S
+    envelope = 0.5 - 0.5 * np.cos(math.pi * np.clip(key, 0.0, 1.0))
+    if kind == "fm":
+        beta = NFM_SYNTH_DEVIATION_HZ / NFM_SYNTH_TONE_HZ
+        carrier = np.exp(1j * beta * np.sin(2.0 * math.pi * NFM_SYNTH_TONE_HZ * t))
+    else:
+        carrier = (1.0 + AM_SYNTH_DEPTH * np.cos(2.0 * math.pi * AM_SYNTH_TONE_HZ * t)).astype(np.complex128)
+    sigma = SQUELCH_BURST_NOISE_LSB / 127.5
+    amplitude = math.sqrt(2.0 * sigma * sigma * 10.0 ** (carrier_db / 10.0))
+    rng = np.random.default_rng(seed)
+    noise = rng.normal(0.0, sigma, count) + 1j * rng.normal(0.0, sigma, count)
+    return amplitude * envelope * carrier + noise
+
+
+def build_squelch_burst(out_dir):
+    """Write the auto squelch's burst fixtures (issue #518) at their own level, unnormalised."""
+    total = 0
+    for name, seed, kind, carrier_db in SQUELCH_BURST:
+        samples = squelch_burst_samples(seed, kind, carrier_db)
+        written = write_capture(out_dir, name, to_cu8(samples, headroom=1.0, normalize=False).tobytes())
         total += written
         print(f"{name:28s} synth   {written // 1024:6d} KiB")
     return total
@@ -1137,6 +1725,8 @@ def build_upstream(args):
             samples = load_iq(path, start_s, duration_s)
         else:
             audio = ffmpeg_read(path, 1, start_s, duration_s)
+            if source_key in AUDIO_DEEMPHASIS_US:
+                audio = undo_deemphasis(audio, AUDIO_DEEMPHASIS_US[source_key])
             samples = remodulate(audio, deviation or DEFAULT_DEVIATION)
         written = write_fixture(args.out, name, samples)
         total += written
@@ -1154,9 +1744,14 @@ def derived_fixture_names():
         [entry[0] for entry in DERIVED_SIMULCAST]
         + [entry[0] for entry in DERIVED_ATTENUATED]
         + [entry[0] for entry in DERIVED_NOISE]
+        + [entry[0] for entry in DERIVED_CLIP]
+        + [entry[0] for entry in DERIVED_RETUNE]
+        + [entry[0] for entry in DERIVED_GAP]
         + [DPMR_SYNTH_NAME]
         + [entry[0] for entry in NFM_SYNTH]
+        + [entry[0] for entry in AM_SYNTH]
         + [entry[0] for entry in ANALOG_CTCSS_SYNTH]
+        + [entry[0] for entry in ANALOG_DCS_SYNTH]
         + [
             TETRA_SYNTH_NAME,
             TETRA_INVERTED_NAME,
@@ -1169,6 +1764,7 @@ def derived_fixture_names():
             TETRA_CLOCK_SLOW_NAME,
             TETRA_BAD_CRC_IMPAIRED_NAME,
         ]
+        + [entry[0] for entry in SQUELCH_BURST]
     )
 
 
@@ -1212,10 +1808,15 @@ def main():
     if not args.only:
         total += build_derived(args.out)
         total += build_noise(args.out)
+        total += build_clip(args.out)
+        total += build_derived_retune(args.out)
+        total += build_derived_gap(args.out)
         total += build_dpmr_synth(args.out)
-        total += build_tetra_synth(args.out)
         total += build_nfm_synth(args.out)
+        total += build_am_synth(args.out)
+        total += build_tetra_synth(args.out)
         total += build_analog_synth(args.out)
+        total += build_squelch_burst(args.out)
     else:
         for name in derived_fixture_names():
             if name in args.only:

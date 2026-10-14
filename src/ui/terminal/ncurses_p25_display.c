@@ -12,7 +12,6 @@
 #include <dsd-neo/app_control/frontend.h>
 #include <dsd-neo/app_control/p25_metrics.h>
 #include <dsd-neo/core/constants.h>
-#include <dsd-neo/core/dsd_time.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/state.h>
 #include <dsd-neo/core/synctype_ids.h>
@@ -21,6 +20,7 @@
 #include <dsd-neo/protocol/p25/p25_sm_watchdog.h>
 #include <dsd-neo/protocol/p25/p25_trunk_sm.h>
 #include <dsd-neo/runtime/config.h>
+#include <dsd-neo/runtime/decode_clock.h>
 #include <dsd-neo/runtime/trunk_cc_candidates.h>
 #include <dsd-neo/ui/ncurses_internal.h>
 #include <dsd-neo/ui/ncurses_p25_display.h>
@@ -42,9 +42,16 @@ ui_iden_entry_is_usable(const p25_iden_entry_t* entry) {
     return entry && entry->populated && entry->base_freq != 0 && entry->chan_spac != 0;
 }
 
+/* Computed in 64 bits like process_channel_to_freq(), and 0 (no channel) for a stored base at or below 0 or a result
+   outside 1..DSD_TRUNK_FREQ_MAX_HZ: the base is a 32-bit over-the-air field in 5 Hz units, so base * 5 overflows a 32-bit
+   long, and where long is 32-bit a raw base of 2^31 or more is stored negative. */
 static long int
 ui_iden_entry_calc_freq(const p25_iden_entry_t* entry, int step) {
-    return (entry->base_freq * 5) + ((long)step * entry->chan_spac * 125);
+    if (entry->base_freq <= 0) {
+        return 0;
+    }
+    const long long freq_hz = ((long long)entry->base_freq * 5LL) + ((long long)step * entry->chan_spac * 125LL);
+    return (freq_hz > 0 && freq_hz <= DSD_TRUNK_FREQ_MAX_HZ) ? (long int)freq_hz : 0;
 }
 
 static int
@@ -69,7 +76,8 @@ ui_iden_entry_matches(const p25_iden_entry_t* entry, int raw, int denom, long in
     if (denom <= 0) {
         denom = 1;
     }
-    return ui_iden_entry_calc_freq(entry, raw / denom) == freq;
+    const long int calc = ui_iden_entry_calc_freq(entry, raw / denom);
+    return calc != 0 && calc == freq;
 }
 
 static int
@@ -202,7 +210,7 @@ ui_p25_iden_trust_str(int trust) {
 
 static void
 ui_p25_print_iden_line(int id, const p25_iden_entry_t* entry, int has_other_class, const char* mode_base) {
-    double base_mhz = (double)(entry->base_freq * 5) / 1000000.0;
+    double base_mhz = (double)entry->base_freq * 5.0 / 1000000.0;
     double spac_mhz = (double)(entry->chan_spac * 125) / 1000000.0;
     const char* trust_str = ui_p25_iden_trust_str(entry->trust);
     const char* mode_tag = has_other_class ? ((mode_base[0] == 'F') ? "FDMA[F/T]" : "TDMA[F/T]") : mode_base;
@@ -714,7 +722,7 @@ ui_print_p25_sm_last_release(const dsd_state* state) {
     if (state->p25_sm_last_release_time == 0) {
         return 0;
     }
-    double dt_rel = (double)(time(NULL) - state->p25_sm_last_release_time);
+    double dt_rel = (double)(dsd_decode_time() - state->p25_sm_last_release_time);
     printw("| SM Last: release d=%4.1fs\n", dt_rel);
     return 1;
 }
@@ -724,7 +732,7 @@ ui_print_p25_sm_last_reason(const dsd_state* state) {
     if (state->p25_sm_last_reason[0] == '\0' || state->p25_sm_last_reason_time == 0) {
         return 0;
     }
-    double dt_tag = (double)(time(NULL) - state->p25_sm_last_reason_time);
+    double dt_tag = (double)(dsd_decode_time() - state->p25_sm_last_reason_time);
     printw("| SM Last: %s d=%4.1fs\n", state->p25_sm_last_reason, dt_tag);
     return 1;
 }
@@ -734,7 +742,7 @@ ui_print_p25_sm_tags(const dsd_state* state) {
     if (state->p25_sm_tag_count <= 0) {
         return 0;
     }
-    time_t now = time(NULL);
+    time_t now = dsd_decode_time();
     ui_print_lborder_green();
     addstr(" SM Tags: ");
     int shown = 0;
@@ -976,75 +984,45 @@ ui_print_p25_trunk_metrics(const dsd_opts* opts, const dsd_state* state) {
     return lines;
 }
 
-static int
-ui_clamp_p2_ring_fill(int fill) {
-    if (fill < 0) {
-        return 0;
-    }
-    if (fill > DSD_P25_P2_AUDIO_RING_DEPTH) {
-        return DSD_P25_P2_AUDIO_RING_DEPTH;
-    }
-    return fill;
-}
-
-static void
-ui_get_p2_hold_windows(double* ring_hold, double* mac_hold) {
-    *ring_hold = 0.75;
-    *mac_hold = 3.0;
+static double
+ui_get_p2_mac_hold(void) {
     const dsdneoRuntimeConfig* cfg = dsd_neo_get_config();
-    if (cfg) {
-        *ring_hold = cfg->p25_ring_hold_s;
-        *mac_hold = cfg->p25_mac_hold_s;
-    }
+    return cfg ? cfg->p25_mac_hold_s : 3.0;
 }
 
+// The slot activity the SM gate weighs: an open audio gate until the voice sync is a hangtime old, or fresh MAC
+// signalling.
 static int
-ui_p2_ring_recent(int ring_count, double dmac, double ring_hold) {
-    return (ring_count > 0) && (dmac >= 0.0) && (dmac <= ring_hold);
-}
-
-static int
-ui_p2_slot_active(const dsd_opts* opts, const dsd_state* state, int slot, double dmac, double dt, double ring_hold,
-                  double mac_hold) {
-    int ring_recent = ui_p2_ring_recent(state->p25_p2_audio_ring_count[slot], dmac, ring_hold);
-    int has_audio = state->p25_p2_audio_allowed[slot] || ring_recent;
-    if (opts && dt >= opts->trunk_hangtime) {
-        has_audio = ring_recent;
-    }
+ui_p2_slot_active(const dsd_opts* opts, const dsd_state* state, int slot, double dmac, double dt, double mac_hold) {
     if (dmac >= 0.0 && dmac <= mac_hold) {
         return 1;
     }
-    return has_audio;
+    if (opts && dt >= opts->trunk_hangtime) {
+        return 0;
+    }
+    return state->p25_p2_audio_allowed[slot] ? 1 : 0;
 }
 
 static int
 ui_print_p25p2_slot_line(const dsd_state* state) {
     int act = state->p25_p2_active_slot;
-    int lfill = ui_clamp_p2_ring_fill(state->p25_p2_audio_ring_count[0]);
-    int rfill = ui_clamp_p2_ring_fill(state->p25_p2_audio_ring_count[1]);
-    printw("| P2 slot: %s; jitter S1:%d/%d S2:%d/%d\n",
-           (act == 0)   ? "1"
-           : (act == 1) ? "2"
-                        : "-",
-           lfill, DSD_P25_P2_AUDIO_RING_DEPTH, rfill, DSD_P25_P2_AUDIO_RING_DEPTH);
+    printw("| P2 slot: %s\n", (act == 0) ? "1" : (act == 1) ? "2" : "-");
     return 1;
 }
 
 static int
 ui_print_p25p2_gate_line(const dsd_opts* opts, const dsd_state* state) {
-    time_t now = time(NULL);
+    time_t now = dsd_decode_time();
     double l_dmac = (state->p25_p2_last_mac_active[0] != 0) ? (double)(now - state->p25_p2_last_mac_active[0]) : -1.0;
     double r_dmac = (state->p25_p2_last_mac_active[1] != 0) ? (double)(now - state->p25_p2_last_mac_active[1]) : -1.0;
     double dt = (state->last_vc_sync_time != 0) ? (double)(now - state->last_vc_sync_time) : -1.0;
     double dt_tune = (state->p25_last_vc_tune_time != 0) ? (double)(now - state->p25_last_vc_tune_time) : -1.0;
-    double ring_hold = 0.75;
-    double mac_hold = 3.0;
-    ui_get_p2_hold_windows(&ring_hold, &mac_hold);
-    int l_act = ui_p2_slot_active(opts, state, 0, l_dmac, dt, ring_hold, mac_hold);
-    int r_act = ui_p2_slot_active(opts, state, 1, r_dmac, dt, ring_hold, mac_hold);
-    printw("| SM Gate: L[a=%d rc=%d dMAC=%4.1fs act=%d]  R[a=%d rc=%d dMAC=%4.1fs act=%d]  dt=%4.1fs tune=%4.1fs\n",
-           state->p25_p2_audio_allowed[0] ? 1 : 0, state->p25_p2_audio_ring_count[0], l_dmac, l_act,
-           state->p25_p2_audio_allowed[1] ? 1 : 0, state->p25_p2_audio_ring_count[1], r_dmac, r_act, dt, dt_tune);
+    const double mac_hold = ui_get_p2_mac_hold();
+    int l_act = ui_p2_slot_active(opts, state, 0, l_dmac, dt, mac_hold);
+    int r_act = ui_p2_slot_active(opts, state, 1, r_dmac, dt, mac_hold);
+    printw("| SM Gate: L[a=%d dMAC=%4.1fs act=%d]  R[a=%d dMAC=%4.1fs act=%d]  dt=%4.1fs tune=%4.1fs\n",
+           state->p25_p2_audio_allowed[0] ? 1 : 0, l_dmac, l_act, state->p25_p2_audio_allowed[1] ? 1 : 0, r_dmac, r_act,
+           dt, dt_tune);
     return 1;
 }
 
@@ -1061,8 +1039,8 @@ ui_print_p25p2_slot_metrics(const dsd_opts* opts, const dsd_state* state, int is
 
 static int
 ui_print_p25p1_sm_timers_metric(const dsd_state* state) {
-    time_t now = time(NULL);
-    double nowm = dsd_time_now_monotonic_s();
+    time_t now = dsd_decode_time();
+    double nowm = dsd_decode_now_mono_s();
     double dt_cc = ui_time_diff_maybe_monotonic(now, state->last_cc_sync_time, nowm, state->last_cc_sync_time_m);
     double dt_vc = ui_time_diff_maybe_monotonic(now, state->last_vc_sync_time, nowm, state->last_vc_sync_time_m);
     double dt_tune =
@@ -1188,7 +1166,7 @@ ui_print_p25_secondary_ccs(const dsd_opts* opts, const dsd_state* state) {
     int cols = ui_screen_cols_default80();
     int shown = 0;
     int line_used = 0;
-    time_t now = time(NULL);
+    time_t now = dsd_decode_time();
     int count = state->p25_secondary_cc_count;
     if (count > P25_SECONDARY_CC_MAX) {
         count = P25_SECONDARY_CC_MAX;
@@ -1226,7 +1204,7 @@ ui_print_p25_neighbors(const dsd_opts* opts, const dsd_state* state) {
     int cols = ui_screen_cols_default80();
     int shown = 0;
     int line_used = 0;
-    time_t now = time(NULL);
+    time_t now = dsd_decode_time();
     for (int i = 0; i < n && shown < 20; i++) {
         int k = idxs[i];
         char buf[160];

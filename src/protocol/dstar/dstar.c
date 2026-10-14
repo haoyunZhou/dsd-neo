@@ -6,6 +6,9 @@
 #include <dsd-neo/core/audio.h>
 #include <dsd-neo/core/dibit.h>
 #include <dsd-neo/core/events.h>
+#include <dsd-neo/core/file_io.h>
+#include <dsd-neo/core/state.h>
+#include <dsd-neo/core/synctype_ids.h>
 #include <dsd-neo/core/vocoder.h>
 #include <dsd-neo/protocol/dstar/dstar.h>
 #include <dsd-neo/protocol/dstar/dstar_const.h>
@@ -24,7 +27,9 @@ processDSTAR(dsd_opts* opts, dsd_state* state) {
     uint8_t sd[480];
     DSD_MEMSET(sd, 0, sizeof(sd));
     int i, j;
-    char ambe_fr[4][24];
+    /* Soft AMBE 3600x2400 frame: each cell the interleave reaches carries its symbol's bit and the confidence in it
+     * (issue #599). The 24 it never reaches stay bit 0 at reliability 0, which the decoder never reads. */
+    dsd_vocoder_soft_bit ambe_fr[4][24];
     DSD_MEMSET(ambe_fr, 0, sizeof(ambe_fr));
 
     /* The superframe sits behind an exact 24-symbol sync word, which is the only thing about
@@ -33,6 +38,11 @@ processDSTAR(dsd_opts* opts, dsd_state* state) {
     dstar_confirm_begin_frame(state);
     dstar_confirm_note_evidence(state, DSTAR_EVIDENCE_WEAK);
 
+    /* The superframe belongs to one carrier (issue #575): its slow data decodes only after the last voice frame, so a
+       header, text or position message read whole before the carrier boundary moved the carrier count (a replay read
+       adopting a recorded retune) would publish the carrier left's station after the boundary ended its call. From the
+       voice frame read across or after the move, the superframe is dropped, slow data and all, as on a sync loss. */
+    const uint32_t carrier_seq = state->carrier_seq;
     //20 voice and 19 slow data frames (20th is frame sync)
     for (j = 0; j < 21; j++) {
 
@@ -41,13 +51,18 @@ processDSTAR(dsd_opts* opts, dsd_state* state) {
         const int* x = dstar_interleave_x;
 
         for (i = 0; i < 72; i++) {
-            int dibit = get_dibit_and_analog_signal(opts, state, NULL);
-            ambe_fr[*w][*x] = dibit & 1;
+            float symbol = 0.0f;
+            int dibit = getDibitAndSoftSymbol(opts, state, &symbol);
+            ambe_fr[*w][*x].bit = (uint8_t)(dibit & 1);
+            ambe_fr[*w][*x].reliability = dsd_two_level_symbol_reliability(opts, state, symbol);
             w++;
             x++;
         }
+        if (state->carrier_seq != carrier_seq) {
+            break;
+        }
 
-        processMbeFrame(opts, state, NULL, ambe_fr, NULL);
+        processMbeFrameSoft(opts, state, DSD_VOICE_PROTOCOL_DSTAR, NULL, ambe_fr, NULL);
         dsd_play_synthesized_voice(opts, state);
 
         if (j != 20) {
@@ -92,6 +107,8 @@ processDSTAR_HD(dsd_opts* opts, dsd_state* state) {
         /* A CRC-16/X.25 over 39 octets: proof on its own, and it opens the transmission the
          * voice superframe below belongs to. */
         dstar_confirm_note_evidence(state, DSTAR_EVIDENCE_STRONG);
+        /* The capture of the transmission before it ends here (issue #661). */
+        dsd_mbe_out_close_protocol(opts, state, DSD_MBE_OUT_SLOT1, DSD_SYNC_DSTAR_HD_POS);
     }
     (void)processDSTAR(opts, state);
     return header_ok;

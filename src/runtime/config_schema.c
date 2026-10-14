@@ -26,7 +26,14 @@ static const dsdcfg_schema_entry_t s_schema[] = {
     {"input", "rtl_gain", "RTL-SDR gain in dB (0 for AGC)", "0", NULL, DSDCFG_TYPE_INT, 0, 49},
     {"input", "rtl_ppm", "RTL-SDR frequency correction in PPM", "0", NULL, DSDCFG_TYPE_INT, -1000, 1000},
     {"input", "rtl_bw_khz", "RTL-SDR DSP bandwidth in kHz", "48", NULL, DSDCFG_TYPE_INT, 4, 48},
-    {"input", "rtl_sql", "RTL-SDR squelch level in dB (0 to disable)", "0", NULL, DSDCFG_TYPE_INT, -100, 0},
+    {"input", "rtl_sql", "Squelch level in dB (0 to disable); radio and audio inputs", "0", NULL, DSDCFG_TYPE_INT, -120,
+     0},
+    {"input", "rtl_sql_mode",
+     "Squelch: a fixed level (rtl_sql), auto (a margin over the learned noise floor; radio inputs) or noise (FM "
+     "quieting)",
+     "level", "level|auto|noise", DSDCFG_TYPE_ENUM, 0, 0},
+    {"input", "rtl_sql_margin_db", "Auto squelch margin over the noise floor, or noise squelch quieting, in dB", "10",
+     NULL, DSDCFG_TYPE_INT, 3, 30},
     {"input", "rtl_volume", "RTL-SDR volume multiplier", "2", NULL, DSDCFG_TYPE_INT, 1, 3},
     {"input", "auto_ppm", "Enable carrier/error-based RTL auto-PPM correction", "false", NULL, DSDCFG_TYPE_BOOL, 0, 0},
     {"input", "rtltcp_host", "RTL-TCP server hostname or IP", "127.0.0.1", NULL, DSDCFG_TYPE_STRING, 0, 0},
@@ -74,8 +81,8 @@ static const dsdcfg_schema_entry_t s_schema[] = {
 
     /* [mode] section */
     {"mode", "decode", "Decode mode preset", "auto",
-     "auto|p25p1|p25p2|dmr|dmr_mono|nxdn48|nxdn96|x2tdma|ysf|dstar|edacs_pv|dpmr|m17|tdma|analog", DSDCFG_TYPE_ENUM, 0,
-     0},
+     "auto|p25p1|p25p2|dmr|dmr_mono|nxdn48|nxdn96|x2tdma|ysf|dstar|edacs_pv|dpmr|m17|tdma|analog|am", DSDCFG_TYPE_ENUM,
+     0, 0},
     {"mode", "dmr_mono", "Enable the DMR single-slot mono decoder without changing the decode preset", "false", NULL,
      DSDCFG_TYPE_BOOL, 0, 0},
     {"mode", "dmr_lrrp_ports", "Extra UDP ports decoded as DMR LRRP, comma-separated (at most 8)", "", NULL,
@@ -159,6 +166,18 @@ static const dsdcfg_schema_entry_t s_schema[] = {
      "NFM channel-filter width in Hz: the full RF passband, not the tuner or audio bandwidth. Leave it out for the "
      "default; an explicit value, 16000 included, always runs the channel filter and must fit the DSP rate",
      "16000", NULL, DSDCFG_TYPE_INT, 8000, 25000},
+    {"analog", "am_bandwidth_hz",
+     "AM channel-filter width in Hz: the full RF passband, not the tuner or audio bandwidth; decode = am needs an IQ "
+     "radio input. Leave it out for the default; it must fit the DSP rate",
+     "6000", NULL, DSDCFG_TYPE_INT, 5000, 20000},
+    {"analog", "tone_filter",
+     "CTCSS/DCS receive policy on the analog FM monitor and nfm scan rows: allow hears only traffic carrying a "
+     "tone_list tone or code, block mutes it; off (the default) keeps tone_list. The received tone is shown apart",
+     "off", "off|allow|block", DSDCFG_TYPE_ENUM, 0, 0},
+    {"analog", "tone_list",
+     "Tones and codes for tone_filter: '/'-separated standard CTCSS tones (150.0 too) and DCS codes, e.g. "
+     "67.0/100.0/D023N (a bare D023 is D023N; commas are refused)",
+     "", NULL, DSDCFG_TYPE_STRING, 0, 0},
 };
 
 /* Deprecated persisted spellings remain accepted for read compatibility, but are deliberately kept out of the

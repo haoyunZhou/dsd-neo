@@ -130,7 +130,6 @@ unset_all_runtime_env(void) {
         "DSD_NEO_P25_MIN_FOLLOW_DWELL",
         "DSD_NEO_P25P1_ERR_HOLD_PCT",
         "DSD_NEO_P25P1_ERR_HOLD_S",
-        "DSD_NEO_P25_RING_HOLD",
         "DSD_NEO_P25_SOFT_ERASURE_THRESHOLD",
         "DSD_NEO_P25_SOFT_HARD_OVERRIDE",
         "DSD_NEO_P25_VC_GRACE",
@@ -1073,7 +1072,6 @@ test_protocol_env_knobs(void) {
     setenv("DSD_NEO_P25_GRANT_TIMEOUT", "4.0", 1);
     setenv("DSD_NEO_P25_CC_GRACE", "6.0", 1);
     setenv("DSD_NEO_P25_VC_GRACE", "1.0", 1);
-    setenv("DSD_NEO_P25_RING_HOLD", "1.5", 1);
     setenv("DSD_NEO_P25_MAC_HOLD", "2.5", 1);
     setenv("DSD_NEO_P25_VOICE_HOLD", "1.0", 1);
 
@@ -1144,14 +1142,6 @@ test_protocol_env_knobs(void) {
         return rc;
     }
     rc = expect_double_close(cfg->p25_vc_grace_s, 1.0, 1e-9, 1117, "p25_vc_grace_s");
-    if (rc != 0) {
-        return rc;
-    }
-    rc = expect_int_eq(cfg->p25_ring_hold_is_set, 1, 1118, "p25_ring_hold_is_set");
-    if (rc != 0) {
-        return rc;
-    }
-    rc = expect_double_close(cfg->p25_ring_hold_s, 1.5, 1e-9, 1119, "p25_ring_hold_s");
     if (rc != 0) {
         return rc;
     }
@@ -1277,7 +1267,6 @@ test_protocol_env_knobs(void) {
     unsetenv("DSD_NEO_P25_GRANT_TIMEOUT");
     unsetenv("DSD_NEO_P25_CC_GRACE");
     unsetenv("DSD_NEO_P25_VC_GRACE");
-    unsetenv("DSD_NEO_P25_RING_HOLD");
     unsetenv("DSD_NEO_P25_MAC_HOLD");
     unsetenv("DSD_NEO_P25_VOICE_HOLD");
 
@@ -1440,6 +1429,42 @@ test_dmr_t3_tools_env(void) {
     }
     unsetenv("DSD_NEO_DMR_T3_STEP_HZ");
     unsetenv("DSD_NEO_DMR_T3_CC_FREQ");
+
+    /* The control channel is a trunk frequency, so it must fit 1..2147483647 Hz (DSD_TRUNK_FREQ_MAX_HZ) on every
+     * platform, in Hz or in MHz (values under 1e5). One past it is not set; MHz still converts, and the ceiling itself
+     * is kept. */
+    struct t3_cc_freq_case {
+        const char* text;
+        int is_set;
+        long hz;
+    };
+
+    static const t3_cc_freq_case kT3CcFreqCases[] = {
+        {"3000", 0, 0L},                /* 3 GHz in MHz */
+        {"5000000000", 0, 0L},          /* 5 GHz in Hz, which a 64-bit long holds */
+        {"2147483648", 0, 0L},          /* one past the ceiling */
+        {"2147483647", 1, 2147483647L}, /* the ceiling itself */
+        {"851.0125", 1, 851012500L},
+    };
+    int code = 1276;
+    for (const t3_cc_freq_case& tc : kT3CcFreqCases) {
+        setenv("DSD_NEO_DMR_T3_CC_FREQ", tc.text, 1);
+        dsd_neo_config_init();
+        cfg = dsd_neo_get_config();
+        char name[96];
+        DSD_SNPRINTF(name, sizeof name, "dmr_t3_cc_freq_is_set for \"%s\"", tc.text);
+        rc = expect_int_eq(cfg->dmr_t3_cc_freq_is_set, tc.is_set, code, name);
+        if (rc != 0) {
+            return rc;
+        }
+        DSD_SNPRINTF(name, sizeof name, "dmr_t3_cc_freq_hz for \"%s\"", tc.text);
+        rc = expect_long_eq(cfg->dmr_t3_cc_freq_hz, tc.hz, code + 1, name);
+        if (rc != 0) {
+            return rc;
+        }
+        code += 2;
+    }
+    unsetenv("DSD_NEO_DMR_T3_CC_FREQ");
     return 0;
 }
 
@@ -1567,6 +1592,41 @@ test_tcp_misc_env(void) {
         return rc;
     }
     unsetenv("DSD_NEO_TCP_BUFSZ");
+    return 0;
+}
+
+/* "on" and "off" share a first letter, so the env switches must read them as whole words: DSD_NEO_RTL_AGC=off used to
+   leave the AGC on and DSD_NEO_TUNER_AUTOGAIN=on left autogain off. Older single-letter spellings keep working. */
+static int
+test_env_on_off_words(void) {
+    static const struct {
+        const char* value;
+        int enabled;
+    } k_cases[] = {
+        {"off", 0},  {"OFF", 0},   {"on", 1}, {"On", 1}, {"yes", 1}, {"no", 0},
+        {"true", 1}, {"false", 0}, {"1", 1},  {"0", 0},  {"y", 1},   {"f", 0},
+    };
+
+    for (size_t i = 0; i < sizeof(k_cases) / sizeof(k_cases[0]); i++) {
+        unset_all_runtime_env();
+        setenv("DSD_NEO_RTL_AGC", k_cases[i].value, 1);
+        setenv("DSD_NEO_TUNER_AUTOGAIN", k_cases[i].value, 1);
+        dsd_neo_config_init();
+        const dsdneoRuntimeConfig* cfg = dsd_neo_get_config();
+        int rc = expect(cfg != NULL, 1500, "cfg NULL");
+        if (rc != 0) {
+            return rc;
+        }
+        rc = expect_int_eq(cfg->rtl_agc_enable, k_cases[i].enabled, 1501, k_cases[i].value);
+        if (rc != 0) {
+            return rc;
+        }
+        rc = expect_int_eq(cfg->tuner_autogain_enable, k_cases[i].enabled, 1502, k_cases[i].value);
+        if (rc != 0) {
+            return rc;
+        }
+    }
+    unset_all_runtime_env();
     return 0;
 }
 
@@ -2438,6 +2498,10 @@ main(void) {
         return rc;
     }
     rc = test_dmr_t3_heur_apply();
+    if (rc != 0) {
+        return rc;
+    }
+    rc = test_env_on_off_words();
     if (rc != 0) {
         return rc;
     }

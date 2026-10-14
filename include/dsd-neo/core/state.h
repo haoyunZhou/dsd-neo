@@ -18,6 +18,7 @@
 
 #include <dsd-neo/core/input_level.h>
 #include <dsd-neo/core/opts_fwd.h>
+#include <dsd-neo/core/p25p2_playout.h>
 #include <dsd-neo/core/state_ext.h>
 #include <dsd-neo/core/state_fwd.h>
 
@@ -52,8 +53,13 @@ typedef struct {
     char text[DSD_TETRA_MESSAGE_TEXT_SIZE];
 } dsd_tetra_message;
 
+/* The highest frequency, in Hz, a trunking channel is stored or tuned at, the same on every platform: the largest value
+ * a 32-bit long holds (long is 32-bit on Windows, and trunk frequencies are stored as long), which also fits the
+ * uint32_t tuner path. No trunking band comes near it. A channel-map row, an over-the-air channel computation or a
+ * cached control channel past it is refused rather than stored or tuned. */
+#define DSD_TRUNK_FREQ_MAX_HZ  2147483647L
+
 enum DSD_ATTR_PACKED {
-    DSD_P25_P2_AUDIO_RING_DEPTH = 4,
     DSD_P25_MAC_FRAGMENT_MAX_OCTETS = 256,
     DSD_TRUNK_CHAN_MAP_SIZE = 0xFFFF,
     /* Scan-list slots stored inline in dsd_state. Protocol fixed-slot writers raw-index
@@ -158,7 +164,7 @@ typedef struct {
     uint8_t color_pair;  //this value corresponds to which color pair the line should be in ncurses
     uint8_t severity;    // neutral event severity for non-terminal frontends
     uint8_t category;    // neutral event category for non-terminal frontends
-    uint8_t crc_invalid; // Known failed CRC; zero does not imply verification.
+    uint8_t crc_invalid; // DSD_CRC_* provenance bits (crc_provenance.h); zero does not imply verification.
     int8_t systype;      //indentifier of which decoded system type this is from (P25, DMR, etc)
     int8_t subtype;      //subtype of systpe (VLC, TLC, PDU data, System Event, etc)
     uint32_t sys_id1;    //sys_id1 through 5 will be a hierarchy of system identifiers
@@ -191,7 +197,19 @@ typedef struct {
     // named is ordinary -- so the emptiness alone cannot serve as "ask again", or a later render
     // of the same epoch would stamp whichever channel the scanner has since hopped to.
     uint8_t channel_label_resolved;
-    uint32_t channel;  // If this occurs on a trunking channel, which channel
+    uint32_t channel; // If this occurs on a trunking channel, which channel
+    // Frequency in Hz the call was heard on, or 0 when unknown. The call's own frequency (a grant's
+    // channel, the followed voice channel) whenever the call has one; otherwise the receiver's tuned
+    // frequency, taken once, on the epoch's first render while the call is active, and kept for the
+    // rest of the epoch. A row is never given the tuner reading after its call has ended.
+    int64_t freq_hz;
+    // Which access code access_code is, a dsd_access_code_kind (<dsd-neo/core/access_code.h>);
+    // DSD_ACCESS_CODE_NONE (0) when none is known. Refreshed from the decoder while the call is
+    // active, never erased there by an unknown reading, and frozen once the call has ended.
+    uint8_t access_code_kind;
+    // The colour code, NAC, RAN or CAN the call was heard with; meaningful only when
+    // access_code_kind is not DSD_ACCESS_CODE_NONE.
+    uint16_t access_code;
     time_t event_time; //time event occurred
     // Wall-clock time the transmission this row describes began, or 0 when unknown.
     // event_time is restamped as last-activity on every render pass, so by commit it
@@ -233,6 +251,12 @@ typedef struct Event_History_I {
     // `revision`, so a consumer that mirrors committed rows only (the Qt call
     // history) can skip rescanning the ring while this is unchanged.
     uint64_t commit_rev;
+    // Which ring this is: a nonzero nonce drawn once, when initState() allocates the ring, and shared by
+    // its two slots. A state an embedding host reuses for another run keeps it, and its push_seq goes on
+    // counting; a new state draws another. A frontend that keys its mirror on push stamps tells by it the
+    // rows it already read from a new ring that repeats their stamps and content, as a capture replayed in
+    // a fresh state does.
+    uint64_t instance;
     // Decoder-thread scratch consumed by next data notice; snapshots incidental, no dirty marks; frontends never render
     Event_History_Staged staged;
 } Event_History_I;
@@ -250,20 +274,15 @@ typedef struct {
 
 } HPFilter;
 
+/* One slot's digital voice high-pass (`-v 0x8`, issue #653): the transposed direct form II state of the 2nd-order
+   Butterworth section dsd_voice_hpf_process() runs on 8 kHz vocoder frames, and the reception it last ran for, so a new
+   call or protocol on the slot starts from clear state (<dsd-neo/core/voice_chain.h>). */
 typedef struct {
-    LPFilter lpf;
-    HPFilter hpf;
-    float out_in;
-} PBFilter;
-
-typedef struct {
-    float alpha;
-    float beta;
-
-    float vin[3];
-    float vout[3];
-
-} NOTCHFilter;
+    double s1;
+    double s2;
+    uint64_t call_epoch; /* The last nonzero call epoch the slot's frames belonged to; 0 before the first. */
+    int protocol_family; /* dsd_call_state_protocol_family() of the last frame; 0 before the first. */
+} dsd_voice_hpf_state;
 
 //end new filters
 
@@ -366,6 +385,11 @@ typedef struct {
     unsigned int FrameNumbering[NB_OF_DPMR_VOICE_FRAME_TO_DECODE];
     unsigned int CommunicationMode[NB_OF_DPMR_VOICE_FRAME_TO_DECODE];
     unsigned int Version[NB_OF_DPMR_VOICE_FRAME_TO_DECODE];
+    /* Per half (dpmr_resolve_half_scrambling(), issue #655): DPMR_HALF_CLEAR, DPMR_HALF_SCRAMBLED (Version 3), by the
+       half's own Version when its CRC-7 passed, else by the transmission's last verified half or this frame's other
+       one; DPMR_HALF_UNVERIFIED when no half has verified since the transmission's boundary: the bridge plays none of
+       it. Version itself is the raw field. */
+    unsigned int Scrambled[NB_OF_DPMR_VOICE_FRAME_TO_DECODE];
     unsigned int CommsFormat[NB_OF_DPMR_VOICE_FRAME_TO_DECODE];
     unsigned int EmergencyPriority[NB_OF_DPMR_VOICE_FRAME_TO_DECODE];
     unsigned int Reserved[NB_OF_DPMR_VOICE_FRAME_TO_DECODE];
@@ -436,6 +460,8 @@ typedef enum {
     DSD_SCAN_STAY_MANUAL_HOLD = 7,    /**< operator hold (Y): the dwell is paused, not expired */
     DSD_SCAN_STAY_IDLE_DWELL = 8,     /**< nothing holds it; the idle dwell / qualify window runs */
     DSD_SCAN_STAY_HANGTIME = 9,       /**< -Y legacy rule: waiting out -t since the last sync */
+    DSD_SCAN_STAY_CARRIER = 10,       /**< analog row: its carrier is open (issue #526) */
+    DSD_SCAN_STAY_TONE_PENDING = 11,  /**< analog row: carrier open, the tone policy still checking (issue #527) */
 } dsd_scan_stay_reason;
 
 /** Live scan timing for the frontends' Scan Timing row (issue #508). Plain inline
@@ -458,8 +484,8 @@ struct dsd_scan_timing_publication {
     uint8_t conventional; /**< 1 = conventional / -Y row, so hold_ms means something */
 };
 
-/** Which sub-audible signalling the analog receiver has identified (issue #522). DCS is
- * reserved for #523; this build publishes NONE or CTCSS. */
+/** Which sub-audible signalling the analog receiver has identified: a CTCSS tone (issue #522)
+ * or a DCS code (issue #523). */
 typedef enum {
     DSD_ANALOG_TONE_KIND_NONE = 0,
     DSD_ANALOG_TONE_KIND_CTCSS = 1,
@@ -485,8 +511,12 @@ typedef enum {
     DSD_ANALOG_TONE_STATE_UNAVAILABLE = 5,
 } dsd_analog_tone_state;
 
-/** Receive-policy verdict on the received tone. Reserved for #527: detection never gates
- * audio, so this build always publishes OFF. */
+/** The configured tone policy's verdict on the reception (issue #527; src/dsp/analog_tone_policy.c).
+ * OFF: no policy is in force (none configured, or detection is not running: the AM monitor, a digital mode), and
+ * the ordinary carrier squelch alone decides. PENDING: a list policy is in force and nothing is decided yet --
+ * no carrier, or a carrier inside its acquisition window. ALLOWED / REJECTED: decided, and re-evaluated for as long
+ * as the transmission lasts. The monitor plays only OFF and ALLOWED, and only they are scan activity: a PENDING
+ * carrier holds a scan row only while it lasts, leaving no tail, and a REJECTED one holds none. */
 typedef enum {
     DSD_ANALOG_TONE_GATE_OFF = 0,
     DSD_ANALOG_TONE_GATE_PENDING = 1,
@@ -503,19 +533,41 @@ struct dsd_analog_rx_publication {
     /** 1 while a carrier is open, held through the 200 ms hangover. On stdin, UDP and TCP input
      * and on a live radio stream the tap cannot clear it while no samples arrive, so a reader of
      * carrier_open or tone_state must also honour stale_after_ms, as dsd_app_rx_tone_view()
-     * does. */
+     * does. Kept on the AM monitor too, where no detection runs and tone_state stays INACTIVE
+     * (issue #524). */
     int carrier_open;
     int tone_kind;       /**< dsd_analog_tone_kind; NONE unless tone_state is LOCKED */
     int tone_state;      /**< dsd_analog_tone_state */
     int ctcss_tenths_hz; /**< locked CTCSS tone in tenths of a hertz (1000 = 100.0 Hz); 0 = none */
-    int dcs_code;        /**< DCS code as its octal value (023 octal = 19); reserved for #523 */
-    int dcs_inverted;    /**< 1 = inverted DCS polarity; reserved for #523 */
-    int gate;            /**< dsd_analog_tone_gate; always OFF until #527 */
+    /** 1 while the locked CTCSS tone was confirmed only by allowing for transmitter tone error, off its table value by
+        more than the detector's 0.5 Hz on-value gate (issue #643; 150.6 Hz read as 150.0). The tone policy may pass the
+        reception on it at once, but rejects on it only when its window ends. 0 otherwise. */
+    int ctcss_off_value;
+    int dcs_code;     /**< locked DCS code as its value (023 octal = 19); 0 = none */
+    int dcs_inverted; /**< 1 = the locked code is named in inverted polarity (the canonical member
+                              of its alias class, runtime/analog_tones.h: never, for the standard set) */
+    /** 1 while, with a carrier and nothing locked -- or only an off-value CTCSS tone (ctcss_off_value) -- the DCS
+        detector holds a candidate code it has not confirmed: some slicer read a supported code's word once (issue
+        #527). The tone policy waits past its window for it. Not tone_state's ACQUIRING, which turns NONE 500 ms into a
+        carrier with nothing locked. */
+    int dcs_candidate;
+    int gate; /**< dsd_analog_tone_gate: the configured tone policy's verdict (issue #527) */
+    /** 1 when gate was decided because no tone or code was confirmed within the acquisition window (an allow list's
+        "no tone" rejection, a block list's "no tone" pass); 0 when a confirmed value decided it, or nothing is
+        decided. */
+    int gate_no_tone;
+    /** 1 once a reception the policy rejected has ended -- its carrier's 200 ms hangover ran out, or its input paused,
+        with gate REJECTED -- until the next carrier opens, the policy changes or the tap resets for any other reason
+        (a retune, a row or target change, an input switch, a mode change). gate is back to PENDING by then; this keeps
+        the rejection for the scanners (issue #527), so that traffic rejected between two of their passes does not hold
+        the row on a window still running from before it (-t since the row landed or since traffic the policy passed, a
+        trunk-scan activity hold). */
+    int gate_rejected_ended;
     /** Bumped on every reset (retune, row or target change, input switch, mode change, stop,
      * input-rate change, carrier hangover, stream pause), so a reader can tell a new reception
      * from the one it last saw. */
     uint32_t generation;
-    /** Monotonic ms (dsd_time_monotonic_ms()) after which this publication no longer describes
+    /** Real monotonic ms (dsd_realtime_mono_ms()) after which this publication no longer describes
      * the channel if the tap has not run again since. Set only on input that may pause: stdin,
      * UDP and TCP, whose producer may stop sending between transmissions, and live RTL-family
      * radio streams, which stop when their source does (an rtl_tcp server that went away, a
@@ -586,6 +638,12 @@ struct dsd_state {
     unsigned long long int p2_wacn;
     unsigned long long int p2_sysid;
     unsigned long long int p2_cc; //p1 NAC
+    /* 1 once p2_cc is proven on the carrier being decoded: a burst descrambled with it (a scrambled FACCH or SACCH, or an
+     * ESS) passed its Reed-Solomon check, or a CRC-checked network status broadcast named it. Only then is p2_cc a
+     * Phase 2 call's received NAC (issue #575): a call carried by unscrambled FACCH/SACCH never tests the seed, which
+     * -X or another carrier may have left. 0 at every carrier boundary and whenever p2_cc changes; p2_cc itself, the
+     * descrambling key, is never reset for it. */
+    uint8_t p2_cc_verified;
     unsigned long long int p2_siteid;
     unsigned long long int p2_rfssid;
     long int p25_cc_freq;        // P25 control-channel frequency from network status
@@ -613,9 +671,10 @@ struct dsd_state {
     time_t slco_sfrag_last[2];
     //event history itemized per slot
     Event_History_I* event_history_s;
-    // Decoder-thread-only scoped failure context; dispatch must save and restore each slot.
+    // Decoder-thread-only scoped DSD_CRC_* provenance bits (crc_provenance.h) for the content being decoded;
+    // dispatch ORs its bits in and must save and restore each slot.
     uint8_t event_crc_invalid[2];
-    // DMR header-chain failure retained until the protocol resets the assembly.
+    // DMR header-chain DSD_CRC_* bits (failed, or RAS-accepted), retained until the protocol resets the assembly.
     uint8_t data_header_crc_invalid[2];
     // Codec2 contexts (NULL when codec2 unavailable; unconditional for ABI stability)
     struct CODEC2* codec2_3200; // M17 fullrate
@@ -638,6 +697,11 @@ struct dsd_state {
     uint8_t dmr_data_target_is_group[2];
     // P25 trunking freq storage
     long int p25_vc_freq[2];
+    /* With trunking off, the voice channel frequency a grant update named for the target of a call active on this
+       carrier, kept per slot with that target (issue #575): a call takes it only when it has that target, never another
+       call's (p25_conventional_grant_frequency()). */
+    long int p25_conventional_grant_freq[2];
+    uint32_t p25_conventional_grant_target[2];
     long int trunk_vc_freq[2]; // generic trunk-owner voice-channel frequencies
     // Trunking LCNs and maps
     long int trunk_lcn_freq[DSD_TRUNK_LCN_EMBEDDED];
@@ -714,14 +778,32 @@ struct dsd_state {
     float analog_out_f[960]; // float buffer for analog monitor path
     short analog_out[960];   // int16 buffer for analog monitor output
     int analog_sample_counter;
-    //new stereo float sample storage
-    float f_l[160];     //single sample left
-    float f_r[160];     //single sample right
-    float f_l4[4][160]; //quad sample for up to a P25p2 4V
-    float f_r4[4][160]; //quad sample for up to a P25p2 4V
+    /* The auto squelch's gate flag for each sample of analog_out_f (DSD_SQUELCH_FLAG_CLOSED, 0 open), as the RTL stream
+       read it with the sample, and the monitor sink's gain, which ramps between closed and open samples. */
+    uint8_t analog_out_flags[960];
+    float analog_sink_gain;
+    /* The rate the analog block being collected runs at, and what it started under: the PCM input rate and stream
+       generations and, on RTL input, the stream generation of its samples (issue #633). A sample collected at another
+       rate marks the block mixed: it neither plays nor goes to the -6 WAV. */
+    int analog_block_rate_hz;
+    uint32_t analog_block_rate_gen;
+    uint32_t analog_block_pcm_gen;
+    uint32_t analog_block_rtl_gen;
+    uint8_t analog_block_mixed;
+    /* The rate the analog sinks last said they had no memory to convert, so that is said once per rate. */
+    int analog_sink_nomem_hz;
     //new stereo short sample storage
-    short s_l[160];      //single sample left
-    short s_r[160];      //single sample right
+    short s_l[160]; //single sample left
+    short s_r[160]; //single sample right
+    /* Per slot: 1 when the vocoder left the current frame's short samples out of s_l/s_r (it staged silence, or
+       skipped short staging), 0 when dsd_voice_stage_short_left/right() staged them there. The P25 Phase 2 playout
+       reads it to tell decoded audio from silence (issue #651). */
+    uint8_t mbe_short_silenced[2];
+    /* Per slot: the vocoder's verdict on the slot's last voice frame (issue #655), 1 when it is muted: by encryption
+       (judged by the protocol that owns the call, after the frame's keystream), the user's encrypted-audio mute,
+       reverse mute (-q), or DMR mono not playing the slot. Short staging, the per-call WAV, MBE capture and the DMR
+       mixes all read it, so they agree; see dsd_voice_crypto_audible() in <dsd-neo/core/audio.h>. */
+    uint8_t mbe_slot_muted[2];
     short s_l4[18][160]; //quad sample for up to a P25p2 4V
     short s_r4[18][160]; //quad sample for up to a P25p2 4V
     //new stereo short sample storage tapped from 48_k internal upsampling
@@ -762,12 +844,17 @@ struct dsd_state {
      * 5.2 days at 4800 symbols/s, which is undefined behaviour and aborts a UBSan build
      * (#395). Readers must treat it as wrapping -- compare differences, never magnitudes. */
     uint32_t symbolcnt;
+    uint32_t
+        datascope_symbolcnt_mark; /* symbolcnt at the datascope's last refresh: the refresh never resets symbolcnt */
     int symbolc;
     uint8_t symbol_replay_format;         /* DSD_SYMBOL_REPLAY_FORMAT_* */
     uint8_t symbol_replay_header_checked; /* header probe already done for current symbol file */
     uint8_t symbol_replay_has_soft;       /* current replay record supplied soft metrics */
     dsd_dibit_soft_t symbol_replay_soft;
     float symbol_replay_soft_symbol;
+    /* The symbol the replay reader (soft capture or float symbol file) just gave had no usable stored amplitude
+       (NaN, infinite, out of range, or past the end) and stands in as 0: an erasure, whatever the thresholds. */
+    uint8_t symbol_replay_symbol_unusable;
     unsigned int symbol_replay_soft_records;
     unsigned int symbol_capture_soft_records;
 
@@ -782,6 +869,16 @@ struct dsd_state {
     int rtl_symbol_cache_levels;
     uint32_t rtl_symbol_cache_generation;
     int rtl_symbol_cache_published_pending;
+    /* The I/Q replay batch the cached samples come from: the capture time it spans, its sample count, and the batch
+       index of rtl_symbol_cache[0]. Each sample the cache hands out runs the decode clock's media time to its own
+       capture time (issue #572); a count of 0, as after a live read, runs nothing. */
+    uint64_t rtl_symbol_cache_media_start_ns;
+    uint64_t rtl_symbol_cache_media_duration_ns;
+    uint32_t rtl_symbol_cache_media_count;
+    uint32_t rtl_symbol_cache_media_first_index;
+    /* The centre in Hz that batch was captured on, which each sample the cache hands out publishes as
+       dsd_opts::iq_replay_center_freq (issue #575); 0, as after a live read, publishes nothing. */
+    uint32_t rtl_symbol_cache_center_hz;
     int rtl_fsk_sps_num;
     int rtl_fsk_sps_den;
     int rtl_fsk_sps_accum;
@@ -990,6 +1087,11 @@ struct dsd_state {
     unsigned int dmr_color_code;
     unsigned int dmr_t3_syscode;
     unsigned int nxdn_last_ran;
+    /* 1 while nxdn_last_ran holds a value that is not a decoded RAN, which the terminal shows in its place: an IDAS
+     * (Type-D) carrier's SCCH area bit or site type, or the fixed 7 a DCR transmission is given. 0 once a RAN field
+     * (CAC, FACCH2/UDCH, SACCH, site information) writes it. Every write of a value sets it (the (unsigned)-1 resets
+     * need not), and only a RAN is read as the carrier's access code (issue #575). */
+    uint8_t nxdn_last_ran_stand_in;
     unsigned int nxdn_cipher_type;
     unsigned int nxdn_key;
 
@@ -1047,8 +1149,9 @@ struct dsd_state {
     /* Live slot crypto captured by the DMR terminator handler just before its reset, so the
      * heal of a voice burst mis-typed as a terminator can restore exactly what the vocoder was
      * decrypting with. Deliberately limited to what the canonical dsd_call_snapshot cannot
-     * supply -- the FID and service options the Basic Privacy gates require, and the MI as the
-     * superframe machinery last advanced it (the snapshot's MI can lag it); ALGID and key id
+     * supply -- the FID and service options the Basic Privacy gates require, the MI as the
+     * superframe machinery last advanced it (the snapshot's MI can lag it), and the vendor
+     * late-entry mode (dmr_le_vendor); ALGID and key id
      * are read back from the snapshot the reacquire hook receives, so they have one source of
      * truth. Indexed by slot; epoch ties each capture to the ended epoch it belongs to, so a
      * stale stash can never be applied to a later call, and the engine's retune/no-carrier
@@ -1058,6 +1161,7 @@ struct dsd_state {
     unsigned long long int dmr_heal_epoch[2];
     unsigned int dmr_heal_fid[2];
     unsigned int dmr_heal_so[2];
+    uint8_t dmr_heal_le_vendor[2];
     uint8_t dmr_heal_valid[2];
 
     /* Per-slot DMR encryption-classification hysteresis (src/protocol/dmr/dmr_enc_class.c).
@@ -1070,6 +1174,11 @@ struct dsd_state {
     uint8_t dmr_enc_class[2];         /* applied classification: 0 none, 1 clear, 2 encrypted */
     uint8_t dmr_enc_class_est[2];     /* classification corroborated (strong LC or matching repeat) */
     uint8_t dmr_enc_class_pending[2]; /* quarantined contradicting candidate (0 none, 1 clear, 2 enc) */
+
+    /* Per-slot, per-call DMR vendor late-entry mode (DMR_LE_VENDOR_* in <dsd-neo/protocol/dmr/dmr.h>, 0 none), set
+     * from verified Kirisun/Hytera Enhanced signalling. The user's late-entry setting stays in opts->dmr_le, which
+     * decoding never writes (issue #657). */
+    uint8_t dmr_le_vendor[2];
 
     char slot1light[8];
     char slot2light[8];
@@ -1097,7 +1206,9 @@ struct dsd_state {
         [2][24 * 128]; //unified pdu 'superframe' //[slot][byte] -- increased capacity to 127(+1) full rate blocks
     uint8_t cap_plus_csbk_bits[2][12 * 8 * 8]; //CSBK Cap+ FL initial and appended block bit storage, by slot
     uint8_t cap_plus_block_num[2];             //received block number storage -- per timeslot
-    uint8_t data_block_crc_valid[2][127];      //flag each individual block as good crc on confirmed data
+    // Per-block CRC verdict on confirmed data: 1 good, 0 failed, DMR_DATA_BLOCK_CRC_RAS (2) a confirmed block whose
+    // CRC9 failed but the RAS heuristic accepted under -F. Block 0 is the header and only ever holds 0 or 1.
+    uint8_t data_block_crc_valid[2][127];
     // Confirmed data sequence tracking (DBSN expected per slot)
     uint8_t data_dbsn_expected[2];
     uint8_t data_dbsn_have[2];
@@ -1135,6 +1246,9 @@ struct dsd_state {
     uint8_t dpmr_confirmed;
     uint8_t dpmr_confirm_weak_streak;
     uint8_t dpmr_confirm_frame_evidence;
+    /* The scrambling the current dPMR transmission's last CRC-verified CCH half signalled (issue #655): 0 none yet,
+       1 clear, 2 scrambled (Version 3). A half whose CRC-7 failed takes it; a transmission boundary forgets it. */
+    uint8_t dpmr_scrambled;
 
     /* How recently a dPMR CCH CRC-7 passed, for the SPS hunt's profile accounting
      * (src/engine/dispatch/dispatch_dpmr.c). The flag, not the stamp, opens the window,
@@ -1145,12 +1259,10 @@ struct dsd_state {
     //new audio filter structs
     LPFilter RCFilter;
     HPFilter HRCFilter;
-    PBFilter PBF;
-    NOTCHFilter NF;
     LPFilter RCFilterL;
-    HPFilter HRCFilterL;
     LPFilter RCFilterR;
-    HPFilter HRCFilterR;
+    /* The digital voice high-pass per slot (0 left, 1 right); see dsd_voice_hpf_state. */
+    dsd_voice_hpf_state voice_hpf[2];
 
     int dpmr_color_code;
 
@@ -1180,6 +1292,8 @@ struct dsd_state {
     uint8_t nxdn_new_iv; //1 when a new IV comes in, else 0
     uint16_t nxdn_pn95_seed;
 
+    /* NXDN's (and P25 Phase 1's) own "encrypted and no key" flag for slot 0, kept for NXDN's lockout. The audio,
+       recording and capture verdict is mbe_slot_muted (issue #655); the vocoder no longer writes these. */
     short int dmr_encL;
     short int dmr_encR;
 
@@ -1190,8 +1304,10 @@ struct dsd_state {
     int ess_b[2][96];       //external storage for ESS_B fragments
     int16_t ess_b_llr[2][96];
     int fourv_counter[2]; //external reference counter for ESS_B fragment collection
-    int voice_counter[2]; //external reference counter for 18V x 2 P25p2 Superframe
-    int p2_is_lcch;       //flag to tell us when a frame is lcch and not sacch
+    /* The slot's ESS_B is the carrier left's (issue #575): set by p25p2_frame_forget_carrier(), cleared when the slot's
+       next 4V burst collects a fragment. A 2V burst decodes no ESS while it is set. */
+    uint8_t p25_p2_ess_b_stale[2];
+    int p2_is_lcch; //flag to tell us when a frame is lcch and not sacch
     // Authoritative P25 voice crypto classification. Slot 0 is also used by P25 Phase 1.
     dsd_p25_crypto_state p25_crypto_state[2];
     // Retained Phase 1 carrier requires the next transmission's LCW identity before media or lockout.
@@ -1212,12 +1328,9 @@ struct dsd_state {
     dsd_p25_p2_rekey_state p25_p2_rekey[2];
     // P25p2 per-slot audio gating (set on MAC_PTT/ACTIVE, cleared on MAC_END/IDLE/SIGNAL)
     int p25_p2_audio_allowed[2];
-    // P25p2 small output jitter buffers (per-slot ring of decoded 20 ms frames)
-    // Depth DSD_P25_P2_AUDIO_RING_DEPTH to match drain behavior (~80 ms max at depth=4)
-    float p25_p2_audio_ring[2][DSD_P25_P2_AUDIO_RING_DEPTH][160];
-    int p25_p2_audio_ring_head[2]; // pop index
-    int p25_p2_audio_ring_tail[2]; // push index
-    int p25_p2_audio_ring_count[2];
+    /* P25 Phase 2 voice playout: per-slot queues played per burst pair in both output formats (issue #651).
+       Decoder-thread private; ui_snapshot skips it. */
+    dsd_p25p2_playout p25p2_playout;
     // P25p2 currently active voice slot (0 or 1), -1 when unknown/idle
     int p25_p2_active_slot;
     // P25p2 recent MAC_ACTIVE/PTT timestamps per slot (guards early bounce)
@@ -1533,6 +1646,31 @@ struct dsd_state {
     int use_throttle;                        //only use throttle if set to 1
     uint64_t symbol_replay_next_deadline_ns; //0 when uninitialized
 
+    /* Input switches on the decoder thread (issue #634).
+       input_interrupted: a frame-sync hunt read gave way to a queued command once its input had been silent for a
+       stream pause; getFrameSync() returns at once and the engine loop applies the command.
+       input_boundary: the stream the decoder read was replaced (a switch, a rollback that restarted it, a loss, a
+       fallback); the engine ends the reception (noCarrier() and an explicit end of every call) before it decodes the
+       new stream.
+       input_fallback_pending: the file or TCP input ended; the frame being decoded reads zeros until it ends, and the
+       engine loop then switches to the Pulse input, unless a command replaced the ended input meanwhile. */
+    int input_interrupted;
+    int input_boundary;
+    /* The carrier boundary's count (issue #575): dsd_engine_carrier_boundary() bumps it whenever the receiver leaves a
+       carrier. A decoder that buffers several bursts or frames before it decodes them notes it when collection starts,
+       and drops what it buffered, as on a sync loss, when it moved meanwhile: those bursts belong to the carrier left. */
+    uint32_t carrier_seq;
+    /* The frame processFrame() is dispatching (issue #661): its synctype, which a decoder borrowing another protocol's
+       vocoder (YSF, scrambled dPMR) leaves alone while it changes synctype, and carrier_seq when dispatch began.
+       frame_dispatch_active is 0 outside a dispatch. MBE capture attributes a frame to this protocol, and refuses one
+       read across a carrier boundary. */
+    int frame_dispatch_active;
+    int frame_dispatch_synctype;
+    uint32_t frame_dispatch_carrier_seq;
+    /* The radio source the stream last started on, as dsd_engine_note_stream_source() keys it; 0 before any start. */
+    uint64_t carrier_source_key;
+    int input_fallback_pending;
+
     //dmr trunking stuff
     int dmr_rest_channel;
     int dmr_mfid;     //just when 'fid' is used as a manufacturer ID and not a feature set id
@@ -1790,6 +1928,7 @@ struct dsd_state {
 
     // Advisory-only input level health for ncurses/status snapshots.
     dsd_input_level_snapshot input_level;
+    // Decode time of the last input-level warning, which its cooldown runs against (dsd_input_level_publish()).
     time_t input_level_last_toast_time;
     dsd_input_level_status input_level_last_toast_status;
     dsd_input_level_source input_level_last_toast_source;
@@ -1810,6 +1949,25 @@ struct dsd_state {
     uint8_t trunk_scan_hold;           /**< 1 = --trunk-scan dwell paused on the active target */
     uint8_t trunk_scan_active_avoided; /**< 1 = the parked target is itself avoided (fallback) */
     uint16_t trunk_scan_avoided_count; /**< Avoided --trunk-scan targets */
+    /* The tuner gain a --trunk-scan target without its own rtl_gain runs, which the gain controls edit and a save
+     * writes, and whether the parked target's own rtl_gain overrides it; written by the coordinator beside the trio
+     * above. Valid while trunk_scan_target_count > 0. */
+    int16_t trunk_scan_configured_gain;     /**< dB in driver units; 0 = AGC */
+    uint8_t trunk_scan_gain_override;       /**< 1 = the parked target runs its own rtl_gain */
+    uint8_t trunk_scan_configured_autogain; /**< 1 = the configured tuner autogain is on */
+    /* The scan row on air, for the "this channel" editors (issue #518): the scanner that owns it (dsd_scan_row_scanner,
+     * 0 = none), the scan session (a new one for every trunk-scan coordinator and -Y scan, so an edit opened on one never
+     * lands on the next), the row (a --trunk-scan target's index, a -Y channel map row), the session-edit fields
+     * (DSD_SCAN_ROW_FIELD_*, runtime/scan_row_edit.h) it can take, those it runs a session edit of, and those its list
+     * row sets itself. Written by the trunk-scan coordinator and the -Y channel scan beside the fields above. */
+    uint32_t scan_row_session;
+    int32_t scan_row_index;
+    uint8_t scan_row_scanner;
+    uint8_t scan_row_editable;
+    uint8_t scan_row_edited;
+    uint8_t scan_row_listed;
+    /* The number dsd_opts::scan_row_scope_seq took when the row's options were installed (dsd_scan_mode_options()). */
+    uint32_t scan_row_scope_seq;
     /* Voice-gated scan (issue #381): per-visit gate memory for -Y. Arrive/sync/voice
      * anchors are monotonic seconds (-1 = unset this visit); roll_seen restarts the
      * visit on external lcn_freq_roll changes; hold_seen is lcn_scan_hold as of the
@@ -1840,6 +1998,27 @@ struct dsd_state {
     /* Received sub-audible tone (issue #522), published by the analog tap for every frontend.
      * Rides the vertex_ks_count..ui_msg range; see dsd_analog_rx_publication. */
     dsd_analog_rx_publication analog_rx;
+    /* The dynamic squelch (issue #518 follow-up) as the RTL stream last showed it, for every frontend
+     * (dsd_squelch_publish_status()): whether one runs (an AUTO or NOISE setting on the analog monitor), whether that is
+     * the noise squelch (0: the floor tracker, under AUTO or as NOISE's stand-in), the tracker's floor's state
+     * (dsd_squelch_floor_state), whether the gate is open, whether the channel plan could be designed (0: the gate
+     * stays open), the floor in hundredths of a dB on rtl_squelch_level's scale (0 while learning), whether the noise
+     * squelch has measured a window yet, and its quieting in hundredths of a dB. On audio input the PCM noise squelch
+     * (issue #628) writes them itself on the decoder thread, with what it knows (dsd_squelch_noise_state; 0 on radio
+     * input). Rides the vertex_ks_count..ui_msg range. */
+    uint8_t squelch_auto_active;
+    uint8_t squelch_auto_state;
+    uint8_t squelch_auto_gate_open;
+    uint8_t squelch_auto_plan_valid;
+    int32_t squelch_auto_floor_cdb;
+    uint8_t squelch_noise_active;
+    uint8_t squelch_noise_measured;
+    int32_t squelch_noise_quieting_cdb;
+    uint8_t squelch_noise_state;
+    /* 1 while EDACS plays an analog voice call (edacs_analog(), issue #625), which ends on the dynamic squelch's gate:
+       the readout shows the tracker during a call and what it is for between calls. Written on the decoder thread;
+       rides the vertex_ks_count..ui_msg range. */
+    uint8_t squelch_edacs_call;
 
     // Transient UI message (shown briefly in ncurses printer)
     char ui_msg[128];
@@ -2752,6 +2931,10 @@ struct dsd_state {
     uint8_t  tetra_sndcp_nsapi;
     uint8_t  tetra_sndcp_pdu_type;
     uint16_t tetra_sndcp_nbits;
+    /* 1 from initState() until an engine run starts on this state, which clears it (dsd_engine_run_with_lifecycle()).
+     * A state an earlier run used keeps that run's decode-domain stamps, which no rebase reaches, so a run moves the
+     * decode clock onto an I/Q replay's capture clock only on a fresh one (dsd_engine_decode_clock_enter_replay()). */
+    uint8_t engine_fresh;
 };
 
 // cppcheck-suppress-end uninitMemberVarNoCtor

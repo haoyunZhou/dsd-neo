@@ -9,15 +9,16 @@
  */
 
 #include <dsd-neo/core/call_state.h>
-#include <dsd-neo/core/dsd_time.h>
 #include <dsd-neo/core/events.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/state.h>
 #include <dsd-neo/core/synctype_ids.h>
 #include <dsd-neo/core/talkgroup_policy.h>
+#include <dsd-neo/protocol/p25/p25_crc.h>
 #include <dsd-neo/protocol/p25/p25_crypto.h>
 #include <dsd-neo/protocol/p25/p25_trunk_sm.h>
 #include <dsd-neo/protocol/p25/p25_xcch.h>
+#include <dsd-neo/runtime/decode_clock.h>
 #include <dsd-neo/runtime/trunk_scan_hooks.h>
 #include <dsd-neo/runtime/trunk_tuning_hooks.h>
 #include <math.h>
@@ -30,6 +31,7 @@
 #include "dsd-neo/core/safe_api.h"
 #include "dsd-neo/core/state_ext.h"
 #include "dsd-neo/core/state_fwd.h"
+#include "test_support.h"
 
 static dsd_opts g_opts;
 static dsd_state g_state;
@@ -120,7 +122,7 @@ canonical_call_set_service(uint8_t slot, uint16_t service_options) {
         .emergency = (uint8_t)((service_options & 0x80U) != 0U),
         .priority = (uint8_t)(service_options & 0x07U),
         .has_service_metadata = 1U,
-        .observed_m = dsd_time_now_monotonic_s(),
+        .observed_m = dsd_decode_now_mono_s(),
     };
     return dsd_call_state_observe(&g_state, &observation, DSD_CALL_BOUNDARY_CONTINUE) >= 0;
 }
@@ -176,7 +178,7 @@ canonical_call_begin_p1(uint64_t target, uint64_t source, uint16_t service_optio
         .emergency = (uint8_t)((service_options & 0x80U) != 0U),
         .priority = (uint8_t)(service_options & 0x07U),
         .has_service_metadata = 1U,
-        .observed_m = dsd_time_now_monotonic_s(),
+        .observed_m = dsd_decode_now_mono_s(),
     };
     return dsd_call_state_observe(&g_state, &observation, DSD_CALL_BOUNDARY_BEGIN) > 0;
 }
@@ -194,7 +196,7 @@ set_hangtime_started(p25_sm_ctx_t* ctx, double started_m) {
 
 static void
 expire_traffic_hang(p25_sm_ctx_t* ctx) {
-    set_hangtime_started(ctx, dsd_time_now_monotonic_s() - ctx->config.hangtime_s - 0.1);
+    set_hangtime_started(ctx, dsd_decode_now_mono_s() - ctx->config.hangtime_s - 0.1);
     p25_sm_tick_ctx(ctx, &g_opts, &g_state);
 }
 
@@ -407,6 +409,35 @@ test_inband_zero_source_preserves_grant_identity(void) {
     return 0;
 }
 
+// A decode instant far from any platform clock reading (1e9 s), so a window that read the platform
+// clock instead of the decode clock could not land on the expected side of its boundary.
+#define P25_TEST_DECODE_T0_NS 1000000000000000000ULL
+
+static void
+decode_clock_at_ms(uint64_t offset_ms) {
+    dsd_decode_clock_test_set_ns(P25_TEST_DECODE_T0_NS + (offset_ms * 1000000ULL));
+}
+
+// Two events sent back to back stamp the system clock at one reading on a coarse clock (a
+// virtualised CI runner), so a test that orders two event stamps runs on the test decode clock and
+// moves it on between those events (issue #619).
+static uint64_t g_decode_step_ms;
+
+static void
+decode_clock_step(void) {
+    g_decode_step_ms += 1U;
+    decode_clock_at_ms(g_decode_step_ms);
+}
+
+static int
+run_on_test_decode_clock(int (*test)(void)) {
+    g_decode_step_ms = 0U;
+    dsd_decode_clock_use_test(P25_TEST_DECODE_T0_NS);
+    const int rc = test();
+    dsd_decode_clock_use_system();
+    return rc;
+}
+
 static int
 test_same_identity_ptt_starts_new_epoch_after_missed_end(void) {
     reset_test_state();
@@ -425,6 +456,7 @@ test_same_identity_ptt_starts_new_epoch_after_missed_end(void) {
     }
 
     const double first_start_m = ctx.slots[0].last_start_m;
+    decode_clock_step();
     ev = p25_sm_ev_ptt_call(0, 1000, 0, 123, 1, P25_SM_SVC_UNKNOWN);
     p25_sm_event(&ctx, &g_opts, &g_state, &ev);
     if (ctx.slots[0].last_start_m <= first_start_m || ctx.slots[0].voice_active
@@ -464,7 +496,7 @@ test_raw_ptt_retransmissions_coalesce_history(void) {
     uint8_t signature[P25_SM_PTT_SIGNATURE_BYTES];
     const uint64_t mi = UINT64_C(0x0102030405060708);
     make_ptt_signature(signature, mi, 0x80, 0x2468, 123, 1000);
-    const double first_m = dsd_time_now_monotonic_s() - 10.0;
+    const double first_m = dsd_decode_now_mono_s() - 10.0;
     p25_sm_event_t ev = raw_ptt_event(0, 1000, 123, signature, first_m, 0);
     p25_sm_event(&ctx, &g_opts, &g_state, &ev);
 
@@ -540,7 +572,7 @@ test_raw_ptt_signature_changes_open_epochs(void) {
 
     uint8_t signature[P25_SM_PTT_SIGNATURE_BYTES];
     make_ptt_signature(signature, UINT64_C(0x0102030405060708), 0x84, 0x1111, 123, 1000);
-    const double first_m = dsd_time_now_monotonic_s() - 10.0;
+    const double first_m = dsd_decode_now_mono_s() - 10.0;
     p25_sm_event_t ev = raw_ptt_event(0, 1000, 123, signature, first_m, 0);
     p25_sm_event(&ctx, &g_opts, &g_state, &ev);
 
@@ -597,7 +629,7 @@ test_raw_ptt_boundary_invalidation(void) {
         start_tdma_fixture(&ctx, 0);
         uint8_t signature[P25_SM_PTT_SIGNATURE_BYTES];
         make_ptt_signature(signature, UINT64_C(0x1112131415161718), 0x80, 0, 123, 1000);
-        const double first_m = dsd_time_now_monotonic_s() - 10.0;
+        const double first_m = dsd_decode_now_mono_s() - 10.0;
         p25_sm_event_t ev = raw_ptt_event(0, 1000, 123, signature, first_m, 0);
         p25_sm_event(&ctx, &g_opts, &g_state, &ev);
 
@@ -633,7 +665,7 @@ test_raw_ptt_boundary_invalidation(void) {
     start_tdma_fixture(&ctx, 0);
     uint8_t signature[P25_SM_PTT_SIGNATURE_BYTES];
     make_ptt_signature(signature, UINT64_C(0x2122232425262728), 0x80, 0, 123, 1000);
-    const double first_m = dsd_time_now_monotonic_s() - 10.0;
+    const double first_m = dsd_decode_now_mono_s() - 10.0;
     p25_sm_event_t ev = raw_ptt_event(0, 1000, 123, signature, first_m, 0);
     p25_sm_event(&ctx, &g_opts, &g_state, &ev);
     p25_sm_release(&ctx, &g_opts, &g_state, "ptt-marker-test");
@@ -701,7 +733,7 @@ test_raw_ptt_markers_are_slot_local(void) {
 
     uint8_t signature[P25_SM_PTT_SIGNATURE_BYTES];
     make_ptt_signature(signature, UINT64_C(0x3132333435363738), 0x80, 0, 123, 1000);
-    const double first_m = dsd_time_now_monotonic_s() - 10.0;
+    const double first_m = dsd_decode_now_mono_s() - 10.0;
     p25_sm_event_t ev = raw_ptt_event(0, 1000, 123, signature, first_m, 0);
     p25_sm_event(&ctx, &g_opts, &g_state, &ev);
     ev = raw_ptt_event(1, 2000, 456, signature, first_m + 0.1, 1);
@@ -750,6 +782,188 @@ conventional_ptt_payload(int payload[180], int facch, int encrypted) {
     for (int i = 0; i < 12; i++) {
         payload[data_bits + i] = (crc[facch][encrypted] >> (11 - i)) & 1;
     }
+}
+
+// The PTT retransmission window (1 s) measures from the observation time the real XCCH MAC_PTT
+// handler stamps from the decode clock. A conventional FACCH MAC_PTT copy 0.9 s after the first is
+// a retransmission of the running call; the next copy, 1.1 s after that one, opens a new epoch.
+static int
+test_conventional_ptt_window_runs_on_the_decode_clock(void) {
+    reset_test_state();
+    g_opts.trunk_enable = 0;
+    g_state.p25_cc_freq = 0;
+    g_state.synctype = g_state.lastsynctype = DSD_SYNC_P25P2_POS;
+    g_state.currentslot = 1; // FACCH carries its own slot: slot 2.
+    dsd_decode_clock_use_test(P25_TEST_DECODE_T0_NS);
+    p25_sm_init_ctx(p25_sm_get_ctx(), &g_opts, &g_state);
+    p25_crypto_reset_slot(&g_state, 1);
+    int payload[180];
+    conventional_ptt_payload(payload, 1, 0);
+
+    int fail = 0;
+    dsd_call_snapshot call = {0};
+    process_FACCH_MAC_PDU(&g_opts, &g_state, payload);
+    if (dsd_call_state_get(&g_state, 1U, &call) <= 0 || call.phase != DSD_CALL_PHASE_ACTIVE) {
+        DSD_FPRINTF(stderr, "FAIL: Conventional FACCH MAC_PTT did not open a call\n");
+        fail = 1;
+    }
+    const uint64_t first_epoch = call.epoch;
+
+    decode_clock_at_ms(900U);
+    process_FACCH_MAC_PDU(&g_opts, &g_state, payload);
+    if (dsd_call_state_get(&g_state, 1U, &call) <= 0 || call.epoch != first_epoch) {
+        DSD_FPRINTF(stderr, "FAIL: MAC_PTT copy 0.9 s after the first was not a retransmission\n");
+        fail = 1;
+    }
+
+    decode_clock_at_ms(2000U);
+    process_FACCH_MAC_PDU(&g_opts, &g_state, payload);
+    if (dsd_call_state_get(&g_state, 1U, &call) <= 0 || call.phase != DSD_CALL_PHASE_ACTIVE
+        || call.epoch == first_epoch) {
+        DSD_FPRINTF(stderr, "FAIL: MAC_PTT copy 1.1 s after the last one did not open a new epoch\n");
+        fail = 1;
+    }
+    dsd_decode_clock_use_system();
+    return fail;
+}
+
+// FACCH MAC_END_PTT (for the current slot) naming @p tg / @p src, with a valid CRC-12.
+static void
+facch_end_payload(int payload[180], int tg, int src) {
+    uint8_t mac[23] = {0};
+    mac[0] = 0x40; // opcode 2: MAC_END_PTT
+    mac[13] = (uint8_t)((src >> 16) & 0xFF);
+    mac[14] = (uint8_t)((src >> 8) & 0xFF);
+    mac[15] = (uint8_t)(src & 0xFF);
+    mac[16] = (uint8_t)((tg >> 8) & 0xFF);
+    mac[17] = (uint8_t)(tg & 0xFF);
+    for (int i = 0; i < 180; i++) {
+        payload[i] = (mac[i / 8] >> (7 - i % 8)) & 1;
+    }
+    for (int crc = 0; crc < 4096; crc++) {
+        for (int i = 0; i < 12; i++) {
+            payload[144 + i] = (crc >> (11 - i)) & 1;
+        }
+        if (crc12_xb_bridge(payload, 144) == 0) {
+            return;
+        }
+    }
+}
+
+// Two matching FACCH MAC_END_PTT copies inside 1 s release a fully inactive TDMA carrier; a copy
+// arriving later is a stale repeat. Both copies go through the real XCCH handler, which stamps
+// each END from the decode clock, and the handler's own line reports the outcome.
+static int
+run_facch_second_end(uint64_t second_end_ms, const char* expect_line, int expect_release) {
+    reset_test_state();
+    g_state.trunk_chan_map[0x1234] = 851500000;
+    g_state.p25_chan_tdma_explicit[1] = 2;
+    g_state.synctype = g_state.lastsynctype = DSD_SYNC_P25P2_POS;
+    g_state.currentslot = 0;
+    dsd_decode_clock_use_test(P25_TEST_DECODE_T0_NS);
+    p25_sm_ctx_t* ctx = p25_sm_get_ctx();
+    p25_sm_init_ctx(ctx, &g_opts, &g_state);
+    p25_sm_event_t ev = p25_sm_ev_group_grant(0x1234, 851500000, 1000, 123, 0);
+    p25_sm_event(ctx, &g_opts, &g_state, &ev);
+    ev = p25_sm_ev_ptt_call(0, 1000, 0, 123, 1, 0);
+    p25_sm_event(ctx, &g_opts, &g_state, &ev);
+    int payload[180];
+    facch_end_payload(payload, 1000, 123);
+
+    char out[8192];
+    dsd_test_capture_stderr cap;
+    if (dsd_test_capture_stderr_begin(&cap, "p25_facch_double_end") != 0) {
+        dsd_decode_clock_use_system();
+        return 1;
+    }
+    decode_clock_at_ms(10U);
+    process_FACCH_MAC_PDU(&g_opts, &g_state, payload);
+    const int tuned_after_first = ctx->state == P25_SM_TUNED && g_return_requests == 0;
+    decode_clock_at_ms(10U + second_end_ms);
+    process_FACCH_MAC_PDU(&g_opts, &g_state, payload);
+    (void)dsd_test_capture_stderr_end(&cap);
+    const int read_ok = dsd_test_capture_stderr_read(&cap, out, sizeof(out)) == 0;
+    dsd_decode_clock_use_system();
+
+    if (!read_ok || !tuned_after_first) {
+        DSD_FPRINTF(stderr, "FAIL: First FACCH END was not applied on a tuned carrier\n");
+        return 1;
+    }
+    const int released = ctx->state == P25_SM_ON_CC && g_return_requests == 1;
+    if (strstr(out, expect_line) == NULL || released != expect_release
+        || (!expect_release && (ctx->state != P25_SM_TUNED || g_return_requests != 0))) {
+        DSD_FPRINTF(stderr, "FAIL: Second FACCH END %llu ms later: want \"%s\" and release=%d, got release=%d\n",
+                    (unsigned long long)second_end_ms, expect_line, expect_release, released);
+        return 1;
+    }
+    return 0;
+}
+
+static int
+test_tdma_facch_double_end_window_runs_on_the_decode_clock(void) {
+    int fail = 0;
+    fail |= run_facch_second_end(500U, "(channel release)", 1);
+    fail |= run_facch_second_end(1500U, "(stale/repeated)", 0);
+    return fail;
+}
+
+// A conventional FACCH call fades (the engine's no-carrier end) and the vocoder's identity-less
+// media mark re-enters the slot. Neither passes an observation time, so the call store stamps both
+// and decides whether the re-entry is the faded call coming back. The MAC_END_PTT that follows
+// prints the identities that decision left on the slot, which must be the decode clock's verdict:
+// the faded call's 0.25 s after the fade, the unnamed re-entry's 2 s after it, however little real
+// time passed in between.
+static int
+run_identityless_reentry_mac_end(uint64_t reentry_gap_ms, const char* expect_line) {
+    reset_test_state();
+    g_opts.trunk_enable = 0;
+    g_state.p25_cc_freq = 0;
+    g_state.synctype = g_state.lastsynctype = DSD_SYNC_P25P2_POS;
+    g_state.currentslot = 1; // FACCH carries its own slot: slot 2.
+    dsd_decode_clock_use_test(P25_TEST_DECODE_T0_NS);
+    p25_sm_init_ctx(p25_sm_get_ctx(), &g_opts, &g_state);
+    p25_crypto_reset_slot(&g_state, 1);
+    int payload[180];
+    conventional_ptt_payload(payload, 1, 0);
+    process_FACCH_MAC_PDU(&g_opts, &g_state, payload);
+
+    decode_clock_at_ms(1000U);
+    (void)dsd_call_state_end_ex(&g_state, 1U, 0.0, DSD_CALL_END_SYNC_LOSS);
+    decode_clock_at_ms(1000U + reentry_gap_ms);
+    const dsd_call_observation reentry = {
+        .protocol = DSD_SYNC_P25P2_POS,
+        .slot = 1U,
+        .kind = DSD_CALL_KIND_VOICE,
+    };
+    (void)dsd_call_state_observe(&g_state, &reentry, DSD_CALL_BOUNDARY_BEGIN);
+
+    facch_end_payload(payload, 1000, 0xFFFFFF);
+    char out[8192];
+    dsd_test_capture_stderr cap;
+    if (dsd_test_capture_stderr_begin(&cap, "p25_reentry_mac_end") != 0) {
+        dsd_decode_clock_use_system();
+        return 1;
+    }
+    decode_clock_at_ms(1000U + reentry_gap_ms + 250U);
+    process_FACCH_MAC_PDU(&g_opts, &g_state, payload);
+    (void)dsd_test_capture_stderr_end(&cap);
+    const int read_ok = dsd_test_capture_stderr_read(&cap, out, sizeof(out)) == 0;
+    dsd_decode_clock_use_system();
+
+    if (!read_ok || strstr(out, expect_line) == NULL) {
+        DSD_FPRINTF(stderr, "FAIL: MAC_END %llu ms after an identity-less re-entry: want \"%s\" in \"%s\"\n",
+                    (unsigned long long)reentry_gap_ms, expect_line, read_ok ? out : "");
+        return 1;
+    }
+    return 0;
+}
+
+static int
+test_identityless_reentry_mac_end_identities_run_on_the_decode_clock(void) {
+    int fail = 0;
+    fail |= run_identityless_reentry_mac_end(250U, "VCH 2 - TG 1000 SRC 123 ");
+    fail |= run_identityless_reentry_mac_end(2000U, "VCH 2 - TG 0 SRC 0 ");
+    return fail;
 }
 
 static int
@@ -839,7 +1053,7 @@ test_conventional_raw_ptt_retransmissions_coalesce(void) {
 
     uint8_t signature[P25_SM_PTT_SIGNATURE_BYTES];
     make_ptt_signature(signature, UINT64_C(0x6162636465666768), 0x80, 0, 123, 1000);
-    const double first_m = dsd_time_now_monotonic_s() - 10.0;
+    const double first_m = dsd_decode_now_mono_s() - 10.0;
     if (!p25_sm_emit_ptt_call_metadata(&g_opts, &g_state, 0, 1000, 0, 123, 1, P25_SM_SVC_UNKNOWN, signature, first_m,
                                        0)) {
         return 1;
@@ -888,7 +1102,7 @@ test_trunked_late_voice_is_rejected_after_encryption_lockout(void) {
 
     uint8_t signature[P25_SM_PTT_SIGNATURE_BYTES];
     const uint64_t mi = UINT64_C(0xE83FF2906EA8F0D1);
-    const double first_m = dsd_time_now_monotonic_s();
+    const double first_m = dsd_decode_now_mono_s();
     make_ptt_signature(signature, mi, 0x84, 0x026C, 618620, 20601);
     if (!p25_sm_emit_ptt_call_metadata(&g_opts, &g_state, 0, 20601, 0, 618620, 1, P25_SM_SVC_UNKNOWN, signature,
                                        first_m, 0)
@@ -1067,7 +1281,7 @@ test_pending_crypto_uses_classification_deadline(void) {
         return 1;
     }
 
-    ctx.slots[0].crypto_attempt_m = dsd_time_now_monotonic_s() - ctx.config.grant_timeout_s - 0.1;
+    ctx.slots[0].crypto_attempt_m = dsd_decode_now_mono_s() - ctx.config.grant_timeout_s - 0.1;
     p25_sm_tick_ctx(&ctx, &g_opts, &g_state);
     if (ctx.state != P25_SM_ON_CC || g_return_requests != 1) {
         DSD_FPRINTF(stderr, "FAIL: Pending crypto did not release on its classification timeout\n");
@@ -1372,7 +1586,7 @@ test_p1_clear_identity_quarantines_conflicting_hdu(void) {
     // presumed-clear call exactly like encrypted-follow mode: the tuple never
     // corroborated against explicit-clear service options, so releasing the
     // channel would drop clear voice over a single unrepeated observation.
-    ctx.slots[0].crypto_attempt_m = dsd_time_now_monotonic_s() - ctx.config.grant_timeout_s - 0.1;
+    ctx.slots[0].crypto_attempt_m = dsd_decode_now_mono_s() - ctx.config.grant_timeout_s - 0.1;
     p25_sm_tick_ctx(&ctx, &g_opts, &g_state);
     if (ctx.state != P25_SM_TUNED || g_return_requests != 0 || encrypted_call_cache_has(3069U, 1)
         || g_state.p25_p1_crypto_conflict.active || g_state.p25_crypto_state[0] != DSD_P25_CRYPTO_CLEAR
@@ -1390,7 +1604,7 @@ test_p1_follow_mode_expires_clear_conflict(void) {
         return 1;
     }
 
-    ctx.slots[0].crypto_attempt_m = dsd_time_now_monotonic_s() - ctx.config.grant_timeout_s - 0.1;
+    ctx.slots[0].crypto_attempt_m = dsd_decode_now_mono_s() - ctx.config.grant_timeout_s - 0.1;
     p25_sm_tick_ctx(&ctx, &g_opts, &g_state);
     if (ctx.state != P25_SM_TUNED || g_return_requests != 0 || !ctx.slots[0].grant_active || !ctx.slots[0].voice_active
         || ctx.slots[0].crypto_attempt_m > 0.0 || g_state.p25_p1_crypto_conflict.active
@@ -1417,7 +1631,7 @@ test_p1_follow_mode_does_not_clear_conflict_after_encrypted_lcw(void) {
         return 1;
     }
 
-    ctx.slots[0].crypto_attempt_m = dsd_time_now_monotonic_s() - ctx.config.grant_timeout_s - 0.1;
+    ctx.slots[0].crypto_attempt_m = dsd_decode_now_mono_s() - ctx.config.grant_timeout_s - 0.1;
     p25_sm_tick_ctx(&ctx, &g_opts, &g_state);
     if (ctx.state != P25_SM_TUNED || g_return_requests != 0 || !ctx.slots[0].grant_active
         || !g_state.p25_p1_crypto_conflict.active || g_state.p25_crypto_state[0] != DSD_P25_CRYPTO_ENCRYPTED_PENDING
@@ -1456,7 +1670,7 @@ test_p1_clear_conflict_restarts_deadline(void) {
         return 1;
     }
 
-    const double stale_deadline_m = dsd_time_now_monotonic_s() - ctx->config.grant_timeout_s - 0.1;
+    const double stale_deadline_m = dsd_decode_now_mono_s() - ctx->config.grant_timeout_s - 0.1;
     ctx->slots[0].crypto_attempt_m = stale_deadline_m;
     if (p25_crypto_resolve(&g_opts, &g_state, DSD_P25_CRYPTO_PHASE1, 0, 0xA0, 0x0064, UINT64_C(0x2122232425262728),
                            3069)
@@ -1554,7 +1768,7 @@ test_p1_follow_mode_preserves_grant_conflict_deadline(void) {
         return 1;
     }
 
-    ctx->slots[0].crypto_attempt_m = dsd_time_now_monotonic_s() - ctx->config.grant_timeout_s - 0.1;
+    ctx->slots[0].crypto_attempt_m = dsd_decode_now_mono_s() - ctx->config.grant_timeout_s - 0.1;
     p25_sm_tick_ctx(ctx, &g_opts, &g_state);
     if (ctx->state != P25_SM_TUNED || !ctx->slots[0].voice_active || !ctx->slots[0].grant_active
         || g_state.p25_p1_crypto_conflict.active || ctx->slots[0].crypto_attempt_m > 0.0
@@ -1585,6 +1799,7 @@ test_p1_pending_identity_restarts_crypto_without_hdu(void) {
         return 1;
     }
 
+    decode_clock_step();
     ev = p25_sm_ev_active(0);
     p25_sm_event(&ctx, &g_opts, &g_state, &ev);
     if (ctx.slots[0].voice_active || !g_state.p25_p1_identity_pending
@@ -1676,7 +1891,7 @@ test_conventional_end_is_follower_noop(void) {
     g_state.p25_cc_freq = 0;
     p25_sm_ctx_t* ctx = p25_sm_get_ctx();
     p25_sm_init_ctx(ctx, &g_opts, &g_state);
-    const double now_m = dsd_time_now_monotonic_s();
+    const double now_m = dsd_decode_now_mono_s();
     dsd_call_snapshot call;
 
     if (!p25_sm_emit_ptt_call(&g_opts, &g_state, 0, 1000, 0, 123, 1, 0) || dsd_call_state_get(&g_state, 0U, &call) <= 0
@@ -1735,7 +1950,7 @@ test_conventional_ota_end_reasons_are_terminator(void) {
     g_state.p25_cc_freq = 0;
     p25_sm_ctx_t* ctx = p25_sm_get_ctx();
     p25_sm_init_ctx(ctx, &g_opts, &g_state);
-    const double now_m = dsd_time_now_monotonic_s();
+    const double now_m = dsd_decode_now_mono_s();
 
     if (!p25_sm_emit_ptt_call(&g_opts, &g_state, 0, 1000, 0, 123, 1, 0)
         || !p25_sm_emit_end_call_at(&g_opts, &g_state, 0, 1000, 123, now_m)
@@ -1768,7 +1983,7 @@ test_conventional_ota_end_reasons_are_terminator(void) {
     if (!p25_sm_emit_ptt_call(&g_opts, &g_state, 0, 4000, 0, 111, 1, 0)) {
         return 1;
     }
-    p25_sm_emit_mac_release(&g_opts, &g_state, 0, dsd_time_now_monotonic_s());
+    p25_sm_emit_mac_release(&g_opts, &g_state, 0, dsd_decode_now_mono_s());
     if (conventional_slot_ended_with_reason(0U, DSD_CALL_END_TERMINATOR, "MAC Release")) {
         return 1;
     }
@@ -1848,6 +2063,55 @@ test_conventional_anonymous_activity_preserves_service_options(void) {
         return 1;
     }
     return 0;
+}
+
+/* Issue #575: the conventional voice message carries no frequency, and with trunking off the receiver follows no
+ * grant. The one frequency that names this call's carrier is what a grant update naming the call's own target wrote
+ * to p25_vc_freq[] (every trunking-off writer of it is target-matched), so the call takes that. A DMR grant decoded
+ * with trunking off leaves trunk_vc_freq[] behind for display; that names another channel, so the call never takes
+ * it. */
+static int
+test_conventional_voice_takes_only_its_own_grant_frequency(void) {
+    int fail = 0;
+    static const char* const cases[3] = {"own grant update", "DMR leftover", "another call's grant update"};
+    for (int which = 0; which < 3; which++) {
+        reset_test_state();
+        g_opts.trunk_enable = 0;
+        g_state.p25_cc_freq = 0;
+        g_state.synctype = g_state.lastsynctype = DSD_SYNC_P25P1_POS;
+        p25_sm_init_ctx(p25_sm_get_ctx(), &g_opts, &g_state);
+        p25_crypto_reset_slot(&g_state, 0);
+        long want = 0;
+        if (which == 0) {
+            /* As a grant update naming this call's target leaves it. */
+            g_state.p25_vc_freq[0] = 851012500L;
+            g_state.p25_conventional_grant_freq[0] = 851012500L;
+            g_state.p25_conventional_grant_target[0] = 1000U;
+            want = 851012500L;
+        } else if (which == 1) {
+            g_state.trunk_vc_freq[0] = g_state.trunk_vc_freq[1] = 852012500L;
+        } else {
+            /* As a grant update naming another call, TG 2000, leaves them: not this call's frequency. */
+            g_state.p25_vc_freq[0] = g_state.p25_vc_freq[1] = 851012500L;
+            g_state.p25_conventional_grant_freq[0] = 851012500L;
+            g_state.p25_conventional_grant_target[0] = 2000U;
+        }
+        dsd_call_snapshot call = {0};
+        if (!p25_sm_emit_active_call(&g_opts, &g_state, 0, 1000, 0, 123, 1, 0)
+            || dsd_call_state_get(&g_state, 0U, &call) <= 0 || call.phase != DSD_CALL_PHASE_ACTIVE
+            || call.frequency_hz != want) {
+            DSD_FPRINTF(stderr, "FAIL: Conventional call frequency %lld, expected %ld (%s)\n",
+                        (long long)call.frequency_hz, want, cases[which]);
+            fail = 1;
+        }
+        if (!p25_sm_emit_active(&g_opts, &g_state, 0) || dsd_call_state_get(&g_state, 0U, &call) <= 0
+            || call.frequency_hz != want) {
+            DSD_FPRINTF(stderr, "FAIL: Anonymous conventional activity frequency %lld, expected %ld (%s)\n",
+                        (long long)call.frequency_hz, want, cases[which]);
+            fail = 1;
+        }
+    }
+    return fail;
 }
 
 static int
@@ -1950,7 +2214,7 @@ test_tdma_boundaries_only_hang_after_last_assigned_voice(void) {
         return 1;
     }
 
-    const double stale_m = dsd_time_now_monotonic_s() - ctx.config.grant_timeout_s - 0.1;
+    const double stale_m = dsd_decode_now_mono_s() - ctx.config.grant_timeout_s - 0.1;
     ctx.t_tune_m = stale_m;
     ctx.slots[0].last_grant_m = stale_m;
     p25_sm_tick_ctx(&ctx, &g_opts, &g_state);
@@ -2003,6 +2267,7 @@ test_tdma_idle_ends_voice_with_newer_grant(void) {
     p25_sm_event(&ctx, &g_opts, &g_state, &ev);
 
     const double idle_observed_m = ctx.slots[0].last_grant_m;
+    decode_clock_step();
     ev = p25_sm_ev_group_grant_update(0x1234, 851500000, 1000, 123, 0);
     p25_sm_event(&ctx, &g_opts, &g_state, &ev);
     const double newer_grant_m = ctx.slots[0].last_grant_m;
@@ -2062,7 +2327,7 @@ test_anonymous_followup_restarts_crypto_pending(void) {
     // retention of the ended call and must not reopen (P25_P2_ACTIVE_PTT_EPOCH
     // covers that); after it, one that fails identity decode is the next
     // transmission and must not inherit the ended call's clear classification.
-    ctx.slots[0].last_end_m = dsd_time_now_monotonic_s() - 1.1;
+    ctx.slots[0].last_end_m = dsd_decode_now_mono_s() - 1.1;
     ev = p25_sm_ev_active(0);
     p25_sm_event(&ctx, &g_opts, &g_state, &ev);
     if (g_state.p25_crypto_state[0] != DSD_P25_CRYPTO_ENCRYPTED_PENDING || ctx.slots[0].svc_bits != P25_SM_SVC_UNKNOWN
@@ -2195,7 +2460,7 @@ test_external_cc_tune_hands_off_assignment(void) {
         return 1;
     }
     ctx.recent_call_ends[0].valid = 0;
-    g_state.p25_last_cc_msg_time_m = dsd_time_now_monotonic_s() + 0.01;
+    g_state.p25_last_cc_msg_time_m = dsd_decode_now_mono_s() + 0.01;
     ev = p25_sm_ev_group_grant(0x1235, 852500000, 2000, 456, 0);
     p25_sm_event(&ctx, &g_opts, &g_state, &ev);
     if (ctx.state != P25_SM_TUNED || ctx.vc_freq_hz != 852500000 || ctx.slots[0].ota_tg != 2000) {
@@ -2264,7 +2529,7 @@ test_external_cc_tune_pending_waits_for_completion(void) {
         return 1;
     }
 
-    g_state.p25_last_cc_msg_time_m = dsd_time_now_monotonic_s() + 0.01;
+    g_state.p25_last_cc_msg_time_m = dsd_decode_now_mono_s() + 0.01;
     ev = p25_sm_ev_group_grant(0x1235, 852500000, 2000, 456, 0);
     p25_sm_event(&ctx, &g_opts, &g_state, &ev);
     dsd_trunk_tuning_requests_reset();
@@ -2464,7 +2729,7 @@ test_tdma_pending_other_slot_blocks_release(void) {
         return 1;
     }
 
-    double acquisition_m = dsd_time_now_monotonic_s() - ctx.config.hangtime_s - 0.1;
+    double acquisition_m = dsd_decode_now_mono_s() - ctx.config.hangtime_s - 0.1;
     ctx.t_tune_m = acquisition_m;
     ctx.slots[1].last_grant_m = acquisition_m;
     p25_sm_tick_ctx(&ctx, &g_opts, &g_state);
@@ -2473,7 +2738,7 @@ test_tdma_pending_other_slot_blocks_release(void) {
         return 1;
     }
 
-    acquisition_m = dsd_time_now_monotonic_s() - ctx.config.grant_timeout_s - 0.1;
+    acquisition_m = dsd_decode_now_mono_s() - ctx.config.grant_timeout_s - 0.1;
     ctx.t_tune_m = acquisition_m;
     ctx.slots[1].last_grant_m = acquisition_m;
     p25_sm_tick_ctx(&ctx, &g_opts, &g_state);
@@ -2500,7 +2765,7 @@ test_tdma_pending_other_slot_blocks_release(void) {
         DSD_FPRINTF(stderr, "FAIL: Expected the ended slot to start the countdown beside the data grant\n");
         return 1;
     }
-    acquisition_m = dsd_time_now_monotonic_s() - ctx.config.hangtime_s - 0.1;
+    acquisition_m = dsd_decode_now_mono_s() - ctx.config.hangtime_s - 0.1;
     ctx.t_tune_m = acquisition_m;
     ctx.slots[1].last_grant_m = acquisition_m;
     p25_sm_tick_ctx(&ctx, &g_opts, &g_state);
@@ -2508,7 +2773,7 @@ test_tdma_pending_other_slot_blocks_release(void) {
         DSD_FPRINTF(stderr, "FAIL: Pending data companion did not survive until its grant deadline\n");
         return 1;
     }
-    acquisition_m = dsd_time_now_monotonic_s() - ctx.config.grant_timeout_s - 0.1;
+    acquisition_m = dsd_decode_now_mono_s() - ctx.config.grant_timeout_s - 0.1;
     ctx.t_tune_m = acquisition_m;
     ctx.slots[1].last_grant_m = acquisition_m;
     p25_sm_tick_ctx(&ctx, &g_opts, &g_state);
@@ -2599,16 +2864,13 @@ test_tdma_single_slot_end_retains_carrier(void) {
     // Simulate what xcch.c does: enable audio on PTT
     g_state.p25_p2_audio_allowed[0] = 1;
 
-    // Simulate audio in the ring buffer (jitter buffer has samples)
-    g_state.p25_p2_audio_ring_count[0] = 5;
-
     // Verify slot 1 never had activity
     if (ctx.slots[1].last_active_m != 0.0) {
         DSD_FPRINTF(stderr, "FAIL: Expected slot 1 last_active_m=0 (never active)\n");
         return 1;
     }
 
-    // END arrives while the decoder gate and jitter ring still contain media.
+    // END arrives while the decoder gate is still open.
     ev = p25_sm_ev_end(0);
     p25_sm_event(&ctx, &g_opts, &g_state, &ev);
 
@@ -2622,11 +2884,6 @@ test_tdma_single_slot_end_retains_carrier(void) {
     // Verify the SM cleared audio_allowed for slot 0
     if (g_state.p25_p2_audio_allowed[0] != 0) {
         DSD_FPRINTF(stderr, "FAIL: Expected audio_allowed[0]=0 after END, got %d\n", g_state.p25_p2_audio_allowed[0]);
-        return 1;
-    }
-
-    if (g_state.p25_p2_audio_ring_count[0] != 0) {
-        DSD_FPRINTF(stderr, "FAIL: Expected slot 0 jitter ring cleanup at END\n");
         return 1;
     }
 
@@ -2743,7 +3000,7 @@ test_tdma_facch_double_end_release(void) {
     ev = p25_sm_ev_ptt_call(0, 1000, 0, 123, 1, 0);
     p25_sm_event(&ctx, &g_opts, &g_state, &ev);
 
-    double first_m = dsd_time_now_monotonic_s() + 0.01;
+    double first_m = dsd_decode_now_mono_s() + 0.01;
     ev = p25_sm_ev_facch_end_call_at(0, 1000, 123, first_m);
     p25_sm_event(&ctx, &g_opts, &g_state, &ev);
     if (ctx.state != P25_SM_TUNED || g_return_requests != 0) {
@@ -2766,7 +3023,7 @@ test_tdma_facch_double_end_release(void) {
     p25_sm_event(&ctx, &g_opts, &g_state, &ev);
     ev = p25_sm_ev_ptt_call(0, 1000, 0, 123, 1, 0);
     p25_sm_event(&ctx, &g_opts, &g_state, &ev);
-    first_m = dsd_time_now_monotonic_s() + 0.01;
+    first_m = dsd_decode_now_mono_s() + 0.01;
     ev = p25_sm_ev_end_call_at(0, 1000, 123, first_m);
     p25_sm_event(&ctx, &g_opts, &g_state, &ev);
     p25_sm_event(&ctx, &g_opts, &g_state, &ev);
@@ -2802,7 +3059,7 @@ test_tdma_facch_double_end_release(void) {
     p25_sm_event(&ctx, &g_opts, &g_state, &ev);
     ev = p25_sm_ev_ptt_call(1, 2000, 0, 456, 1, 0);
     p25_sm_event(&ctx, &g_opts, &g_state, &ev);
-    first_m = dsd_time_now_monotonic_s() + 0.01;
+    first_m = dsd_decode_now_mono_s() + 0.01;
     ev = p25_sm_ev_facch_end_call_at(0, 1000, 123, first_m);
     p25_sm_event(&ctx, &g_opts, &g_state, &ev);
     ev = p25_sm_ev_facch_end_call_at(0, 1000, 123, first_m + 0.5);
@@ -2821,10 +3078,11 @@ test_tdma_facch_double_end_release(void) {
     p25_sm_event(&ctx, &g_opts, &g_state, &ev);
     ev = p25_sm_ev_ptt_call(0, 1000, 0, 123, 1, 0);
     p25_sm_event(&ctx, &g_opts, &g_state, &ev);
-    first_m = dsd_time_now_monotonic_s();
+    first_m = dsd_decode_now_mono_s();
     ev = p25_sm_ev_facch_end_call_at(0, 1000, 123, first_m);
     p25_sm_event(&ctx, &g_opts, &g_state, &ev);
 
+    decode_clock_step();
     ev = p25_sm_ev_group_grant(0x1235, 851500000, 2000, 456, 0);
     p25_sm_event(&ctx, &g_opts, &g_state, &ev);
     if (!ctx.slots[1].grant_active || ctx.slots[1].last_grant_m <= first_m) {
@@ -2850,7 +3108,7 @@ test_tdma_facch_double_end_release(void) {
     p25_sm_event(&ctx, &g_opts, &g_state, &ev);
     ev = p25_sm_ev_ptt_call(0, 1000, 0, 123, 1, 0);
     p25_sm_event(&ctx, &g_opts, &g_state, &ev);
-    first_m = dsd_time_now_monotonic_s() + 0.01;
+    first_m = dsd_decode_now_mono_s() + 0.01;
     ev = p25_sm_ev_facch_end_call_at(0, 1000, 123, first_m);
     p25_sm_event(&ctx, &g_opts, &g_state, &ev);
     ev = p25_sm_ev_facch_end_call_at(0, 1000, 123, first_m + 0.5);
@@ -2883,7 +3141,7 @@ test_tdma_facch_double_end_release_placeholder_src(void) {
     ev = p25_sm_ev_ptt_call(0, 1000, 0, 123, 1, 0);
     p25_sm_event(&ctx, &g_opts, &g_state, &ev);
 
-    const double first_m = dsd_time_now_monotonic_s() + 0.01;
+    const double first_m = dsd_decode_now_mono_s() + 0.01;
     ev = p25_sm_ev_facch_end_call_at(0, 1000, 0xFFFFFF, first_m);
     p25_sm_event(&ctx, &g_opts, &g_state, &ev);
     if (ctx.state != P25_SM_TUNED || g_return_requests != 0) {
@@ -2912,7 +3170,7 @@ test_tdma_facch_double_end_release_placeholder_src(void) {
     p25_sm_event(&ctx, &g_opts, &g_state, &ev);
     ev = p25_sm_ev_ptt_call(0, 1000, 0, 123, 1, 0);
     p25_sm_event(&ctx, &g_opts, &g_state, &ev);
-    const double second_m = dsd_time_now_monotonic_s() + 0.01;
+    const double second_m = dsd_decode_now_mono_s() + 0.01;
     ev = p25_sm_ev_facch_end_call_at(0, 1000, 0xFFFFFF, second_m);
     p25_sm_event(&ctx, &g_opts, &g_state, &ev);
     ev = p25_sm_ev_facch_end_call_at(0, 1000, 456, second_m + 0.5);
@@ -3019,7 +3277,7 @@ test_inband_policy_reject_releases_after_companion_ended(void) {
     p25_sm_event(&ctx, &g_opts, &g_state, &ev);
     ev = p25_sm_ev_ptt_call(1, 2000, 0, 202, 1, 0);
     p25_sm_event(&ctx, &g_opts, &g_state, &ev);
-    ev = p25_sm_ev_end_call_at(1, 2000, 202, dsd_time_now_monotonic_s());
+    ev = p25_sm_ev_end_call_at(1, 2000, 202, dsd_decode_now_mono_s());
     p25_sm_event(&ctx, &g_opts, &g_state, &ev);
     if (ctx.state != P25_SM_TUNED || ctx.slots[1].voice_active || !ctx.slots[1].grant_active
         || p25_sm_hangtime_started_m(&ctx) > 0.0) {
@@ -3143,12 +3401,13 @@ main(void) {
     fail += test_private_ptt_preserves_grant_identity();
     fail += test_authoritative_group_replaces_private_identity();
     fail += test_inband_zero_source_preserves_grant_identity();
-    fail += test_same_identity_ptt_starts_new_epoch_after_missed_end();
+    fail += run_on_test_decode_clock(test_same_identity_ptt_starts_new_epoch_after_missed_end);
     fail += test_raw_ptt_retransmissions_coalesce_history();
     fail += test_raw_ptt_signature_changes_open_epochs();
     fail += test_raw_ptt_boundary_invalidation();
     fail += test_raw_ptt_markers_are_slot_local();
     fail += test_conventional_raw_ptt_retransmissions_coalesce();
+    fail += test_conventional_ptt_window_runs_on_the_decode_clock();
     fail += test_conventional_voice_start_encryption_policy();
     fail += test_trunked_late_voice_is_rejected_after_encryption_lockout();
     fail += test_source_less_identity_change_does_not_inherit_rid();
@@ -3164,7 +3423,7 @@ main(void) {
     fail += test_p1_clear_conflict_restarts_deadline();
     fail += test_p1_grant_hdu_conflict_survives_first_active();
     fail += test_p1_follow_mode_preserves_grant_conflict_deadline();
-    fail += test_p1_pending_identity_restarts_crypto_without_hdu();
+    fail += run_on_test_decode_clock(test_p1_pending_identity_restarts_crypto_without_hdu);
     fail += test_identified_followup_without_service_restarts_crypto_pending();
     fail += test_missed_end_identity_change_without_service_restarts_crypto_pending();
     fail += test_conventional_end_is_follower_noop();
@@ -3172,9 +3431,10 @@ main(void) {
     fail += test_conventional_anonymous_activity_waits_for_identity();
     fail += test_conventional_anonymous_activity_preserves_service_options();
     fail += test_conventional_unknown_service_stays_unconfirmed();
+    fail += test_conventional_voice_takes_only_its_own_grant_frequency();
     fail += test_end_clears_voice();
     fail += test_tdma_boundaries_only_hang_after_last_assigned_voice();
-    fail += test_tdma_idle_ends_voice_with_newer_grant();
+    fail += run_on_test_decode_clock(test_tdma_idle_ends_voice_with_newer_grant);
     fail += test_anonymous_followup_restarts_crypto_pending();
     fail += test_source_less_duplicate_grant_republishes_crypto();
     fail += test_unassigned_companion_start_is_rejected();
@@ -3189,8 +3449,10 @@ main(void) {
     fail += test_tdma_enc_lockout_slot_does_not_block_release();
     fail += test_tdma_single_slot_end_retains_carrier();
     fail += test_tdma_end_identity_and_order_guards();
-    fail += test_tdma_facch_double_end_release();
+    fail += run_on_test_decode_clock(test_tdma_facch_double_end_release);
     fail += test_tdma_facch_double_end_release_placeholder_src();
+    fail += test_tdma_facch_double_end_window_runs_on_the_decode_clock();
+    fail += test_identityless_reentry_mac_end_identities_run_on_the_decode_clock();
     fail += test_inband_target_change_rechecks_policy();
     fail += test_inband_policy_reject_preserves_tdma_companion();
     fail += test_inband_policy_reject_releases_after_companion_ended();

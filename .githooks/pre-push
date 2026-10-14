@@ -36,83 +36,26 @@ fi
 
 zeros="0000000000000000000000000000000000000000"
 
-remote_head_ref=$(git symbolic-ref -q "refs/remotes/${remote_name}/HEAD" 2> /dev/null || true)
-if [[ -z "$remote_head_ref" ]]; then
-  if git show-ref --verify --quiet "refs/remotes/${remote_name}/main"; then
-    remote_head_ref="refs/remotes/${remote_name}/main"
-  elif git show-ref --verify --quiet "refs/remotes/${remote_name}/master"; then
-    remote_head_ref="refs/remotes/${remote_name}/master"
-  fi
-fi
-
-resolve_new_ref_base() {
-  local base=""
-  for base in \
-    "$remote_head_ref" \
-    "refs/remotes/${remote_name}/main" \
-    "refs/remotes/${remote_name}/master"; do
-    if [[ -n "$base" ]] && git show-ref --verify --quiet "$base"; then
-      printf '%s\n' "$base"
-      return 0
-    fi
-  done
-  return 1
-}
-
-remote_tracking_refs=()
-mapfile -t remote_tracking_refs < <(
-  git for-each-ref --format='%(refname)' "refs/remotes/${remote_name}" 2> /dev/null || true
-)
-
-select_best_remote_merge_base() {
-  local local_sha="$1"
-  local ref=""
-  local merge_base=""
-  local distance=""
-  local best_base=""
-  local best_distance=""
-
-  for ref in "${remote_tracking_refs[@]}"; do
-    merge_base=$(git merge-base "$local_sha" "$ref" 2> /dev/null || true)
-    if [[ -z "$merge_base" ]]; then
-      continue
-    fi
-    distance=$(git rev-list --count "${merge_base}..${local_sha}" 2> /dev/null || true)
-    if [[ -z "$distance" ]]; then
-      continue
-    fi
-    if [[ -z "$best_base" || "$distance" -lt "$best_distance" ]]; then
-      best_base="$merge_base"
-      best_distance="$distance"
-    fi
-  done
-
-  if [[ -n "$best_base" ]]; then
-    printf '%s\n' "$best_base"
-    return 0
-  fi
-  return 1
-}
-
-new_ref_diff_files_fallback() {
-  local local_ref="$1"
-  local local_sha="$2"
-  local fallback_base=""
-  local empty_tree=""
-
-  fallback_base=$(select_best_remote_merge_base "$local_sha" || true)
-  if [[ -n "$fallback_base" ]]; then
-    echo "pre-push: using merge-base fallback for ${local_ref} (no remote default branch found)." >&2
-    git diff --name-only --diff-filter=ACMR "${fallback_base}..${local_sha}" || true
-    return 0
-  fi
-
-  empty_tree=$(git hash-object -t tree /dev/null)
-  echo "pre-push: using empty-tree fallback for ${local_ref} (no remote default branch or merge-base found)." >&2
-  git diff --name-only --diff-filter=ACMR "${empty_tree}" "${local_sha}^{tree}" || true
-}
+# tools/push_changed_files.sh lists each pushed ref's changed paths, raw and
+# NUL-separated, and fails rather than report "nothing changed" when it cannot
+# compute them; the list goes through a private temporary file outside the
+# checkout.
+push_paths_file=$(mktemp "${TMPDIR:-/tmp}/dsd-neo-pre-push-paths.XXXXXX")
+trap 'rm -f "$push_paths_file"' EXIT
 
 head_sha=$(git rev-parse -q --verify HEAD 2> /dev/null || true)
+
+# A change to a pinned or vendored dependency runs the per-TU analyzers over the
+# whole tree (see tools/ci_changed_files.sh), a deletion included.
+analysis_full_scan=0
+is_dependency_input() {
+  case "$1" in
+    tools/ci-dependency-pins.env | cmake/Pffft.cmake | src/third_party/* | android/third_party/libusb/* | android/third_party/librtlsdr/* | android/third_party/libairspy/*)
+      return 0
+      ;;
+  esac
+  return 1
+}
 
 changed_paths=()
 head_changed_paths=()
@@ -127,28 +70,48 @@ while read -r local_ref local_sha _remote_ref remote_sha; do
     continue
   fi
 
-  if [[ "$remote_sha" == "$zeros" ]]; then
-    # New branch/ref: compare against remote default branch when possible.
-    base_ref=$(resolve_new_ref_base || true)
-    if [[ -n "$base_ref" ]]; then
-      mapfile -t diff_files < <(git diff --name-only --diff-filter=ACMR "${base_ref}...${local_sha}" || true)
-    else
-      mapfile -t diff_files < <(new_ref_diff_files_fallback "${local_ref}" "${local_sha}")
-    fi
-  else
-    mapfile -t diff_files < <(git diff --name-only --diff-filter=ACMR "${remote_sha}...${local_sha}" || true)
+  if ! tools/push_changed_files.sh "$remote_name" "$local_ref" "$local_sha" "$remote_sha" > "$push_paths_file"; then
+    echo "pre-push: could not list the files ${local_ref} changes; not pushing unchecked." >&2
+    exit 1
   fi
+  mapfile -d '' -t diff_files < "$push_paths_file"
+  # The checks below handle paths one per line, so a name with a newline in it
+  # would split into two paths that do not exist: skipped with a warning for a
+  # ref that is not checked out, or a misleading "local deletions" failure for
+  # the one that is.
+  for p in "${diff_files[@]}"; do
+    if [[ "$p" == *$'\n'* ]]; then
+      printf 'pre-push: %s changes a path with a newline in it, which the checks cannot handle: %q\n' "$local_ref" "$p" >&2
+      exit 1
+    fi
+  done
   changed_paths+=("${diff_files[@]}")
   if [[ -n "$head_sha" && "$local_sha" == "$head_sha" ]]; then
     head_changed_paths+=("${diff_files[@]}")
   fi
-done
 
-if [[ ${#changed_paths[@]} -eq 0 ]]; then
+  # Deletions are listed apart: every other check needs paths that exist.
+  if ! tools/push_changed_files.sh "$remote_name" "$local_ref" "$local_sha" "$remote_sha" D > "$push_paths_file" 2> /dev/null; then
+    echo "pre-push: could not list the files ${local_ref} deletes; not pushing unchecked." >&2
+    exit 1
+  fi
+  mapfile -d '' -t deleted_files < "$push_paths_file"
+  for p in "${deleted_files[@]}"; do
+    if is_dependency_input "$p"; then
+      analysis_full_scan=1
+    fi
+  done
+done
+# The check runner sets its own EXIT trap, so remove the list now.
+rm -f "$push_paths_file"
+
+if [[ ${#changed_paths[@]} -eq 0 && $analysis_full_scan -eq 0 ]]; then
   exit 0
 fi
 
-mapfile -t changed_paths < <(printf '%s\n' "${changed_paths[@]}" | sort -u)
+if [[ ${#changed_paths[@]} -gt 0 ]]; then
+  mapfile -t changed_paths < <(printf '%s\n' "${changed_paths[@]}" | sort -u)
+fi
 if [[ ${#head_changed_paths[@]} -gt 0 ]]; then
   mapfile -t head_changed_paths < <(printf '%s\n' "${head_changed_paths[@]}" | sort -u)
 fi
@@ -171,6 +134,11 @@ dependency_scan_targets=()
 missing_worktree_paths=()
 skipped_missing_paths=()
 for p in "${changed_paths[@]}"; do
+  # Matched before the vendored snapshots are dropped below.
+  if is_dependency_input "$p"; then
+    analysis_full_scan=1
+  fi
+
   # Vendored upstream snapshots are never formatted or analyzed: they are carried
   # as-is so they can be diffed against upstream and re-synced. The build glue
   # around them (android/third_party/CMakeLists.txt) is ours and stays in scope.
@@ -211,7 +179,7 @@ for p in "${changed_paths[@]}"; do
   esac
 
   case "$p" in
-    .github/dependabot.yml | .github/requirements/* | vcpkg.json | vcpkg-configuration.json | vcpkg-ports/* | vcpkg-triplets/* | tools/osv_scan.sh)
+    .github/dependabot.yml | .github/requirements/* | vcpkg.json | vcpkg-configuration.json | vcpkg-ports/* | vcpkg-triplets/* | tools/osv_scan.sh | tools/ci-dependency-pins.env | cmake/Pffft.cmake | tools/update_pffft.py | tools/update_aur_pffft.py | tools/pffft_metadata.py | CMakeLists.txt)
       dependency_scan_targets+=("$p")
       ;;
   esac
@@ -364,12 +332,14 @@ if [[ ${#iwyu_tus[@]} -gt 0 ]]; then
 fi
 
 echo "pre-push: changed paths=${#changed_paths[@]} sources=${#changed_sources[@]}" \
-  "headers=${#changed_headers[@]} tus=${#analysis_tus[@]} iwyu=${#iwyu_tus[@]}"
+  "headers=${#changed_headers[@]} tus=${#analysis_tus[@]} iwyu=${#iwyu_tus[@]}" \
+  "analysis_full=${analysis_full_scan}"
 
+# The same tree tools/cppcheck.sh scans, as in tools/ci_changed_files.sh.
 cppcheck_sources=()
 for p in "${analysis_tus[@]}"; do
   case "$p" in
-    src/*) cppcheck_sources+=("$p") ;;
+    src/* | include/* | android/*) cppcheck_sources+=("$p") ;;
   esac
 done
 if [[ ${#cppcheck_sources[@]} -gt 0 ]]; then
@@ -425,6 +395,29 @@ mark_missing_tool() {
 tu_count=${#analysis_tus[@]}
 iwyu_count=${#iwyu_tus[@]}
 cppcheck_count=${#cppcheck_sources[@]}
+
+# The per-TU analyzers' file arguments, and what their labels say they cover. A
+# full-tree run passes no file list; the project's translation units size its
+# shares and start its lanes.
+analysis_files=(-- "${analysis_tus[@]}")
+iwyu_files=(-- "${iwyu_tus[@]}")
+cppcheck_files=(-- "${cppcheck_sources[@]}")
+analysis_scope="${tu_count} TU(s)"
+iwyu_scope="${iwyu_count} TU(s)"
+cppcheck_scope="${cppcheck_count} TU(s)"
+if [[ $analysis_full_scan -eq 1 ]]; then
+  mapfile -t project_tus < <(git ls-files -- '*.c' '*.cc' '*.cpp' '*.cxx' \
+    ':!:build/*' ':!:src/third_party/*' ':!:android/third_party/*')
+  tu_count=${#project_tus[@]}
+  iwyu_count=$tu_count
+  cppcheck_count=$tu_count
+  analysis_files=()
+  iwyu_files=()
+  cppcheck_files=()
+  analysis_scope="full tree; a dependency changed"
+  iwyu_scope=$analysis_scope
+  cppcheck_scope=$analysis_scope
+fi
 
 # analyzer_share BUDGET PERMILLE CAP -> workers, at least 1, at most CAP (0: uncapped)
 analyzer_share() {
@@ -506,7 +499,12 @@ lane_guardrails() {
   if command -v rg > /dev/null 2>&1; then
     run_check "secret redaction guardrail" tools/check_secret_redaction.sh
     run_check "workflow Git pin guardrail" tools/check_workflow_git_pins.sh
-    run_check "workflow download pin guardrail" tools/check_workflow_download_pins.sh
+    # Its job-condition reader is Python.
+    if command -v python3 > /dev/null 2>&1; then
+      run_check "workflow download pin guardrail" tools/check_workflow_download_pins.sh
+    else
+      mark_missing_tool "python3" "workflow download pin guardrail"
+    fi
     run_check "vcpkg overlay pin guardrail" tools/check_vcpkg_overlay_pins.sh
   else
     mark_missing_tool "rg" "repository security guardrails"
@@ -590,7 +588,7 @@ lane_scan() {
 # shellcheck disable=SC2329 # Started through runner_spawn.
 lane_clang_tidy() {
   if command -v clang-tidy > /dev/null 2>&1; then
-    run_check "clang-tidy (${tu_count} TU(s), ${jobs_tidy} worker(s))" tools/clang_tidy.sh --jobs "$jobs_tidy" -- "${analysis_tus[@]}"
+    run_check "clang-tidy (${analysis_scope}, ${jobs_tidy} worker(s))" tools/clang_tidy.sh --jobs "$jobs_tidy" "${analysis_files[@]}"
   else
     mark_missing_tool "clang-tidy" "clang-tidy analysis"
   fi
@@ -599,7 +597,7 @@ lane_clang_tidy() {
 # shellcheck disable=SC2329 # Started through runner_spawn.
 lane_cppcheck() {
   if command -v cppcheck > /dev/null 2>&1; then
-    run_check "cppcheck strict (${cppcheck_count} TU(s), ${jobs_cppcheck} worker(s))" tools/cppcheck.sh --strict --jobs "$jobs_cppcheck" -- "${cppcheck_sources[@]}"
+    run_check "cppcheck strict (${cppcheck_scope}, ${jobs_cppcheck} worker(s))" tools/cppcheck.sh --strict --jobs "$jobs_cppcheck" "${cppcheck_files[@]}"
   else
     mark_missing_tool "cppcheck" "cppcheck analysis"
   fi
@@ -608,7 +606,7 @@ lane_cppcheck() {
 # shellcheck disable=SC2329 # Started through runner_spawn.
 lane_iwyu() {
   if command -v include-what-you-use > /dev/null 2>&1; then
-    run_check "IWYU strict (${iwyu_count} TU(s), ${jobs_iwyu} worker(s))" tools/iwyu.sh --strict --jobs "$jobs_iwyu" -- "${iwyu_tus[@]}"
+    run_check "IWYU strict (${iwyu_scope}, ${jobs_iwyu} worker(s))" tools/iwyu.sh --strict --jobs "$jobs_iwyu" "${iwyu_files[@]}"
   else
     mark_missing_tool "include-what-you-use" "IWYU analysis"
   fi
@@ -619,7 +617,7 @@ lane_fanalyzer() {
   # gcc alone: the analyzer covers C only, so the script no longer calls g++, and
   # a host that builds C++ with clang should not lose the analysis over it.
   if command -v gcc > /dev/null 2>&1; then
-    run_check "GCC fanalyzer strict (${tu_count} TU(s), ${jobs_fanalyzer} worker(s))" tools/gcc_fanalyzer.sh --strict --jobs "$jobs_fanalyzer" -- "${analysis_tus[@]}"
+    run_check "GCC fanalyzer strict (${analysis_scope}, ${jobs_fanalyzer} worker(s))" tools/gcc_fanalyzer.sh --strict --jobs "$jobs_fanalyzer" "${analysis_files[@]}"
   else
     mark_missing_tool "gcc" "GCC fanalyzer analysis"
   fi
@@ -629,16 +627,29 @@ echo "pre-push: jobs=${JOBS} (clang-tidy=${jobs_tidy} cppcheck=${jobs_cppcheck}"
   "fanalyzer=${jobs_fanalyzer} iwyu=${jobs_iwyu} lizard=${jobs_lizard}" \
   "clang-format=${jobs_format}) serial=${RUNNER_SERIAL}"
 
-# The per-TU analyzers all read build/dev-debug/compile_commands.json and each
-# would configure the preset itself if it were missing. Do that once, up front,
+# The per-TU analyzers all read build/dev-debug/compile_commands.json (or
+# DSD_ANALYSIS_BUILD_DIR's) and each would configure the preset itself if it
+# were missing. Do that once, up front,
 # so concurrent lanes never race on the same build tree. If it fails there is no
 # database to analyze against, and letting the lanes start would have three of
 # them configure the same build directory at the same time, so they are skipped:
 # the recorded failure is the verdict.
+#
+# A full-tree run follows a dependency change, so it always reconfigures: that
+# refetches a changed pin (PFFFT) into build/dev-debug, whose compile database the
+# per-TU analyzers and whose cache tools/cppcheck.sh read. An existing tree would
+# otherwise be analyzed against the old dependency and pass.
+# The analyzers read DSD_ANALYSIS_BUILD_DIR when it is set, so that is the tree
+# configured here.
+analysis_build_dir="${DSD_ANALYSIS_BUILD_DIR:-build/dev-debug}"
 compile_db_ready=1
-if [[ $tu_count -gt 0 && ! -f build/dev-debug/compile_commands.json && ! -f compile_commands.json ]]; then
+configure_label="CMake configure (dev-debug compile database)"
+if [[ $analysis_full_scan -eq 1 ]]; then
+  configure_label="CMake configure (dev-debug in ${analysis_build_dir}; refetch the pinned dependencies)"
+fi
+if [[ $tu_count -gt 0 ]] && [[ $analysis_full_scan -eq 1 || (! -f "$analysis_build_dir/compile_commands.json" && ! -f compile_commands.json) ]]; then
   if command -v cmake > /dev/null 2>&1; then
-    run_check "CMake configure (dev-debug compile database)" cmake --preset dev-debug
+    run_check "$configure_label" cmake --preset dev-debug -B "$analysis_build_dir"
     if [[ "$RUNNER_LAST_RC" -ne 0 ]]; then
       compile_db_ready=0
       echo "pre-push: skipping the per-TU analyzers (no compile database)." >&2
@@ -652,7 +663,11 @@ if [[ $tu_count -gt 0 && $compile_db_ready -eq 0 ]]; then
   # Naming the tool is not the same as naming what went unanalyzed: "cmake is
   # missing" reads like a nuisance, where the fact is that ${tu_count} changed
   # translation units are about to be pushed with no per-TU analysis at all.
-  runner_note_skipped "clang-tidy, IWYU and GCC -fanalyzer over ${tu_count} changed translation unit(s): no compile database"
+  if [[ $analysis_full_scan -eq 1 ]]; then
+    runner_note_skipped "cppcheck, clang-tidy, IWYU and GCC -fanalyzer over the whole tree: the dev-debug configure that refetches the changed dependency failed"
+  else
+    runner_note_skipped "clang-tidy, IWYU and GCC -fanalyzer over ${tu_count} changed translation unit(s): no compile database"
+  fi
 fi
 
 runner_spawn guardrails lane_guardrails
@@ -663,7 +678,8 @@ if [[ $tu_count -gt 0 && $compile_db_ready -eq 1 ]]; then
   runner_spawn iwyu lane_iwyu
   runner_spawn fanalyzer lane_fanalyzer
 fi
-if [[ $cppcheck_count -gt 0 ]]; then
+# A full-tree cppcheck reads the PFFFT the configure above refetched.
+if [[ $cppcheck_count -gt 0 ]] && [[ $analysis_full_scan -eq 0 || $compile_db_ready -eq 1 ]]; then
   runner_spawn cppcheck lane_cppcheck
 fi
 runner_wait_all

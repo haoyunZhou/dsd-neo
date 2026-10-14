@@ -44,11 +44,53 @@ ModalSheet {
     property real pendingGain: NaN
     property real pendingPpm: NaN
     property real pendingSquelch: NaN
+    // A dynamic squelch requested, by its margin, and which one (auto or noise).
+    property real pendingSquelchMargin: NaN
+    property int pendingSquelchMode: commands.squelchModeAuto
     property real pendingAnalogWidth: NaN
+    property real pendingOtherWidth: NaN
+
+    // Issue #518: while a scan row is on air and takes "this channel" edits,
+    // the gain, squelch and width controls can edit that row's own setting for
+    // the rest of the session instead of the default every row without its own
+    // runs. The row is captured when the scope is chosen, so an edit reaches it
+    // however the scan moves on, and the panel goes back to the default when
+    // another row comes on air: the readings would no longer be the row's.
+    readonly property int rowFields: metrics.scanRowActive === true ? metrics.scanRowEditable : 0
+    readonly property int rowRadioFields: rowFields
+        & (commands.scanRowFieldSquelch | commands.scanRowFieldWidth | commands.scanRowFieldGain)
+    property bool rowScopeChosen: false
+    property var rowContext: ({})
+    readonly property bool rowScope: rowScopeChosen && rowRadioFields !== 0
+    readonly property bool rowGain: rowScope && (rowFields & commands.scanRowFieldGain) !== 0
+    readonly property bool rowSquelch: rowScope && (rowFields & commands.scanRowFieldSquelch) !== 0
+    readonly property bool rowWidth: rowScope && (rowFields & commands.scanRowFieldWidth) !== 0
+    // Only an nfm row takes a tone policy, and only it has an FM discriminator
+    // for the noise squelch to quiet.
+    readonly property bool rowNfm: rowScope && (rowFields & commands.scanRowFieldTone) !== 0
+    // The readings the steppers start from are the row's only while both
+    // snapshots are of its scope; between the decoder's two publishes they
+    // can pair one row's values with another's identity.
+    readonly property bool rowSynced: metrics.scanRowSynced === true
+    // In "This channel" a control the row takes no edit of is held, never sent
+    // to the default the scope note says is left alone, and so is every row
+    // control while the readings are not the row's.
+    readonly property bool gainSteppable: !rowScope || (rowGain && rowSynced)
+    readonly property bool squelchSteppable: !rowScope || (rowSquelch && rowSynced)
+    readonly property string onAirRow: metrics.scanRowActive === true ? metrics.scanRowKey : ""
+    onOnAirRowChanged: {
+        if (rowScopeChosen)
+            chooseScope(false);
+    }
 
     // What each control steps from and displays.
     readonly property bool airspyActive: metrics.airspy !== undefined && metrics.airspy.gain_mode !== undefined
-    readonly property int gainDb: isNaN(pendingGain) ? metrics.tunerGainDb : pendingGain
+    // Under --trunk-scan a target can carry its own rtl_gain. While it is on air the
+    // reading is the target's, and the buttons edit the configured gain beneath it,
+    // the one every other target runs and the scan restores at each switch.
+    readonly property bool gainRowOverride: metrics.tunerGainRowOverride === true
+    readonly property int baseGainDb: (gainRowOverride && !rowGain) ? metrics.configuredTunerGainDb : metrics.tunerGainDb
+    readonly property int gainDb: isNaN(pendingGain) ? baseGainDb : pendingGain
     readonly property int ppm: isNaN(pendingPpm) ? metrics.ppm : pendingPpm
     // A scan row or target can carry its own squelch (--squelch-db). While it is on
     // air the readout is the row's, and the buttons edit the configured default
@@ -56,73 +98,236 @@ ModalSheet {
     // moved on. Whether each level is off is the engine's decision, not the sign
     // of its dB reading: a full-scale default also reads 0 dB and gates everything.
     readonly property bool squelchRowOverride: metrics.squelchRowOverride === true
-    readonly property real baseSquelchDb: squelchRowOverride ? metrics.configuredSquelchDb : metrics.squelchDb
-    readonly property bool baseSquelchOff: squelchRowOverride
-        ? metrics.configuredSquelchOff : metrics.squelchOff
+    // Editing "this channel", the buttons step the threshold the row runs.
+    readonly property real baseSquelchDb: rowSquelch ? metrics.effectiveSquelchDb
+        : (squelchRowOverride ? metrics.configuredSquelchDb : metrics.squelchDb)
+    readonly property bool baseSquelchOff: rowSquelch ? metrics.effectiveSquelchOff
+        : (squelchRowOverride ? metrics.configuredSquelchOff : metrics.squelchOff)
     readonly property real squelchDb: isNaN(pendingSquelch) ? baseSquelchDb : pendingSquelch
     // Off is a state of its own, not a very low threshold: squelchDb bottoms out
     // at the -120 dB display floor either way. A pending request speaks for
     // itself, since 0 is what the engine reads as "switch it off".
     readonly property bool squelchOff: isNaN(pendingSquelch) ? baseSquelchOff : pendingSquelch >= 0
+    // The auto squelch opens a margin over the noise floor the demodulator
+    // learns on each channel. Only an nfm or am row takes it as its own, the
+    // rows whose width it edits too, so on any other row "this channel" is a
+    // level: there an auto default is off, as the reading says.
+    readonly property bool squelchAutoOffered: !rowSquelch || rowWidth
+    // The noise squelch opens when the FM discriminator's noise above voice
+    // quiets by its margin: an nfm row takes it, and so does the default unless
+    // the session is the AM monitor on its own, which refuses it.
+    readonly property bool squelchNoiseOffered: rowSquelch ? rowNfm : metrics.squelchNoiseOffered === true
+    // A noise setting where the noise squelch cannot run -- an am row that
+    // inherits it, the AM monitor on its own -- runs as auto, and the panel
+    // shows and steps it as Auto.
+    readonly property bool baseSquelchNoiseAsAuto: rowSquelch
+        ? (!rowNfm && metrics.effectiveSquelchNoise === true)
+        : (!squelchNoiseOffered && metrics.configuredSquelchNoise === true)
+    readonly property bool baseSquelchAuto: squelchAutoOffered
+        && ((rowSquelch ? metrics.effectiveSquelchAuto === true : metrics.configuredSquelchAuto === true)
+            || baseSquelchNoiseAsAuto)
+    readonly property bool baseSquelchNoise: rowSquelch ? (rowNfm && metrics.effectiveSquelchNoise === true)
+        : (squelchNoiseOffered && metrics.configuredSquelchNoise === true)
+    readonly property int baseSquelchMargin: rowSquelch ? metrics.effectiveSquelchMarginDb
+        : metrics.configuredSquelchMarginDb
+    readonly property bool squelchAuto: !isNaN(pendingSquelchMargin) ? pendingSquelchMode === commands.squelchModeAuto
+        : (isNaN(pendingSquelch) && baseSquelchAuto)
+    readonly property bool squelchNoise: !isNaN(pendingSquelchMargin) ? pendingSquelchMode === commands.squelchModeNoise
+        : (isNaN(pendingSquelch) && baseSquelchNoise)
+    // Auto or Noise: the buttons step the margin.
+    readonly property bool squelchDynamic: squelchAuto || squelchNoise
+    // The margin the buttons step, or the one choosing Auto or Noise starts from.
+    readonly property int squelchMargin: !isNaN(pendingSquelchMargin) ? pendingSquelchMargin
+        : (baseSquelchMargin > 0 ? baseSquelchMargin : commands.squelchMarginDefaultDb)
     // The threshold in force comes first; with a row override that is the row's,
     // and the default being edited is named below it.
-    readonly property string squelchReading: squelchRowOverride
-        ? squelchText(metrics.effectiveSquelchOff, metrics.effectiveSquelchDb)
-        : squelchText(squelchOff, squelchDb)
+    readonly property string squelchReading: (squelchRowOverride && !rowSquelch)
+        ? squelchSettingText(metrics.effectiveSquelchAuto === true, metrics.effectiveSquelchNoise === true,
+            metrics.effectiveSquelchMarginDb, metrics.effectiveSquelchOff, metrics.effectiveSquelchDb)
+        : squelchSettingText(squelchAuto, squelchNoise, squelchMargin, squelchOff, squelchDb)
+    // What an auto squelch in force shows: its floor, "learning", or why it is
+    // off here. Held while a request is outstanding; it describes the old setting.
+    readonly property string squelchAutoStatus: (isNaN(pendingSquelch) && isNaN(pendingSquelchMargin)
+        && metrics.squelchAutoStatus !== undefined) ? metrics.squelchAutoStatus : ""
 
     // 0 dB is the tuner's automatic gain, not silence — worth saying, because
     // "0" next to a signal that vanished reads as a mistake otherwise.
     readonly property bool autoGain: gainDb <= 0
 
-    // Issue #525: the NFM channel width, shown under the analog preset. The
+    // Issue #525: the analog channel width, shown under the analog presets. The
     // stepper edits the configured width (0 is the default), and the reading is
     // the width in force as the engine spells it for every frontend: what the
     // front end reports while the monitor runs, with "DSP-limited" when the DSP
-    // rate rather than the filter bounds it.
+    // rate rather than the filter bounds it. Under the AM preset (issue #524)
+    // it is the AM width, stepped over the AM widths; otherwise, and while an
+    // nfm scan row runs over the AM preset, the NFM width.
     readonly property int analogMode: commands.decodeModeForFlag("-fA")
-    readonly property bool analogPreset: analogMode >= 0 && metrics.decodeMode === analogMode
+    readonly property int amMode: commands.decodeModeForFlag("-fM")
+    readonly property bool amPreset: amMode >= 0 && metrics.decodeMode === amMode
+    readonly property bool analogPreset: (analogMode >= 0 && metrics.decodeMode === analogMode) || amPreset
+    // Issue #526: an nfm or am scan row on air runs the width of its kind
+    // whatever the configured preset, a digital one included, so its width is in
+    // force and shown there too, as the terminal shows it.
+    readonly property bool analogRowActive: metrics.analogBandwidthRowActive === true
+    readonly property bool analogWidthInForce: analogPreset || analogRowActive
+    // The kind the section edits and reads: the configured preset's, or while
+    // an analog scan row is on air the kind that row runs (an nfm row runs FM
+    // on an AM session too), which is the width the readings describe.
+    readonly property bool sectionAm: analogRowActive ? metrics.analogBandwidthAm === true : amPreset
+    readonly property var analogWidths: sectionAm ? Util.AM_WIDTHS_HZ : Util.NFM_WIDTHS_HZ
+    // The unset default of the kind the section edits.
+    readonly property int analogDefaultWidth: sectionAm ? Util.AM_DEFAULT_WIDTH_HZ : Util.NFM_DEFAULT_WIDTH_HZ
     // The width is the radio front end's filter; PCM audio arrives demodulated.
     readonly property bool analogWidthEditable: metrics.radioInput === true
+    // A row can carry its own width (--nfm-bandwidth-hz on an nfm row,
+    // --am-bandwidth-hz on an am row). While it is on air the readout is the
+    // row's, and the stepper edits the configured default of the row's kind
+    // beneath it, as the squelch does: an edit made to the row would be gone the
+    // moment the scanner moved on. On PCM input the width filters nothing, row
+    // or not.
+    readonly property bool analogRowOverride: metrics.analogBandwidthRowOverride === true && analogWidthEditable
     readonly property int analogWidthConfigured: isNaN(pendingAnalogWidth)
         ? metrics.analogBandwidthConfiguredHz : pendingAnalogWidth
     // Under another preset an explicit width stays editable on a radio, as the
     // terminal row does: a switch to NFM is held to it, and where the device or
     // the capture forces a DSP rate that cannot filter it, the refusal says to
     // narrow it, which has to be possible before the switch.
-    readonly property bool analogWidthOffered: analogPreset
+    readonly property bool analogWidthOffered: analogWidthInForce
         || (analogWidthEditable && (metrics.analogBandwidthConfiguredHz > 0 || !isNaN(pendingAnalogWidth)))
     // An explicit width steps from itself. The default steps from the width in
     // force, which below a 20 kHz DSP rate is the width the rate leaves rather
-    // than 16 kHz, so the first step from there is one the rate can take.
+    // than 16 kHz for NFM, so the first step from there is one the rate can take.
+    // Under a row's own width the width in force is the row's, not the default's,
+    // so the default steps from the unset default of the row's kind (16 kHz for
+    // an nfm row, 6 kHz for an am row), within what the DSP rate filters.
     readonly property int analogWidthStepFrom: {
+        // Editing "this channel", the width setting the row runs, from the same
+        // snapshots as its identity: the live front-end reading can already be
+        // the next row's.
+        if (rowWidth)
+            return isNaN(pendingAnalogWidth) ? (metrics.analogBandwidthSettingHz > 0 ? metrics.analogBandwidthSettingHz
+                                                                                     : analogDefaultWidth)
+                                             : pendingAnalogWidth;
         if (analogWidthConfigured > 0)
             return analogWidthConfigured;
-        return metrics.analogBandwidthHz > 0 ? metrics.analogBandwidthHz : Util.NFM_DEFAULT_WIDTH_HZ;
+        if (analogRowOverride)
+            return analogDefaultWidth;
+        if (metrics.analogBandwidthHz > 0)
+            return metrics.analogBandwidthHz;
+        return analogDefaultWidth;
     }
     // The widest width the DSP rate filters (the running stream's, or with none
     // the rate an RTL-SDR input's DSP bandwidth sets; 0 = not known): the steps
     // skip what the engine would refuse.
     readonly property int analogWidthMax: metrics.analogBandwidthMaxHz > 0 ? metrics.analogBandwidthMaxHz : 0
-    readonly property bool analogWidthCanNarrow: analogWidthEditable
-        && Util.nextNfmWidth(analogWidthStepFrom, -1, analogWidthMax) > 0
-    readonly property bool analogWidthCanWiden: analogWidthEditable
-        && Util.nextNfmWidth(analogWidthStepFrom, 1, analogWidthMax) > 0
+    readonly property bool analogWidthCanNarrow: analogWidthEditable && (!rowScope || (rowWidth && rowSynced))
+        && Util.nextWidthIn(analogWidths, analogWidthStepFrom, -1, analogWidthMax) > 0
+    readonly property bool analogWidthCanWiden: analogWidthEditable && (!rowScope || (rowWidth && rowSynced))
+        && Util.nextWidthIn(analogWidths, analogWidthStepFrom, 1, analogWidthMax) > 0
     // A request stands in for the reading until the engine answers, spelled as
     // the setting it is ("12.5 kHz", or "default" for 0).
-    // Outside the preset no width is in force, so the setting stands in.
+    // Outside the preset, with no analog row on air, no width is in force, so the
+    // setting stands in. A row's own width comes first, and the default being
+    // edited is named below it (analogWidthDefaultText).
     readonly property string analogWidthReading: {
+        if (rowWidth)
+            return isNaN(pendingAnalogWidth) ? metrics.analogBandwidthReading : Util.widthKhzText(pendingAnalogWidth);
+        if (analogRowOverride)
+            return Util.widthKhzText(metrics.analogBandwidthHz);
         if (!isNaN(pendingAnalogWidth))
             return pendingAnalogWidth > 0 ? Util.widthKhzText(pendingAnalogWidth) : qsTr("default");
-        if (!analogPreset)
+        if (!analogWidthInForce)
             return analogWidthConfigured > 0 ? Util.widthKhzText(analogWidthConfigured) : qsTr("default");
         return metrics.analogBandwidthReading;
     }
+    // The configured width a row's own width shadows, and the row's leave
+    // returns to, as the engine names it: the unset default of the row's kind
+    // (16 kHz for NFM, 6 kHz for AM).
+    readonly property string analogWidthDefaultText: qsTr("default %1").arg(Util.widthKhzText(
+        analogWidthConfigured > 0 ? analogWidthConfigured : analogDefaultWidth))
+
+    // The width of the analog kind the section above does not edit: AM, or NFM
+    // under the AM preset (AM again while an nfm row runs over the AM
+    // preset). Offered on a radio while an explicit one is set, as
+    // the terminal offers its row: a switch between NFM and AM is held to it too,
+    // and where the device or the capture forces a DSP rate that cannot filter
+    // it, the refusal says to narrow it, which has to be possible before the
+    // switch. So is AM's default where the engine reports the DSP rate cannot
+    // filter it (amBandwidthOffered): a switch to AM is refused there with word
+    // to narrow the width. It is a setting only; no width of that kind is in
+    // force.
+    readonly property bool otherKindAm: !sectionAm
+    readonly property var otherWidths: otherKindAm ? Util.AM_WIDTHS_HZ : Util.NFM_WIDTHS_HZ
+    readonly property int otherWidthSetting: (otherKindAm
+        ? metrics.amBandwidthConfiguredHz : metrics.nfmBandwidthConfiguredHz) || 0
+    readonly property int otherWidthConfigured: isNaN(pendingOtherWidth) ? otherWidthSetting : pendingOtherWidth
+    readonly property bool otherWidthOffered: analogWidthEditable
+        && (otherWidthSetting > 0 || !isNaN(pendingOtherWidth)
+            || (otherKindAm ? metrics.amBandwidthOffered : metrics.nfmBandwidthOffered) === true)
+    readonly property int otherWidthStepFrom: {
+        if (otherWidthConfigured > 0)
+            return otherWidthConfigured;
+        return otherKindAm ? Util.AM_DEFAULT_WIDTH_HZ : Util.NFM_DEFAULT_WIDTH_HZ;
+    }
+    readonly property bool otherWidthCanNarrow: analogWidthEditable && !rowScope
+        && Util.nextWidthIn(otherWidths, otherWidthStepFrom, -1, analogWidthMax) > 0
+    readonly property bool otherWidthCanWiden: analogWidthEditable && !rowScope
+        && Util.nextWidthIn(otherWidths, otherWidthStepFrom, 1, analogWidthMax) > 0
+
+    // An outstanding width request belongs to the kind it was sent for, and the
+    // two sections swap kinds when the preset moves between NFM and AM, or an
+    // nfm row comes on air over the AM preset or leaves: a request left standing
+    // would read as the other kind's width, and step from it.
+    onSectionAmChanged: forgetWidthRequests()
 
     function open() {
         // Whatever was outstanding belongs to the last time this was open, and on
         // Android the service may have been driven from elsewhere since.
         forgetRequests();
+        chooseScope(false);
         visible = true;
+    }
+
+    /** Edit the default (false) or "this channel" (true), capturing the row on air for the latter. */
+    function chooseScope(thisChannel) {
+        forgetRequests();
+        rowContext = thisChannel ? commands.scanRowContext() : ({});
+        // The controls show the metrics' row: a context taken from a newer
+        // snapshot names a row whose values they do not show yet, so the
+        // choice waits for the metrics to catch up rather than step that row
+        // from another one's values.
+        rowScopeChosen = thisChannel && rowContext.active === true && rowContext.key === onAirRow && rowSynced;
+        if (!rowScopeChosen)
+            rowContext = ({});
+    }
+
+    /** A session edit of the captured row: @p field and @p action as the bridge names them. */
+    function rowEdit(field, action, value) {
+        commands.editScanRow(rowContext, field, action, value);
+    }
+
+    /**
+     * "Use default" or "List value" for @p field: the reading changes to a value
+     * the panel did not compute, so a step still outstanding for that field no
+     * longer stands for it.
+     */
+    function rowAction(field, action) {
+        if (field === commands.scanRowFieldGain) {
+            pendingGain = NaN;
+            gainTtl.stop();
+        } else if (field === commands.scanRowFieldSquelch) {
+            pendingSquelch = NaN;
+            pendingSquelchMargin = NaN;
+            squelchTtl.stop();
+        } else if (field === commands.scanRowFieldWidth) {
+            forgetWidthRequests();
+        }
+        rowEdit(field, action, {});
+    }
+
+    /** A tuner gain as the panel prints it: 0 is the tuner's automatic gain. */
+    function gainText(db) {
+        return db <= 0 ? qsTr("auto") : db + " dB";
     }
 
     /** A squelch reading as the panel prints it. */
@@ -130,44 +335,96 @@ ModalSheet {
         return off ? qsTr("off") : Math.round(db) + " dB";
     }
 
+    /** A squelch setting as the panel prints it: a dynamic squelch by its margin, a level as squelchText(). */
+    function squelchSettingText(auto, noise, margin, off, db) {
+        if (noise)
+            return qsTr("noise +%1 dB").arg(margin);
+        return auto ? qsTr("auto +%1 dB").arg(margin) : squelchText(off, db);
+    }
+
     /** Drop every outstanding request and go back to reading the engine. */
     function forgetRequests() {
         pendingGain = NaN;
         pendingPpm = NaN;
         pendingSquelch = NaN;
-        pendingAnalogWidth = NaN;
+        pendingSquelchMargin = NaN;
         gainTtl.stop();
         ppmTtl.stop();
         squelchTtl.stop();
+        forgetWidthRequests();
+    }
+
+    /** Drop the outstanding channel width requests of both analog sections. */
+    function forgetWidthRequests() {
+        pendingAnalogWidth = NaN;
+        pendingOtherWidth = NaN;
         analogWidthTtl.stop();
+        otherWidthTtl.stop();
+    }
+
+    // The width command of the kind the section edits (sectionAm).
+    function sendAnalogWidth(hz) {
+        if (rowWidth)
+            rowEdit(commands.scanRowFieldWidth, commands.scanRowEditSet, {"widthHz": hz});
+        else if (sectionAm)
+            commands.setAmBandwidthHz(hz);
+        else
+            commands.setNfmBandwidthHz(hz);
     }
 
     /**
-     * Step the NFM channel width through the common channel plans. The engine
+     * Step the channel width through the common channel plans. The engine
      * refuses a width the DSP rate cannot filter, with a message, and keeps the
      * one it had; the pending value then expires back to the reading.
      */
     function stepAnalogWidth(direction) {
         if (!(direction > 0 ? analogWidthCanWiden : analogWidthCanNarrow))
             return;
-        var next = Util.nextNfmWidth(analogWidthStepFrom, direction, analogWidthMax);
+        var next = Util.nextWidthIn(analogWidths, analogWidthStepFrom, direction, analogWidthMax);
         pendingAnalogWidth = next;
         analogWidthTtl.restart();
-        commands.setNfmBandwidthHz(next);
+        sendAnalogWidth(next);
     }
 
     /**
-     * Return the NFM channel width to the unset default (0). Not a step to
-     * 16 kHz: the default keeps its own rule (the channel filter runs only at
-     * DSP rates of 20 kHz or more) and a save leaves it out of the config, so a
-     * later default reaches it.
+     * Return the channel width to the unset default (0). Not a step to the
+     * default's width: a save leaves the default out of the config, so a later
+     * default reaches it, and the NFM default keeps its own rule (the channel
+     * filter runs only at DSP rates of 20 kHz or more).
      */
     function resetAnalogWidth() {
-        if (!analogWidthEditable || analogWidthConfigured <= 0)
+        if (!analogWidthEditable || analogWidthConfigured <= 0 || rowScope)
             return;
         pendingAnalogWidth = 0;
         analogWidthTtl.restart();
-        commands.setNfmBandwidthHz(0);
+        sendAnalogWidth(0);
+    }
+
+    // The width command of the other kind (otherKindAm).
+    function sendOtherWidth(hz) {
+        if (otherKindAm)
+            commands.setAmBandwidthHz(hz);
+        else
+            commands.setNfmBandwidthHz(hz);
+    }
+
+    /** Step the other kind's width, as stepAnalogWidth() steps the section's. */
+    function stepOtherWidth(direction) {
+        if (!(direction > 0 ? otherWidthCanWiden : otherWidthCanNarrow))
+            return;
+        var next = Util.nextWidthIn(otherWidths, otherWidthStepFrom, direction, analogWidthMax);
+        pendingOtherWidth = next;
+        otherWidthTtl.restart();
+        sendOtherWidth(next);
+    }
+
+    /** Return the other kind's width to its unset default (0). */
+    function resetOtherWidth() {
+        if (!analogWidthEditable || otherWidthConfigured <= 0 || rowScope)
+            return;
+        pendingOtherWidth = 0;
+        otherWidthTtl.restart();
+        sendOtherWidth(0);
     }
 
     /**
@@ -179,6 +436,8 @@ ModalSheet {
      * on a button press at the end of the range that changes no setting.
      */
     function stepGain(delta) {
+        if (!gainSteppable)
+            return;
         var next = gainDb + delta;
         if (next < 0)
             next = 0;
@@ -188,7 +447,10 @@ ModalSheet {
             return;
         pendingGain = next;
         gainTtl.restart();
-        commands.setTunerGain(next);
+        if (rowGain)
+            rowEdit(commands.scanRowFieldGain, commands.scanRowEditSet, {"gainDb": next});
+        else
+            commands.setTunerGain(next);
     }
 
     /** Nudge the crystal correction. Real dongles land within about ±100 ppm. */
@@ -216,12 +478,22 @@ ModalSheet {
      * floor. Above it, -5 dB is the last real threshold, because 0 is off.
      */
     function stepSquelch(delta) {
-        var cur = squelchOff ? -125 : squelchDb;
+        if (!squelchSteppable)
+            return;
+        // A row's own squelch is whole dB down to -100, the options cell's range.
+        var floor = rowSquelch ? -100 : -120;
+        var cur = squelchOff ? floor - 5 : squelchDb;
         var next = cur + delta;
-        if (next < -120) {
-            if (squelchOff)
-                return;
-            next = 0;
+        if (next < floor) {
+            // A step up from below the floor (a row that follows a default
+            // under -100 dB) lands on it; only a step down reaches off.
+            if (delta > 0) {
+                next = floor;
+            } else {
+                if (squelchOff)
+                    return;
+                next = 0;
+            }
         } else if (next > -5) {
             next = -5;
         }
@@ -229,9 +501,91 @@ ModalSheet {
         // "already there" is a tolerance, not an equality.
         if (!squelchOff && Math.abs(next - squelchDb) < 0.001)
             return;
-        pendingSquelch = next;
+        requestSquelchDb(next);
+    }
+
+    /** Ask for a level squelch of @p db (0 = off), on the row or the default. */
+    function requestSquelchDb(db) {
+        // The margin the panel shows, an Auto request still outstanding
+        // included, read before that request is let go.
+        var margin = squelchMargin;
+        pendingSquelchMargin = NaN;
+        pendingSquelch = db;
         squelchTtl.restart();
-        commands.setSquelchDb(next);
+        // A row keeps its margin through a level, for a switch back to Auto.
+        if (rowSquelch)
+            rowEdit(commands.scanRowFieldSquelch, commands.scanRowEditSet,
+                {"squelchDb": Math.round(db), "squelchMarginDb": margin});
+        else
+            commands.setSquelchDb(db);
+    }
+
+    /**
+     * Ask for a dynamic squelch, @p mode (commands.squelchModeAuto or
+     * squelchModeNoise) with @p margin dB, on the row or the default.
+     */
+    function requestSquelchDynamic(mode, margin) {
+        pendingSquelch = NaN;
+        pendingSquelchMode = mode;
+        pendingSquelchMargin = margin;
+        squelchTtl.restart();
+        if (rowSquelch)
+            rowEdit(commands.scanRowFieldSquelch, commands.scanRowEditSet,
+                {"squelchMode": mode, "squelchMarginDb": margin});
+        else if (mode === commands.squelchModeNoise)
+            commands.setSquelchNoise(margin);
+        else
+            commands.setSquelchAuto(margin);
+    }
+
+    /**
+     * Nudge the auto or noise squelch's margin, 1 dB a step within the range
+     * the engine takes: a margin is a few dB of quieting or over the floor,
+     * not a threshold.
+     */
+    function stepSquelchMargin(delta) {
+        if (!squelchSteppable || !squelchDynamic)
+            return;
+        var next = Math.max(commands.squelchMarginMinDb, Math.min(commands.squelchMarginMaxDb, squelchMargin + delta));
+        if (next === squelchMargin)
+            return;
+        requestSquelchDynamic(squelchNoise ? commands.squelchModeNoise : commands.squelchModeAuto, next);
+    }
+
+    /**
+     * The dB | Auto | Noise choice (@p index 0, 1, 2). Auto and Noise start
+     * from the margin the setting last ran, or the default; dB goes back to the
+     * level the setting kept beneath it.
+     */
+    function chooseSquelchMode(index) {
+        var current = squelchNoise ? 2 : (squelchAuto ? 1 : 0);
+        if (!squelchSteppable || index === current)
+            return;
+        if (index === 1) {
+            if (squelchAutoOffered)
+                requestSquelchDynamic(commands.squelchModeAuto, squelchMargin);
+            return;
+        }
+        if (index === 2) {
+            if (squelchNoiseOffered)
+                requestSquelchDynamic(commands.squelchModeNoise, squelchMargin);
+            return;
+        }
+        var levelOff = metrics.configuredSquelchLevelOff === true;
+        var db = rowSquelch ? metrics.effectiveSquelchDb : metrics.configuredSquelchDb;
+        if (rowSquelch) {
+            // A row's own level is whole dB from -100 to -1 (0 is off there),
+            // so a legacy full-scale default comes back as -1 dB.
+            requestSquelchDb(levelOff ? 0 : Math.min(-1, Math.max(-100, Math.round(db))));
+            return;
+        }
+        // The default gets its level back exactly as stored: a legacy linear
+        // full-scale threshold reads 0 dB, which sent as dB would mean off.
+        // The pending reading says what comes back until the engine's arrives.
+        pendingSquelchMargin = NaN;
+        pendingSquelch = levelOff ? 0 : Math.min(db, -0.001);
+        squelchTtl.restart();
+        commands.restoreSquelchLevel();
     }
 
     Timer {
@@ -252,7 +606,10 @@ ModalSheet {
         id: squelchTtl
 
         interval: sheet.requestTtlMs
-        onTriggered: sheet.pendingSquelch = NaN
+        onTriggered: {
+            sheet.pendingSquelch = NaN;
+            sheet.pendingSquelchMargin = NaN;
+        }
     }
 
     Timer {
@@ -262,15 +619,52 @@ ModalSheet {
         onTriggered: sheet.pendingAnalogWidth = NaN
     }
 
+    Timer {
+        id: otherWidthTtl
+
+        interval: sheet.requestTtlMs
+        onTriggered: sheet.pendingOtherWidth = NaN
+    }
+
     MicroLabel {
         text: qsTr("Radio")
     }
 
+    // Issue #518: what the gain, squelch and width controls below edit while a
+    // scan row is on air that takes "this channel" edits.
+    SegmentedControl {
+        objectName: "radioScope"
+        visible: sheet.rowRadioFields !== 0
+        width: parent.width
+        model: [qsTr("All channels"), qsTr("This channel")]
+        currentIndex: sheet.rowScope ? 1 : 0
+        onSelected: function (index) {
+            sheet.chooseScope(index === 1);
+        }
+    }
+    Text {
+        objectName: "radioScopeNote"
+        visible: sheet.rowScope
+        width: parent.width
+        wrapMode: Text.WordWrap
+        text: qsTr("Gain, squelch and width changes apply to %1 for this session, not to the list or the defaults.").arg(
+            sheet.rowContext.label || "")
+        color: Theme.textSecondary
+        font.pixelSize: Theme.fontSize(12)
+    }
+
     AirspyControls {
+        objectName: "radioAirspy"
         width: parent.width
         visible: sheet.airspyActive
+        // The device's own settings, gain stages included: held while "This
+        // channel" is chosen, as the scope note leaves the defaults alone.
+        enabled: !sheet.rowScope
         settings: metrics.airspy || ({})
-        onEdited: function(key, value) { commands.setAirspy(key, value); }
+        onEdited: function(key, value) {
+            if (!sheet.rowScope)
+                commands.setAirspy(key, value);
+        }
     }
     Column {
         visible: !sheet.airspyActive
@@ -288,7 +682,8 @@ ModalSheet {
                 objectName: "radioGainValue"
                 width: parent.width - 116
                 anchors.verticalCenter: parent.verticalCenter
-                text: sheet.autoGain ? qsTr("auto") : sheet.gainDb + " dB"
+                text: (sheet.gainRowOverride && !sheet.rowGain) ? sheet.gainText(metrics.tunerGainDb)
+                                                                 : sheet.gainText(sheet.gainDb)
                 color: Theme.textPrimary
                 font.family: Theme.mono
                 font.pixelSize: Theme.fontSize(14)
@@ -298,6 +693,7 @@ ModalSheet {
                 width: 48
                 text: "−"
                 accessibleName: qsTr("Decrease Gain")
+                enabled: sheet.gainSteppable
                 onClicked: sheet.stepGain(-1)
             }
             OutlineButton {
@@ -305,7 +701,65 @@ ModalSheet {
                 width: 48
                 text: "+"
                 accessibleName: qsTr("Increase Gain")
+                enabled: sheet.gainSteppable
                 onClicked: sheet.stepGain(1)
+            }
+        }
+        // "This channel": follow the default, offered when the list sets the
+        // gain, or go back to the list's value, offered while the row runs an edit.
+        Row {
+            objectName: "radioGainRowActions"
+            visible: sheet.rowGain && ((metrics.scanRowListed | metrics.scanRowEdited)
+                & commands.scanRowFieldGain) !== 0
+            spacing: 8
+            OutlineButton {
+                objectName: "radioGainRowInherit"
+                visible: (metrics.scanRowListed & commands.scanRowFieldGain) !== 0
+                text: qsTr("Use default")
+                accessibleName: qsTr("This Channel Uses the Default Gain")
+                onClicked: sheet.rowAction(commands.scanRowFieldGain, commands.scanRowEditInherit)
+            }
+            OutlineButton {
+                objectName: "radioGainRowReset"
+                visible: (metrics.scanRowEdited & commands.scanRowFieldGain) !== 0
+                text: qsTr("List value")
+                accessibleName: qsTr("This Channel Back to Its List Gain")
+                onClicked: sheet.rowAction(commands.scanRowFieldGain, commands.scanRowEditReset)
+            }
+        }
+        // Shown only while the parked trunk-scan target runs its own gain: says the
+        // target owns the reading above, and which default the buttons are changing.
+        Row {
+            objectName: "radioGainRowNote"
+            visible: sheet.gainRowOverride && !sheet.rowGain
+            spacing: 8
+            Rectangle {
+                objectName: "radioGainRowBadge"
+                implicitWidth: gainRowBadge.implicitWidth + 14
+                implicitHeight: Math.max(20, gainRowBadge.implicitHeight + 8)
+                anchors.verticalCenter: parent.verticalCenter
+                radius: 5
+                color: "transparent"
+                border.width: 1
+                border.color: Theme.controlBorder
+
+                Text {
+                    id: gainRowBadge
+                    anchors.centerIn: parent
+                    text: qsTr("target")
+                    font.family: Theme.mono
+                    font.pixelSize: Theme.fontSize(10)
+                    font.letterSpacing: 1
+                    color: Theme.cyan
+                }
+            }
+            Text {
+                objectName: "radioGainDefault"
+                anchors.verticalCenter: parent.verticalCenter
+                text: qsTr("default %1").arg(sheet.gainText(sheet.gainDb))
+                color: Theme.textSecondary
+                font.family: Theme.mono
+                font.pixelSize: Theme.fontSize(12)
             }
         }
     }
@@ -318,6 +772,21 @@ ModalSheet {
             color: Theme.textSecondary
             font.pixelSize: Theme.fontSize(14)
         }
+        // A fixed threshold in dB, the auto squelch (a margin over each
+        // channel's own noise floor) or the noise squelch (an FM channel's
+        // quieting, as a radio's squelch): the same whatever the dongle,
+        // antenna or gain.
+        SegmentedControl {
+            objectName: "radioSquelchMode"
+            visible: sheet.squelchAutoOffered
+            width: parent.width
+            enabled: sheet.squelchSteppable
+            model: sheet.squelchNoiseOffered ? [qsTr("dB"), qsTr("Auto"), qsTr("Noise")] : [qsTr("dB"), qsTr("Auto")]
+            currentIndex: sheet.squelchNoise ? 2 : (sheet.squelchAuto ? 1 : 0)
+            onSelected: function (index) {
+                sheet.chooseSquelchMode(index);
+            }
+        }
         Row {
             width: parent.width
             spacing: 10
@@ -326,33 +795,73 @@ ModalSheet {
                 width: parent.width - 116
                 anchors.verticalCenter: parent.verticalCenter
                 text: sheet.squelchReading
-                // Read aloud as the terminal prints it, row note and default included.
+                // Read aloud as the terminal prints it, row note, default and floor included.
                 Accessible.role: Accessible.StaticText
-                Accessible.name: sheet.squelchRowOverride ? metrics.squelchReadout : sheet.squelchReading
+                Accessible.name: sheet.squelchRowOverride ? metrics.squelchReadout
+                    : (sheet.squelchAutoStatus !== "" ? sheet.squelchReading + " (" + sheet.squelchAutoStatus + ")"
+                        : sheet.squelchReading)
                 color: Theme.textPrimary
                 font.family: Theme.mono
                 font.pixelSize: Theme.fontSize(14)
             }
+            // In Auto and Noise the buttons step the margin, 1 dB at a time.
             OutlineButton {
                 objectName: "radioSquelchDown"
                 width: 48
                 text: "−"
-                accessibleName: qsTr("Decrease Squelch")
-                onClicked: sheet.stepSquelch(-5)
+                accessibleName: sheet.squelchDynamic ? qsTr("Decrease Squelch Margin") : qsTr("Decrease Squelch")
+                enabled: sheet.squelchSteppable
+                onClicked: sheet.squelchDynamic ? sheet.stepSquelchMargin(-1) : sheet.stepSquelch(-5)
             }
             OutlineButton {
                 objectName: "radioSquelchUp"
                 width: 48
                 text: "+"
-                accessibleName: qsTr("Increase Squelch")
-                onClicked: sheet.stepSquelch(5)
+                accessibleName: sheet.squelchDynamic ? qsTr("Increase Squelch Margin") : qsTr("Increase Squelch")
+                enabled: sheet.squelchSteppable
+                onClicked: sheet.squelchDynamic ? sheet.stepSquelchMargin(1) : sheet.stepSquelch(5)
+            }
+        }
+        // The dynamic squelch in force: the floor it opens over ("learning"
+        // until it has one), the quieting the noise squelch reads, or why it is
+        // off here (no radio input, a digital channel).
+        Text {
+            objectName: "radioSquelchAutoStatus"
+            visible: sheet.squelchAutoStatus !== ""
+            width: parent.width
+            text: sheet.squelchAutoStatus
+            wrapMode: Text.Wrap
+            color: Theme.textSecondary
+            font.family: Theme.mono
+            font.pixelSize: Theme.fontSize(12)
+        }
+        // "This channel": follow the default, offered when the list sets the
+        // squelch, or go back to the list's value, offered while the row runs an edit.
+        Row {
+            objectName: "radioSquelchRowActions"
+            visible: sheet.rowSquelch && ((metrics.scanRowListed | metrics.scanRowEdited)
+                & commands.scanRowFieldSquelch) !== 0
+            spacing: 8
+            OutlineButton {
+                objectName: "radioSquelchRowInherit"
+                visible: (metrics.scanRowListed & commands.scanRowFieldSquelch) !== 0
+                text: qsTr("Use default")
+                accessibleName: qsTr("This Channel Uses the Default Squelch")
+                onClicked: sheet.rowAction(commands.scanRowFieldSquelch, commands.scanRowEditInherit)
+            }
+            OutlineButton {
+                objectName: "radioSquelchRowReset"
+                visible: (metrics.scanRowEdited & commands.scanRowFieldSquelch) !== 0
+                text: qsTr("List value")
+                accessibleName: qsTr("This Channel Back to Its List Squelch")
+                onClicked: sheet.rowAction(commands.scanRowFieldSquelch, commands.scanRowEditReset)
             }
         }
         // Shown only while the row on air overrides the squelch: says the row owns the
         // reading above, and which default the buttons are changing.
         Row {
             objectName: "radioSquelchRowNote"
-            visible: sheet.squelchRowOverride
+            visible: sheet.squelchRowOverride && !sheet.rowSquelch
             spacing: 8
             Rectangle {
                 objectName: "radioSquelchRowBadge"
@@ -377,7 +886,8 @@ ModalSheet {
             Text {
                 objectName: "radioSquelchDefault"
                 anchors.verticalCenter: parent.verticalCenter
-                text: qsTr("default %1").arg(sheet.squelchText(sheet.squelchOff, sheet.squelchDb))
+                text: qsTr("default %1").arg(sheet.squelchSettingText(sheet.squelchAuto, sheet.squelchNoise,
+                    sheet.squelchMargin, sheet.squelchOff, sheet.squelchDb))
                 color: Theme.textSecondary
                 font.family: Theme.mono
                 font.pixelSize: Theme.fontSize(12)
@@ -483,6 +993,9 @@ ModalSheet {
 
                 objectName: "radioDecode_" + modelData.short
                 text: modelData.short
+                // AM needs the radio's I/Q (issue #524): on audio that arrives
+                // demodulated the engine would refuse it, so it is not offered.
+                enabled: modelData.iqOnly !== true || metrics.radioInput === true
                 selected: mode >= 0 && mode === metrics.decodeMode
                 onClicked: {
                     if (mode >= 0)
@@ -492,16 +1005,32 @@ ModalSheet {
         }
     }
 
+    // Why the AM chip is greyed out, rather than leaving a dead control. The
+    // sheet opens only on a radio input, but stays open across a live switch to
+    // audio that arrives demodulated, where the chip goes grey under the reader.
+    Text {
+        objectName: "radioDecodeIqNote"
+        visible: metrics.radioInput !== true
+        width: parent.width
+        wrapMode: Text.WordWrap
+        text: qsTr("AM needs a radio (I/Q) input; this audio arrives already demodulated.")
+        color: Theme.textSecondary
+        font.family: Theme.sans
+        font.pixelSize: Theme.fontSize(12)
+    }
+
     // ---- Analog ----
-    // The NFM channel filter's width: the full RF passband the monitor keeps,
-    // not the tuner or the audio bandwidth. It has to fit the DSP rate.
+    // The analog channel filter's width (NFM, or AM under the AM preset): the
+    // full RF passband the monitor keeps, not the tuner or the audio bandwidth.
+    // It has to fit the DSP rate.
     Column {
         objectName: "radioAnalogSection"
         visible: sheet.analogWidthOffered
         width: parent.width
         spacing: 8
         Text {
-            text: qsTr("NFM channel width")
+            objectName: "radioAnalogSectionTitle"
+            text: sheet.sectionAm ? qsTr("AM channel width") : qsTr("NFM channel width")
             color: Theme.textSecondary
             font.pixelSize: Theme.fontSize(14)
         }
@@ -514,6 +1043,9 @@ ModalSheet {
                 width: parent.width - 116
                 anchors.verticalCenter: parent.verticalCenter
                 text: sheet.analogWidthReading
+                // Read aloud as the terminal prints it, row note and default included.
+                Accessible.role: Accessible.StaticText
+                Accessible.name: sheet.analogRowOverride ? metrics.analogBandwidthReading : sheet.analogWidthReading
                 color: Theme.textPrimary
                 font.family: Theme.mono
                 font.pixelSize: Theme.fontSize(14)
@@ -535,33 +1067,159 @@ ModalSheet {
                 onClicked: sheet.stepAnalogWidth(1)
             }
         }
+        // "This channel": follow the default, offered when the list sets the
+        // width, or go back to the list's value, offered while the row runs an edit.
+        Row {
+            objectName: "radioAnalogBandwidthRowActions"
+            visible: sheet.rowWidth && ((metrics.scanRowListed | metrics.scanRowEdited)
+                & commands.scanRowFieldWidth) !== 0
+            spacing: 8
+            OutlineButton {
+                objectName: "radioAnalogBandwidthRowInherit"
+                visible: (metrics.scanRowListed & commands.scanRowFieldWidth) !== 0
+                text: qsTr("Use default")
+                accessibleName: qsTr("This Channel Uses the Default Width")
+                onClicked: sheet.rowAction(commands.scanRowFieldWidth, commands.scanRowEditInherit)
+            }
+            OutlineButton {
+                objectName: "radioAnalogBandwidthRowReset"
+                visible: (metrics.scanRowEdited & commands.scanRowFieldWidth) !== 0
+                text: qsTr("List value")
+                accessibleName: qsTr("This Channel Back to Its List Width")
+                onClicked: sheet.rowAction(commands.scanRowFieldWidth, commands.scanRowEditReset)
+            }
+        }
+        // Shown only while the row on air sets its own width: says the row owns
+        // the reading above, and which default the stepper is changing.
+        Row {
+            objectName: "radioAnalogBandwidthRowNote"
+            visible: sheet.analogRowOverride && !sheet.rowWidth
+            spacing: 8
+            Rectangle {
+                objectName: "radioAnalogBandwidthRowBadge"
+                implicitWidth: analogRowBadge.implicitWidth + 14
+                implicitHeight: Math.max(20, analogRowBadge.implicitHeight + 8)
+                anchors.verticalCenter: parent.verticalCenter
+                radius: 5
+                color: "transparent"
+                border.width: 1
+                border.color: Theme.controlBorder
+
+                Text {
+                    id: analogRowBadge
+                    anchors.centerIn: parent
+                    text: qsTr("row")
+                    font.family: Theme.mono
+                    font.pixelSize: Theme.fontSize(10)
+                    font.letterSpacing: 1
+                    color: Theme.cyan
+                }
+            }
+            Text {
+                objectName: "radioAnalogBandwidthRowDefault"
+                anchors.verticalCenter: parent.verticalCenter
+                text: sheet.analogWidthDefaultText
+                color: Theme.textSecondary
+                font.family: Theme.mono
+                font.pixelSize: Theme.fontSize(12)
+            }
+        }
         // Back to the unset default, offered while an explicit width is set.
         OutlineButton {
             objectName: "radioAnalogBandwidthDefault"
-            visible: sheet.analogWidthConfigured > 0
+            visible: sheet.analogWidthConfigured > 0 && !sheet.rowScope
             width: parent.width
             text: qsTr("Use the default width")
             accessibleName: qsTr("Default Channel Width")
             enabled: sheet.analogWidthEditable
             onClicked: sheet.resetAnalogWidth()
         }
-        // Outside the preset: what the setting is for.
+        // Outside the preset, with no analog row on air: what the setting is for.
         Text {
             objectName: "radioAnalogBandwidthIdleNote"
-            visible: !sheet.analogPreset && sheet.analogWidthEditable
+            visible: !sheet.analogWidthInForce && sheet.analogWidthEditable
             width: parent.width
             wrapMode: Text.WordWrap
             text: qsTr("Used when NFM is chosen, which needs a width the DSP rate can filter.")
             color: Theme.textSecondary
             font.pixelSize: Theme.fontSize(12)
         }
-        // Why the stepper is greyed out, rather than leaving a dead control.
+        // Why the stepper is greyed out, rather than leaving a dead control. On
+        // audio input with a rigctl peer (a live switch to it while the sheet is
+        // open, issue #621) the width is the peer's passband, which the
+        // monitor's Passband row sets.
         Text {
             objectName: "radioAnalogBandwidthNote"
             visible: !sheet.analogWidthEditable
             width: parent.width
             wrapMode: Text.WordWrap
-            text: qsTr("The channel width filters a radio input; this audio arrives already demodulated.")
+            text: metrics.peerPassband === true
+                ? qsTr("On this input the rigctl peer demodulates; set its passband from the Monitor's Passband row.")
+                : qsTr("The channel width filters a radio input; this audio arrives already demodulated.")
+            color: Theme.textSecondary
+            font.pixelSize: Theme.fontSize(12)
+        }
+    }
+
+    // The explicit width of the other analog kind (AM, or NFM under the AM
+    // preset): a setting for the next switch to it, with no reading in force.
+    Column {
+        objectName: "radioAnalogOtherSection"
+        visible: sheet.otherWidthOffered
+        width: parent.width
+        spacing: 8
+        Text {
+            objectName: "radioAnalogOtherSectionTitle"
+            text: sheet.otherKindAm ? qsTr("AM channel width") : qsTr("NFM channel width")
+            color: Theme.textSecondary
+            font.pixelSize: Theme.fontSize(14)
+        }
+        Row {
+            objectName: "radioAnalogOtherBandwidth"
+            width: parent.width
+            spacing: 10
+            Text {
+                objectName: "radioAnalogOtherBandwidthValue"
+                width: parent.width - 116
+                anchors.verticalCenter: parent.verticalCenter
+                text: sheet.otherWidthConfigured > 0 ? Util.widthKhzText(sheet.otherWidthConfigured) : qsTr("default")
+                color: Theme.textPrimary
+                font.family: Theme.mono
+                font.pixelSize: Theme.fontSize(14)
+            }
+            OutlineButton {
+                objectName: "radioAnalogOtherBandwidthDown"
+                width: 48
+                text: "−"
+                accessibleName: sheet.otherKindAm ? qsTr("Narrower AM Channel") : qsTr("Narrower NFM Channel")
+                enabled: sheet.otherWidthCanNarrow
+                onClicked: sheet.stepOtherWidth(-1)
+            }
+            OutlineButton {
+                objectName: "radioAnalogOtherBandwidthUp"
+                width: 48
+                text: "+"
+                accessibleName: sheet.otherKindAm ? qsTr("Wider AM Channel") : qsTr("Wider NFM Channel")
+                enabled: sheet.otherWidthCanWiden
+                onClicked: sheet.stepOtherWidth(1)
+            }
+        }
+        OutlineButton {
+            objectName: "radioAnalogOtherBandwidthDefault"
+            visible: sheet.otherWidthConfigured > 0 && !sheet.rowScope
+            width: parent.width
+            text: qsTr("Use the default width")
+            accessibleName: sheet.otherKindAm ? qsTr("Default AM Channel Width") : qsTr("Default NFM Channel Width")
+            enabled: sheet.analogWidthEditable
+            onClicked: sheet.resetOtherWidth()
+        }
+        Text {
+            objectName: "radioAnalogOtherBandwidthIdleNote"
+            width: parent.width
+            wrapMode: Text.WordWrap
+            text: sheet.otherKindAm
+                ? qsTr("Used when AM is chosen, which needs a width the DSP rate can filter.")
+                : qsTr("Used when NFM is chosen, which needs a width the DSP rate can filter.")
             color: Theme.textSecondary
             font.pixelSize: Theme.fontSize(12)
         }

@@ -13,16 +13,20 @@
 
 #include <dsd-neo/app_control/history.h>
 #include <dsd-neo/app_control/snapshot.h>
+#include <dsd-neo/core/analog_tone.h>
 #include <dsd-neo/core/opts.h>
+#include <dsd-neo/core/power.h>
 #include <dsd-neo/core/safe_api.h>
 #include <dsd-neo/core/state.h>
-#include <dsd-neo/io/tcp_input.h>
+#include <dsd-neo/dsp/demod_pipeline.h>
 #include <dsd-neo/platform/file_compat.h>
+#include <dsd-neo/runtime/analog_tones.h>
 #include <dsd-neo/runtime/call_alert.h>
 #include <dsd-neo/runtime/config.h>
 #include <dsd-neo/runtime/decode_mode.h>
 #include <dsd-neo/runtime/radioreference.h>
 #include <dsd-neo/runtime/scan_mode.h>
+#include <dsd-neo/runtime/scan_options.h>
 #include <sndfile.h>
 #include <stdio.h>
 #include <string.h>
@@ -38,7 +42,6 @@
 static dsdneoRuntimeConfig g_cfg;
 static int g_cfg_valid = 1;
 static int g_stat_path_rc = -1;
-static int g_tcp_valid = 1;
 static int g_rr_available = 1;
 static char g_rr_builtin_key[64];
 static int g_env_int_value;
@@ -53,6 +56,14 @@ dsd_neo_get_config(void) {
     return g_cfg_valid ? &g_cfg : NULL;
 }
 
+/* The analog width view's reading of the unset NFM default where the channel filter runs but the rate cannot realize
+   the default: the legacy WIDE plan's passband, which no rate these cases run at falls back on. */
+int
+dsd_channel_lpf_legacy_wide_width_hz(int rate_hz) {
+    (void)rate_hz;
+    return 0;
+}
+
 int
 env_get_int(const char* name, int defv) {
     (void)name;
@@ -63,11 +74,6 @@ double
 env_get_double(const char* name, double defv) {
     (void)name;
     return g_env_double_has_value ? g_env_double_value : defv;
-}
-
-int
-tcp_input_is_valid(const tcp_input_ctx* ctx) {
-    return (ctx != NULL && g_tcp_valid) ? 1 : 0;
 }
 
 int
@@ -145,7 +151,6 @@ reset_fixture(dsd_opts* opts, dsd_state* state, UiCtx* ctx) {
     DSD_MEMSET(&g_cfg, 0, sizeof(g_cfg));
     g_cfg_valid = 1;
     g_stat_path_rc = -1;
-    g_tcp_valid = 1;
     g_rr_available = 1;
     g_rr_builtin_key[0] = '\0';
     g_env_int_value = 0;
@@ -169,6 +174,15 @@ test_predicates(void) {
     rc |= expect_int("rtl active null ctx", io_rtl_active(NULL), 0);
     opts.audio_in_type = AUDIO_IN_RTL;
     rc |= expect_int("rtl active input", io_rtl_active(&ctx), 1);
+
+    /* The squelch row: radio and audio input, not a symbol file (issue #628). */
+    rc |= expect_int("squelch row null ctx", io_squelch_offered(NULL), 0);
+    rc |= expect_int("squelch row on rtl", io_squelch_offered(&ctx), 1);
+    opts.audio_in_type = AUDIO_IN_TCP;
+    rc |= expect_int("squelch row on tcp audio", io_squelch_offered(&ctx), 1);
+    opts.audio_in_type = AUDIO_IN_SYMBOL_BIN;
+    rc |= expect_int("squelch row hidden on a symbol file", io_squelch_offered(&ctx), 0);
+    opts.audio_in_type = AUDIO_IN_RTL;
 
     rc |= expect_int("trunk predicate null ctx", trunk_enabled(NULL), 0);
     rc |= expect_int("trunk predicate off", trunk_enabled(&ctx), 0);
@@ -197,6 +211,17 @@ test_predicates(void) {
     rc |= expect_int("scan rotation trunk scan", scan_rotation_active(&ctx), 1);
     opts.trunk_scan_enabled = 0;
 
+    /* The frequency row is hidden while --trunk-scan owns the tuner, which refuses a manual tune; -Y and plain
+       sessions keep it. */
+    rc |= expect_int("frequency row null ctx", rtl_freq_offered(NULL), 1);
+    rc |= expect_int("frequency row plain session", rtl_freq_offered(&ctx), 1);
+    opts.scanner_mode = 1;
+    rc |= expect_int("frequency row under -Y", rtl_freq_offered(&ctx), 1);
+    opts.scanner_mode = 0;
+    opts.trunk_scan_enabled = 1;
+    rc |= expect_int("frequency row hidden under trunk scan", rtl_freq_offered(&ctx), 0);
+    opts.trunk_scan_enabled = 0;
+
     rc |= expect_int("provoice predicate null ctx", provoice_active(NULL), 0);
     rc |= expect_int("provoice predicate off", provoice_active(&ctx), 0);
     opts.frame_provoice = 1;
@@ -219,6 +244,12 @@ test_decoder_labels(void) {
     rc |= expect_str("decode mode dmr", lbl_decode_mode(&ctx, b, sizeof(b)), "Mode... [DMR]");
     dsd_test_scan_labels_set(1, DSD_SCAN_MODE_P25);
     rc |= expect_str("decode mode with row override", lbl_decode_mode(&ctx, b, sizeof(b)), "Mode... [DMR; scan p25]");
+    /* Issue #526: an nfm row reads as its class, beside the configured digital mode it will return to. */
+    dsd_test_scan_labels_set(1, DSD_SCAN_MODE_NFM);
+    rc |= expect_str("decode mode on an nfm row", lbl_decode_mode(&ctx, b, sizeof(b)), "Mode... [DMR; scan nfm]");
+    /* ...and an am row as its own class, not as NFM. */
+    dsd_test_scan_labels_set(1, DSD_SCAN_MODE_AM);
+    rc |= expect_str("decode mode on an am row", lbl_decode_mode(&ctx, b, sizeof(b)), "Mode... [DMR; scan am]");
     dsd_test_scan_labels_set(0, DSD_SCAN_MODE_INHERIT);
     opts.monitor_input_audio = 1;
     opts.use_cosine_filter = 1;
@@ -283,9 +314,9 @@ test_decoder_labels(void) {
     opts.use_hpf = 0;
     opts.use_pbf = 1;
     opts.use_hpf_d = 0;
-    rc |= expect_str("lpf on", lbl_lpf(&ctx, b, sizeof(b)), "Low-pass filter [On]");
-    rc |= expect_str("hpf off", lbl_hpf(&ctx, b, sizeof(b)), "High-pass filter [Off]");
-    rc |= expect_str("pbf on", lbl_pbf(&ctx, b, sizeof(b)), "Pulse-shaping band-pass [On]");
+    rc |= expect_str("lpf on", lbl_lpf(&ctx, b, sizeof(b)), "Low-pass filter (960 Hz) [On]");
+    rc |= expect_str("hpf off", lbl_hpf(&ctx, b, sizeof(b)), "High-pass filter (960 Hz) [Off]");
+    rc |= expect_str("pbf on", lbl_pbf(&ctx, b, sizeof(b)), "Voice band-pass [On]");
     rc |= expect_str("hpf digital off", lbl_hpf_d(&ctx, b, sizeof(b)), "Digital high-pass filter [Off]");
     /* The M17 row can disable the effective filter while the configured value
      * shown by this toggle remains enabled. */
@@ -601,12 +632,17 @@ test_input_and_audio_labels(void) {
     opts.audio_gain = 12.0f;
     rc |= expect_str("digital gain set", lbl_gain_dig(&ctx, b, sizeof(b)), "Digital gain... [12]");
     rc |= expect_str("analog gain", lbl_gain_ana(&ctx, b, sizeof(b)), "Analog gain... [50]");
+    /* 0 is auto, the analog AGC (the default since issue #518). */
+    opts.audio_gainA = 0.0f;
+    rc |= expect_str("analog gain auto", lbl_gain_ana(&ctx, b, sizeof(b)), "Analog gain... [auto]");
+    opts.audio_gainA = 50.0f;
 
+    /* The label reads the snapshot's context pointer without following it: the decoder frees the context a reconnect
+       or a switch replaces (issue #634). A disconnected input has none. */
     opts.audio_in_type = AUDIO_IN_TCP;
     opts.tcp_in_ctx = (tcp_input_ctx*)0x1;
-    g_tcp_valid = 1;
     rc |= expect_str("tcp on", lbl_tcp(&ctx, b, sizeof(b)), "TCP audio: tcp.example:7355 [On]");
-    g_tcp_valid = 0;
+    opts.tcp_in_ctx = NULL;
     rc |= expect_str("tcp off", lbl_tcp(&ctx, b, sizeof(b)), "TCP audio: tcp.example:7355 [Off]");
     opts.tcp_hostname[0] = '\0';
     rc |= expect_str("tcp unconfigured", lbl_tcp(&ctx, b, sizeof(b)), "TCP audio... [Off]");
@@ -630,6 +666,176 @@ test_input_and_audio_labels(void) {
     opts.call_alert_events = DSD_CALL_ALERT_EVENT_VOICE_START | DSD_CALL_ALERT_EVENT_DATA;
     rc |= expect_str("call alert start data", lbl_call_alert_events(&ctx, b, sizeof(b)), "Alert on... [Start+Data]");
 
+    /* Input > Squelch names the configured setting it edits (issue #518 follow-up), on audio input as on a radio input
+       (issue #628). */
+    dsd_scan_settings configured = {0};
+    opts.audio_in_type = AUDIO_IN_UDP;
+    opts.rtl_squelch_level = 0.0;
+    rc |= expect_str("squelch off", lbl_input_sql(&ctx, b, sizeof(b)), "Squelch... [off]");
+    opts.rtl_squelch_level = dsd_squelch_level_from_sql(-60.0);
+    rc |= expect_str("squelch level", lbl_input_sql(&ctx, b, sizeof(b)), "Squelch... [-60.0 dB]");
+    opts.rtl_squelch_mode = DSD_SQUELCH_MODE_AUTO;
+    opts.rtl_squelch_margin_db = 10;
+    rc |= expect_str("squelch auto", lbl_input_sql(&ctx, b, sizeof(b)), "Squelch... [auto +10 dB]");
+    opts.rtl_squelch_mode = DSD_SQUELCH_MODE_NOISE;
+    opts.rtl_squelch_margin_db = 14;
+    rc |= expect_str("squelch noise", lbl_input_sql(&ctx, b, sizeof(b)), "Squelch... [noise +14 dB]");
+    opts.rtl_squelch_mode = DSD_SQUELCH_MODE_AUTO;
+    opts.rtl_squelch_margin_db = 10;
+    /* Under a scan row, the default beneath it. */
+    configured.rtl_squelch_mode = DSD_SQUELCH_MODE_LEVEL;
+    configured.rtl_squelch_level = dsd_squelch_level_from_sql(-80.0);
+    dsd_test_scan_labels_configured(&configured);
+    rc |= expect_str("squelch under a row", lbl_input_sql(&ctx, b, sizeof(b)), "Squelch... [-80.0 dB]");
+    dsd_test_scan_labels_configured(NULL);
+    opts.rtl_squelch_mode = DSD_SQUELCH_MODE_LEVEL;
+    rc |= expect_str("squelch null ctx", lbl_input_sql(NULL, b, sizeof(b)), "Squelch... [off]");
+
+    return rc;
+}
+
+/*
+ * Input > NFM bandwidth... and AM bandwidth... (issues #524, #525) name the configured width they edit, a setting
+ * rather than a reading: an explicit width as set, the unset default as "default" (the status line shows what that
+ * gives), and under a live scan scope the configured width beneath a row's own (issue #526). In every build, and on
+ * audio input with a rigctl peer (-U), where the width is the passband the peer is asked for (issue #621): the rows say
+ * so, and an unset NFM width reads as what stands in for it, -B or the peer's own passband.
+ */
+static int
+test_input_width_labels(void) {
+    int rc = 0;
+    char b[160];
+    static dsd_opts opts;
+    static dsd_state state;
+    UiCtx ctx;
+    reset_fixture(&opts, &state, &ctx);
+
+    /* A radio input: the channel filter. */
+    opts.audio_in_type = AUDIO_IN_RTL;
+    rc |= expect_str("nfm bandwidth default", lbl_input_nfm_bw(&ctx, b, sizeof(b)), "NFM bandwidth... [default]");
+    opts.analog_nfm_bandwidth_hz = 12500;
+    rc |= expect_str("nfm bandwidth explicit", lbl_input_nfm_bw(&ctx, b, sizeof(b)), "NFM bandwidth... [12.5 kHz]");
+    opts.analog_nfm_bandwidth_hz = 16000;
+    rc |= expect_str("nfm bandwidth explicit default value", lbl_input_nfm_bw(&ctx, b, sizeof(b)),
+                     "NFM bandwidth... [16 kHz]");
+    opts.analog_nfm_bandwidth_hz = 11250;
+    rc |= expect_str("nfm bandwidth 11.25", lbl_input_nfm_bw(&ctx, b, sizeof(b)), "NFM bandwidth... [11.25 kHz]");
+    /* Under an nfm scan row with its own width, dsd_opts holds the row's 12.5 kHz; the row names the configured width,
+       the one it edits. */
+    dsd_scan_settings configured = {0};
+    configured.analog_nfm_bandwidth_hz = 20000;
+    dsd_test_scan_labels_configured(&configured);
+    opts.analog_nfm_bandwidth_hz = 12500;
+    rc |= expect_str("nfm bandwidth under a width row", lbl_input_nfm_bw(&ctx, b, sizeof(b)),
+                     "NFM bandwidth... [20 kHz]");
+    dsd_test_scan_labels_configured(NULL);
+    opts.analog_nfm_bandwidth_hz = 0;
+    rc |= expect_str("am bandwidth default", lbl_input_am_bw(&ctx, b, sizeof(b)), "AM bandwidth... [default]");
+    opts.analog_am_bandwidth_hz = 12500;
+    rc |= expect_str("am bandwidth explicit", lbl_input_am_bw(&ctx, b, sizeof(b)), "AM bandwidth... [12.5 kHz]");
+    configured.analog_nfm_bandwidth_hz = 0;
+    configured.analog_am_bandwidth_hz = 8000;
+    dsd_test_scan_labels_configured(&configured);
+    rc |= expect_str("am bandwidth under a scan row", lbl_input_am_bw(&ctx, b, sizeof(b)), "AM bandwidth... [8 kHz]");
+    dsd_test_scan_labels_configured(NULL);
+    opts.analog_am_bandwidth_hz = 0;
+    rc |= expect_str("nfm bandwidth null ctx", lbl_input_nfm_bw(NULL, b, sizeof(b)), "NFM bandwidth... [default]");
+    rc |= expect_str("am bandwidth null ctx", lbl_input_am_bw(NULL, b, sizeof(b)), "AM bandwidth... [default]");
+
+    /* A radio input with a live rigctl peer: the peer only follows the frequency, so the rows stay the channel filter,
+       and -B stands in for nothing. */
+    opts.use_rigctl = 1;
+    opts.rigctl_sockfd = (dsd_socket_t)5;
+    opts.setmod_bw = 12500;
+    rc |= expect_str("nfm bandwidth on a radio with a peer", lbl_input_nfm_bw(&ctx, b, sizeof(b)),
+                     "NFM bandwidth... [default]");
+    rc |= expect_str("am bandwidth on a radio with a peer", lbl_input_am_bw(&ctx, b, sizeof(b)),
+                     "AM bandwidth... [default]");
+
+    /* Audio input with a rigctl peer: the passband the peer is asked for; -B stands in for an unset NFM width. */
+    opts.audio_in_type = AUDIO_IN_UDP;
+    rc |= expect_str("nfm passband -B", lbl_input_nfm_bw(&ctx, b, sizeof(b)), "NFM passband... [-B 12.5 kHz]");
+    opts.setmod_bw = 0;
+    rc |= expect_str("nfm passband peer's own", lbl_input_nfm_bw(&ctx, b, sizeof(b)), "NFM passband... [peer's own]");
+    opts.analog_nfm_bandwidth_hz = 12500;
+    rc |= expect_str("nfm passband explicit", lbl_input_nfm_bw(&ctx, b, sizeof(b)), "NFM passband... [12.5 kHz]");
+    opts.analog_nfm_bandwidth_hz = 0;
+    opts.setmod_bw = 12500;
+    rc |= expect_str("am passband default", lbl_input_am_bw(&ctx, b, sizeof(b)), "AM passband... [default]");
+    opts.analog_am_bandwidth_hz = 8000;
+    rc |= expect_str("am passband explicit", lbl_input_am_bw(&ctx, b, sizeof(b)), "AM passband... [8 kHz]");
+    opts.analog_am_bandwidth_hz = 0;
+    /* Audio input without a live peer edits nothing the session uses: the rows keep the plain wording. */
+    opts.rigctl_sockfd = DSD_INVALID_SOCKET;
+    rc |= expect_str("nfm bandwidth peer gone", lbl_input_nfm_bw(&ctx, b, sizeof(b)), "NFM bandwidth... [default]");
+    opts.rigctl_sockfd = (dsd_socket_t)5;
+    opts.use_rigctl = 0;
+    rc |= expect_str("nfm bandwidth rigctl off", lbl_input_nfm_bw(&ctx, b, sizeof(b)), "NFM bandwidth... [default]");
+    return rc;
+}
+
+/*
+ * Audio > Tone filter... reads the policy the configuration sets, from the shared app-control view the Call Info line
+ * and the Qt monitor read: "off", or the mode and its list, and while a scan row's own policy is on air that policy
+ * with the configured one it shadows, "(row; default X)". A long list's overflow mark is ASCII here, as every menu
+ * label is. Before the first snapshot it reads the menu's own options, the policy its picker opens on, not "off".
+ */
+static int
+test_tone_filter_label(void) {
+    int rc = 0;
+    char b[192];
+    static dsd_opts opts;
+    static dsd_state state;
+    UiCtx ctx;
+    reset_fixture(&opts, &state, &ctx);
+    dsd_test_scan_labels_tone_policy(DSD_TONE_FILTER_OFF, NULL);
+    rc |= expect_str("tone filter off", lbl_tone_filter(&ctx, b, sizeof(b)), "Tone filter... [off]");
+    dsd_tone_set set;
+    DSD_MEMSET(&set, 0, sizeof(set));
+    (void)dsd_tone_set_parse("D023N/100", &set, NULL, 0);
+    dsd_test_scan_labels_tone_policy(DSD_TONE_FILTER_ALLOW, &set);
+    rc |= expect_str("tone filter allow", lbl_tone_filter(&ctx, b, sizeof(b)), "Tone filter... [allow 100.0 Hz/D023N]");
+    /* Off keeps its list, and reads off. */
+    dsd_test_scan_labels_tone_policy(DSD_TONE_FILTER_OFF, &set);
+    rc |= expect_str("tone filter off with a list", lbl_tone_filter(&ctx, b, sizeof(b)), "Tone filter... [off]");
+
+    /* An nfm row with its own policy on air: dsd_opts holds the row's, the configured view the default. */
+    dsd_scan_settings configured = {0};
+    configured.analog_tone_filter = DSD_TONE_FILTER_ALLOW;
+    configured.analog_tone_set = set;
+    dsd_test_scan_labels_configured(&configured);
+    dsd_scan_option_values row = {0};
+    row.present = DSD_SCAN_OPT_TONE;
+    row.tone_filter = DSD_TONE_FILTER_BLOCK;
+    (void)dsd_tone_set_parse("67.0", &row.tone_set, NULL, 0);
+    dsd_test_scan_labels_row_options(&row);
+    dsd_test_scan_labels_tone_policy(DSD_TONE_FILTER_BLOCK, &row.tone_set);
+    rc |= expect_str("tone filter under a row", lbl_tone_filter(&ctx, b, sizeof(b)),
+                     "Tone filter... [block 67.0 Hz (row; default allow 100.0 Hz/D023N)]");
+    dsd_test_scan_labels_row_options(NULL);
+    dsd_test_scan_labels_configured(NULL);
+
+    /* A long list says how much it left out, in ASCII. */
+    (void)dsd_tone_set_parse("67/69.3/71.9/74.4/77/79.7/82.5/85.4/88.5/91.5/94.8/97.4/100/103.5/D023/D025/D026", &set,
+                             NULL, 0);
+    dsd_test_scan_labels_tone_policy(DSD_TONE_FILTER_BLOCK, &set);
+    const char* label = lbl_tone_filter(&ctx, b, sizeof(b));
+    rc |= expect_int("tone filter long list",
+                     strncmp(label, "Tone filter... [block 67.0 Hz/69.3 Hz/", 38) == 0 && strstr(label, "...+") != NULL
+                         && strstr(label, "\xE2\x80\xA6") == NULL && label[strlen(label) - 1U] == ']',
+                     1);
+    dsd_test_scan_labels_tone_policy(DSD_TONE_FILTER_OFF, NULL);
+
+    /* No snapshot yet: the menu's own options, with no state. */
+    opts.analog_tone_filter = DSD_TONE_FILTER_ALLOW;
+    (void)dsd_tone_set_parse("D023N/100", &opts.analog_tone_set, NULL, 0);
+    dsd_test_scan_labels_set(0, DSD_SCAN_MODE_INHERIT);
+    rc |= expect_str("tone filter before snapshots", lbl_tone_filter(&ctx, b, sizeof(b)),
+                     "Tone filter... [allow 100.0 Hz/D023N]");
+    rc |= expect_str("tone filter without a context", lbl_tone_filter(NULL, b, sizeof(b)), "Tone filter... [off]");
+    dsd_test_scan_labels_set(1, DSD_SCAN_MODE_INHERIT);
+    opts.analog_tone_filter = DSD_TONE_FILTER_OFF;
+    DSD_MEMSET(&opts.analog_tone_set, 0, sizeof(opts.analog_tone_set));
     return rc;
 }
 
@@ -659,10 +865,22 @@ test_recording_labels(void) {
     opts.audio_in_type = AUDIO_IN_SYMBOL_BIN;
     DSD_SNPRINTF(opts.audio_in_dev, sizeof(opts.audio_in_dev), "%s", "last.bin");
     rc |= expect_str("stop replay on", lbl_stop_symbol_playback(&ctx, b, sizeof(b)), "Stop replay [last.bin]");
+    /* A WAV file is a playback the row stops too (issue #634). */
+    opts.symbolfile = NULL;
+    opts.audio_in_type = AUDIO_IN_WAV;
+    DSD_SNPRINTF(opts.audio_in_dev, sizeof(opts.audio_in_dev), "%s", "voice.wav");
+    rc |= expect_str("stop replay on a wav", lbl_stop_symbol_playback(&ctx, b, sizeof(b)), "Stop replay [voice.wav]");
+    opts.audio_in_type = AUDIO_IN_PULSE;
+    DSD_SNPRINTF(opts.audio_in_dev, sizeof(opts.audio_in_dev), "%s", "pulse");
+    rc |= expect_str("stop replay off on pulse", lbl_stop_symbol_playback(&ctx, b, sizeof(b)), "Stop replay [Off]");
+    /* Replay last names the last capture closed, not the input: a file that exists by the input's name is no
+       capture (issue #634). */
     g_stat_path_rc = 0;
+    rc |= expect_str("replay last none", lbl_replay_last(&ctx, b, sizeof(b)), "Replay last capture [none]");
+    DSD_SNPRINTF(opts.symbol_capture_last, sizeof(opts.symbol_capture_last), "%s", "last.bin");
     rc |= expect_str("replay last available", lbl_replay_last(&ctx, b, sizeof(b)), "Replay last capture [last.bin]");
     g_stat_path_rc = -1;
-    rc |= expect_str("replay last none", lbl_replay_last(&ctx, b, sizeof(b)), "Replay last capture [none]");
+    opts.symbol_capture_last[0] = '\0';
 
     rc |= expect_str("event log off", lbl_event_log(&ctx, b, sizeof(b)), "Event log file... [off]");
     DSD_SNPRINTF(opts.event_out_file, sizeof(opts.event_out_file), "%s", "events.log");
@@ -824,6 +1042,8 @@ main(void) {
     rc |= test_trunking_labels();
     rc |= test_encryption_labels();
     rc |= test_input_and_audio_labels();
+    rc |= test_input_width_labels();
+    rc |= test_tone_filter_label();
     rc |= test_recording_labels();
     rc |= test_display_and_advanced_labels();
     rc |= test_radioreference_labels_and_predicates();

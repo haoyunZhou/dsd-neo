@@ -77,6 +77,11 @@ typedef struct dsd_frontend_metrics {
     /* dsd_frontend_channel_lpf_default. The width the analog monitor returns to from a CQPSK toggle or a typed
      * digital scan row follows it, not the demod rate it runs at then. */
     int channel_lpf_default;
+    /* The demodulator kind (DSD_ANALOG_DEMOD_*) of the analog profile behind
+     * channel_bandwidth_hz, or -1 when it is not an analog monitor width: no
+     * radio, digital output (including a typed scan row's profile), or the M17
+     * encoder's monitor path, which publishes no analog profile. */
+    int channel_analog_kind;
     uint32_t stream_generation;
     int stream_active;
     dsd_input_level_snapshot input_level;
@@ -125,8 +130,8 @@ enum {
     DSD_FRONTEND_SNR_FALLBACK_C4FM_EYE = 1u << 0,
     DSD_FRONTEND_SNR_FALLBACK_GFSK_EYE = 1u << 1,
     DSD_FRONTEND_SNR_FALLBACK_QPSK_CONST = 1u << 2,
-    DSD_FRONTEND_SNR_FALLBACK_ALL =
-        DSD_FRONTEND_SNR_FALLBACK_C4FM_EYE | DSD_FRONTEND_SNR_FALLBACK_GFSK_EYE | DSD_FRONTEND_SNR_FALLBACK_QPSK_CONST
+    DSD_FRONTEND_SNR_FALLBACK_ALL = DSD_FRONTEND_SNR_FALLBACK_C4FM_EYE | DSD_FRONTEND_SNR_FALLBACK_GFSK_EYE
+        | DSD_FRONTEND_SNR_FALLBACK_QPSK_CONST
 };
 
 int dsd_app_frontend_get_metrics(dsd_frontend_metrics* out);

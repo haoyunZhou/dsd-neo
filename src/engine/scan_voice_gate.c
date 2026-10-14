@@ -8,8 +8,11 @@
 #include <dsd-neo/core/safe_api.h>
 #include <dsd-neo/core/state.h>
 #include <dsd-neo/core/talkgroup_policy.h>
+#include <dsd-neo/dsp/analog_rx.h>
 #include <dsd-neo/engine/channel_scan.h>
 #include <dsd-neo/engine/scan_voice_gate.h>
+#include <dsd-neo/runtime/analog_tones.h>
+#include <dsd-neo/runtime/decode_clock.h>
 
 #include <math.h>
 #include <stdint.h>
@@ -24,9 +27,57 @@
 #define DSD_SCAN_VOICE_DEFAULT_QUALIFY_MS 1000
 #define DSD_SCAN_VOICE_DEFAULT_HOLD_MS    2000
 
+/* The gate waits for decoded voice, which an analog row never produces: its carrier holds it instead. */
 static int
 scan_voice_gate_enabled(const dsd_opts* opts) {
-    return opts && opts->scan_voice_only == 1;
+    return opts && opts->scan_voice_only == 1 && !dsd_opts_is_analog_family(opts);
+}
+
+/* The analog carrier on air, before the tone policy has its say: dsd_scan_analog_carrier_open() without the verdict. */
+static int
+scan_analog_carrier_heard(const dsd_opts* opts, const dsd_state* state) {
+    if (!opts || !state || opts->trunk_enable == 1 || state->carrier != 0 || !dsd_analog_monitor_tap_active(opts)) {
+        return 0;
+    }
+    /* The tap's carrier, and only for the channel the receiver is on now: a read from before a retune says
+       nothing about the new row. */
+    if (!dsd_analog_rx_carrier_open_now(opts, state)) {
+        return 0;
+    }
+    /* An input that stopped delivering leaves its last word published; past this the pause has outlasted
+       the hangover (rx_tone_view.c reads it the same way). */
+    const uint64_t stale_after_ms = state->analog_rx.stale_after_ms;
+    return stale_after_ms == 0U || dsd_realtime_mono_ms() <= stale_after_ms;
+}
+
+int
+dsd_scan_analog_tone_gate(const dsd_opts* opts, const dsd_state* state) {
+    if (!scan_analog_carrier_heard(opts, state)) {
+        return DSD_ANALOG_TONE_GATE_OFF;
+    }
+    return dsd_analog_tone_gate_in_force(opts, state);
+}
+
+int
+dsd_scan_analog_tone_rejection_ended(const dsd_opts* opts, const dsd_state* state) {
+    if (!opts || !state || opts->trunk_enable == 1 || state->carrier != 0 || !dsd_analog_monitor_tap_active(opts)
+        || scan_analog_carrier_heard(opts, state)) {
+        return 0;
+    }
+    if (dsd_analog_rx_carrier_open_now(opts, state)) {
+        /* Published open but no longer heard: an input that stopped delivering, past its deadline. A rejection it left
+           published ended with it. */
+        return dsd_analog_tone_gate_in_force(opts, state) == DSD_ANALOG_TONE_GATE_REJECTED;
+    }
+    return dsd_analog_rx_rejection_ended_now(opts, state);
+}
+
+int
+dsd_scan_analog_carrier_open(const dsd_opts* opts, const dsd_state* state) {
+    /* Only traffic the tone policy passes is activity (issue #527): a rejected carrier holds nothing, and one still
+       being checked holds the row only through its verdict (dsd_scan_analog_tone_gate()), leaving no tail. */
+    return scan_analog_carrier_heard(opts, state)
+           && dsd_analog_tone_gate_passes(dsd_analog_tone_gate_in_force(opts, state));
 }
 
 static int
@@ -460,7 +511,8 @@ scan_y_timing_span_ms(double seconds) {
 static void
 scan_y_timing_fill_hangtime(const dsd_opts* opts, const dsd_state* state, double now_m, double now_wall_s,
                             dsd_scan_timing_publication* out) {
-    out->reason = (uint8_t)DSD_SCAN_STAY_HANGTIME;
+    /* An analog row's carrier keeps restarting the same window (issue #526): say what holds it. */
+    out->reason = (uint8_t)(dsd_scan_analog_carrier_open(opts, state) ? DSD_SCAN_STAY_CARRIER : DSD_SCAN_STAY_HANGTIME);
     out->dwell_ms = 0U;
     out->hold_ms = 0U;
     if (state->last_cc_sync_time == 0 || !(opts->trunk_hangtime >= 0.0f)) {
@@ -494,6 +546,18 @@ dsd_engine_scan_y_timing_tick(const dsd_opts* opts, dsd_state* state, double now
          * returns early, so publishing a deadline would count down to a hop that the
          * release, not the clock, actually causes. */
         report.reason = (uint8_t)DSD_SCAN_STAY_MANUAL_HOLD;
+    } else if (dsd_scan_analog_tone_gate(opts, state) == DSD_ANALOG_TONE_GATE_REJECTED) {
+        /* Traffic the tone policy rejected (issue #527) holds the row only while the list has nowhere else to go,
+           muted, for as long as its carrier lasts; with somewhere to go the next pass steps. Either way no window
+           runs (engine.c no_carrier_scanner_step_is_due()), and the hangtime window the carrier no longer restarts
+           would count down to a step that never comes. */
+        report.reason = (uint8_t)DSD_SCAN_STAY_CARRIER;
+    } else if (dsd_scan_analog_tone_gate(opts, state) == DSD_ANALOG_TONE_GATE_PENDING) {
+        /* A carrier the tone policy is still checking (issue #527) holds the row until its verdict, whatever -t says
+           (engine.c no_carrier_scanner_step_is_due()), for no longer than the policy's window. It is no activity and
+           restarts no window: the hangtime runs on beneath it from the last carrier the policy passed, or the row's
+           landing, so nothing counts down to a step the check itself decides. */
+        report.reason = (uint8_t)DSD_SCAN_STAY_TONE_PENDING;
     } else if (dsd_scan_voice_gate_owns_step(opts, state)) {
         scan_y_timing_fill_gate(state, &report);
     } else {

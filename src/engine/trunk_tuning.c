@@ -5,7 +5,7 @@
 
 #include <dsd-neo/core/audio.h>
 #include <dsd-neo/core/call_state.h>
-#include <dsd-neo/core/dsd_time.h>
+#include <dsd-neo/core/channel_mode.h>
 #include <dsd-neo/core/events.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/state.h>
@@ -20,15 +20,20 @@
 #include <dsd-neo/protocol/dmr/dmr_block.h>
 #include <dsd-neo/protocol/p25/p25_sm_watchdog.h>
 #include <dsd-neo/protocol/p25/p25p2_frame.h>
+#include <dsd-neo/runtime/analog_channel.h>
 #include <dsd-neo/runtime/config.h>
+#include <dsd-neo/runtime/decode_clock.h>
 #include <dsd-neo/runtime/decode_mode.h>
+#include <dsd-neo/runtime/rigctl_passband.h>
+#include <dsd-neo/runtime/scan_mode.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
-#include <time.h>
 #include "dsd-neo/core/opts_fwd.h"
 #include "dsd-neo/core/safe_api.h"
 #include "dsd-neo/core/state_fwd.h"
 #include "dsd-neo/runtime/trunk_tuning_hooks.h"
+#include "scan_analog_internal.h"
 
 static int DSD_ATTR_USED
 dsd_engine_current_demod_rate(const dsd_opts* opts, const dsd_state* state) {
@@ -152,7 +157,7 @@ dsd_engine_release_tuned_call_state(dsd_opts* opts, dsd_state* state) {
     if (!opts || !state) {
         return;
     }
-    const double ended_m = dsd_time_now_monotonic_s();
+    const double ended_m = dsd_decode_now_mono_s();
     for (int slot = 0; slot < DSD_CALL_STATE_SLOT_COUNT; slot++) {
         // The state machine is leaving this voice channel by decision, not because the carrier
         // went away, so nothing that follows on the control channel may be read as this
@@ -182,6 +187,8 @@ dsd_engine_release_tuned_call_state(dsd_opts* opts, dsd_state* state) {
     state->dmr_fidR = 0;
     dmr_enc_class_reset(state, 0);
     dmr_enc_class_reset(state, 1);
+    dmr_le_vendor_reset(state, 0);
+    dmr_le_vendor_reset(state, 1);
     state->payload_algid = 0;
     state->payload_algidR = 0;
     state->payload_keyid = 0;
@@ -192,6 +199,8 @@ dsd_engine_release_tuned_call_state(dsd_opts* opts, dsd_state* state) {
     state->payload_miN = 0;
     state->p25_vc_freq[0] = 0;
     state->p25_vc_freq[1] = 0;
+    DSD_MEMSET(state->p25_conventional_grant_freq, 0, sizeof(state->p25_conventional_grant_freq));
+    DSD_MEMSET(state->p25_conventional_grant_target, 0, sizeof(state->p25_conventional_grant_target));
     state->trunk_vc_freq[0] = 0;
     state->trunk_vc_freq[1] = 0;
     state->p25_p2_audio_allowed[0] = 0;
@@ -209,6 +218,8 @@ dsd_engine_release_tuned_call_state(dsd_opts* opts, dsd_state* state) {
 #ifdef USE_RADIO
 typedef struct {
     int active;
+    /* The front end runs the analog monitor output (rtl_stream_get_analog_profile()). */
+    int analog_monitor;
     int rf_mod;
     int p25_vc_cqpsk_override;
     int rtl_cqpsk_enable;
@@ -267,6 +278,7 @@ dsd_engine_rtl_profile_snapshot_capture(const dsd_opts* opts, const dsd_state* s
         return;
     }
     snapshot->active = 1;
+    snapshot->analog_monitor = rtl_stream_get_analog_profile(NULL, NULL, NULL) ? 1 : 0;
     snapshot->rf_mod = state->rf_mod;
     snapshot->p25_vc_cqpsk_override = state->p25_vc_cqpsk_override;
     (void)rtl_stream_get_cqpsk_status(&snapshot->rtl_cqpsk_enable, NULL);
@@ -284,6 +296,12 @@ dsd_engine_rtl_profile_snapshot_restore(dsd_state* state, const dsd_engine_rtl_p
     rtl_stream_clear_pending_retune_profile();
     state->rf_mod = snapshot->rf_mod;
     state->p25_vc_cqpsk_override = snapshot->p25_vc_cqpsk_override;
+    if (snapshot->analog_monitor) {
+        /* The front end was on the analog monitor (an analog scan row, issue #526) and the retune that
+         * would have moved it never landed. It still runs that profile, and a symbol profile applied on
+         * top of it would take the monitor output away. */
+        return;
+    }
     /* Queue the restore for the demod thread instead of mutating demod state
      * from this thread. A saved override wins over the plain TED SPS; with
      * neither saved, ted_sps=0 clears any override left behind. */
@@ -323,6 +341,69 @@ dsd_engine_prepare_p25_cc_rtl_chain(const dsd_opts* opts, dsd_state* state, long
                                                  profile, ted_sps, 0);
 }
 
+/* Whether a digital retune carries the digital family, which lands it where the digital family's prediction says
+ * (rtl_stream_output_rate_for_family()), after an analog scan row or target (issues #526, #583). A retune preparation
+ * decides it once, and the GFSK chain's TED and the digital family it attaches both follow that one answer. Only when
+ * the configured mode is digital, and when the scan row the retune is for was timed for the digital family's landing
+ * (dsd_scan_mode_take_timed_digital_family(); with @p spend the decision is taken, so a later retune no timing of the
+ * row preceded decides afresh), or the front end runs the analog family now, or the work already outstanding lands a
+ * family (rtl_stream_family_landing_after_pending()). The retune queued here lands after that work: an analog target's
+ * retune still in flight when the operator moves on, or a width edit for it still queued, would otherwise leave its
+ * symbol profile on the analog monitor, and a retune that carries the digital family still outstanding moves the
+ * output rate to that family's landing, which this retune then has to land on too, as the decoder is timed for it.
+ * Without a scan row (a plain -T retune, a control channel outside a scan) the stream's answer decides alone.
+ *
+ * The row's timing asked the stream the same question first (dsd_scan_mode_symbol_timing_rate_hz()). Only the decoder
+ * thread queues receive requests and retunes, while the controller and demod threads only resolve them, so between
+ * the two reads the answer can only fall from 1 to 0 (an analog retune that fails, or is refused where it lands, a
+ * request retired or replaced), which the row's own decision absorbs: its retune still carries the family the decoder
+ * and its TED were timed for. It cannot rise from 0 to 1 for a row's retune: the scanners prepare it straight after
+ * timing the row (trunk_scan_switch_to(), channel_scan_start_row()), queueing no receive work in between, the decoder
+ * thread queues analog work only for an analog row or target (its retune, and the width
+ * trunk_scan_reapply_analog_width() asks again once that lands), with no row on air or at a scan's leave (app-control
+ * asks for the analog monitor only when the options in force run it, and not while a command holds the scope
+ * suspended), and it queues a retune that carries the digital family only as a row's or a control channel's own retune,
+ * here, none of which leaves a digital row's timing behind it. */
+static int
+dsd_engine_retune_lands_digital_family(const dsd_opts* opts, const dsd_state* state, int spend) {
+    const int timed_digital_family =
+        spend ? dsd_scan_mode_take_timed_digital_family(state) : dsd_scan_mode_timed_digital_family(state);
+    return dsd_scan_mode_configured_digital(opts, state)
+           && (timed_digital_family || rtl_stream_family_landing_after_pending());
+}
+
+/* Whether the CQPSK state of the symbol profile queued for the parked trunk-scan target is the target's own choice,
+ * which stands over DSD_NEO_CQPSK where a retune out of the analog family lands (issue #583), as it does on a retune
+ * that stays on the digital family: a P25 target with a modulation value (c4fm, cqpsk or auto:
+ * dsd_engine_trunk_scan_active_p25_cqpsk_request() answers), or a DMR or NXDN target, whose GFSK chain always queues
+ * CQPSK off. A P25 target with no modulation, a -Y row and a plain -T retune (no coordinator) land where an open of the
+ * mode would. The decoder's timing decides the same from the scan scope (dsd_scan_mode_symbol_timing_rate_hz()). */
+static int
+dsd_engine_trunk_scan_cqpsk_explicit(const dsd_state* state) {
+    int requested_cqpsk = 0;
+    return (dsd_engine_trunk_scan_active_p25_cqpsk_request(state, &requested_cqpsk)
+            || dsd_engine_trunk_scan_active_gfsk_symbol_rate(state) > 0)
+               ? 1
+               : 0;
+}
+
+/* The output rate a four-level GFSK profile for @p symbol_rate_hz runs at once the retune lands: the stream's live
+ * rate, or the digital family's when the retune carries that family (@p lands_digital_family, the preparation's
+ * dsd_engine_retune_lands_digital_family()), which it lands on from the analog monitor, resampled to its audio rate,
+ * or from a digital front end alike. A trunk-scan target's FSK stands over DSD_NEO_CQPSK there
+ * (dsd_engine_trunk_scan_cqpsk_explicit()). */
+static int
+dsd_engine_gfsk_landing_rate(const dsd_state* state, int symbol_rate_hz, int lands_digital_family) {
+    if (lands_digital_family) {
+        const unsigned int landing_hz = rtl_stream_output_rate_for_family(DSD_RX_FAMILY_DIGITAL, 0, symbol_rate_hz,
+                                                                          dsd_engine_trunk_scan_cqpsk_explicit(state));
+        if (landing_hz > 0U) {
+            return (int)landing_hz;
+        }
+    }
+    return (int)rtl_stream_output_rate(state->rtl_ctx);
+}
+
 /*
  * Four-level GFSK control/park channel. The symbol rate is a parameter because the family spans
  * two of them: DMR and NXDN96 at 4800 sym/s in a 12.5 kHz channel, NXDN48 at 2400 sym/s in a
@@ -331,10 +412,11 @@ dsd_engine_prepare_p25_cc_rtl_chain(const dsd_opts* opts, dsd_state* state, long
  */
 static void
 dsd_engine_prepare_gfsk_cc_rtl_chain(const dsd_opts* opts, const dsd_state* state, long int target_freq_hz, int ted_sps,
-                                     int symbol_rate_hz) {
+                                     int symbol_rate_hz, int lands_digital_family) {
     int retune_ted_sps = ted_sps;
     if (state->rtl_ctx) {
-        retune_ted_sps = dsd_opts_compute_sps_rate(opts, symbol_rate_hz, (int)rtl_stream_output_rate(state->rtl_ctx));
+        retune_ted_sps = dsd_opts_compute_sps_rate(
+            opts, symbol_rate_hz, dsd_engine_gfsk_landing_rate(state, symbol_rate_hz, lands_digital_family));
     }
     dsd_engine_prepare_retune_profile_for_target(opts, state, (uint32_t)target_freq_hz, 0, symbol_rate_hz, 4,
                                                  dsd_rtl_channel_profile_for(opts, symbol_rate_hz, 4, 2),
@@ -378,8 +460,55 @@ dsd_engine_prepare_current_cc_rtl_chain(const dsd_opts* opts, const dsd_state* s
     }
 }
 
+/* An analog scan row (issue #526): the analog monitor, the row's demodulator and its width (0 = the
+ * kind's default), bound to the target with the scan's gain profile and no symbol profile. Returns -1
+ * when the front end refuses the width at the rate it runs.
+ *
+ * A width the published DSP rate cannot fit -- the row's own, or the configured width of its kind a row without one
+ * runs, the AM default included (dsd_engine_scan_held_width_hz()) -- was named when the scan started, or when that rate
+ * or the configured width last changed (dsd_engine_scan_warn_analog_width() checks it against the same rate), together
+ * with the fact that the row is skipped at every visit, so it is refused here without calling into the stream, whose
+ * refusal log a valid row's request would re-arm and repeat at every rotation; the trunk-scan coordinator stays quiet
+ * about the failed visit for the same reason. So is any held width while DSD_NEO_CHANNEL_LPF=0 turns the channel filter
+ * off, which the stream refuses at every rate and the same warning names. Any other refusal is the stream's to log. */
+static int
+dsd_engine_prepare_scan_analog_profile(const dsd_opts* opts, const dsd_state* state, long int freq) {
+    const int width_hz = dsd_opts_analog_width_hz(opts);
+    const int held_hz = dsd_engine_scan_held_width_hz(opts->analog_demod, width_hz);
+    const int rate_hz = dsd_engine_scan_dsp_rate_hz(opts, state);
+    if (held_hz > 0 && rate_hz > 0
+        && (dsd_engine_scan_channel_lpf_forced_off()
+            || dsd_analog_width_check(opts->analog_demod, held_hz, rate_hz, NULL, 0U) != 0)) {
+        return -1;
+    }
+    dsd_engine_prepare_retune_profile_for_target(opts, state, (uint32_t)freq, -1, 0, 4, RTL_STREAM_CHANNEL_PROFILE_WIDE,
+                                                 0, 0);
+    const rtl_stream_retune_analog_profile analog = {DSD_RX_FAMILY_ANALOG, opts->analog_demod, width_hz, 0};
+    return rtl_stream_prepare_retune_analog_profile_for_target((uint32_t)freq, &analog);
+}
+
+/* A digital tune after an analog scan row (a -Y row, a conventional or trunked target, a return to a control
+ * channel): the symbol profile already queued for the target lands on the digital family, which also retires any live
+ * request queued before it (a width edit for the analog target). It is attached when the retune carries that family
+ * (@p lands_digital_family, the preparation's dsd_engine_retune_lands_digital_family(): the row was timed for that
+ * landing, or the front end runs the analog family or outstanding work lands a family); a digital-only session never
+ * does, so it retunes as it always has. It says whether the profile's CQPSK state is a trunk-scan target's own
+ * choice (dsd_engine_trunk_scan_cqpsk_explicit()), which the stream then lands over DSD_NEO_CQPSK (issue #583); the
+ * stream ignores that for a profile that leaves the CQPSK state alone. */
 static void
-dsd_engine_prepare_cc_rtl_chain(const dsd_opts* opts, dsd_state* state, long int target_freq_hz, int ted_sps) {
+dsd_engine_prepare_digital_family(const dsd_state* state, long int freq, int lands_digital_family) {
+    if (!lands_digital_family) {
+        return;
+    }
+    const rtl_stream_retune_analog_profile digital = {DSD_RX_FAMILY_DIGITAL, DSD_ANALOG_DEMOD_FM, 0,
+                                                      dsd_engine_trunk_scan_cqpsk_explicit(state)};
+    (void)rtl_stream_prepare_retune_analog_profile_for_target((uint32_t)freq, &digital);
+}
+
+/* @p lands_digital_family is the preparation's one landing-family decision (dsd_engine_retune_lands_digital_family()). */
+static void
+dsd_engine_prepare_cc_rtl_chain(const dsd_opts* opts, dsd_state* state, long int target_freq_hz, int ted_sps,
+                                int lands_digital_family) {
     if (!opts || !state || opts->audio_in_type != AUDIO_IN_RTL) {
         return;
     }
@@ -390,7 +519,7 @@ dsd_engine_prepare_cc_rtl_chain(const dsd_opts* opts, dsd_state* state, long int
     if (ted_sps > 0) {
         const int gfsk_rate = dsd_engine_gfsk_cc_symbol_rate(state);
         if (gfsk_rate > 0) {
-            dsd_engine_prepare_gfsk_cc_rtl_chain(opts, state, target_freq_hz, ted_sps, gfsk_rate);
+            dsd_engine_prepare_gfsk_cc_rtl_chain(opts, state, target_freq_hz, ted_sps, gfsk_rate, lands_digital_family);
             return;
         }
     }
@@ -429,24 +558,150 @@ dsd_engine_update_vc_tune_state(dsd_opts* opts, dsd_state* state, long int freq)
     dsd_frame_sync_sps_hunt_restart_dwell(state);
     /* Reset activity timers so noCarrier() does not immediately force a return
      * to CC before we have a chance to acquire sync on the new VC. */
-    state->last_vc_sync_time = time(NULL);
-    state->last_vc_sync_time_m = dsd_time_now_monotonic_s();
+    state->last_vc_sync_time = dsd_decode_time();
+    state->last_vc_sync_time_m = dsd_decode_now_mono_s();
     state->last_cc_sync_time = state->last_vc_sync_time;
     state->last_cc_sync_time_m = state->last_vc_sync_time_m;
     state->p25_last_vc_tune_time = state->last_vc_sync_time;
     state->p25_last_vc_tune_time_m = state->last_vc_sync_time_m;
 }
 
-static int
-dsd_engine_tune_rigctl(const dsd_opts* opts, long int freq) {
-    if (opts->setmod_bw != 0 && !SetModulation(opts->rigctl_sockfd, opts->setmod_bw)) {
-        DSD_FPRINTF(stderr, "Rigctl modulation update failed for bandwidth %d.\n", opts->setmod_bw);
+/* Send the demodulator and passband a rigctl peer is asked for under the settings in force (issues #526, #621), which
+ * one rule decides: dsd_rigctl_passband_of(), keyed on the analog demodulator in force. On audio input (a PCM, UDP or
+ * TCP source) the peer demodulates what DSD-neo hears, so while the analog monitor runs it is asked for that monitor's
+ * demodulator at the row's own width (in the options of the row being tuned, dsd_engine_scan_tuning_row_options(), or
+ * of the row on air for a live edit, dsd_scan_mode_row_options()), else at the configured width of that kind -- the
+ * in-force width, which a scan installs per row -- else for AM at the 6 kHz default and for FM at -B, else at the
+ * peer's own passband (0). A width (own, configured or the AM default) is a strict request: a peer that refuses it
+ * fails the tune, and the scanner moves on as for any row it cannot tune. A width or -B on the monitor is a passband
+ * this client sets, sent through SetScanRowModulation(), which reads the peer's own passband first so a later return to
+ * it sends the passband read (dsd_rigctl_passband_sets_passband()). Anything else -- a digital mode, a symbol or null
+ * input -- asks for FM at -B and stays best-effort, as -B always has been, unless a refusal leaves the peer on an am
+ * row's AM, or on a demodulator not known; without -B that is the peer's own passband (0), sent only to undo an AM row
+ * or a passband this client set, which returns the peer to FM at the passband it had before (SetModulationKind()). On
+ * an RTL-family input DSD-neo demodulates the I/Q itself and the peer only follows the frequency, so it is asked for FM
+ * at -B, best-effort, whatever the row runs and whatever the peer runs. A passband this client sets goes through the
+ * capturing call, and so does -B on a digital mode of audio input, which the peer's FM passband is heard through
+ * (dsd_rigctl_passband_captures()); anything else as a plain request. With @p session
+ * (dsd_channel_modes_rigctl_request_is_session()) the passband is the session's, not a scan row's, and so is the
+ * reading of the peer's own taken for it: a return to the peer's own retires it (RigctlMarkSessionPassband()), where a
+ * scan row's lasts the scan. */
+static bool
+dsd_engine_rigctl_send_passband(const dsd_opts* opts, const dsd_rigctl_passband* passband, int session) {
+    if (!dsd_rigctl_passband_captures(opts, passband)) {
+        return SetModulationKind(opts->rigctl_sockfd, passband->kind, passband->bandwidth_hz);
     }
-    if (!SetFreq(opts->rigctl_sockfd, freq)) {
-        DSD_FPRINTF(stderr, "Rigctl frequency update failed for %ld Hz.\n", freq);
+    const bool ok = SetScanRowModulation(opts->rigctl_sockfd, passband->kind, passband->bandwidth_hz);
+    if (session) {
+        RigctlMarkSessionPassband(opts->rigctl_sockfd, passband->kind);
+    }
+    return ok;
+}
+
+static void
+dsd_engine_rigctl_note_refusal(const dsd_rigctl_passband* passband) {
+    DSD_FPRINTF(stderr, "Rigctl %s modulation update failed for bandwidth %d.\n",
+                dsd_analog_demod_label(passband->kind), passband->bandwidth_hz);
+}
+
+/* A passband this client sets goes through SetScanRowModulation(), which first reads the peer's own passband so that
+ * the FM undo and the scan's leave can send it back. A refused width fails the tune. Any other request, -B on the FM
+ * monitor included, is best-effort, as -B always was, unless the peer demodulates audio input and is not known to run
+ * the demodulator asked for (still on the AM an am row put it on, or on either after a lost reply,
+ * CachedModulationKind()): the row would then be heard through the wrong one, so that tune fails too. On an RTL-family
+ * input DSD-neo demodulates the I/Q, and what the peer runs is never heard, so no refusal fails the tune there. A tune
+ * that sets a passband is a scan row's (a trunk grant runs a digital mode and sets none), whose reading lasts the scan.
+ * One that follows with -B on audio input is captured too (issue #621): a scan row's under a trunk scan or a typed -Y
+ * list, else a trunk grant's on a plain session, the session's, whose reading a return to the peer's own retires
+ * (dsd_channel_modes_rigctl_request_is_session(), which tells a typed list's first row, tuned before its scope is
+ * entered, from the configuration). */
+static int
+dsd_engine_tune_rigctl_modulation(const dsd_opts* opts, const dsd_state* state) {
+    const dsd_rigctl_passband passband = dsd_rigctl_passband_of(opts, dsd_engine_scan_tuning_row_options(opts, state));
+    const int session =
+        dsd_rigctl_passband_sets_passband(&passband) ? 0 : dsd_channel_modes_rigctl_request_is_session(opts, state);
+    if (dsd_engine_rigctl_send_passband(opts, &passband, session)) {
+        return 1;
+    }
+    dsd_engine_rigctl_note_refusal(&passband);
+    if (dsd_rigctl_passband_is_width(&passband)) {
         return 0;
     }
-    return 1;
+    return opts->audio_in_type == AUDIO_IN_RTL || CachedModulationKind(opts->rigctl_sockfd) == passband.kind;
+}
+
+int
+dsd_engine_scan_rigctl_apply_modulation(const dsd_opts* opts, const dsd_state* state) {
+    if (!state || !dsd_opts_rigctl_peer_demodulates(opts)) {
+        return -1;
+    }
+    /* Unlike a tune's best-effort -B (dsd_engine_tune_rigctl_modulation()), a live edit names what the peer is to run
+       now, the -B or peer's own passband a row goes back to included: a refusal of any request fails it, so the edit
+       goes back rather than read as applied while the peer keeps the passband it had. The row is the one whose scope
+       is in force, the edit's, not a -Y tune staged since, which a failed tune can leave naming another row. Whether
+       the request is the session's is told as at every rigctl leg (issue #621): off a trunk scan with no scan scope,
+       unless a typed -Y list is configured, whose first row is tuned before its scope is entered. */
+    const dsd_rigctl_passband passband = dsd_rigctl_passband_of(opts, dsd_scan_mode_row_options(state));
+    const bool ok =
+        dsd_engine_rigctl_send_passband(opts, &passband, dsd_channel_modes_rigctl_request_is_session(opts, state));
+    if (!ok) {
+        dsd_engine_rigctl_note_refusal(&passband);
+    }
+    return ok ? 1 : 0;
+}
+
+void
+dsd_engine_scan_rigctl_restore(const dsd_opts* opts, const dsd_state* state) {
+    if (!dsd_opts_rigctl_live(opts)) {
+        return;
+    }
+    const dsd_rigctl_passband passband = dsd_rigctl_passband_of(opts, dsd_engine_scan_tuning_row_options(opts, state));
+    /* A passband this client sets, or -B on a digital mode of audio input (issue #621): the restore keeps the reading
+       of the peer's own taken for it, so the session's later return sends that back. */
+    if (!RestoreScanModulation(opts->rigctl_sockfd, passband.kind, passband.bandwidth_hz,
+                               dsd_rigctl_passband_captures(opts, &passband) != 0)) {
+        DSD_FPRINTF(stderr, "Rigctl %s modulation restore failed for bandwidth %d.\n",
+                    dsd_analog_demod_label(passband.kind), passband.bandwidth_hz);
+    }
+}
+
+void
+dsd_engine_rigctl_ask_session_passband(const dsd_opts* opts, const dsd_state* state) {
+    if (!dsd_opts_rigctl_peer_demodulates(opts)) {
+        return;
+    }
+    /* Only a width: -B and the peer's own passband are what a session asked nothing of always ran, and a tune asks for
+       them as before. */
+    const dsd_rigctl_passband passband = dsd_rigctl_passband_of(opts, NULL);
+    if (!dsd_rigctl_passband_is_width(&passband)) {
+        return;
+    }
+    /* The session's unless a trunk scan or a typed -Y list is configured, whose rows ask for their own: at start no
+       scan holds a scope yet, so the typed list is told from its configuration; the untyped list's requests are the
+       session's, as the legacy leg's are. */
+    if (!dsd_engine_rigctl_send_passband(opts, &passband, dsd_channel_modes_rigctl_request_is_session(opts, state))) {
+        dsd_engine_rigctl_note_refusal(&passband);
+    }
+}
+
+/* The rigctl leg of a tune: the modulation request, then the frequency. A tune that fails leaves the row on air where
+ * it was, so what the modulation request changed on the peer is put back (RevertModulation()): an am row's AM
+ * accepted before its frequency was refused, or the switch to AM that read the peer's own AM passband before the am
+ * row's width was refused, would otherwise have the row still on air heard through AM, and an nfm row's own passband
+ * accepted before its frequency was refused, through that passband (issue #526). */
+static int
+dsd_engine_tune_rigctl(const dsd_opts* opts, const dsd_state* state, long int freq) {
+    const dsd_rigctl_modulation before = CachedModulation(opts->rigctl_sockfd);
+    if (dsd_engine_tune_rigctl_modulation(opts, state)) {
+        if (SetFreq(opts->rigctl_sockfd, freq)) {
+            return 1;
+        }
+        DSD_FPRINTF(stderr, "Rigctl frequency update failed for %ld Hz.\n", freq);
+    }
+    if (!RevertModulation(opts->rigctl_sockfd, before)) {
+        DSD_FPRINTF(stderr, "Rigctl modulation could not be put back after the failed tune.\n");
+    }
+    return 0;
 }
 
 static int
@@ -483,9 +738,15 @@ dsd_engine_tune_rtl(dsd_opts* opts, dsd_state* state, long int freq, uint64_t re
 
 static dsd_trunk_tune_result
 dsd_engine_tune_with_backend(dsd_opts* opts, dsd_state* state, long int freq, uint64_t request_id) {
+    /* Every backend below carries the frequency as uint32_t; one past it (possible where long is 64-bit) would wrap to
+       an unrelated channel, so the tune fails instead. The callers have already refused freq <= 0. */
+    if ((long long)freq > (long long)UINT32_MAX) {
+        DSD_FPRINTF(stderr, "Trunk tune to %ld Hz refused: past the tuner limit of 4294967295 Hz.\n", freq);
+        return DSD_TRUNK_TUNE_RESULT_FAILED;
+    }
     const int conventional_scan = dsd_engine_conventional_scan_active(opts);
     if (opts->use_rigctl == 1) {
-        if (!dsd_engine_tune_rigctl(opts, freq)) {
+        if (!dsd_engine_tune_rigctl(opts, state, freq)) {
             return DSD_TRUNK_TUNE_RESULT_FAILED;
         }
         opts->rtlsdr_center_freq = (uint32_t)freq;
@@ -739,7 +1000,9 @@ dsd_engine_trunk_tune_to_cc_request(dsd_opts* opts, dsd_state* state, long int f
     dsd_engine_maybe_drain_audio(opts, state);
     if (opts->audio_in_type == AUDIO_IN_RTL) {
 #ifdef USE_RADIO
-        dsd_engine_prepare_cc_rtl_chain(opts, state, freq, ted_sps);
+        const int lands_digital_family = dsd_engine_retune_lands_digital_family(opts, state, 1);
+        dsd_engine_prepare_cc_rtl_chain(opts, state, freq, ted_sps, lands_digital_family);
+        dsd_engine_prepare_digital_family(state, freq, lands_digital_family);
 #endif
     }
     result = dsd_engine_tune_with_backend(opts, state, freq, request_id);
@@ -756,15 +1019,23 @@ dsd_engine_trunk_tune_to_cc_request(dsd_opts* opts, dsd_state* state, long int f
     dsd_frame_sync_reset_mod_state();
     // Do not set trunk_is_tuned here; this is a CC hunt action.
     state->trunk_cc_freq = (long int)freq;
-    state->last_cc_sync_time = time(NULL);
-    state->last_cc_sync_time_m = dsd_time_now_monotonic_s();
+    state->last_cc_sync_time = dsd_decode_time();
+    state->last_cc_sync_time_m = dsd_decode_now_mono_s();
     return result;
 }
 
 #ifdef USE_RADIO
-static void
+/* Queue the receive profile a scanner row runs on. Returns -1 when the front end refuses it. */
+static int
 dsd_engine_prepare_scan_profile(const dsd_opts* opts, dsd_state* state, long int freq, int ted_sps) {
-    if (opts->audio_in_type == AUDIO_IN_RTL && ted_sps > 0) {
+    if (opts->audio_in_type != AUDIO_IN_RTL) {
+        return 0;
+    }
+    if (dsd_opts_is_analog_family(opts)) {
+        return dsd_engine_prepare_scan_analog_profile(opts, state, freq);
+    }
+    if (ted_sps > 0) {
+        const int lands_digital_family = dsd_engine_retune_lands_digital_family(opts, state, 1);
         if (dsd_engine_conventional_scan_active(opts)) {
             const int rate = dsd_frame_sync_active_profile_symbol_rate_hz(state);
             const int levels = dsd_frame_sync_active_profile_levels(state);
@@ -772,11 +1043,81 @@ dsd_engine_prepare_scan_profile(const dsd_opts* opts, dsd_state* state, long int
                                                          dsd_rtl_channel_profile_for(opts, rate, levels, state->rf_mod),
                                                          ted_sps, 0);
         } else {
-            dsd_engine_prepare_cc_rtl_chain(opts, state, freq, ted_sps);
+            dsd_engine_prepare_cc_rtl_chain(opts, state, freq, ted_sps, lands_digital_family);
         }
+        dsd_engine_prepare_digital_family(state, freq, lands_digital_family);
     }
+    return 0;
 }
 #endif
+
+int
+dsd_engine_scan_dsp_rate_hz(const dsd_opts* opts, const dsd_state* state) {
+#ifdef USE_RADIO
+    if (opts && state && opts->audio_in_type == AUDIO_IN_RTL && state->rtl_ctx) {
+        /* The rate the stream holds an analog request to, published from its start; not the CFO metrics rate, which
+           stays 0 until the demod thread has processed a block. */
+        const int rate_hz = rtl_stream_get_request_rate_hz();
+        return rate_hz > 0 ? rate_hz : 0;
+    }
+#else
+    (void)opts;
+    (void)state;
+#endif
+    return 0;
+}
+
+uint32_t
+dsd_engine_scan_family_requests(const dsd_opts* opts) {
+#ifdef USE_RADIO
+    if (opts && opts->audio_in_type == AUDIO_IN_RTL) {
+        return rtl_stream_live_family_request_count();
+    }
+#else
+    (void)opts;
+#endif
+    return 0U;
+}
+
+void
+dsd_engine_scan_supersede_familyless_retunes(const dsd_opts* opts) {
+#ifdef USE_RADIO
+    if (opts && opts->audio_in_type == AUDIO_IN_RTL) {
+        rtl_stream_supersede_familyless_retunes();
+    }
+#else
+    (void)opts;
+#endif
+}
+
+uint32_t
+dsd_engine_scan_familyless_retune_supersedes(const dsd_opts* opts) {
+#ifdef USE_RADIO
+    if (opts && opts->audio_in_type == AUDIO_IN_RTL) {
+        return rtl_stream_familyless_retune_supersedes();
+    }
+#else
+    (void)opts;
+#endif
+    return 0U;
+}
+
+int
+dsd_engine_scan_retune_attaches_family(const dsd_opts* opts, const dsd_state* state, int ted_sps) {
+#ifdef USE_RADIO
+    if (!opts || !state || opts->audio_in_type != AUDIO_IN_RTL) {
+        return 0;
+    }
+    /* As dsd_engine_prepare_scan_profile() queues them: the analog profile, or a symbol profile with the digital
+       family (dsd_engine_prepare_digital_family()), by the decision the tune's preparation spends. */
+    return dsd_opts_is_analog_family(opts) || (ted_sps > 0 && dsd_engine_retune_lands_digital_family(opts, state, 0));
+#else
+    (void)opts;
+    (void)state;
+    (void)ted_sps;
+    return 0;
+#endif
+}
 
 static void
 dsd_engine_scan_tune_failed(const dsd_opts* opts, uint64_t request_id, dsd_trunk_tune_result result) {
@@ -813,7 +1154,15 @@ dsd_engine_scan_tune_to_freq(dsd_opts* opts, dsd_state* state, long int freq, in
     (void)ted_sps;
 #else
     dsd_engine_rtl_profile_snapshot_capture(opts, state, &rtl_snapshot);
-    dsd_engine_prepare_scan_profile(opts, state, freq, ted_sps);
+    if (dsd_engine_prepare_scan_profile(opts, state, freq, ted_sps) != 0) {
+        /* The row's analog width does not fit the DSP rate: the row cannot be received, so it is not tuned,
+         * and no backend moved. The retune profile queued for it is all that changed, so only that is dropped:
+         * requesting the profile the front end already runs again would re-apply it at every rotation past the
+         * row. */
+        rtl_stream_clear_pending_retune_profile();
+        dsd_trunk_tuning_request_complete(tune_request_id, DSD_TRUNK_TUNE_RESULT_FAILED);
+        return DSD_TRUNK_TUNE_RESULT_FAILED;
+    }
 #endif
 
     dsd_engine_maybe_drain_audio(opts, state);
@@ -827,8 +1176,8 @@ dsd_engine_scan_tune_to_freq(dsd_opts* opts, dsd_state* state, long int freq, in
     }
 
     dsd_frame_sync_reset_mod_state();
-    state->last_cc_sync_time = time(NULL);
-    state->last_cc_sync_time_m = dsd_time_now_monotonic_s();
+    state->last_cc_sync_time = dsd_decode_time();
+    state->last_cc_sync_time_m = dsd_decode_now_mono_s();
     state->last_vc_sync_time = 0;
     state->last_vc_sync_time_m = 0.0;
     opts->trunk_is_tuned = 0;

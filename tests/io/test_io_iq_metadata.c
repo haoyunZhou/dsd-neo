@@ -7,6 +7,7 @@
 #include <dsd-neo/io/iq_replay.h>
 #include <dsd-neo/platform/file_compat.h>
 #include <dsd-neo/platform/posix_compat.h>
+#include <errno.h>
 #include <inttypes.h>
 #include <stdio.h>
 #include <string.h>
@@ -88,15 +89,81 @@ write_text_file(const char* path, const char* text) {
     return 0;
 }
 
+/* A temp directory a test made and the NULL-terminated list of files the test writes in it. */
+typedef struct {
+    char dir[DSD_TEST_PATH_MAX];
+    const char* const* files;
+} temp_dir_entry;
+
+/* Every temp directory made so far, recorded as soon as it exists so that main() removes it whichever way the test
+ * that made it returned. */
+static temp_dir_entry g_temp_dirs[16];
+static size_t g_temp_dir_count = 0;
+
 static int
-mk_temp_dir(char* out_dir, size_t out_dir_size) {
+track_temp_dir(const char* dir, const char* const* files) {
+    if (g_temp_dir_count >= sizeof(g_temp_dirs) / sizeof(g_temp_dirs[0])) {
+        DSD_FPRINTF(stderr, "FAIL: no room to record temp directory %s\n", dir);
+        return -1;
+    }
+    temp_dir_entry* entry = &g_temp_dirs[g_temp_dir_count];
+    DSD_SNPRINTF(entry->dir, sizeof(entry->dir), "%s", dir);
+    entry->files = files;
+    g_temp_dir_count++;
+    return 0;
+}
+
+/* Remove every temp directory with the files in it, newest first so that a subdirectory goes before the directory
+ * holding it. One that is not empty afterwards fails the test. */
+static int
+remove_temp_dirs(void) {
+    int rc = 0;
+    while (g_temp_dir_count > 0U) {
+        g_temp_dir_count--;
+        const temp_dir_entry* entry = &g_temp_dirs[g_temp_dir_count];
+        if (dsd_test_remove_temp_dir(entry->dir, entry->files) != 0) {
+            DSD_FPRINTF(stderr, "FAIL: could not remove temp directory %s: %s\n", entry->dir, strerror(errno));
+            rc = 1;
+        }
+    }
+    return rc;
+}
+
+/* Make a temp directory for a test that writes @p files in it. */
+static int
+mk_temp_dir(char* out_dir, size_t out_dir_size, const char* const* files) {
     if (!out_dir || out_dir_size == 0) {
         return -1;
     }
     if (!dsd_test_mkdtemp(out_dir, out_dir_size, "dsdneo_iq_test")) {
         return -1;
     }
+    if (track_temp_dir(out_dir, files) != 0) {
+        (void)dsd_test_rmdir(out_dir);
+        return -1;
+    }
     return 0;
+}
+
+/* Make the subdirectory @p subdir of a temp directory for a test that writes @p files in it. */
+static int
+mk_temp_subdir(const char* subdir, const char* const* files) {
+    if (dsd_mkdir(subdir, 0700) != 0) {
+        return -1;
+    }
+    if (track_temp_dir(subdir, files) != 0) {
+        (void)dsd_test_rmdir(subdir);
+        return -1;
+    }
+    return 0;
+}
+
+/* A replay open a test expects to be refused hands back no source. Close one a regression opens anyway, so that the
+ * data file it holds can still be removed: the native Windows CRT cannot remove an open file. */
+static void
+close_refused_source(dsd_iq_replay_source** src) {
+    dsd_iq_replay_close(*src);
+    *src = NULL;
 }
 
 static const char*
@@ -236,7 +303,8 @@ static int
 test_metadata_round_trip_capture_open_close(void) {
     int rc = 0;
     char dir[256];
-    if (mk_temp_dir(dir, sizeof(dir)) != 0) {
+    static const char* const files[] = {"capture.iq", "capture.iq.json", NULL};
+    if (mk_temp_dir(dir, sizeof(dir), files) != 0) {
         DSD_FPRINTF(stderr, "failed to create temp dir\n");
         return 1;
     }
@@ -318,7 +386,8 @@ static int
 test_metadata_v2_events_round_trip(void) {
     int rc = 0;
     char dir[256];
-    if (mk_temp_dir(dir, sizeof(dir)) != 0) {
+    static const char* const files[] = {"events.iq", "events.iq.json", NULL};
+    if (mk_temp_dir(dir, sizeof(dir), files) != 0) {
         return 1;
     }
 
@@ -421,7 +490,8 @@ test_metadata_reuse_after_explicit_clear(void) {
     int rc = 0;
     char dir[256];
     char err[256] = {0};
-    if (mk_temp_dir(dir, sizeof(dir)) != 0) {
+    static const char* const files[] = {"events.iq", "events1.iq.json", "events2.iq.json", NULL};
+    if (mk_temp_dir(dir, sizeof(dir), files) != 0) {
         return 1;
     }
 
@@ -490,7 +560,8 @@ test_metadata_output_is_write_only_on_first_success(void) {
     int rc = 0;
     char dir[256];
     char err[256] = {0};
-    if (mk_temp_dir(dir, sizeof(dir)) != 0) {
+    static const char* const files[] = {"events.iq", "events.iq.json", NULL};
+    if (mk_temp_dir(dir, sizeof(dir), files) != 0) {
         return 1;
     }
 
@@ -538,7 +609,8 @@ test_missing_field_reports_clear_error(void) {
     int rc = 0;
     char dir[256];
     char err[256];
-    if (mk_temp_dir(dir, sizeof(dir)) != 0) {
+    static const char* const files[] = {"missing.iq.json", "missing.iq", NULL};
+    if (mk_temp_dir(dir, sizeof(dir), files) != 0) {
         return 1;
     }
     char meta[512];
@@ -599,7 +671,8 @@ test_json_unescape_and_control_rejection(void) {
     int rc = 0;
     char dir[256];
     char err[256];
-    if (mk_temp_dir(dir, sizeof(dir)) != 0) {
+    static const char* const files[] = {"escaped.iq.json", "bad_control.iq.json", "bad_nul.iq.json", NULL};
+    if (mk_temp_dir(dir, sizeof(dir), files) != 0) {
         return 1;
     }
 
@@ -608,9 +681,10 @@ test_json_unescape_and_control_rejection(void) {
      * path resolution are covered in the same parse. The rejection cases below
      * then prove decoded control bytes cannot reach operational string fields.
      */
+    static const char* const sub_files[] = {"test.iq", NULL};
     char subdir[512];
     path_join(subdir, sizeof(subdir), dir, "sub");
-    if (dsd_mkdir(subdir, 0700) != 0) {
+    if (mk_temp_subdir(subdir, sub_files) != 0) {
         return 1;
     }
 
@@ -756,7 +830,8 @@ test_invalid_json_shapes_and_number_types(void) {
     int rc = 0;
     char dir[256];
     char err[256];
-    if (mk_temp_dir(dir, sizeof(dir)) != 0) {
+    static const char* const files[] = {"x.iq", "trunc.iq.json", "nested.iq.json", "float.iq.json", NULL};
+    if (mk_temp_dir(dir, sizeof(dir), files) != 0) {
         return 1;
     }
 
@@ -864,7 +939,22 @@ test_event_timeline_validation(void) {
     int rc = 0;
     char dir[256];
     char err[256];
-    if (mk_temp_dir(dir, sizeof(dir)) != 0) {
+    static const char* const files[] = {"events_bad.iq",
+                                        "unknown_kind.iq.json",
+                                        "missing_duration.iq.json",
+                                        "negative_duration.iq.json",
+                                        "negative_offset.iq.json",
+                                        "unsorted_offsets.iq.json",
+                                        "offset_past_eof.iq.json",
+                                        "events_on_v1.iq.json",
+                                        "events_then_bad_field.iq.json",
+                                        "retuned_v1.iq.json",
+                                        "retuned_mute_only.iq.json",
+                                        "retuned_retune_only.iq.json",
+                                        "retune_flag_false.iq.json",
+                                        "retuned_count_mismatch.iq.json",
+                                        NULL};
+    if (mk_temp_dir(dir, sizeof(dir), files) != 0) {
         return 1;
     }
 
@@ -997,6 +1087,7 @@ test_event_timeline_validation(void) {
     prc = dsd_iq_replay_open(retuned_v1, &cfg, &src, err, sizeof(err));
     rc |= expect_int("retuned v1 replay open rejected", prc, DSD_IQ_ERR_RETUNE_REJECT);
     rc |= expect_true("retuned v1 rejected source null", src == NULL);
+    close_refused_source(&src);
     dsd_iq_replay_config_clear(&cfg);
 
     // Replay open rejects retune-bearing captures even when metadata reads cleanly.
@@ -1017,6 +1108,7 @@ test_event_timeline_validation(void) {
     prc = dsd_iq_replay_open(retuned_mute_only, &cfg, &src, err, sizeof(err));
     rc |= expect_int("retuned mute-only replay open rejected", prc, DSD_IQ_ERR_RETUNE_REJECT);
     rc |= expect_true("retuned mute-only rejected source null", src == NULL);
+    close_refused_source(&src);
     dsd_iq_replay_config_clear(&cfg);
 
     char retuned_retune_only[512];
@@ -1038,6 +1130,7 @@ test_event_timeline_validation(void) {
     prc = dsd_iq_replay_open(retuned_retune_only, &cfg, &src, err, sizeof(err));
     rc |= expect_int("retuned retune-only replay open rejected", prc, DSD_IQ_ERR_RETUNE_REJECT);
     rc |= expect_true("retuned retune-only rejected source null", src == NULL);
+    close_refused_source(&src);
     dsd_iq_replay_config_clear(&cfg);
 
     char retune_flag_false[512];
@@ -1055,6 +1148,7 @@ test_event_timeline_validation(void) {
     prc = dsd_iq_replay_open(retune_flag_false, &cfg, &src, err, sizeof(err));
     rc |= expect_int("retune with false summary replay open rejected", prc, DSD_IQ_ERR_RETUNE_REJECT);
     rc |= expect_true("retune with false summary source null", src == NULL);
+    close_refused_source(&src);
     dsd_iq_replay_config_clear(&cfg);
 
     char retuned_count_mismatch[512];
@@ -1077,6 +1171,7 @@ test_event_timeline_validation(void) {
     prc = dsd_iq_replay_open(retuned_count_mismatch, &cfg, &src, err, sizeof(err));
     rc |= expect_int("retuned count mismatch replay open rejected", prc, DSD_IQ_ERR_RETUNE_REJECT);
     rc |= expect_true("retuned count mismatch source null", src == NULL);
+    close_refused_source(&src);
     dsd_iq_replay_config_clear(&cfg);
     return rc;
 }
@@ -1086,7 +1181,9 @@ test_rate_chain_validation(void) {
     int rc = 0;
     char dir[256];
     char err[256];
-    if (mk_temp_dir(dir, sizeof(dir)) != 0) {
+    static const char* const files[] = {
+        "r.iq", "rate1.iq.json", "rate2.iq.json", "rate3.iq.json", "rate4.iq.json", "rate5.iq.json", NULL};
+    if (mk_temp_dir(dir, sizeof(dir), files) != 0) {
         return 1;
     }
 
@@ -1134,7 +1231,8 @@ test_relative_data_resolution_info_and_open_validation(void) {
     int rc = 0;
     char dir[256];
     char err[256];
-    if (mk_temp_dir(dir, sizeof(dir)) != 0) {
+    static const char* const files[] = {NULL}; /* everything this test writes is in the meta subdirectory */
+    if (mk_temp_dir(dir, sizeof(dir), files) != 0) {
         return 1;
     }
 
@@ -1143,9 +1241,12 @@ test_relative_data_resolution_info_and_open_validation(void) {
      * by the info printer and replay opener. Later cases keep the path valid but
      * vary byte counts and retune flags to exercise open-time rejection paths.
      */
+    static const char* const meta_files[] = {
+        "capture.iq",   "capture.iq.json",   "truncated_events.iq", "truncated_events.iq.json",
+        "bad_align.iq", "bad_align.iq.json", "retune.iq.json",      NULL};
     char subdir[512];
     path_join(subdir, sizeof(subdir), dir, "meta");
-    if (dsd_mkdir(subdir, 0700) != 0) {
+    if (mk_temp_subdir(subdir, meta_files) != 0) {
         return 1;
     }
 
@@ -1243,12 +1344,16 @@ test_relative_data_resolution_info_and_open_validation(void) {
     prc = dsd_iq_replay_open(bad_meta, &cfg, &src, err, sizeof(err));
     rc |= expect_int("open rejects zero effective bytes", prc, DSD_IQ_ERR_ALIGNMENT);
     rc |= expect_true("source not created on failure", src == NULL);
+    close_refused_source(&src);
+    dsd_iq_replay_config_clear(&cfg);
 
     char retune_meta[512];
     path_join(retune_meta, sizeof(retune_meta), subdir, "retune.iq.json");
     write_valid_metadata(retune_meta, "capture.iq", "cu8", "none", "post_mute_pre_widen", 1536000, 32, 1, 48000, 1, 10);
     prc = dsd_iq_replay_open(retune_meta, &cfg, &src, err, sizeof(err));
     rc |= expect_int("open rejects contains_retunes", prc, DSD_IQ_ERR_RETUNE_REJECT);
+    close_refused_source(&src);
+    dsd_iq_replay_config_clear(&cfg);
 
     return rc;
 }
@@ -1258,7 +1363,8 @@ test_replay_read_partial_eof_and_rewind(void) {
     int rc = 0;
     char dir[256];
     char err[256];
-    if (mk_temp_dir(dir, sizeof(dir)) != 0) {
+    static const char* const files[] = {"read.iq.json", "read.iq", NULL};
+    if (mk_temp_dir(dir, sizeof(dir), files) != 0) {
         return 1;
     }
 
@@ -1326,6 +1432,220 @@ test_replay_read_partial_eof_and_rewind(void) {
 
     dsd_iq_replay_close(src);
     dsd_iq_replay_config_clear(&cfg);
+    return rc;
+}
+
+enum { kReplayReadChunk = 65536 }; /* this test's reads */
+
+/* Issue #572: the replay source knows from its open how many bytes the capture holds. A data file cut short after the
+ * open (truncated while it replays) runs out before them, and the read that finds nothing more is an I/O error, not
+ * the capture's end: the bytes still there are read first, then reads fail. A sidecar whose data_bytes is 0 (an
+ * interrupted capture, replayed as the file was at its open) reads to that end with no error. The reads are 64 KiB,
+ * larger than a stdio buffer, so none holds bytes the cut removed; the replay reader's own chunks are one live
+ * transfer (dsd_iq_replay_chunk_bytes()), which at a low capture rate a stdio buffer can hold ahead of a cut. */
+static int
+test_replay_read_of_a_data_file_cut_short(void) {
+    static const char* const files[] = {"cut.iq", "cut.iq.json", "whole.iq", "whole.iq.json", NULL};
+    static uint8_t payload[3 * kReplayReadChunk];
+    static uint8_t buf[kReplayReadChunk];
+    int rc = 0;
+    char dir[256];
+    char err[256];
+    if (mk_temp_dir(dir, sizeof(dir), files) != 0) {
+        return 1;
+    }
+    for (size_t i = 0; i < sizeof(payload); i++) {
+        payload[i] = (uint8_t)((i * 31U) & 0xFFU);
+    }
+
+    char meta[512];
+    char data[512];
+    path_join(meta, sizeof(meta), dir, "cut.iq.json");
+    path_join(data, sizeof(data), dir, "cut.iq");
+    if (write_bytes_file(data, payload, sizeof(payload)) != 0
+        || write_valid_metadata(meta, "cut.iq", "cu8", "none", "post_mute_pre_widen", 1536000, 32, 1, 48000, 0,
+                                sizeof(payload))
+               != 0) {
+        return 1;
+    }
+    dsd_iq_replay_config cfg;
+    dsd_iq_replay_source* src = NULL;
+    DSD_MEMSET(&cfg, 0, sizeof(cfg));
+    int prc = dsd_iq_replay_open(meta, &cfg, &src, err, sizeof(err));
+    rc |= expect_int("cut data file: open", prc, DSD_IQ_OK);
+    if (prc != DSD_IQ_OK || !src) {
+        dsd_iq_replay_config_clear(&cfg);
+        return 1;
+    }
+    size_t got = 99U;
+    rc |= expect_int("cut data file: first chunk", dsd_iq_replay_read(src, buf, sizeof(buf), &got), DSD_IQ_OK);
+    rc |= expect_u64("cut data file: first chunk size", got, kReplayReadChunk);
+    rc |= expect_true("cut data file: first chunk bytes", memcmp(buf, payload, kReplayReadChunk) == 0);
+
+    /* Cut the file 1000 bytes into the second chunk, under the open source. */
+    rc |= expect_int("cut data file: cut", write_bytes_file(data, payload, kReplayReadChunk + 1000U), 0);
+    got = 99U;
+    rc |= expect_int("cut data file: the bytes left", dsd_iq_replay_read(src, buf, sizeof(buf), &got), DSD_IQ_OK);
+    rc |= expect_u64("cut data file: the bytes left, size", got, 1000U);
+    rc |= expect_true("cut data file: the bytes left, bytes", memcmp(buf, payload + kReplayReadChunk, 1000U) == 0);
+    got = 99U;
+    rc |= expect_int("cut data file: the read past the cut fails", dsd_iq_replay_read(src, buf, sizeof(buf), &got),
+                     DSD_IQ_ERR_IO);
+    rc |= expect_u64("cut data file: the failed read's size", got, 0U);
+    got = 99U;
+    rc |= expect_int("cut data file: the next read fails too", dsd_iq_replay_read(src, buf, sizeof(buf), &got),
+                     DSD_IQ_ERR_IO);
+    dsd_iq_replay_close(src);
+    src = NULL;
+    dsd_iq_replay_config_clear(&cfg);
+
+    /* data_bytes 0: the file's size at the open, rounded down to a whole sample, is the capture. */
+    path_join(meta, sizeof(meta), dir, "whole.iq.json");
+    path_join(data, sizeof(data), dir, "whole.iq");
+    if (write_bytes_file(data, payload, kReplayReadChunk + 1001U) != 0
+        || write_valid_metadata(meta, "whole.iq", "cu8", "none", "post_mute_pre_widen", 1536000, 32, 1, 48000, 0, 0U)
+               != 0) {
+        return 1;
+    }
+    DSD_MEMSET(&cfg, 0, sizeof(cfg));
+    prc = dsd_iq_replay_open(meta, &cfg, &src, err, sizeof(err));
+    rc |= expect_int("data_bytes 0: open", prc, DSD_IQ_OK);
+    if (prc != DSD_IQ_OK || !src) {
+        dsd_iq_replay_config_clear(&cfg);
+        return 1;
+    }
+    got = 99U;
+    rc |= expect_int("data_bytes 0: first chunk", dsd_iq_replay_read(src, buf, sizeof(buf), &got), DSD_IQ_OK);
+    rc |= expect_u64("data_bytes 0: first chunk size", got, kReplayReadChunk);
+    got = 99U;
+    rc |= expect_int("data_bytes 0: the rest", dsd_iq_replay_read(src, buf, sizeof(buf), &got), DSD_IQ_OK);
+    rc |= expect_u64("data_bytes 0: the rest, whole samples", got, 1000U);
+    got = 99U;
+    rc |= expect_int("data_bytes 0: the end", dsd_iq_replay_read(src, buf, sizeof(buf), &got), DSD_IQ_OK);
+    rc |= expect_u64("data_bytes 0: the end's size", got, 0U);
+    dsd_iq_replay_close(src);
+    dsd_iq_replay_config_clear(&cfg);
+    return rc;
+}
+
+/* One sidecar of test_replay_open_refuses_formats_it_cannot_convert(). */
+typedef struct {
+    const char* metadata_file;
+    const char* sample_format;
+    const char* endianness;
+    const char* capture_stage;
+    int want_rc;
+    const char* named[2]; /* what a refusal's error names */
+} replay_format_case;
+
+/* Issue #572: replay converts cu8 at either capture stage, little-endian cs16 at post_mute_pre_widen, and cf32 only
+ * as the driver delivered it, before the input ring (replay_convert_block_to_f32() in rtl_device.cpp). The open
+ * refuses any other format and stage, naming them, where it used to open a capture whose every chunk the reader then
+ * dropped. --iq-info still describes such a capture, and reports it as not replay compatible. */
+static int
+test_replay_open_refuses_formats_it_cannot_convert(void) {
+    static const char* const files[] = {"capture.iq",   "cs16.iq.json",           "cf32_cu8_stage.iq.json",
+                                        "cf32.iq.json", "cu8_cf32_stage.iq.json", NULL};
+    static const replay_format_case cases[] = {
+        {"cs16.iq.json", "cs16", "little", "post_mute_pre_widen", DSD_IQ_OK, {NULL, NULL}},
+        {"cf32_cu8_stage.iq.json",
+         "cf32",
+         "little",
+         "post_mute_pre_widen",
+         DSD_IQ_ERR_UNSUPPORTED_FMT,
+         {"cf32", "post_mute_pre_widen"}},
+        {"cf32.iq.json", "cf32", "little", "post_driver_cf32_pre_ring", DSD_IQ_OK, {NULL, NULL}},
+        {"cu8_cf32_stage.iq.json", "cu8", "none", "post_driver_cf32_pre_ring", DSD_IQ_OK, {NULL, NULL}},
+    };
+    int rc = 0;
+    char dir[256];
+    if (mk_temp_dir(dir, sizeof(dir), files) != 0) {
+        return 1;
+    }
+    char data[512];
+    path_join(data, sizeof(data), dir, "capture.iq");
+    uint8_t payload[64];
+    for (size_t i = 0; i < sizeof(payload); i++) {
+        payload[i] = (uint8_t)(96U + i);
+    }
+    if (write_bytes_file(data, payload, sizeof(payload)) != 0) {
+        return 1;
+    }
+
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        const replay_format_case* tc = &cases[c];
+        char meta[512];
+        char label[160];
+        char err[256] = {0};
+        path_join(meta, sizeof(meta), dir, tc->metadata_file);
+        if (write_valid_metadata(meta, "capture.iq", tc->sample_format, tc->endianness, tc->capture_stage, 1536000, 32,
+                                 1, 48000, 0, sizeof(payload))
+            != 0) {
+            return 1;
+        }
+        dsd_iq_replay_config cfg;
+        dsd_iq_replay_source* src = NULL;
+        DSD_MEMSET(&cfg, 0, sizeof(cfg));
+        DSD_SNPRINTF(label, sizeof(label), "replay open of %s at %s", tc->sample_format, tc->capture_stage);
+        rc |= expect_int(label, dsd_iq_replay_open(meta, &cfg, &src, err, sizeof(err)), tc->want_rc);
+        if (tc->want_rc != DSD_IQ_OK) {
+            DSD_SNPRINTF(label, sizeof(label), "refused replay open of %s at %s: no source", tc->sample_format,
+                         tc->capture_stage);
+            rc |= expect_true(label, src == NULL);
+            for (size_t n = 0; n < 2U && tc->named[n]; n++) {
+                DSD_SNPRINTF(label, sizeof(label), "refused replay open of %s at %s: the error names %s",
+                             tc->sample_format, tc->capture_stage, tc->named[n]);
+                if (expect_true(label, strstr(err, tc->named[n]) != NULL) != 0) {
+                    DSD_FPRINTF(stderr, "  error: %s\n", err);
+                    rc = 1;
+                }
+            }
+            close_refused_source(&src);
+        }
+        dsd_iq_replay_close(src);
+        dsd_iq_replay_config_clear(&cfg);
+
+        /* --iq-info parses every one of them, and says whether replay accepts it. */
+        DSD_MEMSET(&cfg, 0, sizeof(cfg));
+        DSD_SNPRINTF(label, sizeof(label), "metadata read of %s at %s", tc->sample_format, tc->capture_stage);
+        rc |= expect_int(label, dsd_iq_replay_read_metadata(meta, &cfg, err, sizeof(err)), DSD_IQ_OK);
+        FILE* out = tmpfile();
+        FILE* warn = tmpfile();
+        if (!out || !warn) {
+            if (out) {
+                fclose(out);
+            }
+            if (warn) {
+                fclose(warn);
+            }
+            dsd_iq_replay_config_clear(&cfg);
+            return 1;
+        }
+        DSD_SNPRINTF(label, sizeof(label), "info print of %s at %s", tc->sample_format, tc->capture_stage);
+        rc |= expect_int(label, dsd_iq_info_print(&cfg, meta, sizeof(payload), out, warn), DSD_IQ_OK);
+        char out_buf[4096];
+        char warn_buf[1024];
+        fflush(out);
+        fseek(out, 0, SEEK_SET);
+        size_t n = fread(out_buf, 1, sizeof(out_buf) - 1, out);
+        out_buf[n] = '\0';
+        fflush(warn);
+        fseek(warn, 0, SEEK_SET);
+        n = fread(warn_buf, 1, sizeof(warn_buf) - 1, warn);
+        warn_buf[n] = '\0';
+        fclose(out);
+        fclose(warn);
+        const char* want_compat = tc->want_rc == DSD_IQ_OK ? "Replay compatible:   yes" : "Replay compatible:   no";
+        DSD_SNPRINTF(label, sizeof(label), "info of %s at %s: %s", tc->sample_format, tc->capture_stage, want_compat);
+        rc |= expect_true(label, strstr(out_buf, want_compat) != NULL);
+        if (tc->want_rc != DSD_IQ_OK) {
+            DSD_SNPRINTF(label, sizeof(label), "info of %s at %s: the warning names %s", tc->sample_format,
+                         tc->capture_stage, tc->named[0]);
+            rc |= expect_true(label, strstr(warn_buf, "replay compatibility check failed") != NULL
+                                         && strstr(warn_buf, tc->named[0]) != NULL);
+        }
+        dsd_iq_replay_config_clear(&cfg);
+    }
     return rc;
 }
 
@@ -1411,9 +1731,174 @@ test_committed_analog_fixture_sidecars_open(void) {
     return rc;
 }
 
+static int
+expect_utc(const char* text, int want_rc, int64_t want_s) {
+    int64_t got_s = -12345;
+    const int rc = dsd_iq_replay_parse_utc_seconds(text, &got_s);
+    char label[160];
+    DSD_SNPRINTF(label, sizeof(label), "capture_started_utc \"%s\" parse result", text ? text : "(null)");
+    int fail = expect_int(label, rc, want_rc);
+    DSD_SNPRINTF(label, sizeof(label), "capture_started_utc \"%s\" seconds", text ? text : "(null)");
+    fail |= expect_u64(label, (uint64_t)got_s, (uint64_t)(want_rc == DSD_IQ_OK ? want_s : -12345));
+    return fail;
+}
+
+/* Issue #572: an I/Q replay decodes on its capture's clock from the sidecar's capture_started_utc, in the one form the
+   capture writer stamps. Anything else is refused rather than guessed at. */
+static int
+test_capture_started_utc_parses_the_writer_form_only(void) {
+    int rc = 0;
+    rc |= expect_utc("1970-01-01T00:00:00Z", DSD_IQ_OK, 0);
+    rc |= expect_utc("1999-12-31T23:59:59Z", DSD_IQ_OK, 946684799);
+    rc |= expect_utc("2000-01-01T00:00:00Z", DSD_IQ_OK, 946684800);
+    rc |= expect_utc("2024-02-29T23:59:59Z", DSD_IQ_OK, 1709251199);
+    rc |= expect_utc("2026-07-30T00:00:00Z", DSD_IQ_OK, 1785369600);
+    rc |= expect_utc("2026-09-01T06:51:37Z", DSD_IQ_OK, 1788245497);
+    rc |= expect_utc("2100-03-01T00:00:00Z", DSD_IQ_OK, 4107542400);
+    rc |= expect_utc("9999-12-31T23:59:59Z", DSD_IQ_OK, 253402300799);
+    static const char* const kRefused[] = {
+        "",
+        "2026-09-01",
+        "2026-09-01T06:51:37",
+        "2026-09-01T06:51:37+00:00",
+        "2026-09-01T06:51:37.5Z",
+        "2026-09-01 06:51:37Z",
+        "2026-9-01T06:51:37Z0",
+        "2026-13-01T06:51:37Z",
+        "2026-00-01T06:51:37Z",
+        "2026-09-00T06:51:37Z",
+        "2026-09-31T06:51:37Z",
+        "2023-02-29T00:00:00Z",
+        "2100-02-29T00:00:00Z",
+        "2026-09-01T24:00:00Z",
+        "2026-09-01T06:60:37Z",
+        "2026-09-01T06:51:60Z",
+        "2026-09-01T06:5a:37Z",
+        "+026-09-01T06:51:37Z",
+    };
+    for (size_t i = 0; i < sizeof(kRefused) / sizeof(kRefused[0]); i++) {
+        rc |= expect_utc(kRefused[i], DSD_IQ_ERR_INVALID_META, 0);
+    }
+    int64_t out = 7;
+    rc |= expect_int("NULL text", dsd_iq_replay_parse_utc_seconds(NULL, &out), DSD_IQ_ERR_INVALID_ARG);
+    rc |= expect_int("NULL out", dsd_iq_replay_parse_utc_seconds("2026-09-01T06:51:37Z", NULL), DSD_IQ_ERR_INVALID_ARG);
+    rc |= expect_u64("NULL text leaves out alone", (uint64_t)out, 7U);
+    return rc;
+}
+
+/* Every committed fixture's sidecar carries a capture_started_utc the replay can run its decode clock on. */
+static int
+test_committed_fixture_capture_times_parse(void) {
+    static const char* const kFixtures[] = {
+        "am_adjacent_synth",
+        "am_airband_real",
+        "am_tone_synth",
+        "dmr_t3_cc",
+        "dmr_t3_ras_cc",
+        "dmr_voice",
+        "dpmr",
+        "dpmr_synth",
+        "dstar",
+        "edacs",
+        "m17",
+        "nfm_adjacent_synth",
+        "nfm_ctcss_real",
+        "nfm_ctcss_synth_1000",
+        "nfm_ctcss_synth_1506",
+        "nfm_ctcss_synth_670",
+        "nfm_ctcss_synth_drop",
+        "nfm_dcs_synth_023i",
+        "nfm_dcs_synth_023n",
+        "nfm_dcs_synth_drop",
+        "nfm_dcs_synth_noisy",
+        "nfm_notone_synth",
+        "nfm_squelch_real_a",
+        "nfm_squelch_real_b",
+        "nfm_tone_synth",
+        "noise_floor",
+        "nxdn48",
+        "nxdn48_after_retune",
+        "nxdn48_attenuated",
+        "nxdn96",
+        "p25p1_c4fm_cc",
+        "p25p1_c4fm_vc",
+        "p25p1_cqpsk_cc",
+        "p25p1_cqpsk_cc_simulcast",
+        "p25p1_cqpsk_vc",
+        "p25p2_cc",
+        "provoice",
+        "rf_clip",
+        "ysf",
+        "ysf_gap",
+    };
+    int rc = 0;
+    for (size_t i = 0; i < sizeof(kFixtures) / sizeof(kFixtures[0]); i++) {
+        char leaf[96];
+        char meta[DSD_TEST_PATH_MAX];
+        DSD_SNPRINTF(leaf, sizeof(leaf), "%s.iq.json", kFixtures[i]);
+        if (path_join(meta, sizeof(meta), DSD_NEO_TEST_IQ_FIXTURE_DIR, leaf) != 0) {
+            return 1;
+        }
+        dsd_iq_replay_config cfg;
+        DSD_MEMSET(&cfg, 0, sizeof(cfg));
+        char err[256] = {0};
+        if (dsd_iq_replay_read_metadata(meta, &cfg, err, sizeof(err)) != DSD_IQ_OK) {
+            DSD_FPRINTF(stderr, "FAIL: fixture %s: %s\n", kFixtures[i], err);
+            rc = 1;
+            continue;
+        }
+        int64_t seconds = 0;
+        if (dsd_iq_replay_parse_utc_seconds(cfg.capture_started_utc, &seconds) != DSD_IQ_OK) {
+            DSD_FPRINTF(stderr, "FAIL: fixture %s: capture_started_utc \"%s\" does not parse\n", kFixtures[i],
+                        cfg.capture_started_utc);
+            rc = 1;
+        }
+        dsd_iq_replay_config_clear(&cfg);
+    }
+    return rc;
+}
+
+/* Issue #626: the replay reader's chunk, the replay's demod block, is at most one live RTL transfer (8192 complex
+ * samples) and no longer than one lasts at 1.536 Msps (16/3 ms), in the format's bytes; a capture with no rate or a
+ * format with no sample size has none. Literal values, so the rule is not checked against itself. */
+static int
+test_replay_chunk_is_one_live_transfer(void) {
+    static const struct {
+        dsd_iq_sample_format format;
+        uint32_t rate_hz;
+        uint64_t bytes;
+    } k_cases[] = {
+        {DSD_IQ_FORMAT_CU8, 48000U, 512U},      /* every committed fixture: 256 samples, 5.33 ms */
+        {DSD_IQ_FORMAT_CU8, 44100U, 470U},      /* 235.2 samples, rounded down */
+        {DSD_IQ_FORMAT_CU8, 960000U, 10240U},   /* 5120 samples, 5.33 ms; a live transfer there lasts 8.53 ms */
+        {DSD_IQ_FORMAT_CU8, 1024000U, 10922U},  /* 5461.3 samples, rounded down */
+        {DSD_IQ_FORMAT_CU8, 1536000U, 16384U},  /* exactly a live transfer */
+        {DSD_IQ_FORMAT_CU8, 2400000U, 16384U},  /* a live transfer: 8192 samples, 3.41 ms */
+        {DSD_IQ_FORMAT_CU8, 1U, 2U},            /* at least one sample */
+        {DSD_IQ_FORMAT_CF32, 48000U, 2048U},    /* 256 samples of 8 bytes */
+        {DSD_IQ_FORMAT_CF32, 1536000U, 65536U}, /* 8192 samples */
+        {DSD_IQ_FORMAT_CF32, 6000000U, 65536U}, /* 8192 samples, 1.37 ms */
+        {DSD_IQ_FORMAT_CU8, 0U, 0U},            /* no rate */
+        {DSD_IQ_FORMAT_CF32, 0U, 0U},           /* no rate */
+        {DSD_IQ_FORMAT_UNKNOWN, 48000U, 0U},    /* no sample size */
+    };
+
+    int rc = 0;
+    for (size_t i = 0; i < sizeof(k_cases) / sizeof(k_cases[0]); i++) {
+        char label[96];
+        DSD_SNPRINTF(label, sizeof(label), "replay chunk bytes (format %d, %u Hz)", (int)k_cases[i].format,
+                     (unsigned)k_cases[i].rate_hz);
+        rc |= expect_u64(label, (uint64_t)dsd_iq_replay_chunk_bytes(k_cases[i].format, k_cases[i].rate_hz),
+                         k_cases[i].bytes);
+    }
+    return rc;
+}
+
 int
 main(void) {
     int rc = 0;
+    rc |= test_capture_started_utc_parses_the_writer_form_only();
+    rc |= test_committed_fixture_capture_times_parse();
     rc |= test_committed_analog_fixture_sidecars_open();
     rc |= test_metadata_round_trip_capture_open_close();
     rc |= test_metadata_v2_events_round_trip();
@@ -1426,5 +1911,9 @@ main(void) {
     rc |= test_rate_chain_validation();
     rc |= test_relative_data_resolution_info_and_open_validation();
     rc |= test_replay_read_partial_eof_and_rewind();
+    rc |= test_replay_read_of_a_data_file_cut_short();
+    rc |= test_replay_open_refuses_formats_it_cannot_convert();
+    rc |= test_replay_chunk_is_one_live_transfer();
+    rc |= remove_temp_dirs();
     return rc ? 1 : 0;
 }

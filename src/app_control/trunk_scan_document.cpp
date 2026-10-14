@@ -6,6 +6,7 @@
 #include <dsd-neo/app_control/trunk_scan_validate.h>
 #include <dsd-neo/core/csv_validate.h>
 #include <dsd-neo/core/dmr_key_map.h>
+#include <dsd-neo/core/power.h>
 #include <dsd-neo/core/safe_api.h>
 #include <dsd-neo/engine/trunk_scan.h>
 #include <dsd-neo/platform/file_compat.h>
@@ -319,6 +320,8 @@ targetTypeName(dsd_trunk_scan_target_type type) {
         case DSD_TRUNK_SCAN_TARGET_NXDN48_TRUNK: return "nxdn48-trunk";
         case DSD_TRUNK_SCAN_TARGET_NXDN48_CONVENTIONAL: return "nxdn48-conventional";
         case DSD_TRUNK_SCAN_TARGET_P25_CONVENTIONAL: return "p25-conventional";
+        case DSD_TRUNK_SCAN_TARGET_NFM_CONVENTIONAL: return "nfm-conventional";
+        case DSD_TRUNK_SCAN_TARGET_AM_CONVENTIONAL: return "am-conventional";
     }
     return "";
 }
@@ -344,6 +347,11 @@ describe(const dsd_trunk_scan_target& t) {
     result.gain_db = t.rtl_gain_is_set ? t.rtl_gain_db : -1;
     result.squelch_db_set = (t.row_options.present & DSD_SCAN_OPT_SQUELCH) ? 1 : 0;
     result.squelch_db = result.squelch_db_set ? t.row_options.squelch_db : 0;
+    result.squelch_mode =
+        result.squelch_db_set ? dsd_squelch_mode_or_level(t.row_options.squelch_mode) : DSD_SQUELCH_MODE_LEVEL;
+    result.squelch_margin_db = dsd_squelch_mode_is_dynamic(result.squelch_mode) ? t.row_options.squelch_margin_db : 0;
+    result.bandwidth_hz = (t.row_options.present & DSD_SCAN_OPT_BANDWIDTH) ? t.row_options.channel_bw_hz : -1;
+    result.tone_filter = dsd_scan_option_tone_summary(&t.row_options, result.tone_list, sizeof result.tone_list);
     return result;
 }
 

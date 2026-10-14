@@ -3,8 +3,6 @@
  * Copyright (C) 2025 by arancormonk <180709949+arancormonk@users.noreply.github.com>
  */
 #include <dsd-neo/core/dibit.h>
-#include <dsd-neo/core/dsd_time.h>
-#include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/state.h>
 #include <dsd-neo/protocol/p25/p25.h>
 #include <dsd-neo/protocol/p25/p25_crypto.h>
@@ -12,6 +10,7 @@
 #include <dsd-neo/protocol/p25/p25_trunk_sm.h>
 #include <dsd-neo/protocol/p25/p25p1_hdu.h>
 #include <dsd-neo/runtime/colors.h>
+#include <dsd-neo/runtime/decode_clock.h>
 #include <stdio.h>
 #include "dsd-neo/core/opts_fwd.h"
 #include "dsd-neo/core/safe_api.h"
@@ -54,14 +53,9 @@ processTDU(dsd_opts* opts, dsd_state* state) {
 
     //reset some strings -- since its a tdu, blank out any call strings, only want during actual call
 
-    //reset gain
-    if (opts->floating_point == 1) {
-        state->aout_gain = opts->audio_gain;
-    }
-
     // Mark the Phase 1 transmission boundary and reset encryption indicators
     // so the next LDU on this retained carrier starts muted.
-    state->p25_p1_last_tdu_m = dsd_time_now_monotonic_s();
+    state->p25_p1_last_tdu_m = dsd_decode_now_mono_s();
     // Reset encryption indicators at TDU boundary so the next LDU starts muted
     // until we positively identify clear payload (prevents brief encrypted bursts).
     state->payload_miP = 0;

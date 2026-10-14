@@ -5,8 +5,8 @@
 
 #include <dsd-neo/app_control/call_view.h>
 #include <dsd-neo/app_control/notification_status.h>
+#include <dsd-neo/core/audio_activity.h>
 #include <dsd-neo/core/call_state.h>
-#include <dsd-neo/core/dsd_time.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/opts_fwd.h>
 #include <dsd-neo/core/safe_api.h>
@@ -15,6 +15,7 @@
 #include <dsd-neo/core/synctype_ids.h>
 #include <dsd-neo/platform/atomic_compat.h>
 #include <dsd-neo/platform/threading.h>
+#include <dsd-neo/runtime/decode_clock.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -33,14 +34,20 @@ static atomic_int g_mu_state = 0; /* 0=uninit, 1=initing, 2=init */
    at the DMR/P25p2/D-STAR/M17/EDACS sites, so tens of times a second -- and deriving the
    record is not cheap: dsd_app_vc_freq() alone copies the whole recent-activity snapshot
    under the canonical call-state lock whenever no voice frequency is cached, which is
-   every publish of a conventional or not-yet-tuned session. The only reader in the tree
-   is the Android service's 1 Hz poll, so a desktop run must not pay for any of it. */
+   every publish of a conventional or not-yet-tuned session. Two readers arm it: the
+   Android JNI accessor, through dsd_app_notification_encode() (the service's 1 Hz poll
+   and ScreenSupport's synchronous samples), and the JSON API feed's status and system
+   topics (src/api/api_feed.c), which call get() only while an API client is connected.
+   A run with neither, such as a desktop or CLI session with no API client, must not pay
+   for any of it. */
 static atomic_int g_wanted = 0;
 
-/* The sync-hold decay, sharing DSD_APP_SYNC_HOLD_S with the Qt panel so the two surfaces
-   cannot come to disagree about when a session stops reading as locked. Guarded by g_mu
-   with the record itself, because dsd_app_notification_reset() clears them together and
-   can be called from a thread other than the publisher's. */
+/* The sync-hold decay, sharing DSD_APP_SYNC_HOLD_S and the real-time clock with the Qt panel
+   so the two surfaces cannot come to disagree about when a session stops reading as locked.
+   It only smooths what a display shows, so it is real time even though the record beside it
+   ages decoded calls on the decode clock. Guarded by g_mu with the record itself, because
+   dsd_app_notification_reset() clears them together and can be called from a thread other
+   than the publisher's. */
 static int g_sync_type = DSD_SYNC_NONE;
 static double g_sync_seen_m = 0.0;
 
@@ -76,7 +83,8 @@ dsd_app_notification_publish_state(const dsd_state* state) {
     dsd_app_slot_call slots[DSD_CALL_STATE_SLOT_COUNT];
     int line_states[DSD_CALL_STATE_SLOT_COUNT];
     double started[DSD_CALL_STATE_SLOT_COUNT];
-    const double now_m = dsd_time_now_monotonic_s();
+    const double now_m = dsd_decode_now_mono_s();
+    const double hold_now_m = dsd_realtime_mono_s();
     /* int, not uint8_t: DSD_CALL_STATE_SLOT_COUNT is an int-typed enum constant, and
        comparing a narrower loop variable against it is what
        bugprone-too-small-loop-variable flags -- matches the loop shape already used
@@ -100,11 +108,12 @@ dsd_app_notification_publish_state(const dsd_state* state) {
        NONE whenever the current search window found nothing, which on a control channel
        is most of them. Published raw, the label blinks on and off between polls -- and
        because that changes the encoded record, the service re-posts the notification at
-       the full poll rate on a channel carrying no traffic at all. */
+       the full poll rate on a channel carrying no traffic at all. Real time, as in the Qt
+       panel: the hold is display smoothing, not a decode decision. */
     if (synctype != DSD_SYNC_NONE) {
         g_sync_type = synctype;
-        g_sync_seen_m = now_m;
-    } else if (g_sync_type != DSD_SYNC_NONE && (now_m - g_sync_seen_m) > DSD_APP_SYNC_HOLD_S) {
+        g_sync_seen_m = hold_now_m;
+    } else if (g_sync_type != DSD_SYNC_NONE && (hold_now_m - g_sync_seen_m) > DSD_APP_SYNC_HOLD_S) {
         g_sync_type = DSD_SYNC_NONE;
     }
 
@@ -152,7 +161,8 @@ dsd_app_notification_publish_opts(const dsd_opts* opts) {
     g_status.radio_input = radio ? 1U : 0U;
     g_status.trunking = (opts->trunk_enable == 1) ? 1U : 0U;
     g_status.trunk_tuned = (opts->trunk_is_tuned == 1) ? 1U : 0U;
-    g_status.center_freq_hz = radio ? (int64_t)opts->rtlsdr_center_freq : 0;
+    /* The tuned frequency, which follows an I/Q replay's recorded retunes (issue #575); 0 off a radio input. */
+    g_status.center_freq_hz = (int64_t)dsd_opts_tuned_freq_hz(opts);
     g_status.revision++;
     g_have = 1;
     dsd_mutex_unlock(&g_mu);
@@ -179,6 +189,10 @@ dsd_app_notification_get(dsd_app_notification_status* out) {
         out->lead_slot = -1;
     }
     dsd_mutex_unlock(&g_mu);
+    /* Not from g_status: the stamp has its own atomic word, written per audio block on the decode thread, and copying
+       it into the record there would put a lock on that path. One read fills both fields, so the age is the age of
+       the stamp beside it. */
+    dsd_audio_activity_read(&out->audible_stamp, &out->audible_age_ms);
     return have;
 }
 
@@ -195,6 +209,9 @@ dsd_app_notification_reset(void) {
     g_sync_seen_m = 0.0;
     g_have = 0;
     dsd_mutex_unlock(&g_mu);
+    /* The audible-audio stamp goes with the session as well: left set, the next session's first records would report
+       the last one's audio as recent. Its own atomic store, so this stays safe from any thread. It stays armed. */
+    dsd_audio_activity_reset();
 }
 
 /**
@@ -353,6 +370,13 @@ dsd_app_notification_encode(char* out, size_t out_size) {
         return 0;
     }
 
+    /* The Android JNI accessor nativeNotificationStatus() is the only caller (from the service's status poll and from
+       ScreenSupport's synchronous samples), and the only reader of the audible-audio stamp, so this is where the stamp
+       turns on -- on the first poll, which comes before the engine has published anything. Not in get(): the
+       JSON API feed reads through get() and never looks at the stamp, and a session nobody reads it from must
+       keep every audio writer at its unarmed cost of one load. */
+    dsd_audio_activity_arm();
+
     dsd_app_notification_status status;
     if (!dsd_app_notification_get(&status)) {
         return 0;
@@ -365,10 +389,13 @@ dsd_app_notification_encode(char* out, size_t out_size) {
        whole record: a reader must never be handed a prefix it could parse as a complete,
        shorter record. */
     char scratch[DSD_APP_NOTIFICATION_RECORD_SIZE];
-    int used = DSD_SNPRINTF(scratch, sizeof(scratch), "v2\t%s\t%u\t%u\t%u\t%lld\t%lld\t%lld\t%d", protocol,
-                            (unsigned)status.radio_input, (unsigned)status.trunking, (unsigned)status.trunk_tuned,
-                            (long long)status.cc_freq_hz, (long long)status.vc_freq_hz,
-                            (long long)status.center_freq_hz, (int)status.lead_slot);
+    /* v3: version, protocol, radio, trunking, tuned, cc, vc, centre, lead slot, audible stamp, audible age (11 header
+       fields), then 11 per slot. The stamp is unsigned and the age signed (-1 for none), each in decimal. */
+    int used =
+        DSD_SNPRINTF(scratch, sizeof(scratch), "v3\t%s\t%u\t%u\t%u\t%lld\t%lld\t%lld\t%d\t%llu\t%ld", protocol,
+                     (unsigned)status.radio_input, (unsigned)status.trunking, (unsigned)status.trunk_tuned,
+                     (long long)status.cc_freq_hz, (long long)status.vc_freq_hz, (long long)status.center_freq_hz,
+                     (int)status.lead_slot, (unsigned long long)status.audible_stamp, (long)status.audible_age_ms);
     /* DSD_SNPRINTF forwards to vsnprintf: a negative return is an encoding error, and a
        return >= the buffer size means the formatted record was truncated. Either way,
        there is no whole record to hand back. */

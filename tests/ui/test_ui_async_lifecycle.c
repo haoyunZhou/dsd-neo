@@ -15,6 +15,7 @@
 #include <dsd-neo/platform/threading.h>
 #include <dsd-neo/platform/timing.h>
 #include <dsd-neo/runtime/control_pump.h>
+#include <dsd-neo/runtime/decode_clock.h>
 #include <dsd-neo/ui/menu_core.h>
 #include <dsd-neo/ui/ncurses.h>
 #include <dsd-neo/ui/ui_async.h>
@@ -53,7 +54,6 @@ static int g_timeout_calls;
 static int g_escdelay_calls;
 static int g_ncurses_open_calls;
 static int g_ncurses_close_calls;
-static int g_rr_panel_shutdown_calls;
 static int g_clearok_calls;
 static int g_ncurses_input_calls;
 static int g_last_menu_key = ERR;
@@ -183,9 +183,7 @@ dsd_terminal_close(void) {
 }
 
 void
-rr_panel_shutdown(void) {
-    g_rr_panel_shutdown_calls++;
-}
+rr_panel_shutdown(void) {}
 
 void
 dsd_terminal_render(dsd_opts* opts, dsd_state* state) {
@@ -204,7 +202,7 @@ dsd_terminal_handle_input(dsd_opts* opts, dsd_state* state, int c) {
 }
 
 uint64_t
-dsd_time_monotonic_ns(void) {
+dsd_realtime_mono_ns(void) {
     return g_time_ns;
 }
 
@@ -213,12 +211,19 @@ dsd_sleep_ms(unsigned int ms) {
     (void)ms;
 }
 
+/* PDCurses (Windows) has no set_escdelay(), and dsd_curses_set_escdelay() skips it there. */
+#if defined(DSD_USE_PDCURSES)
+enum { kEscdelayCallsPerConfigure = 0 };
+#else
+enum { kEscdelayCallsPerConfigure = 1 };
+
 int
 set_escdelay(int delay) {
     (void)delay;
     g_escdelay_calls++;
     return 0;
 }
+#endif
 
 int
 keypad(WINDOW* win, bool bf) {
@@ -235,11 +240,13 @@ wtimeout(WINDOW* win, int delay) {
     g_timeout_calls++;
 }
 
+#if defined(DSD_USE_PDCURSES)
+/* PDCurses (Windows) implements timeout() as a function; ncurses defines it as wtimeout() on stdscr. */
 void
 timeout(int delay) {
-    (void)delay;
-    g_timeout_calls++;
+    wtimeout(stdscr, delay);
 }
+#endif
 
 int
 wgetch(WINDOW* win) {
@@ -368,7 +375,6 @@ test_ui_curses_close_uses_opened_state(void) {
 
     g_ncurses_open_calls = 0;
     g_ncurses_close_calls = 0;
-    g_rr_panel_shutdown_calls = 0;
     dsd_neo_ui_async_test_set_context(&opts, &state);
 
     int curses_opened = dsd_neo_ui_async_test_open_curses_if_needed();
@@ -455,11 +461,7 @@ test_ui_single_frame_snapshot_input_and_draw_helpers(void) {
     stdscr = (WINDOW*)0x1;
     g_getch_value = 'a';
     dsd_neo_ui_async_test_process_input_frame(&opts);
-#if DSD_PLATFORM_WIN_NATIVE
-    rc |= expect_int("PDCurses does not configure escdelay", g_escdelay_calls, 0);
-#else
-    rc |= expect_int("configure escdelay once", g_escdelay_calls, 1);
-#endif
+    rc |= expect_int("configure escdelay once", g_escdelay_calls, kEscdelayCallsPerConfigure);
     rc |= expect_int("configure keypad once", g_keypad_calls, 1);
     rc |= expect_int("configure timeout once", g_timeout_calls, 1);
     rc |= expect_int("normal input delivered", g_ncurses_input_calls, 1);
@@ -467,11 +469,7 @@ test_ui_single_frame_snapshot_input_and_draw_helpers(void) {
 
     g_getch_value = KEY_RESIZE;
     dsd_neo_ui_async_test_process_input_frame(&opts);
-#if DSD_PLATFORM_WIN_NATIVE
-    rc |= expect_int("PDCurses escdelay remains unused", g_escdelay_calls, 0);
-#else
-    rc |= expect_int("configure not repeated", g_escdelay_calls, 1);
-#endif
+    rc |= expect_int("configure not repeated", g_escdelay_calls, kEscdelayCallsPerConfigure);
     rc |= expect_int("resize clearok", g_clearok_calls, 1);
 
     uint64_t last_draw_ns = 100U;

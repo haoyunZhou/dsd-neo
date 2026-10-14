@@ -14,6 +14,7 @@
 #include <dsd-neo/core/talkgroup_policy.h>
 #include <dsd-neo/crypto/aes.h>
 #include <dsd-neo/crypto/des.h>
+#include <dsd-neo/runtime/decode_clock.h>
 #include <dsd-neo/runtime/trunk_tuning_hooks.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -135,10 +136,11 @@ nxdn_trunk_diag_log_missing_channel_once(const dsd_opts* opts, dsd_state* state,
 
 void
 // NOLINTNEXTLINE(misc-use-internal-linkage)
-watchdog_event_current(dsd_opts* opts, dsd_state* state, uint8_t slot) {
+dsd_event_note_current_call(dsd_opts* opts, dsd_state* state, uint8_t slot, const char* note) {
     (void)opts;
     (void)state;
     (void)slot;
+    (void)note;
 }
 
 int
@@ -185,18 +187,6 @@ long int
 dsd_rigctl_query_hook_get_current_freq_hz(const dsd_opts* opts) {
     (void)opts;
     return 0;
-}
-
-uint64_t
-// NOLINTNEXTLINE(misc-use-internal-linkage)
-dsd_time_monotonic_ns(void) {
-    return 0ULL;
-}
-
-uint64_t
-// NOLINTNEXTLINE(misc-use-internal-linkage)
-dsd_time_monotonic_ms(void) {
-    return dsd_time_monotonic_ns() / 1000000U;
 }
 
 static dsd_trunk_tune_result
@@ -298,6 +288,7 @@ main(void) {
         return 1;
     }
 
+    dsd_decode_clock_use_test(1000000000000ULL);
     opts->trunk_enable = 1;
     opts->trunk_use_allow_list = 1;
     opts->trunk_tune_group_calls = 1;
@@ -341,6 +332,7 @@ main(void) {
     rc |= expect_true("group source fallback allowed", g_tune_count == 1 && g_last_tune_freq == freq);
 
     dsd_trunk_tuning_hooks_set((dsd_trunk_tuning_hooks){0});
+    dsd_decode_clock_use_system();
 
     if (rc == 0) {
         printf("NXDN_GRANT_POLICY: OK\n");

@@ -6,19 +6,24 @@
  * Copyright (C) 2026 by arancormonk <180709949+arancormonk@users.noreply.github.com>
  */
 
+#include <dsd-neo/core/ambe_interleave.h>
 #include <dsd-neo/core/bit_packing.h>
 #include <dsd-neo/core/call_state.h>
 #include <dsd-neo/core/dibit.h>
 #include <dsd-neo/core/file_io.h>
 #include <dsd-neo/core/opts.h>
+#include <dsd-neo/core/parse.h>
 #include <dsd-neo/core/state.h>
 #include <dsd-neo/core/state_ext.h>
 #include <dsd-neo/core/synctype_ids.h>
 #include <dsd-neo/core/talkgroup_policy.h>
 #include <dsd-neo/core/time_format.h>
 #include <dsd-neo/fec/block_codes.h>
+#include <dsd-neo/runtime/decode_clock.h>
 #include <dsd-neo/runtime/rdio_export.h>
 #include <errno.h>
+#include <math.h>
+#include <mbelib-neo/mbelib.h>
 #include <sndfile.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -35,6 +40,7 @@
 #include "dsd-neo/core/state_fwd.h"
 #include "dsd-neo/platform/file_compat.h"
 #include "dsd-neo/platform/platform.h"
+#include "dsd-neo/platform/posix_compat.h"
 #include "test_support.h"
 
 static int
@@ -213,6 +219,33 @@ read_file_bytes_prefix(const char* path, unsigned char* out, size_t want) {
     return 0;
 }
 
+/* A frame as saveAmbe2450Data() writes it: the error count, six packed bytes, then the final bit. It holds LF, CR and
+ * Ctrl-Z, which a text-mode stream on Windows would expand (LF to CRLF) or read as end of file. */
+static const unsigned char kBinaryProbeFrame[8] = {0x0A, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0xFF, 0x01};
+
+static void
+binary_probe_ambe_bits(char* ambe_d) {
+    for (int byte = 0; byte < 6; byte++) {
+        for (int bit = 0; bit < 8; bit++) {
+            ambe_d[(byte * 8) + bit] = (char)((kBinaryProbeFrame[1 + byte] >> (7 - bit)) & 1U);
+        }
+    }
+    ambe_d[48] = (char)kBinaryProbeFrame[7];
+}
+
+/* The MBE file holds exactly its four-byte header and the probe frame, byte for byte. */
+static int
+expect_mbe_file_bytes(const char* label, const char* path, const char* header) {
+    unsigned char bytes[12];
+    size_t got = 0;
+    if (read_file_exact(path, bytes, sizeof bytes, &got) != 0) {
+        return 1;
+    }
+    int ok = got == sizeof bytes && memcmp(bytes, header, 4) == 0
+             && memcmp(bytes + 4, kBinaryProbeFrame, sizeof kBinaryProbeFrame) == 0;
+    return expect_true(label, ok);
+}
+
 static long
 file_size_or_negative(const char* path) {
     FILE* f = fopen(path, "rb");
@@ -228,6 +261,87 @@ file_size_or_negative(const char* path) {
     long size = ftell(f);
     fclose(f);
     return size;
+}
+
+typedef struct {
+    int count;
+    char last[256];
+} dir_count_ctx;
+
+static int
+count_dir_entry(const char* name, void* user) {
+    dir_count_ctx* ctx = (dir_count_ctx*)user;
+    ctx->count++;
+    DSD_SNPRINTF(ctx->last, sizeof ctx->last, "%s", name);
+    return 0;
+}
+
+static int
+count_dir_files(const char* dir) {
+    dir_count_ctx ctx;
+    DSD_MEMSET(&ctx, 0, sizeof ctx);
+    if (dsd_dir_list(dir, count_dir_entry, &ctx) != 0) {
+        return -1;
+    }
+    return ctx.count;
+}
+
+/* Remove every regular file in dir, then dir. */
+static int
+remove_dir_files_cb(const char* name, void* user) {
+    const char* dir = (const char*)user;
+    char path[DSD_TEST_PATH_MAX];
+    DSD_SNPRINTF(path, sizeof path, "%s%c%s", dir, dsd_test_path_sep(), name);
+    (void)remove(path);
+    return 0;
+}
+
+static void
+remove_dir_tree(const char* dir) {
+    (void)dsd_dir_list(dir, remove_dir_files_cb, (void*)dir);
+    (void)remove_dir(dir);
+}
+
+typedef struct {
+    char names[8][256];
+    long sizes[8];
+    int count;
+    const char* dir;
+} dir_files_ctx;
+
+static int
+collect_dir_file(const char* name, void* user) {
+    dir_files_ctx* ctx = (dir_files_ctx*)user;
+    if (ctx->count >= 8) {
+        return 1;
+    }
+    DSD_SNPRINTF(ctx->names[ctx->count], sizeof ctx->names[0], "%s", name);
+    char path[DSD_TEST_PATH_MAX * 2];
+    DSD_SNPRINTF(path, sizeof path, "%s/%s", ctx->dir, name);
+    ctx->sizes[ctx->count] = file_size_or_negative(path);
+    ctx->count++;
+    return 0;
+}
+
+/* How many files in dir end in ext, and the bytes they hold together. */
+static int
+count_capture_files(const char* dir, const char* ext, long* total_size) {
+    dir_files_ctx ctx;
+    DSD_MEMSET(&ctx, 0, sizeof ctx);
+    ctx.dir = dir;
+    (void)dsd_dir_list(dir, collect_dir_file, &ctx);
+    int count = 0;
+    long total = 0;
+    for (int i = 0; i < ctx.count; i++) {
+        if (has_suffix(ctx.names[i], ext)) {
+            count++;
+            total += ctx.sizes[i];
+        }
+    }
+    if (total_size) {
+        *total_size = total;
+    }
+    return count;
 }
 
 static int
@@ -370,8 +484,22 @@ write_sdrtrunk_json_input(FILE** out, const char* json) {
     return 0;
 }
 
+/* The output buffers the gain stage (processAudio()) writes, for a zeroed state: JSON playback runs it for every frame
+   in either output format (issue #652). Each run starts them over. */
+static void
+prepare_gain_stage(dsd_state* state) {
+    static short out_buf[100 + (160 * 512)];
+    state->audio_out_buf = out_buf;
+    state->audio_out_buf_p = out_buf + 100;
+    state->audio_out_idx = 0;
+    state->audio_out_idx2 = 0;
+    state->aout_max_buf_p = state->aout_max_buf;
+    state->aout_max_buf_idx = 0;
+}
+
 static int
 run_sdrtrunk_json(const char* json, dsd_opts* opts, dsd_state* state) {
+    prepare_gain_stage(state);
     FILE* in = NULL;
     if (write_sdrtrunk_json_input(&in, json) != 0) {
         return 1;
@@ -1357,8 +1485,10 @@ test_sdrtrunk_json_invalid_numeric_fields_reset_to_zero(void) {
     return rc;
 }
 
+/* Issue #661: a protocol token creates no capture; the first voice frame recorded under it does. A token with no voice
+   behind it leaves the folder empty. */
 static int
-test_sdrtrunk_json_protocol_opens_and_closes_mbe_out_file(void) {
+test_sdrtrunk_json_protocol_token_alone_creates_no_capture(void) {
     int rc = 0;
     char dir[DSD_TEST_PATH_MAX];
     static dsd_opts opts;
@@ -1376,26 +1506,69 @@ test_sdrtrunk_json_protocol_opens_and_closes_mbe_out_file(void) {
     DSD_MEMSET(history, 0, sizeof history);
     DSD_SNPRINTF(opts.mbe_out_dir, sizeof opts.mbe_out_dir, "%s%c", dir, dsd_test_path_sep());
     opts.playfiles = 1;
-    state.tgcount = 3;
-    state.tg[2][1] = 4;
     state.event_history_s = history;
 
     rc |= run_sdrtrunk_json(json, &opts, &state);
-    rc |= expect_int("sdrtrunk mbe close clears flag", opts.mbe_out, 0);
-    rc |= expect_true("sdrtrunk mbe close clears handle", opts.mbe_out_f == NULL);
-    rc |= expect_true("sdrtrunk mbe filename suffix", has_suffix(opts.mbe_out_file, "_S1.amb"));
-    rc |= expect_int("sdrtrunk mbe resets tgcount", state.tgcount, 0);
-    rc |= expect_int("sdrtrunk mbe resets tg table", state.tg[2][1], 0);
+    rc |= expect_int("sdrtrunk token only: no capture flag", opts.mbe_out, 0);
+    rc |= expect_true("sdrtrunk token only: no handle", opts.mbe_out_f == NULL);
+    rc |= expect_int("sdrtrunk token only: folder empty", count_dir_files(dir), 0);
 
-    char header[8];
-    if (read_file_prefix(opts.mbe_out_path, header, sizeof header) != 0) {
-        rc = 1;
-    } else {
-        rc |= expect_true("sdrtrunk mbe header", strcmp(header, ".amb") == 0);
+    dsd_state_ext_free_all(&state);
+    remove_dir_tree(dir);
+    return rc;
+}
+
+/* A second protocol token in one file starts a capture of its own, in its own format, even before any dispatch has
+   ever run (the frame's protocol is the token's). */
+static int
+test_sdrtrunk_json_second_protocol_gets_its_own_capture(void) {
+    int rc = 0;
+    char dir[DSD_TEST_PATH_MAX];
+    static dsd_opts opts;
+    static dsd_state state;
+    static Event_History_I history[2];
+    static const char json_formats[] =
+        "{\"version\":\"2\",\"protocol\":\"APCO25-PHASE1\",\"call_type\":\"GROUP\",\"encrypted\":\"false\","
+        "\"hex\":\"000000000000000000000000000000000000\",\"protocol\":\"DMR\",\"hex\":\"000000000000000000\"}";
+    static const char json_owners[] =
+        "{\"version\":\"2\",\"protocol\":\"DMR\",\"call_type\":\"GROUP\",\"encrypted\":\"false\","
+        "\"hex\":\"000000000000000000\",\"protocol\":\"APCO25-PHASE2\",\"hex\":\"000000000000000000\"}";
+
+    if (!dsd_test_mkdtemp(dir, sizeof dir, "dsdneo_sdrtrunk_two")) {
+        return 1;
     }
+    long size = 0;
 
-    (void)remove(opts.mbe_out_path);
-    (void)remove_dir(dir);
+    DSD_MEMSET(&opts, 0, sizeof opts);
+    DSD_MEMSET(&state, 0, sizeof state);
+    DSD_MEMSET(history, 0, sizeof history);
+    DSD_SNPRINTF(opts.mbe_out_dir, sizeof opts.mbe_out_dir, "%s", dir);
+    opts.playfiles = 1;
+    opts.floating_point = 1;
+    state.event_history_s = history;
+    rc |= run_sdrtrunk_json(json_formats, &opts, &state);
+    rc |= expect_true("sdrtrunk two formats: closed at eof", opts.mbe_out_f == NULL);
+    rc |= expect_int("sdrtrunk two formats: one imb", count_capture_files(dir, ".imb", &size), 1);
+    rc |= expect_true("sdrtrunk two formats: imb holds the imbe record", size == 4 + 12);
+    rc |= expect_int("sdrtrunk two formats: one amb", count_capture_files(dir, ".amb", &size), 1);
+    rc |= expect_true("sdrtrunk two formats: amb holds the ambe record", size == 4 + 8);
+    remove_dir_tree(dir);
+    (void)dsd_mkdir(dir, 0700);
+    dsd_state_ext_free_all(&state);
+
+    DSD_MEMSET(&opts, 0, sizeof opts);
+    DSD_MEMSET(&state, 0, sizeof state);
+    DSD_MEMSET(history, 0, sizeof history);
+    DSD_SNPRINTF(opts.mbe_out_dir, sizeof opts.mbe_out_dir, "%s", dir);
+    opts.playfiles = 1;
+    opts.floating_point = 1;
+    state.event_history_s = history;
+    rc |= run_sdrtrunk_json(json_owners, &opts, &state);
+    rc |= expect_int("sdrtrunk two owners: two amb", count_capture_files(dir, ".amb", &size), 2);
+    rc |= expect_true("sdrtrunk two owners: one record each", size == 2L * (4 + 8));
+
+    dsd_state_ext_free_all(&state);
+    remove_dir_tree(dir);
     return rc;
 }
 
@@ -1443,6 +1616,160 @@ test_sdrtrunk_json_hex_voice_writes_unencrypted_mbe_records(void) {
 
     fclose(out);
     opts.mbe_out_f = NULL;
+    return rc;
+}
+
+/* A clean AMBE 3600x2450 voice frame, as SDRTrunk records DMR voice: 36 dibits
+ * in transmit order, two per hex digit. Sent twice from a fresh vocoder state it
+ * decodes, with no corrected errors, to voice peaking near 7200 on the int16
+ * scale. It is 49 parameter bits packed with mbelib-neo's
+ * mbe_quality_frame_from_data() (tools/quality) and mapped to dibits through
+ * dsd_ambe_2450_dibit_map. */
+static const char k_sdrtrunk_dmr_voice_hex[] = "3ABF032D9ADEE4CB50";
+
+/* SDRTrunk JSON playback runs every frame it synthesizes through the voice chain as soon as it is made, as the vocoder
+ * does, so a frame it then withholds (encrypted, no key) still moves the filter and the gain on (issue #653): when
+ * playback turns decryptable partway (DMR AES late entry), the chain picks up from the call, not from stale state. */
+static int
+test_sdrtrunk_json_withheld_frames_run_the_voice_chain(void) {
+    static dsd_opts opts;
+    static dsd_state state;
+    static Event_History_I history[2];
+    static mbe_parms cur, prev, prev_enhanced;
+    int rc = 0;
+
+    char json[320];
+    DSD_SNPRINTF(json, sizeof json,
+                 "{\"version\":\"2\",\"protocol\":\"DMR\",\"call_type\":\"GROUP\",\"encrypted\":\"true\","
+                 "\"encryption_algorithm\":\"36\",\"encryption_key_id\":\"9\","
+                 "\"frames\":[{\"hex\":\"%s\"},{\"hex\":\"%s\"}]}",
+                 k_sdrtrunk_dmr_voice_hex, k_sdrtrunk_dmr_voice_hex);
+
+    DSD_MEMSET(&opts, 0, sizeof opts);
+    DSD_MEMSET(&state, 0, sizeof state);
+    DSD_MEMSET(history, 0, sizeof history);
+    opts.playfiles = 1;
+    opts.floating_point = 1;
+    opts.use_hpf_d = 1;
+    state.event_history_s = history;
+    state.aout_gain = 25.0f;
+    mbe_initMbeParms(&cur, &prev, &prev_enhanced);
+    state.cur_mp = &cur;
+    state.prev_mp = &prev;
+    state.prev_mp_enhanced = &prev_enhanced;
+
+    rc |= run_sdrtrunk_json(json, &opts, &state);
+    rc |= expect_true("sdrtrunk withheld frames move the high-pass",
+                      fabs(state.voice_hpf[0].s1) > 1e-9 || fabs(state.voice_hpf[0].s2) > 1e-9);
+    rc |= expect_true("sdrtrunk withheld frames move the auto gain", fabsf(state.aout_gain - 25.0f) > 1e-3f);
+    dsd_state_ext_free_all(&state);
+    return rc;
+}
+
+/* mbelib-neo's float PCM is int16 / 7. SDRTrunk JSON playback scales each frame
+ * to the int16 scale its WAV writers expect, as live decode does, so a per-call
+ * WAV holds the PCM mbe_floattoshort() makes of the frames, not a 7th of it. */
+static int
+test_sdrtrunk_json_voice_wav_is_pcm16_scale(void) {
+    static dsd_opts opts;
+    static dsd_state state;
+    static Event_History_I history[2];
+    int rc = 0;
+
+    char ambe_fr[4][24];
+    DSD_MEMSET(ambe_fr, 0, sizeof ambe_fr);
+    for (size_t i = 0; i < DSD_AMBE_2450_DIBITS; i++) {
+        const int nibble = dsd_hex_nibble_value((unsigned char)k_sdrtrunk_dmr_voice_hex[i / 2U]);
+        if (nibble < 0) {
+            DSD_FPRINTF(stderr, "sdrtrunk pcm16 frame: bad hex digit\n");
+            return 1;
+        }
+        const unsigned dibit = ((unsigned)nibble >> ((i % 2U) ? 0U : 2U)) & 0x3U;
+        const dsd_ambe_2450_dibit_map_entry* map = &dsd_ambe_2450_dibit_map[i];
+        ambe_fr[map->high_row][map->high_col] = (char)((dibit >> 1U) & 1U);
+        ambe_fr[map->low_row][map->low_col] = (char)(dibit & 1U);
+    }
+    short want[320];
+    static mbe_parms cur, prev, prev_enhanced;
+    mbe_initMbeParms(&cur, &prev, &prev_enhanced);
+    int peak = 0;
+    for (size_t frame = 0; frame < 2U; frame++) {
+        char ambe_d[49] = {0};
+        float audio[160] = {0};
+        mbe_process_result result;
+        rc |= expect_int("sdrtrunk pcm16 reference decode",
+                         mbe_decodeAmbe3600x2450Frame((const char (*)[24])ambe_fr, ambe_d, &result), 0);
+        rc |= expect_true("sdrtrunk pcm16 reference synthesis",
+                          mbe_processAmbe2450Dataf(audio, &result, ambe_d, &cur, &prev, &prev_enhanced) >= 0);
+        mbe_floattoshort(audio, want + (frame * 160U));
+    }
+    for (int i = 0; i < 320; i++) {
+        const int magnitude = want[i] < 0 ? -want[i] : want[i];
+        peak = magnitude > peak ? magnitude : peak;
+    }
+    rc |= expect_true("sdrtrunk pcm16 reference is audible", peak >= 4000);
+
+    char json[256];
+    DSD_SNPRINTF(json, sizeof json,
+                 "{\"version\":\"2\",\"protocol\":\"DMR\",\"call_type\":\"GROUP\",\"encrypted\":\"false\","
+                 "\"frames\":[{\"hex\":\"%s\"},{\"hex\":\"%s\"}]}",
+                 k_sdrtrunk_dmr_voice_hex, k_sdrtrunk_dmr_voice_hex);
+
+    DSD_MEMSET(&opts, 0, sizeof opts);
+    DSD_MEMSET(&state, 0, sizeof state);
+    DSD_MEMSET(history, 0, sizeof history);
+    opts.playfiles = 1;
+    opts.floating_point = 1;
+    opts.dmr_stereo_wav = 1;
+    // A fixed unity gain with the high-pass off leaves the voice chain (issue #653) a pass-through, so the WAV shows
+    // the scale alone.
+    opts.audio_gain = 1.0f;
+    opts.audio_gainR = 1.0f;
+    state.event_history_s = history;
+    mbe_initMbeParms(&cur, &prev, &prev_enhanced);
+    state.cur_mp = &cur;
+    state.prev_mp = &prev;
+    state.prev_mp_enhanced = &prev_enhanced;
+
+    char wav_path[DSD_TEST_PATH_MAX];
+    const int fd = dsd_test_mkstemp(wav_path, sizeof wav_path, "sdrtrunk_json_pcm16");
+    if (fd < 0) {
+        return 1;
+    }
+    dsd_close(fd);
+    SF_INFO info;
+    DSD_MEMSET(&info, 0, sizeof info);
+    info.samplerate = 8000;
+    info.channels = 1;
+    info.format = SF_FORMAT_WAV | SF_FORMAT_PCM_16;
+    opts.wav_out_f = sf_open(wav_path, SFM_WRITE, &info);
+    if (!opts.wav_out_f) {
+        (void)remove(wav_path);
+        return 1;
+    }
+
+    rc |= run_sdrtrunk_json(json, &opts, &state);
+    sf_close(opts.wav_out_f);
+    opts.wav_out_f = NULL;
+
+    short got[320];
+    DSD_MEMSET(got, 0, sizeof got);
+    DSD_MEMSET(&info, 0, sizeof info);
+    SNDFILE* written = sf_open(wav_path, SFM_READ, &info);
+    rc |= expect_true("sdrtrunk pcm16 wav readable", written != NULL);
+    if (written) {
+        rc |= expect_int("sdrtrunk pcm16 wav frames", (int)sf_read_short(written, got, 320), 320);
+        sf_close(written);
+    }
+    int worst = 0;
+    for (int i = 0; i < 320; i++) {
+        const int difference = (int)got[i] - (int)want[i];
+        const int magnitude = difference < 0 ? -difference : difference;
+        worst = magnitude > worst ? magnitude : worst;
+    }
+    rc |= expect_true("sdrtrunk voice wav matches mbe_floattoshort", worst <= 1);
+    dsd_state_ext_free_all(&state);
+    (void)remove(wav_path);
     return rc;
 }
 
@@ -1871,18 +2198,57 @@ test_sdrtrunk_nxdn_missing_context_and_sacch_alignment(void) {
     return rc;
 }
 
+/* An IMBE record as saveImbe4400Data() writes it: the error count and eleven packed bytes, LF, CR and Ctrl-Z among
+ * them, as in the AMBE probe. */
+static const unsigned char kBinaryProbeImbe[12] = {0x0A, 0x0D, 0x0A, 0x1A, 0x0A, 0x00,
+                                                   0xFF, 0x01, 0x0D, 0x0A, 0x1A, 0x80};
+
+static void
+binary_probe_imbe_bits(char* imbe_d) {
+    for (int byte = 0; byte < 11; byte++) {
+        for (int bit = 0; bit < 8; bit++) {
+            imbe_d[(byte * 8) + bit] = (char)((kBinaryProbeImbe[1 + byte] >> (7 - bit)) & 1U);
+        }
+    }
+}
+
 static int
-test_open_mbe_out_file_creates_slot_files_and_closes(void) {
+expect_imbe_file_bytes(const char* label, const char* path) {
+    unsigned char bytes[16];
+    size_t got = 0;
+    if (read_file_exact(path, bytes, sizeof bytes, &got) != 0) {
+        return 1;
+    }
+    int ok = got == sizeof bytes && memcmp(bytes, ".imb", 4) == 0
+             && memcmp(bytes + 4, kBinaryProbeImbe, sizeof kBinaryProbeImbe) == 0;
+    return expect_true(label, ok);
+}
+
+static void
+mbe_out_test_reset(dsd_opts* opts, dsd_state* state, const char* dir) {
+    DSD_MEMSET(opts, 0, sizeof *opts);
+    DSD_MEMSET(state, 0, sizeof *state);
+    if (dir) {
+        DSD_SNPRINTF(opts->mbe_out_dir, sizeof opts->mbe_out_dir, "%s", dir);
+    }
+    state->frame_dispatch_synctype = DSD_SYNC_NONE;
+}
+
+/* Issue #661: the capture writer creates each slot's file with its first frame, in the folder (-d without a trailing
+   separator included), in the frame's record format, and the closers clear what it recorded. */
+static int
+test_mbe_out_write_creates_slot_files_and_closes(void) {
     int rc = 0;
 
     struct {
         int synctype;
+        dsd_mbe_out_format format;
         const char* suffix;
         const char* header;
     } slot1_cases[] = {
-        {DSD_SYNC_P25P1_POS, "_S1.imb", ".imb"},
-        {DSD_SYNC_DSTAR_VOICE_POS, "_S1.dmb", ".dmb"},
-        {DSD_SYNC_DMR_BS_VOICE_POS, "_S1.amb", ".amb"},
+        {DSD_SYNC_P25P1_POS, DSD_MBE_OUT_FORMAT_IMBE, "_S1.imb", ".imb"},
+        {DSD_SYNC_DSTAR_VOICE_POS, DSD_MBE_OUT_FORMAT_DSTAR, "_S1.dmb", ".dmb"},
+        {DSD_SYNC_DMR_BS_VOICE_POS, DSD_MBE_OUT_FORMAT_AMBE, "_S1.amb", ".amb"},
     };
 
     char dir[DSD_TEST_PATH_MAX];
@@ -1894,46 +2260,62 @@ test_open_mbe_out_file_creates_slot_files_and_closes(void) {
     for (size_t i = 0; i < sizeof slot1_cases / sizeof slot1_cases[0]; i++) {
         static dsd_opts opts;
         static dsd_state state;
-        DSD_MEMSET(&opts, 0, sizeof opts);
-        DSD_MEMSET(&state, 0, sizeof state);
-        DSD_SNPRINTF(opts.mbe_out_dir, sizeof opts.mbe_out_dir, "%s%c", dir, dsd_test_path_sep());
+        mbe_out_test_reset(&opts, &state, dir);
         state.synctype = slot1_cases[i].synctype;
         state.tgcount = 7;
         state.tg[3][2] = 9;
 
-        openMbeOutFile(&opts, &state);
+        rc |= expect_true("slot1 capture enabled by the folder", dsd_mbe_out_enabled(&opts, 0));
+        rc |= expect_true("slot1 no file before the first frame", opts.mbe_out_f == NULL);
+        char bits[88];
+        DSD_MEMSET(bits, 0, sizeof bits);
+        if (slot1_cases[i].format == DSD_MBE_OUT_FORMAT_IMBE) {
+            binary_probe_imbe_bits(bits);
+            state.errs2 = kBinaryProbeImbe[0];
+        } else {
+            binary_probe_ambe_bits(bits);
+            state.errs2 = kBinaryProbeFrame[0];
+        }
+        dsd_mbe_out_write(&opts, &state, 0, slot1_cases[i].format, bits);
         rc |= expect_int("slot1 open flag", opts.mbe_out, 1);
         rc |= expect_true("slot1 file handle opened", opts.mbe_out_f != NULL);
+        rc |= expect_int("slot1 owner", opts.mbe_out_owner, dsd_mbe_out_owner_of(slot1_cases[i].synctype));
+        rc |= expect_int("slot1 format", opts.mbe_out_format, (int)slot1_cases[i].format);
         rc |= expect_true("slot1 filename suffix", has_suffix(opts.mbe_out_file, slot1_cases[i].suffix));
-        rc |= expect_true("slot1 path contains filename", strstr(opts.mbe_out_path, opts.mbe_out_file) != NULL);
+        char want_path[DSD_TEST_PATH_MAX * 2];
+        DSD_SNPRINTF(want_path, sizeof want_path, "%s/%s", dir, opts.mbe_out_file);
+        rc |= expect_true("slot1 file inside the folder", strcmp(opts.mbe_out_path, want_path) == 0);
         rc |= expect_int("slot1 tgcount reset", state.tgcount, 0);
         rc |= expect_int("slot1 tg table reset", state.tg[3][2], 0);
 
         closeMbeOutFile(&opts, &state);
         rc |= expect_int("slot1 close clears flag", opts.mbe_out, 0);
         rc |= expect_true("slot1 close clears handle", opts.mbe_out_f == NULL);
+        rc |= expect_int("slot1 close clears owner", opts.mbe_out_owner, 0);
+        rc |= expect_int("slot1 close clears format", opts.mbe_out_format, DSD_MBE_OUT_FORMAT_NONE);
 
-        char header[8];
-        if (read_file_prefix(opts.mbe_out_path, header, sizeof header) != 0) {
-            rc = 1;
+        if (slot1_cases[i].format == DSD_MBE_OUT_FORMAT_IMBE) {
+            rc |= expect_imbe_file_bytes("slot1 header and binary imbe record", opts.mbe_out_path);
         } else {
-            rc |= expect_true("slot1 header", strcmp(header, slot1_cases[i].header) == 0);
+            rc |= expect_mbe_file_bytes("slot1 header and binary frame", opts.mbe_out_path, slot1_cases[i].header);
         }
         (void)remove(opts.mbe_out_path);
     }
 
     static dsd_opts opts;
     static dsd_state state;
-    DSD_MEMSET(&opts, 0, sizeof opts);
-    DSD_MEMSET(&state, 0, sizeof state);
-    DSD_SNPRINTF(opts.mbe_out_dir, sizeof opts.mbe_out_dir, "%s%c", dir, dsd_test_path_sep());
+    mbe_out_test_reset(&opts, &state, dir);
     state.synctype = DSD_SYNC_DMR_BS_VOICE_POS;
     state.tgcount = 5;
     state.tg[4][3] = 8;
 
-    openMbeOutFileR(&opts, &state);
+    char probe_bits[49];
+    binary_probe_ambe_bits(probe_bits);
+    state.errs2R = kBinaryProbeFrame[0];
+    dsd_mbe_out_write(&opts, &state, 1, DSD_MBE_OUT_FORMAT_AMBE, probe_bits);
     rc |= expect_int("slot2 open flag", opts.mbe_outR, 1);
     rc |= expect_true("slot2 file handle opened", opts.mbe_out_fR != NULL);
+    rc |= expect_true("slot2 leaves slot1 alone", opts.mbe_out_f == NULL);
     rc |= expect_true("slot2 filename suffix", has_suffix(opts.mbe_out_fileR, "_S2.amb"));
     rc |= expect_true("slot2 path contains filename", strstr(opts.mbe_out_path, opts.mbe_out_fileR) != NULL);
     rc |= expect_int("slot2 tgcount reset", state.tgcount, 0);
@@ -1943,14 +2325,340 @@ test_open_mbe_out_file_creates_slot_files_and_closes(void) {
     rc |= expect_int("slot2 close clears flag", opts.mbe_outR, 0);
     rc |= expect_true("slot2 close clears handle", opts.mbe_out_fR == NULL);
 
-    char header[8];
-    if (read_file_prefix(opts.mbe_out_path, header, sizeof header) != 0) {
-        rc = 1;
-    } else {
-        rc |= expect_true("slot2 header", strcmp(header, ".amb") == 0);
-    }
+    rc |= expect_mbe_file_bytes("slot2 header and binary frame", opts.mbe_out_path, ".amb");
     (void)remove(opts.mbe_out_path);
     (void)remove_dir(dir);
+    return rc;
+}
+
+/* A folder given with its trailing separator gets no second one. */
+static int
+test_mbe_out_folder_with_separator_is_not_doubled(void) {
+    int rc = 0;
+    char dir[DSD_TEST_PATH_MAX];
+    if (!dsd_test_mkdtemp(dir, sizeof dir, "dsdneo_mbe_sep")) {
+        return 1;
+    }
+    static dsd_opts opts;
+    static dsd_state state;
+    mbe_out_test_reset(&opts, &state, NULL);
+    DSD_SNPRINTF(opts.mbe_out_dir, sizeof opts.mbe_out_dir, "%s/", dir);
+    state.synctype = DSD_SYNC_DMR_BS_VOICE_POS;
+    char bits[49] = {0};
+    dsd_mbe_out_write(&opts, &state, 0, DSD_MBE_OUT_FORMAT_AMBE, bits);
+    char want_path[DSD_TEST_PATH_MAX * 2];
+    DSD_SNPRINTF(want_path, sizeof want_path, "%s/%s", dir, opts.mbe_out_file);
+    rc |= expect_true("separator not doubled", strcmp(opts.mbe_out_path, want_path) == 0);
+    closeMbeOutFile(&opts, &state);
+    rc |= expect_int("one file in the folder", count_dir_files(dir), 1);
+    remove_dir_tree(dir);
+    return rc;
+}
+
+/* What the writer refuses creates nothing: a frame read across a carrier boundary during its dispatch, and a YSF frame
+   before a FICH has verified the transmission on this carrier. */
+static int
+test_mbe_out_refuses_unconfirmed_and_carrier_crossing_frames(void) {
+    int rc = 0;
+    char dir[DSD_TEST_PATH_MAX];
+    if (!dsd_test_mkdtemp(dir, sizeof dir, "dsdneo_mbe_refuse")) {
+        return 1;
+    }
+    static dsd_opts opts;
+    static dsd_state state;
+    char bits[49] = {0};
+
+    mbe_out_test_reset(&opts, &state, dir);
+    state.synctype = DSD_SYNC_DMR_BS_VOICE_POS;
+    state.frame_dispatch_active = 1;
+    state.frame_dispatch_synctype = DSD_SYNC_DMR_BS_VOICE_POS;
+    state.frame_dispatch_carrier_seq = 4U;
+    state.carrier_seq = 5U;
+    dsd_mbe_out_write(&opts, &state, 0, DSD_MBE_OUT_FORMAT_AMBE, bits);
+    rc |= expect_true("carrier-crossing frame creates nothing", opts.mbe_out_f == NULL);
+
+    mbe_out_test_reset(&opts, &state, dir);
+    state.synctype = DSD_SYNC_YSF_POS;
+    state.ysf_fich_confirmed = 0;
+    dsd_mbe_out_write(&opts, &state, 0, DSD_MBE_OUT_FORMAT_AMBE, bits);
+    rc |= expect_true("unconfirmed ysf frame creates nothing", opts.mbe_out_f == NULL);
+    /* Borrowing the NXDN decoder changes nothing: the dispatch says YSF. */
+    state.synctype = DSD_SYNC_NXDN_POS;
+    state.frame_dispatch_active = 1;
+    state.frame_dispatch_synctype = DSD_SYNC_YSF_POS;
+    dsd_mbe_out_write(&opts, &state, 0, DSD_MBE_OUT_FORMAT_AMBE, bits);
+    rc |= expect_true("unconfirmed borrowed ysf frame creates nothing", opts.mbe_out_f == NULL);
+    rc |= expect_int("nothing in the folder", count_dir_files(dir), 0);
+
+    state.ysf_fich_confirmed = 1;
+    dsd_mbe_out_write(&opts, &state, 0, DSD_MBE_OUT_FORMAT_AMBE, bits);
+    rc |= expect_true("confirmed ysf frame creates the capture", opts.mbe_out_f != NULL);
+    rc |= expect_int("borrowed frame owned by ysf", opts.mbe_out_owner, dsd_mbe_out_owner_of(DSD_SYNC_YSF_POS));
+    closeMbeOutFile(&opts, &state);
+    remove_dir_tree(dir);
+    return rc;
+}
+
+/* A capture holds one owner's frames in one format: a frame of another format or owner closes it, on either slot,
+   before the next capture is created. A TDMA pair of one owner and format stays open side by side. */
+static int
+test_mbe_out_rotates_on_owner_and_format(void) {
+    int rc = 0;
+    char dir[DSD_TEST_PATH_MAX];
+    if (!dsd_test_mkdtemp(dir, sizeof dir, "dsdneo_mbe_rotate")) {
+        return 1;
+    }
+    static dsd_opts opts;
+    static dsd_state state;
+    char ambe[49] = {0};
+    char imbe[88] = {0};
+    long size = 0;
+
+    /* YSF V/D2 then full rate: one .amb, one .imb. */
+    mbe_out_test_reset(&opts, &state, dir);
+    state.synctype = DSD_SYNC_YSF_POS;
+    state.ysf_fich_confirmed = 1;
+    dsd_mbe_out_write(&opts, &state, 0, DSD_MBE_OUT_FORMAT_AMBE, ambe);
+    dsd_mbe_out_write(&opts, &state, 0, DSD_MBE_OUT_FORMAT_AMBE, ambe);
+    dsd_mbe_out_write(&opts, &state, 0, DSD_MBE_OUT_FORMAT_IMBE, imbe);
+    rc |= expect_int("format change: open capture is imbe", opts.mbe_out_format, DSD_MBE_OUT_FORMAT_IMBE);
+    closeMbeOutFile(&opts, &state);
+    rc |= expect_int("format change: one amb", count_capture_files(dir, ".amb", &size), 1);
+    rc |= expect_true("format change: amb holds two records", size == 4 + (2 * 8));
+    rc |= expect_int("format change: one imb", count_capture_files(dir, ".imb", &size), 1);
+    rc |= expect_true("format change: imb holds one record", size == 4 + 12);
+    remove_dir_tree(dir);
+    (void)dsd_mkdir(dir, 0700);
+
+    /* DMR then NXDN, both AMBE: two files. */
+    mbe_out_test_reset(&opts, &state, dir);
+    state.synctype = DSD_SYNC_DMR_BS_VOICE_POS;
+    dsd_mbe_out_write(&opts, &state, 0, DSD_MBE_OUT_FORMAT_AMBE, ambe);
+    state.synctype = DSD_SYNC_NXDN_POS;
+    dsd_mbe_out_write(&opts, &state, 0, DSD_MBE_OUT_FORMAT_AMBE, ambe);
+    rc |=
+        expect_int("owner change: open capture is nxdn's", opts.mbe_out_owner, dsd_mbe_out_owner_of(DSD_SYNC_NXDN_POS));
+    closeMbeOutFile(&opts, &state);
+    rc |= expect_int("owner change: two amb files", count_capture_files(dir, ".amb", NULL), 2);
+    remove_dir_tree(dir);
+    (void)dsd_mkdir(dir, 0700);
+
+    /* DMR slots 1 and 2 side by side. */
+    mbe_out_test_reset(&opts, &state, dir);
+    state.synctype = DSD_SYNC_DMR_BS_VOICE_POS;
+    dsd_mbe_out_write(&opts, &state, 0, DSD_MBE_OUT_FORMAT_AMBE, ambe);
+    dsd_mbe_out_write(&opts, &state, 1, DSD_MBE_OUT_FORMAT_AMBE, ambe);
+    dsd_mbe_out_write(&opts, &state, 0, DSD_MBE_OUT_FORMAT_AMBE, ambe);
+    rc |= expect_true("dmr pair: both slots open", opts.mbe_out_f != NULL && opts.mbe_out_fR != NULL);
+    closeMbeOutFile(&opts, &state);
+    closeMbeOutFileR(&opts, &state);
+    rc |= expect_int("dmr pair: two files", count_capture_files(dir, ".amb", NULL), 2);
+    remove_dir_tree(dir);
+    (void)dsd_mkdir(dir, 0700);
+
+    /* P25 Phase 2 slot 2, then Phase 1 (IMBE on slot 1), then Phase 2 slot 2 again: the Phase 1 frame retires the
+       slot 2 capture, so the second Phase 2 burst starts a new one. */
+    mbe_out_test_reset(&opts, &state, dir);
+    state.synctype = DSD_SYNC_P25P2_POS;
+    dsd_mbe_out_write(&opts, &state, 1, DSD_MBE_OUT_FORMAT_AMBE, ambe);
+    char first_slot2[1024];
+    DSD_SNPRINTF(first_slot2, sizeof first_slot2, "%s", opts.mbe_out_fileR);
+    state.synctype = DSD_SYNC_P25P1_POS;
+    dsd_mbe_out_write(&opts, &state, 0, DSD_MBE_OUT_FORMAT_IMBE, imbe);
+    rc |= expect_true("phase change: slot 2 retired", opts.mbe_out_fR == NULL);
+    state.synctype = DSD_SYNC_P25P2_POS;
+    dsd_mbe_out_write(&opts, &state, 1, DSD_MBE_OUT_FORMAT_AMBE, ambe);
+    rc |= expect_true("phase change: imb retired by the amb burst", opts.mbe_out_f == NULL);
+    rc |= expect_true("phase change: fresh slot 2 capture", opts.mbe_out_fR != NULL);
+    closeMbeOutFileR(&opts, &state);
+    rc |= expect_int("phase change: two amb", count_capture_files(dir, ".amb", NULL), 2);
+    rc |= expect_int("phase change: one imb", count_capture_files(dir, ".imb", NULL), 1);
+    remove_dir_tree(dir);
+    (void)dsd_mkdir(dir, 0700);
+
+    /* P25 Phase 2 slot 2, then YSF on slot 1: another owner retires the slot 2 capture. */
+    mbe_out_test_reset(&opts, &state, dir);
+    state.synctype = DSD_SYNC_P25P2_POS;
+    dsd_mbe_out_write(&opts, &state, 1, DSD_MBE_OUT_FORMAT_AMBE, ambe);
+    state.synctype = DSD_SYNC_YSF_POS;
+    state.ysf_fich_confirmed = 1;
+    dsd_mbe_out_write(&opts, &state, 0, DSD_MBE_OUT_FORMAT_AMBE, ambe);
+    rc |= expect_true("owner change: slot 2 retired", opts.mbe_out_fR == NULL);
+    closeMbeOutFile(&opts, &state);
+    rc |= expect_int("owner change: two amb", count_capture_files(dir, ".amb", NULL), 2);
+    remove_dir_tree(dir);
+    return rc;
+}
+
+/* A handle a caller attached (owner 0) takes every frame as it is: never rotated, never replaced. */
+static int
+test_mbe_out_attached_handle_is_written_as_is(void) {
+    int rc = 0;
+    static dsd_opts opts;
+    static dsd_state state;
+    mbe_out_test_reset(&opts, &state, NULL);
+    FILE* out = tmpfile();
+    if (!out) {
+        return 1;
+    }
+    opts.mbe_out_f = out;
+    char ambe[49] = {0};
+    char imbe[88] = {0};
+    state.synctype = DSD_SYNC_DMR_BS_VOICE_POS;
+    dsd_mbe_out_write(&opts, &state, 0, DSD_MBE_OUT_FORMAT_AMBE, ambe);
+    state.synctype = DSD_SYNC_P25P1_POS;
+    dsd_mbe_out_write(&opts, &state, 0, DSD_MBE_OUT_FORMAT_IMBE, imbe);
+    rc |= expect_true("attached handle kept", opts.mbe_out_f == out);
+    fflush(out);
+    (void)fseek(out, 0, SEEK_END);
+    rc |= expect_true("attached handle took both records", ftell(out) == 8 + 12);
+    fclose(out);
+    opts.mbe_out_f = NULL;
+    return rc;
+}
+
+/* A handle a caller attached keeps its frames, but the frame it takes still ends the other slot's capture when that
+   capture is another protocol's: the P25 segment does not run on across the YSF frame. */
+static int
+test_mbe_out_attached_handle_retires_the_other_slot(void) {
+    int rc = 0;
+    char dir[DSD_TEST_PATH_MAX];
+    if (!dsd_test_mkdtemp(dir, sizeof dir, "dsdneo_mbe_attached")) {
+        return 1;
+    }
+    static dsd_opts opts;
+    static dsd_state state;
+    mbe_out_test_reset(&opts, &state, dir);
+    char ambe[49] = {0};
+    char imbe[88] = {0};
+    state.synctype = DSD_SYNC_P25P2_POS;
+    dsd_mbe_out_write(&opts, &state, 1, DSD_MBE_OUT_FORMAT_AMBE, ambe);
+    rc |= expect_true("P25 Phase 2 slot 2 capture created", opts.mbe_out_fR != NULL);
+
+    FILE* out = tmpfile();
+    if (!out) {
+        closeMbeOutFileR(&opts, &state);
+        remove_dir_tree(dir);
+        return 1;
+    }
+    opts.mbe_out_f = out;
+    state.synctype = DSD_SYNC_YSF_POS;
+    state.ysf_fich_confirmed = 1;
+    dsd_mbe_out_write(&opts, &state, 0, DSD_MBE_OUT_FORMAT_IMBE, imbe);
+    rc |= expect_true("attached handle kept", opts.mbe_out_f == out);
+    rc |= expect_true("the other protocol's slot 2 capture closed", opts.mbe_out_fR == NULL);
+    fflush(out);
+    (void)fseek(out, 0, SEEK_END);
+    rc |= expect_true("attached handle took the record", ftell(out) == 12);
+    fclose(out);
+    opts.mbe_out_f = NULL;
+    closeMbeOutFileR(&opts, &state);
+    remove_dir_tree(dir);
+    return rc;
+}
+
+/* A folder that refuses files costs one creation attempt a second and one error per run of failures. */
+static int
+test_mbe_out_failed_creation_is_throttled_and_logged_once(void) {
+    int rc = 0;
+    char dir[DSD_TEST_PATH_MAX];
+    if (!dsd_test_mkdtemp(dir, sizeof dir, "dsdneo_mbe_fail")) {
+        return 1;
+    }
+    char missing[DSD_TEST_PATH_MAX];
+    DSD_SNPRINTF(missing, sizeof missing, "%s/missing", dir);
+    static dsd_opts opts;
+    static dsd_state state;
+    mbe_out_test_reset(&opts, &state, missing);
+    state.synctype = DSD_SYNC_DMR_BS_VOICE_POS;
+    char ambe[49] = {0};
+
+    dsd_test_capture_stderr cap;
+    if (dsd_test_capture_stderr_begin(&cap, "dsdneo_mbe_fail_log") != 0) {
+        remove_dir_tree(dir);
+        return 1;
+    }
+    const double before = dsd_realtime_mono_s();
+    dsd_mbe_out_write(&opts, &state, 0, DSD_MBE_OUT_FORMAT_AMBE, ambe);
+    const double retry_at = opts.mbe_out_retry_at;
+    /* The retry time passes: one more attempt, still failing, still no second error. */
+    opts.mbe_out_retry_at = 0.0;
+    dsd_mbe_out_write(&opts, &state, 0, DSD_MBE_OUT_FORMAT_AMBE, ambe);
+    (void)dsd_test_capture_stderr_end(&cap);
+    char log[4096];
+    (void)dsd_test_capture_stderr_read(&cap, log, sizeof log);
+
+    rc |= expect_true("failed creation leaves no handle", opts.mbe_out_f == NULL);
+    rc |= expect_true("failed creation sets a retry time ahead", retry_at > before + 0.5);
+    rc |= expect_int("failed creation reported", opts.mbe_out_fail_logged, 1);
+    int reports = 0;
+    for (const char* p = strstr(log, "couldn't create an MBE capture"); p != NULL;
+         p = strstr(p + 1, "couldn't create an MBE capture")) {
+        reports++;
+    }
+    rc |= expect_int("one error for the run of failures", reports, 1);
+
+    /* The folder appears, but the retry time is still ahead: the frame waits for it rather than creating the file. */
+    (void)dsd_mkdir(missing, 0700);
+    opts.mbe_out_retry_at = dsd_realtime_mono_s() + 3600.0;
+    dsd_mbe_out_write(&opts, &state, 0, DSD_MBE_OUT_FORMAT_AMBE, ambe);
+    rc |= expect_true("creation waits for the retry time", opts.mbe_out_f == NULL);
+
+    opts.mbe_out_retry_at = 0.0;
+    dsd_mbe_out_write(&opts, &state, 0, DSD_MBE_OUT_FORMAT_AMBE, ambe);
+    rc |= expect_true("creation succeeds once the folder exists", opts.mbe_out_f != NULL);
+    rc |= expect_int("success ends the run of failures", opts.mbe_out_fail_logged, 0);
+    closeMbeOutFile(&opts, &state);
+    remove_dir_tree(missing);
+    remove_dir_tree(dir);
+    return rc;
+}
+
+/* Each protocol's closer closes its own captures and a caller's attached handle, never another protocol's. */
+static int
+test_mbe_out_close_protocol_closes_only_its_own(void) {
+    int rc = 0;
+    char dir[DSD_TEST_PATH_MAX];
+    if (!dsd_test_mkdtemp(dir, sizeof dir, "dsdneo_mbe_close")) {
+        return 1;
+    }
+    static dsd_opts opts;
+    static dsd_state state;
+    char ambe[49] = {0};
+    mbe_out_test_reset(&opts, &state, dir);
+    state.synctype = DSD_SYNC_YSF_NEG;
+    state.ysf_fich_confirmed = 1;
+    dsd_mbe_out_write(&opts, &state, 0, DSD_MBE_OUT_FORMAT_AMBE, ambe);
+
+    static const int others[] = {DSD_SYNC_DPMR_FS1_POS, DSD_SYNC_NXDN_POS,        DSD_SYNC_DMR_BS_DATA_POS,
+                                 DSD_SYNC_DMR_MS_DATA,  DSD_SYNC_X2TDMA_DATA_POS, DSD_SYNC_EDACS_POS,
+                                 DSD_SYNC_P25P1_POS,    DSD_SYNC_P25P2_POS,       DSD_SYNC_DSTAR_HD_POS};
+    for (size_t i = 0; i < sizeof others / sizeof others[0]; i++) {
+        dsd_mbe_out_close_protocol(&opts, &state, DSD_MBE_OUT_BOTH, others[i]);
+    }
+    rc |= expect_true("ysf capture survives other protocols' closers", opts.mbe_out_f != NULL);
+    dsd_mbe_out_close_protocol(&opts, &state, DSD_MBE_OUT_BOTH, DSD_SYNC_YSF_POS);
+    rc |= expect_true("ysf closer closes it, either polarity", opts.mbe_out_f == NULL);
+
+    /* P25's closers act for both phases; ProVoice's capture is EDACS's to close. */
+    state.synctype = DSD_SYNC_P25P2_NEG;
+    dsd_mbe_out_write(&opts, &state, 1, DSD_MBE_OUT_FORMAT_AMBE, ambe);
+    dsd_mbe_out_close_protocol(&opts, &state, DSD_MBE_OUT_SLOT2, DSD_SYNC_P25P1_POS);
+    rc |= expect_true("p25 closer closes a phase 2 capture", opts.mbe_out_fR == NULL);
+    state.synctype = DSD_SYNC_PROVOICE_POS;
+    char imbe[88] = {0};
+    dsd_mbe_out_write(&opts, &state, 0, DSD_MBE_OUT_FORMAT_IMBE, imbe);
+    dsd_mbe_out_close_protocol(&opts, &state, DSD_MBE_OUT_SLOT1, DSD_SYNC_EDACS_NEG);
+    rc |= expect_true("edacs closer closes a provoice capture", opts.mbe_out_f == NULL);
+
+    FILE* attached = tmpfile();
+    if (attached) {
+        opts.mbe_out_f = attached;
+        opts.mbe_out = 1;
+        dsd_mbe_out_close_protocol(&opts, &state, DSD_MBE_OUT_SLOT1, DSD_SYNC_NXDN_POS);
+        rc |= expect_true("any closer closes an attached handle", opts.mbe_out_f == NULL);
+    }
+    remove_dir_tree(dir);
     return rc;
 }
 
@@ -2012,7 +2720,7 @@ write_cookie_file(char* path, size_t path_size, const char* prefix, const char c
         DSD_FPRINTF(stderr, "dsd_test_mkstemp failed: %s\n", strerror(errno));
         return 1;
     }
-    FILE* f = fdopen(fd, "wb");
+    FILE* f = dsd_test_fdopen(fd, "wb");
     if (!f) {
         DSD_FPRINTF(stderr, "fdopen failed: %s\n", strerror(errno));
         (void)dsd_close(fd);
@@ -2036,7 +2744,7 @@ write_short_cookie_file(char* path, size_t path_size, const char* prefix) {
         DSD_FPRINTF(stderr, "dsd_test_mkstemp failed: %s\n", strerror(errno));
         return 1;
     }
-    FILE* f = fdopen(fd, "wb");
+    FILE* f = dsd_test_fdopen(fd, "wb");
     if (!f) {
         DSD_FPRINTF(stderr, "fdopen failed: %s\n", strerror(errno));
         (void)dsd_close(fd);
@@ -2401,6 +3109,16 @@ test_wav_output_helpers_create_temp_and_raw_files(void) {
         rc |= expect_true("raw wav close clears handle", opts.wav_out_raw == NULL);
         rc |= expect_wav_header("raw wav RIFF/WAVE header", raw_path);
         rc |= expect_true("raw wav header-only size", file_size_or_negative(raw_path) >= 44);
+        /* The analog sink rate, which every block is converted to (issue #633); a zeroed opts has no raw output rate
+           set, so it is the 48 kHz default. */
+        SF_INFO raw_info;
+        DSD_MEMSET(&raw_info, 0, sizeof raw_info);
+        SNDFILE* raw = sf_open(raw_path, SFM_READ, &raw_info);
+        rc |= expect_true("raw wav reopens", raw != NULL);
+        if (raw) {
+            sf_close(raw);
+        }
+        rc |= expect_true("raw wav runs at the analog sink rate", raw_info.samplerate == 48000);
     }
     (void)remove(raw_path);
     (void)remove_dir(dir);
@@ -2417,9 +3135,9 @@ test_close_and_rename_wav_removes_header_only_files(void) {
     }
 
     rc |= expect_true("close rename null filename rejects",
-                      close_and_rename_wav_file(NULL, NULL, NULL, dir, NULL) == NULL);
+                      close_and_rename_wav_file(NULL, NULL, NULL, dir, NULL, 0) == NULL);
     rc |= expect_true("close rename empty filename rejects",
-                      close_and_rename_wav_file(NULL, NULL, "", dir, NULL) == NULL);
+                      close_and_rename_wav_file(NULL, NULL, "", dir, NULL, 0) == NULL);
 
     char path[DSD_TEST_PATH_MAX];
     DSD_MEMSET(path, 0, sizeof path);
@@ -2427,7 +3145,7 @@ test_close_and_rename_wav_removes_header_only_files(void) {
     rc |= expect_true("close rename source wav opened", wav != NULL);
     if (wav) {
         rc |= expect_true("close rename header-only returns null",
-                          close_and_rename_wav_file(wav, NULL, path, dir, NULL) == NULL);
+                          close_and_rename_wav_file(wav, NULL, path, dir, NULL, 0) == NULL);
         rc |= expect_true("close rename header-only removed source", file_size_or_negative(path) < 0);
     }
 
@@ -2452,7 +3170,7 @@ test_close_and_rename_wav_preserves_nonempty_event_file(void) {
     if (wav) {
         rc |= expect_true("close rename wrote pcm samples", write_wav_test_samples(wav));
 
-        Event_History_I history;
+        static Event_History_I history;
         DSD_MEMSET(&history, 0, sizeof history);
         Event_History* item = &history.Event_History_Items[0];
         item->event_time = (time_t)1700000000;
@@ -2464,7 +3182,7 @@ test_close_and_rename_wav_preserves_nonempty_event_file(void) {
         DSD_SNPRINTF(item->tgt_str, sizeof item->tgt_str, "%s", "TGTUNIT");
 
         rc |= expect_true("close rename nonempty returns null",
-                          close_and_rename_wav_file(wav, NULL, path, dir, &history) == NULL);
+                          close_and_rename_wav_file(wav, NULL, path, dir, &history, 0) == NULL);
         rc |= expect_true("close rename nonempty removed temp source", file_size_or_negative(path) < 0);
 
         char renamed[DSD_TEST_PATH_MAX];
@@ -2502,7 +3220,7 @@ test_close_and_rename_wav_numeric_and_failure_paths(void) {
     if (wav) {
         rc |= expect_true("numeric rename wrote pcm samples", write_wav_test_samples(wav));
 
-        Event_History_I history;
+        static Event_History_I history;
         DSD_MEMSET(&history, 0, sizeof history);
         Event_History* item = &history.Event_History_Items[0];
         item->event_time = (time_t)1700001000;
@@ -2512,7 +3230,7 @@ test_close_and_rename_wav_numeric_and_failure_paths(void) {
         DSD_SNPRINTF(item->sysid_string, sizeof item->sysid_string, "%s", "SYS-N");
 
         rc |= expect_true("numeric rename returns null",
-                          close_and_rename_wav_file(wav, NULL, path, dir, &history) == NULL);
+                          close_and_rename_wav_file(wav, NULL, path, dir, &history, 0) == NULL);
         rc |= expect_true("numeric rename removed temp source", file_size_or_negative(path) < 0);
 
         char renamed[DSD_TEST_PATH_MAX];
@@ -2538,7 +3256,7 @@ test_close_and_rename_wav_numeric_and_failure_paths(void) {
         char missing_dir[DSD_TEST_PATH_MAX];
         DSD_SNPRINTF(missing_dir, sizeof missing_dir, "%s%cmissing", dir, dsd_test_path_sep());
         rc |= expect_true("rename failure returns null",
-                          close_and_rename_wav_file(wav, NULL, fail_path, missing_dir, NULL) == NULL);
+                          close_and_rename_wav_file(wav, NULL, fail_path, missing_dir, NULL, 0) == NULL);
         rc |= expect_true("rename failure keeps original temp wav", file_size_or_negative(fail_path) > 44);
     }
 
@@ -2548,8 +3266,10 @@ test_close_and_rename_wav_numeric_and_failure_paths(void) {
     return rc;
 }
 
+// The sidecar files a recording at its call's start (event_start_time), or at the WAV's open time when per-call WAV
+// was switched on after the call began; close_and_rename_wav_file() hands the exporter that open time.
 static int
-test_close_and_rename_wav_exports_rdio_sidecar(void) {
+close_and_rename_rdio_case(const char* label, time_t opened, time_t want_start) {
     int rc = 0;
     char dir[DSD_TEST_PATH_MAX];
     if (!dsd_test_mkdtemp(dir, sizeof dir, "dsdneo_wav_rdio")) {
@@ -2565,7 +3285,7 @@ test_close_and_rename_wav_exports_rdio_sidecar(void) {
         rc |= expect_true("rdio rename wrote pcm samples", write_wav_test_samples(wav));
 
         static dsd_opts opts;
-        Event_History_I history;
+        static Event_History_I history;
         DSD_MEMSET(&opts, 0, sizeof opts);
         DSD_MEMSET(&history, 0, sizeof history);
         opts.rdio_mode = DSD_RDIO_MODE_DIRWATCH;
@@ -2574,19 +3294,25 @@ test_close_and_rename_wav_exports_rdio_sidecar(void) {
         opts.rdio_upload_retries = 1;
 
         Event_History* item = &history.Event_History_Items[0];
+        // A 10-second call, closed at its end: event_time is the row's last activity.
+        item->event_start_time = (time_t)1700001990;
         item->event_time = (time_t)1700002000;
         item->gi = 0;
         item->source_id = 660045U;
         item->target_id = 1201U;
-        item->channel = 851012500U;
+        // The sidecar's freq is the frequency the call was heard on, never the trunk channel number.
+        item->channel = 0x10C8U;
+        item->freq_hz = 851012500;
         item->enc = 1;
         DSD_SNPRINTF(item->sysid_string, sizeof item->sysid_string, "%s", "P25_TEST");
         DSD_SNPRINTF(item->t_name, sizeof item->t_name, "%s", "FIRE DISP");
 
-        rc |=
-            expect_true("rdio rename returns null", close_and_rename_wav_file(wav, &opts, path, dir, &history) == NULL);
+        rc |= expect_true("rdio rename returns null",
+                          close_and_rename_wav_file(wav, &opts, path, dir, &history, opened) == NULL);
         rc |= expect_true("rdio rename removed temp source", file_size_or_negative(path) < 0);
 
+        // The file is still named for the row's last activity (event_time); only the sidecar files the call by
+        // its start.
         char renamed[DSD_TEST_PATH_MAX];
         rc |= expect_true("rdio rename creates event filename",
                           find_wav_rename_output_for_numeric_event(renamed, sizeof renamed, dir, item));
@@ -2597,7 +3323,12 @@ test_close_and_rename_wav_exports_rdio_sidecar(void) {
                 || read_file_prefix(sidecar, body, sizeof body) != 0) {
                 rc = 1;
             } else {
-                rc |= expect_true("rdio sidecar start time", strstr(body, "\"start_time\": 1700002000") != NULL);
+                // Four samples round down to no length, so the recording stops where it starts.
+                char want[64];
+                DSD_SNPRINTF(want, sizeof want, "\"start_time\": %lld,", (long long)want_start);
+                rc |= expect_true(label, strstr(body, want) != NULL);
+                DSD_SNPRINTF(want, sizeof want, "\"stop_time\": %lld,", (long long)want_start);
+                rc |= expect_true(label, strstr(body, want) != NULL);
                 rc |= expect_true("rdio sidecar talkgroup", strstr(body, "\"talkgroup\": 1201") != NULL);
                 rc |=
                     expect_true("rdio sidecar talkgroup tag", strstr(body, "\"talkgroup_tag\": \"FIRE DISP\"") != NULL);
@@ -2615,6 +3346,15 @@ test_close_and_rename_wav_exports_rdio_sidecar(void) {
 
     (void)remove(path);
     (void)remove_dir(dir);
+    return rc;
+}
+
+static int
+test_close_and_rename_wav_exports_rdio_sidecar(void) {
+    int rc = close_and_rename_rdio_case("recording opened before the call starts at the call", (time_t)1700001900,
+                                        (time_t)1700001990);
+    rc |= close_and_rename_rdio_case("recording opened mid-call starts when it opened", (time_t)1700001995,
+                                     (time_t)1700001995);
     return rc;
 }
 
@@ -2798,8 +3538,11 @@ main(void) {
     rc |= test_sdrtrunk_json_dmr_replay_oversized_key_id_ignores_a_matching_map_row();
     rc |= test_sdrtrunk_json_p25p2_encryption_metadata_updates_event();
     rc |= test_sdrtrunk_json_invalid_numeric_fields_reset_to_zero();
-    rc |= test_sdrtrunk_json_protocol_opens_and_closes_mbe_out_file();
+    rc |= test_sdrtrunk_json_protocol_token_alone_creates_no_capture();
+    rc |= test_sdrtrunk_json_second_protocol_gets_its_own_capture();
     rc |= test_sdrtrunk_json_hex_voice_writes_unencrypted_mbe_records();
+    rc |= test_sdrtrunk_json_voice_wav_is_pcm16_scale();
+    rc |= test_sdrtrunk_json_withheld_frames_run_the_voice_chain();
     rc |= test_sdrtrunk_json_wav_honors_talkgroup_policy();
     rc |= test_sdrtrunk_json_mbe_capture_honors_talkgroup_policy();
     rc |= test_sdrtrunk_json_hex_voice_blocks_encrypted_without_keystream();
@@ -2807,7 +3550,14 @@ main(void) {
     rc |= test_sdrtrunk_nxdn_published_voice_vectors();
     rc |= test_sdrtrunk_nxdn_missing_context_and_sacch_alignment();
     rc |= test_sdrtrunk_dmr_capture_and_late_entry();
-    rc |= test_open_mbe_out_file_creates_slot_files_and_closes();
+    rc |= test_mbe_out_write_creates_slot_files_and_closes();
+    rc |= test_mbe_out_folder_with_separator_is_not_doubled();
+    rc |= test_mbe_out_refuses_unconfirmed_and_carrier_crossing_frames();
+    rc |= test_mbe_out_rotates_on_owner_and_format();
+    rc |= test_mbe_out_attached_handle_is_written_as_is();
+    rc |= test_mbe_out_attached_handle_retires_the_other_slot();
+    rc |= test_mbe_out_failed_creation_is_throttled_and_logged_once();
+    rc |= test_mbe_out_close_protocol_closes_only_its_own();
     rc |= test_truncated_reads_fail();
     rc |= test_open_mbe_in_file_classifies_cookies();
     rc |= test_open_mbe_in_file_accepts_sdrtrunk_extension();

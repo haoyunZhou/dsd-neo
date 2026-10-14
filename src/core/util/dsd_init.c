@@ -4,21 +4,27 @@
  */
 
 #include <dsd-neo/core/airspy_config.h>
+#include <dsd-neo/core/analog_tone.h>
+#include <dsd-neo/core/audio.h>
 #include <dsd-neo/core/enc_lockout.h>
 #include <dsd-neo/core/events.h>
 #include <dsd-neo/core/init.h>
 #include <dsd-neo/core/keyring.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/p25_cqpsk_dibit.h>
+#include <dsd-neo/core/p25p2_playout.h>
 #include <dsd-neo/core/power.h>
 #include <dsd-neo/core/state.h>
 #include <dsd-neo/core/state_ext.h>
 #include <dsd-neo/core/synctype_ids.h>
 #include <dsd-neo/dsp/symbol_timing_debug.h>
 #include <dsd-neo/dsp/sync_calibration.h>
+#include <dsd-neo/platform/nonce.h>
 #include <dsd-neo/platform/posix_compat.h>
 #include <dsd-neo/runtime/analog_channel.h>
+#include <dsd-neo/runtime/decode_clock.h>
 #include <dsd-neo/runtime/log.h>
+#include <dsd-neo/runtime/scan_row_edit.h>
 #include <dsd-neo/runtime/shutdown.h>
 #include <mbelib-neo/mbelib.h>
 #include <stdint.h>
@@ -83,6 +89,7 @@ init_opts_display_and_audio_defaults(dsd_opts* opts) {
     opts->p25tg = 0;
     opts->scoperate = 15;
     DSD_SNPRINTF(opts->audio_in_dev, sizeof opts->audio_in_dev, "%s", "pulse");
+    opts->radio_in_dev[0] = 0;
     DSD_SNPRINTF(opts->audio_out_dev, sizeof opts->audio_out_dev, "%s", "pulse");
     opts->audio_in_fd = -1;
     opts->audio_out_fd = -1;
@@ -100,14 +107,24 @@ init_opts_output_defaults(dsd_opts* opts) {
     opts->mbe_out_path[0] = 0;
     opts->mbe_out_f = NULL;
     opts->mbe_out_fR = NULL; //second slot on a TDMA system
+    opts->mbe_out_retry_at = 0.0;
+    opts->mbe_out_retry_atR = 0.0;
+    opts->mbe_out_owner = 0;
+    opts->mbe_out_ownerR = 0;
+    opts->mbe_out_format = 0;
+    opts->mbe_out_formatR = 0;
+    opts->mbe_out_fail_logged = 0;
+    opts->mbe_out_fail_loggedR = 0;
     opts->audio_gain = 0;
     opts->audio_gainR = 0;
-    opts->audio_gainA = 50.0f; //scale of 1 - 100
+    opts->audio_gainA = 0.0f; //0 = auto (the analog AGC); 1 - 100 fixed, 50 = reference level
     opts->audio_out = 1;
     opts->wav_out_file[0] = 0;
     opts->wav_out_fileR[0] = 0;
     opts->wav_out_file_raw[0] = 0;
     opts->symbol_out_file[0] = 0;
+    opts->symbol_out_open_path[0] = 0;
+    opts->symbol_capture_last[0] = 0;
     opts->lrrp_out_file[0] = 0;
     opts->event_out_file[0] = 0;
     opts->frame_log_file[0] = 0;
@@ -128,13 +145,26 @@ init_opts_output_defaults(dsd_opts* opts) {
     opts->frame_log_write_error_reported = 0;
     opts->p25_sm_log_open_error_reported = 0;
     opts->p25_sm_log_write_error_reported = 0;
-    opts->symbol_out_file_creation_time = time(NULL);
+    /* No per-call WAV is open yet; set before the rebase below, which clamps these. */
+    opts->wav_out_open_time = 0;
+    opts->wav_out_open_timeR = 0;
+    /* symbol_out_file_creation_time, on the list the engine's replay rebase shares. */
+    dsd_state_rebase_decode_timestamps(opts, NULL);
     opts->symbol_out_file_is_auto = 0;
     opts->mbe_out = 0;
     opts->mbe_outR = 0; //second slot on a TDMA system
     opts->wav_out_f = NULL;
     opts->wav_out_fR = NULL;
     opts->wav_out_raw = NULL;
+}
+
+/* The squelch: a -110 dB level until a spec, a config or --squelch sets one, and the auto squelch's default margin
+   ready for a switch to it. */
+static void
+init_opts_squelch_defaults(dsd_opts* opts) {
+    opts->rtl_squelch_level = dB_to_pwr(-110);
+    opts->rtl_squelch_mode = DSD_SQUELCH_MODE_LEVEL;
+    opts->rtl_squelch_margin_db = DSD_SQUELCH_MARGIN_DEFAULT_DB;
 }
 
 static void
@@ -185,7 +215,6 @@ init_opts_decoder_and_input_defaults(dsd_opts* opts) {
     //all RTL user options -- enabled AGC by default due to weak signal related issues
     opts->rtl_dev_index = 0;  //choose which device we want by index number
     opts->rtl_gain_value = 0; //mid value, 0 - AGC - 0 to 49 acceptable values
-    opts->rtl_squelch_level = dB_to_pwr(-110);
     opts->rtl_volume_multiplier =
         2; //sample multiplier; This multiplies the sample value to produce a higher 'inlvl' for the demodulator
     // Generic input volume for non-RTL inputs (Pulse/WAV/TCP/UDP)
@@ -228,6 +257,7 @@ init_opts_decoder_and_input_defaults(dsd_opts* opts) {
 
     opts->wav_sample_rate = 48000; //default value (DSDPlus uses 96000 on raw signal wav files)
     opts->staged_file_sample_rate = 0;
+    opts->wav_header_replaced_rate = 0;
     opts->wav_interpolator = 1;  //default factor of 1 on 48000; 2 on 96000; sample rate / decimator
     opts->wav_decimator = 48000; //maybe for future use?
     DSD_MEMSET(&opts->input_resampler, 0, sizeof(opts->input_resampler));
@@ -263,6 +293,7 @@ init_opts_runtime_and_network_defaults(dsd_opts* opts) {
     opts->iq_replay_loop = 0;
     opts->iq_replay_active = 0;
     opts->iq_replay_rate_mode = DSD_IQ_REPLAY_RATE_FAST;
+    opts->iq_replay_center_freq = 0U;
     opts->iq_capture_format = 1; /* DSD_IQ_FORMAT_CU8 */
     opts->iq_capture_max_bytes = 0;
     opts->iq_capture_path[0] = '\0';
@@ -281,8 +312,10 @@ init_opts_runtime_and_network_defaults(dsd_opts* opts) {
     opts->monitor_input_audio = 0; //enable with -8
     opts->analog_only = 0;         //only turned on with -fA
     opts->analog_demod = DSD_ANALOG_DEMOD_FM;
-    opts->analog_nfm_bandwidth_hz = 0; // 0 = default NFM channel width, not an explicit request
-    opts->analog_am_bandwidth_hz = 0;  // 0 = default AM channel width, not an explicit request
+    opts->analog_nfm_bandwidth_hz = 0;              // 0 = default NFM channel width, not an explicit request
+    opts->analog_am_bandwidth_hz = 0;               // 0 = default AM channel width, not an explicit request
+    opts->analog_tone_filter = DSD_TONE_FILTER_OFF; // no CTCSS/DCS receive policy (issue #527)
+    DSD_MEMSET(&opts->analog_tone_set, 0, sizeof(opts->analog_tone_set));
 
     opts->inverted_p2 = 0;
     opts->p2counter = 0;
@@ -391,9 +424,9 @@ init_opts_trunking_and_filter_defaults(dsd_opts* opts) {
     opts->slot1_on = 1;
     opts->slot2_on = 1;
 
-    //enable filter options
+    //filter options (-v 0x9): the analog voice band-pass and the digital high-pass on
     opts->use_lpf = 0;
-    opts->use_hpf = 1;
+    opts->use_hpf = 0;
     opts->use_pbf = 1;
     opts->use_hpf_d = 1;
 
@@ -420,10 +453,33 @@ init_opts_trunking_and_filter_defaults(dsd_opts* opts) {
 }
 
 void
+dsd_state_rebase_decode_timestamps(dsd_opts* opts, dsd_state* state) {
+    const time_t now = dsd_decode_time();
+    if (opts) {
+        opts->symbol_out_file_creation_time = now;
+        /* A per-call WAV cannot have been opened after now. One opened on the system clock before the decode clock
+           moved back onto a replay's capture (-P opens while the arguments are parsed) has recorded nothing yet, so it
+           takes the capture's now; a stamp already behind now is a real open time and stays. */
+        if (opts->wav_out_open_time > now) {
+            opts->wav_out_open_time = now;
+        }
+        if (opts->wav_out_open_timeR > now) {
+            opts->wav_out_open_timeR = now;
+        }
+    }
+    if (state) {
+        state->last_cc_sync_time = now;
+        state->last_vc_sync_time = now;
+        state->last_t3_tune_time = now;
+    }
+}
+
+void
 initOpts(dsd_opts* opts) {
     init_opts_display_and_audio_defaults(opts);
     init_opts_output_defaults(opts);
     init_opts_decoder_and_input_defaults(opts);
+    init_opts_squelch_defaults(opts);
     init_opts_runtime_and_network_defaults(opts);
     init_opts_trunking_and_filter_defaults(opts);
 } //initopts
@@ -496,6 +552,10 @@ init_state_core_buffers(dsd_state* state) {
     state->rtl_symbol_cache_levels = 0;
     state->rtl_symbol_cache_generation = 0;
     state->rtl_symbol_cache_published_pending = 0;
+    state->rtl_symbol_cache_media_start_ns = 0U;
+    state->rtl_symbol_cache_media_duration_ns = 0U;
+    state->rtl_symbol_cache_media_count = 0U;
+    state->rtl_symbol_cache_media_first_index = 0U;
     state->rtl_fsk_sps_num = 0;
     state->rtl_fsk_sps_den = 0;
     state->rtl_fsk_sps_accum = 0;
@@ -508,13 +568,8 @@ init_state_core_buffers(dsd_state* state) {
     DSD_MEMSET(state->audio_out_temp_buf, 0.0f, sizeof(state->audio_out_temp_buf));
     DSD_MEMSET(state->audio_out_temp_bufR, 0.0f, sizeof(state->audio_out_temp_bufR));
 
-    //set float temp buffer to baseline
-    DSD_MEMSET(state->f_l, 0.0f, sizeof(state->f_l));
-    DSD_MEMSET(state->f_r, 0.0f, sizeof(state->f_r));
-
-    //set float temp buffer to baseline
-    DSD_MEMSET(state->f_l4, 0.0f, sizeof(state->f_l4));
-    DSD_MEMSET(state->f_r4, 0.0f, sizeof(state->f_r4));
+    dsd_audio_dmr_mix_media_discard(0);
+    dsd_audio_dmr_mix_media_discard(1);
 
     //zero out the short sample storage buffers
     DSD_MEMSET(state->s_l, 0, sizeof(state->s_l));
@@ -556,6 +611,9 @@ init_state_audio_output_buffers(dsd_state* state) {
 
 static void
 init_state_sync_and_stream_defaults(dsd_state* state) {
+    state->input_interrupted = 0;
+    state->input_boundary = 0;
+    state->input_fallback_pending = 0;
     state->center = 0;
     state->jitter = -1;
     state->synctype = DSD_SYNC_NONE;
@@ -583,6 +641,7 @@ init_state_sync_and_stream_defaults(dsd_state* state) {
     set_spaces(state->fsubtype, 14);
     set_spaces(state->ftype, 13);
     state->symbolcnt = 0;
+    state->datascope_symbolcnt_mark = 0;
     state->symbolc = 0; //
     state->symbol_replay_format = DSD_SYMBOL_REPLAY_FORMAT_UNKNOWN;
     state->symbol_replay_header_checked = 0;
@@ -591,10 +650,14 @@ init_state_sync_and_stream_defaults(dsd_state* state) {
     state->symbol_replay_soft.llr[0] = 0;
     state->symbol_replay_soft.llr[1] = 0;
     state->symbol_replay_soft_symbol = 0.0f;
+    state->symbol_replay_symbol_unusable = 0;
     state->symbol_replay_soft_records = 0;
     state->symbol_capture_soft_records = 0;
     state->rf_mod = 0;
     state->lastsynctype = DSD_SYNC_NONE;
+    state->frame_dispatch_active = 0;
+    state->frame_dispatch_synctype = DSD_SYNC_NONE;
+    state->frame_dispatch_carrier_seq = 0U;
     state->p25_cqpsk_dibit_map_idx = DSD_P25_CQPSK_DIBIT_MAP_IDENTITY;
     state->lastp25type = 0;
     state->offset = 0;
@@ -723,6 +786,7 @@ init_state_dpmr_confirmation(dsd_state* state) {
     state->dpmr_confirmed = 0;
     state->dpmr_confirm_weak_streak = 0;
     state->dpmr_confirm_frame_evidence = 0;
+    state->dpmr_scrambled = 0;
     state->dpmr_cch_evidence = 0;
     state->dpmr_cch_evidence_symbolcnt = 0;
 }
@@ -758,6 +822,7 @@ init_state_protocol_defaults_a(dsd_state* state) {
     state->debug_mode = 0;
 
     state->nxdn_last_ran = -1;
+    state->nxdn_last_ran_stand_in = 0U;
     state->nxdn_confirmed = 0;
     state->nxdn_confirm_weak_streak = 0;
     state->nxdn_confirm_frame_evidence = 0;
@@ -788,8 +853,7 @@ init_state_protocol_defaults_a(dsd_state* state) {
     DSD_MEMSET(state->ess_b_llr, 0, sizeof(state->ess_b_llr));
     state->fourv_counter[0] = 0;
     state->fourv_counter[1] = 0;
-    state->voice_counter[0] = 0;
-    state->voice_counter[1] = 0;
+    dsd_p25p2_playout_reset(state, -1);
     state->p25_crypto_state[0] = DSD_P25_CRYPTO_UNKNOWN;
     state->p25_crypto_state[1] = DSD_P25_CRYPTO_UNKNOWN;
     DSD_MEMSET(state->p25_p2_rekey, 0, sizeof(state->p25_p2_rekey));
@@ -814,6 +878,7 @@ init_state_protocol_defaults_a(dsd_state* state) {
     state->dmr_soR = 0;
     state->dmr_fid = 0;
     state->dmr_fidR = 0;
+    state->dmr_le_vendor[0] = state->dmr_le_vendor[1] = 0; // DMR_LE_VENDOR_NONE
     state->dmr_flco = 0;
     state->dmr_flcoR = 0;
     state->dmr_ms_mode = 0;
@@ -895,6 +960,8 @@ init_state_protocol_defaults_b(dsd_state* state) {
 
     state->dmr_encL = 0;
     state->dmr_encR = 0;
+    state->mbe_slot_muted[0] = 0;
+    state->mbe_slot_muted[1] = 0;
 }
 
 static void
@@ -940,6 +1007,16 @@ init_state_trunk_scan_publication(dsd_state* state) {
     state->trunk_scan_hold = 0;
     state->trunk_scan_active_avoided = 0;
     state->trunk_scan_avoided_count = 0;
+    state->trunk_scan_configured_gain = 0;
+    state->trunk_scan_gain_override = 0;
+    state->trunk_scan_configured_autogain = 0;
+    state->scan_row_session = 0U;
+    state->scan_row_index = -1;
+    state->scan_row_scanner = (uint8_t)DSD_SCAN_ROW_SCANNER_NONE;
+    state->scan_row_editable = 0U;
+    state->scan_row_edited = 0U;
+    state->scan_row_listed = 0U;
+    state->scan_row_scope_seq = 0U;
     state->scan_voice_gate_arrive_m = -1.0;
     state->scan_voice_gate_sync_m = -1.0;
     state->scan_voice_gate_voice_m = -1.0;
@@ -956,12 +1033,23 @@ init_state_trunk_scan_publication(dsd_state* state) {
     state->scan_timing.visit_deadline_m = -1.0;
 }
 
+/* The voice channel frequencies, and with trunking off the one a grant update named for its call's target (issue
+   #575). */
+static void
+init_state_p25_voice_channel_freqs(dsd_state* state) {
+    state->p25_vc_freq[0] = 0;
+    state->p25_vc_freq[1] = 0;
+    DSD_MEMSET(state->p25_conventional_grant_freq, 0, sizeof(state->p25_conventional_grant_freq));
+    DSD_MEMSET(state->p25_conventional_grant_target, 0, sizeof(state->p25_conventional_grant_target));
+}
+
 static void
 init_state_p25_and_trunk_defaults(dsd_state* state) {
     //P2 variables
     state->p2_wacn = 0;
     state->p2_sysid = 0;
     state->p2_cc = 0;
+    state->p2_cc_verified = 0U;
     state->p2_siteid = 0;
     state->p2_rfssid = 0;
     state->p2_hardset = 0;
@@ -1011,8 +1099,7 @@ init_state_p25_and_trunk_defaults(dsd_state* state) {
     state->p25_cc_freq = 0;
     state->p25_last_cc_msg_time = 0;
     state->p25_last_cc_msg_time_m = 0.0;
-    state->p25_vc_freq[0] = 0;
-    state->p25_vc_freq[1] = 0;
+    init_state_p25_voice_channel_freqs(state);
 
     init_state_p25_patch_defaults(state);
     dsd_enc_lockout_init(state);
@@ -1048,13 +1135,12 @@ init_state_p25_and_trunk_defaults(dsd_state* state) {
     state->trunk_chan_map_seq = 0;
     state->lcn_freq_count = 0; //number of frequncies imported as an enumerated lcn list
     state->lcn_freq_roll = 0;  //needs reset if sync is found?
-    state->last_cc_sync_time = time(NULL);
-    state->last_vc_sync_time = time(NULL);
+    /* last_cc_sync_time, last_vc_sync_time and last_t3_tune_time, on the list the engine's replay rebase shares. */
+    dsd_state_rebase_decode_timestamps(NULL, state);
     state->rtl_fsk_reacquire_last_sync_time = 0;
     state->rtl_fsk_reacquire_last_sync_m = 0.0;
     state->rtl_fsk_reacquire_gap_start_m = 0.0;
     state->rtl_fsk_reacquire_last_request_m = 0.0;
-    state->last_t3_tune_time = time(NULL);
     state->is_con_plus = 0;
 }
 
@@ -1239,6 +1325,16 @@ init_state_codec2_and_events(dsd_state* state) {
     for (uint8_t i = 0; i < 2; i++) {
         init_event_history(&state->event_history_s[i], 0, 255);
     }
+    if (state->event_history_s != NULL) {
+        /* The ring's identity (Event_History_I::instance): a replay decoded again in a fresh state pushes the
+           same rows at the same stamps, and only this tells that ring from the one a frontend read before. */
+        uint64_t instance = 0U;
+        while (instance == 0U) {
+            dsd_nonce_fill(&instance, sizeof(instance));
+        }
+        state->event_history_s[0].instance = instance;
+        state->event_history_s[1].instance = instance;
+    }
 
     // Initialize transient UI toast message state
     state->ui_msg[0] = '\0';
@@ -1262,6 +1358,8 @@ initState(dsd_state* state) {
     init_state_string_and_m17_defaults(state);
     init_state_codec2_and_events(state);
     (void)dsd_call_state_ensure(state);
+    // No engine run has used this state yet (see dsd_state::engine_fresh).
+    state->engine_fresh = 1U;
 
 } //init_state
 

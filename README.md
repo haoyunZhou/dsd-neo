@@ -43,7 +43,7 @@ This project is an active work in progress as we decouple from the upstream fork
 - Modularized fork with clear boundaries: `runtime`, `platform`, `dsp`, `io`, `engine`, `fec`, `crypto`, `protocol`, `core`, plus `ui` and a CLI app.
 - Protocol coverage: DMR, dPMR, D‑STAR, NXDN, P25 Phase 1/2, X2‑TDMA, EDACS, ProVoice, M17
   (RF/UDP LSF, stream, packet, BERT), YSF.
-- Requires [arancormonk/mbelib-neo](https://github.com/arancormonk/mbelib-neo) 2.x for IMBE/AMBE vocoder primitives.
+- Requires [arancormonk/mbelib-neo](https://github.com/arancormonk/mbelib-neo) 2.3 or newer for IMBE/AMBE vocoder primitives.
 - Public headers live under `include/dsd-neo/...` and are included as `#include <dsd-neo/<module>/<header>>`.
 
 ## How DSD‑neo Is Different
@@ -60,13 +60,16 @@ This project is an active work in progress as we decouple from the upstream fork
 
   - Follow P25 and DMR trunked voice automatically using channel maps and group lists (`-C ...csv`, `-G group.csv`, `-T`, `--frontend terminal`; `-N` is the short alias).
   - Name source radio IDs separately with `--src-csv examples/src.csv` (labels only, with group-list fallback; works in conventional decode too).
-  - Rotate one tuner across CSV-defined P25 trunk, DMR trunk, NXDN trunk, and one-frequency DMR, NXDN96 and NXDN48
-    targets with `--trunk-scan targets.csv`.
+  - Rotate one tuner across CSV-defined P25 trunk, DMR trunk, NXDN trunk, and one-frequency P25, DMR, NXDN96, NXDN48
+    and analog NFM and AM targets with `--trunk-scan targets.csv`; conventional `-Y` channel maps can mix `nfm` and
+    `am` rows with digital ones too.
+  - Noise squelch on audio input (`--squelch noise[+N]` with `-fA` on Pulse, file, stdin, TCP or UDP audio): it learns
+    the noise above voice from the discriminator audio itself and opens on FM quieting, as a radio's squelch does.
   - On‑the‑fly retune control via rigctl (`-U`) for external SDR front-ends (e.g., SDR++). For RTL/RTL‑TCP input, DSD-neo retunes directly (optional external UDP retune control can be enabled on loopback with `--rtl-udp-control <port>`; remote exposure requires `--rtl-udp-control-bind <ipv4>`; see `docs/udp-control.md`).
 
 - RTL‑SDR quality‑of‑life features
 
-  - Bias‑tee control (when supported by your librtlsdr), manual or auto gain, power squelch, adjustable tuner bandwidth, and per‑run PPM correction.
+  - Bias‑tee control (when supported by your librtlsdr), manual or auto gain, squelch (a fixed level; auto, a margin over each channel's learned noise floor; or noise, an FM channel's quieting as on a radio), adjustable tuner bandwidth, and per‑run PPM correction.
   - Optional carrier/error-based auto‑PPM drift correction with SNR/power gating and short training/lock, for long unattended runs.
   - rtl_tcp niceties: configurable prebuffering to reduce dropouts and settings tuned for stable network use.
 
@@ -104,6 +107,23 @@ This project is an active work in progress as we decouple from the upstream fork
 - Versus DSD‑FME: similar protocol coverage and UI heritage, but DSD‑neo adds a broader M17 implementation than FME's simplified stream decoder: RF/UDP LSF, packet, BERT, EOT, MPKT, packet CRC assembly, AES-CTR receive, signed-stream verification, and stream/packet/BERT encoders. It also adds network‑friendly I/O (UDP audio in), refined RTL‑TCP handling (prebuffer, tuned defaults), optional auto‑PPM, and packaged cross‑platform binaries.
 - Versus the original DSD: more protocols (notably P25 Phase 2, M17, YSF, EDACS), built‑in trunking, network inputs, device control, and an interactive UI.
 
+## Control and telemetry API
+
+DSD‑neo can serve a TCP JSON‑Lines API that lets another program drive the decoder and consume
+live data, including alpha tags, aliases and system/site identity:
+
+```bash
+dsd-neo -i rtl:0:851.375M:22:2:24:0:1 --api 9911
+```
+
+- Newline‑delimited JSON both ways: every control the terminal and Qt frontends have (tuning, gain,
+  talkgroup edits, scanning, keys, config, …) and streaming telemetry (`call`, `event`, `system`,
+  `metrics`, `quality`, `status`).
+- Runs headless or alongside the terminal frontend; loopback by default, with a shared‑secret token
+  required off loopback.
+- Desktop only (not built on Android). See [docs/api.md](docs/api.md) for the protocol, the telemetry
+  fields and the command catalog.
+
 ## Build From Source
 
 Requirements
@@ -113,7 +133,7 @@ Requirements
 - Dependencies:
   - Required: libsndfile; OpenSSL 3.x libcrypto; a curses backend (ncursesw/PDCurses); and an audio backend (PulseAudio by default, PortAudio on Windows).
   - Optional: librtlsdr (RTL‑SDR support; 2.0.3 or newer for RTL‑SDR Blog V4/V4L dongles), SoapySDR >= 0.8.1 (non‑RTL SDR backends), Codec2 (additional vocoder paths), libcurl >= 7.56.0 (rdio API uploads), expat 2.x (RadioReference import), PortAudio on non-Windows builds, help2man (man page generation).
-  - Vocoder: mbelib-neo 2.x (`mbe-neo` CMake package) is required.
+  - Vocoder: mbelib-neo 2.3+ (`mbe-neo` CMake package) is required.
   - TETRA speech is not a build dependency. At runtime, `TETRA_VOCODER_CMD` names an external decoder. The ETSI ACELP sources stay on the developer's machine; see `tools/tetra/README.md`.
 
 OS package hints
@@ -137,7 +157,7 @@ OS package hints
 
 MBE vocoder dependency (mbelib-neo)
 
-DSD‑neo requires the `mbe-neo` 2.x CMake package (from `mbelib-neo`) with the soft-decision/V2 API. The older 1.x mbelib-neo releases are not supported. If CMake fails with “could not find mbe-neo”, install it and re-run configure.
+DSD‑neo requires the `mbe-neo` 2.3+ CMake package (from `mbelib-neo`) with the soft-decision/V2 API. The 1.x releases and 2.0 through 2.2 are not supported. If CMake fails with “could not find mbe-neo”, install it and re-run configure.
 
 Example (Linux/macOS):
 
@@ -315,7 +335,10 @@ These are CMake cache options (set at configure time via `-D...`).
 ## CI Backend Policy
 
 - CI treats backend availability as a build contract, not a best-effort option.
-- Linux CI runs a backend matrix for `both`, `soapy_only`, `rtl_only`, and `neither`.
+- Linux CI runs a backend matrix for `both`, `soapy_only`, `rtl_only`, `airspy_only`, and `neither`, plus `both` again
+  on a native arm64 runner.
+- Every pull request runs the full ctest suite on Linux x86_64 and arm64, macOS arm64 and Windows x64 (MSVC), and on an
+  optimized x86-64-v3 fast-math Linux build with GCC and with Clang; see "Continuous Integration" in `docs/testing.md`.
 - Linux CI also builds and tests the Android configuration on the host (no audio library, no terminal UI, no SDR
   library, no Codec2, radio pipeline forced on), and `android-ci` cross-compiles the arm64 CLI and the APK on every pull
   request, then signs and publishes the APK from `main` and release tags.
@@ -393,7 +416,7 @@ Common options:
 
 - See the friendly CLI guide: [docs/cli.md](docs/cli.md)
   - Or run `dsd-neo -h` for quick usage in your terminal.
-  - Digital/analog output gain: `-g <float>` (digital; `0` = auto, `1` ≈ 2%, `50` = 100%) and `-n <float>` (analog 0–100%).
+  - Digital/analog output gain: `-g <float>` (digital; `0` = auto, `1` ≈ 2%, `50` = 100%) and `-n <float>` (analog; `0` = auto, the default; `1`–`100` fixed, `50` = reference level).
   - Single-tuner trunk scan workflow: `docs/trunk-scan.md`
   - CSV formats (channel maps, trunk scan targets, group lists, source ID lists, key lists): `docs/csv-formats.md` (examples in `examples/`)
 
@@ -401,7 +424,7 @@ Quick examples
 
 - UDP in → Pulse out with UI: `dsd-neo -i udp -o pulse --frontend terminal`
 - DMR trunking from TCP PCM input (with rigctl): `dsd-neo -fs -i tcp -U 4532 -T -C dmr_t3_chan.csv -G group.csv --frontend terminal`
-- Single-tuner P25/DMR/NXDN trunk scan from RTL-SDR: `dsd-neo -fa -i rtl:0:851.0125M:22:0:48:0:2 --trunk-scan examples/trunk_scan_targets.csv -G examples/group.csv --frontend terminal`
+- Single-tuner P25/DMR/NXDN/NFM trunk scan from RTL-SDR: `dsd-neo -fa -i rtl:0:851.0125M:22:0:48:0:2 --trunk-scan examples/trunk_scan_targets.csv -G examples/group.csv --frontend terminal`
 - Source radio names during replay: `dsd-neo --iq-replay p25-control.iq.json -f1 -G examples/group.csv --src-csv examples/src.csv --frontend terminal`
 - IQ capture + inspect + replay: `dsd-neo -i rtl:0:851.375M:22:0:48:0:2 --iq-capture p25-control.iq --frontend terminal` then `dsd-neo --iq-info p25-control.iq.json` then `dsd-neo --iq-replay p25-control.iq.json -f1 --frontend terminal`
 
@@ -457,7 +480,7 @@ Quick examples
 - Protocols: `src/protocol/<name>`, headers `<dsd-neo/protocol/<name>/...>` — DMR, dPMR, D‑STAR, NXDN, P25, X2‑TDMA, EDACS, ProVoice, M17, YSF.
 - UI: `src/ui/terminal` (ncurses frontend, target `dsd-neo_ui_terminal`), `src/ui/qt` (Qt Quick frontend, target `dsd-neo_ui_qt`, option `DSD_ENABLE_QT_UI`).
 - Android app: `android/` — Kotlin foreground service, JNI lifecycle glue, and vendored libusb/librtlsdr for USB‑OTG dongles.
-- Third‑party: `src/third_party/ezpwd` (INTERFACE target `dsd-neo_ezpwd`), `src/third_party/pffft` (STATIC target `dsd-neo_pffft`).
+- Third‑party: `src/third_party/ezpwd` (INTERFACE target `dsd-neo_ezpwd`), pinned PFFFT fork via `cmake/Pffft.cmake` (STATIC target `dsd-neo_pffft`).
 
 ## Tooling
 
@@ -516,3 +539,11 @@ Quick examples
   `share/doc/dsd-neo/licenses/`).
 - Project-authored source files carry SPDX identifiers reflecting their license; vendored and embedded upstream-derived
   code retains upstream license/provenance headers, which should be consulted for file-specific details.
+
+### FFT source acquisition
+
+The build downloads a pinned, checksum-verified PFFFT fork and compiles it into
+DSD-neo. For offline packaging, provide
+`-DFETCHCONTENT_SOURCE_DIR_DSD_PFFFT=/absolute/path/to/pffft`; see
+[dependency management](docs/dependencies.md#pinned-pffft-source) for checksums,
+manual updates, scalar builds and AUR packaging. No PFFFT runtime package is needed.

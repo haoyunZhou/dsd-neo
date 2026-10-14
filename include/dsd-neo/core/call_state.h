@@ -217,7 +217,7 @@ typedef struct {
     uint8_t audio_permitted;
     uint8_t media_active;
     uint8_t end_reason;  /**< dsd_call_end_reason; meaningful only while phase is DSD_CALL_PHASE_ENDED. */
-    uint8_t crc_invalid; /**< Sticky known CRC failure in this logical transmission; zero is not verified. */
+    uint8_t crc_invalid; /**< Sticky DSD_CRC_* bits (crc_provenance.h) for this transmission; zero is not verified. */
     char source_text[DSD_CALL_IDENTITY_TEXT_SIZE];
     char target_text[DSD_CALL_IDENTITY_TEXT_SIZE];
     char route_text[DSD_CALL_ROUTE_COUNT][DSD_CALL_IDENTITY_TEXT_SIZE];
@@ -253,8 +253,6 @@ typedef struct {
  * missed and leave a stale verdict vouching for the wrong row.
  */
 typedef struct {
-    uint16_t nxdn_grant_chan;
-    long nxdn_grant_freq;
     unsigned int mfid;
     int ea_mode;
     int edacs_a_bits;

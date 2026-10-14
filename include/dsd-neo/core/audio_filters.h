@@ -32,8 +32,18 @@ void lpf_f(dsd_state* state, float* input, int len);
  */
 void dsd_hpf(dsd_state* state, short* input, int len);
 void hpf_f(dsd_state* state, float* input, int len);
+/**
+ * @brief The digital voice high-pass (`-v 0x8`) on int16 samples, slot 1's (hpf_dL) or slot 2's (hpf_dR) filter state,
+ * saturating to int16. The voice chain (dsd_voice_chain_run(), <dsd-neo/core/voice_chain.h>) runs the same filter on
+ * every decoded frame before its gain; since issue #653 it is a 2nd-order Butterworth at 300 Hz with unity passband.
+ */
 void hpf_dL(dsd_state* state, short* input, int len);
 void hpf_dR(dsd_state* state, short* input, int len);
+/**
+ * @note Pass-through shims since issue #518: the old one-pole 8 kHz / 12 kHz "PBF" pair they ran took 1 kHz 18 dB
+ *  down. The analog monitor's voice band-pass is dsd_analog_audio_process_f() (<dsd-neo/dsp/analog_audio.h>); these
+ *  stay so out-of-tree callers still link. See docs/code_map.md.
+ */
 void pbf(dsd_state* state, short* input, int len);
 void pbf_f(dsd_state* state, float* input, int len);
 

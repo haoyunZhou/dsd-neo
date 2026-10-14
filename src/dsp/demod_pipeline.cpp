@@ -12,22 +12,30 @@
  */
 
 #include <atomic>
+#include <climits>
+#include <dsd-neo/core/power.h>
 #include <dsd-neo/dsp/costas.h>
 #include <dsd-neo/dsp/demod_pipeline.h>
 #include <dsd-neo/dsp/demod_state.h>
 #include <dsd-neo/dsp/firdes.h>
 #include <dsd-neo/dsp/halfband.h>
 #include <dsd-neo/dsp/math_utils.h>
+#include <dsd-neo/dsp/nfm_noise_squelch.h>
 #include <dsd-neo/dsp/simd_fir.h>
+#include <dsd-neo/dsp/squelch_floor.h>
 #include <dsd-neo/dsp/ted.h>
 #include <dsd-neo/runtime/analog_channel.h>
 #include <dsd-neo/runtime/config.h>
 #include <dsd-neo/runtime/mem.h>
 #include <dsd-neo/runtime/rtl_stream_metrics_hooks.h>
 #include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include "dsd-neo/core/safe_api.h"
 #include "dsd-neo/dsp/fsk_modem.h"
+#ifdef DSD_NEO_TEST_HOOKS
+#include "demod_pipeline_test_support.h"
+#endif
 
 #ifndef DSD_NEO_RESTRICT
 #if defined(_MSC_VER)
@@ -149,10 +157,24 @@ static_assert(DSD_ANALOG_CHANNEL_GUARD_HZ * 2 == DSD_ANALOG_CHANNEL_TRANSITION_H
               "analog guard must stay half the channel-filter transition");
 static_assert(DSD_CHANNEL_LPF_MAX_TAPS == DSD_ANALOG_CHANNEL_MAX_TAPS,
               "demod_state channel LPF capacity must match the analog validator's tap limit");
-static_assert(sizeof(demod_state::channel_lpf_plan_taps) / sizeof(float) == DSD_ANALOG_CHANNEL_MAX_TAPS,
+static_assert(DSD_DEMOD_BUF_ALIGN == DSD_NEO_ALIGN,
+              "the aligned demod_state buffers meet the alignment assumed of them");
+/* The aligned buffers are declared rounded up to whole alignment blocks (DSD_DEMOD_ALIGNED_FLOATS), so each holds at
+   least its capacity. The capacity constants, not sizeof, bound what is used of them. */
+static_assert(sizeof(demod_state::channel_lpf_plan_taps) / sizeof(float) >= DSD_ANALOG_CHANNEL_MAX_TAPS,
               "channel LPF plan array must hold the analog tap capacity");
-static_assert(sizeof(demod_state::channel_lpf_hist_i) / sizeof(float) >= DSD_ANALOG_CHANNEL_MAX_TAPS - 1,
-              "channel LPF history must hold taps - 1 samples at analog capacity");
+static_assert(sizeof(demod_state::channel_lpf_hist_i) / sizeof(float) >= DSD_CHANNEL_LPF_HIST_LEN
+                  && sizeof(demod_state::channel_lpf_hist_q) / sizeof(float) >= DSD_CHANNEL_LPF_HIST_LEN,
+              "channel LPF history arrays hold DSD_CHANNEL_LPF_HIST_LEN samples");
+/* The streaming FIR's windows reach pending + c back, pending up to the largest c a plan had and c up to the largest
+   c the capacity allows: a tap change without a reset must still find them in the history. */
+static_assert(2 * ((DSD_CHANNEL_LPF_MAX_TAPS - 1) / 2) <= DSD_CHANNEL_LPF_HIST_LEN,
+              "channel LPF history must hold pending + c at any two plans' tap counts");
+static_assert(sizeof(demod_state::hb_workbuf) / sizeof(float) >= DSD_DEMOD_WORKBUF_LENGTH
+                  && sizeof(demod_state::timing_buf) / sizeof(float) >= DSD_DEMOD_WORKBUF_LENGTH,
+              "the channel LPF writes either work buffer");
+static_assert(DSD_DEMOD_WORKBUF_LENGTH / 2 >= MAXIMUM_BUF_LENGTH / 2 + (DSD_CHANNEL_LPF_MAX_TAPS - 1) / 2,
+              "a channel LPF work buffer holds a maximum block's outputs on a tap shrink");
 static_assert(kChannelLpfTaps <= DSD_CHANNEL_LPF_MAX_TAPS, "digital channel LPF cap exceeds the plan array");
 static_assert(DSD_ANALOG_DEMOD_FM == 0, "a zeroed demod_state must mean the FM analog demodulator");
 /* Protected channel edges: the highest frequency each profile's channel LPF is
@@ -344,8 +366,23 @@ audio_polydecim_release(struct demod_state* d) {
     }
 }
 
+#ifdef DSD_NEO_TEST_HOOKS
+/* While set (dsd_demod_test_fail_post_polydecim_alloc()), the decimator's allocation fails. */
+static int g_post_polydecim_test_fail_alloc = 0;
+
+extern "C" void
+dsd_demod_test_fail_post_polydecim_alloc(int fail) {
+    g_post_polydecim_test_fail_alloc = fail ? 1 : 0;
+}
+#endif
+
 static int
 audio_polydecim_allocate(struct demod_state* d, int K) {
+#ifdef DSD_NEO_TEST_HOOKS
+    if (g_post_polydecim_test_fail_alloc) {
+        return 0;
+    }
+#endif
     d->post_polydecim_taps = static_cast<float*>(dsd_neo_aligned_malloc((size_t)K * sizeof(float)));
     d->post_polydecim_hist = static_cast<float*>(dsd_neo_aligned_malloc((size_t)K * sizeof(float)));
     if (!d->post_polydecim_taps || !d->post_polydecim_hist) {
@@ -460,6 +497,24 @@ audio_polydecim_process(struct demod_state* d, const float* in, int in_len, floa
     return out_len;
 }
 
+/* The post-demod decimator starts over on either path: the polyphase history and phase, and the fallback's one-pole and
+   part-filled group, so the next output comes with the M-th sample from here and holds nothing from before. */
+static void
+post_decim_reset_state(struct demod_state* d) {
+    if (d->post_polydecim_hist && d->post_polydecim_K > 0) {
+        DSD_MEMSET(d->post_polydecim_hist, 0, (size_t)d->post_polydecim_K * sizeof(float));
+    }
+    d->post_polydecim_hist_head = 0;
+    d->post_polydecim_phase = 0;
+    d->post_fallback_lp_y = 0.0f;
+    d->post_fallback_lp_valid = 0;
+    d->post_fallback_box_acc = 0.0f;
+    d->post_fallback_box_phase = 0;
+    DSD_MEMSET(d->post_flag_hist, DSD_SQUELCH_FLAG_CLOSED, sizeof(d->post_flag_hist));
+    d->post_flag_head = 0;
+    d->post_fallback_mid_flag = DSD_SQUELCH_FLAG_CLOSED;
+}
+
 /* ---------------- Fixed channel LPF (complex, no decimation) ----------------- */
 
 int
@@ -572,6 +627,40 @@ dsd_channel_lpf_legacy_wide_width_hz(int rate_hz) {
     return width_hz > 0.0 ? (int)lround(width_hz) : 0;
 }
 
+/* The channel FIR starts over: no history, no pending outputs, so its next output is centred on its next input. */
+static void
+channel_lpf_reset_state(struct demod_state* d) {
+    DSD_MEMSET(d->channel_lpf_hist_i, 0, sizeof(d->channel_lpf_hist_i));
+    DSD_MEMSET(d->channel_lpf_hist_q, 0, sizeof(d->channel_lpf_hist_q));
+    d->channel_lpf_pending = 0;
+}
+
+/* The half-band cascade starts over: no history and nothing pending in any stage, so each stage's next output is centred
+   on its next input sample. */
+static void
+halfband_reset_state(struct demod_state* d) {
+    for (int st = 0; st < 10; st++) {
+        DSD_MEMSET(d->hb_hist_i[st], 0, sizeof(d->hb_hist_i[st]));
+        DSD_MEMSET(d->hb_hist_q[st], 0, sizeof(d->hb_hist_q[st]));
+    }
+    DSD_MEMSET(d->hb_pending, 0, sizeof(d->hb_pending));
+}
+
+void
+dsd_demod_reset_filter_state(struct demod_state* d) {
+    if (!d) {
+        return;
+    }
+    halfband_reset_state(d);
+    channel_lpf_reset_state(d);
+    post_decim_reset_state(d);
+    /* The auto squelch's next block takes its context afresh: at the same context it keeps the floor and starts its
+       windows (and the coherence history) over, so none spans the reset; at another it moves the floor. The noise
+       squelch's next block starts it over. */
+    d->squelch_auto_ran = 0;
+    d->squelch_noise_ran = 0;
+}
+
 /**
  * @brief Ensure channel LPF taps are generated for this demodulator state.
  *
@@ -579,6 +668,10 @@ dsd_channel_lpf_legacy_wide_width_hz(int rate_hz) {
  * Keeps absolute cutoffs in Hz constant across sample rates and avoids global
  * per-block profile dispatch. The plan is cached by (rate_out, profile, width): the analog
  * family's width-driven design when it has a width, the profile design otherwise.
+ *
+ * A plan for another rate_out than the previous one starts the channel over, since its history holds samples at the
+ * old rate. A width or profile change at the same rate keeps the history and pending outputs: the streaming FIR
+ * reconciles a new tap count through pending.
  */
 static void
 channel_lpf_ensure_plan(struct demod_state* d) {
@@ -599,6 +692,10 @@ channel_lpf_ensure_plan(struct demod_state* d) {
         return;
     }
 
+    if (d->channel_lpf_plan_rate_out > 0 && d->channel_lpf_plan_rate_out != rate_out) {
+        channel_lpf_reset_state(d);
+    }
+
     int taps_len = 0;
     if (width_hz > 0) {
         taps_len =
@@ -615,36 +712,98 @@ channel_lpf_ensure_plan(struct demod_state* d) {
     d->channel_lpf_plan_taps_len = taps_len;
 }
 
+/* A block the channel filter does not run on (the filter off, or no plan for the width) passes unfiltered and breaks
+   the stream the filter was on: what it held back is dropped and its next block starts over. pending is above 0
+   exactly when the filter took samples since its last reset, so only the first such block clears. */
+static void
+channel_lpf_bypass(struct demod_state* d) {
+    if (d->channel_lpf_pending != 0) {
+        channel_lpf_reset_state(d);
+    }
+}
+
+/*
+ * The channel FIR, streaming: a block makes the outputs whose look-ahead it completes, max(0, pending + N - c), each
+ * centred on its own input sample, so the output does not depend on where the blocks are cut. The first c samples
+ * after a reset make no output yet (about 1.4 ms at 48 kHz with 135 taps), and a block can make none at all.
+ */
 static void
 channel_lpf_apply(struct demod_state* d) {
-    if (!d || !d->channel_lpf_enable || d->lp_len < 2) {
+    if (!d) {
+        return;
+    }
+    if (!d->channel_lpf_enable) {
+        channel_lpf_bypass(d);
         return;
     }
 
     channel_lpf_ensure_plan(d);
     const float* taps = d->channel_lpf_plan_taps;
-    int taps_len = d->channel_lpf_plan_taps_len;
-    if (!taps || taps_len < 3) {
+    const int taps_len = d->channel_lpf_plan_taps_len;
+    if (taps_len < 3 || !d->lowpassed || d->lp_len < 0) {
+        channel_lpf_bypass(d);
         return;
     }
 
-    const int hist_len = taps_len - 1;
     const int N = d->lp_len >> 1; /* complex samples */
-    if (hist_len > d->channel_lpf_hist_len) {
-        d->channel_lpf_hist_len = hist_len;
-    }
-
     const float* in = assume_aligned_ptr(d->lowpassed, DSD_NEO_ALIGN);
     float* out = (d->lowpassed == d->hb_workbuf) ? d->timing_buf : d->hb_workbuf;
     float* hi = assume_aligned_ptr(d->channel_lpf_hist_i, DSD_NEO_ALIGN);
     float* hq = assume_aligned_ptr(d->channel_lpf_hist_q, DSD_NEO_ALIGN);
+    const int out_cap = DSD_DEMOD_WORKBUF_LENGTH / 2;
 
     /* Use SIMD-dispatched complex symmetric FIR */
-    simd_fir_complex_apply(in, d->lp_len, out, hi, hq, taps, taps_len);
+    const int made = simd_fir_complex_apply(in, N, out, out_cap, hi, hq, DSD_CHANNEL_LPF_HIST_LEN,
+                                            &d->channel_lpf_pending, taps, taps_len);
+    if (made < 0) {
+        /* Not reachable: a plan has odd taps within the capacity, pending stays within the history (the static
+           asserts above), and a block fits the work buffer. Should it happen, the block passes unfiltered and the
+           filter starts over. */
+        channel_lpf_reset_state(d);
+        return;
+    }
 
     d->lowpassed = out;
-    d->lp_len = N << 1;
+    d->lp_len = made << 1;
 }
+
+#if defined(_MSC_VER) && !defined(__clang__)
+/* MSVC: the same written order under /fp:fast (see the Clang pragma below). */
+#pragma float_control(precise, on, push)
+#endif
+/*
+ * The mean of each step consecutive samples, in place: output k overwrites sample k, which the loop has read by then.
+ * *acc and *phase hold the group a call leaves part-filled (its sum and its sample count, 0..step-1), and the next call
+ * completes it, so the output does not depend on where the blocks are cut. A group sums from 0 in sample order, as a
+ * whole block would. Returns the outputs made.
+ */
+static int
+boxcar_decimate_stream(float* signal, int len, int step, float* acc, int* phase) {
+#if defined(__clang__)
+    /* Each group's sum must round the same however the input is split into blocks. Under fast-math Clang reassociates
+       the running sum across unrolled iterations, which groups the samples by where a block starts. Only the
+       allocation-failure fallback decimator runs this, so keeping the written order costs nothing. */
+#pragma clang fp reassociate(off)
+#endif
+    float sum = *acc;
+    int count = *phase;
+    int out_len = 0;
+    for (int i = 0; i < len; i++) {
+        sum += signal[i];
+        if (++count < step) {
+            continue;
+        }
+        signal[out_len++] = sum / (float)step;
+        sum = 0.0f;
+        count = 0;
+    }
+    *acc = sum;
+    *phase = count;
+    return out_len;
+}
+#if defined(_MSC_VER) && !defined(__clang__)
+#pragma float_control(pop)
+#endif
 
 /**
  * @brief Boxcar low-pass and decimate by step (no wraparound).
@@ -658,23 +817,19 @@ channel_lpf_apply(struct demod_state* d) {
  */
 int
 low_pass_simple(float* signal2, int len, int step) {
-    int i, i2;
     if (step <= 0) {
         return len;
     }
-    for (i = 0; i + (step - 1) < len; i += step) {
-        float sum = 0.0f;
-        for (i2 = 0; i2 < step; i2++) {
-            sum += signal2[i + i2];
-        }
-        // Normalize by step with rounding. Writes output at i/step index.
-        float val = sum / (float)step;
-        signal2[i / step] = val;
+    if (len <= 0) {
+        return len / step;
     }
+    /* One block on its own: a trailing part-filled group is dropped. */
+    float acc = 0.0f;
+    int phase = 0;
+    const int out_len = boxcar_decimate_stream(signal2, len, step, &acc, &phase);
     /* Duplicate the final sample to provide one-sample lookahead for callers
 	   that expect at least one extra element. Only do this when there is
 	   capacity (i.e., out_len < len) to avoid writing past the end. */
-    int out_len = len / step;
     if (out_len > 0 && out_len < len) {
         signal2[out_len] = signal2[out_len - 1];
     }
@@ -697,12 +852,19 @@ low_pass_real(struct demod_state* s) {
         decim = 1;
     }
     float recip = 1.0f / (float)decim;
+    /* The auto squelch's flags: an output takes its last input's (every stream sets rate_out2 to rate_in, where this
+       stage passes each sample through). */
+    uint8_t* flags = s->result_flags_active ? s->result_flags : NULL;
     while (i < s->result_len) {
         s->now_lpr += r[i];
+        const uint8_t flag = flags ? flags[i] : 0U;
         i++;
         s->prev_lpr_index += slow;
         if (s->prev_lpr_index < fast) {
             continue;
+        }
+        if (flags) {
+            flags[i2] = flag;
         }
         r[i2] = s->now_lpr * recip;
         s->prev_lpr_index -= fast;
@@ -757,6 +919,183 @@ dsd_fm_demod(struct demod_state* fm) {
     fm->result_len = pairs;
 }
 
+/* AM envelope detector (issue #524): output = kAmOutputGain x clamp(|z| / C - 1, +/-kAmEnvelopeClamp). The gain puts
+   100% modulation at 0.25, where FM monitor audio sits at about 6 kHz deviation once the 1/pi output scale (live and
+   I/Q replay) turns discriminator radians into audio, so the downstream voice filters and AGC see the level they see
+   for FM. Below kAmCarrierFloor there is no carrier to normalise by. */
+static const float kAmOutputGain = 0.25f;
+static const float kAmEnvelopeClamp = 2.0f;
+static const float kAmCarrierFloor = 1e-9f;
+
+/* The rate the AM detector runs at: the demod rate. An I/Q replay that decimates after the demodulator
+   (post_downsample above 1) would run it faster, but no AM front end runs there: the stream start and every runtime
+   request refuse AM on such a capture (rtl_demod_check_analog_post_decimation()). */
+static int
+am_detector_rate_hz(const struct demod_state* d) {
+    return d->rate_out > 0 ? d->rate_out : 48000;
+}
+
+/* One-pole coefficient for the DSD_AM_CARRIER_TAU_MS carrier estimate at the rate the detector runs. */
+static float
+am_carrier_alpha(const struct demod_state* d) {
+    const double tau_s = (double)DSD_AM_CARRIER_TAU_MS / 1000.0;
+    return (float)(1.0 - exp(-1.0 / ((double)am_detector_rate_hz(d) * tau_s)));
+}
+
+/* Count a squelched block into the closed run, saturating. */
+static void
+am_note_squelched_block(struct demod_state* d, int pairs) {
+    const int room = INT_MAX - d->am_squelched_samples;
+    d->am_squelched_samples = pairs < room ? d->am_squelched_samples + pairs : INT_MAX;
+}
+
+/* Whether the squelch has been closed long enough (DSD_AM_CARRIER_HOLD_MS) for the audio it lets through now to be
+   another transmission, whose carrier the estimate must start over on. */
+static int
+am_squelch_ended_transmission(const struct demod_state* d) {
+    const int hold_ms = DSD_AM_CARRIER_HOLD_MS;
+    const long long hold_samples = (long long)am_detector_rate_hz(d) * hold_ms / 1000;
+    return (long long)d->am_squelched_samples > hold_samples ? 1 : 0;
+}
+
+static float
+am_block_mean_magnitude(const float* iq, int pairs) {
+    double sum = 0.0;
+    for (int n = 0; n < pairs; n++) {
+        const double i = (double)iq[(size_t)(n << 1) + 0];
+        const double q = (double)iq[(size_t)(n << 1) + 1];
+        sum += sqrt(i * i + q * q);
+    }
+    return pairs > 0 ? (float)(sum / (double)pairs) : 0.0f;
+}
+
+/* The mean magnitude of the open run of samples starting at @p first (up to the next closed one): the carrier a
+   transmission the auto squelch has just opened on starts from. */
+static float
+am_open_run_mean_magnitude(const float* iq, const uint8_t* flags, int first, int pairs) {
+    double sum = 0.0;
+    int count = 0;
+    for (int n = first; n < pairs && (flags[n] & DSD_SQUELCH_FLAG_CLOSED) == 0U; n++) {
+        const double i = (double)iq[(size_t)(n << 1) + 0];
+        const double q = (double)iq[(size_t)(n << 1) + 1];
+        sum += sqrt(i * i + q * q);
+        count++;
+    }
+    return count > 0 ? (float)(sum / (double)count) : 0.0f;
+}
+
+/* An estimate this far (3 dB) from what the channel carries on reopening is not that carrier's: the gate closes a
+   sub-window after the carrier leaves, and the estimate follows the noise until it does. */
+static const float kAmReseedRatio = 1.41421356f;
+
+/* The AM detector under the auto squelch, which gates per sample (result_flags): a closed sample is silence and leaves
+   the carrier estimate where it was, as a squelched block does under the level squelch, and counts into the closed
+   run. The first open sample after a run past the hold, or after any closed run when the estimate is 3 dB off the open
+   run's mean magnitude, starts the estimate afresh from that open run. */
+static void
+am_demod_flagged(struct demod_state* fm, int pairs) {
+    const float* iq = assume_aligned_ptr(fm->lowpassed, DSD_NEO_ALIGN);
+    float* out = assume_aligned_ptr(fm->result, DSD_NEO_ALIGN);
+    const uint8_t* flags = fm->result_flags;
+    float carrier = fm->am_carrier;
+    const float alpha = am_carrier_alpha(fm);
+    for (int n = 0; n < pairs; n++) {
+        if ((flags[n] & DSD_SQUELCH_FLAG_CLOSED) != 0U) {
+            out[n] = 0.0f;
+            am_note_squelched_block(fm, 1);
+            continue;
+        }
+        if (fm->am_squelched_samples > 0) {
+            const float run = am_open_run_mean_magnitude(iq, flags, n, pairs);
+            if (am_squelch_ended_transmission(fm) || carrier > run * kAmReseedRatio || run > carrier * kAmReseedRatio) {
+                carrier = run;
+            }
+            fm->am_squelched_samples = 0;
+        }
+        if (!(carrier >= kAmCarrierFloor)) {
+            carrier = am_open_run_mean_magnitude(iq, flags, n, pairs);
+        }
+        const float i = iq[(size_t)(n << 1) + 0];
+        const float q = iq[(size_t)(n << 1) + 1];
+        const float a = sqrtf(i * i + q * q);
+        out[n] = carrier >= kAmCarrierFloor
+                     ? kAmOutputGain * clamp_float((a / carrier) - 1.0f, -kAmEnvelopeClamp, kAmEnvelopeClamp)
+                     : 0.0f;
+        carrier += alpha * (a - carrier);
+    }
+    fm->am_carrier = carrier;
+}
+
+/**
+ * @brief AM envelope detector on interleaved low-passed I/Q (issue #524).
+ *
+ * @param fm Demodulator state (uses lowpassed as input, writes to result, updates am_carrier).
+ */
+void
+dsd_am_demod(struct demod_state* fm) {
+    const int pairs = fm->lp_len >> 1;
+    if (pairs <= 0) {
+        fm->result_len = 0;
+        return;
+    }
+    float* out = assume_aligned_ptr(fm->result, DSD_NEO_ALIGN);
+    fm->result_len = pairs;
+    if (fm->result_flags_active) {
+        am_demod_flagged(fm, pairs);
+        return;
+    }
+    if (fm->channel_squelched) {
+        /* The squelch zeroed the block. A zero envelope would read as -0.25 under the held carrier estimate; the block
+           is silence instead, and the estimate stays for the audio the squelch lets through next, unless the squelch
+           stays closed past the hold. */
+        for (int n = 0; n < pairs; n++) {
+            out[n] = 0.0f;
+        }
+        am_note_squelched_block(fm, pairs);
+        return;
+    }
+    const float* iq = assume_aligned_ptr(fm->lowpassed, DSD_NEO_ALIGN);
+    float carrier = fm->am_carrier;
+    if (am_squelch_ended_transmission(fm)) {
+        /* The squelch was closed long enough to end the transmission: whatever opened it is measured afresh, not
+           divided by the last station's carrier. */
+        carrier = 0.0f;
+    }
+    fm->am_squelched_samples = 0;
+    if (!(carrier >= kAmCarrierFloor)) {
+        /* Reset (or no carrier yet): start from this block's own level rather than fading in from nothing. */
+        carrier = am_block_mean_magnitude(iq, pairs);
+    }
+    const float alpha = am_carrier_alpha(fm);
+    for (int n = 0; n < pairs; n++) {
+        const float i = iq[(size_t)(n << 1) + 0];
+        const float q = iq[(size_t)(n << 1) + 1];
+        const float a = sqrtf(i * i + q * q);
+        if (carrier >= kAmCarrierFloor) {
+            out[n] = kAmOutputGain * clamp_float((a / carrier) - 1.0f, -kAmEnvelopeClamp, kAmEnvelopeClamp);
+        } else {
+            out[n] = 0.0f;
+        }
+        carrier += alpha * (a - carrier);
+    }
+    fm->am_carrier = carrier;
+}
+
+int
+dsd_demod_am_active(const struct demod_state* d) {
+    return (d && d->mode_demod == &dsd_am_demod && dsd_demod_analog_monitor_active(d)) ? 1 : 0;
+}
+
+int
+dsd_demod_iq_dc_block_active(const struct demod_state* d) {
+    return (d && d->iq_dc_block_enable && !dsd_demod_am_active(d)) ? 1 : 0;
+}
+
+int
+dsd_demod_iq_balance_active(const struct demod_state* d) {
+    return (d && d->iqbal_enable && !d->cqpsk_enable && !dsd_demod_am_active(d)) ? 1 : 0;
+}
+
 /**
  * @brief Pass-through demodulator: copies low-passed samples to output unchanged.
  *
@@ -764,11 +1103,15 @@ dsd_fm_demod(struct demod_state* fm) {
  */
 void
 raw_demod(struct demod_state* fm) {
+    /* The channel FIR can make up to 143 complex samples more than a maximum block on a tap shrink (its work buffers
+       hold them); result holds MAXIMUM_BUF_LENGTH floats. */
+    const int capacity = (int)(sizeof(fm->result) / sizeof(fm->result[0]));
+    const int n = fm->lp_len < capacity ? fm->lp_len : capacity;
     int i;
-    for (i = 0; i < fm->lp_len; i++) {
+    for (i = 0; i < n; i++) {
         fm->result[i] = fm->lowpassed[i];
     }
-    fm->result_len = fm->lp_len;
+    fm->result_len = n;
 }
 
 /**
@@ -1036,10 +1379,11 @@ mean_power(const float* samples, int len, int step) {
     return (float)(energy / (double)(len > 0 ? len : 1));
 }
 
-/* Optional complex DC blocker prior to FM discrimination (per-sample leaky integrator) */
+/* Optional complex DC blocker prior to FM discrimination (per-sample leaky integrator). Never under the AM detector,
+   whose carrier sits at 0 Hz (dsd_demod_iq_dc_block_active()); its estimate then holds where it was. */
 static inline void
 iq_dc_block(struct demod_state* d) {
-    if (!d || !d->iq_dc_block_enable || !d->lowpassed || d->lp_len < 2) {
+    if (!dsd_demod_iq_dc_block_active(d) || !d->lowpassed || d->lp_len < 2) {
         return;
     }
     int k = d->iq_dc_shift;
@@ -1071,19 +1415,40 @@ iq_dc_block(struct demod_state* d) {
 
 /**
  * @brief Apply stage-wise half-band decimation for complex baseband.
+ *
+ * Streaming: each stage carries its look-ahead and decimation phase in hb_pending, so the cascade's output does not
+ * depend on where the blocks are cut. A stage makes at most (N + 1) / 2 outputs for N in, so every stage after the first
+ * fits the block's own buffer, which it writes in turn with hb_workbuf.
  */
 static void
 full_demod_apply_halfband_decimation(struct demod_state* d) {
-    if (!d || d->downsample_passes <= 0) {
+    if (!d) {
         return;
     }
-    int in_len = d->lp_len;
+    if (d->hb_state_passes != d->downsample_passes) {
+        /* Another cascade: its stages run at other rates, so what the old one held is not their past. */
+        halfband_reset_state(d);
+        d->hb_state_passes = d->downsample_passes;
+    }
+    if (d->downsample_passes <= 0) {
+        return;
+    }
+    /* Whole complex samples: a stray trailing float was never a sample. */
+    int in_len = d->lp_len > 0 ? (d->lp_len & ~1) : 0;
     float* src = d->lowpassed;
     float* dst = d->hb_workbuf;
     for (int i = 0; i < d->downsample_passes; i++) {
         const float* taps = (i == 0) ? hb31_q15_taps : hb_q15_taps;
         int taps_len = (i == 0) ? 31 : HB_TAPS;
-        int out_len = simd_hb_decim2_complex(src, in_len, dst, d->hb_hist_i[i], d->hb_hist_q[i], taps, taps_len);
+        int out_len = simd_hb_decim2_complex(src, in_len, dst, d->hb_hist_i[i], d->hb_hist_q[i], &d->hb_pending[i],
+                                             taps, taps_len);
+        if (out_len < 0) {
+            /* Not reachable: fixed odd taps, pending kept within 0..c by the decimator and a reset, and whole samples.
+               Should it happen, the cascade starts over and the block makes no samples. */
+            halfband_reset_state(d);
+            d->lp_len = 0;
+            return;
+        }
         src = dst;
         in_len = out_len;
         dst = (src == d->hb_workbuf) ? d->lowpassed : d->hb_workbuf;
@@ -1092,14 +1457,282 @@ full_demod_apply_halfband_decimation(struct demod_state* d) {
     d->lp_len = in_len;
 }
 
+/* The half-band cascade and the channel filter made no samples (a filter warm-up, or nothing in): the block has no
+   output, and the per-block decisions after this point (squelch gate, envelope, CQPSK zero symbols) wait for one with
+   samples. */
+static int
+full_demod_front_end_empty(struct demod_state* d) {
+    if (d->lowpassed && d->lp_len >= 2) {
+        d->front_end_empty = 0;
+        return 0;
+    }
+    d->result_len = 0;
+    d->front_end_empty = 1;
+    return 1;
+}
+
+/* Mean of the squares of @p len interleaved I/Q floats: Σ(I²+Q²) over the complex samples divided by 2N, the scale
+   mean_power() reads for a signal with no DC. */
+static float
+mean_square_iq(const float* samples, int len) {
+    double p = 0.0;
+    for (int i = 0; i < len; i++) {
+        const double s = (double)samples[i];
+        p += s * s;
+    }
+    return len > 0 ? (float)(p / (double)len) : 0.0f;
+}
+
+/* ---------------- The auto squelch (issue #518 follow-up) ---------------- */
+
+/* The rate the channel-filtered I/Q runs at: the demod rate before any post-decimation. */
+static int
+squelch_channel_rate_hz(const struct demod_state* d) {
+    if (d->rate_out <= 0) {
+        return 0;
+    }
+    return d->rate_out * (d->post_downsample > 1 ? d->post_downsample : 1);
+}
+
+/* A dynamic setting runs on the analog monitor, the M17 encoder's monitor and the 9600 bit/s FSK path EDACS analog
+   voice reads (dsd_demod_dynamic_squelch_path(), issue #625); a digital channel elsewhere never shows its noise. The
+   tracker runs AUTO, and NOISE where the noise squelch cannot (squelch_noise_wanted()). */
+static int
+squelch_auto_wanted(const struct demod_state* d) {
+    return dsd_squelch_mode_is_dynamic(d->squelch_mode) && dsd_demod_dynamic_squelch_path(d);
+}
+
+/* What the squelch plans follow: the channel filter in force, the half-band stage ahead of it and the channel rate. */
+static dsd_demod_squelch_plan_key
+squelch_plan_key_of(const struct demod_state* d) {
+    const int filtered = d->channel_lpf_enable && d->channel_lpf_plan_taps_len >= 3;
+    dsd_demod_squelch_plan_key k;
+    DSD_MEMSET(&k, 0, sizeof k);
+    k.rate_hz = squelch_channel_rate_hz(d);
+    k.hb_taps = d->downsample_passes <= 0 ? 0 : (d->downsample_passes == 1 ? 31 : HB_TAPS);
+    k.passes = d->downsample_passes > 0 ? d->downsample_passes : 0;
+    if (filtered) {
+        k.taps_len = d->channel_lpf_plan_taps_len;
+        k.rate_out = d->channel_lpf_plan_rate_out;
+        k.profile = d->channel_lpf_plan_profile;
+        k.width_hz = d->channel_lpf_plan_width_hz;
+    }
+    k.set = 1;
+    return k;
+}
+
+static int
+squelch_plan_key_same(const dsd_demod_squelch_plan_key* a, const dsd_demod_squelch_plan_key* b) {
+    return a->set && b->set && a->rate_hz == b->rate_hz && a->taps_len == b->taps_len && a->hb_taps == b->hb_taps
+           && a->passes == b->passes && a->rate_out == b->rate_out && a->profile == b->profile
+           && a->width_hz == b->width_hz;
+}
+
+static const float*
+squelch_plan_hb(const dsd_demod_squelch_plan_key* k) {
+    return k->hb_taps == 31 ? hb31_q15_taps : (k->hb_taps > 0 ? hb_q15_taps : NULL);
+}
+
+static void
+squelch_floor_ensure_plan(struct demod_state* d) {
+    const dsd_demod_squelch_plan_key k = squelch_plan_key_of(d);
+    if (squelch_plan_key_same(&d->squelch_plan, &k)) {
+        return;
+    }
+    dsd_squelch_floor_plan plan;
+    /* A plan that cannot be designed is not valid, and the tracker then keeps the gate open. */
+    (void)dsd_squelch_floor_plan_design(&plan, k.taps_len > 0 ? d->channel_lpf_plan_taps : NULL, k.taps_len,
+                                        squelch_plan_hb(&k), k.hb_taps, k.rate_hz);
+    dsd_squelch_floor_set_plan(&d->squelch_floor, &plan);
+    d->squelch_plan = k;
+}
+
+static void
+squelch_noise_ensure_plan(struct demod_state* d) {
+    const dsd_demod_squelch_plan_key k = squelch_plan_key_of(d);
+    if (squelch_plan_key_same(&d->noise_plan, &k)) {
+        return;
+    }
+    /* The cascade as full_demod_apply_halfband_decimation() runs it: the 31-tap stage first, the 15-tap ones after. */
+    dsd_noise_squelch_stage stages[DSD_NOISE_SQUELCH_MAX_STAGES];
+    const int count = k.passes < DSD_NOISE_SQUELCH_MAX_STAGES ? k.passes : DSD_NOISE_SQUELCH_MAX_STAGES;
+    for (int i = 0; i < count; i++) {
+        stages[i].taps = (i == 0) ? hb31_q15_taps : hb_q15_taps;
+        stages[i].len = (i == 0) ? 31 : HB_TAPS;
+    }
+    dsd_noise_squelch_plan plan;
+    /* A channel with no band above voice has no valid plan: the tracker runs the setting instead. */
+    (void)dsd_noise_squelch_plan_design(&plan, k.taps_len > 0 ? d->channel_lpf_plan_taps : NULL, k.taps_len, stages,
+                                        count, k.rate_hz);
+    dsd_noise_squelch_set_plan(&d->noise_squelch, &plan);
+    d->noise_plan = k;
+}
+
+/* The flag histories of the post-decimator and the resampler start over, closed: their next outputs map to samples of
+   the channel just taken, not to flags left from before. */
+static void
+squelch_flag_histories_reset(struct demod_state* d) {
+    DSD_MEMSET(d->post_flag_hist, DSD_SQUELCH_FLAG_CLOSED, sizeof(d->post_flag_hist));
+    d->post_fallback_mid_flag = DSD_SQUELCH_FLAG_CLOSED;
+    DSD_MEMSET(d->resamp_flag_hist, DSD_SQUELCH_FLAG_CLOSED, sizeof(d->resamp_flag_hist));
+}
+
+/* The tracker takes the context it runs in: a gap since it last ran starts its windows over, and a new context moves
+   the floor (remembered for the context left, seeded from the cache for the one taken, or learned). A floor kept
+   through a gap ages like a cached one: past DSD_SQUELCH_FLOOR_STALE_S of sample time (the level squelch, digital
+   traffic) it is learned again, neither kept nor stored for its channel with a fresh stamp. */
+static void
+squelch_auto_take_context(struct demod_state* d) {
+    dsd_squelch_floor* t = &d->squelch_floor;
+    const int same =
+        d->squelch_context_applied_set && dsd_squelch_floor_key_equal(&d->squelch_context_applied, &d->squelch_context);
+    if (d->squelch_auto_ran && same) {
+        return;
+    }
+    if (d->squelch_context_applied_set
+        && d->squelch_cache.clock_s - d->squelch_floor_active_s > (double)DSD_SQUELCH_FLOOR_STALE_S) {
+        dsd_squelch_floor_reset(t);
+    }
+    if (same) {
+        dsd_squelch_floor_restart_windows(t);
+    } else {
+        dsd_squelch_floor_change_context(t, &d->squelch_cache,
+                                         d->squelch_context_applied_set ? &d->squelch_context_applied : NULL,
+                                         &d->squelch_context);
+    }
+    squelch_flag_histories_reset(d);
+    d->squelch_context_applied = d->squelch_context;
+    d->squelch_context_applied_set = 1;
+}
+
+/* Run the tracker over the block's channel samples, one flag per sample into result_flags. Nothing is zeroed. */
+static void
+squelch_auto_run(struct demod_state* d) {
+    dsd_squelch_floor* t = &d->squelch_floor;
+    squelch_floor_ensure_plan(d);
+    int margin = d->squelch_margin_db;
+    if (margin < DSD_SQUELCH_MARGIN_MIN_DB) {
+        margin = DSD_SQUELCH_MARGIN_MIN_DB;
+    } else if (margin > DSD_SQUELCH_MARGIN_MAX_DB) {
+        margin = DSD_SQUELCH_MARGIN_MAX_DB;
+    }
+    if (t->margin_db != margin) {
+        dsd_squelch_floor_set_margin(t, margin);
+    }
+    squelch_auto_take_context(d);
+    d->squelch_auto_ran = 1;
+    dsd_squelch_floor_process(t, d->lowpassed, d->lp_len >> 1, d->result_flags);
+    d->squelch_floor_active_s = d->squelch_cache.clock_s;
+    d->result_flags_active = 1;
+}
+
+/* A NOISE setting runs the noise squelch on the FM monitor, or the M17 encoder's, whose channel plan has a band above
+   voice; on an AM channel, one too narrow for the band (8 and 10 kHz NFM), or the 9600 bit/s FSK path (whose
+   discriminator output is peak-normalised, not the radians the noise squelch is calibrated on), the tracker runs it as
+   AUTO with the same N. */
+static int
+squelch_noise_wanted(struct demod_state* d) {
+    if (d->squelch_mode != DSD_SQUELCH_MODE_NOISE
+        || !(dsd_demod_analog_monitor_active(d) || dsd_demod_encoder_monitor_active(d)) || dsd_demod_am_active(d)) {
+        return 0;
+    }
+    squelch_noise_ensure_plan(d);
+    return d->noise_squelch.plan.valid;
+}
+
+/* The noise squelch takes the context it runs in: a gap since it last ran, or another context, starts it over (gate
+   closed, filters and windows empty), and the flag histories with it. */
+static void
+squelch_noise_take_context(struct demod_state* d) {
+    dsd_noise_squelch* t = &d->noise_squelch;
+    int threshold = d->squelch_margin_db;
+    if (threshold < DSD_SQUELCH_MARGIN_MIN_DB) {
+        threshold = DSD_SQUELCH_MARGIN_MIN_DB;
+    } else if (threshold > DSD_SQUELCH_MARGIN_MAX_DB) {
+        threshold = DSD_SQUELCH_MARGIN_MAX_DB;
+    }
+    if (t->threshold_db != threshold) {
+        dsd_noise_squelch_set_threshold(t, threshold);
+    }
+    const int same = d->noise_context_set && dsd_squelch_floor_key_equal(&d->noise_context, &d->squelch_context);
+    if (d->squelch_noise_ran && same) {
+        return;
+    }
+    dsd_noise_squelch_reset(t);
+    squelch_flag_histories_reset(d);
+    d->noise_context = d->squelch_context;
+    d->noise_context_set = 1;
+}
+
+/* After the discriminator: run the noise squelch over the block's outputs, one flag per sample into result_flags.
+   Nothing is zeroed. */
+static void
+squelch_noise_run(struct demod_state* d) {
+    if (!d->squelch_noise_armed) {
+        return;
+    }
+    d->squelch_noise_armed = 0;
+    const int pairs = d->lp_len >> 1;
+    if (pairs <= 0 || d->result_len != pairs || !d->lowpassed) {
+        /* Not reachable: an FM monitor block makes one discriminator output per channel sample. Should it happen, the
+           block plays and the squelch starts over. */
+        if (d->result_len > 0) {
+            DSD_MEMSET(d->result_flags, 0, (size_t)d->result_len);
+        }
+        d->squelch_noise_ran = 0;
+        return;
+    }
+    dsd_noise_squelch_process(&d->noise_squelch, d->result, d->lowpassed, pairs, d->result_flags);
+    d->squelch_noise_ran = 1;
+}
+
+/* The per-channel floors age with the stream's sample time in every mode, digital and level squelch included, so a
+   floor cached before an hour on other traffic is stale when its channel comes back. */
+static void
+squelch_cache_age(struct demod_state* d) {
+    const int rate = squelch_channel_rate_hz(d);
+    if (rate > 0 && d->lowpassed && d->lp_len >= 2) {
+        dsd_squelch_floor_cache_advance(&d->squelch_cache, (double)(d->lp_len >> 1) / (double)rate);
+    }
+}
+
 static void
 full_demod_update_channel_state(struct demod_state* d) {
-    channel_lpf_apply(d);
+    squelch_cache_age(d);
     if (d->lowpassed && d->lp_len >= 2) {
         int n = (d->lp_len > 512) ? 512 : d->lp_len;
-        d->channel_pwr = mean_power(d->lowpassed, n, 1);
+        /* mean_power() pools I and Q and takes their common mean out. An AM carrier sits at 0 Hz, so that mean is the
+           carrier itself and what is left swings with its phase, A²(1 - sin 2φ)/4, down to nothing: the squelch chopped
+           an AM channel as the carrier drifted. On AM the carrier is the signal, so its power is measured whole (the IQ
+           DC block, which runs after this, is bypassed on AM for the same reason). */
+        d->channel_pwr = dsd_demod_am_active(d) ? mean_square_iq(d->lowpassed, n) : mean_power(d->lowpassed, n, 1);
     }
-    const float squelch_level = d->channel_squelch_level.load(std::memory_order_relaxed);
+    if (squelch_noise_wanted(d)) {
+        /* The noise squelch gates per sample at the decoder's sink, from the discriminator's output (squelch_noise_run()
+           after the demodulator): the block runs whole, and the level gate is off. */
+        squelch_noise_take_context(d);
+        d->squelch_noise_armed = 1;
+        d->squelch_auto_ran = 0;
+        d->result_flags_active = 1;
+        d->channel_squelched = 0;
+        d->squelch_gate_open = 1;
+        return;
+    }
+    d->squelch_noise_armed = 0;
+    d->squelch_noise_ran = 0;
+    if (squelch_auto_wanted(d)) {
+        /* The auto squelch gates per sample at the decoder's sink: the block runs whole, and the level gate is off. */
+        squelch_auto_run(d);
+        d->channel_squelched = 0;
+        d->squelch_gate_open = 1;
+        return;
+    }
+    d->squelch_auto_ran = 0;
+    d->result_flags_active = 0;
+    /* The level gate runs under a LEVEL setting only: an AUTO one off the analog monitor is off, whatever level the
+       stream still holds from before it. */
+    const float squelch_level =
+        d->squelch_mode == DSD_SQUELCH_MODE_LEVEL ? d->channel_squelch_level.load(std::memory_order_relaxed) : 0.0f;
     if (d->lowpassed && d->lp_len > 0 && squelch_level > 0.0f && d->channel_pwr < squelch_level) {
         d->channel_squelched = 1;
         d->squelch_gate_open = 0;
@@ -1221,9 +1854,12 @@ full_demod_run_non_cqpsk_chain(struct demod_state* d) {
     }
 }
 
+/* Optional I/Q image suppression before the discriminator. Never under the AM detector (dsd_demod_iq_balance_active()):
+   its estimate reads a carrier at 0 Hz, whose I/Q is a fixed phasor, as a full image and subtracts the wanted signal
+   with it; the estimate then holds where it was. */
 static void
 full_demod_apply_iq_balance(struct demod_state* d) {
-    if (!d->iqbal_enable || d->cqpsk_enable || d->channel_squelched || !d->lowpassed || d->lp_len < 2) {
+    if (!dsd_demod_iq_balance_active(d) || d->channel_squelched || !d->lowpassed || d->lp_len < 2) {
         return;
     }
     double s2r = 0.0, s2i = 0.0, p2 = 0.0;
@@ -1344,24 +1980,41 @@ full_demod_run_output_demod(struct demod_state* d) {
     if (d->cqpsk_enable) {
         qpsk_differential_demod(d);
         full_demod_debug_cqpsk_symbols(d);
+    } else if (d->mode_demod == &dsd_am_demod && !dsd_demod_am_active(d)) {
+        /* A typed digital scan row's profile on an AM session: its signal is FM, so the discriminator reads it as under
+           -fA, and the AM detector's carrier estimate is left for the monitor's return (a family switch, which resets
+           it). The audio chain after it is the AM session's, not -fA's: AM runs no de-emphasis, so the row's
+           discriminator output is not de-emphasized, as on a digital open, where -fA's FM monitor de-emphasizes it. */
+        dsd_fm_demod(d);
     } else {
         d->mode_demod(d);
     }
 }
 
+/* A block that runs the post-demod decimator with another factor, rate_out or path than the block before (the factor
+   and rate a replay's rate chain sets, the path the polyphase allocation decides) starts it over: its state holds
+   samples at the old rate, or belongs to the other path. */
 static void
-full_demod_apply_post_audio_decimation(struct demod_state* d) {
-    if (d->cqpsk_enable || d->post_downsample <= 1) {
+post_decim_track_state_key(struct demod_state* d, int decim) {
+    const int fallback = d->post_polydecim_enabled ? 0 : 1;
+    if (d->post_decim_state_M == decim && d->post_decim_state_rate_out == d->rate_out
+        && d->post_decim_state_fallback == fallback) {
         return;
     }
-    int decim = d->post_downsample;
-    audio_polydecim_ensure(d, decim);
-    if (d->post_polydecim_enabled) {
-        int out_n = audio_polydecim_process(d, d->result, d->result_len, d->timing_buf);
-        if (out_n > 0) {
-            DSD_MEMCPY(d->result, d->timing_buf, (size_t)out_n * sizeof(float));
-            d->result_len = out_n;
-        }
+    post_decim_reset_state(d);
+    d->post_decim_state_M = decim;
+    d->post_decim_state_rate_out = d->rate_out;
+    d->post_decim_state_fallback = fallback;
+}
+
+/* The fallback when the polyphase decimator cannot be allocated: a one-pole low-pass, then the mean of each decim
+   samples. Both carry their state across blocks: the one-pole starts from the first sample after a reset and then runs
+   on, and a group a block leaves part-filled is completed by the next one. */
+static void
+post_decim_run_fallback(struct demod_state* d, int decim) {
+    const int n = d->result_len > 0 ? d->result_len : 0;
+    if (n == 0) {
+        d->result_len = 0;
         return;
     }
     int Fs = (d->rate_out > 0) ? d->rate_out : 48000;
@@ -1376,13 +2029,91 @@ full_demod_apply_post_audio_decimation(struct demod_state* d) {
         a = 1.0;
     }
     float alpha_f = clamp_float((float)a, 0.0f, 1.0f);
-    float y = (d->result_len > 0) ? d->result[0] : 0.0f;
-    for (int k = 0; k < d->result_len; k++) {
+    float y = d->post_fallback_lp_y;
+    if (!d->post_fallback_lp_valid) {
+        y = d->result[0];
+        d->post_fallback_lp_valid = 1;
+    }
+    for (int k = 0; k < n; k++) {
         float x = d->result[k];
         y += (x - y) * alpha_f;
         d->result[k] = y;
     }
-    d->result_len = low_pass_simple(d->result, d->result_len, decim);
+    d->post_fallback_lp_y = y;
+    d->result_len = boxcar_decimate_stream(d->result, n, decim, &d->post_fallback_box_acc, &d->post_fallback_box_phase);
+}
+
+/* The auto squelch's flags through the polyphase decimator, in place, before it runs (from its phase): each output
+   takes the flag of the input at or just before its filter's centre, K/2 samples back. */
+static void
+post_decim_map_flags_polyphase(struct demod_state* d, int in_len) {
+    if (!d->post_polydecim_enabled || !d->post_polydecim_taps || !d->post_polydecim_hist || in_len <= 0) {
+        return;
+    }
+    const int M = d->post_polydecim_M;
+    const int delay = d->post_polydecim_K / 2 < 31 ? d->post_polydecim_K / 2 : 31;
+    uint8_t* flags = d->result_flags;
+    int phase = d->post_polydecim_phase;
+    int head = d->post_flag_head;
+    int out_len = 0;
+    for (int n = 0; n < in_len; n++) {
+        d->post_flag_hist[head] = flags[n];
+        head = (head + 1) & 31;
+        if (++phase < M) {
+            continue;
+        }
+        phase -= M;
+        flags[out_len++] = d->post_flag_hist[(head + 31 - delay) & 31];
+    }
+    d->post_flag_head = head;
+}
+
+/* The same through the fallback, before it runs: each group's output takes the flag of the group's middle sample. */
+static void
+post_decim_map_flags_fallback(struct demod_state* d, int in_len, int decim) {
+    uint8_t* flags = d->result_flags;
+    int count = d->post_fallback_box_phase;
+    uint8_t mid = d->post_fallback_mid_flag;
+    int out_len = 0;
+    for (int n = 0; n < in_len; n++) {
+        if (count == (decim - 1) / 2) {
+            mid = flags[n];
+        }
+        if (++count < decim) {
+            continue;
+        }
+        flags[out_len++] = mid;
+        count = 0;
+    }
+    d->post_fallback_mid_flag = mid;
+}
+
+/* Decimate the audio by post_downsample, streaming on either path: the block publishes the outputs its samples
+   complete, 0 included (a block shorter than what the next output still needs makes none and its samples wait in the
+   decimator's state), so the output does not depend on where the blocks are cut. */
+static void
+full_demod_apply_post_audio_decimation(struct demod_state* d) {
+    if (d->cqpsk_enable || d->post_downsample <= 1) {
+        return;
+    }
+    const int decim = d->post_downsample;
+    audio_polydecim_ensure(d, decim);
+    post_decim_track_state_key(d, decim);
+    if (d->post_polydecim_enabled) {
+        if (d->result_flags_active) {
+            post_decim_map_flags_polyphase(d, d->result_len);
+        }
+        const int out_n = audio_polydecim_process(d, d->result, d->result_len, d->timing_buf);
+        if (out_n > 0) {
+            DSD_MEMCPY(d->result, d->timing_buf, (size_t)out_n * sizeof(float));
+        }
+        d->result_len = out_n > 0 ? out_n : 0;
+        return;
+    }
+    if (d->result_flags_active && d->result_len > 0) {
+        post_decim_map_flags_fallback(d, d->result_len, decim);
+    }
+    post_decim_run_fallback(d, decim);
 }
 
 static void
@@ -1423,6 +2154,10 @@ full_demod_apply_squelch_envelope(struct demod_state* d) {
 void
 full_demod(struct demod_state* d) {
     full_demod_apply_halfband_decimation(d);
+    channel_lpf_apply(d);
+    if (full_demod_front_end_empty(d)) {
+        return;
+    }
     full_demod_update_channel_state(d);
     if (full_demod_emit_zero_cqpsk_symbols(d)) {
         return;
@@ -1434,6 +2169,7 @@ full_demod(struct demod_state* d) {
         return;
     }
     full_demod_run_output_demod(d);
+    squelch_noise_run(d);
     if (d->mode_demod == &raw_demod) {
         return;
     }

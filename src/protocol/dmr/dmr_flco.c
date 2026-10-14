@@ -12,6 +12,7 @@
 
 #include <dsd-neo/core/bit_packing.h>
 #include <dsd-neo/core/key_presence.h>
+#include <dsd-neo/runtime/decode_clock.h>
 
 #include <dsd-neo/core/audio.h>
 #include <dsd-neo/core/call_state.h>
@@ -199,10 +200,12 @@ dmr_flco_detect_kenwood_sc(dmr_flco_ctx* ctx, int crc_ok) {
     }
 }
 
+// A verified Kirisun LC sets its slot's late-entry mode for the call (issue #657: never the user's opts->dmr_le).
 static void
 dmr_flco_detect_kirisun_le(dmr_flco_ctx* ctx, int crc_ok) {
     if (crc_ok && ctx->fid == 0x0A) {
-        ctx->opts->dmr_le = ((ctx->so & 0x40U) != 0U) ? 3 : 0;
+        dmr_le_vendor_set(ctx->state, ctx->slot_idx,
+                          ((ctx->so & 0x40U) != 0U) ? DMR_LE_VENDOR_KIRISUN_ENC : DMR_LE_VENDOR_KIRISUN_CLEAR);
     }
 }
 
@@ -264,11 +267,30 @@ dmr_flco_store_flco_and_normalize(dmr_flco_ctx* ctx) {
     }
 }
 
+// An embedded LC's only integrity check is its 5-bit checksum; clean FEC alone does not vouch for the payload. The
+// alias and GPS handlers below still claim their FLCOs (is_alias/is_gps) when the checksum fails, so the bytes are
+// never read as a voice LC, but they apply nothing: a failed fragment would otherwise put text or a position on a
+// call whose identity was checked, and mark the whole call failed with it. Alias and GPS repeat every superframe
+// cycle, so a checked copy follows. This holds under -F too, whose relaxation covers CSBK and data, not embedded LC.
+static int
+dmr_flco_embedded_checksum_ok(const dmr_flco_ctx* ctx, const char* what) {
+    if (ctx->CRCCorrect == 1U) {
+        return 1;
+    }
+    DSD_FPRINTF(stderr, " %s (checksum ERR; ignored)", what);
+    return 0;
+}
+
 static void
 dmr_flco_handle_alias_header(dmr_flco_ctx* ctx) {
     if (!ctx->protected_lc && (ctx->fid == 0 || ctx->fid == 0x68) && ctx->type == 3 && ctx->flco == 0x04) {
         ctx->is_alias = 1;
-        dmr_talker_alias_lc_header(ctx->opts, ctx->state, ctx->slot, ctx->lc_bits);
+        if (dmr_flco_embedded_checksum_ok(ctx, "Talker Alias Header")) {
+            dmr_talker_alias_lc_header(ctx->opts, ctx->state, ctx->slot, ctx->lc_bits);
+        } else {
+            // The header sets how every later block is read; a new one arrived and could not be trusted.
+            dmr_talker_alias_lc_invalidate(ctx->state, ctx->slot);
+        }
     }
 }
 
@@ -277,7 +299,12 @@ dmr_flco_handle_alias_blocks(dmr_flco_ctx* ctx) {
     if (!ctx->protected_lc && (ctx->fid == 0 || ctx->fid == 0x68) && ctx->type == 3 && ctx->flco > 0x04
         && ctx->flco < 0x08) {
         ctx->is_alias = 1;
-        dmr_talker_alias_lc_blocks(ctx->opts, ctx->state, ctx->slot, ctx->flco - 5, ctx->lc_bits);
+        if (dmr_flco_embedded_checksum_ok(ctx, "Talker Alias Block")) {
+            dmr_talker_alias_lc_blocks(ctx->opts, ctx->state, ctx->slot, ctx->flco - 5, ctx->lc_bits);
+        } else {
+            // A later block decodes everything before it, including this missing segment.
+            dmr_talker_alias_lc_invalidate(ctx->state, ctx->slot);
+        }
     }
 }
 
@@ -285,7 +312,9 @@ static void
 dmr_flco_handle_embedded_gps(dmr_flco_ctx* ctx) {
     if (!ctx->protected_lc && (ctx->fid == 0 || ctx->fid == 0x68) && ctx->type == 3 && ctx->flco == 0x08) {
         ctx->is_gps = 1;
-        dmr_embedded_gps(ctx->opts, ctx->state, ctx->lc_bits);
+        if (dmr_flco_embedded_checksum_ok(ctx, "Embedded GPS")) {
+            dmr_embedded_gps(ctx->opts, ctx->state, ctx->lc_bits);
+        }
     }
 }
 
@@ -495,7 +524,7 @@ dmr_flco_handle_irrecoverable_hytera_enhanced(dmr_flco_ctx* ctx) {
             ctx->state->payload_miR = mi;
         }
         dmr_enc_class_force(ctx->state, ctx->slot, 1);
-        ctx->opts->dmr_le = 2;
+        dmr_le_vendor_set(ctx->state, ctx->slot, DMR_LE_VENDOR_HYTERA_ENH);
         *ctx->IrrecoverableErrors = 0;
     } else {
         DSD_FPRINTF(stderr, "%s", KRED);
@@ -563,13 +592,7 @@ dmr_flco_reset_slot_crypto(dmr_flco_ctx* ctx, uint8_t idx) {
     *live.keyid = 0;
     *live.mi = 0;
     dmr_enc_class_reset(ctx->state, idx);
-    if (ctx->opts->floating_point == 1) {
-        if (idx == 0U) {
-            ctx->state->aout_gain = ctx->opts->audio_gain;
-        } else {
-            ctx->state->aout_gainR = ctx->opts->audio_gain;
-        }
-    }
+    dmr_le_vendor_reset(ctx->state, idx);
 }
 
 static void
@@ -714,7 +737,7 @@ dmr_flco_voice_boundary(const dmr_flco_ctx* ctx) {
         || current.media_active != 0U) {
         return DSD_CALL_BOUNDARY_BEGIN;
     }
-    if (dsd_time_now_monotonic_s() - current.started_m > DMR_FLCO_HEADER_REPEAT_WINDOW_S) {
+    if (dsd_decode_now_mono_s() - current.started_m > DMR_FLCO_HEADER_REPEAT_WINDOW_S) {
         return DSD_CALL_BOUNDARY_BEGIN;
     }
     return DSD_CALL_BOUNDARY_CONTINUE;
@@ -738,14 +761,36 @@ dmr_flco_publish_voice(dmr_flco_ctx* ctx) {
          * (handle_voice_sync() in dmr_trunk_sm.c), and dsd_call_state_observe()
          * leaves a previously observed channel alone when an observation omits
          * one, so saying nothing here is what preserves the SM's value.
+         *
+         * The LC carries no frequency either. The voice channel's stands in only
+         * while the receiver followed a grant to it: with trunking off every
+         * decoded grant writes trunk_vc_freq[] for display (dmr_csbk.c) while the
+         * receiver stays put, so there it names another channel, not the carrier
+         * this call is decoded on (issue #575).
          */
-        .frequency_hz = ctx->state->trunk_vc_freq[ctx->slot],
+        .frequency_hz = dsd_opts_trunk_vc_followed(ctx->opts) ? ctx->state->trunk_vc_freq[ctx->slot] : 0,
         .service_options = ctx->so,
         .emergency = (uint8_t)((ctx->so & 0x80U) != 0U),
         .priority = (uint8_t)(ctx->so & 0x03U),
         .has_service_metadata = 1U,
     };
-    (void)dsd_call_state_observe(ctx->state, &observation, dmr_flco_voice_boundary(ctx));
+    dsd_call_snapshot before;
+    const int was_active =
+        dsd_call_state_get(ctx->state, ctx->slot, &before) > 0 && before.phase == DSD_CALL_PHASE_ACTIVE;
+    const dsd_call_boundary boundary = dmr_flco_voice_boundary(ctx);
+    (void)dsd_call_state_observe(ctx->state, &observation, boundary);
+    // A new transmission replaced the slot's active call, whose terminator was missed, so the vendor late-entry mode
+    // was that call's (issue #657): a voice LC header after the call carried voice (or after the header repeat window),
+    // which dmr_flco_voice_boundary() reads as the next transmission even where it specializes an identity-less epoch
+    // (a Kirisun or Hytera Enhanced call whose own LCs publish no identity) instead of opening its own, or an LC naming
+    // another call, which forks the epoch. Header repeats and embedded LCs of the same call keep the mode, and so does
+    // evidence decoded before any call was active (a PI after a lost voice LC header).
+    dsd_call_snapshot after;
+    if (was_active
+        && (boundary == DSD_CALL_BOUNDARY_BEGIN
+            || (dsd_call_state_get(ctx->state, ctx->slot, &after) > 0 && after.epoch != before.epoch))) {
+        dmr_le_vendor_reset(ctx->state, ctx->slot);
+    }
     dmr_flco_publish_crypto(ctx);
     dsd_event_sync_slot(ctx->opts, ctx->state, ctx->slot);
 }
@@ -761,13 +806,15 @@ dmr_flco_publish_voice(dmr_flco_ctx* ctx) {
 // healed. The epoch tie plus the all-cleared gate mean a stale stash can never overwrite
 // fresher signaling or leak into a later call.
 static int
-dmr_flco_slot_crypto_is_clear(const dmr_flco_slot_crypto* live) {
-    return *live->fid == 0U && *live->so == 0U && *live->algid == 0 && *live->keyid == 0 && *live->mi == 0ULL;
+dmr_flco_slot_crypto_is_clear(const dsd_state* state, uint8_t idx, const dmr_flco_slot_crypto* live) {
+    return *live->fid == 0U && *live->so == 0U && *live->algid == 0 && *live->keyid == 0 && *live->mi == 0ULL
+           && state->dmr_le_vendor[idx] == DMR_LE_VENDOR_NONE;
 }
 
 // The stash holds only what the canonical snapshot cannot supply: the FID and service options
 // the Basic Privacy gates require, which the snapshot never carried, and the MI as the
-// superframe machinery last advanced it, which the snapshot's copy can lag. The ALGID and key id
+// superframe machinery last advanced it, which the snapshot's copy can lag, and the slot's vendor
+// late-entry mode (issue #657), which is call state the snapshot never carried. The ALGID and key id
 // are deliberately not duplicated here -- the heal reads them back from the `previous` snapshot
 // the canonical layer hands it, so there is one source of truth for them.
 static void
@@ -775,12 +822,13 @@ dmr_flco_stash_slot_crypto(dsd_state* state, uint8_t slot, uint64_t epoch) {
     const uint8_t idx = slot != 0U ? 1U : 0U;
     const dmr_flco_slot_crypto live = dmr_flco_slot_crypto_fields(state, idx);
     state->dmr_heal_valid[idx] = 0U;
-    if (dmr_flco_slot_crypto_is_clear(&live)) {
+    if (dmr_flco_slot_crypto_is_clear(state, idx, &live)) {
         return;
     }
     state->dmr_heal_fid[idx] = *live.fid;
     state->dmr_heal_so[idx] = *live.so;
     state->dmr_heal_mi[idx] = *live.mi;
+    state->dmr_heal_le_vendor[idx] = state->dmr_le_vendor[idx];
     state->dmr_heal_epoch[idx] = epoch;
     state->dmr_heal_valid[idx] = 1U;
 }
@@ -798,7 +846,7 @@ dmr_flco_heal_restore(dsd_state* state, uint8_t slot, const dsd_call_snapshot* p
     // Only into a slot whose live fields are entirely cleared -- the post-reset shape -- so
     // fresher signaling (a header that decoded between the reset and the heal) never loses.
     const dmr_flco_slot_crypto live = dmr_flco_slot_crypto_fields(state, idx);
-    if (!dmr_flco_slot_crypto_is_clear(&live)) {
+    if (!dmr_flco_slot_crypto_is_clear(state, idx, &live)) {
         return;
     }
     *live.fid = state->dmr_heal_fid[idx];
@@ -806,6 +854,7 @@ dmr_flco_heal_restore(dsd_state* state, uint8_t slot, const dsd_call_snapshot* p
     *live.algid = (int)previous->algid;
     *live.keyid = (int)previous->kid;
     *live.mi = state->dmr_heal_mi[idx];
+    state->dmr_le_vendor[idx] = state->dmr_heal_le_vendor[idx];
     // The stash held live, already-corroborated signaling; restoring it re-establishes the
     // classification so the resumed transmission is not re-proved from scratch.
     dmr_enc_class_force(state, idx, (*live.so & 0x40U) != 0U);
@@ -1012,14 +1061,9 @@ dmr_flco_slot_can_decrypt(const dmr_flco_ctx* ctx) {
 
 static void
 dmr_flco_emit_enc_lockout_event(dmr_flco_ctx* ctx) {
-    dsd_event_history_transaction transaction;
-    dsd_event_history_transaction_begin(ctx->state, &transaction);
-    DSD_SNPRINTF(ctx->state->event_history_s[ctx->slot].Event_History_Items[0].internal_str,
-                 sizeof(ctx->state->event_history_s[ctx->slot].Event_History_Items[0].internal_str),
-                 "Target: %d; has been locked out; Encryption Lock Out Enabled.", ctx->target);
-    dsd_event_history_mark_dirty(&ctx->state->event_history_s[ctx->slot]);
-    dsd_event_history_transaction_end(&transaction);
-    watchdog_event_current(ctx->opts, ctx->state, ctx->slot);
+    char note[128];
+    DSD_SNPRINTF(note, sizeof note, "Target: %d; has been locked out; Encryption Lock Out Enabled.", ctx->target);
+    dsd_event_note_current_call(ctx->opts, ctx->state, ctx->slot, note);
 }
 
 // Arm the ledger for a corroborated, undecryptable encrypted transmission and force the
@@ -1366,8 +1410,12 @@ dmr_flco_run(dmr_flco_ctx* ctx) {
         dmr_flco_print_regular_header(ctx);
         dmr_flco_print_call_class(ctx);
         const int is_private = dmr_flco_call_kind(ctx) == DSD_CALL_KIND_PRIVATE_VOICE;
-        dsd_trunk_scan_hook_dmr_conventional_activity(ctx->opts, ctx->state, ctx->target, ctx->source, is_private,
-                                                      (ctx->so & 0x40U) != 0U, 0);
+        // The scan hold takes only identity that cleared its check. CRCCorrect is also 1 for a RAS-accepted LC
+        // under -F; that exception is deliberate (trunk_scan_hooks.h), so a scanned RAS repeater still holds.
+        if (ctx->CRCCorrect == 1U) {
+            dsd_trunk_scan_hook_dmr_conventional_activity(ctx->opts, ctx->state, ctx->target, ctx->source, is_private,
+                                                          (ctx->so & 0x40U) != 0U, 0);
+        }
         dmr_flco_print_emergency_flag(ctx);
         if (ctx->type != 2U && ctx->CRCCorrect == 1U) {
             dmr_flco_publish_voice(ctx);
@@ -1486,7 +1534,7 @@ dmr_cach_handle_single_fragment(dsd_state* state, uint8_t cach_bits[25], uint8_t
     }
 
     int slot = state->currentslot;
-    time_t now = time(NULL);
+    time_t now = dsd_decode_time();
     if (state->slco_sfrag_last[slot] != 0 && (now - state->slco_sfrag_last[slot]) < 1) {
         return err;
     }
@@ -1843,7 +1891,7 @@ dmr_slco_handle_con_plus_control(dsd_opts* opts, dsd_state* state, const dmr_slc
     DSD_SNPRINTF(state->dmr_site_parms, sizeof(state->dmr_site_parms), "%d-%d ", data->con_netid, data->con_siteid);
 
     dmr_sm_note_cc_activity(opts, state, 0);
-    if ((time(NULL) - state->last_vc_sync_time) > 2) {
+    if ((dsd_decode_time() - state->last_vc_sync_time) > 2) {
         rotate_symbol_out_file(opts, state);
     }
 }

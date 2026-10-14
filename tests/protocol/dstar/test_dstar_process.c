@@ -10,11 +10,14 @@
 #include <dsd-neo/core/audio.h>
 #include <dsd-neo/core/dibit.h>
 #include <dsd-neo/core/events.h>
+#include <dsd-neo/core/file_io.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/safe_api.h>
 #include <dsd-neo/core/state.h>
+#include <dsd-neo/core/synctype_ids.h>
 #include <dsd-neo/core/vocoder.h>
 #include <dsd-neo/protocol/dstar/dstar.h>
+#include <dsd-neo/protocol/dstar/dstar_const.h>
 #include <dsd-neo/protocol/dstar/dstar_header.h>
 #include <dsd-neo/protocol/dstar/dstar_header_utils.h>
 #include <dsd-neo/runtime/telemetry.h>
@@ -26,10 +29,15 @@ enum {
     DSTAR_VOICE_DIBITS_PER_FRAME = 72,
     DSTAR_SLOW_DATA_FRAMES = 20,
     DSTAR_SLOW_DATA_DIBITS_PER_FRAME = 24,
+    DSTAR_FRAME_DIBITS = DSTAR_VOICE_DIBITS_PER_FRAME + DSTAR_SLOW_DATA_DIBITS_PER_FRAME,
     DSTAR_EXPECTED_VOICE_DIBITS = DSTAR_VOICE_FRAMES * DSTAR_VOICE_DIBITS_PER_FRAME,
     DSTAR_EXPECTED_SLOW_DIBITS = DSTAR_SLOW_DATA_FRAMES * DSTAR_SLOW_DATA_DIBITS_PER_FRAME,
 };
 
+/* Both readers share one symbol stream, so the position of each read shows its order. A read at position `pos`
+ * returns dibit `pos & 3`, and the soft reader also hands out the symbol (pos + 1) / 4, from which the reliability
+ * stub below recovers `pos` and reports expected_reliability(pos). */
+static int stream_pos;
 static int dibit_calls;
 static int soft_symbol_calls;
 static int mbe_frame_calls;
@@ -44,11 +52,28 @@ static int header_decode_soft_calls;
 /* What the stubbed header CRC reports; processDSTAR_HD() must hand it straight back. */
 static int header_decode_soft_result = 1;
 static uint8_t captured_slow_data[DSTAR_EXPECTED_SLOW_DIBITS];
-static char captured_ambe_frame[4][24];
+static dsd_vocoder_soft_bit captured_ambe_frames[DSTAR_VOICE_FRAMES][4][24];
 static float captured_soft_symbols[DSD_DSTAR_HEADER_CODED_BITS];
+/* The stream position whose read adopts a retune its capture recorded, where the carrier boundary moves the carrier
+   count (dsd_engine_carrier_boundary(), issue #575); -1 for none. */
+static int boundary_at = -1;
+
+static void
+note_read(dsd_state* state) {
+    if (stream_pos == boundary_at && state != NULL) {
+        state->carrier_seq++;
+    }
+}
+
+/* Never 0, so a cell the reader left untouched ({0, 0}) cannot pass for one it filled. */
+static uint8_t
+expected_reliability(int pos) {
+    return (uint8_t)(1 + ((pos * 37) % 254));
+}
 
 static void
 reset_counters(void) {
+    stream_pos = 0;
     dibit_calls = 0;
     soft_symbol_calls = 0;
     mbe_frame_calls = 0;
@@ -59,17 +84,20 @@ reset_counters(void) {
     watchdog_history_calls = 0;
     watchdog_current_calls = 0;
     header_decode_soft_calls = 0;
+    boundary_at = -1;
     DSD_MEMSET(captured_slow_data, 0, sizeof(captured_slow_data));
-    DSD_MEMSET(captured_ambe_frame, 0, sizeof(captured_ambe_frame));
+    DSD_MEMSET(captured_ambe_frames, 0, sizeof(captured_ambe_frames));
     DSD_MEMSET(captured_soft_symbols, 0, sizeof(captured_soft_symbols));
 }
 
+/* Only the slow data is read hard (issue #599). */
 int
 get_dibit_and_analog_signal(dsd_opts* opts, dsd_state* state, int* out_analog_signal) {
     (void)opts;
-    (void)state;
     (void)out_analog_signal;
-    int value = dibit_calls & 3;
+    note_read(state);
+    int value = stream_pos & 3;
+    stream_pos++;
     dibit_calls++;
     return value;
 }
@@ -77,24 +105,51 @@ get_dibit_and_analog_signal(dsd_opts* opts, dsd_state* state, int* out_analog_si
 int
 getDibitAndSoftSymbol(dsd_opts* opts, dsd_state* state, float* out_soft_symbol) {
     (void)opts;
-    (void)state;
+    note_read(state);
     assert(out_soft_symbol != NULL);
-    *out_soft_symbol = (float)(soft_symbol_calls + 1) * 0.25F;
+    *out_soft_symbol = (float)(stream_pos + 1) * 0.25F;
+    int value = stream_pos & 3;
+    stream_pos++;
     soft_symbol_calls++;
-    return soft_symbol_calls & 3;
+    return value;
 }
 
+uint8_t
+dsd_two_level_symbol_reliability(const dsd_opts* opts, const dsd_state* state, float symbol) {
+    assert(opts != NULL);
+    assert(state != NULL);
+    return expected_reliability((int)(symbol * 4.0F) - 1);
+}
+
+/* The soft path is D-STAR voice's only way into the vocoder: no processMbeFrame stub exists, so a hard call fails to
+ * link. */
 void
-processMbeFrame(dsd_opts* opts, dsd_state* state, char imbe_fr[8][23], char ambe_fr[4][24], char imbe7100_fr[7][24]) {
+processMbeFrameSoft(dsd_opts* opts, dsd_state* state, dsd_voice_protocol protocol, dsd_vocoder_soft_bit imbe_fr[8][23],
+                    dsd_vocoder_soft_bit ambe_fr[4][24], dsd_vocoder_soft_bit imbe7100_fr[7][24]) {
+    assert(protocol == DSD_VOICE_PROTOCOL_DSTAR);
     (void)opts;
     (void)state;
     assert(imbe_fr == NULL);
     assert(ambe_fr != NULL);
     assert(imbe7100_fr == NULL);
-    if (mbe_frame_calls == 0) {
-        DSD_MEMCPY(captured_ambe_frame, ambe_fr, sizeof(captured_ambe_frame));
-    }
+    assert(mbe_frame_calls < DSTAR_VOICE_FRAMES);
+    DSD_MEMCPY(captured_ambe_frames[mbe_frame_calls], ambe_fr, sizeof(captured_ambe_frames[0]));
     mbe_frame_calls++;
+}
+
+/* A verified header ends the capture of the transmission before it (issue #661). */
+static int capture_close_calls;
+static int capture_close_voice_frames_before = -1;
+static int capture_close_synctype = -1;
+
+void
+dsd_mbe_out_close_protocol(dsd_opts* opts, dsd_state* state, int slot_mask, int synctype) {
+    (void)opts;
+    (void)state;
+    assert(slot_mask == DSD_MBE_OUT_SLOT1);
+    capture_close_calls++;
+    capture_close_voice_frames_before = mbe_frame_calls;
+    capture_close_synctype = synctype;
 }
 
 void
@@ -106,20 +161,6 @@ playSynthesizedVoiceMS(dsd_opts* opts, dsd_state* state) {
 
 void
 playSynthesizedVoiceSS(dsd_opts* opts, dsd_state* state) {
-    (void)opts;
-    (void)state;
-    voice_play_calls++;
-}
-
-void
-playSynthesizedVoiceFM(dsd_opts* opts, dsd_state* state) {
-    (void)opts;
-    (void)state;
-    voice_play_calls++;
-}
-
-void
-playSynthesizedVoiceFS(dsd_opts* opts, dsd_state* state) {
     (void)opts;
     (void)state;
     voice_play_calls++;
@@ -165,8 +206,9 @@ dstar_header_decode_soft(struct dsd_state* state, const float soft_symbols[DSD_D
 }
 
 static void
-assert_voice_loop_counts(int expected_ui_calls) {
-    assert(dibit_calls == DSTAR_EXPECTED_VOICE_DIBITS + DSTAR_EXPECTED_SLOW_DIBITS);
+assert_voice_loop_counts(int header_symbols, int expected_ui_calls) {
+    assert(soft_symbol_calls == header_symbols + DSTAR_EXPECTED_VOICE_DIBITS);
+    assert(dibit_calls == DSTAR_EXPECTED_SLOW_DIBITS);
     assert(mbe_frame_calls == DSTAR_VOICE_FRAMES);
     assert(voice_play_calls == DSTAR_VOICE_FRAMES);
     assert(slow_data_calls == 1);
@@ -175,19 +217,36 @@ assert_voice_loop_counts(int expected_ui_calls) {
     assert(watchdog_current_calls == DSTAR_VOICE_FRAMES);
 }
 
+/* Every voice frame's 72 symbols land on the interleave schedule, each cell with its symbol's dibit folded to one bit
+ * (dibits 2 and 3 exercise the fold) and the reliability reported for that symbol. The 24 cells the schedule never
+ * reaches stay {0, 0}. `start` is the stream position of the first voice symbol: 0, or the header's length. */
 static void
-assert_first_ambe_frame_is_interleaved_lsb_stream(void) {
-    assert(captured_ambe_frame[0][10] == 0);
-    assert(captured_ambe_frame[0][22] == 1);
-    assert(captured_ambe_frame[3][11] == 0);
-    assert(captured_ambe_frame[2][9] == 1);
+assert_ambe_frames_follow_interleave(int start) {
+    for (int frame = 0; frame < DSTAR_VOICE_FRAMES; frame++) {
+        dsd_vocoder_soft_bit expected[4][24];
+        DSD_MEMSET(expected, 0, sizeof(expected));
+        for (int i = 0; i < DSTAR_VOICE_DIBITS_PER_FRAME; i++) {
+            const int pos = start + (frame * DSTAR_FRAME_DIBITS) + i;
+            expected[dstar_interleave_w[i]][dstar_interleave_x[i]].bit = (uint8_t)(pos & 1);
+            expected[dstar_interleave_w[i]][dstar_interleave_x[i]].reliability = expected_reliability(pos);
+        }
+        for (int row = 0; row < 4; row++) {
+            for (int col = 0; col < 24; col++) {
+                assert(captured_ambe_frames[frame][row][col].bit == expected[row][col].bit);
+                assert(captured_ambe_frames[frame][row][col].reliability == expected[row][col].reliability);
+            }
+        }
+    }
 }
 
+/* Each voice frame but the last is followed by 24 hard slow-data symbols. */
 static void
-assert_slow_data_starts_after_first_voice_frame(void) {
-    for (int i = 0; i < DSTAR_SLOW_DATA_DIBITS_PER_FRAME; i++) {
-        int expected = (DSTAR_VOICE_DIBITS_PER_FRAME + i) & 3;
-        assert(captured_slow_data[i] == (uint8_t)expected);
+assert_slow_data_follows_each_voice_frame(int start) {
+    for (int frame = 0; frame < DSTAR_SLOW_DATA_FRAMES; frame++) {
+        for (int i = 0; i < DSTAR_SLOW_DATA_DIBITS_PER_FRAME; i++) {
+            const int pos = start + (frame * DSTAR_FRAME_DIBITS) + DSTAR_VOICE_DIBITS_PER_FRAME + i;
+            assert(captured_slow_data[(frame * DSTAR_SLOW_DATA_DIBITS_PER_FRAME) + i] == (uint8_t)(pos & 3));
+        }
     }
 }
 
@@ -205,11 +264,10 @@ test_voice_process_without_telemetry(void) {
      * evidence, and weak evidence has to repeat (#421). */
     assert(processDSTAR(&opts, &state) == 0);
 
-    assert_voice_loop_counts(0);
-    assert(soft_symbol_calls == 0);
+    assert_voice_loop_counts(0, 0);
     assert(header_decode_soft_calls == 0);
-    assert_first_ambe_frame_is_interleaved_lsb_stream();
-    assert_slow_data_starts_after_first_voice_frame();
+    assert_ambe_frames_follow_interleave(0);
+    assert_slow_data_follows_each_voice_frame(0);
 }
 
 static void
@@ -225,8 +283,7 @@ test_voice_process_with_telemetry_attached(void) {
 
     processDSTAR(&opts, &state);
 
-    assert_voice_loop_counts(DSTAR_VOICE_FRAMES);
-    assert(soft_symbol_calls == 0);
+    assert_voice_loop_counts(0, DSTAR_VOICE_FRAMES);
     assert(header_decode_soft_calls == 0);
 }
 
@@ -243,11 +300,12 @@ test_header_process_captures_header_then_voice(void) {
     header_decode_soft_result = 1;
     assert(processDSTAR_HD(&opts, &state) == 1);
 
-    assert(soft_symbol_calls == DSD_DSTAR_HEADER_CODED_BITS);
     assert(header_decode_soft_calls == 1);
     assert(captured_soft_symbols[0] == 0.25F);
     assert(captured_soft_symbols[DSD_DSTAR_HEADER_CODED_BITS - 1] == 165.0F);
-    assert_voice_loop_counts(0);
+    assert_voice_loop_counts(DSD_DSTAR_HEADER_CODED_BITS, 0);
+    assert_ambe_frames_follow_interleave(DSD_DSTAR_HEADER_CODED_BITS);
+    assert_slow_data_follows_each_voice_frame(DSD_DSTAR_HEADER_CODED_BITS);
 }
 
 /* #391: the header CRC is the only verdict the D-STAR data path has, and processDSTAR_HD()
@@ -268,7 +326,7 @@ test_header_process_reports_the_header_crc_verdict(void) {
 
     assert(header_decode_soft_calls == 1);
     /* The voice frame is consumed regardless: that is the point of reporting the failure. */
-    assert_voice_loop_counts(0);
+    assert_voice_loop_counts(DSD_DSTAR_HEADER_CODED_BITS, 0);
     header_decode_soft_result = 1;
 }
 
@@ -316,9 +374,16 @@ test_passing_header_confirms_the_voice_frame_behind_it(void) {
     opts.pulse_digi_out_channels = 1;
     reset_counters();
 
+    capture_close_calls = 0;
+    capture_close_voice_frames_before = -1;
+    state.synctype = DSD_SYNC_DSTAR_HD_NEG;
     header_decode_soft_result = 1;
     assert(processDSTAR_HD(&opts, &state) == 1);
     assert(state.dstar_confirmed == 1);
+    /* It also ends the capture before any voice frame of its own superframe is written (issue #661). */
+    assert(capture_close_calls == 1);
+    assert(capture_close_voice_frames_before == 0);
+    assert(DSD_SYNC_IS_DSTAR(capture_close_synctype));
 }
 
 /* A failed header leaves the transmission unproved: the superframe it consumed anyway is
@@ -333,11 +398,46 @@ test_failed_header_leaves_the_transmission_pending(void) {
     opts.pulse_digi_out_channels = 1;
     reset_counters();
 
+    capture_close_calls = 0;
     header_decode_soft_result = 0;
     assert(processDSTAR_HD(&opts, &state) == 0);
     assert(state.dstar_confirmed == 0);
     assert(state.dstar_confirm_weak_streak == 1);
+    /* A header that fails its CRC bounds nothing: the capture goes on. */
+    assert(capture_close_calls == 0);
     header_decode_soft_result = 1;
+}
+
+/* Issue #575: the carrier boundary moved the carrier count while the superframe was read (a replay read adopting a
+   recorded retune). Its slow data decodes only after the twenty-first voice frame, so a header, text or position
+   message read whole before the move would publish the carrier left's station after the boundary ended its call: the
+   superframe is dropped from the voice frame read across or after the move, slow data and all, as on a sync loss. */
+static void
+test_voice_superframe_split_by_a_carrier_boundary_is_dropped(void) {
+    static const int boundaries[3] = {
+        (10 * DSTAR_FRAME_DIBITS) + 30,                                /* inside the eleventh voice frame */
+        (19 * DSTAR_FRAME_DIBITS) + DSTAR_VOICE_DIBITS_PER_FRAME + 10, /* inside the last slow data */
+        (20 * DSTAR_FRAME_DIBITS) + 5,                                 /* inside the last voice frame */
+    };
+    static const int voice_frames_before[3] = {10, 20, 20};
+    for (int b = 0; b < 3; b++) {
+        static dsd_opts opts;
+        static dsd_state state;
+        DSD_MEMSET(&opts, 0, sizeof(opts));
+        DSD_MEMSET(&state, 0, sizeof(state));
+        opts.floating_point = 1;
+        opts.pulse_digi_out_channels = 1;
+        reset_counters();
+        boundary_at = boundaries[b];
+
+        (void)processDSTAR(&opts, &state);
+
+        assert(state.carrier_seq == 1U);
+        assert(slow_data_calls == 0);
+        assert(mbe_frame_calls == voice_frames_before[b]);
+        assert(voice_play_calls == voice_frames_before[b]);
+        assert(soft_symbol_calls == (voice_frames_before[b] + 1) * DSTAR_VOICE_DIBITS_PER_FRAME);
+    }
 }
 
 int
@@ -349,6 +449,7 @@ main(void) {
     test_voice_process_confirms_on_the_second_superframe();
     test_passing_header_confirms_the_voice_frame_behind_it();
     test_failed_header_leaves_the_transmission_pending();
+    test_voice_superframe_split_by_a_carrier_boundary_is_dropped();
     printf("DSTAR_PROCESS: OK\n");
     return 0;
 }

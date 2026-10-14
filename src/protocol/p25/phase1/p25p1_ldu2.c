@@ -25,7 +25,6 @@
 #include <dsd-neo/core/audio.h>
 #include <dsd-neo/core/call_state.h>
 #include <dsd-neo/core/dibit.h>
-#include <dsd-neo/core/dsd_time.h>
 #include <dsd-neo/core/events.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/parse.h>
@@ -42,6 +41,7 @@
 #include <dsd-neo/protocol/p25/p25p1_ldu.h>
 #include <dsd-neo/protocol/p25/p25p1_soft.h>
 #include <dsd-neo/runtime/colors.h>
+#include <dsd-neo/runtime/decode_clock.h>
 #include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -107,21 +107,21 @@ typedef struct {
 
 static void
 ldu2_refresh_hold_hysteresis(const dsd_opts* opts, dsd_state* state) {
-    time_t now = time(NULL);
+    time_t now = dsd_decode_time();
     double hold_hyst = opts->trunk_hangtime * 0.75;
     if (hold_hyst < 0.75) {
         hold_hyst = 0.75;
     }
     if (state->last_vc_sync_time != 0 && (double)(now - state->last_vc_sync_time) <= hold_hyst) {
         state->last_vc_sync_time = now;
-        state->last_vc_sync_time_m = dsd_time_now_monotonic_s();
+        state->last_vc_sync_time_m = dsd_decode_now_mono_s();
     }
 }
 
 static void
 ldu2_process_imbe_frame(dsd_opts* opts, dsd_state* state, int* status_count, int emit_active) {
-    process_IMBE(opts, state, status_count);
-    if (p25_crypto_audio_permitted(opts, state, 0)) {
+    // A frame the vocoder never synthesized (a skipped non-standard c0) mixes nothing in any output (issue #654).
+    if (process_IMBE(opts, state, status_count) && p25_crypto_audio_permitted(opts, state, 0)) {
         dsd_play_synthesized_voice(opts, state);
     }
     if (emit_active != 0) {
@@ -275,8 +275,8 @@ ldu2_run_fec(dsd_state* state, char hex_data[16][6], char hex_parity[8][6],
     }
 
     state->p25_p1_voice_fec_ok++;
-    state->last_vc_sync_time = time(NULL);
-    state->last_vc_sync_time_m = dsd_time_now_monotonic_s();
+    state->last_vc_sync_time = dsd_decode_time();
+    state->last_vc_sync_time_m = dsd_decode_now_mono_s();
 
     return 0;
 }
@@ -493,8 +493,18 @@ processLDU2(dsd_opts* opts, dsd_state* state) {
     state->currentslot = 0;
 
     Ldu2Frame frame = {0};
+    const uint32_t carrier_seq = state->carrier_seq;
     ldu2_collect_voice_symbols(opts, state, &frame);
     ldu2_consume_trailing_status(opts, state);
+    if (state->carrier_seq != carrier_seq) {
+        /* The carrier boundary moved the carrier count while the LDU was read (issue #575). The encryption sync is
+           read whole by the seventh voice frame but decodes only now, so it would publish the carrier left's
+           algorithm, key and MI after the boundary ended that call: the encryption sync and low-speed data are
+           dropped, as on a sync loss, and the MI is not advanced for a superframe that will not follow. */
+        state->xl_is_hdu = 0;
+        DSD_FPRINTF(stderr, "\n");
+        return;
+    }
     frame.irrecoverable_errors = ldu2_run_fec(state, frame.hex_data, frame.hex_parity, frame.soft_dibits);
 
     ldu2_decode_post_fec_fields(state, &frame);

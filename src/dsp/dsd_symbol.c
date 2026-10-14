@@ -20,13 +20,15 @@
  */
 
 #include <dsd-neo/core/audio.h>
-#include <dsd-neo/core/audio_filters.h>
-#include <dsd-neo/core/dsd_time.h>
+#include <dsd-neo/core/audio_activity.h>
+#include <dsd-neo/core/audio_sink.h>
 #include <dsd-neo/core/input_level.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/state.h>
 #include <dsd-neo/core/synctype_ids.h>
+#include <dsd-neo/dsp/analog_audio.h>
 #include <dsd-neo/dsp/analog_rx.h>
+#include <dsd-neo/dsp/analog_sink.h>
 #include <dsd-neo/dsp/frame_sync.h>
 #include <dsd-neo/dsp/sps_filters.h>
 #include <dsd-neo/dsp/symbol.h>
@@ -36,11 +38,17 @@
 #include <dsd-neo/platform/audio.h>
 #include <dsd-neo/platform/file_compat.h>
 #include <dsd-neo/platform/timing.h>
+#include <dsd-neo/runtime/analog_tones.h>
 #include <dsd-neo/runtime/config.h>
+#include <dsd-neo/runtime/control_pump.h>
+#include <dsd-neo/runtime/decode_clock.h>
 #include <dsd-neo/runtime/exitflag.h>
+#include <dsd-neo/runtime/frame_sync_hooks.h>
 #include <dsd-neo/runtime/log.h>
 #include <dsd-neo/runtime/net_audio_input_hooks.h>
 #include <dsd-neo/runtime/shutdown.h>
+#include <dsd-neo/runtime/squelch.h>
+#include <dsd-neo/runtime/trunk_tuning_hooks.h>
 #include <dsd-neo/runtime/udp_audio_hooks.h>
 #include <fcntl.h>
 #include <math.h>
@@ -48,7 +56,6 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
-#include <time.h>
 #include "dsd-neo/core/dibit.h"
 #include "dsd-neo/core/opts_fwd.h"
 #include "dsd-neo/core/safe_api.h"
@@ -65,8 +72,6 @@
 #ifdef DSD_NEO_TEST_HOOKS
 #include "symbol_test_support.h"
 #endif
-
-extern dsd_socket_t Connect(char* hostname, int portno);
 
 #ifdef DSD_NEO_TEST_HOOKS
 // Test-hook entry points are intentionally externally visible to focused fixtures.
@@ -151,6 +156,24 @@ probe_symbol_replay_format(dsd_opts* opts, dsd_state* state) {
     return 0;
 }
 
+/*
+ * A float read from a symbol file is external data, so the reader checks it on the bits it read, before they become a
+ * float: the global fast-math option folds isfinite() and x != x to constants. A symbol enters only when its magnitude
+ * after the reader's scaling is below 2^31, so it is finite and every integer conversion of it downstream is defined
+ * ((int)lrintf(symbol) in get_dibit_and_analog_signal(); lrintf()'s long is 32 bits on Windows). Real symbols sit
+ * orders of magnitude below either bound, so only an Inf, a NaN or an absurdly large value fails.
+ */
+#define SYMBOL_FILE_MAGNITUDE_MASK  0x7FFFFFFFu
+/* A soft record holds the decoder's own symbol: below 2^31. */
+#define SYMBOL_FILE_SOFT_LIMIT_BITS 0x4F000000u
+/* A float symbol file is scaled by 10000 on the way in: below 2^17, as 2^17 * 10000 is below 2^31. */
+#define SYMBOL_FILE_FLT_LIMIT_BITS  0x48000000u
+
+static int
+symbol_file_bits_in_range(uint32_t bits, uint32_t limit_bits) {
+    return (bits & SYMBOL_FILE_MAGNITUDE_MASK) < limit_bits;
+}
+
 static int
 read_soft_symbol_record(dsd_opts* opts, dsd_state* state, float* symbol_out) {
     unsigned char record[DSD_SYMBOL_CAPTURE_SOFT_RECORD_SIZE];
@@ -166,7 +189,16 @@ read_soft_symbol_record(dsd_opts* opts, dsd_state* state, float* symbol_out) {
     state->symbol_replay_soft.llr[0] = read_le_i16(record + 2);
     state->symbol_replay_soft.llr[1] = read_le_i16(record + 4);
     uint32_t raw_symbol = read_le_u32(record + 6);
-    DSD_MEMCPY(symbol_out, &raw_symbol, sizeof(raw_symbol));
+    if (symbol_file_bits_in_range(raw_symbol, SYMBOL_FILE_SOFT_LIMIT_BITS)) {
+        DSD_MEMCPY(symbol_out, &raw_symbol, sizeof(raw_symbol));
+        state->symbol_replay_symbol_unusable = 0;
+    } else {
+        /* The record's dibit and soft metrics still decide it. The amplitude carries no information: it enters as 0,
+           and is marked so that two-level reliability gives the bit no confidence, as 0 alone does only when the
+           thresholds centre on it. */
+        *symbol_out = 0.0f;
+        state->symbol_replay_symbol_unusable = 1;
+    }
     state->symbol_replay_soft_symbol = *symbol_out;
     state->symbol_replay_has_soft = 1;
     state->symbol_replay_soft_records++;
@@ -242,6 +274,8 @@ clamp_symbol_center_to_margin(int* center, int samples_per_symbol) {
 
 typedef struct {
     float sample;
+    /* The sample's auto squelch flag (DSD_SQUELCH_FLAG_CLOSED; 0 open), as the RTL stream read it with the sample. */
+    uint8_t sample_flag;
     float sum;
     int count;
     int symbol_span;
@@ -259,6 +293,9 @@ typedef struct {
        from the input: it is already recorded there and already captured. */
     int sample_replayed;
     unsigned int analog_out_cap;
+    /* A frame-sync hunt read (getSymbol() without sync): only it may leave a silent input's wait for a queued command,
+       or for the input that ended (issue #634). Frame decoding reads on. */
+    int hunting;
 #ifdef USE_RADIO
     int rtl_output_kind;
     int rtl_direct_output;
@@ -272,9 +309,25 @@ typedef struct {
     int rtl_symbol_rate_hz;
     int rtl_symbol_levels;
     uint32_t rtl_stream_generation;
+    /* The stream generation the sample in hand came off, read with it (issue #633): the analog block's rate check
+       needs it per sample, since the generation above is refreshed once a symbol. */
+    uint32_t rtl_sample_generation;
     int cqpsk_symbol_rate;
+    /* On the monitor output, the monitor the front end publishes it runs: an analog kind (dsd_analog_demod), or
+       SYMBOL_MONITOR_OFF_PROFILE or SYMBOL_MONITOR_UNKNOWN (symbol_refresh_rtl_profile()). */
+    int rtl_monitor_kind;
 #endif
 } symbol_work_ctx;
+
+#ifdef USE_RADIO
+/* What symbol_work_ctx::rtl_monitor_kind holds when the front end publishes no analog kind. */
+enum {
+    /* Nothing published tells: a direct output, a front end off the analog family, or no front-end hooks at all. */
+    SYMBOL_MONITOR_UNKNOWN = -1,
+    /* The analog family on a profile other than its monitor: a typed digital scan row's channel. */
+    SYMBOL_MONITOR_OFF_PROFILE = -2,
+};
+#endif
 
 static inline void
 symbol_work_ctx_init(symbol_work_ctx* work, const dsd_state* state) {
@@ -286,6 +339,8 @@ symbol_work_ctx_init(symbol_work_ctx* work, const dsd_state* state) {
     work->timing_level = dsd_symbol_timing_debug_level();
 #ifdef USE_RADIO
     work->rtl_symbol_levels = 4;
+    /* Not 0, which is DSD_ANALOG_DEMOD_FM: only an RTL input's refresh classifies the monitor output. */
+    work->rtl_monitor_kind = SYMBOL_MONITOR_UNKNOWN;
 #endif
     if (!state) {
         return;
@@ -747,6 +802,11 @@ maybe_auto_center(const dsd_opts* opts, dsd_state* state, int have_sync) {
 #endif
 
 #ifdef USE_RADIO
+/* The rate the symbol timing is in as far as the RTL output rescale knows: the output rate it last rescaled to, or
+   the rate an input switch to the radio found it in (dsd_symbol_note_timing_rate()). 0 before either, when the timing
+   is taken to be in 48 kHz units. Decoder thread only. */
+static unsigned int g_rtl_timing_rate_hz = 0U;
+
 /*
  * When using the RTL pipeline without resampling to 48 kHz, adjust
  * samplesPerSymbol and symbolCenter proportional to the current output rate
@@ -757,18 +817,26 @@ maybe_adjust_sps_for_output_rate(const dsd_opts* opts, dsd_state* state) {
     if (opts->audio_in_type != AUDIO_IN_RTL) {
         return; /* only for RTL input */
     }
-    static unsigned int last_rate = 0;
     unsigned int Fs = 0;
     if (state->rtl_ctx) {
         Fs = dsd_rtl_stream_metrics_hook_output_rate_hz();
     }
-    if (Fs == 0 || Fs == last_rate) {
+    if (Fs == 0 || Fs == g_rtl_timing_rate_hz) {
         return;
     }
-    dsd_audio_rescale_symbol_timing(state, last_rate != 0 ? (int)last_rate : 48000, (int)Fs);
-    last_rate = Fs;
+    dsd_audio_rescale_symbol_timing(state, g_rtl_timing_rate_hz != 0 ? (int)g_rtl_timing_rate_hz : 48000, (int)Fs);
+    g_rtl_timing_rate_hz = Fs;
 }
 #endif
+
+void
+dsd_symbol_note_timing_rate(int rate_hz) {
+#ifdef USE_RADIO
+    g_rtl_timing_rate_hz = rate_hz > 0 ? (unsigned int)rate_hz : 0U;
+#else
+    (void)rate_hz;
+#endif
+}
 
 #ifdef USE_RADIO
 enum {
@@ -779,7 +847,11 @@ enum {
 enum {
     RTL_SYMBOL_CACHE_EMPTY = 0,
     RTL_SYMBOL_CACHE_READY = 1,
+    /* The cache dropped what it held: the stream or its profile changed under it. */
     RTL_SYMBOL_CACHE_RETRY = 2,
+    /* The cache holds an I/Q replay's first batch after a change, labelled with what it ran on, which the caller's
+       work context has yet to follow (rtl_symbol_cache_fill_replay_batch()). */
+    RTL_SYMBOL_CACHE_REFRESH = 3,
 };
 
 static inline int
@@ -798,6 +870,21 @@ rtl_fsk_discriminator_output_active(int output_kind) {
     return output_kind == RTL_STREAM_OUTPUT_FSK_DISCRIMINATOR_LOCAL;
 }
 
+/* The profile labels the symbol cache compares, from what the front end publishes: a direct output's channel profile,
+   symbol rate and levels (2, or 4 for anything else), and none for the monitor output. */
+static inline void
+rtl_symbol_profile_labels(int direct, int* channel_profile, int* symbol_rate_hz, int* levels) {
+    if (!direct) {
+        *channel_profile = 0;
+        *symbol_rate_hz = 0;
+        *levels = 4;
+        return;
+    }
+    if (*levels != 2) {
+        *levels = 4;
+    }
+}
+
 static inline int
 rtl_symbol_current_profile(int* output_kind, int* channel_profile, int* symbol_rate_hz, int* levels,
                            uint32_t* generation) {
@@ -808,27 +895,15 @@ rtl_symbol_current_profile(int* output_kind, int* channel_profile, int* symbol_r
     if (generation) {
         *generation = dsd_rtl_stream_metrics_hook_stream_generation();
     }
-    if (!rtl_direct_output_active(current_output_kind)) {
-        if (channel_profile) {
-            *channel_profile = 0;
-        }
-        if (symbol_rate_hz) {
-            *symbol_rate_hz = 0;
-        }
-        if (levels) {
-            *levels = 4;
-        }
-        return 0;
-    }
-
+    const int direct = rtl_direct_output_active(current_output_kind);
     int current_symbol_rate_hz = 0;
     int current_levels = 4;
     int current_channel_profile = 0;
-    (void)dsd_rtl_stream_metrics_hook_symbol_profile(&current_symbol_rate_hz, &current_levels,
-                                                     &current_channel_profile);
-    if (current_levels != 2) {
-        current_levels = 4;
+    if (direct) {
+        (void)dsd_rtl_stream_metrics_hook_symbol_profile(&current_symbol_rate_hz, &current_levels,
+                                                         &current_channel_profile);
     }
+    rtl_symbol_profile_labels(direct, &current_channel_profile, &current_symbol_rate_hz, &current_levels);
     if (channel_profile) {
         *channel_profile = current_channel_profile;
     }
@@ -838,7 +913,7 @@ rtl_symbol_current_profile(int* output_kind, int* channel_profile, int* symbol_r
     if (levels) {
         *levels = current_levels;
     }
-    return 1;
+    return direct;
 }
 
 static inline void
@@ -890,6 +965,29 @@ rtl_symbol_cache_reset_pending(dsd_state* state) {
     rtl_symbol_cache_publish_pending(state);
 }
 
+/* No media span and no capture centre: the cached samples came from a live read, which carries neither. */
+static inline void
+rtl_symbol_cache_clear_media(dsd_state* state) {
+    state->rtl_symbol_cache_media_start_ns = 0U;
+    state->rtl_symbol_cache_media_duration_ns = 0U;
+    state->rtl_symbol_cache_media_count = 0U;
+    state->rtl_symbol_cache_media_first_index = 0U;
+    state->rtl_symbol_cache_center_hz = 0U;
+}
+
+/* An I/Q replay's sample reaches symbol processing at its own capture time (issue #572): the decode clock's media time
+   moves to it as the cache hands it out, so a decision the decoder takes on it reads the same time whatever batch it
+   came in. A live sample carries no span and moves nothing. */
+static inline void
+rtl_symbol_cache_run_media_to(const dsd_state* state, int pos) {
+    if (state->rtl_symbol_cache_media_count == 0U || pos < 0) {
+        return;
+    }
+    dsd_decode_clock_set_media_ns(dsd_decode_clock_batch_media_ns(
+        state->rtl_symbol_cache_media_start_ns, state->rtl_symbol_cache_media_duration_ns,
+        state->rtl_symbol_cache_media_count, state->rtl_symbol_cache_media_first_index + (uint32_t)pos));
+}
+
 static inline int
 rtl_symbol_cache_pop(dsd_state* state, uint32_t generation, float* sample_out) {
     if (!state || !sample_out || state->rtl_symbol_cache_pos >= state->rtl_symbol_cache_len) {
@@ -899,12 +997,14 @@ rtl_symbol_cache_pop(dsd_state* state, uint32_t generation, float* sample_out) {
         rtl_symbol_cache_reset_pending(state);
         return RTL_SYMBOL_CACHE_RETRY;
     }
-    float sample = state->rtl_symbol_cache[state->rtl_symbol_cache_pos++];
+    const int pos = state->rtl_symbol_cache_pos++;
+    float sample = state->rtl_symbol_cache[pos];
     rtl_symbol_cache_publish_pending(state);
     if (dsd_rtl_stream_metrics_hook_stream_generation() != generation) {
         rtl_symbol_cache_reset_pending(state);
         return RTL_SYMBOL_CACHE_RETRY;
     }
+    rtl_symbol_cache_run_media_to(state, pos);
     *sample_out = sample;
     return RTL_SYMBOL_CACHE_READY;
 }
@@ -940,6 +1040,7 @@ rtl_symbol_cache_clear(dsd_state* state) {
     state->rtl_symbol_cache_symbol_rate_hz = 0;
     state->rtl_symbol_cache_levels = 0;
     state->rtl_symbol_cache_generation = 0;
+    rtl_symbol_cache_clear_media(state);
 }
 
 #ifdef DSD_NEO_TEST_HOOKS
@@ -986,6 +1087,61 @@ dsd_symbol_test_rtl_cache_and_center_contract(int out_values[10]) {
 }
 #endif
 
+/*
+ * An I/Q replay's read hands out samples of one demod block's batch, published with the stream generation and the
+ * profile the block ran on (dsd_rtl_stream_metrics_hook_replay_batch()). The decoder paces the demod, so a RESET, a
+ * profile the SPS hunt asked for and a CQPSK toggle all land while the decoder waits in that read, and the first batch
+ * after each always carries labels the caller has not seen. Labelled with what the caller saw before the read, it would
+ * be dropped every time: at once for a new generation, at the next refresh for a new profile. It is the new stream's
+ * first output, not an old one, so the cache keeps it under the batch's own labels and asks the caller to follow them
+ * before the first sample is taken (RTL_SYMBOL_CACHE_REFRESH). A batch the stream has moved on from since it was
+ * published (a flush the decoder asked for) is still dropped: the pop checks the batch's generation, and the caller's
+ * refresh drops a cache whose labels the stream no longer carries. The batch's media span goes with its samples, so
+ * each one the cache hands out runs the decode clock to its own capture time (rtl_symbol_cache_pop()), and so does the
+ * centre it was captured on, which the reader notes with each sample (dsd_opts_note_iq_replay_center(), issue #575; a
+ * live fill holds none).
+ *
+ * A batch of the monitor output is dropped, as a live read's is: that output is read one sample at a time outside the
+ * cache, and the refresh tells a move off a direct output by the kind the cache still holds.
+ */
+static int
+rtl_symbol_cache_fill_replay_batch(dsd_state* state, int got, const dsd_rtl_stream_replay_batch* batch, int output_kind,
+                                   int channel_profile, int symbol_rate_hz, int levels, uint32_t* generation,
+                                   uint32_t read_generation, float* sample_out) {
+    const int direct = rtl_direct_output_active(batch->output_kind);
+    if (!direct) {
+        if (generation) {
+            *generation = batch->generation;
+        }
+        rtl_symbol_cache_reset_pending(state);
+        return RTL_SYMBOL_CACHE_RETRY;
+    }
+    int batch_channel_profile = batch->channel_profile;
+    int batch_symbol_rate_hz = batch->symbol_rate_hz;
+    int batch_levels = batch->levels;
+    rtl_symbol_profile_labels(direct, &batch_channel_profile, &batch_symbol_rate_hz, &batch_levels);
+
+    state->rtl_symbol_cache_len = got;
+    state->rtl_symbol_cache_pos = 0;
+    state->rtl_symbol_cache_output_kind = batch->output_kind;
+    state->rtl_symbol_cache_channel_profile = batch_channel_profile;
+    state->rtl_symbol_cache_symbol_rate_hz = batch_symbol_rate_hz;
+    state->rtl_symbol_cache_levels = batch_levels;
+    state->rtl_symbol_cache_generation = batch->generation;
+    state->rtl_symbol_cache_media_start_ns = batch->media_start_ns;
+    state->rtl_symbol_cache_media_duration_ns = batch->media_duration_ns;
+    state->rtl_symbol_cache_media_count = batch->output_count;
+    state->rtl_symbol_cache_media_first_index = batch->first_index;
+    state->rtl_symbol_cache_center_hz = batch->center_frequency_hz;
+    rtl_symbol_cache_publish_pending(state);
+    if (batch->generation != read_generation || batch->output_kind != output_kind
+        || batch_channel_profile != channel_profile || batch_symbol_rate_hz != symbol_rate_hz
+        || batch_levels != levels) {
+        return RTL_SYMBOL_CACHE_REFRESH;
+    }
+    return rtl_symbol_cache_pop(state, batch->generation, sample_out);
+}
+
 static int
 rtl_symbol_cache_refill(dsd_state* state, int output_kind, int channel_profile, int symbol_rate_hz, int levels,
                         uint32_t* generation, uint32_t expected_generation, float* sample_out) {
@@ -999,6 +1155,14 @@ rtl_symbol_cache_refill(dsd_state* state, int output_kind, int channel_profile, 
         got = DSD_RTL_SYMBOL_CACHE_CAP;
     }
 
+    dsd_rtl_stream_replay_batch batch;
+    if (dsd_rtl_stream_metrics_hook_replay_batch(&batch) == 1) {
+        return rtl_symbol_cache_fill_replay_batch(state, got, &batch, output_kind, channel_profile, symbol_rate_hz,
+                                                  levels, generation, read_generation, sample_out);
+    }
+
+    /* A live read carries no labels. A generation that moved while it waited may have flushed what it returned, so the
+       batch is dropped; a profile that moved is only seen at the next refresh, which drops the rest. */
     uint32_t fill_generation = dsd_rtl_stream_metrics_hook_stream_generation();
     if (fill_generation != read_generation) {
         if (generation) {
@@ -1015,6 +1179,7 @@ rtl_symbol_cache_refill(dsd_state* state, int output_kind, int channel_profile, 
     state->rtl_symbol_cache_symbol_rate_hz = symbol_rate_hz;
     state->rtl_symbol_cache_levels = levels;
     state->rtl_symbol_cache_generation = generation ? *generation : fill_generation;
+    rtl_symbol_cache_clear_media(state);
     rtl_symbol_cache_publish_pending(state);
     return rtl_symbol_cache_pop(state, read_generation, sample_out);
 }
@@ -1060,9 +1225,6 @@ symbol_scale_pcm_i16(short s, int input_volume_multiplier) {
 static inline unsigned int
 symbol_analog_block_size(const dsd_opts* opts, const dsd_state* state, unsigned int analog_out_cap) {
     unsigned int analog_block = analog_out_cap;
-#ifndef USE_RADIO
-    (void)state;
-#endif
     if (opts->audio_in_type == AUDIO_IN_RTL) {
 #ifdef USE_RADIO
         unsigned int Fs = 0;
@@ -1076,21 +1238,27 @@ symbol_analog_block_size(const dsd_opts* opts, const dsd_state* state, unsigned 
             } else if (analog_block > 4000) {
                 analog_block = 4000;
             }
+            if (analog_block > analog_out_cap) {
+                analog_block = analog_out_cap;
+            }
         }
 #endif
     }
-#ifdef USE_RADIO
-    if (analog_block > analog_out_cap) {
-        analog_block = analog_out_cap;
+    /* Never past the buffers the block fills (analog_out_f, analog_out_flags), whatever capacity the caller passed. */
+    const unsigned int buffer_cap =
+        (unsigned int)(sizeof(state->analog_out_flags) / sizeof(state->analog_out_flags[0]));
+    if (analog_block > buffer_cap) {
+        analog_block = buffer_cap;
     }
-#endif
     return analog_block;
 }
 
+/* The block in int16, each sample scaled by @p gain (dsd_analog_sink_write()'s gain); analog_out_f is left as it is. A
+   gain of 1.0 leaves every sample exactly as it was. */
 static inline void
-symbol_convert_analog_block_to_i16(dsd_state* state, unsigned int analog_block) {
+symbol_convert_analog_block_to_i16(dsd_state* state, unsigned int analog_block, double gain) {
     for (unsigned int i = 0; i < analog_block; i++) {
-        state->analog_out[i] = float_to_int16_clip(state->analog_out_f[i]);
+        state->analog_out[i] = float_to_int16_clip((float)(gain * (double)state->analog_out_f[i]));
     }
 }
 
@@ -1107,7 +1275,7 @@ dsd_symbol_test_convert_analog_block_to_i16(const float* input, short* output, u
     for (unsigned int i = 0; i < n; i++) {
         state.analog_out_f[i] = input[i];
     }
-    symbol_convert_analog_block_to_i16(&state, n);
+    symbol_convert_analog_block_to_i16(&state, n, 1.0);
     for (unsigned int i = 0; i < n; i++) {
         output[i] = state.analog_out[i];
     }
@@ -1128,65 +1296,375 @@ symbol_update_unsynced_input_power(dsd_opts* opts, dsd_state* state, unsigned in
     }
 }
 
+#ifdef DSD_NEO_TEST_HOOKS
+static void (*g_symbol_test_raw_wav_sync)(void) = NULL;
+
+void
+dsd_symbol_test_set_raw_wav_sync(void (*sync)(void)) {
+    g_symbol_test_raw_wav_sync = sync;
+}
+#endif
+
+/* Sync the unsynced raw WAV to disk after a block. */
 static inline void
-symbol_write_unsynced_raw_wav(dsd_opts* opts, dsd_state* state, unsigned int analog_block) {
+symbol_sync_unsynced_raw_wav(SNDFILE* wav) {
+#ifdef DSD_NEO_TEST_HOOKS
+    if (g_symbol_test_raw_wav_sync) {
+        g_symbol_test_raw_wav_sync();
+        return;
+    }
+#endif
+    sf_write_sync(wav);
+}
+
+/* The rate the block runs at, as received-tone detection reads it. */
+static inline int
+symbol_analog_audio_rate_hz(const dsd_opts* opts) {
+#ifdef USE_RADIO
+    if (opts->audio_in_type == AUDIO_IN_RTL) {
+        const unsigned int rtl_rate = dsd_rtl_stream_metrics_hook_output_rate_hz();
+        if (rtl_rate > 0U) {
+            return (int)rtl_rate;
+        }
+    }
+#endif
+    const int rate = dsd_opts_current_input_timing_rate(opts);
+    return rate > 0 ? rate : 48000;
+}
+
+/* The rate the finished analog block ran at, or 0 when it mixes samples collected at two rates: a rate change that
+   landed while it filled, which announces no reception boundary (issue #633). Such a block neither plays nor goes to
+   the -6 WAV: at either rate, part of it would play at the wrong speed. */
+static inline int
+symbol_analog_block_rate_hz(const dsd_opts* opts, const dsd_state* state) {
+    const int rate_hz = symbol_analog_audio_rate_hz(opts);
+    if (state->analog_block_mixed != 0 || (state->analog_block_rate_hz > 0 && state->analog_block_rate_hz != rate_hz)) {
+        return 0;
+    }
+    return rate_hz;
+}
+
+/* A block starts filling: the rate it runs at and what that rate is keyed on (issue #633), the reception the audio
+   chain notes for it (dsd_analog_audio_block_begin()), and the analog sinks' gap bookkeeping. @p rtl_generation is the
+   RTL stream generation of the samples (0 off RTL input). */
+static inline void
+symbol_analog_block_begin(const dsd_opts* opts, dsd_state* state, uint32_t rtl_generation) {
+    state->analog_block_rate_hz = symbol_analog_audio_rate_hz(opts);
+    state->analog_block_rate_gen = opts->input_rate_generation;
+    state->analog_block_pcm_gen = opts->pcm_input_generation;
+    state->analog_block_rtl_gen = rtl_generation;
+    state->analog_block_mixed = 0;
+    dsd_analog_audio_block_begin(opts, state, DSD_ANALOG_AUDIO_CHAIN_MONITOR);
+    dsd_analog_sink_block_begin(state);
+}
+
+/* Every collected sample: whether the input rate may have moved since the block's last sample (a PCM rate commit, a new
+   PCM input stream, or a new RTL stream generation). Only then is the rate read, and a sample at another rate than the
+   block's marks it mixed. A provisional rate a transaction restored before this sample was read never does. */
+static inline void
+symbol_analog_block_track_rate(const dsd_opts* opts, dsd_state* state, uint32_t rtl_generation) {
+    if (opts->input_rate_generation == state->analog_block_rate_gen
+        && opts->pcm_input_generation == state->analog_block_pcm_gen && rtl_generation == state->analog_block_rtl_gen) {
+        return;
+    }
+    if (symbol_analog_audio_rate_hz(opts) != state->analog_block_rate_hz) {
+        state->analog_block_mixed = 1;
+    }
+    state->analog_block_rate_gen = opts->input_rate_generation;
+    state->analog_block_pcm_gen = opts->pcm_input_generation;
+    state->analog_block_rtl_gen = rtl_generation;
+}
+
+/* What the block's samples are, for the audio chain's gain that takes the reference signal to the reference level and
+   the -6 raw WAV's int16 scale (issue #643): on an RTL input, the FSK discriminator output when the symbol cache holds
+   that kind (the -8 source monitor under digital decoding; symbol_refresh_rtl_profile() empties the block when the
+   output moves), else monitor audio; PCM otherwise. */
+static inline dsd_analog_audio_source
+symbol_analog_audio_source(const dsd_opts* opts, const dsd_state* state) {
+#ifdef USE_RADIO
+    if (opts->audio_in_type == AUDIO_IN_RTL) {
+        return state->rtl_symbol_cache_output_kind == RTL_STREAM_OUTPUT_FSK_DISCRIMINATOR_LOCAL
+                   ? DSD_ANALOG_AUDIO_SOURCE_RTL_FSK
+                   : DSD_ANALOG_AUDIO_SOURCE_RTL_MONITOR;
+    }
+#else
+    (void)opts;
+    (void)state;
+#endif
+    return DSD_ANALOG_AUDIO_SOURCE_PCM16;
+}
+
+/* The -6 raw WAV as an analog sink. */
+typedef struct {
+    SNDFILE* wav;
+} symbol_raw_wav_sink;
+
+static void
+symbol_raw_wav_sink_write(const void* ctx, const short* samples, size_t count) {
+    const symbol_raw_wav_sink* sink = (const symbol_raw_wav_sink*)ctx;
+    symbol_write_wav_short_block(sink->wav, samples, (sf_count_t)count, "symbol raw WAV");
+}
+
+/* The -6 raw WAV gets each block at the analog sink rate (issue #633): as it is when the block already runs at that
+   rate, converted otherwise, and not at all when the block mixes two rates (@p block_hz 0). It is written at int16
+   scale (issue #643): RTL monitor audio, at the monitor's 1/pi output scale, is scaled to the level a PCM input at the
+   reference has, and the FSK discriminator output and PCM input are written as they are. The block itself is not
+   touched: received-tone detection and the monitor read it after. */
+static inline void
+symbol_write_raw_wav_block(const dsd_opts* opts, dsd_state* state, unsigned int count, int block_hz) {
+    if (block_hz <= 0) {
+        dsd_analog_sink_break(state);
+        return;
+    }
+    const int sink_hz = dsd_opts_analog_sink_rate_hz(opts);
+    const symbol_raw_wav_sink sink = {opts->wav_out_raw};
+    const double gain = dsd_analog_audio_int16_scale(symbol_analog_audio_source(opts, state));
+    if (block_hz == sink_hz
+        || dsd_analog_sink_write(opts, state, DSD_ANALOG_SINK_RAW_WAV, state->analog_out_f, count, gain, block_hz,
+                                 sink_hz, symbol_raw_wav_sink_write, &sink)
+               == DSD_ANALOG_SINK_NATIVE) {
+        symbol_convert_analog_block_to_i16(state, count, gain);
+        symbol_write_wav_short_block(opts->wav_out_raw, state->analog_out, count, "symbol raw WAV");
+    }
+}
+
+static inline void
+symbol_write_unsynced_raw_wav(dsd_opts* opts, dsd_state* state, unsigned int analog_block, int block_hz) {
     if (opts->wav_out_raw != NULL && opts->frame_nxdn48 == 0 && opts->frame_nxdn96 == 0 && opts->frame_dpmr == 0
         && opts->frame_m17 == 0) {
-        symbol_convert_analog_block_to_i16(state, analog_block);
-        symbol_write_wav_short_block(opts->wav_out_raw, state->analog_out, analog_block, "symbol raw WAV");
-        sf_write_sync(opts->wav_out_raw);
+        symbol_write_raw_wav_block(opts, state, analog_block, block_hz);
+        symbol_sync_unsynced_raw_wav(opts->wav_out_raw);
+    }
+}
+
+/* The monitor gate: the squelch open over the block, the monitor on, no digital carrier flagged and audio out on.
+ * Nothing plays while a retune is unresolved (dsd_trunk_tuning_pending_request()): in flight, when the front end still
+ * delivers the channel being left, or failed after the scanner had moved on, when it delivers a channel other than the
+ * one the scanner shows, until a later retune lands or the scan ends -- the same gate that holds back digital frames.
+ * Nor, on the analog monitor of either kind, from a block that began before a retune or reset, or before the tap
+ * started, or that a boundary the tap has not read past yet leaves the old channel's (issues #524, #526). Nor while
+ * the tone policy is still checking the reception or has rejected it (issue #527): this is the one sink point, so the
+ * local stream and the UDP analog socket mute together; the -6 raw WAV, written above, is not gated. */
+static inline int
+symbol_unsynced_audio_allowed(const dsd_opts* opts, const dsd_state* state) {
+    /* Under the auto squelch the level gate is off and each sample carries its own gate (symbol_apply_sink_gate()). */
+    if (!dsd_squelch_level_open(opts) || opts->monitor_input_audio != 1 || state->carrier != 0
+        || opts->audio_out != 1) {
+        return 0;
+    }
+    return dsd_trunk_tuning_pending_request() == 0U && !dsd_analog_rx_block_straddles_boundary(opts, state)
+           && dsd_analog_tone_gate_passes(dsd_analog_tone_gate_in_force(opts, state));
+}
+
+typedef struct {
+    const dsd_opts* opts;
+    dsd_state* state;
+    /* Nonzero only while the audible-audio stamp is armed and the block is analog reception an output takes
+       (symbol_write_unsynced_audio(), issue #574): each write that hands the output samples notes the stamp. */
+    int stamp;
+} symbol_monitor_sink;
+
+/* The monitor sink: the local raw stream, the UDP analog socket, or in the analog-only modes the -o - descriptor
+   (dsd_audio_sink_monitor_takes_fd(), issue #659). The audible-audio stamp is noted here, where samples reach the
+   output, so a block the converter mutes (a rate it cannot take, no memory for it) notes nothing. */
+static void
+symbol_monitor_sink_write(const void* ctx, const short* samples, size_t count) {
+    const symbol_monitor_sink* sink = (const symbol_monitor_sink*)ctx;
+    if (sink->stamp && count > 0U) {
+        dsd_audio_activity_note();
+    }
+    if (sink->opts->audio_out_type == 0) {
+        (void)dsd_audio_sink_write_device(DSD_AUDIO_SINK_RAW, sink->opts->audio_raw_out, samples, count);
+    }
+    if (sink->opts->audio_out_type == 8) {
+        dsd_udp_audio_hook_blast_analog(sink->opts, sink->state, count * sizeof(short), samples);
+    }
+    if (dsd_audio_sink_monitor_takes_fd(sink->opts)) {
+        (void)dsd_audio_sink_write_fd(sink->opts->audio_out_fd, samples, count * sizeof(short), sizeof(short));
+    }
+}
+
+static inline int symbol_unsynced_carrier_active(const dsd_opts* opts, const dsd_state* state);
+
+/* Whether the block the monitor sink is about to play is analog reception the app plays (issue #574): the FM or AM
+   monitor's, not the -8 source monitor's during digital decoding, on the carrier the tap holds open with the tone
+   policy passing it (symbol_unsynced_carrier_active()), and under the auto squelch with at least one sample its own
+   gate hears, so the fade-out the sink writes after the gate closes is not. Provenance, never level: an unmodulated
+   carrier counts. Asked only while the audible-audio stamp is armed. */
+static int
+symbol_unsynced_block_audible(const dsd_opts* opts, const dsd_state* state, unsigned int analog_block) {
+    if (!dsd_analog_monitor_tap_active(opts) || !symbol_unsynced_carrier_active(opts, state)) {
+        return 0;
+    }
+    if (!dsd_squelch_flags_in_force(opts, state)) {
+        return 1;
+    }
+    for (unsigned int i = 0; i < analog_block; i++) {
+        if (dsd_squelch_gate_open(opts, state, state->analog_out_flags[i])) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* The block goes to the monitor sink at the analog sink rate (issue #633): as it is when it already runs at that rate,
+   converted otherwise. */
+static inline void
+symbol_write_unsynced_audio(const dsd_opts* opts, dsd_state* state, unsigned int analog_block, int block_hz) {
+    /* The stamp follows the shared output rule, which for the monitor is the sink below: it feeds the raw fd only in
+       the analog-only modes. The sink notes it when it writes samples (symbol_monitor_sink_write()). */
+    const int takes_fd = dsd_audio_sink_monitor_takes_fd(opts);
+    const int stamp = dsd_audio_activity_armed() && dsd_audio_activity_output_plays(opts, opts->audio_raw_out, takes_fd)
+                      && symbol_unsynced_block_audible(opts, state, analog_block);
+    const symbol_monitor_sink sink = {opts, state, stamp};
+    const int sink_hz = dsd_opts_analog_sink_rate_hz(opts);
+    const int has_sink = (opts->audio_out_type == 0 && opts->audio_raw_out) || opts->audio_out_type == 8 || takes_fd;
+    /* Synchronous playback can hold the decoder for the block's playing time; that is not
+       time spent waiting for input, which received-tone detection measures (issue #522). */
+    dsd_analog_rx_playback_begin(state);
+    if (!has_sink || block_hz == sink_hz
+        || dsd_analog_sink_write(opts, state, DSD_ANALOG_SINK_MONITOR, state->analog_out_f, analog_block, 1.0, block_hz,
+                                 sink_hz, symbol_monitor_sink_write, &sink)
+               == DSD_ANALOG_SINK_NATIVE) {
+        symbol_convert_analog_block_to_i16(state, analog_block, 1.0);
+        symbol_monitor_sink_write(&sink, state->analog_out, analog_block);
+    }
+    dsd_analog_rx_playback_end(state);
+}
+
+/* Whether the block is carrier activity for the scanner's hold. The analog monitor's carrier, FM or AM (issue #524),
+ * is the receive tap's (squelch open above its level floor, through its 200 ms hangover, at every input rate, dropped
+ * at every retune and while one is unresolved), whether or not the block is played: -o null and a muted UI hold the
+ * row too (issue #526). Under the tone policy (issue #527) only traffic it passes is activity
+ * (dsd_analog_tone_gate_passes()): a rejected carrier never holds the row, and one still being checked stamps nothing
+ * either, so a check its carrier ends before a verdict leaves no hangtime tail behind it (the -Y scanner holds the row
+ * by the verdict alone while the check runs, and while allowed traffic is on air, since this stamp comes only as a
+ * block ends and a verdict can pass the traffic part-way through one). The -8 source monitor under digital decoding
+ * keeps its old rule, the carrier it plays, which is none while a retune is unresolved. Either way the channel a
+ * retune leaves, or one a failed retune left the receiver on, never holds the row the scanner shows: its hangtime runs
+ * out and the scanner tunes on. */
+static inline int
+symbol_unsynced_carrier_active(const dsd_opts* opts, const dsd_state* state) {
+    if (opts->monitor_input_audio != 1 || state->carrier != 0) {
+        return 0;
+    }
+    if (dsd_analog_monitor_tap_active(opts)) {
+        return dsd_analog_rx_carrier_open_now(opts, state)
+               && dsd_analog_tone_gate_passes(dsd_analog_tone_gate_in_force(opts, state));
+    }
+    return opts->audio_out == 1 && dsd_squelch_level_open(opts) && dsd_trunk_tuning_pending_request() == 0U;
+}
+
+/* Stamp carrier activity: the -Y hangtime anchor and, off a tuned trunked voice channel, the voice anchor. */
+static inline void
+symbol_stamp_unsynced_carrier(const dsd_opts* opts, dsd_state* state) {
+    if (!symbol_unsynced_carrier_active(opts, state)) {
+        return;
+    }
+    if (opts->trunk_enable != 1) {
+        state->last_cc_sync_time = dsd_decode_time();
+        state->last_cc_sync_time_m = dsd_decode_now_mono_s();
+    }
+    if (!(opts->trunk_enable == 1 && opts->trunk_is_tuned == 1)) {
+        state->last_vc_sync_time = dsd_decode_time();
+        state->last_vc_sync_time_m = dsd_decode_now_mono_s();
     }
 }
 
 static inline void
-symbol_apply_unsynced_filters(dsd_opts* opts, dsd_state* state, unsigned int analog_block) {
-    if (opts->use_lpf == 1) {
-        lpf_f(state, state->analog_out_f, (int)analog_block);
+symbol_output_unsynced_analog(const dsd_opts* opts, dsd_state* state, unsigned int analog_block, int allowed,
+                              int block_hz) {
+    if (allowed) {
+        symbol_write_unsynced_audio(opts, state, analog_block, block_hz);
     }
-    if (opts->use_hpf == 1) {
-        hpf_f(state, state->analog_out_f, (int)analog_block);
+    symbol_stamp_unsynced_carrier(opts, state);
+}
+
+/* The monitor's voice band-pass, legacy filters and gain stage (dsd_analog_audio_process_f()). The filters run whether
+   or not the block plays, so they hold no stale history when it does; the AGC adapts only to a block that plays. A
+   block that straddles a retune or reset, which never plays, is partly the old channel's: the chain drops it rather
+   than filter it into the state the next channel starts from, and starts over with the next block (it also starts over
+   at a new stream or tuning generation by itself, which covers the -8 source monitor, where no tap tracks the
+   boundary). */
+static inline void
+symbol_process_unsynced_audio(const dsd_opts* opts, dsd_state* state, unsigned int analog_block, int allowed,
+                              int discard) {
+    unsigned int flags = allowed ? DSD_ANALOG_AUDIO_PLAYING : 0U;
+    if (discard) {
+        flags = DSD_ANALOG_AUDIO_DISCARD;
     }
-    if (opts->use_pbf == 1) {
-        pbf_f(state, state->analog_out_f, (int)analog_block);
+    (void)dsd_analog_audio_process_f(opts, state, DSD_ANALOG_AUDIO_CHAIN_MONITOR, state->analog_out_f, analog_block,
+                                     symbol_analog_audio_source(opts, state), symbol_analog_audio_rate_hz(opts), flags);
+}
+
+/* Whether sample @p i of the block plays under the auto squelch: the block's gate and the sample's own. */
+static inline int
+symbol_sample_heard(const dsd_opts* opts, const dsd_state* state, unsigned int i, int allowed) {
+    return allowed && dsd_squelch_gate_open(opts, state, state->analog_out_flags[i]);
+}
+
+/* The audio chain under the auto squelch (issue #518 follow-up), which gates per sample: each run of samples that play,
+   or do not, goes through with its own playing flag, so the AGC adapts to exactly the samples heard, holds while the
+   gate is closed and rolls back on the close edge, whatever the block. A block that straddles a boundary is dropped
+   whole, as symbol_process_unsynced_audio() drops it. */
+static void
+symbol_process_unsynced_audio_runs(const dsd_opts* opts, dsd_state* state, unsigned int analog_block, int allowed,
+                                   int discard) {
+    const dsd_analog_audio_source source = symbol_analog_audio_source(opts, state);
+    const int rate_hz = symbol_analog_audio_rate_hz(opts);
+    if (discard) {
+        (void)dsd_analog_audio_process_f(opts, state, DSD_ANALOG_AUDIO_CHAIN_MONITOR, state->analog_out_f, analog_block,
+                                         source, rate_hz, DSD_ANALOG_AUDIO_DISCARD);
+        state->analog_sink_gain = 0.0f;
+        return;
     }
-    if (opts->audio_gainA > 0.0f) {
-        analog_gain_f(opts, state, state->analog_out_f, (int)analog_block);
-    } else {
-        agsm_f(opts, state, state->analog_out_f, (int)analog_block);
+    unsigned int start = 0U;
+    while (start < analog_block) {
+        const int heard = symbol_sample_heard(opts, state, start, allowed);
+        unsigned int end = start + 1U;
+        while (end < analog_block && symbol_sample_heard(opts, state, end, allowed) == heard) {
+            end++;
+        }
+        (void)dsd_analog_audio_process_f(opts, state, DSD_ANALOG_AUDIO_CHAIN_MONITOR, state->analog_out_f + start,
+                                         end - start, source, rate_hz, heard ? DSD_ANALOG_AUDIO_PLAYING : 0U);
+        start = end;
     }
 }
 
-static inline void
-symbol_output_unsynced_analog(dsd_opts* opts, dsd_state* state, unsigned int analog_block) {
-    if ((opts->rtl_pwr > opts->rtl_squelch_level) && opts->monitor_input_audio == 1 && state->carrier == 0
-        && opts->audio_out == 1) {
-        symbol_convert_analog_block_to_i16(state, analog_block);
-        size_t bytes = (size_t)analog_block * sizeof(short);
-        /* Synchronous playback can hold the decoder for the block's playing time; that is not
-           time spent waiting for input, which received-tone detection measures (issue #522). */
-        dsd_analog_rx_playback_begin(state);
-        if (opts->audio_out_type == 0 && opts->audio_raw_out) {
-            dsd_audio_write(opts->audio_raw_out, state->analog_out, analog_block);
-        }
-        if (opts->audio_out_type == 8) {
-            dsd_udp_audio_hook_blast_analog(opts, state, bytes, state->analog_out);
-        }
-        dsd_analog_rx_playback_end(state);
-        if (opts->trunk_enable != 1) {
-            state->last_cc_sync_time = time(NULL);
-            state->last_cc_sync_time_m = dsd_time_now_monotonic_s();
-        }
-        if (!(opts->trunk_enable == 1 && opts->trunk_is_tuned == 1)) {
-            state->last_vc_sync_time = time(NULL);
-            state->last_vc_sync_time_m = dsd_time_now_monotonic_s();
-        }
+/* The monitor sink under the auto squelch: after every filter, each sample's gain ramps toward 1 while it is heard and
+   toward 0 while not (5 ms up, 10 ms down, in samples), so a closed stretch is exact silence and no edge clicks.
+   Returns 1 when any sample of the block is heard at all, which the block is written for. */
+static int
+symbol_apply_sink_gate(const dsd_opts* opts, dsd_state* state, unsigned int analog_block, int allowed) {
+    if (!allowed) {
+        /* The block gate rejected the whole block (a muted output, digital sync, a retune still landing, the tone
+           policy): none of it plays, not even a fade, as under a level squelch, and the next open sample ramps in. */
+        state->analog_sink_gain = 0.0f;
+        return 0;
     }
+    const double rate = (double)symbol_analog_audio_rate_hz(opts);
+    const float up = (float)(1.0 / (rate * 0.005));
+    const float down = (float)(1.0 / (rate * 0.010));
+    float gain = state->analog_sink_gain;
+    int any = 0;
+    for (unsigned int i = 0; i < analog_block; i++) {
+        if (symbol_sample_heard(opts, state, i, allowed)) {
+            gain = fminf(1.0f, gain + up);
+        } else {
+            gain = fmaxf(0.0f, gain - down);
+        }
+        state->analog_out_f[i] *= gain;
+        any |= gain > 0.0f;
+    }
+    state->analog_sink_gain = gain;
+    return any;
 }
 
 static inline void
 symbol_reset_analog_buffers(dsd_state* state) {
     DSD_MEMSET(state->analog_out_f, 0, sizeof(state->analog_out_f));
     DSD_MEMSET(state->analog_out, 0, sizeof(state->analog_out));
+    DSD_MEMSET(state->analog_out_flags, 0, sizeof(state->analog_out_flags));
     state->analog_sample_counter = 0;
     /* The next block starts at its first sample for received-tone detection too (issue #522), also when this drops
        one part-way through: dsd_symbol_analog_block_reset() and a receive-family switch landing. */
@@ -1199,18 +1677,56 @@ dsd_symbol_analog_block_reset(dsd_state* state) {
         return;
     }
     symbol_reset_analog_buffers(state);
+    /* The part-collected block is dropped: the analog sinks start over (issue #633). */
+    dsd_analog_sink_break(state);
+}
+
+/* Drop a part-collected analog block: the samples after it do not follow on from it. */
+static inline void
+symbol_drop_analog_block(dsd_state* state) {
+    if (state->analog_sample_counter > 0) {
+        symbol_reset_analog_buffers(state);
+        dsd_analog_sink_break(state);
+    }
+}
+
+/* Before a sample joins the analog block: a block starting notes what it begins under (symbol_analog_block_begin()), a
+   block filling checks the sample's rate against its own (symbol_analog_block_track_rate()). */
+static inline void
+symbol_analog_block_collect(const dsd_opts* opts, dsd_state* state, uint32_t rtl_generation) {
+    if (state->analog_sample_counter == 0) {
+        symbol_analog_block_begin(opts, state, rtl_generation);
+    } else {
+        symbol_analog_block_track_rate(opts, state, rtl_generation);
+    }
 }
 
 static inline void
 symbol_finalize_unsynced_analog_block(dsd_opts* opts, dsd_state* state, unsigned int analog_block) {
+    /* 0 for a block that mixes two rates (issue #633): dropped as a block that straddles a boundary is. */
+    const int block_hz = symbol_analog_block_rate_hz(opts, state);
     symbol_update_unsynced_input_power(opts, state, analog_block);
-    symbol_write_unsynced_raw_wav(opts, state, analog_block);
+    symbol_write_unsynced_raw_wav(opts, state, analog_block, block_hz);
     /* Received-tone detection (issue #522) reads the rest of the block here, while it is still
-       raw: the voice filters below run in place, and hpf_f alone takes out everything a CTCSS
-       tone lives in. It only reads, so the audio that follows is unchanged. */
-    dsd_analog_rx_tap(opts, state, state->analog_out_f, analog_block);
-    symbol_apply_unsynced_filters(opts, state, analog_block);
-    symbol_output_unsynced_analog(opts, state, analog_block);
+       raw: the voice band-pass below runs in place and takes every CTCSS tone 40 dB down (and a
+       DCS signal about 32 dB). It only reads, so the audio that follows is unchanged. */
+    dsd_analog_rx_tap_flags(opts, state, state->analog_out_f, state->analog_out_flags, analog_block);
+    /* One gate decision for the block, taken after the tap and before the gain stage, so the
+       AGC adapts to exactly the audio that plays. While the flags carry the gate
+       (dsd_squelch_flags_in_force()) each sample's own gate joins it. */
+    const int allowed = block_hz > 0 && symbol_unsynced_audio_allowed(opts, state);
+    const int discard = block_hz <= 0 || dsd_analog_rx_block_straddles_boundary(opts, state);
+    if (block_hz <= 0) {
+        dsd_analog_sink_break(state);
+    }
+    if (dsd_squelch_flags_in_force(opts, state)) {
+        symbol_process_unsynced_audio_runs(opts, state, analog_block, allowed, discard);
+        const int heard = symbol_apply_sink_gate(opts, state, analog_block, allowed);
+        symbol_output_unsynced_analog(opts, state, analog_block, heard, block_hz);
+    } else {
+        symbol_process_unsynced_audio(opts, state, analog_block, allowed, discard);
+        symbol_output_unsynced_analog(opts, state, analog_block, allowed, block_hz);
+    }
     symbol_reset_analog_buffers(state);
 }
 
@@ -1223,8 +1739,27 @@ dsd_symbol_test_finalize_unsynced_analog_block(dsd_opts* opts, dsd_state* state,
     }
     const unsigned int cap = (unsigned int)(sizeof(state->analog_out_f) / sizeof(state->analog_out_f[0]));
     const unsigned int n = count < cap ? count : cap;
+    symbol_analog_block_begin(opts, state, 0U);
     for (unsigned int i = 0; i < n; i++) {
         state->analog_out_f[i] = input[i];
+    }
+    state->analog_sample_counter = (int)n;
+    symbol_finalize_unsynced_analog_block(opts, state, n);
+    return n;
+}
+
+unsigned int
+dsd_symbol_test_finalize_unsynced_analog_block_flags(dsd_opts* opts, dsd_state* state, const float* input,
+                                                     const uint8_t* flags, unsigned int count) {
+    if (!opts || !state || !input || !flags) {
+        return 0U;
+    }
+    const unsigned int cap = (unsigned int)(sizeof(state->analog_out_flags) / sizeof(state->analog_out_flags[0]));
+    const unsigned int n = count < cap ? count : cap;
+    symbol_analog_block_begin(opts, state, 0U);
+    for (unsigned int i = 0; i < n; i++) {
+        state->analog_out_f[i] = input[i];
+        state->analog_out_flags[i] = flags[i];
     }
     state->analog_sample_counter = (int)n;
     symbol_finalize_unsynced_analog_block(opts, state, n);
@@ -1233,7 +1768,8 @@ dsd_symbol_test_finalize_unsynced_analog_block(dsd_opts* opts, dsd_state* state,
 #endif
 
 static inline void
-symbol_process_unsynced_analog(dsd_opts* opts, dsd_state* state, unsigned int analog_out_cap, float sample) {
+symbol_process_unsynced_analog(dsd_opts* opts, dsd_state* state, unsigned int analog_out_cap, float sample,
+                               uint8_t flag) {
     unsigned int analog_block = symbol_analog_block_size(opts, state, analog_out_cap);
     if (analog_block == 0) {
         return;
@@ -1241,12 +1777,18 @@ symbol_process_unsynced_analog(dsd_opts* opts, dsd_state* state, unsigned int an
     if ((unsigned int)state->analog_sample_counter >= analog_block) {
         state->analog_sample_counter = (int)analog_block - 1;
     }
+    if (opts->audio_in_type != AUDIO_IN_RTL) {
+        /* Audio input carries no flags of its own: the PCM noise squelch's, where it runs (issue #628). */
+        flag = dsd_analog_rx_pcm_squelch_sample(opts, state, sample);
+    }
+    state->analog_out_flags[state->analog_sample_counter] = flag;
     state->analog_out_f[state->analog_sample_counter++] = sample;
     /* Received-tone detection (issue #522) reads the raw block as it fills, so its verdicts keep
        pace with the input however long the block is: 960 samples are 384 ms at 2500 Hz. Every
        sample is offered, the one that completes the block too, so detection that starts on
        that sample hears only it and not the block that began before it. */
-    dsd_analog_rx_tap_partial(opts, state, state->analog_out_f, (unsigned int)state->analog_sample_counter);
+    dsd_analog_rx_tap_partial_flags(opts, state, state->analog_out_f, state->analog_out_flags,
+                                    (unsigned int)state->analog_sample_counter);
     if ((unsigned int)state->analog_sample_counter == analog_block) {
         symbol_finalize_unsynced_analog_block(opts, state, analog_block);
     }
@@ -1259,7 +1801,29 @@ dsd_symbol_test_push_unsynced_analog_sample(dsd_opts* opts, dsd_state* state, fl
         return;
     }
     const unsigned int cap = (unsigned int)(sizeof(state->analog_out) / sizeof(state->analog_out[0]));
-    symbol_process_unsynced_analog(opts, state, cap, sample);
+    symbol_analog_block_collect(opts, state, 0U);
+    symbol_process_unsynced_analog(opts, state, cap, sample, 0U);
+}
+
+void
+dsd_symbol_test_push_unsynced_analog_sample_flag(dsd_opts* opts, dsd_state* state, float sample, uint8_t flag) {
+    if (!opts || !state) {
+        return;
+    }
+    const unsigned int cap = (unsigned int)(sizeof(state->analog_out) / sizeof(state->analog_out[0]));
+    symbol_analog_block_collect(opts, state, 0U);
+    symbol_process_unsynced_analog(opts, state, cap, sample, flag);
+}
+
+void
+dsd_symbol_test_push_unsynced_analog_sample_rtl(dsd_opts* opts, dsd_state* state, float sample,
+                                                uint32_t rtl_generation) {
+    if (!opts || !state) {
+        return;
+    }
+    const unsigned int cap = (unsigned int)(sizeof(state->analog_out) / sizeof(state->analog_out[0]));
+    symbol_analog_block_collect(opts, state, rtl_generation);
+    symbol_process_unsynced_analog(opts, state, cap, sample, 0U);
 }
 #endif
 
@@ -1272,8 +1836,7 @@ symbol_process_synced_analog(dsd_opts* opts, dsd_state* state, unsigned int anal
     state->analog_out_f[state->analog_sample_counter++] = sample;
     if ((unsigned int)state->analog_sample_counter == analog_out_cap) {
         if (opts->wav_out_raw != NULL) {
-            symbol_convert_analog_block_to_i16(state, analog_out_cap);
-            symbol_write_wav_short_block(opts->wav_out_raw, state->analog_out, analog_out_cap, "symbol raw WAV");
+            symbol_write_raw_wav_block(opts, state, analog_out_cap, symbol_analog_block_rate_hz(opts, state));
             sf_write_sync(opts->wav_out_raw);
         }
         symbol_reset_analog_buffers(state);
@@ -1283,7 +1846,10 @@ symbol_process_synced_analog(dsd_opts* opts, dsd_state* state, unsigned int anal
 static inline void
 symbol_process_analog_capture(dsd_opts* opts, dsd_state* state, const symbol_work_ctx* work, int have_sync) {
 #ifdef USE_RADIO
+    /* Samples that are not collected leave a hole in a part-collected block: it is dropped, and the analog sinks start
+       over (issue #633), as at a receive-family switch (symbol_refresh_rtl_profile()). */
     if (work->rtl_symbol_rate_output) {
+        symbol_drop_analog_block(state);
         return;
     }
     /* The analog family's block is monitor audio. Between a switch into that family and the demod thread applying it
@@ -1291,11 +1857,32 @@ symbol_process_analog_capture(dsd_opts* opts, dsd_state* state, const symbol_wor
        not collected, or the block would play it as monitor audio (the switch ends it at the boundary, see
        symbol_refresh_rtl_profile()). */
     if (work->rtl_direct_output && dsd_opts_is_analog_family(opts)) {
+        symbol_drop_analog_block(state);
         return;
     }
+    /* Nor, on the monitor output, while the front end runs a monitor other than the one the decoder is configured for:
+       the other analog kind's (a switch between FM and AM, issue #582), or none (the analog family on a typed digital
+       scan row's channel, which a -Y leave back to Analog or AM puts the monitor back from). The decoder commits such
+       a change at once; the front end follows at the demod thread's next block boundary, clearing the output ring and
+       publishing its new monitor before that monitor's first sample. Until then the decoder reads another profile's
+       audio, a whole block of it when it has a backlog to catch up on, and a block with no boundary in it is one the
+       received-tone tap cannot mute (dsd_analog_rx_block_straddles_boundary()). A block part-collected from it is
+       dropped too, whichever path changed the decoder. A digital decoder on the monitor output collects what it reads,
+       as the -8 source monitor always has. */
+    if (!work->rtl_direct_output && work->rtl_monitor_kind != SYMBOL_MONITOR_UNKNOWN && dsd_opts_is_analog_family(opts)
+        && work->rtl_monitor_kind != opts->analog_demod) {
+        symbol_drop_analog_block(state);
+        return;
+    }
+    const uint32_t rtl_generation = opts->audio_in_type == AUDIO_IN_RTL ? work->rtl_sample_generation : 0U;
+#else
+    const uint32_t rtl_generation = 0U;
 #endif
+    /* A block that starts filling notes the reception it begins in for the audio chain, so a block that runs across a
+       retune is told from one wholly after it (dsd_analog_audio_process_f()), and the rate it runs at (issue #633). */
+    symbol_analog_block_collect(opts, state, rtl_generation);
     if (have_sync == 0) {
-        symbol_process_unsynced_analog(opts, state, work->analog_out_cap, work->sample);
+        symbol_process_unsynced_analog(opts, state, work->analog_out_cap, work->sample, work->sample_flag);
     } else if (have_sync == 1) {
         symbol_process_synced_analog(opts, state, work->analog_out_cap, work->sample);
     }
@@ -1332,18 +1919,17 @@ symbol_stop_after_shutdown(float* sample_out) {
     return 1;
 }
 
-static inline int
-symbol_open_pulse_input_and_reconfigure_output(dsd_opts* opts, dsd_state* state) {
-    opts->audio_in_type = AUDIO_IN_PULSE;
-    /* A new input is a new receiver (issue #522): the tone the file or TCP stream carried does
-       not describe live Pulse audio, which at the same rate nothing else would tell the tap. */
-    dsd_analog_rx_reset(state);
-    if (openAudioInput(opts) != 0) {
-        dsd_request_shutdown(opts, state);
-        return 0;
-    }
-    if (dsd_audio_reconfigure_output_for_input_policy(opts) != 0) {
-        dsd_request_shutdown(opts, state);
+enum { SYMBOL_INPUT_WAIT_SLICE_MS = 100 };
+
+/* The file or TCP input ended, and the session goes on with the Pulse input (issue #634). That switch replaces the input
+   under the decoder, so it is the engine's to make between frames, under the tick guard (dsd_engine_input_fallback()):
+   the frame being decoded finishes on silence, and a frame-sync hunt read leaves the hunt for it at once. */
+static int
+symbol_input_ended(dsd_state* state, const symbol_work_ctx* work, float* sample_out) {
+    state->input_fallback_pending = 1;
+    *sample_out = 0.0f;
+    if (work->hunting) {
+        state->input_interrupted = 1;
         return 0;
     }
     return 1;
@@ -1379,11 +1965,14 @@ symbol_read_sample_stdin(dsd_opts* opts, dsd_state* state, float* sample_out) {
 }
 
 static inline int
-symbol_read_sample_wav(dsd_opts* opts, dsd_state* state, float* sample_out) {
+symbol_read_sample_wav(dsd_opts* opts, dsd_state* state, float* sample_out, const symbol_work_ctx* work) {
     if (symbol_stop_after_shutdown(sample_out)) {
         return 0;
     }
     if (opts->audio_in_file == NULL) {
+        if (state->input_fallback_pending) {
+            return symbol_input_ended(state, work, sample_out);
+        }
         dsd_request_shutdown(opts, state);
         return 0;
     }
@@ -1405,7 +1994,7 @@ symbol_read_sample_wav(dsd_opts* opts, dsd_state* state, float* sample_out) {
          * gets the headless answer -- end of input ends the run -- and re-runs the
          * engine itself when it wants another source. */
         if (opts->audio_out_type == 0 && dsd_opts_frontend_active(opts)) {
-            return symbol_open_pulse_input_and_reconfigure_output(opts, state);
+            return symbol_input_ended(state, work, sample_out);
         }
         dsd_request_shutdown(opts, state);
         return 0;
@@ -1432,6 +2021,19 @@ symbol_maybe_publish_rtl_input_level(dsd_opts* opts, dsd_state* state) {
     }
 }
 
+/* The monitor the front end publishes it runs (symbol_work_ctx::rtl_monitor_kind), read on the monitor output once per
+   getSymbol(). The demod thread clears the output ring before it publishes a new monitor, so no sample of the old one
+   is read under the new answer. A sample of the new one read under the old answer (the switch landing part-way
+   through a symbol) is only dropped. */
+static inline int
+rtl_symbol_monitor_kind(void) {
+    int kind = 0;
+    if (dsd_rtl_stream_metrics_hook_analog_profile(&kind, NULL, NULL) == 1) {
+        return kind;
+    }
+    return dsd_rtl_stream_metrics_hook_analog_family_active() ? SYMBOL_MONITOR_OFF_PROFILE : SYMBOL_MONITOR_UNKNOWN;
+}
+
 static inline int
 symbol_refresh_rtl_profile(dsd_state* state, symbol_work_ctx* work) {
     if (!work) {
@@ -1451,14 +2053,18 @@ symbol_refresh_rtl_profile(dsd_state* state, symbol_work_ctx* work) {
         work->rtl_profile_changed |=
             rtl_symbol_cache_profile(state, work->rtl_output_kind, work->rtl_channel_profile, work->rtl_symbol_rate_hz,
                                      work->rtl_symbol_levels, work->rtl_stream_generation);
+        work->rtl_monitor_kind = SYMBOL_MONITOR_UNKNOWN;
     } else {
         rtl_symbol_cache_clear(state);
+        work->rtl_monitor_kind = rtl_symbol_monitor_kind();
     }
     if (state && work->rtl_direct_output != was_direct) {
         /* The front end moved between the monitor output and a direct (digital) one: a receive-family switch landed.
            Whatever the analog block part-collected came off the old output, so the next block starts with the new
-           one's samples. (A stream's first direct read lands here too, with nothing collected yet.) */
+           one's samples. (A stream's first direct read lands here too, with nothing collected yet.) The analog sinks
+           start over too (issue #633). */
         symbol_reset_analog_buffers(state);
+        dsd_analog_sink_break(state);
     }
     return work->rtl_direct_output;
 }
@@ -1554,11 +2160,11 @@ symbol_apply_rtl_fsk_discriminator_timing(const dsd_opts* opts, dsd_state* state
     int output_rate_hz = symbol_rtl_fsk_output_rate_hz(opts);
     /* The SPS hunt's profile, not the front end's published rate. A hunt step only
      * queues its RTL profile request for the demod thread to apply between input
-     * blocks, so the published rate lags by at least a block -- and under fast I/Q
-     * replay of a fixture that fits the output ring it never moves at all. Slicing
-     * on the lagging rate put the timing back on the old profile after every hunt
-     * step, which frame_sync_ensure_enabled_sps_profile() then read as "the hunt is
-     * on the old profile", cancelling the step and pinning AUTO to 4800/4. */
+     * blocks, so the published rate lags by at least a block, live and in an I/Q
+     * replay alike. Slicing on the lagging rate put the timing back on the old
+     * profile after every hunt step, which frame_sync_ensure_enabled_sps_profile()
+     * then read as "the hunt is on the old profile", cancelling the step and pinning
+     * AUTO to 4800/4. */
     int symbol_rate_hz = dsd_frame_sync_active_profile_symbol_rate_hz(state);
     if (symbol_rate_hz <= 0) {
         symbol_rate_hz = symbol_rtl_fsk_symbol_rate_hz(work);
@@ -1567,6 +2173,18 @@ symbol_apply_rtl_fsk_discriminator_timing(const dsd_opts* opts, dsd_state* state
 
     state->samplesPerSymbol = symbol_rtl_fsk_next_sps(state, output_rate_hz, symbol_rate_hz);
     state->symbolCenter = dsd_opts_symbol_center(state->samplesPerSymbol);
+}
+
+/* The refresh a cache take that is not READY asks for: after a RETRY, which dropped the cache, or a REFRESH, which kept
+   an I/Q replay's first batch after a change. The work context follows the stream either way. A REFRESH's cache already
+   carries the stream's labels, so the refresh finds no change in it to report; the change is reported all the same,
+   and the timing and slicer then reset exactly as after a RETRY. */
+static inline void
+symbol_refresh_rtl_profile_after_take(dsd_state* state, symbol_work_ctx* work, int cache_status) {
+    (void)symbol_refresh_rtl_profile(state, work);
+    if (cache_status == RTL_SYMBOL_CACHE_REFRESH) {
+        work->rtl_profile_changed = 1;
+    }
 }
 
 static inline int
@@ -1578,12 +2196,12 @@ symbol_read_cached_rtl_sample(dsd_opts* opts, dsd_state* state, float* sample_ou
         if (cache_status == RTL_SYMBOL_CACHE_READY) {
             return 1;
         }
-        if (cache_status != RTL_SYMBOL_CACHE_RETRY) {
+        if (cache_status != RTL_SYMBOL_CACHE_RETRY && cache_status != RTL_SYMBOL_CACHE_REFRESH) {
             dsd_request_shutdown(opts, state);
             return 0;
         }
         work->rtl_span_restart = 1;
-        symbol_refresh_rtl_profile(state, work);
+        symbol_refresh_rtl_profile_after_take(state, work, cache_status);
         if (!work->rtl_fsk_discriminator_output) {
             return 0;
         }
@@ -1603,14 +2221,23 @@ symbol_read_sample_rtl(dsd_opts* opts, dsd_state* state, float* sample_out, symb
         if (!symbol_read_cached_rtl_sample(opts, state, sample_out, work)) {
             return 0;
         }
+        /* The cache checks each sample's batch against this generation. */
+        work->rtl_sample_generation = work->rtl_stream_generation;
         opts->rtl_pwr = dsd_rtl_stream_io_hook_return_pwr(state);
+        dsd_frame_sync_note_replay_center(opts, state, state->rtl_symbol_cache_center_hz);
         return 1;
     }
     int got = 0;
-    if (dsd_rtl_stream_io_hook_read(state, sample_out, 1, &got) < 0 || got != 1) {
+    if (dsd_rtl_stream_io_hook_read_ex(state, sample_out, &work->sample_flag, 1, &got) < 0 || got != 1) {
         dsd_request_shutdown(opts, state);
         return 0;
     }
+    work->rtl_sample_generation = dsd_rtl_stream_metrics_hook_stream_generation();
+    /* An I/Q replay's sample runs the decode clock to its capture time (issue #572) and notes the centre it was captured
+       on (issue #575). */
+    uint32_t replay_center_hz = 0U;
+    (void)dsd_rtl_stream_metrics_hook_replay_advance_decode_clock(&replay_center_hz);
+    dsd_frame_sync_note_replay_center(opts, state, replay_center_hz);
     opts->rtl_pwr = dsd_rtl_stream_io_hook_return_pwr(state);
     if (!work->rtl_symbol_rate_output && !work->cqpsk_symbol_rate && !work->rtl_fsk_discriminator_output) {
         *sample_out *= opts->rtl_volume_multiplier;
@@ -1619,18 +2246,68 @@ symbol_read_sample_rtl(dsd_opts* opts, dsd_state* state, float* sample_out, symb
 }
 #endif
 
+/* The TCP reconnect gives up a backoff or a connect attempt for shutdown, and, in a frame-sync hunt, for a queued
+   command (issue #634): the stream ended when its read failed, so the hunt loses nothing of it. */
 static int
-symbol_read_sample_tcp(dsd_opts* opts, dsd_state* state, float* sample_out) {
-    short s = 0;
-    int tcp_result = dsd_net_audio_input_hook_tcp_read_sample(opts->tcp_in_ctx, (int16_t*)&s);
-    s = symbol_scale_pcm_i16(s, opts->input_volume_multiplier);
-    *sample_out = (float)s;
-    if (tcp_result == 0) {
-        int reconnected = 0;
-    TCP_RETRY:
+symbol_tcp_reconnect_cancelled_decoding(void* context) {
+    (void)context;
+    return dsd_exitflag_load() == 1;
+}
+
+static int
+symbol_tcp_reconnect_cancelled_hunting(void* context) {
+    (void)context;
+    return dsd_exitflag_load() == 1 || dsd_runtime_controls_pending();
+}
+
+/* Wait out the reconnect backoff in slices. Returns 1 when the reconnect was cancelled meanwhile. */
+static int
+symbol_tcp_backoff(int backoff_ms, dsd_socket_cancel_fn cancelled) {
+    int waited = 0;
+    while (waited < backoff_ms) {
+        if (cancelled(NULL)) {
+            return 1;
+        }
+        const int left = backoff_ms - waited;
+        const int slice = left < SYMBOL_INPUT_WAIT_SLICE_MS ? left : SYMBOL_INPUT_WAIT_SLICE_MS;
+        dsd_sleep_ms((unsigned int)slice);
+        waited += slice;
+    }
+    return cancelled(NULL);
+}
+
+/* A cancelled reconnect: shutdown, or a hunt read that leaves for a queued command with the TCP input still
+   disconnected, which the next read tries to reconnect again. */
+static int
+symbol_tcp_reconnect_gave_up(dsd_opts* opts, dsd_state* state) {
+    if (dsd_exitflag_load() == 1) {
+        dsd_request_shutdown(opts, state);
+        return 0;
+    }
+    state->input_interrupted = 1;
+    return 0;
+}
+
+static void
+symbol_tcp_close(dsd_opts* opts) {
+    if (opts->tcp_in_ctx) {
+        dsd_net_audio_input_hook_tcp_close(opts->tcp_in_ctx);
+        opts->tcp_in_ctx = NULL;
+    }
+    if (opts->tcp_sockfd != DSD_INVALID_SOCKET) {
+        dsd_socket_close(opts->tcp_sockfd);
+        opts->tcp_sockfd = DSD_INVALID_SOCKET;
+    }
+}
+
+/* Reconnect the TCP input after its read failed. Returns 1 when it reconnected, 0 when it did not (the read that
+   follows finds no stream), and -1 when it was cancelled (symbol_tcp_reconnect_gave_up()). An M17 session keeps
+   trying until it reconnects or is cancelled. */
+static int
+symbol_tcp_reconnect(dsd_opts* opts, dsd_state* state, dsd_socket_cancel_fn cancelled) {
+    for (;;) {
         if (dsd_exitflag_load() == 1) {
-            dsd_request_shutdown(opts, state);
-            return 0;
+            return -1;
         }
         int backoff_ms = 300;
         const dsdneoRuntimeConfig* cfg_retry = dsd_neo_get_config();
@@ -1646,26 +2323,51 @@ symbol_read_sample_tcp(dsd_opts* opts, dsd_state* state, float* sample_out) {
            reception (issue #522). The default backoff is shorter than a pause the received-tone
            tap would notice, so the old tone would otherwise carry over onto the new connection. */
         dsd_analog_rx_reset(state);
-        dsd_net_audio_input_hook_tcp_close(opts->tcp_in_ctx);
-        opts->tcp_in_ctx = NULL;
-        dsd_socket_close(opts->tcp_sockfd);
-        dsd_sleep_ms((unsigned int)backoff_ms);
+        symbol_tcp_close(opts);
+        if (symbol_tcp_backoff(backoff_ms, cancelled)) {
+            return -1;
+        }
 
-        opts->tcp_sockfd = 0;
-        opts->tcp_sockfd = Connect(opts->tcp_hostname, opts->tcp_portno);
-        if (opts->tcp_sockfd != 0) {
+        /* The address the connection was made to: a reconnect looks nothing up (issue #634). */
+        opts->tcp_sockfd =
+            dsd_net_audio_input_hook_tcp_connect(opts->tcp_hostname, opts->tcp_portno, 0, cancelled, NULL);
+        if (opts->tcp_sockfd != DSD_INVALID_SOCKET) {
             opts->tcp_in_ctx = dsd_net_audio_input_hook_tcp_open(opts->tcp_sockfd, opts->wav_sample_rate);
             if (opts->tcp_in_ctx == NULL) {
                 DSD_FPRINTF(stderr, "Error, couldn't Reconnect to TCP audio input\n");
-            } else {
-                reconnected = 1;
-                LOG_INFO("TCP Socket Reconnected Successfully.\n");
+                return 0;
             }
-        } else {
-            LOG_ERROR("TCP Socket Connection Error.\n");
-            if (opts->frame_m17 == 1) {
-                goto TCP_RETRY;
-            }
+            /* A new stream, whatever the old one's resampler tail still returns first (issue #628). */
+            dsd_opts_note_pcm_stream(opts);
+            LOG_INFO("TCP Socket Reconnected Successfully.\n");
+            return 1;
+        }
+        LOG_ERROR("TCP Socket Connection Error.\n");
+        /* A connect a queued command cancelled lost no server: the read gives way to the command first. */
+        if (cancelled(NULL)) {
+            return -1;
+        }
+        if (opts->frame_m17 != 1) {
+            return 0;
+        }
+    }
+}
+
+static int
+symbol_read_sample_tcp(dsd_opts* opts, dsd_state* state, float* sample_out, const symbol_work_ctx* work) {
+    short s = 0;
+    int tcp_result = dsd_net_audio_input_hook_tcp_read_sample(opts->tcp_in_ctx, (int16_t*)&s);
+    s = symbol_scale_pcm_i16(s, opts->input_volume_multiplier);
+    *sample_out = (float)s;
+    if (tcp_result == 0) {
+        if (state->input_fallback_pending) {
+            return symbol_input_ended(state, work, sample_out);
+        }
+        const dsd_socket_cancel_fn cancelled =
+            work->hunting ? symbol_tcp_reconnect_cancelled_hunting : symbol_tcp_reconnect_cancelled_decoding;
+        const int reconnected = symbol_tcp_reconnect(opts, state, cancelled);
+        if (reconnected < 0) {
+            return symbol_tcp_reconnect_gave_up(opts, state);
         }
 
         if (dsd_pcm_input_take_staged_tail_sample(opts, sample_out, 1)) {
@@ -1679,15 +2381,9 @@ symbol_read_sample_tcp(dsd_opts* opts, dsd_state* state, float* sample_out) {
         tcp_result = dsd_net_audio_input_hook_tcp_read_sample(opts->tcp_in_ctx, (int16_t*)&s_retry);
         *sample_out = (float)s_retry;
         if (tcp_result == 0) {
-            dsd_net_audio_input_hook_tcp_close(opts->tcp_in_ctx);
-            opts->tcp_in_ctx = NULL;
-            dsd_socket_close(opts->tcp_sockfd);
-            opts->tcp_sockfd = 0;
-            if (!symbol_open_pulse_input_and_reconfigure_output(opts, state)) {
-                return 0;
-            }
-            *sample_out = 0;
+            symbol_tcp_close(opts);
             DSD_FPRINTF(stderr, "Connection to TCP Server Disconnected.\n");
+            return symbol_input_ended(state, work, sample_out);
         }
     }
     if (opts->audio_in_type == AUDIO_IN_TCP && dsd_pcm_input_uses_staged_resampler(opts)) {
@@ -1697,10 +2393,46 @@ symbol_read_sample_tcp(dsd_opts* opts, dsd_state* state, float* sample_out) {
     return 1;
 }
 
+/* Wait for the next UDP sample. A frame-sync hunt read leaves the wait for a queued command (issue #634), but only
+   once the input has been silent for a stream pause, as long as the analog receiver takes for a boundary
+   (DSD_ANALOG_STREAM_PAUSE_MIN_MS): the partial symbol and sync history it gives up then belong to a paused stream,
+   and a shorter gap never costs a sync. The silence is counted from the first wait that came back empty, with nothing
+   credited for that wait, which may have ended early. Returns 1 with a sample, 0 when the input stopped, and -1 when
+   the read left for a command (state->input_interrupted). */
+static int
+symbol_wait_udp_sample(dsd_opts* opts, dsd_state* state, const symbol_work_ctx* work, int16_t* out) {
+    uint64_t silent_since_ms = 0U;
+    int silent = 0;
+    for (;;) {
+        const int got = dsd_net_audio_input_hook_udp_read_sample_wait(opts, out, SYMBOL_INPUT_WAIT_SLICE_MS);
+        if (got >= 0) {
+            return got;
+        }
+        if (!work->hunting) {
+            continue;
+        }
+        const uint64_t now_ms = dsd_realtime_mono_ms();
+        if (!silent) {
+            silent = 1;
+            silent_since_ms = now_ms;
+            continue;
+        }
+        if (now_ms - silent_since_ms >= DSD_ANALOG_STREAM_PAUSE_MIN_MS && dsd_runtime_controls_pending()) {
+            state->input_interrupted = 1;
+            return -1;
+        }
+    }
+}
+
 static inline int
-symbol_read_sample_udp(dsd_opts* opts, dsd_state* state, float* sample_out) {
+symbol_read_sample_udp(dsd_opts* opts, dsd_state* state, float* sample_out, const symbol_work_ctx* work) {
     short s = 0;
-    if (!dsd_net_audio_input_hook_udp_read_sample(opts, (int16_t*)&s)) {
+    const int got = symbol_wait_udp_sample(opts, state, work, (int16_t*)&s);
+    if (got < 0) {
+        *sample_out = 0.0f;
+        return 0;
+    }
+    if (got == 0) {
         if (dsd_pcm_input_take_staged_tail_sample(opts, sample_out, 1)) {
             return 1;
         }
@@ -1720,6 +2452,33 @@ symbol_read_sample_udp(dsd_opts* opts, dsd_state* state, float* sample_out) {
     if (dsd_pcm_input_uses_staged_resampler(opts)) {
         dsd_pcm_input_stage_resample(opts, *sample_out);
         *sample_out = opts->input_upsample_buf[opts->input_upsample_pos++];
+    }
+    return 1;
+}
+
+/* The next sample from the input itself. */
+static int
+symbol_read_live_sample(dsd_opts* opts, dsd_state* state, symbol_work_ctx* work) {
+    work->sample_flag = 0U;
+    if (opts->audio_in_type == AUDIO_IN_PULSE) {
+        return symbol_read_sample_pulse(opts, &work->sample);
+    }
+    if (opts->audio_in_type == AUDIO_IN_STDIN) {
+        return symbol_read_sample_stdin(opts, state, &work->sample);
+    }
+    if (opts->audio_in_type == AUDIO_IN_WAV) {
+        return symbol_read_sample_wav(opts, state, &work->sample, work);
+    }
+#ifdef USE_RADIO
+    if (opts->audio_in_type == AUDIO_IN_RTL) {
+        return symbol_read_sample_rtl(opts, state, &work->sample, work);
+    }
+#endif
+    if (opts->audio_in_type == AUDIO_IN_TCP) {
+        return symbol_read_sample_tcp(opts, state, &work->sample, work);
+    }
+    if (opts->audio_in_type == AUDIO_IN_UDP) {
+        return symbol_read_sample_udp(opts, state, &work->sample, work);
     }
     return 1;
 }
@@ -1746,27 +2505,12 @@ symbol_take_sample(dsd_opts* opts, dsd_state* state, symbol_work_ctx* work) {
     if (dsd_pcm_input_take_staged_tail_sample(opts, &work->sample, 0)) {
         return 1;
     }
-    if (opts->audio_in_type == AUDIO_IN_PULSE) {
-        return symbol_read_sample_pulse(opts, &work->sample);
-    }
-    if (opts->audio_in_type == AUDIO_IN_STDIN) {
-        return symbol_read_sample_stdin(opts, state, &work->sample);
-    }
-    if (opts->audio_in_type == AUDIO_IN_WAV) {
-        return symbol_read_sample_wav(opts, state, &work->sample);
-    }
-#ifdef USE_RADIO
-    if (opts->audio_in_type == AUDIO_IN_RTL) {
-        return symbol_read_sample_rtl(opts, state, &work->sample, work);
-    }
-#endif
-    if (opts->audio_in_type == AUDIO_IN_TCP) {
-        return symbol_read_sample_tcp(opts, state, &work->sample);
-    }
-    if (opts->audio_in_type == AUDIO_IN_UDP) {
-        return symbol_read_sample_udp(opts, state, &work->sample);
-    }
-    return 1;
+    /* A queued input's backlog comes back from the read at once; only a read that has to wait for the input shows it
+       ran dry to the received-tone backlog skip after a boundary (issue #576). */
+    dsd_analog_rx_input_wait_begin(state);
+    const int taken = symbol_read_live_sample(opts, state, work);
+    dsd_analog_rx_input_wait_end(state);
+    return taken;
 }
 
 #ifdef USE_RADIO
@@ -1800,12 +2544,12 @@ symbol_try_rtl_symbol_rate_fast_path(dsd_opts* opts, dsd_state* state, symbol_wo
         if (cache_status == RTL_SYMBOL_CACHE_READY) {
             break;
         }
-        if (cache_status != RTL_SYMBOL_CACHE_RETRY) {
+        if (cache_status != RTL_SYMBOL_CACHE_RETRY && cache_status != RTL_SYMBOL_CACHE_REFRESH) {
             dsd_request_shutdown(opts, state);
             return -1;
         }
 
-        (void)symbol_refresh_rtl_profile(state, work);
+        symbol_refresh_rtl_profile_after_take(state, work, cache_status);
         if (!work->rtl_symbol_rate_output) {
             break;
         }
@@ -1815,6 +2559,7 @@ symbol_try_rtl_symbol_rate_fast_path(dsd_opts* opts, dsd_state* state, symbol_wo
         return 0;
     }
     opts->rtl_pwr = dsd_rtl_stream_io_hook_return_pwr(state);
+    dsd_frame_sync_note_replay_center(opts, state, state->rtl_symbol_cache_center_hz);
     state->lastsample = work->sample;
     /* One sample per symbol here, which the measurement recognises as a grid with no
        sub-symbol structure to report on. */
@@ -1886,9 +2631,27 @@ symbol_print_timing_line(const dsd_state* state, int timing_level) {
     }
 }
 
+/* The symbol capture ended and the session goes on with the Pulse input: as for a PCM file (symbol_input_ended()),
+   the engine makes the switch between frames, and a frame-sync hunt read leaves the hunt for it. The frame being
+   decoded finishes on erasures: the symbol that stands in is marked unusable, so the two-level readers give its bit no
+   confidence, as the dibit readers give its dibit none (issue #634). */
 static inline int
-symbol_process_symbol_bin_input(dsd_opts* opts, dsd_state* state, float* symbol_out) {
+symbol_bin_input_ended(dsd_state* state, int hunting, float* symbol_out) {
+    state->input_fallback_pending = 1;
+    if (hunting) {
+        state->input_interrupted = 1;
+    }
+    *symbol_out = 0.0f;
+    state->symbol_replay_symbol_unusable = 1;
+    return 1;
+}
+
+static inline int
+symbol_process_symbol_bin_input(dsd_opts* opts, dsd_state* state, float* symbol_out, int hunting) {
     if (opts->symbolfile == NULL) {
+        if (state->input_fallback_pending) {
+            return symbol_bin_input_ended(state, hunting, symbol_out);
+        }
         DSD_FPRINTF(stderr, "Error Opening File %s\n", opts->audio_in_dev);
         *symbol_out = -1.0f;
         return 1;
@@ -1913,6 +2676,7 @@ symbol_process_symbol_bin_input(dsd_opts* opts, dsd_state* state, float* symbol_
             if (c != EOF) {
                 state->symbolc = c & 3;
                 state->symbol_replay_has_soft = 0;
+                state->symbol_replay_symbol_unusable = 0;
                 *symbol_out = dsd_symbol_level_from_dibit((uint8_t)state->symbolc);
                 read_ok = 1;
             }
@@ -1943,9 +2707,7 @@ symbol_process_symbol_bin_input(dsd_opts* opts, dsd_state* state, float* symbol_
         }
         /* Frontend kind on purpose; same reasoning as the PCM end-of-file path above. */
         if (opts->audio_out_type == 0 && dsd_opts_frontend_active(opts)) {
-            (void)symbol_open_pulse_input_and_reconfigure_output(opts, state);
-            *symbol_out = 0.0f;
-            return 1;
+            return symbol_bin_input_ended(state, hunting, symbol_out);
         }
         dsd_request_shutdown(opts, state);
         *symbol_out = 0.0f;
@@ -1954,17 +2716,28 @@ symbol_process_symbol_bin_input(dsd_opts* opts, dsd_state* state, float* symbol_
 }
 
 static inline int
-symbol_process_symbol_flt_input(dsd_opts* opts, float* symbol_out) {
-    float float_symbol = 0.0f;
-    size_t read_count = fread(&float_symbol, sizeof(float), 1, opts->symbolfile);
+symbol_process_symbol_flt_input(dsd_opts* opts, dsd_state* state, float* symbol_out) {
+    uint32_t raw_symbol = 0U;
+    size_t read_count = fread(&raw_symbol, sizeof(raw_symbol), 1, opts->symbolfile);
     if (read_count != 1) {
         dsd_exitflag_store(1);
         *symbol_out = 0.0f;
+        state->symbol_replay_symbol_unusable = 1;
         return 1;
     }
     if (feof(opts->symbolfile)) {
         dsd_exitflag_store(1);
     }
+    /* An unusable symbol reads as 0, the symbol this reader gives when it has none, and in its place, so the symbols
+       after it keep their positions. It is marked as an erasure: 0 is no confidence only when the thresholds centre
+       on it. */
+    state->symbol_replay_symbol_unusable = 0;
+    if (!symbol_file_bits_in_range(raw_symbol, SYMBOL_FILE_FLT_LIMIT_BITS)) {
+        raw_symbol = 0U;
+        state->symbol_replay_symbol_unusable = 1;
+    }
+    float float_symbol = 0.0f;
+    DSD_MEMCPY(&float_symbol, &raw_symbol, sizeof(float_symbol));
     *symbol_out = float_symbol * 10000.0f;
     return 1;
 }
@@ -2164,12 +2937,12 @@ symbol_prepare_span_no_radio(dsd_state* state, symbol_work_ctx* work) {
 #endif
 
 static inline void
-symbol_apply_replay_overrides(dsd_opts* opts, dsd_state* state, float* symbol) {
+symbol_apply_replay_overrides(dsd_opts* opts, dsd_state* state, float* symbol, int hunting) {
     if (opts->audio_in_type == AUDIO_IN_SYMBOL_BIN) {
-        (void)symbol_process_symbol_bin_input(opts, state, symbol);
+        (void)symbol_process_symbol_bin_input(opts, state, symbol, hunting);
     }
     if (opts->audio_in_type == AUDIO_IN_SYMBOL_FLT) {
-        (void)symbol_process_symbol_flt_input(opts, symbol);
+        (void)symbol_process_symbol_flt_input(opts, state, symbol);
     }
 }
 
@@ -2192,6 +2965,7 @@ float
 getSymbol(dsd_opts* opts, dsd_state* state, int have_sync) {
     symbol_work_ctx work;
     symbol_work_ctx_init(&work, state);
+    work.hunting = have_sync == 0;
 
 #ifdef USE_RADIO
     symbol_init_rtl_profile(opts, state, &work);
@@ -2213,6 +2987,6 @@ getSymbol(dsd_opts* opts, dsd_state* state, int have_sync) {
 
     float symbol = symbol_finalize_live_symbol(state, &work);
 
-    symbol_apply_replay_overrides(opts, state, &symbol);
+    symbol_apply_replay_overrides(opts, state, &symbol, work.hunting);
     return symbol_commit_symbol(opts, state, have_sync, &work, symbol);
 }

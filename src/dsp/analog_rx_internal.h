@@ -15,7 +15,8 @@
  * Signal path (issue #522):
  *   raw block @ fs -> stage 1: polyphase Blackman FIR, decimate by D = floor(fs / 2400)
  *                  -> stage 2: Blackman LPF at fs/D, 290 Hz cutoff, 60 Hz transition
- *                  -> DC blocker -> every detector in the core's table (CTCSS here, DCS in #523)
+ *                  -> DC blocker -> every detector in the core's table (DCS, then CTCSS: the first
+ *                     lock in table order is published, see k_detectors in analog_rx.c)
  * Detectors also get the stage-1 output delayed to line up with stage 2 (the "wide" stream,
  * about 0-1 kHz): the CTCSS detector uses it to see a voice fundamental's harmonics, which a
  * tone does not have. And they get the "full" stream, aligned the same way: the raw input's
@@ -55,7 +56,15 @@ enum { DSD_ANALOG_RX_MAX_RATE_HZ = 320000 };
  * @brief Top of the sub-audible band: stage 2's cutoff, and the band every detector assumes
  * its noise fills.
  */
-#define DSD_ANALOG_RX_BAND_HZ 290.0
+#define DSD_ANALOG_RX_BAND_HZ      290.0
+
+/**
+ * @brief Corner of the front end's DC blocker (a one-pole high-pass on the band).
+ *
+ * The DCS detector undoes it: at 134.4 bit/s a 10 Hz high-pass takes a third of a bit's level
+ * away per bit of a run, so it moves the pole to DSD_ANALOG_DCS_DC_CORNER_HZ instead.
+ */
+#define DSD_ANALOG_RX_DC_CORNER_HZ 10.0
 
 /** @brief Target decimated rate; the actual one is fs / floor(fs / 2400). */
 enum { DSD_ANALOG_RX_TARGET_RATE_HZ = 2400 };
@@ -83,6 +92,10 @@ enum { DSD_ANALOG_CTCSS_LONG_WINDOW = 12, DSD_ANALOG_CTCSS_LONG_MIN = 8 };
 /** @brief Consecutive agreeing hops needed to lock, and failing hops that lose the lock. */
 enum { DSD_ANALOG_CTCSS_ACQUIRE_HOPS = 2, DSD_ANALOG_CTCSS_LOSE_HOPS = 4 };
 
+/** @brief Consecutive agreeing hops a tone of the close 150.0/151.4 Hz pair needs instead while its candidate's newest
+    estimate leans toward the other tone of the pair (issue #623; k_pair_lean_hz in analog_ctcss.c). */
+enum { DSD_ANALOG_CTCSS_PAIR_LEAN_HOPS = DSD_ANALOG_CTCSS_ACQUIRE_HOPS + 1 };
+
 /** @brief Carrier time without a lock after which the verdict is "no tone". */
 enum { DSD_ANALOG_CTCSS_NO_TONE_MS = 500 };
 
@@ -99,8 +112,14 @@ typedef struct {
     int state;           /**< ACQUIRING, LOCKED or NONE (dsd_analog_tone_state) */
     int kind;            /**< dsd_analog_tone_kind; NONE unless LOCKED */
     int ctcss_tenths_hz; /**< locked CTCSS tone, tenths of a hertz */
-    int dcs_code;        /**< reserved for the DCS detector (#523) */
-    int dcs_inverted;    /**< reserved for the DCS detector (#523) */
+    int dcs_code;        /**< locked DCS code as its value (023 octal = 19), canonical */
+    int dcs_inverted;    /**< 1 when the canonical member of the locked DCS class is inverted */
+    /** 1 while, not locked, the detector holds a candidate it has not confirmed yet (the DCS detector's
+        dsd_analog_dcs::candidate_age; issue #527); 0 from every other detector. */
+    int candidate;
+    /** 1 while a CTCSS lock rests on transmitter tone error alone (issue #643): the detector's own rules for a tone on
+        its value (within 0.5 Hz) did not confirm it, or no longer hold it (dsd_analog_ctcss::main_confirmed). */
+    int off_value;
 } dsd_analog_rx_report;
 
 /**
@@ -133,6 +152,12 @@ typedef struct {
     double share;      /**< the tone's share of the raw input's full-band power (0..1) */
     double recent_rho; /**< rho over the newest 100 ms at the locked frequency, when locked */
     double harmonic;   /**< phase-locked (2f, 3f) power over the candidate's; computed only when needed */
+    int span;          /**< sub-blocks the measured window held */
+    /** Variance of est_hz in Hz^2 (issue #643), computed only when the tone-error gate needs it: < 0 until then. */
+    double est_var_hz2;
+    /** 1 when every sub-block of the window carries the bin's tone (ctcss_window_stationary()), 0 when not, -1 until
+        the tone-error gate needs it. */
+    int stationary;
 } dsd_analog_ctcss_hop;
 
 /** @brief A tone the acquisition tracks from hop to hop, one per acquisition window. */
@@ -143,7 +168,24 @@ typedef struct {
         reference a lock on index starts from */
     double prev_hz;
     int run; /**< consecutive hops that qualified index */
+    /** Of those, the consecutive newest ones that qualified it on its value, within 0.5 Hz (issue #643): the run the
+        detector's on-value rules alone would have. */
+    int narrow_run;
 } dsd_analog_ctcss_cand;
+
+/** @brief Per-tone gates and factors, computed once when the detector is configured (issue #643). */
+typedef struct {
+    /** How far an estimate may sit off the table value and still be the tone: 0.8 Hz, or 0.5 % where that is more. */
+    double tolerance_hz[DSD_CTCSS_TONE_COUNT];
+    /** The snap and hold gate: the tolerance, or half the distance to the nearest neighbour where that is less. */
+    double gate_hz[DSD_CTCSS_TONE_COUNT];
+    /** The on-value rules' gate: 0.8 Hz, or half the distance to the nearest neighbour where that is less. */
+    double on_value_gate_hz[DSD_CTCSS_TONE_COUNT];
+    /** FM discriminator noise density at the tone over the band average, never below 1. */
+    double noise_shape[DSD_CTCSS_TONE_COUNT];
+    /** The other tone of a close pair (only 150.0 and 151.4 Hz have one), or -1. */
+    int close_neighbour[DSD_CTCSS_TONE_COUNT];
+} dsd_analog_ctcss_tables;
 
 /**
  * @brief CTCSS detector working state (a correlator bin per supported tone).
@@ -173,19 +215,38 @@ typedef struct {
     int ring_head;  /**< next ring slot to write; the oldest sub-block once the ring is full */
     int ring_count; /**< sub-blocks in the ring, up to DSD_ANALOG_CTCSS_LONG_WINDOW */
     int fresh;      /**< sub-blocks closed since the last reset or loss, up to DSD_ANALOG_CTCSS_LONG_WINDOW */
-    int state;      /**< dsd_analog_tone_state: ACQUIRING, LOCKED or NONE */
-    int locked;     /**< table index of the locked tone, or -1 */
+    /** fresh as the on-value rules count it (issue #643): since the last reset or the loss of a lock they held, so a
+        lock that rested on tone error alone, which they never had, starts no late window over for them. */
+    int main_fresh;
+    int state;  /**< dsd_analog_tone_state: ACQUIRING, LOCKED or NONE */
+    int locked; /**< table index of the locked tone, or -1 */
     double locked_hz;
     /** The reverse burst check's reference: locked_hz as it stood two hops ago, or on the first
         hop after a lock the candidate's estimate from the hop before the lock (prev_hz).
         Either comes from a window that ends no later than the older sub-block of each pair the
         check compares. */
     double burst_ref_hz;
-    dsd_analog_ctcss_cand cand;            /**< what the 250 ms window has been qualifying */
-    dsd_analog_ctcss_cand long_cand;       /**< what the late acquisition window has been qualifying */
-    int fail_run;                          /**< consecutive hops the locked tone failed its hold */
-    int holdoff;                           /**< hops left before a tone may lock again (after a reverse burst) */
-    int64_t open_samples;                  /**< unfrozen samples since the last reset, for the no-tone verdict */
+    dsd_analog_ctcss_cand cand;      /**< what the 250 ms window has been qualifying */
+    dsd_analog_ctcss_cand long_cand; /**< what the late acquisition window has been qualifying */
+    int fail_run;                    /**< consecutive hops the locked tone failed its hold */
+    /** How far off its table value the locked tone was confirmed, the most of the lock and later confirmations: what
+        sizes the hold (issue #643). */
+    double lock_offset_hz;
+    /** 1 while the on-value rules confirm the lock: it was locked, or since confirmed, from a run of hops within
+        0.5 Hz, and the on-value hold has not failed DSD_ANALOG_CTCSS_LOSE_HOPS hops in a row since. */
+    int main_confirmed;
+    int main_fail_run; /**< consecutive held hops the on-value hold would have failed */
+    /** 1 once the on-value rules would have lost the lock that is still held (main_fail_run ran out), until it is
+        confirmed again or lost. */
+    int main_lost;
+    /** 1 once the on-value rules' own verdict, with no lock of theirs, is NONE -- they lost a lock, or read no tone after
+        DSD_ANALOG_CTCSS_NO_TONE_MS of carrier -- until a reset: what a lock that rests on tone error alone returns to
+        when it is lost. */
+    int main_none;
+    dsd_analog_ctcss_tables tables;
+    int holdoff;          /**< hops left before a tone may lock again (after a reverse burst) */
+    int wide_holdoff;     /**< the same for the tone-error rules alone, after a burst on a lock that rested on them */
+    int64_t open_samples; /**< unfrozen samples since the last reset, for the no-tone verdict */
     float wide[DSD_ANALOG_CTCSS_WIDE_MAX]; /**< the ring's wide-stream samples, circular */
     int wide_len;                          /**< ring length in samples (LONG_WINDOW * sub_len) */
     int wide_pos;                          /**< next write position; the oldest sample once the ring is full */
@@ -193,6 +254,150 @@ typedef struct {
 } dsd_analog_ctcss;
 
 extern const dsd_analog_rx_detector_ops dsd_analog_ctcss_ops;
+
+/**
+ * @brief Test entry point: measure @p bin over the newest @p span sub-blocks the way an acquisition window does, the
+ * estimate's variance and the window's stationarity included (both are otherwise computed only when needed).
+ */
+void dsd_analog_ctcss_measure_span(const dsd_analog_ctcss* det, int span, int bin, dsd_analog_ctcss_hop* out);
+
+/** @brief DCS bit rate, bit/s. */
+#define DSD_ANALOG_DCS_BAUD              134.4
+
+/** @brief Pole the DCS detector moves the front end's DC blocker to: about 0.3 s per 1/e. */
+#define DSD_ANALOG_DCS_DC_CORNER_HZ      0.5
+
+/**
+ * @brief Pole of the DCS detector's balance stream, the front end's DC blocker undone almost
+ * entirely: about 16 s per 1/e, so a DC offset holds within 2% over the two words a lock is read
+ * from, and the stream stays bounded.
+ */
+#define DSD_ANALOG_DCS_BALANCE_CORNER_HZ 0.01
+
+/**
+ * @brief DCS detector geometry and verdict rules (see analog_dcs.c).
+ *
+ * - HYPOTHESES: droop slicers, one per model of the low-frequency droop a receiver's DC block
+ *   puts on the bit levels (none, and three one-pole high-passes).
+ * - SLICERS: every slicer: the droop slicers, then the balance slicer, which reads the balance
+ *   stream and slices each of its two words against that word's own mean, so a DC offset that
+ *   holds over a word costs it nothing.
+ * - RING: samples of each stream kept for the bit integrals (a power of two). The bit clock's
+ *   edge reaches back two bit integrals, 2 * box_len samples, and a bit read one sample more,
+ *   for the interpolation; below 4800 Hz, above every decimated rate, a bit is at most 36
+ *   samples, so 74 samples are enough.
+ * - HISTORY_BITS: decisions each slicer keeps: two words.
+ * - ACQUIRE_DISTANCE: bits the two words a lock is read from may differ by (one of them must be
+ *   a supported code's word exactly).
+ * - HOLD_DISTANCE: bits a held word may differ from the expected one (the balance slicer's may
+ *   differ in none).
+ * - LOSE_BITS: bits without a held word that lose the lock, counting only bits whose window
+ *   was read wholly with the carrier open (after a dropout the windows hold bits of it for a
+ *   word, which no signal reads through).
+ * - SPAN_BITS: bits since the lock last held, read with the carrier open or closed, that lose
+ *   it whatever the windows held: the bound under dropouts and a flickering carrier.
+ * - TURNOFF_BITS: bits the turn-off tone (134.4 Hz) is measured over; TURNOFF_RUN: consecutive
+ *   bits it must stand out in before the first bit no slicer holds the expected word ends the
+ *   lock, ahead of LOSE_BITS.
+ */
+enum {
+    DSD_ANALOG_DCS_HYPOTHESES = 4,
+    DSD_ANALOG_DCS_SLICERS = DSD_ANALOG_DCS_HYPOTHESES + 1,
+    DSD_ANALOG_DCS_RING = 128,
+    DSD_ANALOG_DCS_HISTORY_BITS = 46,
+    DSD_ANALOG_DCS_ACQUIRE_DISTANCE = 1,
+    DSD_ANALOG_DCS_HOLD_DISTANCE = 1,
+    DSD_ANALOG_DCS_LOSE_BITS = 32,
+    DSD_ANALOG_DCS_SPAN_BITS = 64,
+    DSD_ANALOG_DCS_TURNOFF_BITS = 6,
+    DSD_ANALOG_DCS_TURNOFF_RUN = 2,
+};
+
+/**
+ * @brief One slicer with its own decisions: a droop hypothesis, or the balance slicer, which
+ * uses only bits and count.
+ */
+typedef struct {
+    double droop;    /**< per-bit decay of the modelled high-pass, e^(-T/tau); 1 = none */
+    double gain;     /**< a bit integral's share of its level under that droop, (1 - d) / -ln d */
+    double baseline; /**< the level the high-pass has taken away, in bit-integral units */
+    double amp;      /**< the level of a bit, in bit-integral units; 0 until the first bit */
+    uint64_t bits;   /**< the newest HISTORY_BITS decisions, the newest in bit HISTORY_BITS - 1 */
+    int count;       /**< decisions since the last reset, up to HISTORY_BITS */
+} dsd_analog_dcs_slicer;
+
+/**
+ * @brief DCS detector working state.
+ *
+ * The band is re-poled (the front end's 10 Hz DC blocker undone, 0.5 Hz put in its place),
+ * integrated over each bit at the instants a bit clock recovers from the signal's own edges,
+ * and sliced by every droop hypothesis; the balance stream (the blocker undone, 0.01 Hz in its
+ * place) is integrated at the same instants and sliced by the balance slicer. A lock is a
+ * supported code's word read twice in a row by one slicer; it holds while some slicer reads the
+ * expected word within one bit (the balance slicer exactly), or the locked code exactly at
+ * another place in its word.
+ */
+typedef struct {
+    double rate_hz;                /**< decimated rate this detector is designed for; 0 = unconfigured */
+    double samples_per_bit;        /**< rate_hz / DSD_ANALOG_DCS_BAUD */
+    int box_len;                   /**< bit integral length in samples: samples_per_bit rounded */
+    double fe_pole;                /**< the front end's DC blocker pole, which the detector undoes */
+    double slow_pole;              /**< the pole the detector puts in its place */
+    double balance_pole;           /**< the pole the balance stream puts in its place */
+    double clock_alpha;            /**< per-sample weight of the bit clock's edge-energy average */
+    double x1;                     /**< previous band sample */
+    double u1;                     /**< previous re-poled sample */
+    double u[DSD_ANALOG_DCS_RING]; /**< re-poled samples, sample k at k & (RING - 1) */
+    double v1;                     /**< previous balance-stream sample */
+    double v[DSD_ANALOG_DCS_RING]; /**< balance-stream samples, sample k at k & (RING - 1) */
+    /** The balance stream's newest HISTORY_BITS bit integrals, the newest last: the balance
+        slicer's two words. */
+    double balance_integrals[DSD_ANALOG_DCS_HISTORY_BITS];
+    int64_t n;       /**< samples since the last reset */
+    double next_bit; /**< sample time the next bit ends at */
+    /** The bit clock: the edge energy's component at the bit rate, averaged; its angle says
+        where in the bit the edges fall. */
+    double clock_re;
+    double clock_im;
+    int clock_heard; /**< 1 once the clock has averaged a sample with the carrier open */
+    dsd_analog_dcs_slicer slicer[DSD_ANALOG_DCS_SLICERS]; /**< the droop slicers, then the balance slicer */
+    /* A phasor at the bit rate, e^(-j 2 pi n / samples_per_bit): the bit clock's reference and
+       the turn-off tone's correlator, which runs per bit over the newest TURNOFF_BITS bits. */
+    double osc_re;
+    double osc_im;
+    double step_re;
+    double step_im;
+    double bit_re;
+    double bit_im;
+    double bit_energy;
+    int bit_samples;
+    int bit_open; /**< 1 once a sample of the bit being read arrived unfrozen (carrier open) */
+    double ring_re[DSD_ANALOG_DCS_TURNOFF_BITS];
+    double ring_im[DSD_ANALOG_DCS_TURNOFF_BITS];
+    double ring_energy[DSD_ANALOG_DCS_TURNOFF_BITS];
+    int ring_samples[DSD_ANALOG_DCS_TURNOFF_BITS];
+    int ring_head;
+    int ring_count;
+    int turnoff_run; /**< consecutive bits the turn-off tone dominated */
+    /* Verdict. */
+    int state;            /**< dsd_analog_tone_state: ACQUIRING, LOCKED or NONE */
+    int code;             /**< locked code (canonical), or -1 */
+    int inverted;         /**< polarity of the canonical member of the locked class */
+    uint32_t expected;    /**< the window the locked signal reads next, earliest bit in bit 0 */
+    int fail_run;         /**< bits since the last hold whose window, read wholly with the carrier open, held nothing */
+    int since_held;       /**< bits read since the lock last held (carrier open or closed), up to SPAN_BITS */
+    int since_frozen;     /**< bits read with the carrier open since the last read with it closed, up to a word */
+    int64_t open_samples; /**< unfrozen samples since the last reset, for the no-code verdict */
+    int64_t bits_decided; /**< bits read since the last reset (tests) */
+    /** Bits read with the carrier open since some slicer, while nothing was locked, last read a supported code's word
+        exactly: the first half of a lock, which a code that has not locked yet keeps reading. Held at
+        DSD_ANALOG_DCS_SPAN_BITS, the span a lock that stops holding is kept for, when there is no candidate (after a
+        reset, and once that many bits pass without one). The tone policy (issue #527) extends its window while there
+        is one; see DSD_ANALOG_TONE_WINDOW_DCS_MS. */
+    int candidate_age;
+} dsd_analog_dcs;
+
+extern const dsd_analog_rx_detector_ops dsd_analog_dcs_ops;
 
 /** @brief The shared sub-audible front end: two decimating/low-pass stages and a DC blocker. */
 typedef struct {
@@ -231,9 +436,13 @@ typedef struct {
 typedef struct {
     dsd_analog_subaudible_fe fe;
     dsd_analog_ctcss ctcss;
+    dsd_analog_dcs dcs;
     int carrier_open;       /**< 1 from the first open block until the hangover expires */
     int64_t closed_samples; /**< input samples since the carrier last read open */
     uint32_t resets;        /**< bumped by every reset, published as the generation */
+    /** The resets value the last end of a reception by its carrier left: the carrier's hangover running out here, or
+        an input pause the tap's glue counts as the carrier dropping (issue #527); 0 before any. */
+    uint32_t carrier_end_reset;
     float scratch[DSD_ANALOG_RX_SCRATCH];
     float scratch_wide[DSD_ANALOG_RX_SCRATCH];
     float scratch_full[DSD_ANALOG_RX_SCRATCH];
@@ -247,6 +456,17 @@ typedef struct {
  */
 #define DSD_ANALOG_RX_FLOOR_MEAN_SQUARE 1e-9
 
+/**
+ * @brief What the caller's squelch says about a block (the cores' squelch_open): closed; open, with the carrier also
+ * needing the block above DSD_ANALOG_RX_FLOOR_MEAN_SQUARE (the level squelch, PCM); or open by the auto squelch's
+ * per-sample gate, which tells a carrier from noise itself, so a silent carrier holds too (issue #518 follow-up).
+ */
+enum {
+    DSD_ANALOG_RX_SQUELCH_CLOSED = 0,
+    DSD_ANALOG_RX_SQUELCH_OPEN = 1,
+    DSD_ANALOG_RX_SQUELCH_CARRIER = 2,
+};
+
 /** @brief Zero the core; the first processed block designs the front end for its rate. */
 void dsd_analog_rx_core_init(dsd_analog_rx_core* core);
 
@@ -257,18 +477,28 @@ void dsd_analog_rx_core_reset(dsd_analog_rx_core* core);
  * @brief Feed one block of raw monitor audio.
  *
  * @param rate_hz      Input rate; a change redesigns the front end and resets every detector.
- * @param squelch_open 0 when the caller's squelch reads the block closed; the block is then
- *                     treated as no carrier whatever its level.
+ * @param squelch_open DSD_ANALOG_RX_SQUELCH_CLOSED when the caller's squelch reads the block closed (the block is then
+ *                     treated as no carrier whatever its level), _OPEN or _CARRIER.
  * @return 1 when the front end is running at this rate, 0 when the rate is unusable.
  */
 int dsd_analog_rx_core_process(dsd_analog_rx_core* core, const float* block, int count, int rate_hz, int squelch_open);
 
 /**
+ * @brief Keep only the carrier over one block, as dsd_analog_rx_core_process() keeps it, without feeding the detectors.
+ *
+ * For the AM monitor (issue #524), which has no sub-audible signalling to detect but holds a scan row on its carrier
+ * (issue #526) all the same. A new @p rate_hz designs the front end for it, as dsd_analog_rx_core_process() does.
+ */
+void dsd_analog_rx_core_track_carrier(dsd_analog_rx_core* core, const float* block, int count, int rate_hz,
+                                      int squelch_open);
+
+/**
  * @brief Where the core stands, in publication terms.
  *
  * Zeroes @p out, then fills carrier_open, tone_state (IDLE without carrier, else the merged
- * detector verdict), tone_kind, ctcss_tenths_hz and generation. gate stays OFF: detection
- * never gates audio.
+ * detector verdict), tone_kind, ctcss_tenths_hz or dcs_code and dcs_inverted, dcs_candidate (the
+ * DCS detector's candidate while nothing is locked), and generation. gate stays OFF: detection
+ * never gates audio; the tap's glue fills the tone policy's verdict (issue #527).
  */
 void dsd_analog_rx_core_publish(const dsd_analog_rx_core* core, dsd_analog_rx_publication* out);
 
@@ -296,10 +526,14 @@ int dsd_analog_subaudible_fe_process(dsd_analog_subaudible_fe* fe, const float* 
 /** @brief The CTCSS evaluator's last hop, for tests. */
 const dsd_analog_ctcss_hop* dsd_analog_ctcss_last_hop(const dsd_analog_ctcss* det);
 
+/** @brief The table index a fine estimate of @p hz snaps to, or -1 (the nearest tone whose gate holds it; none
+ *  midway between two whose gates meet), for tests. */
+int dsd_analog_ctcss_snap_index(double hz);
+
 /**
  * @brief Test hook: replace the monotonic clock the tap reads to tell a paused live stream input.
  *
- * NULL restores dsd_time_monotonic_ms(). Defined only in the test-hook build of the DSP module
+ * NULL restores dsd_realtime_mono_ms(). Defined only in the test-hook build of the DSP module
  * (dsd-neo_dsp_private_test_support, compiled with DSD_NEO_TEST_HOOKS); the shipped library
  * has no such symbol.
  */

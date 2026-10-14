@@ -58,6 +58,58 @@ dsd_engine_reset_no_carrier_state(dsd_opts* opts, dsd_state* state) {
     (void)state;
 }
 
+void
+dsd_engine_carrier_boundary(dsd_opts* opts, dsd_state* state, dsd_carrier_boundary_kind kind, int guard_held) {
+    (void)opts;
+    (void)state;
+    (void)kind;
+    (void)guard_held;
+}
+
+/* The scanner's DSP-rate read beside the tune above (trunk_tuning.c): no rate, so no row width is checked. */
+int
+dsd_engine_scan_dsp_rate_hz(const dsd_opts* opts, const dsd_state* state) {
+    (void)opts;
+    (void)state;
+    return 0;
+}
+
+/* And its receive-family request count (trunk_tuning.c): no front end takes a live request here. */
+uint32_t
+dsd_engine_scan_family_requests(const dsd_opts* opts) {
+    (void)opts;
+    return 0U;
+}
+
+/* And the analog ones among them (trunk_tuning.c), which never move here either. */
+uint32_t
+dsd_engine_scan_familyless_retune_supersedes(const dsd_opts* opts) {
+    (void)opts;
+    return 0U;
+}
+
+/* And the scan leave's supersede of the family-less retunes (trunk_tuning.c): nothing to supersede here. */
+void
+dsd_engine_scan_supersede_familyless_retunes(const dsd_opts* opts) {
+    (void)opts;
+}
+
+/* And whether a retune attaches a receive family (trunk_tuning.c): the request count above never moves here. */
+int
+dsd_engine_scan_retune_attaches_family(const dsd_opts* opts, const dsd_state* state, int ted_sps) {
+    (void)opts;
+    (void)state;
+    (void)ted_sps;
+    return 0;
+}
+
+/* And the rigctl peer's restore at leave (trunk_tuning.c): no rigctl peer here. */
+void
+dsd_engine_scan_rigctl_restore(const dsd_opts* opts, const dsd_state* state) {
+    (void)opts;
+    (void)state;
+}
+
 static void
 record_push(double mean_power) {
     g_pushes++;

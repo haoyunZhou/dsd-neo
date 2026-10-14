@@ -14,6 +14,8 @@
 #include <atomic>
 #include <cmath>
 #include <dsd-neo/core/opts.h>
+#include <dsd-neo/core/parse.h>
+#include <dsd-neo/core/state.h>
 #include <dsd-neo/dsp/costas.h>
 #include <dsd-neo/platform/posix_compat.h>
 #include <dsd-neo/runtime/config.h>
@@ -22,7 +24,6 @@
 #include <limits>
 #include <mutex>
 #include <stdint.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "dsd-neo/core/opts_fwd.h"
@@ -87,7 +88,6 @@ config_snapshot_equals_block_a(const dsdneoRuntimeConfig& lhs, const dsdneoRunti
     CONFIG_EQ_FIELD(p25_grant_timeout_s);
     CONFIG_EQ_FIELD(p25_cc_grace_s);
     CONFIG_EQ_FIELD(p25_vc_grace_s);
-    CONFIG_EQ_FIELD(p25_ring_hold_s);
     CONFIG_EQ_FIELD(p25_mac_hold_s);
     CONFIG_EQ_FIELD(p25_voice_hold_s);
     CONFIG_EQ_FIELD(p25_min_follow_dwell_s);
@@ -155,7 +155,6 @@ config_snapshot_equals_block_b(const dsdneoRuntimeConfig& lhs, const dsdneoRunti
     CONFIG_EQ_FIELD(p25_grant_timeout_is_set);
     CONFIG_EQ_FIELD(p25_cc_grace_is_set);
     CONFIG_EQ_FIELD(p25_vc_grace_is_set);
-    CONFIG_EQ_FIELD(p25_ring_hold_is_set);
     CONFIG_EQ_FIELD(p25_mac_hold_is_set);
     CONFIG_EQ_FIELD(p25_voice_hold_is_set);
     CONFIG_EQ_FIELD(p25_wd_ms_is_set);
@@ -360,10 +359,16 @@ env_is_set(const char* v) {
     return v && v[0] != '\0';
 }
 
+/* A whole boolean word (on/off, 1/0, true/false, yes/no) decides first; otherwise the first character does, as it
+   always has (`y...`, `t...`, `n...`, `f...`). The first character alone cannot tell "on" from "off". */
 static int
 env_is_truthy(const char* v) {
     if (!env_is_set(v)) {
         return 0;
+    }
+    int word = 0;
+    if (dsd_parse_bool_strict(v, &word) == 0) {
+        return word == 1;
     }
     return (v[0] == '1' || v[0] == 'y' || v[0] == 'Y' || v[0] == 't' || v[0] == 'T');
 }
@@ -372,6 +377,10 @@ static int
 env_is_falsey(const char* v) {
     if (!env_is_set(v)) {
         return 0;
+    }
+    int word = 0;
+    if (dsd_parse_bool_strict(v, &word) == 0) {
+        return word == 0;
     }
     return (v[0] == '0' || v[0] == 'n' || v[0] == 'N' || v[0] == 'f' || v[0] == 'F');
 }
@@ -524,7 +533,6 @@ config_init_defaults(dsdneoRuntimeConfig& c) {
     c.p25_grant_timeout_s = 3.0;
     c.p25_cc_grace_s = 5.0;
     c.p25_vc_grace_s = 0.75;
-    c.p25_ring_hold_s = 0.75;
     c.p25_mac_hold_s = 0.75;
     c.p25_voice_hold_s = 0.75;
     c.p25_wd_ms = 0; /* 0 => dynamic default selected by caller */
@@ -714,9 +722,6 @@ config_init_dmr_and_p25(dsdneoRuntimeConfig& c) {
     const char* p25_vcg = getenv("DSD_NEO_P25_VC_GRACE");
     c.p25_vc_grace_is_set = env_parse_double_range(p25_vcg, 0.0, 10.0, &c.p25_vc_grace_s);
 
-    const char* p25_rh = getenv("DSD_NEO_P25_RING_HOLD");
-    c.p25_ring_hold_is_set = env_parse_double_range(p25_rh, 0.0, 5.0, &c.p25_ring_hold_s);
-
     const char* p25_mh = getenv("DSD_NEO_P25_MAC_HOLD");
     c.p25_mac_hold_is_set = env_parse_double_range(p25_mh, 0.0, 10.0, &c.p25_mac_hold_s);
 
@@ -793,9 +798,11 @@ config_init_input_and_dmr_t3(dsdneoRuntimeConfig& c) {
     if (env_is_set(t3ccf)) {
         double v = 0.0;
         if (env_parse_double_strict(t3ccf, &v)) {
-            long hz = (v < 1e5) ? (long)std::llround(v * 1000000.0) : (long)std::llround(v);
-            if (hz > 0) {
-                c.dmr_t3_cc_freq_hz = hz;
+            /* Values under 1e5 are MHz. Bounded before rounding: llround() of a value past long long's range is
+               unspecified, and the result is a trunk frequency, so it must also fit DSD_TRUNK_FREQ_MAX_HZ. */
+            const double hz = (v < 1e5) ? v * 1000000.0 : v;
+            if (hz >= 0.5 && hz <= (double)DSD_TRUNK_FREQ_MAX_HZ) {
+                c.dmr_t3_cc_freq_hz = (long)std::llround(hz);
                 c.dmr_t3_cc_freq_is_set = 1;
             }
         }

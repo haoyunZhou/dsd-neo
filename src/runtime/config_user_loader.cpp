@@ -7,8 +7,11 @@
  * INI loading and profile overlay support for user configuration.
  */
 
+#include <dsd-neo/core/analog_tone.h>
+#include <dsd-neo/core/power.h>
 #include <dsd-neo/runtime/airspy_config.h>
 #include <dsd-neo/runtime/analog_channel.h>
+#include <dsd-neo/runtime/analog_tones.h>
 #if defined(_WIN32)
 #include <algorithm>
 #endif
@@ -264,6 +267,19 @@ apply_input_source_keys(dsdneoUserConfig* cfg, const char* key_lc, const char* v
     }
 }
 
+/* rtl_sql_mode: level (rtl_sql's threshold), auto (rtl_sql_margin_db over the learned floor) or noise
+   (rtl_sql_margin_db of quieting on FM). Anything else keeps what was there; the validator reports it. */
+static void
+apply_rtl_sql_mode(const char* val, dsdneoUserConfig* cfg) {
+    if (dsd_strcasecmp(val, "auto") == 0) {
+        cfg->rtl_sql_mode = DSD_SQUELCH_MODE_AUTO;
+    } else if (dsd_strcasecmp(val, "noise") == 0) {
+        cfg->rtl_sql_mode = DSD_SQUELCH_MODE_NOISE;
+    } else if (dsd_strcasecmp(val, "level") == 0) {
+        cfg->rtl_sql_mode = DSD_SQUELCH_MODE_LEVEL;
+    }
+}
+
 static int
 apply_input_rtl_keys(dsdneoUserConfig* cfg, const char* key_lc, const char* val, user_cfg_parse_mode_t mode) {
     if (strcmp(key_lc, "rtl_device") == 0) {
@@ -271,7 +287,9 @@ apply_input_rtl_keys(dsdneoUserConfig* cfg, const char* key_lc, const char* val,
     } else if (strcmp(key_lc, "rtl_freq") == 0) {
         copy_text_value(cfg->rtl_freq, sizeof cfg->rtl_freq, val);
     } else if (strcmp(key_lc, "rtl_gain") == 0) {
-        (void)apply_integer_setting(val, 22, mode, &cfg->rtl_gain);
+        if (apply_integer_setting(val, 22, mode, &cfg->rtl_gain)) {
+            cfg->rtl_gain_is_set = 1;
+        }
     } else if (strcmp(key_lc, "rtl_ppm") == 0) {
         if (apply_integer_setting(val, 0, mode, &cfg->rtl_ppm)) {
             cfg->rtl_ppm_is_set = 1;
@@ -280,6 +298,13 @@ apply_input_rtl_keys(dsdneoUserConfig* cfg, const char* key_lc, const char* val,
         (void)apply_integer_setting(val, 12, mode, &cfg->rtl_bw_khz);
     } else if (strcmp(key_lc, "rtl_sql") == 0) {
         (void)apply_integer_setting(val, 0, mode, &cfg->rtl_sql);
+        cfg->rtl_sql_is_set = 1;
+    } else if (strcmp(key_lc, "rtl_sql_mode") == 0) {
+        apply_rtl_sql_mode(val, cfg);
+        cfg->rtl_sql_is_set = 1;
+    } else if (strcmp(key_lc, "rtl_sql_margin_db") == 0) {
+        (void)apply_integer_setting(val, DSD_SQUELCH_MARGIN_DEFAULT_DB, mode, &cfg->rtl_sql_margin_db);
+        cfg->rtl_sql_is_set = 1;
     } else if (strcmp(key_lc, "rtl_volume") == 0) {
         (void)apply_integer_setting(val, 1, mode, &cfg->rtl_volume);
     } else if (strcmp(key_lc, "auto_ppm") == 0 || strcmp(key_lc, "rtl_auto_ppm") == 0) {
@@ -680,20 +705,57 @@ apply_dsp_section_key(dsdneoUserConfig* cfg, const char* key_lc, const char* val
     }
 }
 
+/* The tone policy's keys (issue #527). A refused tone_filter keeps the mode already loaded; a refused tone_list is left
+   empty and marked, so the policy it would have fed is applied as off rather than guessed. The message names the entry
+   by number, never the text. --validate-config reports each as an error. */
+static void
+apply_analog_tone_key(dsdneoUserConfig* cfg, const char* key_lc, const char* val) {
+    if (strcmp(key_lc, "tone_filter") == 0) {
+        int mode = DSD_TONE_FILTER_OFF;
+        if (dsd_tone_filter_mode_parse(val, &mode) != 0) {
+            LOG_WARN("Config: invalid tone_filter (expected off, allow or block); keeping the previous/default\n");
+            return;
+        }
+        cfg->analog_tone_filter = mode;
+        return;
+    }
+    DSD_MEMSET(&cfg->analog_tone_set, 0, sizeof(cfg->analog_tone_set));
+    cfg->analog_tone_list_refused = 0;
+    if (val[0] == '\0') {
+        return;
+    }
+    char err[DSD_TONE_LIST_ERROR_SIZE];
+    if (dsd_tone_set_parse(val, &cfg->analog_tone_set, err, sizeof err) != 0) {
+        LOG_WARN("Config: invalid tone_list: %s; the tone filter stays off\n", err);
+        cfg->analog_tone_list_refused = 1;
+    }
+}
+
 /* An analog width is refused, never clamped: a value the strict parser rejects is reported and the width already
    loaded (the default, for a base file) stays. --validate-config reports the same text as an error. */
 static void
 apply_analog_section_key(dsdneoUserConfig* cfg, const char* key_lc, const char* val) {
-    if (strcmp(key_lc, "nfm_bandwidth_hz") != 0) {
+    if (strcmp(key_lc, "tone_filter") == 0 || strcmp(key_lc, "tone_list") == 0) {
+        apply_analog_tone_key(cfg, key_lc, val);
+        return;
+    }
+    const int kind = (strcmp(key_lc, "nfm_bandwidth_hz") == 0)  ? DSD_ANALOG_DEMOD_FM
+                     : (strcmp(key_lc, "am_bandwidth_hz") == 0) ? DSD_ANALOG_DEMOD_AM
+                                                                : -1;
+    if (kind < 0) {
         return;
     }
     char err[DSD_ANALOG_ERROR_TEXT_MAX];
     int width_hz = 0;
-    if (dsd_analog_width_parse(DSD_ANALOG_DEMOD_FM, val, &width_hz, err, sizeof err) != 0) {
+    if (dsd_analog_width_parse(kind, val, &width_hz, err, sizeof err) != 0) {
         LOG_WARN("Config: invalid %s = '%s'; %s; keeping the previous/default width\n", key_lc, val, err);
         return;
     }
-    cfg->analog_nfm_bandwidth_hz = width_hz;
+    if (kind == DSD_ANALOG_DEMOD_AM) {
+        cfg->analog_am_bandwidth_hz = width_hz;
+    } else {
+        cfg->analog_nfm_bandwidth_hz = width_hz;
+    }
 }
 
 static void
@@ -733,6 +795,53 @@ apply_section_key(dsdneoUserConfig* cfg, const char* section, const char* key_lc
         cfg->has_analog = 1;
         apply_analog_section_key(cfg, key_lc, val);
     }
+}
+
+static void note_section_present(dsdneoUserConfig* cfg, const char* section);
+
+extern "C" void
+dsd_user_config_init(dsdneoUserConfig* cfg) {
+    user_cfg_reset(cfg);
+}
+
+/* Lowercase and trim a section or key name as the loader does; 0 when it is too long to hold. */
+static int
+user_config_normalize_name(const char* name, char* out, size_t out_size) {
+    if (strlen(name) >= out_size) {
+        return 0; /* no section or key name is that long; a cut one could name another */
+    }
+    DSD_SNPRINTF(out, out_size, "%s", name);
+    user_config_lowercase_ascii(out);
+    user_config_trim_ascii_whitespace(out);
+    return 1;
+}
+
+extern "C" int
+dsd_user_config_apply_section(dsdneoUserConfig* cfg, const char* section) {
+    char section_lc[64];
+    if (cfg == nullptr || section == nullptr || !user_config_normalize_name(section, section_lc, sizeof section_lc)) {
+        return 0;
+    }
+    note_section_present(cfg, section_lc);
+    return 1;
+}
+
+extern "C" int
+dsd_user_config_apply_key(dsdneoUserConfig* cfg, const char* section, const char* key, const char* value) {
+    if (cfg == nullptr || section == nullptr || key == nullptr) {
+        return 0;
+    }
+    if (value == nullptr) {
+        value = "";
+    }
+    char section_lc[64];
+    char key_lc[64];
+    if (!user_config_normalize_name(section, section_lc, sizeof section_lc)
+        || !user_config_normalize_name(key, key_lc, sizeof key_lc)) {
+        return 0;
+    }
+    apply_section_key(cfg, section_lc, key_lc, value, USER_CFG_PARSE_MODE_BASE);
+    return 1;
 }
 
 // INI loader ------------------------------------------------------------------

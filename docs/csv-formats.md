@@ -92,10 +92,10 @@ Optional column:
 Notes:
 
 - `frequency_hz` is parsed as an integer (no `K/M/G` suffixes).
-- `frequency_hz` must be between 100000 (100 kHz) and 6000000000 (6 GHz) — the range any supported front end can
-  reach. A row outside it (including `0`) is skipped with a warning, and its slot in the LCN list below is left at 0 so
-  later rows keep their LCN numbers. This is what tells a channel map apart from a decimal key list, which has the same
-  `number,number` shape.
+- `frequency_hz` must be between 100000 (100 kHz) and 2147483647 (about 2.147 GHz) on every platform — the highest
+  frequency a trunk channel is stored and tuned at, far above any trunking band. A row outside it (including `0`) is
+  skipped with a warning, and its slot in the LCN list below is left at 0 so later rows keep their LCN numbers. This is
+  what tells a channel map apart from a decimal key list, which has the same `number,number` shape.
 - Optional headers after the two required columns are matched case-insensitively, with surrounding whitespace
   trimmed: `name`, `mode`, `keys_hex_csv`, `keys_dec_csv`, `single_key_hex`, `single_key_dec`, and `options` (`relevant_CLI_switches`). They may appear in
   any order, including after column 16. Unrecognized columns are ignored. The first `name` column wins; duplicate
@@ -103,9 +103,16 @@ Notes:
   `relevant_CLI_switches` alias. This preserves legacy free-text note columns, including notes with commas.
 - Channel-map headers and data rows are read in full up to 1 MiB (including the line ending and terminating NUL).
   Longer rows reject the import with an error; they are never split into additional channels.
-- `mode` accepts `p25`, `dmr`, `nxdn96`, `nxdn48`, `dpmr`, `dstar`, `ysf`, and `m17`, case-insensitively and trimmed.
-  Empty or missing values inherit the configured global decoder settings. Invalid nonempty values reject the import
-  with file and row diagnostics, including on rows whose channel number is invalid.
+- `mode` accepts `p25`, `dmr`, `nxdn96`, `nxdn48`, `dpmr`, `dstar`, `ysf`, `m17`, `nfm` (analog narrowband FM) and
+  `am` (analog AM), case-insensitively and trimmed. Empty or missing values inherit the configured global decoder
+  settings. Invalid nonempty values reject the import with file and row diagnostics, including on rows whose channel
+  number is invalid; the diagnostic lists the accepted modes. There are no aliases: `fm`, `analog`, `wfm`, `nbfm` and
+  `fm-conventional` are rejected with the hint `use nfm`.
+- An `nfm` row runs the analog FM monitor (the `-fA` receive path) while it is on air, and an `am` row the AM monitor
+  (the `-fM` receive path, its envelope detector), on a digital session too, and the scanner puts the configured
+  decoder back when it moves on. Their activity is carrier, not a decoded frame: see [Analog rows](#analog-rows)
+  below. Key columns (`keys_hex_csv`, `keys_dec_csv`, `single_key_hex`, `single_key_dec`) on an `nfm` or `am` row
+  reject the import, since an analog row decrypts nothing.
 - Under `-Y`, a declared mode selects its decoder class even when the global preset excludes it. P25 enables both
   phases and excludes DMR and X2-TDMA. Fully declared mixed lists work without `-fa`; untyped lists retain their
   existing behavior. The initial input uses global settings until the first scheduled row entry. Explicit global
@@ -186,6 +193,21 @@ channel,frequency_hz,name,keys_hex_csv,keys_dec_csv,single_key_dec,single_key_he
 3,462612500,Shared,,,1,0000001F00
 ```
 
+Example mixing analog AM, analog NFM and digital rows (`examples/conventional_scan_analog.csv` is a runnable copy;
+`examples/conventional_scan_modes.csv` carries every mode):
+
+```csv
+channel,frequency_hz,name,mode,options
+1,118300000,Tower AM 8.33 kHz,am,--am-bandwidth-hz 8333 --squelch-db -55
+2,121500000,Guard AM default width,am,--squelch-db -60 --scan-max-visit-ms 30000
+3,154430000,Fire dispatch NFM 12.5 kHz,nfm,--nfm-bandwidth-hz 12500 --squelch-db -60
+4,155475000,Mutual aid NFM auto squelch,nfm,--squelch auto
+5,461000000,DMR repeater,dmr,--scan-max-visit-ms 20000
+6,851012500,P25 conventional,p25,--squelch-db -55
+7,150000000,Inherit configured decoder,,
+8,453212500,Public works NFM noise squelch,nfm,--nfm-bandwidth-hz 12500 --squelch noise+12
+```
+
 ### Scoped row options
 
 Channel maps and trunk-scan targets accept an optional `options` column. `relevant_CLI_switches` is an alias;
@@ -201,19 +223,23 @@ Options are parsed once when the list is loaded. They are a restricted argument 
 | `-1 <hex>` | Direct RC4/DES key, 1..16 digits; DMR/P25/NXDN. |
 | `-R <decimal>` | Direct scrambler key, `0..32767`; NXDN/dPMR. |
 | `-k <file>`, `-K <file>` | Decimal/hex key files; DMR/P25/NXDN. |
-| `-G <file>` | Group names and policy for this row or system. |
+| `-G <file>` | Group names and policy for this row or system; digital modes (an analog row rejects it). |
 | `-4` | Force loaded privacy keys over signalling; DMR/NXDN. |
 | `-0`, `--dmr-force-algid <hex>` | DMR algorithm fallback when identifiers are missing. `-0` means ALGID `21`. |
 | `-F` | Relax CRC checks; DMR/P25/M17. |
 | `-^` | Prefer learned P25 control-channel candidates for this target; P25. Restores the configured default on target exit. |
-| `--strict-crc` | Restore strict CRC checks; all modes, including inherited mode. |
-| `--no-force-key` | Disable privacy forcing and algorithm fallback for this row. |
-| `-e`, `--no-data-calls` | Enable/disable data-call tuning and conventional data-header holds; all modes. |
-| `--enc-lockout`, `--enc-follow` | Disable/enable encrypted-call following; all modes. |
-| `--scan-voice-only`, `--no-scan-voice-only` | Enable/disable the conventional voice gate. |
-| `--scan-voice-qualify-ms`, `--scan-voice-hold-ms` | Conventional voice-gate intervals, `100..600000` milliseconds. |
+| `--strict-crc` | Restore strict CRC checks; every digital mode, including inherited mode. |
+| `--no-force-key` | Disable privacy forcing and algorithm fallback for this row; digital modes. |
+| `-e`, `--no-data-calls` | Enable/disable data-call tuning and conventional data-header holds; all digital modes. |
+| `--enc-lockout`, `--enc-follow` | Disable/enable encrypted-call following; all digital modes. |
+| `--scan-voice-only`, `--no-scan-voice-only` | Enable/disable the conventional voice gate; digital modes (an analog row holds on carrier instead). |
+| `--scan-voice-qualify-ms`, `--scan-voice-hold-ms` | Conventional voice-gate intervals, `100..600000` milliseconds; digital modes. |
 | `--scan-max-visit-ms <ms>` | Maximum time on this row or target per visit; `0` disables the cap for it, otherwise `1000..3600000` milliseconds. All modes, and every trunk-target type. |
 | `--squelch-db <dB>` | This row's or target's squelch threshold, in whole dB from `-100` to `0`, the same units as `[input] rtl_sql` and the `sql` field of `-i rtl:`; `0` switches the squelch off for this row alone. All modes, and every trunk-target type. |
+| `--squelch <setting>` | The same option in the squelch grammar: `off`, whole dB from `-100` to `0`, `auto[+N]`, the [auto squelch](cli.md#auto-squelch---squelch-auto) N dB (3 to 30, default 10) over the noise floor learned on this channel, or `noise[+N]`, the [noise squelch](cli.md#noise-squelch---squelch-noise) opening at N dB (3 to 30, default 10) of FM quieting. Levels and `off` on every row and trunk-target type; `auto` on `nfm` and `am` rows and `nfm-conventional` and `am-conventional` targets only; `noise` on `nfm` rows and `nfm-conventional` targets only. A row names one of `--squelch` and `--squelch-db`. |
+| `--nfm-bandwidth-hz <Hz>` | This analog row's or target's NFM channel width, whole Hz from `8000` to `25000` (for example `12500`). `nfm` rows and `nfm-conventional` targets only; a digital or blank row is told it `needs mode nfm`, and an `am` row refuses it as `not supported for this mode/target`. |
+| `--am-bandwidth-hz <Hz>` | This analog row's or target's AM channel width, whole Hz from `5000` to `20000` (for example `8333` for 8.33 kHz airband spacing). `am` rows and `am-conventional` targets only; a digital or blank row is told it `needs mode am`, and an `nfm` row refuses it as `not supported for this mode/target`. A row carries one width. |
+| `--tone-allow <list>`, `--tone-block <list>`, `--no-tone-filter` | This analog row's or target's CTCSS/DCS receive policy (see [Analog rows](#analog-rows)): hear only traffic carrying a listed tone or code, mute it, or no filter on this row whatever is configured. `<list>` is standard CTCSS tones and DCS codes separated by `/`, such as `67.0/100.0/D023N`. One option in three spellings, so a row names one of them once. `nfm` rows and `nfm-conventional` targets only; a digital or blank row is told it `needs mode nfm`, and an `am` row refuses it as `not supported for this mode/target`. |
 
 Protocol-specific options require a declared `mode`; trunk targets use their `type`. A channel map whose rows carry
 `options` but no `mode` still runs through the typed scanner (blank rows inherit the configured decoder), since the
@@ -224,20 +250,171 @@ columns while the gate is on (see `docs/trunk-scan.md`). `--scan-max-visit-ms` i
 trunk-system targets do accept, since the per-visit cap applies to every target type. Input/output, frontend
 selection, decoder flags and scanner-wide `-t` are not accepted in `options`.
 
-`--squelch-db` sets the channel squelch while the row or target is on air and restores the configured default
-when the scanner moves on or stops. A row that omits it inherits the default (`[input] rtl_sql`, the `sql` field of
-`-i rtl:...`, or whatever the squelch control last set); `0` switches the squelch off for that row only; any other
-value is a threshold in dB. Positive numbers (the legacy linear form some CLI inputs accept), values below `-100` and
-fractional dB are rejected with a row diagnostic. On an RTL-SDR, rtl_tcp, SoapySDR or Airspy input the threshold
+`--squelch-db` (or `--squelch`) sets the channel squelch while the row or target is on air and restores the
+configured default when the scanner moves on or stops. A row that omits it inherits the default (`--squelch`,
+`[input] rtl_sql`, the `sql` field of `-i rtl:...`, or whatever the squelch control last set, an auto squelch
+included); `0` or `off` switches the squelch off for that row only; any other value is a threshold in dB.
+Positive numbers (the legacy linear form some CLI inputs accept), values below `-100` and fractional dB are rejected
+with a row diagnostic, and so is `auto` on a digital or blank row: a digital channel runs no auto squelch, so an
+inherited one is off there. On an RTL-SDR, rtl_tcp, SoapySDR or Airspy input the threshold
 gates the demodulator, so a row set well above its signal level decodes nothing: on a trunk-system target it gates
 the control channel too, and a high threshold there makes the whole system look dead. On any other input (rigctl
 tuning a PCM, UDP or TCP audio source) there is no demodulator for it to gate, so it cannot gate digital
 acquisition: it only gates the analog input monitor (`-8`, with audio output on) and the carrier activity that
-monitor stamps, and scan start logs one warning per affected row or target. Frontends show
+monitor stamps, and scan start logs one warning per affected digital row or target. On an analog row that monitor
+and its carrier are exactly what the squelch is for, so an analog row draws no such warning. Frontends show
 the value in force first and, while a row overrides it, the configured default beside it
-(`SQL: -60.0 dB (row; default -80.0 dB)`); the Qt/Android channel-map review and target preview list each row's
-squelch, or `inherit`. The squelch controls and Config->Save work on the configured default, never the row's value;
-a squelch edit made while a row overrides it says so.
+(`SQL: -60.0 dB (row; default -80.0 dB)`, `SQL: auto +6 dB (floor -81.0 dB; row; default -60.0 dB)`); the Qt/Android
+channel-map review and target preview list each row's squelch, or `inherit`. The squelch controls and Config->Save work
+on the configured default, never the row's value; a squelch edit made while a row overrides it says so.
+
+While a scan runs, a row's `--squelch-db`, its channel width and its tone policy (and a trunk-scan target's `rtl_gain`)
+can be changed for the rest of the session from the frontends' "this channel" editors, or made to follow the configured
+default whatever the row says; the file is never written, and Config->Save never saves such an edit. See [Live
+per-channel edits](trunk-scan.md#runtime-behavior).
+
+### Analog rows
+
+`nfm` and `am` channel-map rows and `nfm-conventional` and `am-conventional` trunk-scan targets accept only the options
+that mean something for an analog channel: `--scan-max-visit-ms`, `--squelch-db` or `--squelch` (an auto squelch
+included) and the width option of their own kind,
+`--nfm-bandwidth-hz` on NFM and `--am-bandwidth-hz` on AM, and on NFM the tone policy (`--tone-allow`, `--tone-block`,
+`--no-tone-filter`). Key switches (`-b`, `-H`, `-1`, `-R`, `-k`, `-K`, `--dmr-tg-key-csv`, `--dmr-tg-key-clear`,
+`--no-decryption-keys`, `--key-profile-ref`), forcing (`-4`, `-0`, `--dmr-force-algid`, `--no-force-key`), CRC policy
+(`-F`, `--strict-crc`), `-^`, `-G`, data- and encrypted-call policy (`-e`, `--no-data-calls`, `--enc-*`) and the
+voice-gate switches describe digital frames an analog channel never carries, and are rejected with
+`not supported for this mode/target`.
+
+`--nfm-bandwidth-hz` and `--am-bandwidth-hz` are the full RF channel width the analog channel filter protects while the
+row is on air (the same contracts as the receiver's NFM and AM widths); a row without one uses the configured width of
+its kind (NFM 16 kHz, AM 6 kHz by default; on audio input with a rigctl peer an unset NFM width asks for `-B`, below).
+The width is applied when the row is tuned and restored when the scanner moves on, and Config->Save never writes it (nor
+the row's analog class) as a default. The Qt/Android channel-map review and target preview list it
+(`NFM bandwidth: 12.5 kHz`, `AM bandwidth: 8.333 kHz`), or `inherit` on an analog row without one. The status line shows
+it with the configured width it overrides, `Analog: NFM 12.5 kHz (row; default 16 kHz)` or `Analog: AM 8.333 kHz (row;
+default 6 kHz)`, and the width controls of that kind (the terminal rows, the Radio sheet, and on audio input with a
+rigctl peer the Passband sheet) keep editing the configured width: while the row is on air the edit waits for it to
+leave, and the message says the channel overrides it. An edit of the other kind's width is not shadowed: an AM width
+edit under an `nfm` row, or an NFM width edit under an `am` row, is the configured width's at once. A width the running
+DSP rate cannot filter (the channel filter needs `width / 2 + 600 Hz` within 0.45 of the DSP rate: at a 24 kHz DSP
+bandwidth the widest is 20.4 kHz, at 16 kHz 13.2 kHz) is named with the fix the input allows (an RTL DSP bandwidth that
+fits; on a SoapySDR or Airspy device a wider DSP bandwidth or a narrower width; on an I/Q replay a narrower width) in
+the log and on the status line when the scan starts, against the rate the running stream publishes, and again whenever
+that rate changes. A channel map imported while DSD-neo runs (the terminal menu, Qt, Android) is held to the DSP rate
+known then: the running stream's, or on an RTL-SDR or rtl_tcp input with no stream running the one its DSP bandwidth
+sets. The map still loads, since the DSP bandwidth that fits it can be set afterwards, and the import message names the
+first row that rate cannot run and how many more there are. A SoapySDR or Airspy device, or an I/Q replay, delivers its
+rate only once its stream runs, so its rows are held to it at scan start; the Qt/Android review before an import, like a
+trunk-scan list's preview, checks the width's range only. A row the rate cannot filter is skipped at every visit rather
+than received without its filter, and so is every row with a width of its own while `DSD_NEO_CHANNEL_LPF=0` turns off
+the channel filter each explicit width needs. A row without a width of its own is held to the rate with the configured
+width of its kind it runs, and is named again whenever that configured width changes; the AM default always runs its
+channel filter, so an `am` row on it is held like an explicit width. While the scan has such a row, the configured width
+of its kind is in use on any session, as under `-fA` or `-fM`: a width edit or a loaded config that sets a width the DSP
+rate cannot filter, and a DSP bandwidth or an input switch that would open an RTL-SDR or rtl_tcp device at a rate that
+cannot filter the configured width, is refused, whichever row is on air (a SoapySDR or Airspy device's start checks only
+the width in force against the rate it delivers).
+While a row with its own width is on air, an RTL DSP bandwidth that cannot filter the width is refused rather than
+reopening the stream on it, from the DSP bandwidth control, Input > Switch source and a loaded config alike.
+
+On audio input (rigctl tuning a PCM, UDP or TCP source) the rigctl peer demodulates, so each row's tune asks it for the
+row's demodulator and passband before the frequency: an `am` row sends `M AM <width>` with the AM width it runs (its
+own, else the configured one), and an `nfm` row sends `M NFM <width>` (`M FM <width>` to a peer that refuses the `NFM`
+token) with its own width, else, as a row without a mode of its own does under `-fA`, with the configured NFM width when
+one is set (issue #621). A peer that refuses either skips the row, as any row it cannot tune. SDR++ and GQRX take a
+passband of `0` as "leave it unchanged", and SDR++ keeps each passband it is sent, even across restarts, so before a row
+first changes the peer's AM or FM passband DSD-neo asks the peer what it runs (`m`; a peer on the other demodulator is
+first switched to this one at passband `0`, which keeps its own, and asked again). Every other row asks for `-B` (a
+digital row, or under `-fA` a row without a width, where `-B` stands in for the unset NFM width): on audio input that
+too is a passband DSD-neo sets on the peer, the one the row is heard through, so the peer's own is read first and kept
+for the later return (issue #621). Without `-B`, where an earlier row changed the peer, such a row asks for FM at the
+passband it read, which returns the peer to FM at its own passband; that request is best-effort, except that a peer
+still on an `am` row's AM that
+refuses it skips the row, since the row would be heard through AM, as does one that may be on AM because the reply to a
+request for AM was lost. A row's tune that fails after the peer took the row's demodulator or passband (its frequency
+refused, say) asks the peer for what it ran before, or for the passband it read where DSD-neo had set none, so the row
+still on air is not heard through the other demodulator or the failed row's passband. Leaving `-Y` (the scanner toggled
+off, a map imported or cleared, shutdown) puts back the AM passband an `am` row changed, then asks the peer once more
+for what the session runs (under `-fA` its configured NFM width, else `-B`, a passband DSD-neo sets, so the reading of
+the peer's own passband stays for the session's later return to it), so it is left on neither an am row's demodulator
+nor a row's passband. An untyped list's step asks for that same passband of the session, and a peer that refuses the
+configured NFM width there abandons the step, as a refused `-B` always did; where the session runs the peer's own
+passband (`-B` 0, or `-fA` with neither a width nor `-B`), the step asks for FM at it, best-effort, which undoes a
+passband DSD-neo set and sends nothing to a peer it never changed. A peer that cannot answer `m` is sent passband `0`
+instead, which only a peer that takes it as its normal passband (Hamlib's meaning) returns to it. Audio input without a
+rigctl peer applies no width, and scan start says so; nothing demodulates an `am` row's AM there, so scan start names
+each `am` row as skipped at every visit, whatever its width. On an RTL-family input DSD-neo demodulates the I/Q itself
+and a rigctl peer beside it only follows the frequency: it is asked for `-B`, best-effort, whatever the row runs and
+whatever demodulator the peer is on. On audio input, a rigctl reconnect during the scan (the `9` key, or the menu's host
+and port) to the same host and port keeps what the scan needs to put the peer back; one to another host or port, while
+the old peer may be on an `am` row's AM, asks the new peer for FM at the next FM or digital row, a refusal skipping that
+row, and leaves the old peer as the scan last set it. A reconnect that fails keeps the connection in use.
+
+An analog row holds while its carrier is open: the squelch is open over the monitor audio (above the input's level
+floor, through a 200 ms hangover, at any input rate), whether or not audio is played, so `-o null` or a muted frontend
+no longer lets the scanner leave an active channel. A retune that has not landed, or one that failed and left the
+receiver on another channel, holds nothing. A `-Y` row holds for `-t` after the last carrier; an `nfm-conventional` or
+`am-conventional` target holds for its `activity_hold_ms` after the last carrier and rotates after its `dwell_ms` of
+silence. The per-visit cap and the hold, advance and avoid controls apply as for any row, and the voice gate never
+applies to an analog row, so a global `--scan-voice-only` does not block one. That includes the rows of an untyped
+list scanned under `-fA` or `-fM` (AM), which hold on their carrier under `-t` as well. Scan start warns once about an
+analog row whose squelch is off or at -100 dB or below: noise then keeps its carrier open, re-arming the hold with every
+block, so only the visit cap or a manual advance or avoid moves on. The auto and noise squelches (`--squelch auto`,
+`--squelch noise`, the row's own or inherited) close on noise on a radio input, so a row running one draws no warning.
+On audio input the noise squelch closes an `nfm` row on noise too (it learns its reference from the input; see "Noise
+squelch on audio input" in `docs/cli.md`); the auto squelch, and the noise squelch on an `am` row, are off there and
+the row is warned about as an open one.
+
+On an `nfm` row or `nfm-conventional` target the tone policy (issue #527) is the configured receive policy
+(`--tone-allow`, `--tone-block`, `[analog] tone_filter` and `tone_list`; see "Tone filter" in `docs/cli.md`) for this
+row alone: a row without one runs the configured policy, `--no-tone-filter` turns it off on this row, and the list is
+written as on the command line, `/` between entries. A comma ends the `options` cell (the splitter has no quoting), so a
+list written with commas is refused rather than imported short: when the cell ends with the list and the field after the
+comma lies past the header's last column, or is one of the file's own columns whose whole field is a run of
+`/`-separated entries with no space, starting with a standard tone or code (`67.0`, `67.0/D023N`), alone or followed by
+another row option the same comma cut off (`67.0 --squelch-db -60`), the row is refused with
+`--tone-allow: use / between entries, not commas`, and the text after the comma is not repeated. Any other name with a
+space in it (`100 Main St`, `D023 Repeater`) is its column's own, but a one-word name that is itself a standard tone or
+code (`100`, or `150` now that 150.0 Hz is a supported tone) reads as the list's rest. A code matches by its signal:
+`D023I` passes traffic received as
+`DCS D047N / D023I`. The polarity is part of the signal, so on a source whose audio is inverted a `D023N` transmitter
+arrives as that same `DCS D047N / D023I` and a listed `D023N` does not match it: fix the audio's polarity or list the
+spelling the monitor shows (see [Received code (DCS)](cli.md#received-code-dcs-on-the-analog-monitor)). The row's policy
+applies when the row is tuned and the configured one is restored when the scanner moves on, and Config->Save never
+writes it. The Qt/Android channel-map review and target preview list it (`Tone filter: allow 100.0 Hz/D023N`,
+`Tone filter: off`), or `Tone filter: inherit` on an nfm row without one. An `am` row or `am-conventional` target has
+none: the AM monitor hears no CTCSS or DCS, so the options are refused there, and while it is on air the configured
+policy judges nothing and mutes nothing; its carrier holds it as `Carrier`. The policy is a setting, and frontends show
+it apart from the tone or code received: the `Tone filter:` line (terminal) and `TONE FILTER` row (Qt/Android) read
+`allow 100.0 Hz/D023N (row; default off)` while the row's own policy is on air over a configured policy that is off,
+beside the `Rx tone:` line or `RECEIVED TONE` row that only ever shows what was received. Under a list policy each
+transmission starts muted while it is checked (800 ms, to 1,600 ms while the list holds a DCS code and a received code
+is still being confirmed); the row holds while its carrier lasts, with the stay reason `Tone check` and no countdown
+meanwhile: a `-Y` pass keeps it then even when `-t` has run out, and so does the trunk-scan tick. The check is not
+activity: it restarts no `-t` or `activity_hold_ms` and leaves a target's idle dwell running, so one that ends before a
+verdict leaves no tail, and repeated short bursts the policy never passes (kerchunks, noise) cannot park the scanner on
+a muted row. Traffic the policy allows is activity like any carrier and leaves the ordinary tail. Traffic the policy
+rejects is muted and holds nothing: a `-Y` row moves on at the next no-carrier pass and an `nfm-conventional` target at
+the next tick, without waiting out `-t` or its `activity_hold_ms`, and traffic that was passing and turns out to carry a
+blocked (or, under allow, an unlisted) tone or code is released the same way, as is traffic rejected and ended before
+that pass or tick came (the rejection outlives its carrier for the scanner until the next carrier opens or the row
+changes). An operator hold keeps the row, muted. A `-Y` row on the same frequency is somewhere to take rejected traffic
+only when it would judge it otherwise: a row of another class (a `dmr` row for a mixed-mode repeater's DMR traffic), or
+an `nfm` row whose own or configured policy passes the traffic's tone or code (a repeater listed once per user group,
+each row with its own `--tone-allow`). A row that would reject it too is not, and with nowhere else to go the row keeps
+the traffic, muted, under `Carrier` with no countdown, until it ends and the ordinary tail runs. Example:
+
+```csv
+channel,frequency_hz,name,mode,options
+1,154430000,County fire,nfm,--squelch-db -60 --tone-allow 156.7/D023N
+2,155475000,Public works,nfm,--tone-block 100.0
+3,155520000,Shared repeater,nfm,--no-tone-filter
+```
+
+A list may mix analog and digital rows: each row switches the receiver between the FM monitor, the AM monitor and the
+digital decoder at its own width when it is tuned, without reopening the device, and opens the audio output the row
+plays through. The monitor stays silent while a retune is in flight, and after one that failed once the scanner had
+moved on, until a later retune lands or the scan ends, since the receiver may then still be on another row's channel.
 
 Omitted settings inherit the outer CLI/configuration, including forcing. Use `--no-force-key` on a normal mixed
 clear/BP channel when forcing is configured globally. `-b 1` with normal signalling processes clear and BP calls;
@@ -266,9 +443,9 @@ Backslashes are literal, so `-G "C:\Radio Lists\groups.csv"` works without shell
 include an optional `0x` prefix and whitespace inside a quoted argument. Long switches that take an argument
 also accept `--name=value`; argument-free switches reject it (for example, `--scan-voice-only=yes`). An
 argument must not start with `-`; use `./-name.csv` for a filename that starts with a dash. The one exception is
-`--squelch-db`, whose value is negative: a following token that reads as a negative number, a minus sign and a digit
-followed only by digits, `.`, `e`, `E`, `+` or `-` (`--squelch-db -60`), is its value, while anything else starting
-with `-` (`--squelch-db --strict-crc`) is still refused as a missing value. A malformed number such as
+`--squelch-db` (and `--squelch`), whose value is negative: a following token that reads as a negative number, a minus
+sign and a digit followed only by digits, `.`, `e`, `E`, `+` or `-` (`--squelch-db -60`), is its value, while anything
+else starting with `-` (`--squelch-db --strict-crc`) is still refused as a missing value. A malformed number such as
 `--squelch-db -5.5` is therefore reported as an out-of-range value, the same as `--squelch-db=-5.5`. The digit
 switches `-0`, `-1` and `-4` read as numbers there too: `--squelch-db -4` sets -4 dB and is never the `-4` switch.
 `--squelch-db=-60` also works. CSV commas remain field separators, including inside quotes. Unknown switches,
@@ -303,12 +480,14 @@ Declared modes use these symbol profiles:
 | NXDN48, dPMR | 2400 | 4 |
 | D-STAR | 4800 | 2 |
 
+An analog (`nfm` or `am`) row has no symbol profile: it runs the analog monitor at its channel width.
+
 ## Trunk Scan Target CSV (`--trunk-scan <file>` / `[trunk_scan] targets_csv`)
 
-Purpose: Rotate one tuner across explicit P25 trunk, DMR trunk, NXDN trunk, and one-frequency P25, DMR, NXDN96 and
-NXDN48 conventional targets. Qt/Android can import this format as a playable scan list with a read-only
-preview and privately stored companion files. See
-`docs/trunk-scan.md` for the full setup workflow and troubleshooting guide.
+Purpose: Rotate one tuner across explicit P25 trunk, DMR trunk, NXDN trunk, and one-frequency P25, DMR, NXDN96,
+NXDN48, analog NFM and analog AM conventional targets. Qt/Android can import this format as a playable scan list with a
+read-only preview and privately stored companion files. See `docs/trunk-scan.md` for the full setup workflow and
+troubleshooting guide.
 
 The header must start with this exact prefix:
 
@@ -326,14 +505,14 @@ Columns:
 | Column | Required | Behavior |
 |--------|----------|----------|
 | `id` | Yes | Unique short name shown in the terminal status row and Call Info, as the `[id]` prefix on event-history rows, `-J` log lines and the rdio `talkgroup_tag` fallback, and in log messages. Empty or too-long IDs are rejected. |
-| `type` | Yes | One of `p25-trunk`, `p25-conventional`, `dmr-trunk`, `dmr-conventional`, `nxdn-trunk` (NXDN96, 12.5 kHz), `nxdn48-trunk` (NXDN48, 6.25 kHz), `nxdn-conventional` (NXDN96, 12.5 kHz), or `nxdn48-conventional` (NXDN48, 6.25 kHz). |
-| `frequency_hz` | Yes | Decimal Hz only. Normal 64-bit builds accept `1..4294967295`; 32-bit builds may reject values above `LONG_MAX`. Do not use `K`/`M`/`G` suffixes in CSV. |
-| `chan_csv` | No | Optional channel-map path for trunk targets (`p25-trunk`, `dmr-trunk`, `nxdn-trunk`, `nxdn48-trunk`). Paths are resolved relative to this CSV. Leave empty for conventional DMR, P25 and both conventional NXDN types. |
+| `type` | Yes | One of `p25-trunk`, `p25-conventional`, `dmr-trunk`, `dmr-conventional`, `nxdn-trunk` (NXDN96, 12.5 kHz), `nxdn48-trunk` (NXDN48, 6.25 kHz), `nxdn-conventional` (NXDN96, 12.5 kHz), `nxdn48-conventional` (NXDN48, 6.25 kHz), `nfm-conventional` (one analog NFM channel) or `am-conventional` (one analog AM channel); see [Analog rows](#analog-rows). Exact case. |
+| `frequency_hz` | Yes | Decimal Hz only. Builds with a 64-bit `long` (Linux, macOS, Android) accept `1..4294967295`; Windows builds, whose `long` is 32-bit, and other 32-bit targets reject values above `LONG_MAX` (2147483647). Do not use `K`/`M`/`G` suffixes in CSV. |
+| `chan_csv` | No | Optional channel-map path for trunk targets (`p25-trunk`, `dmr-trunk`, `nxdn-trunk`, `nxdn48-trunk`). Paths are resolved relative to this CSV. Leave empty for conventional DMR, P25, both conventional NXDN types and the analog types. |
 | `dwell_ms` | No | Per-target idle dwell (`250..600000`). Empty uses `--trunk-scan-dwell-ms` or `[trunk_scan] idle_dwell_ms`. |
-| `activity_hold_ms` | No | Per-target conventional DMR/P25/NXDN (NXDN96 and NXDN48) activity hold (`250..600000`). Empty uses `--trunk-scan-activity-hold-ms` or `[trunk_scan] activity_hold_ms`. P25 holds from allowed voice starts, not PDU data; `-e` has no effect on P25 conventional holds. |
+| `activity_hold_ms` | No | Per-target conventional DMR/P25/NXDN (NXDN96 and NXDN48) activity hold (`250..600000`), and an analog target's hold after its carrier drops. Empty uses `--trunk-scan-activity-hold-ms` or `[trunk_scan] activity_hold_ms`. P25 holds from allowed voice starts, not PDU data; `-e` has no effect on P25 conventional holds. |
 | `notes` | No | Ignored. Use for local notes. |
-| `modulation` | No | Per-target demod hint. Empty preserves global/default handling. `auto` uses target defaults and overrides global `-m` locks for that target. Both P25 types accept `auto`, `c4fm`, `cqpsk`; DMR and both NXDN rates accept `auto`, `gfsk`. |
-| `rtl_gain` | No | Per-target RTL-family tuner gain. Empty uses the global/default gain. `0` or `auto` requests device automatic gain. `1..49` requests manual dB gain. Ignored for non-RTL retuning paths. |
+| `modulation` | No | Per-target demod hint. Empty preserves global/default handling. `auto` uses target defaults and overrides global `-m` locks for that target. Both P25 types accept `auto`, `c4fm`, `cqpsk`; DMR and both NXDN rates accept `auto`, `gfsk`. An analog (`nfm-conventional`, `am-conventional`) target takes none. |
+| `rtl_gain` | No | Per-target RTL-family tuner gain. Empty uses the configured gain, including one set live during the scan. `0` or `auto` requests device automatic gain. `1..49` requests manual dB gain. Ignored for non-RTL retuning paths. |
 | `keys_hex_csv` | No | Per-target hex key file (`-K` format), resolved relative to this CSV. A row may fill both key columns; they load into one per-target key set. Empty uses the global keys. |
 | `keys_dec_csv` | No | Per-target decimal key file (`-k` format), resolved relative to this CSV. Empty uses the global keys. |
 | `single_key_dec` | No | Embedded `-b` Motorola Basic Privacy key number (`0..255`). Explicit `0` is present and overrides the global key. May be combined with `single_key_hex`, but not either key-file column. |
@@ -351,9 +530,14 @@ Validation notes:
 - Optional column names match ASCII case-insensitively in this format. Duplicate direct-key headers, malformed direct values, and
   rows that mix a direct value with a key-file path are rejected without echoing the key value.
 - `chan_csv` and `p25_bandplan_csv` on conventional
-  (`p25-conventional`/`dmr-conventional`/`nxdn-conventional`/`nxdn48-conventional`) rows are rejected;
-  a duplicated `p25_bandplan_csv` header is rejected, and a band plan that fails to load fails
+  (`p25-conventional`/`dmr-conventional`/`nxdn-conventional`/`nxdn48-conventional`/`nfm-conventional`/`am-conventional`)
+  rows are rejected; a duplicated `p25_bandplan_csv` header is rejected, and a band plan that fails to load fails
   the whole import.
+- An `nfm-conventional` or `am-conventional` row also rejects a `modulation` value and every key column
+  (`keys_hex_csv`, `keys_dec_csv`, `single_key_dec`, `single_key_hex`), without echoing a key. `nfm-trunk` and
+  `am-trunk` are rejected with `analog targets are conventional only` (use `nfm-conventional`/`am-conventional`),
+  `am` with the hint to use `am-conventional`, and the analog FM spellings (`nfm`, `fm-conventional`, ...) with the
+  hint to use `nfm-conventional`; any other unknown type, including a miscased one, lists the accepted ones.
 - Global `-C`/`[trunking] chan_csv` and `--p25-bandplan`/`[trunking] p25_bandplan_csv` are rejected in trunk scan
   mode so channel maps and band plans do not leak across systems.
 - One tuner can only monitor the active target; traffic on other targets can be missed.
@@ -372,6 +556,19 @@ site-nxdn,nxdn-trunk,461037500,,3000,,NXDN Type-C control channel,auto,
 site-nxdn48,nxdn48-trunk,461556250,nxdn_chan_map.csv,3000,,NXDN48 Type-C control channel (6.25 kHz),gfsk,
 field-nxdn,nxdn-conventional,461550000,,1500,1200,one-frequency NXDN96 channel,gfsk,
 field-nxdn48,nxdn48-conventional,461556250,,1500,1200,one-frequency NXDN48 (6.25 kHz) channel,gfsk,
+```
+
+A list mixing analog AM and NFM channels with digital ones (the `options` column carries each analog target's width,
+spelled for its kind, and squelch):
+
+```csv
+id,type,frequency_hz,chan_csv,dwell_ms,activity_hold_ms,notes,options
+tower,am-conventional,118300000,,2000,3000,airband tower (8.33 kHz spacing),--am-bandwidth-hz 8333 --squelch-db -55
+fire-dispatch,nfm-conventional,154430000,,2000,3000,county fire dispatch,--nfm-bandwidth-hz 12500 --squelch-db -60
+city-dmr,dmr-conventional,461112500,,1500,1200,one-frequency DMR,
+guard,am-conventional,121500000,,2000,3000,airband guard (default 6 kHz AM width),--squelch-db -60
+public-works,nfm-conventional,155475000,,2000,3000,wideband 25 kHz channel,--nfm-bandwidth-hz 16000 --squelch-db -55
+county-p25,p25-conventional,851500000,,1500,1200,one-frequency P25,
 ```
 
 ## P25 Band Plan CSV (`--p25-bandplan <file>` / `[trunking] p25_bandplan_csv`)

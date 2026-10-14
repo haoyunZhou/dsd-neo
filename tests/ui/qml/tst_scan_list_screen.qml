@@ -148,6 +148,75 @@ Item {
             }
         }
 
+        // Issue #526: an nfm-conventional target's own --nfm-bandwidth-hz shows in the preview,
+        // one without it says it inherits, and a digital target says nothing about it.
+        function test_imported_target_preview_shows_bandwidth() {
+            var source = testContext.writeFixtureCsv("bandwidth-targets.csv",
+                "id,type,frequency_hz,chan_csv,dwell_ms,activity_hold_ms,notes,options\n"
+                + "own,nfm-conventional,154430000,,,,,--nfm-bandwidth-hz 11250\n"
+                + "inh,nfm-conventional,155100000,,,,,\n"
+                + "dig,dmr-conventional,461000000,,,,,\n"
+                + "tower,am-conventional,118300000,,,,,--am-bandwidth-hz 8333\n"
+                + "guard,am-conventional,121500000,,,,,\n");
+            var result = importedFiles.importFile(source, "BandwidthTargets.csv", "trunkTargets");
+            verify(result.ok, result.detail || "Import failed");
+            try {
+                screen.selectTargets(result.path);
+                compare(screen.targetRows.length, 5);
+                var preview = visualChild(screen, "scanTargetPreview");
+                verify(preview !== null);
+                tryVerify(function() { return preview.count === 5 && preview.itemAtIndex(4) !== null; });
+                verify(preview.itemAtIndex(0).text.indexOf("NFM bandwidth: 11.25 kHz") >= 0, preview.itemAtIndex(0).text);
+                verify(preview.itemAtIndex(1).text.indexOf("NFM bandwidth: inherit") >= 0, preview.itemAtIndex(1).text);
+                verify(preview.itemAtIndex(2).text.indexOf("bandwidth") < 0, preview.itemAtIndex(2).text);
+                // Issue #526: an am-conventional target's width is the AM one.
+                verify(preview.itemAtIndex(3).text.indexOf("AM bandwidth: 8.333 kHz") >= 0, preview.itemAtIndex(3).text);
+                verify(preview.itemAtIndex(4).text.indexOf("AM bandwidth: inherit") >= 0, preview.itemAtIndex(4).text);
+                verify(preview.itemAtIndex(3).text.indexOf("NFM") < 0, preview.itemAtIndex(3).text);
+                // An analog target takes no modulation, so the preview names none; a digital one's
+                // inherits.
+                for (var i = 0; i < 5; ++i) {
+                    var text = preview.itemAtIndex(i).text;
+                    verify((text.indexOf("Modulation:") >= 0) === (i === 2), text);
+                    verify(text.indexOf("Dwell: inherit · Hold: inherit") >= 0 && text.indexOf("Gain: inherit") >= 0,
+                           text);
+                }
+            } finally {
+                importedFiles.remove(importedFiles.rowForPath(result.path));
+            }
+        }
+
+        // Issue #527: an nfm-conventional target's own tone policy shows in the preview with its
+        // list, one without it says it runs the configured policy, and an am or digital target,
+        // which cannot set one, says nothing about it.
+        function test_imported_target_preview_shows_tone_filter() {
+            var source = testContext.writeFixtureCsv("tone-targets.csv",
+                "id,type,frequency_hz,chan_csv,dwell_ms,activity_hold_ms,notes,options\n"
+                + "allow,nfm-conventional,154430000,,,,,--tone-allow 100.0/D023N\n"
+                + "block,nfm-conventional,155475000,,,,,--tone-block 67.0\n"
+                + "off,nfm-conventional,155520000,,,,,--no-tone-filter\n"
+                + "inh,nfm-conventional,155535000,,,,,\n"
+                + "tower,am-conventional,118300000,,,,,\n"
+                + "dig,dmr-conventional,461000000,,,,,\n");
+            var result = importedFiles.importFile(source, "ToneTargets.csv", "trunkTargets");
+            verify(result.ok, result.detail || "Import failed");
+            try {
+                screen.selectTargets(result.path);
+                compare(screen.targetRows.length, 6);
+                var preview = visualChild(screen, "scanTargetPreview");
+                verify(preview !== null);
+                tryVerify(function() { return preview.count === 6 && preview.itemAtIndex(5) !== null; });
+                var want = ["Tone filter: allow 100.0 Hz/D023N", "Tone filter: block 67.0 Hz", "Tone filter: off",
+                            "Tone filter: inherit"];
+                for (var i = 0; i < 4; ++i)
+                    verify(preview.itemAtIndex(i).text.indexOf(want[i]) >= 0, preview.itemAtIndex(i).text);
+                verify(preview.itemAtIndex(4).text.indexOf("Tone filter") < 0, preview.itemAtIndex(4).text);
+                verify(preview.itemAtIndex(5).text.indexOf("Tone filter") < 0, preview.itemAtIndex(5).text);
+            } finally {
+                importedFiles.remove(importedFiles.rowForPath(result.path));
+            }
+        }
+
         function test_reselect_manual_targets_keeps_entries() {
             screen.addFrequency("First unsaved target", "dmr", "461");
             screen.addFrequency("Second unsaved target", "nxdn", "462");
@@ -715,8 +784,8 @@ Item {
 
         function test_human_protocol_labels_map_to_ids() {
             edit("scanListName", "Protocols");
-            var names = ["P25", "DMR", "NXDN48", "NXDN96"];
-            var ids = ["p25", "dmr", "nxdn48", "nxdn"];
+            var names = ["P25", "DMR", "NXDN48", "NXDN96", "NFM (analog)", "AM (analog)"];
+            var ids = ["p25", "dmr", "nxdn48", "nxdn", "nfm", "am"];
             for (var i = 0; i < ids.length; ++i) {
                 var picker = control("scanAddProtocol");
                 compare(picker.textAt(i), names[i]);
@@ -732,7 +801,43 @@ Item {
                 compare(screen.entries[0].protocol, ids[j]);
             }
             screen.saveDraft();
-            compare(scanLists.get(0).entries[0].protocol, "nxdn");
+            compare(scanLists.get(0).entries[0].protocol, "am");
+        }
+
+        // Issue #526: an nfm or am entry, frequency or saved analog system, holds on carrier and
+        // has no digital modulation, keys or talkgroups: the modulation and decryption choices are
+        // hidden for it and come back for a digital protocol. The hidden values are kept, not
+        // written into the targets the list builds.
+        function test_analog_entries_hide_modulation_and_decryption() {
+            var savedRow = savedSystems.count;
+            verify(savedSystems.add({name: "Tower AM", sourceType: "usb", freqMhz: "118.3", decodeFlag: "-fM"}));
+            try {
+                edit("scanListName", "Analog");
+                screen.addFrequency("Fire", "p25", "154.43");
+                choose("scanEntryModulation", 3);
+                compare(screen.entries[0].modulation, "gfsk");
+                verify(control("scanEntryModulation").visible && control("scanEntryDecryptionScope").visible);
+                for (var analog of ["nfm", "am"]) {
+                    choose("scanEntryProtocol", ["p25", "dmr", "nxdn48", "nxdn", "nfm", "am"].indexOf(analog));
+                    compare(screen.entries[0].protocol, analog);
+                    verify(!control("scanEntryModulation").visible, analog);
+                    verify(!control("scanEntryDecryptionScope").visible, analog);
+                    verify(!control("scanEntryDecryptionProfile").visible, analog);
+                }
+                choose("scanEntryProtocol", 0);
+                verify(control("scanEntryModulation").visible && control("scanEntryDecryptionScope").visible);
+                compare(control("scanEntryModulation").currentIndex, 3);
+                choose("scanEntryProtocol", 5);
+                screen.removeEntry(0);
+                choose("scanSystemPicker", savedRow);
+                control("scanAddSystem").Accessible.pressAction();
+                verify(!control("scanEntryModulation").visible && !control("scanEntryDecryptionScope").visible);
+                screen.addFrequency("Guard", "am", "121.5");
+                verify(screen.validate(), screen.validationText);
+                verify(screen.validationText.indexOf("2 targets ready.") === 0, screen.validationText);
+            } finally {
+                savedSystems.remove(savedRow);
+            }
         }
 
         function test_save_empty_name_stays_open_data() {
@@ -970,11 +1075,21 @@ Item {
             return message;
         }
 
+        function scrollEditorToBottom() {
+            // A geometry change queues Qt.callLater(screen.revealFocus), which scrolls back to the
+            // focused name field. Let a queued reveal run first: run after the scroll, it takes
+            // the Save buttons off screen and the click lands on nothing (seen on a busy host).
+            wait(0);
+            var scroll = control("scanListScroll");
+            var bottom = scroll.contentHeight - scroll.height;
+            scroll.contentY = bottom;
+            renderEditor();
+            fuzzyCompare(scroll.contentY, bottom, 0.5, "The editor stays scrolled to its Save buttons");
+        }
+
         function test_failed_save_keeps_message_in_view(data) {
             prepareFailedValidation(data);
-            var scroll = control("scanListScroll");
-            scroll.contentY = scroll.contentHeight - scroll.height;
-            renderEditor();
+            scrollEditorToBottom();
             var save = control(data.button);
             mouseClick(save, save.width / 2, save.height / 2);
             verifyFailedValidation(data);
@@ -1016,9 +1131,7 @@ Item {
             testContext.setPrefs("appearance", data.appearance);
             data.override = false;
             prepareFailedValidation(data);
-            var scroll = control("scanListScroll");
-            scroll.contentY = scroll.contentHeight - scroll.height;
-            renderEditor();
+            scrollEditorToBottom();
             var save = control("scanSave");
             mouseClick(save, save.width / 2, save.height / 2);
             verifyFailedValidation(data);
@@ -1059,10 +1172,11 @@ Item {
 
         function test_repeated_validation_reveals_message(data) {
             prepareFailedValidation(data);
-            var scroll = control("scanListScroll");
             for (var i = 0; i < 2; ++i) {
-                scroll.contentY = scroll.contentHeight - scroll.height;
-                renderEditor();
+                scrollEditorToBottom();
+                // Out of view before validating, so the reveal below is validation's own.
+                var field = control(data.override ? "scanTuner_gainDb" : "scanListName");
+                verify(!insideVisibleArea(field), "The invalid field starts out of view");
                 control("validateScanDraft").Accessible.pressAction();
                 verifyFailedValidation(data);
             }

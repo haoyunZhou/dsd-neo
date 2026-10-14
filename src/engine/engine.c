@@ -5,17 +5,20 @@
 
 #include <dsd-neo/core/audio.h>
 #include <dsd-neo/core/audio_filters.h>
+#include <dsd-neo/core/audio_input_switch.h>
+#include <dsd-neo/core/audio_sink.h>
 #include <dsd-neo/core/call_state.h>
 #include <dsd-neo/core/channel_mode.h>
 #include <dsd-neo/core/constants.h>
 #include <dsd-neo/core/csv_import.h>
 #include <dsd-neo/core/dibit.h>
-#include <dsd-neo/core/dsd_time.h>
 #include <dsd-neo/core/events.h>
 #include <dsd-neo/core/file_io.h>
+#include <dsd-neo/core/init.h>
 #include <dsd-neo/core/key_set.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/opts_fwd.h>
+#include <dsd-neo/core/p25p2_playout.h>
 #include <dsd-neo/core/power.h>
 #include <dsd-neo/core/safe_api.h>
 #include <dsd-neo/core/source_alias.h>
@@ -27,6 +30,7 @@
 #include <dsd-neo/core/talkgroup_policy.h>
 #include <dsd-neo/core/time_format.h>
 #include <dsd-neo/core/vocoder.h>
+#include <dsd-neo/core/voice_chain.h>
 #include <dsd-neo/dsp/analog_rx.h>
 #include <dsd-neo/dsp/frame_sync.h>
 #include <dsd-neo/dsp/sps_filters.h>
@@ -42,6 +46,8 @@
 #include <dsd-neo/engine/trunk_tuning.h>
 #include <dsd-neo/fec/block_codes.h>
 #include <dsd-neo/io/control.h>
+#include <dsd-neo/io/iq_replay.h>
+#include <dsd-neo/io/iq_types.h>
 #include <dsd-neo/io/rigctl_client.h>
 #include <dsd-neo/io/udp_input.h>
 #include <dsd-neo/io/udp_socket_connect.h>
@@ -61,6 +67,7 @@
 #include <dsd-neo/protocol/p25/p25_crypto.h>
 #include <dsd-neo/protocol/p25/p25_sm_watchdog.h>
 #include <dsd-neo/protocol/p25/p25_trunk_sm.h>
+#include <dsd-neo/protocol/p25/p25p2_frame.h>
 #include <dsd-neo/protocol/provoice/provoice.h>
 #include <dsd-neo/protocol/tetra/tetra_acelp.h>
 #include <dsd-neo/protocol/tetra/tetra_trunk_sm.h>
@@ -69,12 +76,17 @@
 #include <dsd-neo/runtime/cli.h>
 #include <dsd-neo/runtime/config.h>
 #include <dsd-neo/runtime/control_pump.h>
+#include <dsd-neo/runtime/decode_clock.h>
 #include <dsd-neo/runtime/exitflag.h>
 #include <dsd-neo/runtime/input_failure.h>
 #include <dsd-neo/runtime/input_spec.h>
 #include <dsd-neo/runtime/log.h>
 #include <dsd-neo/runtime/rdio_export.h>
+#include <dsd-neo/runtime/rigctl_passband.h>
+#include <dsd-neo/runtime/scan_mode.h>
 #include <dsd-neo/runtime/shutdown.h>
+#include <dsd-neo/runtime/squelch.h>
+#include <dsd-neo/runtime/telemetry.h>
 #include <dsd-neo/runtime/trunk_cc_candidates.h>
 #include <dsd-neo/runtime/trunk_scan_hooks.h>
 #include <dsd-neo/runtime/trunk_tuning_hooks.h>
@@ -82,6 +94,7 @@
 #include <limits.h>
 #include <mbelib-neo/mbelib.h>
 #include <signal.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -103,9 +116,12 @@ struct CODEC2;
 void codec2_destroy(struct CODEC2* codec2_state);
 #endif
 
-// Local caches to avoid redundant device I/O in hot paths
+// Local caches to avoid redundant device I/O in hot paths. The rigctl frequency holds for one connection:
+// dsd_engine_rigctl_tune_cache_forget() empties it once rigctl reconnects (issue #589). The legacy leg keeps no copy of
+// the -B it sent: the client's record of the peer skips a repeat (SetModulationKind()), and every request that changes
+// the peer's passband (a live width, a scan's restore, a manual tune; issue #621) updates that record, where a copy
+// here would go stale.
 static long int s_last_rigctl_freq = -1;
-static int s_last_rigctl_bw = -12345;
 static uint64_t s_no_carrier_generic_recovery_request_id = 0U;
 static uint64_t s_no_carrier_generic_recovery_expected_generation = 0U;
 static const dsd_state* s_no_carrier_generic_recovery_state = NULL;
@@ -122,10 +138,14 @@ no_carrier_clear_generic_recovery_tracking(void) {
     s_no_carrier_generic_recovery_cc = 0;
 }
 
+void
+dsd_engine_rigctl_tune_cache_forget(void) {
+    s_last_rigctl_freq = -1;
+}
+
 static void
 reset_device_io_caches(void) {
-    s_last_rigctl_freq = -1;
-    s_last_rigctl_bw = -12345;
+    dsd_engine_rigctl_tune_cache_forget();
     no_carrier_clear_generic_recovery_tracking();
     dsd_trunk_tuning_requests_reset();
 #ifdef USE_RADIO
@@ -146,22 +166,6 @@ dsd_parse_int_arg(const char* token, int* out) {
         return -1;
     }
     *out = (int)value;
-    return 0;
-}
-
-static int
-dsd_parse_double_arg(const char* token, double* out) {
-    if (!token || !out || token[0] == '\0') {
-        return -1;
-    }
-
-    errno = 0;
-    char* end = NULL;
-    double value = strtod(token, &end);
-    if (errno != 0 || end == token) {
-        return -1;
-    }
-    *out = value;
     return 0;
 }
 
@@ -248,7 +252,7 @@ maybe_request_rtl_fsk_reacquire_on_no_sync(const dsd_opts* opts, dsd_state* stat
         return;
     }
 
-    double nowm = dsd_time_now_monotonic_s();
+    double nowm = dsd_decode_now_mono_s();
     time_t latest_sync_time = max_time_t(state->last_cc_sync_time, state->last_vc_sync_time);
     double latest_sync_m = max_double(state->last_cc_sync_time_m, state->last_vc_sync_time_m);
 
@@ -334,6 +338,12 @@ import_global_channel_map_if_needed(dsd_opts* opts, dsd_state* state) {
         }
         LOG_INFO("NOTICE: Imported channel map from %s\n", opts->chan_in_file);
         dsd_scan_row_keys_warn_if_unused(state, opts->scanner_mode);
+        /* A config file's -Y list, or one the command line read no row from: the command line checked a list it
+           imported rows from (issue #527). */
+        if (opts->scanner_mode == 1) {
+            (void)dsd_scan_mode_warn_tone_filter_unused(opts, state,
+                                                        dsd_channel_modes_conventional_hear_tones(opts, state));
+        }
     }
     return 0;
 }
@@ -424,6 +434,8 @@ open_recording_outputs_if_needed(dsd_opts* opts, dsd_state* state) {
         }
         opts->wav_out_f = open_wav_file(opts->wav_out_dir, opts->wav_out_file, sizeof opts->wav_out_file, 8000, 0);
         opts->wav_out_fR = open_wav_file(opts->wav_out_dir, opts->wav_out_fileR, sizeof opts->wav_out_fileR, 8000, 0);
+        opts->wav_out_open_time = dsd_decode_time();
+        opts->wav_out_open_timeR = opts->wav_out_open_time;
     } else if (opts->static_wav_file == 1 && opts->wav_out_f == NULL && opts->wav_out_file[0] != '\0') {
         openWavOutFileLR(opts, state);
     }
@@ -478,48 +490,6 @@ dsd_engine_signal_handler(int sgnl) {
     dsd_exitflag_store(1);
 }
 
-static double
-atofs(const char* s) {
-    size_t len = strlen(s);
-    if (len == 0) {
-        return 0.0;
-    }
-
-    double value = 0.0;
-
-    char last = s[len - 1];
-    double factor = 1.0;
-
-    switch (last) {
-        case 'g':
-        case 'G': factor = 1e9; break;
-        case 'm':
-        case 'M': factor = 1e6; break;
-        case 'k':
-        case 'K': factor = 1e3; break;
-        default:
-            if (dsd_parse_double_arg(s, &value) != 0) {
-                return 0.0;
-            }
-            return value;
-    }
-
-    if (len == 1) {
-        return 0.0;
-    }
-
-    char unitless[1024];
-    if (len >= sizeof(unitless)) {
-        return 0.0;
-    }
-    DSD_MEMCPY(unitless, s, len - 1);
-    unitless[len - 1] = '\0';
-    if (dsd_parse_double_arg(unitless, &value) != 0) {
-        return 0.0;
-    }
-    return value * factor;
-}
-
 static void
 dsd_engine_setup_copy_spec(char* dst, size_t dst_size, const char* src) {
     if (!dst || dst_size == 0 || !src) {
@@ -540,52 +510,6 @@ dsd_engine_setup_parse_int_token(const char* token, int* out) {
     }
     *out = parsed;
     return 0;
-}
-
-static int
-dsd_engine_setup_parse_bw_token_or_default(const char* token) {
-    int bw = 0;
-    if (token && dsd_parse_int_arg(token, &bw) != 0) {
-        bw = 0;
-    }
-    if (bw == 4 || bw == 6 || bw == 8 || bw == 12 || bw == 16 || bw == 24 || bw == 48 || bw == 72) {
-        return bw;
-    }
-    return 48;
-}
-
-static double
-dsd_engine_setup_parse_sql_token_or_default(const char* token, double fallback) {
-    if (!token) {
-        return fallback;
-    }
-    double sq_val = 0.0;
-    if (dsd_parse_double_arg(token, &sq_val) != 0) {
-        /* A token that is not a number says nothing about the squelch. Treating a
-         * failed parse as the zero left in sq_val switched the squelch off, which
-         * is a setting the user never asked for. */
-        return fallback;
-    }
-    return dsd_squelch_level_from_sql(sq_val);
-}
-
-static void
-dsd_engine_setup_parse_bias_token(dsd_opts* opts, const char* token) {
-    if (!token) {
-        return;
-    }
-    if (strncmp(token, "bias", 4) != 0 && strncmp(token, "b", 1) != 0) {
-        return;
-    }
-    const char* val = strchr(token, '=');
-    int on = 1;
-    if (val && *(val + 1)) {
-        val++;
-        if (*val == '0' || *val == 'n' || *val == 'N' || *val == 'o' || *val == 'O' || *val == 'f' || *val == 'F') {
-            on = 0;
-        }
-    }
-    opts->rtl_bias_tee = on;
 }
 
 static int
@@ -711,6 +635,8 @@ dsd_engine_setup_parse_tcp_input(dsd_opts* opts, dsd_state* state) {
         LOG_INFO("NOTICE: %d \n", opts->tcp_portno);
         opts->tcp_sockfd = Connect(opts->tcp_hostname, opts->tcp_portno);
         if (opts->tcp_sockfd != DSD_INVALID_SOCKET) {
+            /* The input's reconnect goes back to the address this connection went to (issue #634). */
+            ConnectKeepTcpAudioAddress(opts->tcp_hostname, opts->tcp_portno);
             opts->audio_in_type = AUDIO_IN_TCP;
             LOG_INFO("NOTICE: TCP Connection Success!\n");
             return 0;
@@ -733,6 +659,10 @@ dsd_engine_setup_connect_rigctl_if_enabled(dsd_opts* opts) {
     }
     opts->rigctl_sockfd = Connect(opts->rigctlhostname, opts->rigctlportno);
     if (opts->rigctl_sockfd != DSD_INVALID_SOCKET) {
+        /* Issue #589: the peer record names the connection before the lifecycle starts the P25 watchdog, whose retunes
+           use it; a first request made there would otherwise reset the record while a TCP audio reconnect's Connect()
+           reads it on this thread. */
+        RigctlRebindPeer(DSD_INVALID_SOCKET, opts->rigctl_sockfd, 0);
         opts->use_rigctl = 1;
         return;
     }
@@ -756,81 +686,13 @@ dsd_engine_setup_enable_iq_replay_if_selected(dsd_opts* opts) {
     opts->iq_replay_active = 1;
 }
 
-static int
-dsd_engine_setup_parse_rtltcp_tuning_tokens(dsd_opts* opts, char** saveptr) {
-    const char* curr = dsd_strtok_r(NULL, ":", saveptr);
-    if (!curr) {
-        return 0;
-    }
-    opts->rtlsdr_center_freq = (uint32_t)atofs(curr);
-
-    curr = dsd_strtok_r(NULL, ":", saveptr);
-    if (!curr) {
-        return 0;
-    }
-    int parsed = 0;
-    if (dsd_engine_setup_parse_int_token(curr, &parsed) == 0) {
-        opts->rtl_gain_value = parsed;
-    }
-
-    curr = dsd_strtok_r(NULL, ":", saveptr);
-    if (!curr) {
-        return 0;
-    }
-    if (dsd_engine_setup_parse_int_token(curr, &parsed) == 0) {
-        opts->rtlsdr_ppm_error = parsed;
-    }
-
-    curr = dsd_strtok_r(NULL, ":", saveptr);
-    if (!curr) {
-        return 0;
-    }
-    opts->rtl_dsp_bw_khz = dsd_engine_setup_parse_bw_token_or_default(curr);
-
-    curr = dsd_strtok_r(NULL, ":", saveptr);
-    if (!curr) {
-        return 0;
-    }
-    opts->rtl_squelch_level = dsd_engine_setup_parse_sql_token_or_default(curr, opts->rtl_squelch_level);
-
-    curr = dsd_strtok_r(NULL, ":", saveptr);
-    if (!curr) {
-        return 0;
-    }
-    if (dsd_engine_setup_parse_int_token(curr, &parsed) == 0) {
-        opts->rtl_volume_multiplier = parsed;
-    }
-    return 1;
-}
-
 static void
 dsd_engine_setup_parse_rtltcp_input(dsd_opts* opts) {
     if (!dsd_opts_audio_in_dev_is_rtltcp_spec(opts->audio_in_dev)) {
         return;
     }
     LOG_INFO("NOTICE: RTL_TCP Input: ");
-    char* saveptr = NULL;
-    char inbuf[1024];
-    dsd_engine_setup_copy_spec(inbuf, sizeof(inbuf), opts->audio_in_dev);
-
-    if (dsd_strtok_r(inbuf, ":", &saveptr) != NULL) {
-        const char* curr = dsd_strtok_r(NULL, ":", &saveptr);
-        if (curr != NULL) {
-            DSD_STRNCPY(opts->rtltcp_hostname, curr, 1023);
-        }
-        curr = dsd_strtok_r(NULL, ":", &saveptr);
-        if (curr != NULL) {
-            int parsed = 0;
-            if (dsd_engine_setup_parse_int_token(curr, &parsed) == 0) {
-                opts->rtltcp_portno = parsed;
-            }
-        }
-        if (dsd_engine_setup_parse_rtltcp_tuning_tokens(opts, &saveptr)) {
-            while ((curr = dsd_strtok_r(NULL, ":", &saveptr)) != NULL) {
-                dsd_engine_setup_parse_bias_token(opts, curr);
-            }
-        }
-    }
+    (void)dsd_rtl_input_spec_apply(opts);
 
     if (opts->rtltcp_portno == 0) {
         opts->rtltcp_portno = 1234;
@@ -843,6 +705,17 @@ dsd_engine_setup_parse_rtltcp_input(dsd_opts* opts) {
     }
     opts->rtltcp_enabled = 1;
     opts->audio_in_type = AUDIO_IN_RTL;
+}
+
+/* The squelch for a startup notice: a level as dsd_squelch_format() writes it, or auto+NdB, noise+NdB. */
+static void
+dsd_engine_squelch_notice_text(const dsd_opts* opts, char* out, size_t out_size) {
+    if (dsd_squelch_mode_is_dynamic(opts->rtl_squelch_mode)) {
+        DSD_SNPRINTF(out, out_size, "%s+%ddB", opts->rtl_squelch_mode == DSD_SQUELCH_MODE_NOISE ? "noise" : "auto",
+                     opts->rtl_squelch_margin_db);
+        return;
+    }
+    (void)dsd_squelch_format(opts->rtl_squelch_level, "dB", out, out_size);
 }
 
 static void
@@ -864,7 +737,7 @@ dsd_engine_setup_parse_soapy_input(dsd_opts* opts) {
     }
     if (tuning_applied) {
         char sql[24];
-        (void)dsd_squelch_format(opts->rtl_squelch_level, "dB", sql, sizeof sql);
+        dsd_engine_squelch_notice_text(opts, sql, sizeof sql);
         LOG_INFO("NOTICE: SoapySDR tuning: Freq=%u Gain=%d PPM=%d DSP-BW=%dkHz SQ=%s VOL=%d\n",
                  opts->rtlsdr_center_freq, opts->rtl_gain_value, opts->rtlsdr_ppm_error, opts->rtl_dsp_bw_khz, sql,
                  opts->rtl_volume_multiplier);
@@ -874,65 +747,6 @@ dsd_engine_setup_parse_soapy_input(dsd_opts* opts) {
 }
 
 #ifdef USE_RTLSDR
-static int
-dsd_engine_setup_parse_rtl_spec_tokens(dsd_opts* opts, char** saveptr) {
-    const char* curr = dsd_strtok_r(NULL, ":", saveptr);
-    if (!curr) {
-        return 0;
-    }
-    int parsed = 0;
-    if (dsd_engine_setup_parse_int_token(curr, &parsed) == 0) {
-        opts->rtl_dev_index = parsed;
-    }
-
-    curr = dsd_strtok_r(NULL, ":", saveptr);
-    if (!curr) {
-        return 0;
-    }
-    opts->rtlsdr_center_freq = (uint32_t)atofs(curr);
-
-    curr = dsd_strtok_r(NULL, ":", saveptr);
-    if (!curr) {
-        return 0;
-    }
-    if (dsd_engine_setup_parse_int_token(curr, &parsed) == 0) {
-        opts->rtl_gain_value = parsed;
-    }
-
-    curr = dsd_strtok_r(NULL, ":", saveptr);
-    if (!curr) {
-        return 0;
-    }
-    if (dsd_engine_setup_parse_int_token(curr, &parsed) == 0) {
-        opts->rtlsdr_ppm_error = parsed;
-    }
-
-    curr = dsd_strtok_r(NULL, ":", saveptr);
-    if (!curr) {
-        return 0;
-    }
-    opts->rtl_dsp_bw_khz = dsd_engine_setup_parse_bw_token_or_default(curr);
-
-    curr = dsd_strtok_r(NULL, ":", saveptr);
-    if (!curr) {
-        return 0;
-    }
-    opts->rtl_squelch_level = dsd_engine_setup_parse_sql_token_or_default(curr, opts->rtl_squelch_level);
-
-    curr = dsd_strtok_r(NULL, ":", saveptr);
-    if (!curr) {
-        return 0;
-    }
-    if (dsd_engine_setup_parse_int_token(curr, &parsed) == 0) {
-        opts->rtl_volume_multiplier = parsed;
-    }
-
-    while ((curr = dsd_strtok_r(NULL, ":", saveptr)) != NULL) {
-        dsd_engine_setup_parse_bias_token(opts, curr);
-    }
-    return 1;
-}
-
 static void
 dsd_engine_setup_update_rtl_spec_with_selected_index(dsd_opts* opts) {
     if (strncmp(opts->audio_in_dev, "rtl:", 4) != 0) {
@@ -1007,12 +821,7 @@ dsd_engine_setup_configure_local_rtl(dsd_opts* opts, dsd_state* state, char* ven
     UNUSED(state);
 #ifdef USE_RTLSDR
     LOG_INFO("NOTICE: RTL Input: ");
-    char* saveptr = NULL;
-    char inbuf[1024];
-    dsd_engine_setup_copy_spec(inbuf, sizeof(inbuf), opts->audio_in_dev);
-    if (dsd_strtok_r(inbuf, ":", &saveptr) != NULL) {
-        (void)dsd_engine_setup_parse_rtl_spec_tokens(opts, &saveptr);
-    }
+    (void)dsd_rtl_input_spec_apply(opts);
 
     int device_count = dsd_engine_setup_enumerate_rtl_devices(opts, vendor, product, serial);
     if (device_count <= 0) {
@@ -1030,7 +839,7 @@ dsd_engine_setup_configure_local_rtl(dsd_opts* opts, dsd_state* state, char* ven
         opts->rtl_volume_multiplier = 1;
     }
     char sql[24];
-    (void)dsd_squelch_format(opts->rtl_squelch_level, "dB", sql, sizeof sql);
+    dsd_engine_squelch_notice_text(opts, sql, sizeof sql);
     LOG_INFO("NOTICE: RTL #%d: Freq=%d Gain=%d PPM=%d DSP-BW=%dkHz SQ=%s VOL=%d%s\n", opts->rtl_dev_index,
              opts->rtlsdr_center_freq, opts->rtl_gain_value, opts->rtlsdr_ppm_error, opts->rtl_dsp_bw_khz, sql,
              opts->rtl_volume_multiplier, opts->rtl_bias_tee ? " BIAS=on" : "");
@@ -1129,7 +938,7 @@ dsd_engine_setup_parse_udp_output(dsd_opts* opts, dsd_state* state) {
     return 0;
 }
 
-static void
+static int
 dsd_engine_setup_parse_simple_outputs(dsd_opts* opts) {
     if (strncmp(opts->audio_out_dev, "pulse", 5) == 0) {
         opts->audio_out_type = 0;
@@ -1140,10 +949,25 @@ dsd_engine_setup_parse_simple_outputs(dsd_opts* opts) {
         opts->audio_out = 0;
     }
     if (strncmp(opts->audio_out_dev, "-", 1) == 0) {
-        opts->audio_out_fd = dsd_fileno(stdout);
+        const int fd = dsd_fileno(stdout);
+        if (fflush(stdout) != 0 || dsd_set_binary_mode(fd) != 0) {
+            LOG_ERROR("Unable to configure stdout for binary audio output\n");
+            return -1;
+        }
+        opts->audio_out_fd = fd;
         opts->audio_out_type = 1;
+        dsd_audio_sink_fd_reset();
         LOG_INFO("NOTICE: Audio Out Device: -\n");
+        /* The analog monitor writes stdout only in the analog-only modes (dsd_audio_sink_monitor_takes_fd()); the M17
+           encoders' -8 baseband is a stdout writer of its own. */
+        if (opts->monitor_input_audio == 1 && !dsd_audio_sink_monitor_takes_fd(opts) && opts->m17encoder != 1
+            && opts->m17encoderbrt != 1 && opts->m17encoderpkt != 1) {
+            LOG_WARN("WARNING: -8 source monitoring is not written to stdout (-o -) while decoding digital modes; its "
+                     "48 kHz audio would interleave with the decoded voice. Use -o udp (port + 2) or a sound device "
+                     "for it.\n");
+        }
     }
+    return 0;
 }
 
 static int
@@ -1169,9 +993,9 @@ dsd_engine_setup_open_audio_paths(dsd_opts* opts, dsd_state* state) {
     return 0;
 }
 
-/* The DSP bandwidth an RTL-SDR spec ("rtl:dev:freq:gain:ppm:bw:...") sets, read the way
- * dsd_engine_setup_parse_rtl_spec_tokens() reads its sixth field, but without looking for a device; @p fallback (the
- * bandwidth the options already hold) when the spec leaves the field out. */
+/* The DSP bandwidth an RTL-SDR spec ("rtl:dev:freq:gain:ppm:bw:...") sets, read the way dsd_rtl_input_spec_apply()
+ * reads its sixth field, but without looking for a device; @p fallback (the bandwidth the options already hold) when
+ * the spec leaves the field out. */
 static int
 dsd_engine_setup_rtl_spec_bw_khz(const char* spec, int fallback) {
     char inbuf[1024];
@@ -1181,21 +1005,27 @@ dsd_engine_setup_rtl_spec_bw_khz(const char* spec, int fallback) {
     for (int field = 1; curr && field <= 5; field++) {
         curr = dsd_strtok_r(NULL, ":", &saveptr);
     }
-    return curr ? dsd_engine_setup_parse_bw_token_or_default(curr) : fallback;
+    return curr ? dsd_rtl_spec_bw_khz_or_default(curr) : fallback;
 }
 
 /*
- * An explicit analog channel width, from --nfm-bandwidth-hz or [analog] nfm_bandwidth_hz, has to fit the DSP rate the
- * stream will run at. For an RTL-SDR or rtl_tcp input that rate is the DSP bandwidth the input spec (or [input]
- * rtl_bw_khz) sets, known here, so a width it cannot filter is refused before the device opens, with the validator's
- * actionable text. It runs before an RTL-SDR input looks for its device, so the refusal does not depend on a dongle
- * being plugged in (or on RTL-SDR support in the build): the spec alone decides it. An rtl_tcp spec has set
- * rtl_dsp_bw_khz already. Inputs whose device may force another rate (SoapySDR, Airspy) and I/Q replay, whose sidecar
- * sets the rate, are checked where the rate is final, at stream start (rtl_demod_finalize_analog_channel()).
+ * An analog channel width the analog preset filters at has to fit the DSP rate the stream will run at: an explicit
+ * width, from --nfm-bandwidth-hz, --am-bandwidth-hz or [analog], or the AM default (issue #524), which is held to the
+ * rate like an explicit one (the unset NFM default keeps its legacy rule and is never refused for its rate). For an
+ * RTL-SDR or rtl_tcp input that rate is the DSP bandwidth the input spec (or [input] rtl_bw_khz) sets, known here, so a
+ * width it cannot filter is refused before the device opens, with the validator's actionable text: `-fM -i
+ * rtl:0:118.1M:22:0:16 --am-bandwidth-hz 20000` stops here. It runs before an RTL-SDR input looks for its device, so
+ * the refusal does not depend on a dongle being plugged in (or on RTL-SDR support in the build): the spec alone
+ * decides it. An rtl_tcp spec has set rtl_dsp_bw_khz already. Inputs whose device may force another rate (SoapySDR,
+ * Airspy) and I/Q replay, whose sidecar sets the rate, are checked where the rate is final, at stream start
+ * (rtl_demod_finalize_analog_channel()).
  */
 static int
 dsd_engine_setup_check_analog_width(const dsd_opts* opts) {
-    const int width_hz = dsd_opts_analog_width_hz(opts);
+    const int explicit_hz = dsd_opts_analog_width_hz(opts);
+    const int width_hz = opts->analog_demod == DSD_ANALOG_DEMOD_AM
+                             ? dsd_analog_width_effective_hz(DSD_ANALOG_DEMOD_AM, explicit_hz)
+                             : explicit_hz;
     const int rtl_spec = dsd_opts_audio_in_dev_is_rtl_spec(opts->audio_in_dev);
     if (!dsd_opts_is_analog_family(opts) || width_hz <= 0 || opts->iq_replay_active
         || !(rtl_spec || dsd_opts_audio_in_dev_is_rtltcp_spec(opts->audio_in_dev))) {
@@ -1209,6 +1039,49 @@ dsd_engine_setup_check_analog_width(const dsd_opts* opts) {
     }
     LOG_ERROR("%s.\n", err);
     return -1;
+}
+
+/*
+ * The auto squelch needs a radio input: elsewhere it is off, and says so. The noise squelch runs on audio input too
+ * (issue #628), where the PCM noise squelch says so itself if the input has no room or no band above voice. It needs
+ * FM: on the AM monitor (-fM, no scan) a --squelch noise is refused, and a noise setting from an input spec or the
+ * config runs as auto with the same N. A scan's AM rows inherit a noise default as auto without a word: each row
+ * resolves its own. EDACS analog voice runs either setting as auto on a radio input and neither on audio input (issue
+ * #625); the M17 encoder's VOX says its own once its user data is read (dsd_engine_note_m17_encoder_squelch()).
+ */
+static int
+dsd_engine_setup_check_noise_squelch(const dsd_opts* opts) {
+    const int mode = opts->rtl_squelch_mode;
+    if (!dsd_squelch_mode_is_dynamic(mode)) {
+        return 0;
+    }
+    if (dsd_squelch_edacs_analog_voice(opts)) {
+        if (!dsd_opts_input_is_radio(opts)) {
+            LOG_INFO("NOTICE: --squelch %s runs on a radio input only: on this input an EDACS analog call ends on its "
+                     "release marker or the fallback watchdog.\n",
+                     mode == DSD_SQUELCH_MODE_NOISE ? "noise" : "auto");
+        } else if (mode == DSD_SQUELCH_MODE_NOISE) {
+            LOG_INFO("NOTICE: EDACS analog voice runs the noise squelch as auto+%ddB.\n", opts->rtl_squelch_margin_db);
+        }
+        return 0;
+    }
+    if (!dsd_opts_input_is_radio(opts)) {
+        if (mode == DSD_SQUELCH_MODE_AUTO && !dsd_opts_runs_m17_encoder(opts)) {
+            LOG_WARN("WARNING: --squelch auto needs a radio input (rtl:, rtltcp:, soapy:, airspy or --iq-replay); the "
+                     "squelch is off on this input. On audio input use --squelch noise[+N] or a level.\n");
+        }
+        return 0;
+    }
+    if (mode != DSD_SQUELCH_MODE_NOISE || !dsd_squelch_noise_has_no_fm(opts)) {
+        return 0;
+    }
+    if (opts->rtl_squelch_cli_set) {
+        LOG_ERROR("--squelch noise needs an FM channel and -fM is AM: use --squelch auto[+N] or a level.\n");
+        return -1;
+    }
+    LOG_INFO("NOTICE: The noise squelch needs an FM channel; this AM channel runs auto+%ddB.\n",
+             opts->rtl_squelch_margin_db);
+    return 0;
 }
 
 static int
@@ -1246,10 +1119,15 @@ dsd_engine_setup_io(dsd_opts* opts, dsd_state* state) {
         return -1;
     }
     dsd_engine_setup_parse_pulse_input(opts);
+    if (dsd_engine_setup_check_noise_squelch(opts) != 0) {
+        return -1;
+    }
     if (dsd_engine_setup_parse_udp_output(opts, state) != 0) {
         return -1;
     }
-    dsd_engine_setup_parse_simple_outputs(opts);
+    if (dsd_engine_setup_parse_simple_outputs(opts) != 0) {
+        return -1;
+    }
     return dsd_engine_setup_open_audio_paths(opts, state);
 }
 
@@ -1318,6 +1196,12 @@ m17_finalize_userdata_log(dsd_state* state) {
     if (state->m17_vox > 1) {
         state->m17_vox = 1;
     }
+    /* The stream encoder keeps one input sample in INPUT_RATE / 8000: a rate below 8000 kept none and hung reading
+       nothing, and one between the multiples fed codec2 audio at the wrong rate. */
+    if (state->m17_rate < 8000 || state->m17_rate > 48000 || (state->m17_rate % 8000) != 0) {
+        LOG_WARN("M17: INPUT_RATE %d is not a multiple of 8000 up to 48000; using 48000", state->m17_rate);
+        state->m17_rate = 48000;
+    }
     LOG_INFO("NOTICE:  M17:%d:%s:%s:%d;", state->m17_can_en, state->str50c, state->str50b, state->m17_rate);
     if (state->m17_vox == 1) {
         LOG_INFO("NOTICE: VOX;");
@@ -1339,6 +1223,27 @@ dsd_engine_parse_m17_userdata(dsd_opts* opts, dsd_state* state) {
     m17_finalize_userdata_log(state);
 }
 
+/* The M17 stream encoder reads its own input: on a radio input its VOX keys on the dynamic squelch's gate, but on
+   audio input none runs for it (the PCM noise squelch serves the FM monitor), so an AUTO or NOISE setting leaves the
+   VOX keyed (issue #625). Said once VOX is known, after the user data. */
+static void
+dsd_engine_note_m17_encoder_squelch(const dsd_opts* opts, const dsd_state* state) {
+    if (!dsd_opts_runs_m17_encoder(opts) || !dsd_squelch_mode_is_dynamic(opts->rtl_squelch_mode)
+        || dsd_opts_input_is_radio(opts)) {
+        return;
+    }
+    const char* setting = opts->rtl_squelch_mode == DSD_SQUELCH_MODE_NOISE ? "noise" : "auto";
+    if (state->m17_vox == 1) {
+        LOG_WARN("WARNING: M17 VOX: --squelch %s runs on a radio input only (rtl:, rtltcp:, soapy:, airspy or "
+                 "--iq-replay); on this input VOX has no squelch and stays keyed. Use a level (--squelch <dB>).\n",
+                 setting);
+    } else {
+        LOG_INFO("NOTICE: M17 encoder: --squelch %s runs on a radio input only; the encoder has no squelch on this "
+                 "input.\n",
+                 setting);
+    }
+}
+
 static void
 no_carrier_rotate_symbol_output_if_needed(dsd_opts* opts, dsd_state* state) {
     if (opts->symbol_out_f && opts->symbol_out_file_is_auto == 1) {
@@ -1347,28 +1252,43 @@ no_carrier_rotate_symbol_output_if_needed(dsd_opts* opts, dsd_state* state) {
 }
 
 static void
-no_carrier_reset_floating_gain_if_needed(const dsd_opts* opts, dsd_state* state) {
-    if (opts->floating_point == 1) {
-        state->aout_gain = opts->audio_gain;
-        state->aout_gainR = opts->audio_gain;
-    }
-}
-
-static void
 no_carrier_reset_nxdn_scan_markers(dsd_state* state) {
     state->nxdn_last_ran = -1;
 }
 
+/* The legacy rigctl leg: the untyped -Y step and the direct control-channel return. On audio input a rigctl peer
+ * demodulates (issue #621) it asks for the passband the analog monitor runs -- the configured width, the AM default, or
+ * -B standing in for an unset NFM width -- or for the -B a digital mode is heard through, through the capturing call,
+ * so a later return to the peer's own sends the passband read, and that reading is the session's, which such a return
+ * retires (the list has no leave restore to reset it). A refusal fails the step, as a refused -B always has here.
+ * Anywhere else -B is asked for as it always was, strictly, and the client's record of the peer skips a repeat. Where
+ * the session runs the peer's own passband (-B 0, or the FM monitor with neither a width nor -B) it asks for FM at 0,
+ * best-effort: that undoes a passband this client set (a session width before a switch to a digital mode, say) with
+ * the passband read before it, and is a no-op for a peer back on its own or never asked. */
 static dsd_trunk_tune_result
-no_carrier_tune_rigctl_if_needed(const dsd_opts* opts, long int freq) {
+no_carrier_tune_rigctl_if_needed(const dsd_opts* opts, const dsd_state* state, long int freq) {
     if (opts->use_rigctl != 1) {
         return DSD_TRUNK_TUNE_RESULT_FAILED;
     }
-    if (opts->setmod_bw != 0 && opts->setmod_bw != s_last_rigctl_bw) {
+    const dsd_rigctl_passband passband = dsd_rigctl_passband_of(opts, NULL);
+    if (dsd_rigctl_passband_captures(opts, &passband)) {
+        const bool ok = SetScanRowModulation(opts->rigctl_sockfd, passband.kind, passband.bandwidth_hz);
+        /* The untyped -Y list holds no scan scope and has no leave restore: every row asks for the session's passband,
+           so the reading taken for it is the session's too. The direct control-channel return is told as every rigctl
+           leg tells it (dsd_channel_modes_rigctl_request_is_session()): a typed -Y list configured before its first
+           row's scope is entered makes it a scan's. */
+        if (dsd_channel_modes_rigctl_request_is_session(opts, state)) {
+            RigctlMarkSessionPassband(opts->rigctl_sockfd, passband.kind);
+        }
+        if (!ok) {
+            return DSD_TRUNK_TUNE_RESULT_FAILED;
+        }
+    } else if (opts->setmod_bw != 0) {
         if (!SetModulation(opts->rigctl_sockfd, opts->setmod_bw)) {
             return DSD_TRUNK_TUNE_RESULT_FAILED;
         }
-        s_last_rigctl_bw = opts->setmod_bw;
+    } else {
+        (void)SetModulationKind(opts->rigctl_sockfd, DSD_ANALOG_DEMOD_FM, 0);
     }
     if (freq != s_last_rigctl_freq) {
         if (!SetFreq(opts->rigctl_sockfd, freq)) {
@@ -1415,7 +1335,7 @@ no_carrier_step_retune(const dsd_opts* opts, dsd_state* state, long int freq, in
         return -1;
     }
     if (opts->use_rigctl == 1) {
-        if (no_carrier_tune_rigctl_if_needed(opts, freq) != DSD_TRUNK_TUNE_RESULT_OK) {
+        if (no_carrier_tune_rigctl_if_needed(opts, state, freq) != DSD_TRUNK_TUNE_RESULT_OK) {
             return -1;
         }
         *moved = 1;
@@ -1440,11 +1360,40 @@ no_carrier_scanner_step_is_due(const dsd_opts* opts, const dsd_state* state, tim
      * can outlast it: sync refreshes the hangtime anchor for as long as a repeater transmits, and
      * the voice gate holds for as long as media keeps arriving. Opt-in, so with the cap off this
      * is a no-op and the rules below decide alone. */
-    if (dsd_engine_scan_visit_expired(opts, state, dsd_time_now_monotonic_s())) {
+    if (dsd_engine_scan_visit_expired(opts, state, dsd_decode_now_mono_s())) {
         return 1;
     }
+    const int tone_gate = dsd_scan_analog_tone_gate(opts, state);
+    /* Analog traffic the tone policy rejected (issue #527) does not hold the row: it neither stamps the hangtime anchor
+     * nor waits it out, but moves on at this pass. The caller still lets an operator hold keep the row, muted. A list
+     * with nowhere else to go (no other row a step can land on: the others avoided, or skipped at every visit for the
+     * width of their own demodulator, which the front end refuses, or as am rows nothing demodulates) keeps it muted
+     * where it is, as a fixed frequency does: a step would land on the same row, end the reception and judge the same
+     * traffic again, and so would the hangtime rule below. */
+    if (tone_gate == DSD_ANALOG_TONE_GATE_REJECTED) {
+        return dsd_engine_channel_scan_has_other_row(opts, state);
+    }
+    /* Rejected traffic that ended before this pass came -- its carrier's hangover ran out, or its input paused, between
+     * two passes -- holds nothing either: -t since the row landed, or since traffic the policy passed (this traffic
+     * before a blocked or unlisted value was confirmed included), is not waited out. With nowhere else to go the rules
+     * below decide, as after any carrier. */
+    if (dsd_scan_analog_tone_rejection_ended(opts, state) && dsd_engine_channel_scan_has_other_row(opts, state)) {
+        return 1;
+    }
+    /* A carrier on air under a tone policy holds the row by its verdict, whatever the hangtime anchor says, while the
+     * policy is still checking it or once it has allowed it. The check is no activity, so the monitor stamps no anchor
+     * for it (dsd_symbol.c), and it stamps allowed traffic only as a block ends, while the tap publishes the carrier
+     * and its verdict at each read, part-way through a block (960 samples are 384 ms at 2500 Hz, and span two reads at
+     * 22050 Hz): a verdict just turned ALLOWED meets an anchor from before the check. The check is bounded by the
+     * policy's window. A check whose carrier ends before a verdict leaves the anchor where it was, so it adds no -t
+     * tail, and short bursts the policy never passes cannot park the scanner: the rule below steps once -t has run out
+     * since the row landed or since the last block of traffic the policy passed. With no policy in force the verdict
+     * is OFF and the carrier holds through its stamps alone, as before the policy existed. */
+    if (tone_gate == DSD_ANALOG_TONE_GATE_PENDING || tone_gate == DSD_ANALOG_TONE_GATE_ALLOWED) {
+        return 0;
+    }
     if (dsd_scan_voice_gate_owns_step(opts, state)) {
-        return dsd_scan_voice_gate_should_step(opts, state, dsd_time_now_monotonic_s());
+        return dsd_scan_voice_gate_should_step(opts, state, dsd_decode_now_mono_s());
     }
     return (now - state->last_cc_sync_time) > opts->trunk_hangtime;
 }
@@ -1458,7 +1407,7 @@ no_carrier_rearm_abandoned_scan(const dsd_opts* opts, dsd_state* state, time_t n
      * every decoded frame until a tune succeeds. Reopen its windows so decoding can resume
      * and another attempt waits an interval, including when no tuner is available. */
     state->last_cc_sync_time = now;
-    state->last_cc_sync_time_m = dsd_time_now_monotonic_s();
+    state->last_cc_sync_time_m = dsd_decode_now_mono_s();
     dsd_scan_voice_gate_note_retune(state, state->last_cc_sync_time_m);
 }
 
@@ -1519,7 +1468,7 @@ no_carrier_step_scanner_mode_if_needed(dsd_opts* opts, dsd_state* state, time_t 
         dsd_analog_rx_reset(state);
     }
     state->last_cc_sync_time = now;
-    state->last_cc_sync_time_m = dsd_time_now_monotonic_s();
+    state->last_cc_sync_time_m = dsd_decode_now_mono_s();
     dsd_scan_voice_gate_note_retune(state, state->last_cc_sync_time_m);
     // A zero entry parks on the current frequency rather than retuning, so it is not a hop.
     return freq != 0;
@@ -1531,7 +1480,7 @@ no_carrier_is_cc_return_due(const dsd_opts* opts, const dsd_state* state, time_t
         return 0;
     }
     if (dsd_trunk_p25_recovery_allowed(opts, state)
-        && p25_sm_vc_reacquire_hold_active(p25_sm_get_ctx(), opts, state, dsd_time_now_monotonic_s())) {
+        && p25_sm_vc_reacquire_hold_active(p25_sm_get_ctx(), opts, state, dsd_decode_now_mono_s())) {
         return 0;
     }
 
@@ -1609,6 +1558,7 @@ no_carrier_clear_stale_p25_return_hints_after_generic_activity(const dsd_opts* o
     }
 
     state->p2_cc = 0;
+    state->p2_cc_verified = 0U;
     state->p2_wacn = 0;
     state->p2_sysid = 0;
     state->p2_rfssid = 0;
@@ -1681,9 +1631,6 @@ no_carrier_sync_helper_tune_cache(const dsd_opts* opts, const dsd_state* state, 
     }
     if (opts->use_rigctl == 1) {
         s_last_rigctl_freq = cc;
-        if (opts->setmod_bw != 0) {
-            s_last_rigctl_bw = opts->setmod_bw;
-        }
     }
 #ifdef USE_RADIO
     if (opts->audio_in_type == AUDIO_IN_RTL && state->rtl_ctx) {
@@ -1699,7 +1646,7 @@ no_carrier_sync_helper_tune_cache(const dsd_opts* opts, const dsd_state* state, 
 // the old frequency cannot be reacquired here no matter what the next epoch looks like.
 static void
 no_carrier_clear_voice_tune_state(dsd_opts* opts, dsd_state* state, dsd_call_end_reason reason) {
-    const double ended_m = dsd_time_now_monotonic_s();
+    const double ended_m = dsd_decode_now_mono_s();
     for (int slot = 0; slot < DSD_CALL_STATE_SLOT_COUNT; slot++) {
         if (dsd_call_state_end_ex(state, (uint8_t)slot, ended_m, reason) > 0) {
             dsd_event_sync_slot(opts, state, (uint8_t)slot);
@@ -1771,7 +1718,7 @@ no_carrier_try_helper_return_to_cc(dsd_opts* opts, dsd_state* state, long cc, in
         double completed_m = 0.0;
         (void)dsd_trunk_tuning_request_status(tune_request_id, &completed_m);
         if (completed_m <= 0.0) {
-            completed_m = dsd_time_now_monotonic_s();
+            completed_m = dsd_decode_now_mono_s();
         }
         (void)p25_sm_restart_pending_cc_acquisition(p25_sm_get_ctx(), opts, state, completed_m, "no-carrier");
     }
@@ -1888,7 +1835,7 @@ no_carrier_helper_result_is_deferred(int helper_attempted, dsd_trunk_tune_result
 static int
 no_carrier_apply_direct_cc_return(const dsd_opts* opts, dsd_state* state, long cc, int helper_attempted) {
     if (opts->use_rigctl == 1) {
-        if (no_carrier_tune_rigctl_if_needed(opts, cc) != DSD_TRUNK_TUNE_RESULT_OK) {
+        if (no_carrier_tune_rigctl_if_needed(opts, state, cc) != DSD_TRUNK_TUNE_RESULT_OK) {
             return 0;
         }
         state->dmr_rest_channel = -1;
@@ -1912,19 +1859,6 @@ no_carrier_apply_direct_cc_return(const dsd_opts* opts, dsd_state* state, long c
     return 1;
 }
 
-static void
-no_carrier_enable_p25_cc_slots(dsd_opts* opts) {
-    opts->slot1_on = 1;
-    opts->slot2_on = 1;
-}
-
-static void
-no_carrier_enable_p25_cc_slots_if_known(dsd_opts* opts, const dsd_state* state) {
-    if (state->p25_cc_is_tdma == 0 || state->p25_cc_is_tdma == 1) {
-        no_carrier_enable_p25_cc_slots(opts);
-    }
-}
-
 static int
 no_carrier_current_demod_rate(const dsd_opts* opts, const dsd_state* state) {
     int demod_rate = dsd_opts_current_input_timing_rate(opts);
@@ -1942,7 +1876,7 @@ no_carrier_current_demod_rate(const dsd_opts* opts, const dsd_state* state) {
 }
 
 static void
-no_carrier_apply_p25_cc_symbolrate(dsd_opts* opts, dsd_state* state) {
+no_carrier_apply_p25_cc_symbolrate(const dsd_opts* opts, dsd_state* state) {
     int sym_rate = 0;
     if (state->p25_cc_is_tdma == 0) {
         sym_rate = 4800;
@@ -1955,7 +1889,6 @@ no_carrier_apply_p25_cc_symbolrate(dsd_opts* opts, dsd_state* state) {
     state->symbolCenter = dsd_opts_symbol_center(state->samplesPerSymbol);
     state->sps_hunt_idx = sym_rate == 6000 ? DSD_FRAME_SYNC_SPS_PROFILE_6000_4 : DSD_FRAME_SYNC_SPS_PROFILE_4800_4;
     state->sps_hunt_counter = 0;
-    no_carrier_enable_p25_cc_slots(opts);
 }
 
 static int
@@ -2021,23 +1954,26 @@ no_carrier_return_to_control_channel_if_needed(dsd_opts* opts, dsd_state* state,
         int p25_helper_attempted = 0;
         dsd_trunk_tune_result p25_helper_result = DSD_TRUNK_TUNE_RESULT_OK;
         int generic_helper_attempted = 0;
-        if (no_carrier_try_helper_return_to_cc(opts, state, cc, p25_return, clear_generic_p25_alias,
-                                               &p25_helper_attempted, &p25_helper_result, &cc_return_request_id)) {
-            no_carrier_enable_p25_cc_slots_if_known(opts, state);
+        const int helper_returned =
+            no_carrier_try_helper_return_to_cc(opts, state, cc, p25_return, clear_generic_p25_alias,
+                                               &p25_helper_attempted, &p25_helper_result, &cc_return_request_id);
+        const int helper_deferred =
+            !helper_returned && no_carrier_helper_result_is_deferred(p25_helper_attempted, p25_helper_result);
+        if (helper_returned
+            || (!helper_deferred
+                && no_carrier_try_generic_gate_recovery(opts, state, cc, p25_return, clear_generic_p25_alias,
+                                                        &generic_helper_attempted, &cc_return_request_id))) {
             accepted_cc_return = 1;
-        } else if (no_carrier_helper_result_is_deferred(p25_helper_attempted, p25_helper_result)) {
+        } else if (helper_deferred) {
             /* Another P25 transition owns the guard; leave the staged
              * voice state intact so the main loop can retry safely. */
-        } else if (no_carrier_try_generic_gate_recovery(opts, state, cc, p25_return, clear_generic_p25_alias,
-                                                        &generic_helper_attempted, &cc_return_request_id)) {
-            accepted_cc_return = 1;
         } else if (!generic_helper_attempted
                    && no_carrier_apply_direct_cc_return(opts, state, cc, p25_helper_attempted)) {
             no_carrier_sync_selected_control_channel(state, cc, p25_return, clear_generic_p25_alias);
             accepted_cc_return = 1;
             state->edacs_tuned_lcn = -1;
             state->last_cc_sync_time = now;
-            state->last_cc_sync_time_m = dsd_time_now_monotonic_s();
+            state->last_cc_sync_time_m = dsd_decode_now_mono_s();
             if (p25_return) {
                 no_carrier_apply_p25_cc_symbolrate(opts, state);
             }
@@ -2077,7 +2013,7 @@ no_carrier_close_mbe_outputs_if_needed(dsd_opts* opts, dsd_state* state) {
 }
 
 static void
-no_carrier_reset_decode_state(dsd_state* state, int preserve_dmr_confidence) {
+no_carrier_reset_decode_state(dsd_state* state, int preserve_scan_state) {
     state->jitter = -1;
     state->lastsynctype = DSD_SYNC_NONE;
     state->carrier = 0;
@@ -2110,9 +2046,40 @@ no_carrier_reset_decode_state(dsd_state* state, int preserve_dmr_confidence) {
     set_spaces(state->ftype, 13);
     state->errs = 0;
     state->errs2 = 0;
-    if (!preserve_dmr_confidence) {
-        dmr_confidence_reset(state);
+    /* Trunk scan keeps the carrier identity in each target's snapshot, which saves and restores it. */
+    if (!preserve_scan_state) {
+        dsd_engine_forget_carrier_codes(state);
     }
+}
+
+void
+dsd_engine_forget_carrier_codes(dsd_state* state) {
+    if (!state) {
+        return;
+    }
+    dmr_confidence_reset(state);
+    /* The colour code is read as this carrier's (issue #575), so it goes back to "not decoded" (16, as initState()
+     * leaves it) with the lock. BS mode rewrites it when the gate relocks, before any burst is dispatched, but MS mode
+     * has no lock: a call opens before its embedded code decodes, and a failed QR(16,7,6) decode writes nothing, so the
+     * previous carrier's code would label it. Here rather than in dmr_confidence_reset(), whose BS burst-error callers
+     * stay on the same carrier. */
+    state->dmr_color_code = 16U;
+    /* The NXDN RAN likewise ((unsigned)-1, as initState() leaves it; RAN 0 is a legal code), with its stand-in mark. The
+     * SACCH writes it only once the transmission is confirmed, and confirmation restarts at a no-carrier pass, so a call
+     * opening on its FACCH1 VCALL would otherwise read the previous transmission's RAN. On a control channel the
+     * CRC-gated CAC sets it again at once. */
+    state->nxdn_last_ran = (unsigned int)-1;
+    state->nxdn_last_ran_stand_in = 0U;
+    /* The dPMR colour code, which only the confirmed path publishes; the no-carrier pass also resets it with the
+     * confirmation evidence (no_carrier_reset_call_strings_and_dpmr()). */
+    state->dpmr_color_code = -1;
+    /* The Phase 1 NAC: a NID whose BCH-decoded NAC is the reserved 000 or FFF leaves it as it was while the frame still
+     * dispatches, so a Phase 1 call on the next carrier would read this one's. The no-carrier pass resets it as well
+     * (no_carrier_reset_voice_and_audio_metrics()). */
+    state->nac = 0;
+    /* The Phase 2 seed's proof is the carrier's too: the next carrier's bursts, or a network status broadcast, prove it
+     * again. p2_cc itself is the descrambling key and stays. */
+    state->p2_cc_verified = 0U;
 }
 
 static void
@@ -2122,6 +2089,8 @@ no_carrier_reset_non_trunk_fields_if_needed(const dsd_opts* opts, dsd_state* sta
     }
     state->p25_vc_freq[0] = 0;
     state->p25_vc_freq[1] = 0;
+    DSD_MEMSET(state->p25_conventional_grant_freq, 0, sizeof(state->p25_conventional_grant_freq));
+    DSD_MEMSET(state->p25_conventional_grant_target, 0, sizeof(state->p25_conventional_grant_target));
     state->dmr_rest_channel = -1;
     state->nxdn_location_site_code = 0;
     state->nxdn_location_sys_code = 0;
@@ -2133,6 +2102,17 @@ no_carrier_reset_non_trunk_fields_if_needed(const dsd_opts* opts, dsd_state* sta
     state->dmr_branding_sub[0] = '\0';
     state->dmr_branding[0] = '\0';
     state->dmr_site_parms[0] = '\0';
+}
+
+void
+dsd_engine_forget_untrunked_carrier_state(const dsd_opts* opts, dsd_state* state) {
+    if (!opts || !state || opts->trunk_enable != 0) {
+        return;
+    }
+    no_carrier_reset_non_trunk_fields_if_needed(opts, state);
+    /* With trunking off only a DMR grant writes these, naming a channel the carrier that announced it carries. */
+    state->trunk_vc_freq[0] = 0;
+    state->trunk_vc_freq[1] = 0;
 }
 
 static void
@@ -2177,6 +2157,8 @@ no_carrier_reset_payload_and_keystream_state(dsd_state* state) {
     state->dmr_fidR = 0;
     dmr_enc_class_reset(state, 0);
     dmr_enc_class_reset(state, 1);
+    dmr_le_vendor_reset(state, 0);
+    dmr_le_vendor_reset(state, 1);
     state->payload_mi = 0;
     state->payload_miR = 0;
     state->payload_mfid = 0;
@@ -2246,6 +2228,8 @@ no_carrier_reset_dmr_data_blocks(dsd_state* state) {
     state->data_ks_start[1] = 0;
     state->dmr_encL = 0;
     state->dmr_encR = 0;
+    state->mbe_slot_muted[0] = 0;
+    state->mbe_slot_muted[1] = 0;
     state->dmrburstL = 17;
     state->dmrburstR = 17;
     for (short i = 0; i < 4; i++) {
@@ -2254,8 +2238,6 @@ no_carrier_reset_dmr_data_blocks(dsd_state* state) {
     }
     state->fourv_counter[0] = 0;
     state->fourv_counter[1] = 0;
-    state->voice_counter[0] = 0;
-    state->voice_counter[1] = 0;
 }
 
 static void
@@ -2399,11 +2381,15 @@ no_carrier_clear_stale_follow_state_if_needed(dsd_opts* opts, dsd_state* state, 
 static void
 no_carrier_reset_call_strings_and_dpmr(dsd_opts* opts, dsd_state* state) {
     opts->dPMR_next_part_of_superframe = 0;
-    DSD_MEMSET(state->dPMRVoiceFS2Frame.Version, 0, 8);
+    DSD_MEMSET(state->dPMRVoiceFS2Frame.Version, 0, sizeof(state->dPMRVoiceFS2Frame.Version));
+    DSD_MEMSET(state->dPMRVoiceFS2Frame.Scrambled, 0, sizeof(state->dPMRVoiceFS2Frame.Scrambled));
     /* Evidence is per-transmission: the next carrier proves itself again (issue #407). */
     dpmr_confirm_reset(state);
     state->dpmr_cch_evidence = 0;
     state->dpmr_cch_evidence_symbolcnt = 0;
+    /* And so is the colour code it published, read as this carrier's (issue #575): -1, as initState() leaves it,
+     * until the next confirmed transmission decodes one. */
+    state->dpmr_color_code = -1;
 }
 
 static void
@@ -2439,6 +2425,217 @@ no_carrier_finalize_canonical_calls(dsd_opts* opts, dsd_state* state, int retune
     }
 }
 
+/* Whether a boundary of @p kind can run while the P25 or DMR state machine ticks, so that it must hold the P25 SM tick
+   guard: a tune, a source change or an input switch, which a trunking session can make. A scan step runs under
+   conventional scanning and a replay retune with trunking off, where neither recovery tick runs
+   (dsd_trunk_p25_recovery_allowed(), dsd_trunk_dmr_recovery_allowed()), no state machine follows a voice channel, and
+   the caller's hold is not known (a replay retune runs inside a sample read, possibly under processFrame()'s). */
+static int
+carrier_boundary_takes_guard(dsd_carrier_boundary_kind kind) {
+    return kind == DSD_CARRIER_BOUNDARY_TUNE || kind == DSD_CARRIER_BOUNDARY_SOURCE
+           || kind == DSD_CARRIER_BOUNDARY_INPUT_SWITCH;
+}
+
+/* Step 1 of the carrier boundary: the voice channel a trunking state machine followed, if one is held, is released while
+   its calls are still active (dsd_engine_carrier_boundary()). The state machine comes to rest on its control channel
+   without tuning, as trunk scan hands a carrier back (trunk_scan_release_active_carrier()); the P25 release flushes
+   the partial Phase 2 superframe, which the 8 kHz int16 mixer plays only for an active call on a talkgroup the hold or
+   policy allows. The shared release then drops trunk_is_tuned and the voice channel frequencies, so
+   dsd_opts_trunk_vc_followed() stamps no frequency of the assignment left behind. The caller holds the P25 SM tick
+   guard whenever a state machine can be ticking (carrier_boundary_takes_guard()), so the inspection below and the
+   teardown run inside the same hold as the watchdog's writes. */
+static void
+carrier_boundary_release_followed(dsd_opts* opts, dsd_state* state, dsd_carrier_boundary_kind kind) {
+    /* Trunk scan hands its carriers back itself. */
+    const int release_machines = carrier_boundary_takes_guard(kind) && opts->trunk_scan_enabled != 1;
+    int p25_tuned = 0;
+    int dmr_tuned = 0;
+    p25_sm_ctx_t* p25 = NULL;
+    dmr_sm_ctx_t* dmr = NULL;
+    if (release_machines) {
+        p25 = p25_sm_get_ctx();
+        dmr = dmr_sm_get_ctx();
+        p25_tuned = p25_sm_get_state(p25) == P25_SM_TUNED;
+        dmr_tuned = dmr->state == DMR_SM_TUNED;
+    }
+    if (opts->trunk_is_tuned != 1 && !p25_tuned && !dmr_tuned) {
+        return;
+    }
+    if (p25_tuned) {
+        p25_sm_abandon_carrier(p25, opts, state, "carrier-boundary");
+    }
+    if (dmr_tuned) {
+        dmr_sm_abandon_carrier(dmr, opts, state, "carrier-boundary");
+    }
+    dsd_engine_release_tuned_call_state(opts, state);
+}
+
+/* With its codes, step 3 forgets the evidence that vouched for the carrier's transmissions: every confirmation gate's
+   is per-transmission, and the no-carrier pass restarts each so that the next carrier proves itself again, as the
+   forget drops the DMR gate's lock with the colour code. A carrier boundary reaches the next carrier without that pass,
+   and the calls it just ended were the transmissions the evidence vouched for. */
+static void
+carrier_boundary_forget_evidence(dsd_state* state) {
+    nxdn_confirm_reset(state);
+    dpmr_confirm_reset(state);
+    state->dpmr_cch_evidence = 0;
+    state->dpmr_cch_evidence_symbolcnt = 0;
+    dstar_confirm_reset(state);
+    m17_confirm_reset(state);
+    provoice_confirm_reset(state);
+    state->ysf_fich_confirmed = 0;
+    state->p25_p1_nid_evidence = 0;
+    state->p25_p1_nid_evidence_symbolcnt = 0;
+    // The calls end at the boundary, and a vendor late-entry mode is its call's (issue #657).
+    dmr_le_vendor_reset(state, 0);
+    dmr_le_vendor_reset(state, 1);
+}
+
+/* With its codes and evidence, step 3 drops every multi-frame assembly the decoders keep in dsd_state that can publish
+   an identity or a code, as the no-carrier pass drops them: a boundary between frames leaves each half-built, and the
+   next carrier's next piece could complete it with the carrier left's pieces (an NXDN SACCH superframe whose fourth
+   segment passes its own CRC publishes the old talkgroup and source at the new frequency). Decoders that hold a frame's
+   or superframe's pieces locally drop them through the carrier count instead. */
+static void
+carrier_boundary_forget_assemblies(dsd_opts* opts, dsd_state* state) {
+    /* NXDN: the SACCH superframe and the alias blocks. */
+    DSD_MEMSET(state->nxdn_sacch_frame_segment, 1, sizeof(state->nxdn_sacch_frame_segment));
+    DSD_MEMSET(state->nxdn_sacch_frame_segcrc, 1, sizeof(state->nxdn_sacch_frame_segcrc));
+    state->nxdn_part_of_frame = 0;
+    state->nxdn_sf = 0;
+    state->nxdn_alias_block_number = 0;
+    DSD_MEMSET(state->nxdn_alias_block_segment, 0, sizeof(state->nxdn_alias_block_segment));
+    state->nxdn_alias_arib_total_segments = 0;
+    state->nxdn_alias_arib_seen_mask = 0;
+    DSD_MEMSET(state->nxdn_alias_arib_segments, 0, sizeof(state->nxdn_alias_arib_segments));
+    /* DMR: data blocks, short LC (CACH) fragments, Capacity Plus CSBK blocks and data headers, as on a sync loss; the
+       embedded LC, late-entry MI and talker alias fragments; and the alias shown for the call that ended. */
+    dmr_reset_blocks(opts, state);
+    state->dmr_cach_counter = 0;
+    DSD_MEMSET(state->dmr_embedded_signalling, 0, sizeof(state->dmr_embedded_signalling));
+    DSD_MEMSET(state->late_entry_mi_fragment, 0, sizeof(state->late_entry_mi_fragment));
+    DSD_MEMSET(state->dmr_alias_format, 0, sizeof(state->dmr_alias_format));
+    DSD_MEMSET(state->dmr_alias_block_len, 0, sizeof(state->dmr_alias_block_len));
+    DSD_MEMSET(state->dmr_alias_char_size, 0, sizeof(state->dmr_alias_char_size));
+    DSD_MEMSET(state->dmr_alias_block_segment, 0, sizeof(state->dmr_alias_block_segment));
+    DSD_MEMSET(state->generic_talker_alias, 0, sizeof(state->generic_talker_alias));
+    /* P25: Phase 2 MAC fragments and the Phase 1 talker aliases carried over several link control words. */
+    DSD_MEMSET(state->p25_mac_frag, 0, sizeof(state->p25_mac_frag));
+    DSD_MEMSET(state->p25_apx_alias_rx, 0, sizeof(state->p25_apx_alias_rx));
+    DSD_MEMSET(state->p25_l3h_alias_phase1, 0, sizeof(state->p25_l3h_alias_phase1));
+    /* dPMR: the superframe part the next frame's identity half is read against. */
+    opts->dPMR_next_part_of_superframe = 0;
+    /* M17: the LSF from LICH chunks, the packet and the signature. */
+    DSD_MEMSET(state->m17_lsf, 0, sizeof(state->m17_lsf));
+    DSD_MEMSET(state->m17_pkt, 0, sizeof(state->m17_pkt));
+    state->m17_pbc_ct = 0;
+    state->m17_signature_advertised = 0;
+    DSD_MEMSET(state->m17_signature_digest, 0, sizeof(state->m17_signature_digest));
+    DSD_MEMSET(state->m17_signature, 0, sizeof(state->m17_signature));
+    state->m17_signature_received_mask = 0;
+    state->m17_signature_complete = 0;
+    state->m17_signature_bad_sequence = 0;
+    /* YSF: the text assembled frame by frame. */
+    DSD_MEMSET(state->ysf_txt, 0, sizeof(state->ysf_txt));
+    /* P25 Phase 2: the slots' ESS_B, which a 2V burst ahead of any 4V burst would decode as the new carrier's
+       ALG/KID/MI, the partial voice superframe and any staged rekey. And the ended calls' P25 crypto (ALG, KID, MI with
+       its LFSR state): the next carrier's calls key their own. */
+    p25p2_frame_forget_carrier(state);
+    p25_crypto_reset_slot(state, 0);
+    p25_crypto_reset_slot(state, 1);
+}
+
+void
+dsd_engine_forget_carrier_decoding(dsd_opts* opts, dsd_state* state) {
+    if (!opts || !state) {
+        return;
+    }
+    // Frames the P25 Phase 2 playout queued on the carrier left play before it is forgotten: each carries the verdict
+    // it was decoded with (issue #651).
+    dsd_p25p2_playout_drain(opts, state);
+    carrier_boundary_forget_evidence(state);
+    carrier_boundary_forget_assemblies(opts, state);
+    // A capture never spans carriers: what the next carrier carries starts its own (issue #661).
+    no_carrier_close_mbe_outputs_if_needed(opts, state);
+    // Nor does the digital voice high-pass's memory (issue #653).
+    dsd_voice_hpf_reset(state, -1);
+}
+
+void
+dsd_engine_carrier_boundary(dsd_opts* opts, dsd_state* state, dsd_carrier_boundary_kind kind, int guard_held) {
+    if (!opts || !state) {
+        return;
+    }
+    /* The watchdog's ticks write the state machines, the followed assignment and the call state under the P25 SM tick
+       guard, so a boundary that can run beside them holds it from the first inspection through the last step: the
+       caller's hold (@p guard_held), or one taken here. The guard is not re-entrant. */
+    const int take_guard = carrier_boundary_takes_guard(kind) && !guard_held;
+    if (take_guard) {
+        p25_sm_tick_guard_enter();
+    }
+    // The calls end below before the P25 Phase 2 playout drains (step 3): it takes their talkgroup verdict while they
+    // are still active (issue #651).
+    dsd_p25p2_playout_note_policy(opts, state);
+    carrier_boundary_release_followed(opts, state, kind);
+    no_carrier_finalize_canonical_calls(opts, state, 1);
+    dsd_engine_forget_carrier_codes(state);
+    dsd_engine_forget_carrier_decoding(opts, state);
+    dsd_engine_forget_untrunked_carrier_state(opts, state);
+    state->carrier_seq++;
+    if (take_guard) {
+        p25_sm_tick_guard_leave();
+    }
+}
+
+/* FNV-1a over @p text, never 0, which stands for no source. */
+static uint64_t
+carrier_source_hash(const char* text) {
+    uint64_t hash = 14695981039346656037ULL;
+    for (const unsigned char* p = (const unsigned char*)text; *p != '\0'; ++p) {
+        hash ^= (uint64_t)*p;
+        hash *= 1099511628211ULL;
+    }
+    return hash != 0U ? hash : 1U;
+}
+
+/* The source a radio stream runs, as a key: the kind of device and which one, never its settings or tuning. */
+static uint64_t
+carrier_source_key(const dsd_opts* opts) {
+    char key[sizeof opts->audio_in_dev + 32];
+    const char* dev = opts->audio_in_dev;
+    if (dsd_opts_audio_in_dev_is_iqreplay_spec(dev) || dsd_opts_audio_in_dev_is_soapy_spec(dev)) {
+        DSD_SNPRINTF(key, sizeof key, "%s", dev);
+    } else if (dsd_opts_audio_in_dev_is_rtltcp_spec(dev)) {
+        DSD_SNPRINTF(key, sizeof key, "rtltcp/%s/%d", opts->rtltcp_hostname, opts->rtltcp_portno);
+    } else if (dsd_opts_audio_in_dev_is_airspy_spec(dev)) {
+        DSD_SNPRINTF(key, sizeof key, "airspy/%s", opts->airspy.serial);
+    } else {
+        DSD_SNPRINTF(key, sizeof key, "rtl/%d", opts->rtl_dev_index);
+    }
+    return carrier_source_hash(key);
+}
+
+void
+dsd_engine_note_stream_source(dsd_opts* opts, dsd_state* state, int guard_held) {
+    if (!opts || !state) {
+        return;
+    }
+    const uint64_t key = carrier_source_key(opts);
+    if (state->carrier_source_key != 0U
+        && (key != state->carrier_source_key || dsd_opts_audio_in_dev_is_iqreplay_spec(opts->audio_in_dev))) {
+        dsd_engine_carrier_boundary(opts, state, DSD_CARRIER_BOUNDARY_SOURCE, guard_held);
+    }
+    state->carrier_source_key = key;
+}
+
+void
+dsd_engine_leave_replay_carrier(dsd_opts* opts, dsd_state* state) {
+    if (!opts || !state || opts->trunk_enable != 0 || opts->trunk_scan_enabled == 1) {
+        return;
+    }
+    dsd_engine_carrier_boundary(opts, state, DSD_CARRIER_BOUNDARY_REPLAY_RETUNE, 0);
+}
+
 static void
 no_carrier_reset_m17_and_sample_buffers(dsd_state* state) {
     DSD_MEMSET(state->m17_lsf, 0, sizeof(state->m17_lsf));
@@ -2467,10 +2664,8 @@ no_carrier_reset_m17_and_sample_buffers(dsd_state* state) {
 
     DSD_MEMSET(state->audio_out_temp_buf, 0.0f, sizeof(state->audio_out_temp_buf));
     DSD_MEMSET(state->audio_out_temp_bufR, 0.0f, sizeof(state->audio_out_temp_bufR));
-    DSD_MEMSET(state->f_l, 0.0f, sizeof(state->f_l));
-    DSD_MEMSET(state->f_r, 0.0f, sizeof(state->f_r));
-    DSD_MEMSET(state->f_l4, 0.0f, sizeof(state->f_l4));
-    DSD_MEMSET(state->f_r4, 0.0f, sizeof(state->f_r4));
+    dsd_audio_dmr_mix_media_discard(0);
+    dsd_audio_dmr_mix_media_discard(1);
     DSD_MEMSET(state->s_l, 0, sizeof(state->s_l));
     DSD_MEMSET(state->s_r, 0, sizeof(state->s_r));
     DSD_MEMSET(state->s_l4, 0, sizeof(state->s_l4));
@@ -2482,9 +2677,34 @@ no_carrier_reset_m17_and_sample_buffers(dsd_state* state) {
     DSD_MEMSET(state->static_ks_counter, 0, sizeof(state->static_ks_counter));
 }
 
+/* The no-carrier pass's part in the P25 Phase 2 playout (issue #651): the carrier is gone, so what the playout still
+   holds plays now and its queues reset, under the talkgroup verdict the calls have while they are still active and
+   under the slot switches the user set (which no return to the control channel rewrites, issue #657). So it runs
+   before this pass ends the calls, which a return to the control channel does. The watchdog's release drains the
+   playout too, under the tick guard, so this runs only under the guard: a pass that finds it taken leaves the playout
+   to the next pass (whose verdicts the calls' last ones taken still hold), as the recovery tick does. Returns 0 when it
+   left audio for the next pass.
+
+
+   The voice chain's high-pass starts the next reception clear here too (issue #653), under the same guard: the
+   watchdog's crypto expiry purges a slot's filter state under it. Its gain level carries on. */
+static int
+no_carrier_drain_playout(dsd_opts* opts, dsd_state* state, int guard_held) {
+    if (!guard_held && !p25_sm_tick_guard_try_enter()) {
+        return !dsd_p25p2_playout_holds_audio(state);
+    }
+    dsd_p25p2_playout_note_policy(opts, state);
+    dsd_p25p2_flush_partial_audio(opts, state);
+    dsd_voice_hpf_reset(state, -1);
+    if (!guard_held) {
+        p25_sm_tick_guard_leave();
+    }
+    return 1;
+}
+
 static void
 no_carrier_run(dsd_opts* opts, dsd_state* state, int guard_held) {
-    const time_t now = time(NULL);
+    const time_t now = dsd_decode_time();
 
     if (opts->scanner_mode == 1 && opts->trunk_scan_enabled != 1 && dsd_channel_modes_present(state)) {
         /* Typed rows use tracked tunes, bypassing the legacy scan caches. */
@@ -2500,7 +2720,6 @@ no_carrier_run(dsd_opts* opts, dsd_state* state, int guard_held) {
 #endif
 
     no_carrier_rotate_symbol_output_if_needed(opts, state);
-    no_carrier_reset_floating_gain_if_needed(opts, state);
 
 //only do it here on the tweaks
 #ifdef LIMAZULUTWEAKS
@@ -2516,7 +2735,14 @@ no_carrier_run(dsd_opts* opts, dsd_state* state, int guard_held) {
          * hop reason. A pending tune must not close them as sync loss first. */
         return;
     }
-    no_carrier_return_to_control_channel_if_needed(opts, state, now, guard_held);
+    // A drain left to the next pass takes the return to the control channel with it: the return ends the calls.
+    if (no_carrier_drain_playout(opts, state, guard_held)) {
+        no_carrier_return_to_control_channel_if_needed(opts, state, now, guard_held);
+    }
+    if (scanner_retuned) {
+        /* The untyped step moved to another channel: the carrier boundary (issue #575). */
+        dsd_engine_carrier_boundary(opts, state, DSD_CARRIER_BOUNDARY_SCAN_STEP, guard_held);
+    }
     no_carrier_finalize_canonical_calls(opts, state, scanner_retuned);
     dsd_engine_reset_no_carrier_state(opts, state);
 }
@@ -2533,7 +2759,7 @@ dsd_engine_no_carrier_locked(dsd_opts* opts, dsd_state* state) {
 
 void
 dsd_engine_reset_no_carrier_state(dsd_opts* opts, dsd_state* state) {
-    const time_t now = time(NULL);
+    const time_t now = dsd_decode_time();
     no_carrier_clear_stale_p25_return_hints_after_generic_activity(opts, state);
     no_carrier_reset_dibit_and_dmr_buffers(state);
     no_carrier_close_mbe_outputs_if_needed(opts, state);
@@ -2559,16 +2785,23 @@ dsd_engine_reset_no_carrier_state(dsd_opts* opts, dsd_state* state) {
     no_carrier_reset_m17_and_sample_buffers(state);
 }
 
+// One voice chain gain serves both output formats (issue #653), so its setting and starting level do too.
 static int
 live_scanner_apply_audio_gain(dsd_opts* opts, dsd_state* state) {
-    if (opts->floating_point == 1) {
-        if (opts->audio_gain > 50.0f) {
-            opts->audio_gain = 50.0f;
-        }
-        if (opts->audio_gain < 0.0f) {
-            opts->audio_gain = 0.0f;
-        }
-    } else if (opts->audio_gain == 0) {
+    if (opts->audio_gain > 50.0f) {
+        opts->audio_gain = 50.0f;
+    }
+    if (opts->audio_gain < 0.0f) {
+        opts->audio_gain = 0.0f;
+    }
+    if (opts->audio_gainR > 50.0f) {
+        opts->audio_gainR = 50.0f;
+    }
+    if (opts->audio_gainR < 0.0f) {
+        opts->audio_gainR = 0.0f;
+    }
+    // Auto gain (0) starts at 15.
+    if (!(opts->audio_gain > 0.0f)) {
         state->aout_gain = 15.0f;
         state->aout_gainR = 15.0f;
     }
@@ -2576,9 +2809,12 @@ live_scanner_apply_audio_gain(dsd_opts* opts, dsd_state* state) {
 }
 
 #ifdef USE_RADIO
+/* The engine's own stream open. A replay centre an earlier run left (an embedding host's reused options) is not this
+   stream's: it starts with none, which the first replay read sets (issue #575). */
 static int
 live_scanner_start_rtl_if_needed(dsd_opts* opts, dsd_state* state) {
     if (opts->audio_in_type == AUDIO_IN_RTL) {
+        dsd_opts_forget_iq_replay_center(opts);
         if (state->rtl_ctx == NULL) {
             if (rtl_stream_create(opts, &state->rtl_ctx) < 0) {
                 LOG_ERROR("Failed to create radio stream.\n");
@@ -2597,6 +2833,7 @@ live_scanner_start_rtl_if_needed(dsd_opts* opts, dsd_state* state) {
         }
         opts->rtl_started = 1;
         opts->rtl_needs_restart = 0;
+        dsd_engine_note_stream_source(opts, state, 0);
     }
     return 0;
 }
@@ -2654,7 +2891,7 @@ live_scanner_emit_start_log_if_enabled(const dsd_opts* opts, dsd_state* state) {
     if (opts->event_out_file[0] == 0) {
         return;
     }
-    time_t now = time(NULL);
+    time_t now = dsd_decode_time();
     char timestr[9];
     char datestr[11];
     char event_string[2000];
@@ -2697,16 +2934,16 @@ live_scanner_process_synced_frames(dsd_opts* opts, dsd_state* state, dsd_engine_
         p25_sm_tick_guard_leave();
         dsd_trunk_scan_hook_tick(opts, state);
         if (opts->scanner_mode == 1 && opts->scan_voice_only == 1) {
-            dsd_scan_voice_gate_tick(opts, state, frame_dispatchable, dsd_time_now_monotonic_s());
-            if (dsd_scan_voice_gate_should_step(opts, state, dsd_time_now_monotonic_s())) {
+            dsd_scan_voice_gate_tick(opts, state, frame_dispatchable, dsd_decode_now_mono_s());
+            if (dsd_scan_voice_gate_should_step(opts, state, dsd_decode_now_mono_s())) {
                 state->synctype = DSD_SYNC_NONE;
                 break;
             }
         }
         /* A busy legacy -Y row can keep syncing indefinitely. Maintain the visit clock
          * independently of the voice gate and return to noCarrier() when it expires. */
-        dsd_engine_scan_visit_tick(opts, state, dsd_time_now_monotonic_s());
-        if (dsd_engine_scan_visit_expired(opts, state, dsd_time_now_monotonic_s())) {
+        dsd_engine_scan_visit_tick(opts, state, dsd_decode_now_mono_s());
+        if (dsd_engine_scan_visit_expired(opts, state, dsd_decode_now_mono_s())) {
             /* noCarrier() owns the hop, and it only runs once this loop exits. Dropping sync is how
              * the voice-gate escape above hands control back, and the cap needs the same door: a
              * row that keeps syncing would otherwise never let the outer loop reach the step. */
@@ -2714,18 +2951,97 @@ live_scanner_process_synced_frames(dsd_opts* opts, dsd_state* state, dsd_engine_
             break;
         }
         dsd_runtime_pump_controls(opts, state);
+        /* A command replaced the input (issue #634): what follows is another stream, which the outer loop starts with
+           the end of this reception. */
+        if (state->input_boundary) {
+            state->synctype = DSD_SYNC_NONE;
+            break;
+        }
         if (!dsd_engine_channel_scan_service_sync(opts, state)) {
             break;
         }
         /* Refresh after controls, even with the voice gate off: continuous sync
          * keeps moving the legacy hangtime anchor throughout this inner loop. */
-        dsd_engine_scan_y_timing_tick(opts, state, dsd_time_now_monotonic_s(), dsd_time_now_realtime_s());
+        dsd_engine_scan_y_timing_tick(opts, state, dsd_decode_now_mono_s(), dsd_decode_now_realtime_s());
         if (frame_tune_generation) {
             *frame_tune_generation = dsd_trunk_tuning_generation();
         }
         state->synctype = getFrameSync(opts, state);
         (void)dsd_engine_slicer_thresholds_refresh(state, threshold_cache);
     }
+}
+
+/* Whether the input that ended still runs, closed: a command pumped since it ended (in the synced-frames loop, say) may
+   have replaced it, and the fallback never replaces the input chosen then. */
+static int
+dsd_engine_ended_input_runs(const dsd_opts* opts) {
+    switch (opts->audio_in_type) {
+        case AUDIO_IN_WAV: return opts->audio_in_file == NULL;
+        case AUDIO_IN_TCP: return opts->tcp_in_ctx == NULL;
+        case AUDIO_IN_SYMBOL_BIN: return opts->symbolfile == NULL;
+        default: return 0;
+    }
+}
+
+/* The file or TCP input ended (state->input_fallback_pending, which the symbol reader sets): the session goes on with
+   the configured Pulse input, switched to here between frames and under the tick guard, as a menu switch is (issue
+   #634). The session ends when Pulse does not open, as it did when the reader opened Pulse itself: returns -1 then. A
+   rigctl peer that comes to demodulate the input with the switch (a symbol replay ended: symbols are not the peer's
+   audio) is asked for the session's width, as at start and as a command's switch onto audio input asks it (issue
+   #621); one that demodulated the file or TCP stream already runs the request in force. */
+static int
+dsd_engine_input_fallback(dsd_opts* opts, dsd_state* state) {
+    if (!state->input_fallback_pending) {
+        return 0;
+    }
+    state->input_fallback_pending = 0;
+    if (!dsd_engine_ended_input_runs(opts)) {
+        return 0;
+    }
+    /* A new input is a new receiver (issue #522): the tone the file or TCP stream carried does
+       not describe live Pulse audio, which at the same rate nothing else would tell the tap. */
+    dsd_analog_rx_reset(state);
+    dsd_audio_input_request request;
+    DSD_MEMSET(&request, 0, sizeof request);
+    request.kind = DSD_AUDIO_INPUT_PULSE;
+    request.path = NULL;
+    request.tcp_sockfd = DSD_INVALID_SOCKET;
+    const int peer_before = dsd_opts_rigctl_peer_demodulates(opts);
+    /* The output follows Pulse under the guard too: the watchdog may flush audio into the stream a reconfigure
+       closes. So does the width asked of a new peer: the watchdog's retunes use the same peer record, and the guard is
+       not re-entrant. */
+    p25_sm_tick_guard_enter();
+    const int switched = dsd_audio_switch_input(opts, state, &request);
+    const int output_failed =
+        switched == DSD_AUDIO_INPUT_SWITCHED && dsd_audio_reconfigure_output_for_input_policy(opts) != 0;
+    if (switched == DSD_AUDIO_INPUT_SWITCHED && !output_failed && !peer_before) {
+        dsd_engine_rigctl_ask_session_passband(opts, state);
+    }
+    p25_sm_tick_guard_leave();
+    if (switched != DSD_AUDIO_INPUT_SWITCHED || output_failed) {
+        dsd_request_shutdown(opts, state);
+        return -1;
+    }
+    state->input_boundary = 1;
+    return 0;
+}
+
+/* The stream the decoder read was replaced (state->input_boundary, issue #634): noCarrier() has ended the reception,
+   and every call it ended as a fade, which the next transmission could resume, ends as a teardown instead, since
+   nothing the new stream carries continues it. Nor does the hunt or the symbol grid carry the old stream into it: its
+   acquisition proof, votes, history and slicer windows go, as at a scan row boundary
+   (dsd_frame_sync_reset_acquisition()), and so do the matched filter's history and the raw samples its seam would
+   replay, as at the start of a run (issue #444). */
+static void
+dsd_engine_end_input_boundary(dsd_opts* opts, dsd_state* state) {
+    if (!state->input_boundary) {
+        return;
+    }
+    state->input_boundary = 0;
+    no_carrier_finalize_canonical_calls(opts, state, 1);
+    dsd_frame_sync_reset_acquisition(opts, state, opts->trunk_scan_enabled != 1);
+    init_rrc_filter_memory();
+    dsd_symbol_matched_filter_reset(state);
 }
 
 static void
@@ -2736,6 +3052,13 @@ live_scanner_main_loop(dsd_opts* opts, dsd_state* state) {
     dsd_engine_slicer_threshold_cache_init(&threshold_cache);
 
     while (!dsd_exitflag_load()) {
+        /* A hunt read that left a silent input's wait for a queued command (issue #634) ended no reception: unless the
+           command replaced the input, the pass resumes without noCarrier(). */
+        const int interrupted = state->input_interrupted;
+        state->input_interrupted = 0;
+        if (dsd_engine_input_fallback(opts, state) != 0) {
+            continue;
+        }
         dsd_runtime_pump_controls(opts, state);
         p25_sm_try_tick(opts, state);
         if (opts->trunk_scan_enabled != 1 && p25_sm_tick_guard_try_enter()) {
@@ -2745,24 +3068,32 @@ live_scanner_main_loop(dsd_opts* opts, dsd_state* state) {
             p25_sm_tick_guard_leave();
         }
         dsd_trunk_scan_hook_tick(opts, state);
-        dsd_scan_voice_gate_tick(opts, state, 0, dsd_time_now_monotonic_s());
-        dsd_engine_scan_visit_tick(opts, state, dsd_time_now_monotonic_s());
+        dsd_scan_voice_gate_tick(opts, state, 0, dsd_decode_now_mono_s());
+        dsd_engine_scan_visit_tick(opts, state, dsd_decode_now_mono_s());
         dsd_runtime_pump_controls(opts, state);
 
         if (dsd_engine_channel_scan_pending(opts, state)) {
-            dsd_engine_scan_y_timing_tick(opts, state, dsd_time_now_monotonic_s(), dsd_time_now_realtime_s());
+            dsd_engine_scan_y_timing_tick(opts, state, dsd_decode_now_mono_s(), dsd_decode_now_realtime_s());
             dsd_sleep_ms(1);
             continue;
         }
-        noCarrier(opts, state);
+        if (!interrupted || state->input_boundary) {
+            if (state->input_boundary) {
+                /* The stream the decoder read was replaced: the carrier boundary, before noCarrier(), which keeps a
+                   trunking session's recent voice channel as a fade would want it (issue #575). */
+                dsd_engine_carrier_boundary(opts, state, DSD_CARRIER_BOUNDARY_INPUT_SWITCH, 0);
+            }
+            noCarrier(opts, state);
+            dsd_engine_end_input_boundary(opts, state);
+        }
         if (dsd_engine_channel_scan_pending(opts, state)) {
-            dsd_engine_scan_y_timing_tick(opts, state, dsd_time_now_monotonic_s(), dsd_time_now_realtime_s());
+            dsd_engine_scan_y_timing_tick(opts, state, dsd_decode_now_mono_s(), dsd_decode_now_realtime_s());
             dsd_sleep_ms(1);
             continue;
         }
         /* noCarrier and pending-row commits can replace the visit anchors. Publish
          * the incoming visit before getFrameSync starts emitting its snapshots. */
-        dsd_engine_scan_y_timing_tick(opts, state, dsd_time_now_monotonic_s(), dsd_time_now_realtime_s());
+        dsd_engine_scan_y_timing_tick(opts, state, dsd_decode_now_mono_s(), dsd_decode_now_realtime_s());
         frame_tune_generation = dsd_trunk_tuning_generation();
         state->synctype = getFrameSync(opts, state);
         (void)dsd_engine_slicer_thresholds_refresh(state, &threshold_cache);
@@ -2797,6 +3128,10 @@ liveScanner(dsd_opts* opts, dsd_state* state, const dsd_engine_lifecycle_hooks* 
     if (live_scanner_open_audio_if_needed(opts) != 0) {
         return -1;
     }
+    /* The input is open, so the peer of an audio input is the one that demodulates it: ask it for the width the
+       session's analog monitor runs (issue #621), before the lifecycle starts the frontends and before the P25
+       watchdog starts, whose retunes use the same peer record. */
+    dsd_engine_rigctl_ask_session_passband(opts, state);
     if (live_scanner_start_trunk_scan_if_needed(opts, state) != 0) {
         return -1;
     }
@@ -2838,16 +3173,31 @@ dsd_engine_cleanup_watchdog_snapshots(dsd_opts* opts, dsd_state* state) {
     dsd_event_sync_slot(opts, state, 1);
 }
 
+/* Commit the session's last calls: end the slots as sync loss, commit their rows, and retire the VOICE_END alerts held
+   for a reacquisition that can no longer happen. Repeating it finds nothing left to do. */
+static void
+dsd_engine_finalize_calls(dsd_opts* opts, dsd_state* state) {
+    dsd_engine_cleanup_watchdog_snapshots(opts, state);
+    noCarrier(opts, state);
+    dsd_engine_cleanup_watchdog_snapshots(opts, state);
+    // noCarrier() ended the slots as sync loss, so their VOICE_END alerts are being held against
+    // a reacquisition that can no longer happen. Retire them now, after the pass above has
+    // committed the rows and before audio output closes, or the last transmission of the session
+    // ends silently. Deliberately not inside the snapshot helper: its first call above runs while
+    // calls may still be active.
+    dsd_event_flush_pending_alerts(opts, state);
+}
+
 static void
 dsd_engine_cleanup_close_wavs(dsd_opts* opts, dsd_state* state) {
     if (opts->static_wav_file == 0) {
         if (opts->wav_out_f != NULL) {
             opts->wav_out_f = close_and_rename_wav_file(opts->wav_out_f, opts, opts->wav_out_file, opts->wav_out_dir,
-                                                        &state->event_history_s[0]);
+                                                        &state->event_history_s[0], opts->wav_out_open_time);
         }
         if (opts->wav_out_fR != NULL) {
             opts->wav_out_fR = close_and_rename_wav_file(opts->wav_out_fR, opts, opts->wav_out_fileR, opts->wav_out_dir,
-                                                         &state->event_history_s[1]);
+                                                         &state->event_history_s[1], opts->wav_out_open_timeR);
         }
         return;
     }
@@ -2861,13 +3211,15 @@ dsd_engine_cleanup_close_wavs(dsd_opts* opts, dsd_state* state) {
 }
 
 static void
-dsd_engine_cleanup_close_radio(const dsd_opts* opts, dsd_state* state) {
+dsd_engine_cleanup_close_radio(dsd_opts* opts, dsd_state* state) {
 #ifdef USE_RADIO
     if (opts->rtl_started == 1 && state->rtl_ctx) {
         rtl_stream_stop(state->rtl_ctx);
         rtl_stream_destroy(state->rtl_ctx);
         state->rtl_ctx = NULL;
     }
+    /* The replay centre goes with the stream (issue #575), as at app-control's stop. */
+    dsd_opts_forget_iq_replay_center(opts);
 #else
     UNUSED(opts);
     UNUSED(state);
@@ -2906,7 +3258,7 @@ dsd_engine_cleanup_print_stats(dsd_state* state) {
     if (state->debug_mode == 1) {
         const uint64_t* start_ms = DSD_STATE_EXT_GET_AS(uint64_t, state, DSD_STATE_EXT_ENGINE_START_MS);
         if (start_ms) {
-            uint64_t elapsed_ms = dsd_time_monotonic_ms() - *start_ms;
+            uint64_t elapsed_ms = dsd_realtime_mono_ms() - *start_ms;
             LOG_INFO("NOTICE: Runtime: %llu ms\n", (unsigned long long)elapsed_ms);
         }
     }
@@ -2930,15 +3282,7 @@ dsd_engine_cleanup(dsd_opts* opts, dsd_state* state) {
         nxdn_trunk_diag_log_summary(opts, state);
     }
     dsd_engine_cleanup_codec2(state);
-    dsd_engine_cleanup_watchdog_snapshots(opts, state);
-    noCarrier(opts, state);
-    dsd_engine_cleanup_watchdog_snapshots(opts, state);
-    // noCarrier() ended the slots as sync loss, so their VOICE_END alerts are being held against
-    // a reacquisition that can no longer happen. Retire them now, after the pass above has
-    // committed the rows and before audio output closes, or the last transmission of the session
-    // ends silently. Deliberately not inside the snapshot helper: its first call above runs while
-    // calls may still be active.
-    dsd_event_flush_pending_alerts(opts, state);
+    dsd_engine_finalize_calls(opts, state);
     dsd_engine_cleanup_close_wavs(opts, state);
     dsd_rdio_upload_shutdown();
 
@@ -2983,7 +3327,7 @@ dsd_engine_run_record_start_time_if_debug(dsd_state* state) {
     }
     uint64_t* start_ms = (uint64_t*)malloc(sizeof(*start_ms));
     if (start_ms) {
-        *start_ms = dsd_time_monotonic_ms();
+        *start_ms = dsd_realtime_mono_ms();
         (void)dsd_state_ext_set(state, DSD_STATE_EXT_ENGINE_START_MS, start_ms, free);
     }
 }
@@ -3001,6 +3345,24 @@ dsd_engine_run_install_hooks(void) {
     dsd_engine_p25_optional_hooks_install();
 }
 
+/* Embedded in a host process (Android service, GUI shell), the library must not steal the process signal dispositions;
+ * the host drives shutdown with dsd_request_shutdown() instead. */
+static void
+dsd_engine_install_signal_handlers(void) {
+    const dsdneoRuntimeConfig* cfg = dsd_neo_get_config();
+    if (cfg && cfg->no_signal_handlers_enable) {
+        return;
+    }
+    signal(SIGINT, dsd_engine_signal_handler);
+    signal(SIGTERM, dsd_engine_signal_handler);
+#ifdef SIGPIPE
+    /* A reader that goes away (`-o - | head`, a closed log pipe, a dropped socket) costs that output an error return,
+       never the process: decoding, recording and trunk following carry on, and a shutdown still finalizes the WAV
+       headers (issue #659). No child process is ever started, so nothing inherits this. */
+    signal(SIGPIPE, SIG_IGN);
+#endif
+}
+
 static int
 dsd_engine_run_common_setup(dsd_opts* opts, dsd_state* state, int* early_exit) {
     if (!opts || !state || !early_exit) {
@@ -3009,6 +3371,15 @@ dsd_engine_run_common_setup(dsd_opts* opts, dsd_state* state, int* early_exit) {
     if (opts->trunk_scan_enabled == 1 && opts->scanner_mode == 1) {
         LOG_ERROR("Trunk scan cannot be combined with conventional -Y scanner mode.\n");
         return -1;
+    }
+    /* The UDP retune listener tunes the front end directly, behind the trunk-scan coordinator, which owns the tuner and
+       refuses a manual tune: a datagram would move the receiver under the parked target and record another channel's
+       traffic into that target's state. */
+    if (opts->trunk_scan_enabled == 1 && opts->rtl_udp_port != 0) {
+        LOG_WARN(
+            "WARNING: --rtl-udp-control is off under --trunk-scan, which owns the tuner; UDP port %d not opened.\n",
+            opts->rtl_udp_port);
+        opts->rtl_udp_port = 0;
     }
     if (import_trunking_csvs_if_needed(opts, state) != 0) {
         return -1;
@@ -3038,17 +3409,9 @@ dsd_engine_run_common_setup(dsd_opts* opts, dsd_state* state, int* early_exit) {
         return 0;
     }
 
-    /* Embedded in a host process (Android service, GUI shell), the library must
-     * not steal the process signal dispositions; the host drives shutdown with
-     * dsd_request_shutdown() instead. */
-    {
-        const dsdneoRuntimeConfig* cfg = dsd_neo_get_config();
-        if (!cfg || !cfg->no_signal_handlers_enable) {
-            signal(SIGINT, dsd_engine_signal_handler);
-            signal(SIGTERM, dsd_engine_signal_handler);
-        }
-    }
+    dsd_engine_install_signal_handlers();
     dsd_engine_parse_m17_userdata(opts, state);
+    dsd_engine_note_m17_encoder_squelch(opts, state);
     return 0;
 }
 
@@ -3064,7 +3427,9 @@ static int
 dsd_engine_run_mode_m17_str(dsd_opts* opts, dsd_state* state, const dsd_engine_lifecycle_hooks* hooks,
                             int* lifecycle_started) {
     opts->use_cosine_filter = 1;
-    opts->pulse_digi_rate_out = 48000;
+    /* The digital stream carries only the decoded 8 kHz Codec2 monitor (issue #658); the -8 baseband monitor writes
+       the raw stream, which runs at the analog sink rate. */
+    opts->pulse_digi_rate_out = 8000;
 
     if (opts->audio_in_type == AUDIO_IN_PULSE && openAudioInput(opts) != 0) {
         return -1;
@@ -3154,6 +3519,81 @@ dsd_engine_run_dispatch_mode(dsd_opts* opts, dsd_state* state, const dsd_engine_
     return liveScanner(opts, state, hooks, lifecycle_started);
 }
 
+/* The sidecar path of the I/Q replay the run's input names, as the stream opens it: the `iqreplay:` spec's path, else
+   --iq-replay's. NULL when the input is no replay. */
+static const char*
+dsd_engine_replay_sidecar_path(const dsd_opts* opts) {
+    if (!opts->iq_replay_requested || !dsd_opts_audio_in_dev_is_iqreplay_spec(opts->audio_in_dev)) {
+        return NULL;
+    }
+    const char* colon = strchr(opts->audio_in_dev, ':');
+    if (colon && colon[1] != '\0') {
+        return colon + 1;
+    }
+    return opts->iq_replay_path[0] != '\0' ? opts->iq_replay_path : NULL;
+}
+
+int
+dsd_engine_decode_clock_enter_replay(dsd_opts* opts, dsd_state* state) {
+    if (!opts || !state) {
+        return -1;
+    }
+    const char* path = dsd_engine_replay_sidecar_path(opts);
+    if (!path) {
+        return 0;
+    }
+    dsd_iq_replay_config cfg;
+    DSD_MEMSET(&cfg, 0, sizeof(cfg));
+    char err[256] = {0};
+    if (dsd_iq_replay_read_metadata(path, &cfg, err, sizeof(err)) != DSD_IQ_OK) {
+        LOG_ERROR("IQ replay metadata error: %s\n", err[0] ? err : "unknown error");
+        return -1;
+    }
+    if (!state->engine_fresh) {
+        /* An earlier run on this state left decode-domain stamps on the system clock, and the rebase reaches only the
+           init seeds. Moved onto an older capture's time, the clock would read behind them, and a throttle or timer
+           measured from one (a DMR single-fragment SLCO stamp, say) would hold until the capture caught up. The system
+           clock only moves forward, so staying on it keeps behind now every stamp a run took on it. (An earlier replay
+           of a capture stamped ahead of this device's clock leaves stamps at the capture's later time; no clock choice
+           here moves them.) */
+        dsd_iq_replay_config_clear(&cfg);
+        LOG_WARN("IQ replay: this run reuses a decoder state an earlier run used; replay timing stays on the system "
+                 "clock for this run, and decode times are not anchored to the capture.\n");
+        return 0;
+    }
+    int64_t anchor_s = 0;
+    if (dsd_iq_replay_parse_utc_seconds(cfg.capture_started_utc, &anchor_s) != DSD_IQ_OK) {
+        LOG_WARN("IQ replay: capture_started_utc \"%s\" is not YYYY-MM-DDTHH:MM:SSZ; decode times start at "
+                 "2000-01-01T00:00:00Z.\n",
+                 cfg.capture_started_utc);
+        anchor_s = 0;
+    }
+    dsd_iq_replay_config_clear(&cfg);
+    dsd_decode_clock_use_replay(anchor_s);
+    dsd_state_rebase_decode_timestamps(opts, state);
+    return 0;
+}
+
+void
+dsd_engine_decode_clock_leave_replay(dsd_opts* opts, dsd_state* state) {
+    if (dsd_decode_clock_source() != DSD_DECODE_CLOCK_REPLAY) {
+        return;
+    }
+    /* The replay no longer feeds the decoder, so the calls decoded on it are over. End and commit them while decode
+       time is still the capture's (issue #673): their rows, and the per-call recordings and rdio-scanner sidecars a
+       commit closes, are then stamped on the clock they were decoded on, and each slot's WAV reopens empty. A call the
+       run's end already finalized, or a slot with none, has nothing left to end. */
+    if (opts && state && state->event_history_s) {
+        const double ended_m = dsd_decode_now_mono_s();
+        for (int slot = 0; slot < DSD_CALL_STATE_SLOT_COUNT; slot++) {
+            (void)dsd_call_state_end_ex(state, (uint8_t)slot, ended_m, DSD_CALL_END_EXPLICIT);
+            dsd_event_sync_slot(opts, state, (uint8_t)slot);
+        }
+    }
+    dsd_decode_clock_use_system();
+    dsd_state_rebase_decode_timestamps(opts, state);
+}
+
 int
 dsd_engine_run_with_lifecycle(dsd_opts* opts, dsd_state* state, const dsd_engine_lifecycle_hooks* hooks) {
     if (!opts || !state) {
@@ -3178,6 +3618,16 @@ dsd_engine_run_with_lifecycle(dsd_opts* opts, dsd_state* state, const dsd_engine
     int lifecycle_started = 0;
     dsd_exitflag_store(0);
 
+    /* An I/Q replay decodes on its capture's clock (issue #572). Selected first, before common setup writes its first
+       record (the P25 SM log's event=init) and before the stream, the watchdog or a frontend reads the clock. Only on
+       a state no run has used yet; this run uses it. */
+    const int enter_rc = dsd_engine_decode_clock_enter_replay(opts, state);
+    state->engine_fresh = 0U;
+    if (enter_rc != 0) {
+        rc = 1;
+        goto ENGINE_OUT;
+    }
+
     dsd_engine_run_record_start_time_if_debug(state);
     dsd_engine_run_install_hooks();
 
@@ -3193,12 +3643,22 @@ dsd_engine_run_with_lifecycle(dsd_opts* opts, dsd_state* state, const dsd_engine
 
 ENGINE_OUT:
     if (lifecycle_started && hooks && hooks->stop) {
+        /* The session's last calls are committed and published while the frontends are still attached, so a
+           frontend that records them (the control API's event subscribers) gets the final transmission too. */
+        dsd_exitflag_store(1);
+        dsd_engine_finalize_calls(opts, state);
+        dsd_telemetry_publish_both_and_redraw(opts, state);
         hooks->stop(opts, state, hooks->context);
     }
     dsd_engine_cleanup(opts, state);
+    /* The stream has stopped: the next session's decode time is the system's again. */
+    dsd_engine_decode_clock_leave_replay(opts, state);
     dsd_input_failure failure;
     dsd_input_failure_get(&failure);
-    if (failure.kind == DSD_INPUT_FAILURE_DEVICE) {
+    /* A receiver that failed, or an I/Q replay whose capture could not be read (the replay reader latches a file
+       failure, then ends the stream like its EOF), turns the normal end into a failure exit. */
+    if (failure.kind == DSD_INPUT_FAILURE_DEVICE
+        || (failure.kind == DSD_INPUT_FAILURE_FILE && opts->iq_replay_requested)) {
         rc = 1;
     }
     return rc;

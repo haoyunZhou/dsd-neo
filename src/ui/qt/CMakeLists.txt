@@ -10,6 +10,15 @@ find_package(
 
 add_library(dsd-neo_ui_qt STATIC)
 
+# The UI rejects NaN and infinite values (spectrum auto-range, saved preferences,
+# scan targets, session arguments) and none of it is DSP-bound, so it keeps IEEE
+# semantics even when the global fast-math option is on.
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(dsd-neo_ui_qt PRIVATE -fno-fast-math)
+elseif(MSVC)
+    target_compile_options(dsd-neo_ui_qt PRIVATE /fp:precise)
+endif()
+
 target_sources(
     dsd-neo_ui_qt
     PRIVATE
@@ -107,6 +116,7 @@ qt_add_resources(
         qml/NetworkSheet.qml
         qml/OnboardingScreen.qml
         qml/OutlineButton.qml
+        qml/PassbandSheet.qml
         qml/PlayCircle.qml
         qml/PlexSwitch.qml
         qml/PlexFlickable.qml
@@ -118,11 +128,13 @@ qt_add_resources(
         qml/SegmentedControl.qml
         qml/SettingsScreen.qml
         qml/SpectrumScreen.qml
+        qml/SquelchSheet.qml
         qml/TalkgroupSaveFlow.qml
         qml/TalkgroupEditSheet.qml
         qml/TalkgroupCard.qml
         qml/TalkgroupsScreen.qml
         qml/ToggleRow.qml
+        qml/ToneFilterSheet.qml
         qml/TunerMarker.qml
         qml/UiPanel.qml
         qml/WizardScreen.qml
@@ -159,7 +171,16 @@ qt_add_resources(
         "${PROJECT_SOURCE_DIR}/THIRD_PARTY.md"
         "${PROJECT_SOURCE_DIR}/src/ui/qt/fonts/IBMPlex-LICENSE.txt"
         "${PROJECT_SOURCE_DIR}/src/third_party/ezpwd/lesser.txt"
-        "${PROJECT_SOURCE_DIR}/src/third_party/pffft/COPYING"
+)
+
+qt_add_resources(
+    dsd-neo_ui_qt
+    "dsd_neo_pffft_notices"
+    PREFIX "/dsdneo/notices"
+    BASE "${DSD_PFFFT_LICENSE_DIR}"
+    FILES
+        "${DSD_PFFFT_LICENSE_DIR}/pffft-LICENSE.txt"
+        "${DSD_PFFFT_LICENSE_DIR}/pffft-NOTICES.txt"
 )
 
 # Qt's unprefixed `signals`/`slots`/`emit` macros collide with project C headers

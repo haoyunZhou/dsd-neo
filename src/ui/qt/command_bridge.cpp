@@ -30,11 +30,19 @@
 #pragma GCC diagnostic pop
 #endif
 #include <dsd-neo/app_control/history.h>
+#include <dsd-neo/app_control/scan_row_view.h>
+#include <dsd-neo/app_control/snapshot.h>
+#include <dsd-neo/app_control/squelch_view.h>
+#include <dsd-neo/core/analog_tone.h>
+#include <dsd-neo/core/opts.h>
+#include <dsd-neo/core/power.h>
 #include <dsd-neo/core/safe_api.h>
+#include <dsd-neo/runtime/scan_row_edit.h>
 #include <stdint.h>
 
 #include <atomic>
 #include <cstring>
+#include <dsd-neo/runtime/analog_tones.h>
 #include <dsd-neo/runtime/trunk_tuning_hooks.h>
 #include "decode_mode_flag.h"
 #include "decryption_profile_provider.h"
@@ -283,9 +291,79 @@ CommandBridge::setSquelchDb(double db) const {
     return accepted(dsd_app_command_set_double(DSD_APP_CMD_RTL_SET_SQL_DB, db));
 }
 
+namespace {
+
+/* A dynamic setting for the configured default: AUTO with its margin, or NOISE with its quieting. */
+bool
+submitDynamicSquelch(int mode, int marginDb) {
+    if (marginDb < DSD_SQUELCH_MARGIN_MIN_DB || marginDb > DSD_SQUELCH_MARGIN_MAX_DB) {
+        return false;
+    }
+    dsd_app_squelch_setting_payload payload = {};
+    payload.mode = mode;
+    payload.margin_db = marginDb;
+    return accepted(dsd_app_command_submit(DSD_APP_CMD_RTL_SET_SQL_SETTING, &payload, sizeof payload));
+}
+
+} // namespace
+
+bool
+// cppcheck-suppress functionStatic -- Q_INVOKABLE members cannot be static (Qt meta-object)
+CommandBridge::setSquelchAuto(int marginDb) const {
+    return submitDynamicSquelch(DSD_SQUELCH_MODE_AUTO, marginDb);
+}
+
+bool
+// cppcheck-suppress functionStatic -- Q_INVOKABLE members cannot be static (Qt meta-object)
+CommandBridge::setSquelchNoise(int marginDb) const {
+    return submitDynamicSquelch(DSD_SQUELCH_MODE_NOISE, marginDb);
+}
+
+bool
+// cppcheck-suppress functionStatic -- Q_INVOKABLE members cannot be static (Qt meta-object)
+CommandBridge::restoreSquelchLevel() const {
+    dsd_app_squelch_view view{};
+    if (dsd_app_squelch_view_get(dsd_app_get_latest_opts_snapshot(), dsd_app_get_latest_snapshot(), &view) != 0) {
+        return false;
+    }
+    dsd_app_squelch_setting_payload payload = {};
+    payload.mode = DSD_SQUELCH_MODE_LEVEL;
+    payload.level = view.configured_level;
+    return accepted(dsd_app_command_submit(DSD_APP_CMD_RTL_SET_SQL_SETTING, &payload, sizeof payload));
+}
+
 bool
 CommandBridge::setNfmBandwidthHz(int hz) const {
     return accepted(dsd_app_command_set_i32(DSD_APP_CMD_NFM_BANDWIDTH_SET, static_cast<int32_t>(hz)));
+}
+
+bool
+CommandBridge::setAmBandwidthHz(int hz) const {
+    return accepted(dsd_app_command_set_i32(DSD_APP_CMD_AM_BANDWIDTH_SET, static_cast<int32_t>(hz)));
+}
+
+bool
+CommandBridge::setToneFilter(int mode, const QString& list) const {
+    const QByteArray utf8 = list.toUtf8();
+    /* A list with a NUL in it would reach the decoder cut short; the setter refuses one too long to carry. */
+    if (utf8.contains('\0')) {
+        return false;
+    }
+    return accepted(dsd_app_command_set_tone_filter(static_cast<int32_t>(mode), utf8.constData()));
+}
+
+QString
+CommandBridge::toneFilterError(int mode, const QString& list) const {
+    const QByteArray utf8 = list.toUtf8();
+    if (utf8.contains('\0')) {
+        return tr("the list holds a NUL character");
+    }
+    dsd_tone_set set;
+    char why[DSD_TONE_LIST_ERROR_SIZE] = "";
+    if (dsd_tone_filter_check(mode, utf8.constData(), &set, why, sizeof why) == 0) {
+        return {};
+    }
+    return QString::fromUtf8(why);
 }
 
 bool
@@ -446,6 +524,128 @@ CommandBridge::acknowledgeDecryptionResult(quint64 requestId) {
     if (requestId == m_pendingKeyRequest) {
         m_pendingKeyRequest = 0;
     }
+}
+
+int
+CommandBridge::scanRowFieldSquelch() {
+    return DSD_SCAN_ROW_FIELD_SQUELCH;
+}
+
+int
+CommandBridge::scanRowFieldWidth() {
+    return DSD_SCAN_ROW_FIELD_WIDTH;
+}
+
+int
+CommandBridge::scanRowFieldTone() {
+    return DSD_SCAN_ROW_FIELD_TONE;
+}
+
+int
+CommandBridge::scanRowFieldGain() {
+    return DSD_SCAN_ROW_FIELD_GAIN;
+}
+
+int
+CommandBridge::scanRowEditSet() {
+    return DSD_SCAN_ROW_EDIT_SET;
+}
+
+int
+CommandBridge::scanRowEditInherit() {
+    return DSD_SCAN_ROW_EDIT_INHERIT;
+}
+
+int
+CommandBridge::scanRowEditReset() {
+    return DSD_SCAN_ROW_EDIT_RESET;
+}
+
+int
+CommandBridge::squelchModeLevel() {
+    return DSD_SQUELCH_MODE_LEVEL;
+}
+
+int
+CommandBridge::squelchModeAuto() {
+    return DSD_SQUELCH_MODE_AUTO;
+}
+
+int
+CommandBridge::squelchModeNoise() {
+    return DSD_SQUELCH_MODE_NOISE;
+}
+
+int
+CommandBridge::squelchMarginMinDb() {
+    return DSD_SQUELCH_MARGIN_MIN_DB;
+}
+
+int
+CommandBridge::squelchMarginMaxDb() {
+    return DSD_SQUELCH_MARGIN_MAX_DB;
+}
+
+int
+CommandBridge::squelchMarginDefaultDb() {
+    return DSD_SQUELCH_MARGIN_DEFAULT_DB;
+}
+
+QVariantMap
+// cppcheck-suppress functionStatic -- Q_INVOKABLE members cannot be static (Qt meta-object)
+CommandBridge::scanRowContext() const {
+    const dsd_opts* opts = dsd_app_get_latest_opts_snapshot();
+    dsd_app_scan_row_view view{};
+    (void)dsd_app_scan_row_view_get(opts, dsd_app_get_latest_snapshot(), &view);
+    /* The tone policy below comes from the options snapshot: only one taken under this row's scope is the row's. */
+    if (!view.active || !view.opts_match) {
+        return {{"active", false}};
+    }
+    /* The tone policy the row runs now, its own or the configured one it follows: what a "this channel" tone editor
+       opens on. */
+    char list[DSD_APP_TONE_FILTER_LIST_SIZE] = "";
+    (void)dsd_tone_set_format(&opts->analog_tone_set, list, sizeof list);
+    return {{"active", true},
+            {"scanner", view.scanner},
+            {"session", static_cast<qulonglong>(view.session)},
+            {"row", view.row},
+            {"mode", static_cast<int>(view.mode)},
+            {"target", QString::fromUtf8(view.target_id)},
+            {"label", QString::fromUtf8(view.label)},
+            {"key", QStringLiteral("%1:%2:%3").arg(view.scanner).arg(view.session).arg(view.row)},
+            {"toneMode", opts->analog_tone_filter},
+            {"toneList", QString::fromUtf8(list)}};
+}
+
+bool
+// cppcheck-suppress functionStatic -- Q_INVOKABLE members cannot be static (Qt meta-object)
+CommandBridge::editScanRow(const QVariantMap& context, int field, int action, const QVariantMap& value) const {
+    if (!context.value("active").toBool()) {
+        return false;
+    }
+    dsd_app_scan_row_edit_payload payload = {};
+    payload.session = static_cast<uint32_t>(context.value("session").toULongLong());
+    payload.scanner = context.value("scanner").toInt();
+    payload.row = context.value("row").toInt();
+    payload.mode = context.value("mode").toInt();
+    payload.field = field;
+    payload.action = action;
+    payload.squelch_db = value.value("squelchDb").toInt();
+    payload.squelch_mode = value.value("squelchMode", static_cast<int>(DSD_SQUELCH_MODE_LEVEL)).toInt();
+    payload.squelch_margin_db = value.value("squelchMarginDb").toInt();
+    payload.width_hz = value.value("widthHz").toInt();
+    payload.tone_mode = value.value("toneMode").toInt();
+    payload.gain_db = value.value("gainDb").toInt();
+    const QByteArray target = context.value("target").toString().toUtf8();
+    const QByteArray list = value.value("toneList").toString().toUtf8();
+    /* Text that would reach the decoder cut short, or not fit, is refused here. */
+    if (target.contains('\0') || list.contains('\0') || static_cast<size_t>(target.size()) >= sizeof(payload.target_id)
+        || static_cast<size_t>(list.size()) >= sizeof(payload.tone_list)) {
+        return false;
+    }
+    std::memcpy(payload.target_id, target.constData(), static_cast<size_t>(target.size()));
+    std::memcpy(payload.tone_list, list.constData(), static_cast<size_t>(list.size()));
+    return accepted(dsd_app_command_scan_row_edit(&payload));
 }
 
 QVariantMap

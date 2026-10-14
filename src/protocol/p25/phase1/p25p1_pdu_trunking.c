@@ -457,8 +457,8 @@ p25_handle_mbt_tdma_iden_foreign_system(const uint8_t* mpdu_byte) {
 
     DSD_FPRINTF(stderr, "%s", KYEL);
     DSD_FPRINTF(stderr, "\n TDMA Identifier Update MBT - foreign system, not applied\n");
-    DSD_FPRINTF(stderr, "  IDEN [%X] Type [%X] Base Freq [%ld] (%ld Hz) TX Offset [%d] Spacing [%d]", iden, chan_type,
-                base_freq, base_freq * 5, trans_off, chan_spac);
+    DSD_FPRINTF(stderr, "  IDEN [%X] Type [%X] Base Freq [%ld] (%lld Hz) TX Offset [%d] Spacing [%d]", iden, chan_type,
+                base_freq, (long long)base_freq * 5, trans_off, chan_spac);
     DSD_FPRINTF(stderr, "\n  Foreign WACN [%05lX] SYSID [%03X] - ignored for current IDEN tables", lwacn, lsysid);
 }
 
@@ -753,6 +753,8 @@ p25_telephone_update_nontrunk_vc_freq(const dsd_opts* opts, dsd_state* state, ui
     } else {
         state->p25_vc_freq[0] = state->p25_vc_freq[1] = freq;
     }
+    /* Kept with its target, for that call's own publication only (issue #575). */
+    p25_conventional_grant_note(state, target, freq);
 }
 
 static void DSD_ATTR_USED

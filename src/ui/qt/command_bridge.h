@@ -29,8 +29,55 @@ class DecryptionProfileProvider;
 
 class CommandBridge : public QObject {
     Q_OBJECT
+    /* Issue #518: the session-edit fields and actions (runtime/scan_row_edit.h) "this channel" editors pass to
+     * editScanRow(), and test against metrics.scanRowEditable / scanRowEdited / scanRowListed. */
+    Q_PROPERTY(int scanRowFieldSquelch READ scanRowFieldSquelch CONSTANT)
+    Q_PROPERTY(int scanRowFieldWidth READ scanRowFieldWidth CONSTANT)
+    Q_PROPERTY(int scanRowFieldTone READ scanRowFieldTone CONSTANT)
+    Q_PROPERTY(int scanRowFieldGain READ scanRowFieldGain CONSTANT)
+    Q_PROPERTY(int scanRowEditSet READ scanRowEditSet CONSTANT)
+    Q_PROPERTY(int scanRowEditInherit READ scanRowEditInherit CONSTANT)
+    Q_PROPERTY(int scanRowEditReset READ scanRowEditReset CONSTANT)
+    /* The squelch modes a row edit names (core/power.h dsd_squelch_mode) and the auto squelch's margin range, in
+     * whole dB over the learned floor (issue #518 follow-up). */
+    Q_PROPERTY(int squelchModeLevel READ squelchModeLevel CONSTANT)
+    Q_PROPERTY(int squelchModeAuto READ squelchModeAuto CONSTANT)
+    Q_PROPERTY(int squelchModeNoise READ squelchModeNoise CONSTANT)
+    Q_PROPERTY(int squelchMarginMinDb READ squelchMarginMinDb CONSTANT)
+    Q_PROPERTY(int squelchMarginMaxDb READ squelchMarginMaxDb CONSTANT)
+    Q_PROPERTY(int squelchMarginDefaultDb READ squelchMarginDefaultDb CONSTANT)
 
   public:
+    static int scanRowFieldSquelch();
+    static int scanRowFieldWidth();
+    static int scanRowFieldTone();
+    static int scanRowFieldGain();
+    static int scanRowEditSet();
+    static int scanRowEditInherit();
+    static int scanRowEditReset();
+    static int squelchModeLevel();
+    static int squelchModeAuto();
+    static int squelchModeNoise();
+    static int squelchMarginMinDb();
+    static int squelchMarginMaxDb();
+    static int squelchMarginDefaultDb();
+
+    /**
+     * @brief The scan row on air, captured when a "this channel" editor opens (issue #518): active, scanner, session,
+     * row, mode, target and label. An edit names it, so it reaches that row however the scan has moved on since, and is
+     * refused once that scan has ended. Empty-handed ({active: false}) with no row on air.
+     */
+    Q_INVOKABLE QVariantMap scanRowContext() const;
+    /**
+     * @brief Submit a session edit of one @p field (a scanRowField*) of the row @p context names, with @p action (a
+     * scanRowEdit*). For SET, @p value carries the field's value: squelchDb (whole dB, -100..0; 0 = off) or
+     * squelchMode squelchModeAuto with squelchMarginDb (an nfm or am row's auto squelch), squelchMode
+     * squelchModeNoise with squelchMarginDb (an nfm row's noise squelch), widthHz, toneMode with
+     * toneList, or gainDb (0 = AGC). Returns whether it was queued; the decoder refuses what the row
+     * cannot take, with a message.
+     */
+    Q_INVOKABLE bool editScanRow(const QVariantMap& context, int field, int action, const QVariantMap& value) const;
+
     void
     setDecryptionProfiles(DecryptionProfileProvider* profiles) {
         m_profiles = profiles;
@@ -137,6 +184,25 @@ class CommandBridge : public QObject {
     /** @brief Set the RTL power squelch threshold, in dB. */
     Q_INVOKABLE bool setSquelchDb(double db) const;
 
+    /**
+     * @brief Set the auto squelch: open @p marginDb (squelchMarginMinDb..squelchMarginMaxDb) over the noise floor
+     * the demodulator learns on each channel. Like setSquelchDb() it edits the configured default.
+     */
+    Q_INVOKABLE bool setSquelchAuto(int marginDb) const;
+
+    /**
+     * @brief Set the noise squelch: open an FM channel when its discriminator noise above voice quiets by @p marginDb
+     * (squelchMarginMinDb..squelchMarginMaxDb). Like setSquelchDb() it edits the configured default; the AM monitor
+     * refuses it.
+     */
+    Q_INVOKABLE bool setSquelchNoise(int marginDb) const;
+
+    /**
+     * @brief Put the configured default back on the level it kept beneath a dynamic squelch, exactly as stored (a
+     * legacy linear threshold included, which a whole-dB reading cannot carry).
+     */
+    Q_INVOKABLE bool restoreSquelchLevel() const;
+
     /** @brief Set the dongle's crystal correction, in parts per million. */
     Q_INVOKABLE bool setPpm(int ppm) const;
 
@@ -147,6 +213,31 @@ class CommandBridge : public QObject {
      * the one it had; a view reads the width back rather than trusting the request.
      */
     Q_INVOKABLE bool setNfmBandwidthHz(int hz) const;
+
+    /**
+     * @brief Set the AM channel-filter width in Hz (5000..20000), or 0 for the 6 kHz default (issue #524).
+     *
+     * The engine refuses a width the front end cannot filter at its DSP rate, with a message, and keeps the one it
+     * had; a view reads the width back rather than trusting the request.
+     */
+    Q_INVOKABLE bool setAmBandwidthHz(int hz) const;
+
+    /**
+     * @brief Set the configured CTCSS/DCS tone filter (issue #527): @p mode 0 off, 1 allow, 2 block, with its
+     * '/'-separated list of tones and codes as typed ("67.0/100.0/D023N"; empty for none, which only off takes).
+     *
+     * The decoder checks the list with the same parser as toneFilterError() and refuses what it cannot apply, with a
+     * message, keeping the policy it had. The edit sets the configured policy: a scan row with its own tone options
+     * keeps them while on air. A list longer than the command carries is refused here, without submitting anything.
+     */
+    Q_INVOKABLE bool setToneFilter(int mode, const QString& list) const;
+
+    /**
+     * @brief Why the decoder would refuse setToneFilter() with @p mode and @p list, or an empty string when it would
+     * apply it: the list parser's own message, naming entries by number and never repeating the text, for the editor to
+     * show inline.
+     */
+    Q_INVOKABLE QString toneFilterError(int mode, const QString& list) const;
 
     /**
      * @brief Choose the demodulator: 0 for C4FM, 1 for QPSK, 2 for GFSK.

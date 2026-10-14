@@ -15,6 +15,7 @@
 #include <atomic>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/parse.h>
+#include <dsd-neo/core/power.h>
 #include <dsd-neo/dsp/demod_pipeline.h>
 #include <dsd-neo/dsp/demod_state.h>
 #include <dsd-neo/dsp/math_utils.h>
@@ -26,11 +27,11 @@
 #include <dsd-neo/runtime/log.h>
 #include <dsd-neo/runtime/mem.h>
 #include <dsd-neo/runtime/ring.h>
+#include <dsd-neo/runtime/squelch.h>
 #include <dsd-neo/runtime/worker_pool.h>
 #include <limits.h>
 #include <math.h>
 #include <stdint.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include "dsd-neo/core/opts_fwd.h"
 #include "dsd-neo/core/safe_api.h"
@@ -192,11 +193,9 @@ demod_uses_cqpsk_profile(const demod_state* demod) {
     return (demod && demod->cqpsk_enable) ? 1 : 0;
 }
 
+/* The profile a symbol rate picks among the enabled modes, or -1 when the rate leaves it to the modes alone. */
 static int
-opts_channel_profile_for_rate(const dsd_opts* opts, const demod_state* demod, int symbol_rate_hz) {
-    if (!opts) {
-        return DSD_CH_LPF_PROFILE_WIDE;
-    }
+opts_channel_profile_for_symbol_rate(const dsd_opts* opts, int symbol_rate_hz) {
     switch (symbol_rate_hz) {
         case 9600:
             if (opts->frame_provoice == 1) {
@@ -214,6 +213,19 @@ opts_channel_profile_for_rate(const dsd_opts* opts, const demod_state* demod, in
             }
             break;
         default: break;
+    }
+    return -1;
+}
+
+static int
+opts_channel_profile_for_rate(const dsd_opts* opts, const demod_state* demod, int symbol_rate_hz) {
+    /* The M17 encoder's monitor runs WIDE, whatever digital frame flags -fZ left set (issue #625). */
+    if (!opts || dsd_opts_runs_m17_encoder(opts)) {
+        return DSD_CH_LPF_PROFILE_WIDE;
+    }
+    const int by_rate = opts_channel_profile_for_symbol_rate(opts, symbol_rate_hz);
+    if (by_rate >= 0) {
+        return by_rate;
     }
     if (dsd_opts_uses_wide_4800_profile(opts)) {
         return DSD_CH_LPF_PROFILE_12K5;
@@ -280,15 +292,15 @@ demod_init_common_defaults(struct demod_state* s, int rtl_dsp_bw_hz, struct outp
     s->prev_lpr_index = 0;
     s->deemph_a = 0.0f;
     s->deemph_avg = 0.0f;
+    s->am_carrier = 0.0f;
+    s->am_squelched_samples = 0;
     s->channel_lpf_enable = 0;
-    s->channel_lpf_hist_len = 143;
     s->channel_lpf_profile = DSD_CH_LPF_PROFILE_WIDE;
-    DSD_MEMSET(s->channel_lpf_hist_i, 0, sizeof(s->channel_lpf_hist_i));
-    DSD_MEMSET(s->channel_lpf_hist_q, 0, sizeof(s->channel_lpf_hist_q));
     s->channel_pwr = 0.0f;
     g_channel_pwr.store(0.0f, std::memory_order_relaxed);
     s->channel_squelch_level.store(0.0f, std::memory_order_relaxed);
     s->channel_squelched = 0;
+    s->front_end_empty = 0;
     s->audio_lpf_enable = 0;
     s->audio_lpf_alpha = 0.0f;
     s->audio_lpf_state = 0.0f;
@@ -312,6 +324,11 @@ demod_init_common_defaults(struct demod_state* s, int rtl_dsp_bw_hz, struct outp
     s->post_polydecim_hist_head = 0;
     s->post_polydecim_taps = NULL;
     s->post_polydecim_hist = NULL;
+    /* No decimator state yet: the first block that decimates starts it (its history, phase and the fallback's state
+       are cleared by the filter reset below). */
+    s->post_decim_state_M = 0;
+    s->post_decim_state_rate_out = 0;
+    s->post_decim_state_fallback = 0;
     s->ted_enabled = 0;
     s->ted_gain = 0.0f;
     s->ted_gain_is_set = 0;
@@ -328,10 +345,7 @@ demod_init_common_defaults(struct demod_state* s, int rtl_dsp_bw_hz, struct outp
     s->squelch_env = 1.0f;
     s->squelch_env_attack = 0.125f;
     s->squelch_env_release = 0.03125f;
-    for (int st = 0; st < 10; st++) {
-        DSD_MEMSET(s->hb_hist_i[st], 0, sizeof(s->hb_hist_i[st]));
-        DSD_MEMSET(s->hb_hist_q[st], 0, sizeof(s->hb_hist_q[st]));
-    }
+    dsd_demod_reset_filter_state(s);
     s->lowpassed = s->input_cb_buf;
     s->lp_len = 0;
     s->iqbal_alpha_ema_r = 0.0f;
@@ -466,9 +480,12 @@ demod_apply_ted_defaults(struct demod_state* demod, const dsdneoRuntimeConfig* c
 static void
 demod_apply_cqpsk_defaults(struct demod_state* demod, const dsd_opts* opts) {
     /* The analog family's monitor audio comes from the FM discriminator, never the CQPSK path, whatever DSD_NEO_CQPSK
-       or the modulation say (rtl_demod_enter_analog_family() holds a live switch to the same). */
-    demod->cqpsk_enable =
-        (!dsd_opts_is_analog_family(opts) && rtl_demod_open_cqpsk_request((opts->mod_qpsk == 1) ? 1 : 0) > 0) ? 1 : 0;
+       or the modulation say (rtl_demod_enter_analog_family() holds a live switch to the same), and so does the M17
+       encoder's (issue #625). */
+    demod->cqpsk_enable = (!dsd_opts_is_analog_family(opts) && !dsd_opts_runs_m17_encoder(opts)
+                           && rtl_demod_open_cqpsk_request((opts->mod_qpsk == 1) ? 1 : 0) > 0)
+                              ? 1
+                              : 0;
     if (demod->cqpsk_enable) {
         if (!demod->ted_enabled) {
             demod->ted_enabled = 1;
@@ -518,6 +535,7 @@ demod_apply_channel_lpf_defaults(struct demod_state* demod, const dsd_opts* opts
     demod->analog_demod = DSD_ANALOG_DEMOD_FM;
     demod->channel_lpf_width_hz = 0;
     demod->analog_width_request_hz = 0;
+    demod->analog_width_setting_hz = 0;
     if (dsd_opts_is_analog_family(opts)) {
         /* Provisional: rate_out is not final yet. rtl_demod_finalize_analog_channel() settles it. */
         (void)rtl_demod_apply_analog_channel(demod, opts->analog_demod, dsd_opts_analog_width_hz(opts));
@@ -525,9 +543,33 @@ demod_apply_channel_lpf_defaults(struct demod_state* demod, const dsd_opts* opts
     fsk_modem_apply_config(demod);
 }
 
+/* The detector and de-emphasis of an analog kind: FM runs the discriminator with the configured de-emphasis, AM the
+   envelope detector with none (de-emphasis would tilt AM audio, which is not pre-emphasized). */
+static void
+demod_install_analog_detector(struct demod_state* demod, int kind) {
+    const int am = (kind == DSD_ANALOG_DEMOD_AM) ? 1 : 0;
+    demod->mode_demod = am ? &dsd_am_demod : &dsd_fm_demod;
+    demod->deemph = am ? 0 : 1;
+    if (am) {
+        /* As an AM open has it: no de-emphasis coefficient either (FM's comes back from the config on the way back). */
+        demod->deemph_tau_us = 0;
+        demod->deemph_a = 0.0f;
+    }
+}
+
+/* Note the configured input corrections the AM detector bypasses (dsd_demod_iq_dc_block_active(),
+   dsd_demod_iq_balance_active()), once each per process. */
+static void
+demod_note_am_input_bypasses(const struct demod_state* demod) {
+    const int am_active = dsd_demod_am_active(demod);
+    (void)rtl_demod_note_am_iq_dc_bypass(demod->iq_dc_block_enable, am_active);
+    (void)rtl_demod_note_am_iq_balance_bypass(demod->iqbal_enable, am_active);
+}
+
 static void
 demod_finalize_runtime_profile(struct demod_state* demod, const dsd_opts* opts) {
-    demod->channel_squelch_level.store((float)opts->rtl_squelch_level, std::memory_order_relaxed);
+    /* The level the level gate uses: off under the auto squelch, which gates per sample. */
+    demod->channel_squelch_level.store((float)dsd_squelch_level_in_force(opts), std::memory_order_relaxed);
     if (demod->output_kind == DSD_DEMOD_OUTPUT_FSK_DISCRIMINATOR) {
         demod->ted_enabled = 0;
     }
@@ -556,15 +598,25 @@ rtl_demod_init_for_mode(struct demod_state* demod, struct output_state* output, 
     }
 
     DemodInitParams params = {};
-    if (opts->frame_p25p1 == 1 || opts->frame_p25p2 == 1 || opts->frame_provoice == 1) {
+    /* The M17 encoder's monitor is the FM discriminator with de-emphasis, whatever digital frame flags -fZ left at
+       their defaults (issue #625): they would otherwise pick RO2, which runs neither. */
+    const int encoder = dsd_opts_runs_m17_encoder(opts);
+    if (!encoder && (opts->frame_p25p1 == 1 || opts->frame_p25p2 == 1 || opts->frame_provoice == 1)) {
         demod_init_mode(demod, DEMOD_RO2, &params, rtl_dsp_bw_hz, output);
-    } else if (opts->analog_only == 1 || opts->m17encoder == 1) {
+    } else if (opts->analog_only == 1 || encoder) {
         params.deemph_default = 1;
         demod_init_mode(demod, DEMOD_ANALOG, &params, rtl_dsp_bw_hz, output);
+        if (dsd_opts_is_analog_family(opts)) {
+            /* The M17 encoder's monitor stays on the FM discriminator. */
+            demod_install_analog_detector(demod, opts->analog_demod);
+        }
     } else {
         demod_init_mode(demod, DEMOD_DIGITAL, &params, rtl_dsp_bw_hz, output);
     }
-    demod->cqpsk_enable = (opts->mod_qpsk == 1) ? 1 : 0;
+    demod->cqpsk_enable = (!encoder && opts->mod_qpsk == 1) ? 1 : 0;
+    /* Written on every open: the global demod outlives a session. The dynamic squelch runs on the encoder's monitor
+       (dsd_demod_encoder_monitor_active()). */
+    demod->m17_encoder_monitor = encoder;
     demod_apply_output_kind(demod, opts);
 }
 
@@ -599,6 +651,7 @@ rtl_demod_config_from_env_and_opts(struct demod_state* demod, const dsd_opts* op
     demod_apply_iq_defaults(demod, cfg);
     demod_apply_channel_lpf_defaults(demod, opts, cfg);
     demod_finalize_runtime_profile(demod, opts);
+    demod_note_am_input_bypasses(demod);
 }
 
 static int
@@ -736,18 +789,30 @@ rtl_demod_should_skip_resampler(const struct demod_state* demod) {
     return 0;
 }
 
-static void
-rtl_demod_compute_resampler_ratio(int inRate, int target, int* L, int* M, int* scale) {
-    int g = gcd_int(inRate, target);
-    *L = target / g;
-    *M = inRate / g;
-    if (*L < 1) {
-        *L = 1;
+int
+rtl_demod_resampler_ratio(int in_rate_hz, int target_hz, int* L, int* M) {
+    int l = 1;
+    int m = 1;
+    const int g = gcd_int(in_rate_hz, target_hz);
+    if (g > 0) {
+        l = target_hz / g;
+        m = in_rate_hz / g;
     }
-    if (*M < 1) {
-        *M = 1;
+    if (l < 1) {
+        l = 1;
     }
-    *scale = (*M > 0) ? ((*L + *M - 1) / *M) : 1;
+    if (m < 1) {
+        m = 1;
+    }
+    if (L) {
+        *L = l;
+    }
+    if (M) {
+        *M = m;
+    }
+    /* In 64 bits: an arbitrary DSD_NEO_RESAMP target makes L + M - 1 overflow an int. */
+    const int64_t scale = ((int64_t)l + (int64_t)m - 1) / (int64_t)m;
+    return (scale <= 12 && dsd_resampler_ratio_designable(l, m, DSD_RESAMPLER_DEFAULT_TAPS_PER_PHASE)) ? 1 : 0;
 }
 
 static int
@@ -833,10 +898,7 @@ rtl_demod_maybe_update_resampler_after_rate_change(struct demod_state* demod, st
     }
     int L = 1;
     int M = 1;
-    int scale = 1;
-    rtl_demod_compute_resampler_ratio(inRate, target, &L, &M, &scale);
-
-    if (scale > 12) {
+    if (!rtl_demod_resampler_ratio(inRate, target, &L, &M)) {
         rtl_demod_disable_resampler(demod, 0);
         output->rate = inRate;
         LOG_WARN("WARNING: Resampler ratio too large on retune (L=%d,M=%d). Disabled.\n", L, M);
@@ -845,7 +907,13 @@ rtl_demod_maybe_update_resampler_after_rate_change(struct demod_state* demod, st
 
     if (rtl_demod_resampler_needs_reconfigure(demod, L, M)) {
         rtl_demod_free_resampler_buffers(demod);
-        resamp_design(demod, L, M);
+        if (!resamp_design(demod, L, M)) {
+            /* The samples would pass through at inRate: publishing the target would mislabel them (issue #633). */
+            rtl_demod_disable_resampler(demod, 0);
+            output->rate = inRate;
+            LOG_WARN("WARNING: Resampler design failed on retune (L=%d,M=%d). Disabled.\n", L, M);
+            return;
+        }
         demod->resamp_L = L;
         demod->resamp_M = M;
         demod->resamp_enabled = 1;
@@ -1013,12 +1081,6 @@ demod_check_analog_channel(int kind, int explicit_width_hz, int rate_hz, int rat
     if (explicit_width_hz < 0) {
         return demod_refuse_negative_analog_width(kind, explicit_width_hz, err, err_size);
     }
-    if (kind == DSD_ANALOG_DEMOD_AM) {
-        demod_error_text(err, err_size,
-                         "AM reception is not available on the radio front end yet; the analog monitor demodulates "
-                         "NFM only");
-        return -1;
-    }
     if (explicit_width_hz <= 0 && kind == DSD_ANALOG_DEMOD_FM) {
         /* The unset NFM default keeps the historical filter behaviour at every rate. */
         return 0;
@@ -1041,21 +1103,6 @@ rtl_demod_check_analog_channel(int kind, int explicit_width_hz, int rate_hz, cha
     return demod_check_analog_channel(kind, explicit_width_hz, rate_hz, DSD_ANALOG_RATE_RTL_BW, err, err_size);
 }
 
-/* What sets the input's DSP rate (dsd_analog_rate_source), classified as the stream classifies its input
-   (detect_radio_source()): an I/Q replay's capture, a SoapySDR or Airspy device's capture rate decimated toward the
-   DSP bandwidth, or else the RTL DSP bandwidth itself. */
-static int
-demod_input_rate_source(const dsd_opts* opts) {
-    const char* dev = opts->audio_in_dev;
-    if (opts->iq_replay_active || dsd_opts_audio_in_dev_is_iqreplay_spec(dev)) {
-        return DSD_ANALOG_RATE_CAPTURE;
-    }
-    if (dsd_opts_audio_in_dev_is_soapy_spec(dev) || dsd_opts_audio_in_dev_is_airspy_spec(dev)) {
-        return DSD_ANALOG_RATE_DEVICE;
-    }
-    return DSD_ANALOG_RATE_RTL_BW;
-}
-
 int
 rtl_demod_check_analog_post_decimation(int kind, int explicit_width_hz, int rate_out_hz, int post_downsample, char* err,
                                        size_t err_size) {
@@ -1068,12 +1115,16 @@ rtl_demod_check_analog_post_decimation(int kind, int explicit_width_hz, int rate
         char width_text[DSD_ANALOG_WIDTH_TEXT_MAX];
         (void)dsd_analog_width_format(rtl_demod_analog_requested_width_hz(kind, explicit_width_hz), width_text,
                                       sizeof width_text);
+        /* NFM can fall back on its unset default, which keeps the legacy design at any rate chain; AM has no width
+           that runs here, its default included. */
+        const char* fix = kind == DSD_ANALOG_DEMOD_FM
+                              ? "drop the explicit bandwidth or use a capture with post_downsample 1"
+                              : "AM needs a capture with post_downsample 1";
         DSD_SNPRINTF(err, err_size,
                      "%s bandwidth %s cannot be applied to this I/Q replay: post_downsample %d runs the channel filter "
-                     "at %d Hz, not the %d Hz demod rate; drop the explicit bandwidth or use a capture with "
-                     "post_downsample 1",
+                     "at %d Hz, not the %d Hz demod rate; %s",
                      dsd_analog_demod_label(kind), width_text, post_downsample, rate_out_hz * post_downsample,
-                     rate_out_hz);
+                     rate_out_hz, fix);
     }
     return -1;
 }
@@ -1094,6 +1145,7 @@ rtl_demod_apply_analog_channel(struct demod_state* demod, int kind, int explicit
     demod->analog_family = 1;
     demod->analog_demod = analog_kind;
     demod->analog_width_request_hz = requested_hz;
+    demod->analog_width_setting_hz = explicit_width_hz > 0 ? explicit_width_hz : 0;
     demod->channel_lpf_profile = DSD_CH_LPF_PROFILE_WIDE;
     if (requested_hz > 0) {
         /* A requested width (explicit, or the AM default) is a request for that filter: it turns the channel LPF on. */
@@ -1120,14 +1172,15 @@ rtl_demod_refresh_analog_channel_for_rate(struct demod_state* demod, char* err, 
     if (!dsd_demod_analog_monitor_active(demod)) {
         return 0;
     }
-    const int explicit_width_hz = demod->analog_width_request_hz;
+    const int requested_hz = demod->analog_width_request_hz;
     int rc = 0;
-    if (explicit_width_hz > 0
-        && dsd_analog_width_check(demod->analog_demod, explicit_width_hz, demod->rate_out, err, err_size) != 0) {
+    if (requested_hz > 0
+        && dsd_analog_width_check(demod->analog_demod, requested_hz, demod->rate_out, err, err_size) != 0) {
         /* Kept as requested: never clamped and never swapped for another design. */
         rc = -1;
     }
-    (void)rtl_demod_apply_analog_channel(demod, demod->analog_demod, explicit_width_hz);
+    /* From the setting, which resolves to the same request, so an unset AM default stays unset. */
+    (void)rtl_demod_apply_analog_channel(demod, demod->analog_demod, demod->analog_width_setting_hz);
     return rc;
 }
 
@@ -1142,7 +1195,7 @@ rtl_demod_finalize_analog_channel(struct demod_state* demod, const dsd_opts* opt
     }
     const int kind = opts->analog_demod;
     const int explicit_width_hz = dsd_opts_analog_width_hz(opts);
-    if (demod_check_analog_channel(kind, explicit_width_hz, demod->rate_out, demod_input_rate_source(opts), err,
+    if (demod_check_analog_channel(kind, explicit_width_hz, demod->rate_out, dsd_opts_analog_rate_source(opts), err,
                                    err_size)
             != 0
         || rtl_demod_check_analog_post_decimation(kind, explicit_width_hz, demod->rate_out, demod->post_downsample, err,
@@ -1233,6 +1286,10 @@ rtl_demod_reset_audio_monitor_state(struct demod_state* demod) {
     demod->deemph_avg = 0.0f;
     demod->dc_avg = 0.0f;
     demod->audio_lpf_state = 0.0f;
+    /* Cold, so the AM detector warm-starts from the new channel's own level rather than dividing it by the last one's
+       carrier. */
+    demod->am_carrier = 0.0f;
+    demod->am_squelched_samples = 0;
     /* Fresh-open envelope: open, so the first block of a live channel is not faded in from the last one's squelch. */
     demod->squelch_env = 1.0f;
     demod->squelch_gate_open = 1;
@@ -1245,16 +1302,7 @@ rtl_demod_reset_audio_monitor_state(struct demod_state* demod) {
 
 void
 rtl_demod_clear_filter_histories(struct demod_state* demod) {
-    if (!demod) {
-        return;
-    }
-    for (int st = 0; st < 10; st++) {
-        DSD_MEMSET(demod->hb_hist_i[st], 0, sizeof(demod->hb_hist_i[st]));
-        DSD_MEMSET(demod->hb_hist_q[st], 0, sizeof(demod->hb_hist_q[st]));
-    }
-    DSD_MEMSET(demod->channel_lpf_hist_i, 0, sizeof(demod->channel_lpf_hist_i));
-    DSD_MEMSET(demod->channel_lpf_hist_q, 0, sizeof(demod->channel_lpf_hist_q));
-    demod->channel_lpf_hist_len = 0;
+    dsd_demod_reset_filter_state(demod);
 }
 
 void
@@ -1267,6 +1315,9 @@ rtl_demod_reset_resampler_state(struct demod_state* demod) {
     if (demod->resamp_hist && demod->resamp_taps_per_phase > 0) {
         DSD_MEMSET(demod->resamp_hist, 0, (size_t)demod->resamp_taps_per_phase * 2U * sizeof(float));
     }
+    /* Its outputs' flags start over with it, closed until real inputs reach the filter's centre. */
+    DSD_MEMSET(demod->resamp_flag_hist, DSD_SQUELCH_FLAG_CLOSED, sizeof(demod->resamp_flag_hist));
+    demod->resamp_flag_head = 0;
 }
 
 /* A fresh open starts the carrier and timing loops from nothing: Costas and the band-edge FLL at zero frequency and
@@ -1299,19 +1350,15 @@ demod_family_switch_reset_loops(struct demod_state* demod) {
     demod->cqpsk_agc_avg = 1.0f;
 }
 
-/* The input corrections and the post-demod decimator an open starts from nothing: the I/Q DC blocker and I/Q balance
- * estimates, and a replay's post-demod decimator (its delay line holds the old family's demodulated samples). */
+/* The input corrections an open starts from nothing: the I/Q DC blocker and I/Q balance estimates. A replay's
+ * post-demod decimator, whose state holds the old family's demodulated samples, starts over with the filters
+ * (rtl_demod_clear_filter_histories()). */
 static void
-demod_family_switch_reset_input_and_decimator(struct demod_state* demod) {
+demod_family_switch_reset_input_corrections(struct demod_state* demod) {
     demod->iq_dc_avg_r = 0.0f;
     demod->iq_dc_avg_i = 0.0f;
     demod->iqbal_alpha_ema_r = 0.0f;
     demod->iqbal_alpha_ema_i = 0.0f;
-    if (demod->post_polydecim_hist && demod->post_polydecim_K > 0) {
-        DSD_MEMSET(demod->post_polydecim_hist, 0, (size_t)demod->post_polydecim_K * sizeof(float));
-    }
-    demod->post_polydecim_hist_head = 0;
-    demod->post_polydecim_phase = 0;
 }
 
 static void
@@ -1324,7 +1371,7 @@ demod_family_switch_reset(struct demod_state* demod) {
     demod->squelch_decim_phase = 0;
     rtl_demod_clear_filter_histories(demod);
     rtl_demod_reset_resampler_state(demod);
-    demod_family_switch_reset_input_and_decimator(demod);
+    demod_family_switch_reset_input_corrections(demod);
     demod_family_switch_reset_loops(demod);
     /* Force a fresh channel-filter plan for the new family. */
     demod->channel_lpf_plan_taps_len = 0;
@@ -1340,13 +1387,50 @@ rtl_demod_set_analog_kind(struct demod_state* demod, int kind) {
         return 0;
     }
     demod->analog_demod = kind;
-    /* rtl_demod_check_analog_channel() refuses AM before a stream gets here, so no AM demodulator is installed yet. */
-    demod->mode_demod = &dsd_fm_demod;
-    /* FM keeps the configured de-emphasis; AM runs without it. */
-    demod->deemph = (kind == DSD_ANALOG_DEMOD_FM) ? 1 : 0;
+    demod_install_analog_detector(demod, kind);
     (void)rtl_demod_apply_audio_filters_from_config(demod);
     rtl_demod_reset_audio_monitor_state(demod);
+    /* AM runs neither the I/Q DC blocker nor I/Q balance, so FM would otherwise resume from the estimates it had
+       before AM. */
+    demod->iq_dc_avg_r = 0.0f;
+    demod->iq_dc_avg_i = 0.0f;
+    demod->iqbal_alpha_ema_r = 0.0f;
+    demod->iqbal_alpha_ema_i = 0.0f;
+    demod_note_am_input_bypasses(demod);
     return 1;
+}
+
+namespace {
+
+/* The first time, per process, that a configured input correction (@p enabled) is bypassed because the AM detector
+   runs (@p am_active), log @p text. Returns 1 while it is bypassed, else 0. */
+int
+note_am_bypass_once(std::atomic<int>& noted, int enabled, int am_active, const char* text) {
+    if (!enabled || !am_active) {
+        return 0;
+    }
+    if (noted.exchange(1, std::memory_order_relaxed) == 0) {
+        LOG_INFO("%s", text);
+    }
+    return 1;
+}
+
+} // namespace
+
+int
+rtl_demod_note_am_iq_dc_bypass(int iq_dc_block_enabled, int am_active) {
+    static std::atomic<int> noted{0};
+    return note_am_bypass_once(noted, iq_dc_block_enabled, am_active,
+                               "NOTICE: The I/Q DC blocker stays off while AM is demodulated: it would remove an AM "
+                               "carrier at 0 Hz. It applies again to FM.\n");
+}
+
+int
+rtl_demod_note_am_iq_balance_bypass(int iq_balance_enabled, int am_active) {
+    static std::atomic<int> noted{0};
+    return note_am_bypass_once(noted, iq_balance_enabled, am_active,
+                               "NOTICE: I/Q balance stays off while AM is demodulated: it would read an AM carrier at "
+                               "0 Hz as an image and cancel it. It applies again to FM.\n");
 }
 
 void
@@ -1368,6 +1452,10 @@ rtl_demod_enter_analog_family(struct demod_state* demod, struct output_state* ou
     rtl_demod_maybe_update_resampler_after_rate_change(demod, output, rtl_dsp_bw_hz);
     rtl_demod_maybe_refresh_ted_sps_after_rate_change(demod, NULL, output, /*preserve_active_profile=*/1);
     demod_family_switch_reset(demod);
+    /* rtl_demod_set_analog_kind() notes the bypasses on the running monitor only: here the family was off until the
+       analog channel went in, so a switch onto AM from the digital family (or from a profile CQPSK or a typed digital
+       row put in place) is noted now that the AM detector runs. */
+    demod_note_am_input_bypasses(demod);
 }
 
 int
@@ -1377,6 +1465,14 @@ rtl_demod_open_cqpsk_request(int requested_cqpsk) {
         return (cfg->cqpsk_enable != 0) ? 1 : 0;
     }
     return requested_cqpsk;
+}
+
+int
+rtl_demod_landing_cqpsk(int requested_cqpsk, int requested_is_explicit) {
+    if (requested_is_explicit && requested_cqpsk >= 0) {
+        return requested_cqpsk ? 1 : 0;
+    }
+    return rtl_demod_open_cqpsk_request(requested_cqpsk);
 }
 
 int
@@ -1410,6 +1506,7 @@ rtl_demod_enter_digital_family(struct demod_state* demod, struct output_state* o
     demod->analog_demod = DSD_ANALOG_DEMOD_FM;
     demod->channel_lpf_width_hz = 0;
     demod->analog_width_request_hz = 0;
+    demod->analog_width_setting_hz = 0;
     demod->cqpsk_enable = 0;
     demod->ted_enabled = 0;
     demod->mode_demod = &dsd_fm_demod;
@@ -1456,9 +1553,5 @@ rtl_demod_monitor_output_rate_for(int resamp_target_hz, int rate_out_hz) {
     if (resamp_target_hz <= 0 || resamp_target_hz == rate_out_hz) {
         return rate_out_hz;
     }
-    int L = 1;
-    int M = 1;
-    int scale = 1;
-    rtl_demod_compute_resampler_ratio(rate_out_hz, resamp_target_hz, &L, &M, &scale);
-    return (scale > 12) ? rate_out_hz : resamp_target_hz;
+    return rtl_demod_resampler_ratio(rate_out_hz, resamp_target_hz, NULL, NULL) ? resamp_target_hz : rate_out_hz;
 }

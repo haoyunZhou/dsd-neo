@@ -9,6 +9,7 @@
 #include <assert.h>
 #include <curses.h>
 #include <dsd-neo/app_control/history.h>
+#include <dsd-neo/core/analog_tone.h>
 #include <dsd-neo/core/channel_label.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/power.h>
@@ -27,6 +28,7 @@
 #include <dsd-neo/runtime/config.h>
 #include <dsd-neo/runtime/scan_mode.h>
 #include <dsd-neo/runtime/scan_options.h>
+#include <dsd-neo/runtime/squelch.h>
 #include <dsd-neo/runtime/unicode.h>
 #include <dsd-neo/ui/menu_core.h>
 #include <dsd-neo/ui/ncurses_dsp_display.h>
@@ -44,8 +46,8 @@
 #include <string.h>
 #include <time.h>
 #include "dsd-neo/core/call_state.h"
-#include "dsd-neo/core/dsd_time.h"
 #include "dsd-neo/platform/platform.h"
+#include "dsd-neo/runtime/decode_clock.h"
 
 #if defined(NCURSES_VERSION)
 /* Read the real cursor before replacing ncurses accessors with helper-test stubs. */
@@ -504,8 +506,8 @@ dsd_synctype_to_string(int synctype) { // NOLINT(misc-use-internal-linkage)
 }
 
 static dsd_scan_mode g_scan_mode_active = DSD_SCAN_MODE_INHERIT;
-/* Issue #521: the scan scope as the shared squelch view sees it. The two stubs below replace
- * the runtime definitions at link time, like the other link stubs here, so they keep external
+/* Issue #521: the scan scope as the shared squelch view sees it. The stubs below replace the
+ * runtime definitions at link time, like the other link stubs here, so they keep external
  * linkage; the pointers they hand back stay file-local. */
 static const dsd_scan_option_values* g_scan_row_options;
 static const dsd_scan_settings* g_scan_configured;
@@ -522,10 +524,55 @@ dsd_scan_mode_configured_view(const dsd_state* state) { // NOLINT(misc-use-inter
     return g_scan_configured;
 }
 
+/* Issue #526: the configured width the analog width view reads, as scan_mode.c reads it: the stubbed configured view
+ * while one is set, dsd_opts otherwise. */
+int
+// NOLINTNEXTLINE(misc-use-internal-linkage)
+dsd_scan_mode_configured_analog_width(const dsd_opts* opts, const dsd_state* state, int kind) {
+    const dsd_scan_settings* configured = dsd_scan_mode_configured_view(state);
+    int width_hz = 0;
+    if (configured) {
+        width_hz =
+            kind == DSD_ANALOG_DEMOD_AM ? configured->analog_am_bandwidth_hz : configured->analog_nfm_bandwidth_hz;
+    } else if (opts) {
+        width_hz = kind == DSD_ANALOG_DEMOD_AM ? opts->analog_am_bandwidth_hz : opts->analog_nfm_bandwidth_hz;
+    }
+    return width_hz > 0 ? width_hz : 0;
+}
+
+/* Issue #527: the configured tone policy the rx tone view names beside a row's own, as scan_mode.c reads it: the
+ * stubbed configured view while one is set, dsd_opts otherwise. */
+void
+// NOLINTNEXTLINE(misc-use-internal-linkage)
+dsd_scan_mode_configured_tone_policy(const dsd_opts* opts, const dsd_state* state, int* mode, dsd_tone_set* set) {
+    const dsd_scan_settings* configured = dsd_scan_mode_configured_view(state);
+    int configured_mode = DSD_TONE_FILTER_OFF;
+    dsd_tone_set configured_set;
+    DSD_MEMSET(&configured_set, 0, sizeof(configured_set));
+    if (configured) {
+        configured_mode = configured->analog_tone_filter;
+        configured_set = configured->analog_tone_set;
+    } else if (opts) {
+        configured_mode = opts->analog_tone_filter;
+        configured_set = opts->analog_tone_set;
+    }
+    if (mode) {
+        *mode = configured_mode;
+    }
+    if (set) {
+        *set = configured_set;
+    }
+}
+
 dsd_scan_mode
 dsd_scan_mode_active(const dsd_state* state) { // NOLINT(misc-use-internal-linkage)
     (void)state;
     return g_scan_mode_active;
+}
+
+int
+dsd_scan_mode_is_analog(dsd_scan_mode mode) { // NOLINT(misc-use-internal-linkage)
+    return mode == DSD_SCAN_MODE_NFM || mode == DSD_SCAN_MODE_AM;
 }
 
 uint8_t
@@ -656,13 +703,18 @@ dsd_channel_lpf_legacy_wide_width_hz(int rate_hz) {
     return 0;
 }
 
+#if defined(DSD_USE_PDCURSES)
+#include "pdcurses_macro_stubs.h"
+#endif
 #include "../../src/ui/terminal/dsd_ncurses_printer.c"
 #include "dsd-neo/app_control/frontend.h"
 #include "dsd-neo/core/input_level.h"
 #include "dsd-neo/core/opts_fwd.h"
 #include "dsd-neo/core/secret_redaction.h"
 #include "dsd-neo/core/state_fwd.h"
+#include "dsd-neo/platform/sockets.h"
 #include "dsd-neo/runtime/analog_channel.h"
+#include "dsd-neo/runtime/analog_tones.h"
 
 static int g_requested_ppm;
 /* The channel the front end reports (issue #525): its width, whether the DSP rate limits it, its output, and whether
@@ -672,9 +724,14 @@ static int g_channel_bandwidth_dsp_limited;
 static int g_output_kind = DSD_FRONTEND_RTL_OUTPUT_AUDIO_MONITOR;
 static int g_stream_active;
 static int g_demod_rate_hz;
+/* The demodulator kind of the published analog width (DSD_ANALOG_DEMOD_*), or -1 for none (issue #524). */
+static int g_channel_analog_kind = DSD_ANALOG_DEMOD_FM;
+/* How often a line fetched the metrics: the audio input lines read none (issue #621). */
+static int g_metrics_calls;
 
 int
 dsd_app_frontend_get_metrics(dsd_frontend_metrics* out) { // NOLINT(misc-use-internal-linkage)
+    g_metrics_calls++;
     DSD_MEMSET(out, 0, sizeof(*out));
     out->requested_ppm = g_requested_ppm;
     out->output_kind = g_output_kind;
@@ -682,6 +739,7 @@ dsd_app_frontend_get_metrics(dsd_frontend_metrics* out) { // NOLINT(misc-use-int
     out->channel_bandwidth_dsp_limited = g_channel_bandwidth_dsp_limited;
     out->stream_active = g_stream_active;
     out->demod_rate_hz = g_demod_rate_hz;
+    out->channel_analog_kind = g_channel_analog_kind;
     return 0;
 }
 
@@ -753,7 +811,9 @@ test_dmr_mono_override_terminal_reporting(void) {
 static void
 test_basic_input_source_rendering(void) {
     static dsd_opts opts;
+    static dsd_state state;
     DSD_MEMSET(&opts, 0, sizeof(opts));
+    DSD_MEMSET(&state, 0, sizeof(state));
 
     opts.audio_in_type = AUDIO_IN_PULSE;
     opts.pulse_digi_rate_in = 48000;
@@ -762,13 +822,16 @@ test_basic_input_source_rendering(void) {
     opts.use_rigctl = 1;
     opts.rigctlportno = 4532;
     DSD_SNPRINTF(opts.pa_input_idx, sizeof(opts.pa_input_idx), "pulse-device");
-    DSD_SNPRINTF(opts.tcp_hostname, sizeof(opts.tcp_hostname), "radio.local");
+    DSD_SNPRINTF(opts.rigctlhostname, sizeof(opts.rigctlhostname), "radio.local");
+    DSD_SNPRINTF(opts.tcp_hostname, sizeof(opts.tcp_hostname), "audio.local");
     reset_printw_capture();
-    ui_render_basic_input_sources(&opts);
+    ui_render_basic_input_sources(&opts, &state);
     assert_capture_contains("| Pulse Signal Input:  48 kHz; 2 Ch;");
     assert_capture_contains(" D: pulse-device;");
     assert_capture_contains("RIG: radio.local:4532;");
     assert_capture_contains(" IV: 3X;");
+    /* Audio input shows the squelch as a radio input does (issue #628). */
+    assert_capture_contains(" SQL: off;");
 
     DSD_MEMSET(&opts, 0, sizeof(opts));
     opts.audio_in_type = AUDIO_IN_TCP;
@@ -777,9 +840,32 @@ test_basic_input_source_rendering(void) {
     opts.input_volume_multiplier = 4;
     DSD_SNPRINTF(opts.tcp_hostname, sizeof(opts.tcp_hostname), "10.0.0.5");
     reset_printw_capture();
-    ui_render_basic_input_sources(&opts);
+    ui_render_basic_input_sources(&opts, &state);
     assert_capture_contains("| TCP Signal Input: 10.0.0.5:7355; 48 kHz; 1 Ch;");
     assert_capture_contains(" IV: 4X;");
+
+    /* The PCM noise squelch on an FM monitor: learning, then its quieting, then no band above voice. */
+    opts.rtl_squelch_mode = DSD_SQUELCH_MODE_NOISE;
+    opts.rtl_squelch_margin_db = 12;
+    opts.analog_only = 1;
+    opts.monitor_input_audio = 1;
+    opts.analog_demod = DSD_ANALOG_DEMOD_FM;
+    state.squelch_noise_active = 1;
+    state.squelch_noise_state = DSD_SQUELCH_NOISE_STATE_LEARNING;
+    reset_printw_capture();
+    ui_render_basic_input_sources(&opts, &state);
+    assert_capture_contains(" SQL: noise +12 dB (learning);");
+    state.squelch_noise_state = DSD_SQUELCH_NOISE_STATE_KNOWN;
+    state.squelch_noise_measured = 1;
+    state.squelch_noise_quieting_cdb = 2300;
+    reset_printw_capture();
+    ui_render_basic_input_sources(&opts, &state);
+    assert_capture_contains(" SQL: noise +12 dB (quieting 23 dB);");
+    state.squelch_noise_state = DSD_SQUELCH_NOISE_STATE_NO_BAND;
+    reset_printw_capture();
+    ui_render_basic_input_sources(&opts, &state);
+    assert_capture_contains(" SQL: noise +12 dB (off: no band above voice);");
+    DSD_MEMSET(&state, 0, sizeof(state));
 
     DSD_MEMSET(&opts, 0, sizeof(opts));
     opts.audio_in_type = AUDIO_IN_UDP;
@@ -787,7 +873,7 @@ test_basic_input_source_rendering(void) {
     opts.udp_in_portno = 23456;
     opts.input_volume_multiplier = 5;
     reset_printw_capture();
-    ui_render_basic_input_sources(&opts);
+    ui_render_basic_input_sources(&opts, &state);
     assert_capture_contains("| UDP Signal Input: 127.0.0.1:23456; 96 kHz; 1 Ch;");
     assert_capture_contains("[Waiting]");
 
@@ -795,7 +881,7 @@ test_basic_input_source_rendering(void) {
     opts.udp_in_drops = 3ULL;
     DSD_SNPRINTF(opts.udp_in_bindaddr, sizeof(opts.udp_in_bindaddr), "0.0.0.0");
     reset_printw_capture();
-    ui_render_basic_input_sources(&opts);
+    ui_render_basic_input_sources(&opts, &state);
     assert_capture_contains("| UDP Signal Input: 0.0.0.0:23456; 96 kHz; 1 Ch;");
     assert_capture_contains("Pkts:42 Drops:3");
 
@@ -804,16 +890,143 @@ test_basic_input_source_rendering(void) {
     opts.wav_sample_rate = 48000;
     opts.input_volume_multiplier = 2;
     DSD_SNPRINTF(opts.audio_in_dev, sizeof(opts.audio_in_dev), "capture.wav");
+    opts.rtl_squelch_level = dsd_squelch_level_from_sql(-50.0);
     reset_printw_capture();
-    ui_render_basic_input_sources(&opts);
-    assert_capture_contains("| WAV Audio Input: capture.wav; 48000 kHz;");
-    assert_capture_contains(" IV: 2X;");
+    ui_render_basic_input_sources(&opts, &state);
+    assert_capture_contains("| WAV Audio Input: capture.wav; 48 kHz;");
+    assert_capture_contains(" IV: 2X; SQL: -50.0 dB;");
 
     DSD_MEMSET(&opts, 0, sizeof(opts));
     opts.audio_in_type = AUDIO_IN_STDIN;
     reset_printw_capture();
-    ui_render_basic_input_sources(&opts);
-    assert_capture_contains("| STDIN Standard Input: - Menu Disabled when using STDIN!");
+    ui_render_basic_input_sources(&opts, &state);
+    assert_capture_contains("| STDIN Standard Input: - Menu Disabled when using STDIN! SQL: off;");
+}
+
+/*
+ * Issue #621: on audio input with a rigctl peer (-U) the peer demodulates, and the analog width is the passband it is
+ * asked for. Each audio input line shows it after the squelch, as app-control's analog width view reads it ("Passband:
+ * NFM 12.5 kHz (-B)" while -B stands in for an unset NFM width), and nothing without a peer. The RIG field names the
+ * rigctl host, which a menu reconnect of rigctl or of TCP audio can set apart from the TCP audio host.
+ */
+static void
+test_peer_passband_status_rendering(void) {
+    static dsd_opts opts;
+    static dsd_state state;
+    DSD_MEMSET(&opts, 0, sizeof(opts));
+    DSD_MEMSET(&state, 0, sizeof(state));
+    opts.audio_in_type = AUDIO_IN_TCP;
+    opts.wav_sample_rate = 48000;
+    opts.tcp_portno = 7355;
+    opts.input_volume_multiplier = 1;
+    DSD_SNPRINTF(opts.tcp_hostname, sizeof(opts.tcp_hostname), "audio.local");
+    opts.use_rigctl = 1;
+    opts.rigctl_sockfd = (dsd_socket_t)5;
+    opts.rigctlportno = 4532;
+    DSD_SNPRINTF(opts.rigctlhostname, sizeof(opts.rigctlhostname), "rig.local");
+    opts.setmod_bw = 12500;
+    opts.analog_only = 1;
+    opts.analog_demod = DSD_ANALOG_DEMOD_FM;
+
+    reset_printw_capture();
+    g_metrics_calls = 0;
+    ui_render_basic_input_sources(&opts, &state);
+    assert_capture_contains("| TCP Signal Input: audio.local:7355; 48 kHz; 1 Ch; RIG: rig.local:4532;");
+    assert_capture_contains(" SQL: off; Passband: NFM 12.5 kHz (-B);");
+    assert(strstr(g_printw_capture, "Analog:") == NULL);
+    /* The peer's passband needs no stream metrics, and the audio line, drawn every frame, fetches none. */
+    assert(g_metrics_calls == 0);
+    /* The configured width, then the AM default under AM. */
+    opts.analog_nfm_bandwidth_hz = 20000;
+    reset_printw_capture();
+    ui_render_basic_input_sources(&opts, &state);
+    assert_capture_contains(" Passband: NFM 20 kHz;");
+    opts.analog_nfm_bandwidth_hz = 0;
+    opts.analog_demod = DSD_ANALOG_DEMOD_AM;
+    reset_printw_capture();
+    ui_render_basic_input_sources(&opts, &state);
+    assert_capture_contains(" Passband: AM 6 kHz (default);");
+    opts.analog_demod = DSD_ANALOG_DEMOD_FM;
+    /* -B 0: the peer keeps its own passband. */
+    opts.setmod_bw = 0;
+    reset_printw_capture();
+    ui_render_basic_input_sources(&opts, &state);
+    assert_capture_contains(" Passband: NFM peer's own;");
+    opts.setmod_bw = 12500;
+
+    /* UDP, Pulse, WAV and stdin show it too; UDP names the rig as Pulse and TCP do. */
+    opts.audio_in_type = AUDIO_IN_UDP;
+    opts.udp_in_portno = 23456;
+    reset_printw_capture();
+    ui_render_basic_input_sources(&opts, &state);
+    assert_capture_contains("| UDP Signal Input: 127.0.0.1:23456; 48 kHz; 1 Ch; RIG: rig.local:4532;");
+    assert_capture_contains(" Passband: NFM 12.5 kHz (-B);");
+    opts.audio_in_type = AUDIO_IN_PULSE;
+    opts.pulse_digi_rate_in = 48000;
+    opts.pulse_digi_in_channels = 1;
+    reset_printw_capture();
+    ui_render_basic_input_sources(&opts, &state);
+    assert_capture_contains("RIG: rig.local:4532;");
+    assert_capture_contains(" Passband: NFM 12.5 kHz (-B);");
+    opts.audio_in_type = AUDIO_IN_WAV;
+    DSD_SNPRINTF(opts.audio_in_dev, sizeof(opts.audio_in_dev), "capture.wav");
+    reset_printw_capture();
+    ui_render_basic_input_sources(&opts, &state);
+    assert_capture_contains(" SQL: off; Passband: NFM 12.5 kHz (-B);");
+    opts.audio_in_type = AUDIO_IN_STDIN;
+    reset_printw_capture();
+    ui_render_basic_input_sources(&opts, &state);
+    assert_capture_contains(" SQL: off; Passband: NFM 12.5 kHz (-B);");
+
+    /* No peer: no passband, on any of them. */
+    opts.audio_in_type = AUDIO_IN_TCP;
+    opts.rigctl_sockfd = DSD_INVALID_SOCKET;
+    reset_printw_capture();
+    ui_render_basic_input_sources(&opts, &state);
+    assert(strstr(g_printw_capture, "Passband:") == NULL);
+    opts.rigctl_sockfd = (dsd_socket_t)5;
+    opts.use_rigctl = 0;
+    opts.audio_in_type = AUDIO_IN_UDP;
+    reset_printw_capture();
+    ui_render_basic_input_sources(&opts, &state);
+    assert(strstr(g_printw_capture, "Passband:") == NULL);
+    assert(strstr(g_printw_capture, "RIG:") == NULL);
+    /* A digital session with a peer shows none either. */
+    opts.use_rigctl = 1;
+    opts.analog_only = 0;
+    reset_printw_capture();
+    ui_render_basic_input_sources(&opts, &state);
+    assert(strstr(g_printw_capture, "Passband:") == NULL);
+    /* ...unless the passband controls are offered there (an explicit NFM default, issue #621 review): the field then
+       reads what the peer is asked for now, FM at -B, never the configured width nothing asks for, as the Qt Passband
+       row reads it. */
+    opts.analog_nfm_bandwidth_hz = 20000;
+    reset_printw_capture();
+    ui_render_basic_input_sources(&opts, &state);
+    assert_capture_contains(" SQL: off; Passband: NFM 12.5 kHz (-B);");
+    assert(strstr(g_printw_capture, "20 kHz") == NULL);
+    opts.setmod_bw = 0;
+    reset_printw_capture();
+    ui_render_basic_input_sources(&opts, &state);
+    assert_capture_contains(" Passband: NFM peer's own;");
+    opts.setmod_bw = 12500;
+    opts.analog_nfm_bandwidth_hz = 0;
+
+    /* A radio input with a live rigctl peer: the peer only follows the frequency, and the field is the channel filter,
+       read from the stream's metrics, as without a peer. */
+    opts.analog_only = 1;
+    opts.audio_in_type = AUDIO_IN_RTL;
+    opts.rtl_dsp_bw_khz = 48;
+    DSD_SNPRINTF(opts.audio_in_dev, sizeof(opts.audio_in_dev), "rtl");
+    g_stream_active = 1;
+    g_channel_bandwidth_hz = 0;
+    reset_printw_capture();
+    g_metrics_calls = 0;
+    ui_render_rtl_input_source(&opts, &state);
+    assert_capture_contains(" DSP-BW: 48 kHz; Analog: NFM 16 kHz (default);");
+    assert(strstr(g_printw_capture, "Passband:") == NULL);
+    assert(g_metrics_calls > 0);
+    g_stream_active = 0;
 }
 
 static void
@@ -847,6 +1060,19 @@ test_rtl_and_soapy_input_source_rendering(void) {
     assert_capture_contains(" FRQ: 851012500;");
     assert_capture_contains("| Auto PPM: Off");
     assert_capture_contains("| External RTL Tuning on UDP: 127.0.0.1:5555");
+
+    /* Issue #575: an I/Q replay's recorded RETUNEs leave rtlsdr_center_freq on the capture's opening centre; the field
+     * reads the centre the samples being decoded were captured on, and the tuned centre again once there is none. */
+    DSD_SNPRINTF(opts.audio_in_dev, sizeof(opts.audio_in_dev), "iqreplay:capture.iq.json");
+    opts.iq_replay_center_freq = 851500000U;
+    reset_printw_capture();
+    ui_render_rtl_input_source(&opts, &state);
+    assert_capture_contains(" FRQ: 851500000;");
+    opts.iq_replay_center_freq = 0U;
+    reset_printw_capture();
+    ui_render_rtl_input_source(&opts, &state);
+    assert_capture_contains(" FRQ: 851012500;");
+    DSD_SNPRINTF(opts.audio_in_dev, sizeof(opts.audio_in_dev), "rtl");
 
     /* Squelch off is the default every documented example uses. Printed as a
      * number it read as a threshold that had been applied. */
@@ -911,11 +1137,14 @@ test_rtl_and_soapy_input_source_rendering(void) {
     opts.rtl_gain_value = 0;
     opts.rtl_dsp_bw_khz = 12;
     DSD_SNPRINTF(opts.audio_in_dev, sizeof(opts.audio_in_dev), "soapy:driver=rtlsdr");
+    /* A SoapySDR centre above 2^31 Hz prints as itself, not as a negative number. */
+    opts.rtlsdr_center_freq = 2400000000U;
     reset_printw_capture();
     ui_render_rtl_input_source(&opts, &state);
     assert_capture_contains("| SoapySDR: driver=rtlsdr;");
     assert_capture_contains(" G: AGC;");
     assert_capture_contains(" DSP-BW: 12 kHz;");
+    assert_capture_contains(" FRQ: 2400000000;");
 
     DSD_SNPRINTF(opts.audio_in_dev, sizeof(opts.audio_in_dev), "soapy");
     reset_printw_capture();
@@ -973,6 +1202,7 @@ test_analog_channel_status_rendering(void) {
     DSD_MEMSET(&configured, 0, sizeof(configured));
     configured.analog_only = 1;
     configured.analog_demod = DSD_ANALOG_DEMOD_FM;
+    configured.analog_nfm_bandwidth_hz = 12500;
     g_scan_configured = &configured;
     opts.analog_only = 0;
     opts.frame_dmr = 1;
@@ -981,18 +1211,45 @@ test_analog_channel_status_rendering(void) {
     assert_capture_contains(" Analog: NFM 12.5 kHz;");
     /* ...and with the unset default at a 12 kHz DSP rate, what that leave returns to: the rate itself, DSP-limited,
        not the 16 kHz the rate cannot filter. The row's front end reports its own channel meanwhile. */
+    configured.analog_nfm_bandwidth_hz = 0;
     opts.analog_nfm_bandwidth_hz = 0;
     opts.rtl_dsp_bw_khz = 12;
     g_demod_rate_hz = 12000;
     reset_printw_capture();
     ui_render_rtl_input_source(&opts, &state);
     assert_capture_contains(" DSP-BW: 12 kHz; Analog: NFM 12 kHz (DSP-limited);");
-    opts.analog_nfm_bandwidth_hz = 12500;
     opts.rtl_dsp_bw_khz = 48;
     g_demod_rate_hz = 0;
-    g_scan_configured = NULL;
+
+    /* Issue #526: an nfm row with its own width, on a digital session too. The row's width is in force, and the line
+       names the configured width the row's leave returns to, whatever dsd_opts reads under the row. */
+    configured.analog_only = 0;
+    configured.analog_nfm_bandwidth_hz = 20000;
+    static dsd_scan_option_values row;
+    DSD_MEMSET(&row, 0, sizeof(row));
+    row.present = DSD_SCAN_OPT_BANDWIDTH;
+    row.channel_bw_hz = 12500;
+    g_scan_row_options = &row;
+    g_scan_mode_active = DSD_SCAN_MODE_NFM;
     opts.frame_dmr = 0;
     opts.analog_only = 1;
+    opts.analog_nfm_bandwidth_hz = 12500;
+    g_channel_bandwidth_hz = 12500;
+    reset_printw_capture();
+    ui_render_rtl_input_source(&opts, &state);
+    assert_capture_contains(" Analog: NFM 12.5 kHz (row; default 20 kHz);");
+    /* ...and an nfm row without one shows the configured width it runs. */
+    g_scan_row_options = NULL;
+    opts.analog_nfm_bandwidth_hz = 20000;
+    g_channel_bandwidth_hz = 20000;
+    reset_printw_capture();
+    ui_render_rtl_input_source(&opts, &state);
+    assert_capture_contains(" Analog: NFM 20 kHz;");
+    assert(strstr(g_printw_capture, "(row") == NULL);
+    g_scan_mode_active = DSD_SCAN_MODE_INHERIT;
+    g_channel_bandwidth_hz = 20000;
+    opts.analog_nfm_bandwidth_hz = 12500;
+    g_scan_configured = NULL;
 
     /* The default below a 20 kHz DSP rate runs no channel filter: the 12 kHz rate itself bounds the channel. */
     opts.analog_nfm_bandwidth_hz = 0;
@@ -1041,6 +1298,98 @@ test_rtl_auto_ppm_status_rendering(void) {
     reset_printw_capture();
     ui_print_rtl_auto_ppm_status_values(1, 1, -12, 25.0, 10.0, -1);
     assert_capture_contains("| Auto PPM: Locked (PPM: -12)");
+}
+
+/* Issue #524: under the AM preset the field names AM and the width in force, as app-control's analog width view spells
+ * it for NFM: the configured width while no width is published (the 6 kHz default marked as such), the front end's
+ * while a running stream runs the monitor. AM's unset default is never DSP-limited: a rate that cannot filter it is
+ * refused rather than run without the filter, so a 12 kHz DSP bandwidth, which filters it, still reads 6 kHz. */
+static void
+test_am_channel_field_rendering(void) {
+    static dsd_opts opts;
+    static dsd_state state;
+    DSD_MEMSET(&opts, 0, sizeof(opts));
+    DSD_MEMSET(&state, 0, sizeof(state));
+    opts.audio_in_type = AUDIO_IN_RTL;
+    opts.rtl_dsp_bw_khz = 48;
+    DSD_SNPRINTF(opts.audio_in_dev, sizeof(opts.audio_in_dev), "rtl");
+    opts.analog_only = 1;
+    opts.monitor_input_audio = 1;
+    opts.analog_demod = DSD_ANALOG_DEMOD_AM;
+    g_stream_active = 1;
+    g_channel_bandwidth_hz = 0;
+
+    reset_printw_capture();
+    ui_render_rtl_input_source(&opts, &state);
+    assert_capture_contains(" DSP-BW: 48 kHz; Analog: AM 6 kHz (default);");
+
+    opts.analog_am_bandwidth_hz = 8333;
+    reset_printw_capture();
+    ui_render_rtl_input_source(&opts, &state);
+    assert_capture_contains(" Analog: AM 8.333 kHz;");
+
+    /* The running monitor's own width wins over the configured one, once it is an AM width. An FM width still
+       published (a switch to AM not landed yet) belongs to another channel, so the configured width stays. */
+    g_channel_bandwidth_hz = 10000;
+    g_channel_analog_kind = DSD_ANALOG_DEMOD_FM;
+    reset_printw_capture();
+    ui_render_rtl_input_source(&opts, &state);
+    assert_capture_contains(" Analog: AM 8.333 kHz;");
+    g_channel_analog_kind = DSD_ANALOG_DEMOD_AM;
+    reset_printw_capture();
+    ui_render_rtl_input_source(&opts, &state);
+    assert_capture_contains(" Analog: AM 10 kHz;");
+    g_channel_analog_kind = DSD_ANALOG_DEMOD_FM;
+
+    /* Stopped, at a 12 kHz DSP bandwidth: the default AM channel fits that rate, so it is not DSP-limited. */
+    g_stream_active = 0;
+    g_channel_bandwidth_hz = 0;
+    opts.analog_am_bandwidth_hz = 0;
+    opts.rtl_dsp_bw_khz = 12;
+    reset_printw_capture();
+    ui_render_rtl_input_source(&opts, &state);
+    assert_capture_contains(" DSP-BW: 12 kHz; Analog: AM 6 kHz (default);");
+
+    /* Issue #526: an am row with its own width, on a digital session. The row's width is in force, and the line names
+       the configured AM width -- the 6 kHz default here -- that the row's leave returns to, as for an nfm row. */
+    static dsd_scan_settings configured;
+    DSD_MEMSET(&configured, 0, sizeof(configured));
+    configured.analog_nfm_bandwidth_hz = 12500;
+    g_scan_configured = &configured;
+    static dsd_scan_option_values row;
+    DSD_MEMSET(&row, 0, sizeof(row));
+    row.present = DSD_SCAN_OPT_BANDWIDTH;
+    row.channel_bw_hz = 8333;
+    row.channel_bw_kind = DSD_ANALOG_DEMOD_AM;
+    g_scan_row_options = &row;
+    g_scan_mode_active = DSD_SCAN_MODE_AM;
+    g_stream_active = 1;
+    opts.rtl_dsp_bw_khz = 48;
+    opts.analog_am_bandwidth_hz = 8333;
+    g_channel_bandwidth_hz = 8333;
+    g_channel_analog_kind = DSD_ANALOG_DEMOD_AM;
+    reset_printw_capture();
+    ui_render_rtl_input_source(&opts, &state);
+    assert_capture_contains(" Analog: AM 8.333 kHz (row; default 6 kHz);");
+    /* An NFM row width is not an AM one: it overrides nothing on the AM monitor. */
+    row.channel_bw_kind = DSD_ANALOG_DEMOD_FM;
+    reset_printw_capture();
+    ui_render_rtl_input_source(&opts, &state);
+    assert(strstr(g_printw_capture, "(row") == NULL);
+    /* ...and an am row without one shows the configured width it runs. */
+    g_scan_row_options = NULL;
+    opts.analog_am_bandwidth_hz = 0;
+    g_channel_bandwidth_hz = 6000;
+    reset_printw_capture();
+    ui_render_rtl_input_source(&opts, &state);
+    assert_capture_contains(" Analog: AM 6 kHz");
+    assert(strstr(g_printw_capture, "(row") == NULL);
+    g_scan_mode_active = DSD_SCAN_MODE_INHERIT;
+    g_scan_configured = NULL;
+    g_channel_analog_kind = DSD_ANALOG_DEMOD_FM;
+
+    g_stream_active = 0;
+    g_channel_bandwidth_hz = 0;
 }
 
 static void
@@ -1439,6 +1788,15 @@ seed_rx_tone(dsd_state* state, int carrier, int tone_state, int tenths) {
     }
 }
 
+/* A received DCS code, as the detector publishes it (issue #523). */
+static void
+seed_rx_code(dsd_state* state, int code, int inverted) {
+    seed_rx_tone(state, 1, DSD_ANALOG_TONE_STATE_LOCKED, 0);
+    state->analog_rx.tone_kind = DSD_ANALOG_TONE_KIND_DCS;
+    state->analog_rx.dcs_code = code;
+    state->analog_rx.dcs_inverted = inverted;
+}
+
 static void
 assert_rx_tone_line(const dsd_opts* opts, const dsd_state* state, const char* expected) {
     char line[64];
@@ -1448,9 +1806,9 @@ assert_rx_tone_line(const dsd_opts* opts, const dsd_state* state, const char* ex
 }
 
 /*
- * The received tone (issue #522) on its own Call Info line, which compact view keeps: the
- * formatter's exact bytes for every state the shared view names, and the row's place and
- * colours in the section.
+ * The received tone or code (issues #522, #523) on its own Call Info line, which compact view
+ * keeps: the formatter's exact bytes for every state the shared view names, and the row's place
+ * and colours in the section.
  */
 static void
 test_call_info_rx_tone_line_rendering(void) {
@@ -1476,11 +1834,24 @@ test_call_info_rx_tone_line_rendering(void) {
     seed_rx_tone(state, 0, DSD_ANALOG_TONE_STATE_INACTIVE, 0);
     assert_rx_tone_line(&opts, state, "| Rx tone: \xE2\x80\x94");
 
+    /* A received DCS code: both standard spellings of its signal, canonical first, each three
+       octal digits with leading zeros and the polarity letter. The policy gate the publication
+       carries is configuration's business and never changes the received line. */
+    seed_rx_code(state, 0023, 0);
+    assert_rx_tone_line(&opts, state, "| Rx tone: DCS D023N / D047I");
+    state->analog_rx.gate = DSD_ANALOG_TONE_GATE_REJECTED;
+    assert_rx_tone_line(&opts, state, "| Rx tone: DCS D023N / D047I");
+    seed_rx_code(state, 0754, 0);
+    assert_rx_tone_line(&opts, state, "| Rx tone: DCS D754N / D116I");
+    seed_rx_tone(state, 0, DSD_ANALOG_TONE_STATE_INACTIVE, 0);
+
     /* Without UTF-8 the em dash is a hyphen; everything else the line says is ASCII already. */
     g_unicode_stub = 0;
     assert_rx_tone_line(&opts, state, "| Rx tone: -");
     seed_rx_tone(state, 1, DSD_ANALOG_TONE_STATE_LOCKED, 1000);
     assert_rx_tone_line(&opts, state, "| Rx tone: CTCSS 100.0 Hz");
+    seed_rx_code(state, 0047, 0);
+    assert_rx_tone_line(&opts, state, "| Rx tone: DCS D047N / D023I");
     g_unicode_stub = 1;
 
     /* A paused live stream's publication, past its deadline on the caller's clock, is no
@@ -1501,6 +1872,70 @@ test_call_info_rx_tone_line_rendering(void) {
     ui_render_call_info_rx_tone_line(&opts, state);
     assert_capture_equals("| Rx tone: CTCSS 131.8 Hz\n");
     assert(strcmp(g_color_trace, "+4+4") == 0);
+    seed_rx_code(state, 0245, 0);
+    reset_printw_capture();
+    reset_color_trace();
+    ui_render_call_info_rx_tone_line(&opts, state);
+    assert_capture_equals("| Rx tone: DCS D245N / D072I\n");
+    assert(strcmp(g_color_trace, "+4+4") == 0);
+    seed_rx_tone(state, 1, DSD_ANALOG_TONE_STATE_LOCKED, 1318);
+
+    /* Issue #527: the tone policy on a line of its own under the received tone, only while a policy is in force, with
+       what it does to the carrier on air; the received line never changes for it. */
+    char policy[192];
+    assert(ui_format_tone_filter_line(&opts, state, 0.0, policy, sizeof(policy)) == 0);
+    opts.analog_tone_filter = DSD_TONE_FILTER_ALLOW;
+    assert(dsd_tone_set_parse("100.0/D023N", &opts.analog_tone_set, NULL, 0) == 0);
+    state->analog_rx.gate = DSD_ANALOG_TONE_GATE_ALLOWED;
+    assert(ui_format_tone_filter_line(&opts, state, 0.0, policy, sizeof(policy)) > 0);
+    assert(strcmp(policy, "| Tone filter: allow 100.0 Hz/D023N \xE2\x80\x94 passing") == 0);
+    assert_rx_tone_line(&opts, state, "| Rx tone: CTCSS 131.8 Hz");
+    state->analog_rx.gate = DSD_ANALOG_TONE_GATE_REJECTED;
+    assert(ui_format_tone_filter_line(&opts, state, 0.0, policy, sizeof(policy)) > 0);
+    assert(strcmp(policy, "| Tone filter: allow 100.0 Hz/D023N \xE2\x80\x94 muted: not allowed") == 0);
+    seed_rx_tone(state, 1, DSD_ANALOG_TONE_STATE_ACQUIRING, 0);
+    state->analog_rx.gate = DSD_ANALOG_TONE_GATE_PENDING;
+    g_unicode_stub = 0;
+    assert(ui_format_tone_filter_line(&opts, state, 0.0, policy, sizeof(policy)) > 0);
+    assert(strcmp(policy, "| Tone filter: allow 100.0 Hz/D023N - muted: checking tone") == 0);
+    g_unicode_stub = 1;
+    seed_rx_tone(state, 1, DSD_ANALOG_TONE_STATE_NONE, 0);
+    state->analog_rx.gate = DSD_ANALOG_TONE_GATE_REJECTED;
+    state->analog_rx.gate_no_tone = 1;
+    reset_printw_capture();
+    reset_color_trace();
+    ui_render_call_info_tone_filter_line(&opts, state);
+    assert_capture_equals("| Tone filter: allow 100.0 Hz/D023N \xE2\x80\x94 muted: no tone\n");
+    assert(strcmp(g_color_trace, "+4+4") == 0);
+    seed_rx_tone(state, 0, DSD_ANALOG_TONE_STATE_IDLE, 0);
+    state->analog_rx.gate = DSD_ANALOG_TONE_GATE_PENDING;
+    assert(ui_format_tone_filter_line(&opts, state, 0.0, policy, sizeof(policy)) > 0);
+    assert(strcmp(policy, "| Tone filter: allow 100.0 Hz/D023N") == 0);
+    /* A list too long for the line ends in a count after an overflow mark, which a terminal without UTF-8 gets as
+       "..." like the separator's hyphen: nothing but ASCII reaches it. */
+    assert(dsd_tone_set_parse("67/69.3/71.9/74.4/77/79.7/82.5/85.4/88.5/91.5/94.8/97.4", &opts.analog_tone_set, NULL, 0)
+           == 0);
+    seed_rx_tone(state, 1, DSD_ANALOG_TONE_STATE_ACQUIRING, 0);
+    state->analog_rx.gate = DSD_ANALOG_TONE_GATE_PENDING;
+    assert(ui_format_tone_filter_line(&opts, state, 0.0, policy, sizeof(policy)) > 0);
+    assert(strcmp(policy,
+                  "| Tone filter: allow 67.0 Hz/69.3 Hz/71.9 Hz/74.4 Hz/77.0 Hz/79.7 Hz/82.5 Hz/85.4 Hz/88.5 Hz/"
+                  "\xE2\x80\xA6+3 \xE2\x80\x94 muted: checking tone")
+           == 0);
+    g_unicode_stub = 0;
+    assert(ui_format_tone_filter_line(&opts, state, 0.0, policy, sizeof(policy)) > 0);
+    assert(strcmp(policy,
+                  "| Tone filter: allow 67.0 Hz/69.3 Hz/71.9 Hz/74.4 Hz/77.0 Hz/79.7 Hz/82.5 Hz/85.4 Hz/88.5 Hz/"
+                  "...+3 - muted: checking tone")
+           == 0);
+    reset_printw_capture();
+    ui_render_call_info_tone_filter_line(&opts, state);
+    assert_capture_equals(
+        "| Tone filter: allow 67.0 Hz/69.3 Hz/71.9 Hz/74.4 Hz/77.0 Hz/79.7 Hz/82.5 Hz/85.4 Hz/88.5 Hz/"
+        "...+3 - muted: checking tone\n");
+    g_unicode_stub = 1;
+    opts.analog_tone_filter = DSD_TONE_FILTER_OFF;
+    seed_rx_tone(state, 1, DSD_ANALOG_TONE_STATE_LOCKED, 1318);
 
     /* A Call Info row, so compact view shows it too, and it sits under the channel line. */
     opts.scanner_mode = 1;
@@ -1822,7 +2257,7 @@ test_edacs_tree_update_helpers(void) {
         .ota_source_id = 5678U,
         .channel = 5U,
     };
-    const uint64_t now_ms = (uint64_t)(dsd_time_now_monotonic_s() * 1000.0);
+    const uint64_t now_ms = (uint64_t)(dsd_decode_now_mono_s() * 1000.0);
     assert(dsd_recent_activity_publish(&state, 5U, &observation, "Group Voice Ch: 5 TG: 1234 Src: 5678;", now_ms) == 1);
     state.trunk_lcn_freq[4] = 851012500L;
     dsd_recent_activity_snapshot recent;
@@ -1877,6 +2312,35 @@ test_sync_tree_follows_scan_class(void) {
     reset_printw_capture();
     ui_render_nxdn_site_line(state, 1);
     assert_capture_contains("IDAS - Area: --;");
+    /* Issue #575: DCR's fixed 7 stands in for a RAN it does not carry; the IDAS area keeps its own label. */
+    state->nxdn_last_ran = 7U;
+    state->nxdn_last_ran_stand_in = 1U;
+    reset_printw_capture();
+    ui_render_nxdn_site_line(state, 0);
+    assert_capture_contains("NXDN - RAN: --;");
+    assert(strstr(g_printw_capture, "RAN: 07") == NULL);
+    state->nxdn_last_ran = 1U;
+    reset_printw_capture();
+    ui_render_nxdn_site_line(state, 1);
+    assert_capture_contains("IDAS - Area: 01;");
+    state->nxdn_last_ran = 7U;
+    state->nxdn_last_ran_stand_in = 0U;
+    reset_printw_capture();
+    ui_render_nxdn_site_line(state, 0);
+    assert_capture_contains("NXDN - RAN: 07;");
+    state->nxdn_last_ran = (unsigned int)-1;
+    /* Issue #526: an analog row has no frame sync, so the last digital sync type is dropped
+       rather than shown beside an nfm row. */
+    g_scan_mode_active = DSD_SCAN_MODE_NFM;
+    ncurses_last_synctype = DSD_SYNC_DMR_BS_DATA_POS;
+    state->synctype = DSD_SYNC_NONE;
+    ui_update_sync_and_edacs_tree(state);
+    assert(ncurses_last_synctype == DSD_SYNC_NONE);
+    /* ...nor beside an am row. */
+    g_scan_mode_active = DSD_SCAN_MODE_AM;
+    ncurses_last_synctype = DSD_SYNC_DMR_BS_DATA_POS;
+    ui_update_sync_and_edacs_tree(state);
+    assert(ncurses_last_synctype == DSD_SYNC_NONE);
     g_scan_mode_active = DSD_SCAN_MODE_INHERIT;
     ncurses_last_synctype = DSD_SYNC_NONE;
     dsd_state_ext_free_all(state);
@@ -2035,7 +2499,7 @@ test_canonical_p25_slot_and_recent_activity(void) {
     assert(strstr(g_printw_capture, "9999") == NULL);
     assert(strstr(g_printw_capture, "8888") == NULL);
 
-    const uint64_t now_ms = (uint64_t)(dsd_time_now_monotonic_s() * 1000.0);
+    const uint64_t now_ms = (uint64_t)(dsd_decode_now_mono_s() * 1000.0);
     dsd_call_observation old_activity = observation;
     old_activity.ota_target_id = 100U;
     old_activity.policy_target_id = 100U;
@@ -2302,6 +2766,59 @@ test_live_protocol_panels_ignore_ended_call_identity(void) {
 
     dsd_state_ext_free_all(state);
     free(state);
+}
+
+/* Between transmissions the DMR colour code is back at 16 and the dPMR one at -1, "nothing decoded" (issue #575): the
+   panels print "--" there, as the NXDN RAN line does, rather than the sentinel. */
+static void
+test_colour_code_sentinels_print_as_unknown(void) {
+    dsd_opts* opts = (dsd_opts*)calloc(1U, sizeof(*opts));
+    dsd_state* state = (dsd_state*)calloc(1U, sizeof(*state));
+    assert(opts != NULL && state != NULL);
+    state->dmr_rest_channel = -1;
+
+    state->dmr_color_code = 16U;
+    ncurses_last_synctype = DSD_SYNC_DMR_BS_VOICE_POS;
+    reset_printw_capture();
+    ui_render_p25_dmr_header(opts, state);
+    assert_capture_contains("DMR BS - DCC: --;");
+    assert(strstr(g_printw_capture, "16") == NULL);
+
+    ncurses_last_synctype = DSD_SYNC_DMR_MS_VOICE;
+    reset_printw_capture();
+    ui_render_p25_dmr_header(opts, state);
+    assert_capture_contains("DMR MS - DCC: --;");
+    assert(strstr(g_printw_capture, "16") == NULL);
+
+    state->dmr_color_code = 0U;
+    reset_printw_capture();
+    ui_render_p25_dmr_header(opts, state);
+    assert_capture_contains("DMR MS - DCC: 00;");
+    state->dmr_color_code = 15U;
+    ncurses_last_synctype = DSD_SYNC_DMR_BS_DATA_NEG;
+    reset_printw_capture();
+    ui_render_p25_dmr_header(opts, state);
+    assert_capture_contains("DMR BS - DCC: 15;");
+
+    state->dpmr_color_code = -1;
+    ncurses_last_synctype = DSD_SYNC_DPMR_FS1_POS;
+    reset_printw_capture();
+    ui_render_call_info_dpmr(opts, state);
+    assert_capture_contains("| DCC: [--] ");
+    assert(strstr(g_printw_capture, "-1") == NULL);
+    state->dpmr_color_code = 0;
+    reset_printw_capture();
+    ui_render_call_info_dpmr(opts, state);
+    assert_capture_contains("| DCC: [0] ");
+    state->dpmr_color_code = 63;
+    reset_printw_capture();
+    ui_render_call_info_dpmr(opts, state);
+    assert_capture_contains("| DCC: [63] ");
+
+    ncurses_last_synctype = DSD_SYNC_NONE;
+    dsd_state_ext_free_all(state);
+    free(state);
+    free(opts);
 }
 
 /* An encryption-lockout-suppressed P25p2 companion (canonical call ended by
@@ -2614,6 +3131,19 @@ test_scan_timing_row_phrases(void) {
        to run from, and an unanchored timer is left off rather than shown as zero. */
     seed_scan_timing(&state, DSD_SCAN_STAY_HANGTIME, 1U, -1.0, 0U, 0U, 0U);
     assert_scan_timing_row(&opts, &state, "| Scan Timing: Hangtime");
+
+    /* Issue #526: an analog row's carrier holds it. On -Y it restarts the hangtime window; on a
+       trunk-scan nfm-conventional target it restarts the activity hold and suspends the dwell. */
+    seed_scan_timing(&state, DSD_SCAN_STAY_CARRIER, 1U, 101.9, 2000U, 0U, 0U);
+    assert_scan_timing_row(&opts, &state, "| Scan Timing: Carrier 1.9s/2.0s");
+    DSD_MEMSET(&opts, 0, sizeof(opts));
+    opts.trunk_scan_enabled = 1;
+    seed_scan_timing(&state, DSD_SCAN_STAY_CARRIER, 1U, 101.2, 1200U, 3000U, 1200U);
+    assert_scan_timing_row(&opts, &state, "| Scan Timing: Carrier 1.2s/1.2s  dwell 3.0s (suspended)");
+    /* Issue #527: the same carrier while the tone policy is still checking it: no activity, so no window of its own,
+       and no budget reads as suspended beneath it. */
+    seed_scan_timing(&state, DSD_SCAN_STAY_TONE_PENDING, 1U, -1.0, 0U, 3000U, 1200U);
+    assert_scan_timing_row(&opts, &state, "| Scan Timing: Tone check");
 }
 
 /* The decoder decides when the receiver moves. A poll that lands after the deadline is a
@@ -2824,9 +3354,11 @@ main(void) {
     test_input_source_helpers();
     test_dmr_mono_override_terminal_reporting();
     test_basic_input_source_rendering();
+    test_peer_passband_status_rendering();
     test_rtl_and_soapy_input_source_rendering();
     test_analog_channel_status_rendering();
     test_rtl_auto_ppm_status_rendering();
+    test_am_channel_field_rendering();
     test_demod_symbol_rate_helpers();
     test_input_level_policy();
     test_compact_status_section_rendering();
@@ -2858,6 +3390,7 @@ main(void) {
     test_slot_header_burst_column_is_fixed();
     test_slot_header_id_highlight_is_balanced();
     test_live_protocol_panels_ignore_ended_call_identity();
+    test_colour_code_sentinels_print_as_unknown();
     test_lockout_suppressed_companion_slot_renders_idle();
     return 0;
 }

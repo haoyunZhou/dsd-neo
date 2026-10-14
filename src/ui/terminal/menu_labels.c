@@ -12,17 +12,23 @@
 #include <dsd-neo/app_control/analog_width_view.h>
 #include <dsd-neo/app_control/frontend.h>
 #include <dsd-neo/app_control/history.h>
+#include <dsd-neo/app_control/rtl_gain_view.h>
+#include <dsd-neo/app_control/rx_tone_view.h>
 #include <dsd-neo/app_control/snapshot.h>
+#include <dsd-neo/app_control/squelch_view.h>
 #include <dsd-neo/core/enc_lockout.h>
 #include <dsd-neo/core/opts.h>
+#include <dsd-neo/core/power.h>
 #include <dsd-neo/core/state.h>
 #include <dsd-neo/core/talkgroup_policy.h>
-#include <dsd-neo/io/tcp_input.h>
-#include <dsd-neo/platform/file_compat.h>
+#include <dsd-neo/dsp/analog_audio.h>
+#include <dsd-neo/runtime/analog_channel.h>
+#include <dsd-neo/runtime/analog_tones.h>
 #include <dsd-neo/runtime/config.h>
 #include <dsd-neo/runtime/decode_mode.h>
 #include <dsd-neo/runtime/radioreference.h>
 #include <dsd-neo/runtime/scan_mode.h>
+#include <dsd-neo/runtime/squelch.h>
 #include <stdint.h>
 #include <string.h>
 #include "dsd-neo/core/opts_fwd.h"
@@ -64,6 +70,13 @@ io_rtl_active(const void* ctx) {
     return (c->opts->audio_in_type == AUDIO_IN_RTL);
 }
 
+/* The squelch row: on a radio input, and on audio input, which takes a level or the noise squelch (issue #628). */
+bool
+io_squelch_offered(const void* ctx) {
+    const UiCtx* c = (const UiCtx*)ctx;
+    return c && c->opts && dsd_squelch_input_kind(c->opts) != DSD_SQUELCH_INPUT_OTHER;
+}
+
 bool
 trunk_enabled(const void* ctx) {
     const UiCtx* c = (const UiCtx*)ctx;
@@ -84,6 +97,14 @@ scan_rotation_active(const void* ctx) {
         return false;
     }
     return c->opts->scanner_mode == 1 || c->opts->trunk_scan_enabled == 1;
+}
+
+/* The frequency row tunes the receiver by hand, which --trunk-scan refuses: its coordinator owns the tuner and would
+   undo a manual tune at the next dwell. The row is hidden there rather than opening a prompt whose answer is refused. */
+bool
+rtl_freq_offered(const void* ctx) {
+    const UiCtx* c = (const UiCtx*)ctx;
+    return !(c && c->opts && c->opts->trunk_scan_enabled == 1);
 }
 
 bool
@@ -299,21 +320,21 @@ lbl_p25p2_mod_lock(const void* v, char* b, size_t n) {
 const char*
 lbl_lpf(const void* v, char* b, size_t n) {
     const UiCtx* c = (const UiCtx*)v;
-    DSD_SNPRINTF(b, n, "Low-pass filter [%s]", onoff(c && c->opts && c->opts->use_lpf));
+    DSD_SNPRINTF(b, n, "Low-pass filter (960 Hz) [%s]", onoff(c && c->opts && c->opts->use_lpf));
     return b;
 }
 
 const char*
 lbl_hpf(const void* v, char* b, size_t n) {
     const UiCtx* c = (const UiCtx*)v;
-    DSD_SNPRINTF(b, n, "High-pass filter [%s]", onoff(c && c->opts && c->opts->use_hpf));
+    DSD_SNPRINTF(b, n, "High-pass filter (960 Hz) [%s]", onoff(c && c->opts && c->opts->use_hpf));
     return b;
 }
 
 const char*
 lbl_pbf(const void* v, char* b, size_t n) {
     const UiCtx* c = (const UiCtx*)v;
-    DSD_SNPRINTF(b, n, "Pulse-shaping band-pass [%s]", onoff(c && c->opts && c->opts->use_pbf));
+    DSD_SNPRINTF(b, n, "Voice band-pass [%s]", onoff(c && c->opts && c->opts->use_pbf));
     return b;
 }
 
@@ -844,10 +865,69 @@ lbl_input_warn(const void* v, char* b, size_t n) {
     return b;
 }
 
+/* The configured squelch the row edits: "Squelch... [-60.0 dB]", "[off]", "[auto +10 dB]", "[noise +10 dB]" (issue #518
+   follow-up), on radio and audio input alike (issue #628). A scan row's own squelch is what the readouts show; this row
+   edits the default beneath it. */
+const char*
+lbl_input_sql(const void* v, char* b, size_t n) {
+    const UiCtx* c = (const UiCtx*)v;
+    char text[DSD_SQUELCH_TEXT_SIZE] = "off";
+    if (c && c->opts) {
+        dsd_app_squelch_view view;
+        if (dsd_app_squelch_view_get(c->opts, dsd_app_get_latest_snapshot(), &view) == 0) {
+            const dsd_squelch_setting setting =
+                view.configured_noise  ? dsd_squelch_setting_noise(view.configured_margin_db)
+                : view.configured_auto ? dsd_squelch_setting_auto(view.configured_margin_db)
+                                       : dsd_squelch_setting_of_level(view.configured_level);
+            (void)dsd_squelch_setting_format(&setting, text, sizeof text);
+        } else {
+            const dsd_squelch_setting setting = dsd_squelch_setting_of_opts(c->opts);
+            (void)dsd_squelch_setting_format(&setting, text, sizeof text);
+        }
+    }
+    DSD_SNPRINTF(b, n, "Squelch... [%s]", text);
+    return b;
+}
+
+/* The configured channel width of analog @p kind (issues #524, #525), a setting rather than a reading: an explicit
+   width as set, the unset default as "default" (the status line's width field shows what that gives). On audio input
+   with a rigctl peer (-U) the row edits the passband the peer is asked for (issue #621), and an unset NFM width reads
+   as what stands in for it, "-B 12.5 kHz" or "peer's own". App-control's spelling. The scan scope's configured view
+   while one is live: a row's own width (issue #526) runs over dsd_opts, and the row edits the configured width. */
+static const char*
+lbl_input_width(const void* v, int kind, char* b, size_t n) {
+    const UiCtx* c = (const UiCtx*)v;
+    dsd_app_analog_width_view view;
+    DSD_MEMSET(&view, 0, sizeof view);
+    int configured_hz = 0;
+    if (c) {
+        const dsd_state* snapshot = dsd_app_get_latest_snapshot();
+        (void)dsd_app_analog_width_view_get(c->opts, snapshot, NULL, &view);
+        configured_hz = dsd_scan_mode_configured_analog_width(c->opts, snapshot, kind);
+    }
+    char width[DSD_APP_ANALOG_WIDTH_TEXT_MAX];
+    (void)dsd_app_analog_width_setting_text(&view, kind, configured_hz, width, sizeof width);
+    DSD_SNPRINTF(b, n, "%s %s... [%s]", dsd_analog_demod_label(kind), view.peer_passband ? "passband" : "bandwidth",
+                 width);
+    return b;
+}
+
+const char*
+lbl_input_nfm_bw(const void* v, char* b, size_t n) {
+    return lbl_input_width(v, DSD_ANALOG_DEMOD_FM, b, n);
+}
+
+const char*
+lbl_input_am_bw(const void* v, char* b, size_t n) {
+    return lbl_input_width(v, DSD_ANALOG_DEMOD_AM, b, n);
+}
+
 const char*
 lbl_tcp(const void* vctx, char* b, size_t n) {
     const UiCtx* c = (const UiCtx*)vctx;
-    int active = (c->opts->audio_in_type == AUDIO_IN_TCP && tcp_input_is_valid(c->opts->tcp_in_ctx));
+    /* The snapshot's context pointer is only compared: the decoder frees that context when a reconnect or a switch
+       replaces it (issue #634). */
+    int active = (c->opts->audio_in_type == AUDIO_IN_TCP && c->opts->tcp_in_ctx != NULL);
     if (c->opts->tcp_hostname[0] != '\0' && c->opts->tcp_portno > 0) {
         int m = (n > 28) ? (int)(n - 28) : 0;
         DSD_SNPRINTF(b, n, "TCP audio: %.*s:%d [%s]", m, c->opts->tcp_hostname, c->opts->tcp_portno, onoff(active));
@@ -880,7 +960,11 @@ const char*
 lbl_gain_ana(const void* v, char* b, size_t n) {
     const UiCtx* c = (const UiCtx*)v;
     const float g = (c && c->opts) ? c->opts->audio_gainA : 0.0f;
-    DSD_SNPRINTF(b, n, "Analog gain... [%d]", (int)g);
+    if (dsd_analog_gain_is_auto(g)) {
+        DSD_SNPRINTF(b, n, "Analog gain... [auto]");
+    } else {
+        DSD_SNPRINTF(b, n, "Analog gain... [%d]", (int)g);
+    }
     return b;
 }
 
@@ -937,6 +1021,30 @@ lbl_audio_lpf(const void* v, char* b, size_t n) {
     } else {
         DSD_SNPRINTF(b, n, "Audio low-pass... [Off]");
     }
+    return b;
+}
+
+/* The CTCSS/DCS receive policy (issue #527), read as the Call Info line and the Qt monitor read it (the shared
+   received-tone view): "off", or the mode and its list, and while a scan row's own policy is on air that policy with
+   the configured one it shadows, "(row; default X)". The row's editor edits the configured one. It reads the snapshot
+   pair its picker (act_tone_filter()) opens on, and before the first snapshot the menu's own options with no state,
+   which the view reads as the policy they hold. The value keeps the view's lowercase spelling, as Call Info prints it
+   and as other rows show a shared view's value ("[default]", "[auto]"); On/Off capitals are the toggles' grammar. The
+   view marks what a long list leaves out with a UTF-8 ellipsis; menu labels are ASCII, so it becomes "..."
+   (dsd_tone_display_to_ascii()). */
+const char*
+lbl_tone_filter(const void* v, char* b, size_t n) {
+    const UiCtx* c = (const UiCtx*)v;
+    const dsd_opts* opts = dsd_app_get_latest_opts_snapshot();
+    const dsd_state* state = dsd_app_get_latest_snapshot();
+    if (!opts) {
+        opts = c ? c->opts : NULL;
+        state = NULL;
+    }
+    dsd_app_rx_tone view;
+    (void)dsd_app_rx_tone_view(opts, state, 0.0, &view);
+    dsd_tone_display_to_ascii(view.configured_text);
+    DSD_SNPRINTF(b, n, "Tone filter... [%s]", view.configured_text);
     return b;
 }
 
@@ -1002,12 +1110,9 @@ lbl_stop_symbol_capture(const void* vctx, char* b, size_t n) {
 const char*
 lbl_replay_last(const void* vctx, char* b, size_t n) {
     const UiCtx* c = (const UiCtx*)vctx;
-    if (c->opts->audio_in_dev[0] != '\0') {
-        dsd_stat_t sb;
-        if (dsd_stat_path(c->opts->audio_in_dev, &sb) == 0) {
-            DSD_SNPRINTF(b, n, "Replay last capture [%s]", c->opts->audio_in_dev);
-            return b;
-        }
+    if (c->opts->symbol_capture_last[0] != '\0') {
+        DSD_SNPRINTF(b, n, "Replay last capture [%s]", c->opts->symbol_capture_last);
+        return b;
     }
     DSD_SNPRINTF(b, n, "Replay last capture [none]");
     return b;
@@ -1016,7 +1121,9 @@ lbl_replay_last(const void* vctx, char* b, size_t n) {
 const char*
 lbl_stop_symbol_playback(const void* vctx, char* b, size_t n) {
     const UiCtx* c = (const UiCtx*)vctx;
-    if (c->opts->symbolfile != NULL && c->opts->audio_in_type == AUDIO_IN_SYMBOL_BIN) {
+    const int playback = c->opts->audio_in_type == AUDIO_IN_WAV || c->opts->audio_in_type == AUDIO_IN_SYMBOL_BIN
+                         || c->opts->audio_in_type == AUDIO_IN_SYMBOL_FLT;
+    if (playback) {
         if (c->opts->audio_in_dev[0] != '\0') {
             DSD_SNPRINTF(b, n, "Stop replay [%s]", c->opts->audio_in_dev);
         } else {
@@ -1350,12 +1457,12 @@ lbl_rtl_freq(const void* v, char* b, size_t n) {
 const char*
 lbl_rtl_gain(const void* v, char* b, size_t n) {
     const UiCtx* c = (const UiCtx*)v;
-    const int gain = (c && c->opts) ? c->opts->rtl_gain_value : 0;
-    if (gain == 0) {
+    dsd_app_rtl_gain_view view;
+    if (!c || dsd_app_rtl_gain_view_get(c->opts, c->state, &view) != 0) {
         DSD_SNPRINTF(b, n, "Gain... [AGC]");
-    } else {
-        DSD_SNPRINTF(b, n, "Gain... [%d]", gain);
+        return b;
     }
+    (void)dsd_app_rtl_gain_view_label(&view, b, n);
     return b;
 }
 
@@ -1370,18 +1477,6 @@ const char*
 lbl_rtl_bw(const void* v, char* b, size_t n) {
     const UiCtx* c = (const UiCtx*)v;
     DSD_SNPRINTF(b, n, "DSP bandwidth... [%d kHz]", (c && c->opts) ? c->opts->rtl_dsp_bw_khz : 0);
-    return b;
-}
-
-/* The configured NFM channel width, a setting rather than a reading: an explicit width as set, the unset default as
-   "default" (the status line's "Analog:" field shows what that gives at the DSP rate). App-control's spelling. */
-const char*
-lbl_rtl_nfm_bw(const void* v, char* b, size_t n) {
-    const UiCtx* c = (const UiCtx*)v;
-    char width[DSD_APP_ANALOG_WIDTH_TEXT_MAX];
-    (void)dsd_app_analog_width_setting_format((c && c->opts) ? c->opts->analog_nfm_bandwidth_hz : 0, width,
-                                              sizeof width);
-    DSD_SNPRINTF(b, n, "NFM bandwidth... [%s]", width);
     return b;
 }
 
@@ -1426,6 +1521,11 @@ lbl_rtl_tuner_autogain(const void* v, char* b, size_t n) {
     if (c && c->state && c->state->rtl_ctx) {
         dsd_frontend_metrics metrics = menu_frontend_metrics(v);
         on = metrics.tuner_autogain;
+    }
+    dsd_app_rtl_gain_view view;
+    if (c && dsd_app_rtl_gain_view_get(c->opts, c->state, &view) == 0) {
+        (void)dsd_app_rtl_autogain_view_label(&view, on, b, n);
+        return b;
     }
     DSD_SNPRINTF(b, n, "Tuner autogain [%s]", onoff(on));
     return b;

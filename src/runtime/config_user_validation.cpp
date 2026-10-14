@@ -8,11 +8,13 @@
  */
 
 #include <dsd-neo/core/airspy_config.h>
+#include <dsd-neo/core/analog_tone.h>
 #include <dsd-neo/core/lrrp_ports.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/platform/posix_compat.h>
 #include <dsd-neo/runtime/airspy_config.h>
 #include <dsd-neo/runtime/analog_channel.h>
+#include <dsd-neo/runtime/analog_tones.h>
 #include <dsd-neo/runtime/config.h>
 #include <dsd-neo/runtime/config_schema.h>
 #include <dsd-neo/runtime/path_policy.h>
@@ -159,12 +161,35 @@ validate_standard_entry_value(const dsdcfg_schema_entry_t* entry, const char* va
 static int
 validate_analog_width_entry(const dsdcfg_schema_entry_t* entry, const char* val, dsdcfg_diagnostics_t* diags,
                             int line_num, const char* diag_section, const char* diag_key) {
-    if (strcmp(entry->section, "analog") != 0 || strcmp(entry->key, "nfm_bandwidth_hz") != 0) {
+    if (strcmp(entry->section, "analog") != 0) {
+        return 0;
+    }
+    const int kind = (strcmp(entry->key, "nfm_bandwidth_hz") == 0)  ? DSD_ANALOG_DEMOD_FM
+                     : (strcmp(entry->key, "am_bandwidth_hz") == 0) ? DSD_ANALOG_DEMOD_AM
+                                                                    : -1;
+    if (kind < 0) {
         return 0;
     }
     char err[DSD_ANALOG_ERROR_TEXT_MAX];
     int width_hz = 0;
-    if (dsd_analog_width_parse(DSD_ANALOG_DEMOD_FM, val, &width_hz, err, sizeof err) != 0) {
+    if (dsd_analog_width_parse(kind, val, &width_hz, err, sizeof err) != 0) {
+        dsdcfg_diags_add(diags, DSDCFG_DIAG_ERROR, line_num, diag_section, diag_key, err);
+    }
+    return 1;
+}
+
+/* A tone list is refused by entry number, never echoed, as the CLI and a scan row refuse it (issue #527); the loader
+   then keeps the tone filter off, so the refusal is an error. An empty list is valid on its own: whether a policy needs
+   one is the composed check's question. */
+static int
+validate_analog_tone_list_entry(const dsdcfg_schema_entry_t* entry, const char* val, dsdcfg_diagnostics_t* diags,
+                                int line_num, const char* diag_section, const char* diag_key) {
+    if (strcmp(entry->section, "analog") != 0 || strcmp(entry->key, "tone_list") != 0) {
+        return 0;
+    }
+    char err[DSD_TONE_LIST_ERROR_SIZE];
+    dsd_tone_set set;
+    if (val[0] != '\0' && dsd_tone_set_parse(val, &set, err, sizeof err) != 0) {
         dsdcfg_diags_add(diags, DSDCFG_DIAG_ERROR, line_num, diag_section, diag_key, err);
     }
     return 1;
@@ -176,7 +201,8 @@ validate_entry_value(const dsdcfg_schema_entry_t* entry, const char* val, dsdcfg
     if (!entry || !val || !diags) {
         return;
     }
-    if (validate_analog_width_entry(entry, val, diags, line_num, diag_section, diag_key)) {
+    if (validate_analog_width_entry(entry, val, diags, line_num, diag_section, diag_key)
+        || validate_analog_tone_list_entry(entry, val, diags, line_num, diag_section, diag_key)) {
         return;
     }
     if (strcmp(entry->section, "input") == 0 && strncmp(entry->key, "airspy_", 7) == 0) {
@@ -415,13 +441,18 @@ validate_configured_rtl_bw_khz(int bw) {
     return dsd_analog_rtl_dsp_bw_is_selectable(bw) ? bw : 48;
 }
 
+/* Whether startup builds an RTL-SDR or rtl_tcp input with rtl_bw_khz (it takes rtl_freq, and a host for rtl_tcp). */
+static int
+validate_config_builds_rtl_input(const dsdneoUserConfig* cfg) {
+    return cfg->has_input && cfg->rtl_freq[0] != '\0'
+           && (cfg->input_source == DSDCFG_INPUT_RTL
+               || (cfg->input_source == DSDCFG_INPUT_RTLTCP && cfg->rtltcp_host[0] != '\0'));
+}
+
 static int
 validate_analog_width_rate_applies(const dsdneoUserConfig* cfg) {
-    const int builds_rtl_input = cfg->has_input && cfg->rtl_freq[0] != '\0'
-                                 && (cfg->input_source == DSDCFG_INPUT_RTL
-                                     || (cfg->input_source == DSDCFG_INPUT_RTLTCP && cfg->rtltcp_host[0] != '\0'));
     return cfg->analog_nfm_bandwidth_hz > 0 && cfg->has_mode && cfg->decode_mode == DSDCFG_MODE_ANALOG
-           && builds_rtl_input;
+           && validate_config_builds_rtl_input(cfg);
 }
 
 static void
@@ -439,6 +470,50 @@ validate_composed_analog_width(const dsdneoUserConfig* cfg, const char* section,
     }
 }
 
+/* Issue #524: the AM width a config's decode = am runs (the 6000 Hz default included, which is held to the rate like an
+   explicit width), on an input whose DSP rate is the configured RTL DSP bandwidth (RTL-SDR and rtl_tcp), must fit that
+   rate, as the startup check does (dsd_engine_setup_check_analog_width()). Devices that can force another rate
+   (SoapySDR, Airspy) and I/Q replay are checked against the rate they deliver when the stream starts, and a PCM input
+   runs no channel filter (the session falls back to Analog there). rtl_bw_khz is that rate only where startup builds
+   the input with it, as for NFM. */
+static int
+validate_am_width_rate_applies(const dsdneoUserConfig* cfg) {
+    return cfg->has_mode && cfg->decode_mode == DSDCFG_MODE_AM && validate_config_builds_rtl_input(cfg);
+}
+
+static void
+validate_composed_am_width(const dsdneoUserConfig* cfg, const char* section, const char* key,
+                           dsdcfg_diagnostics_t* diags) {
+    if (!cfg || !diags || !validate_am_width_rate_applies(cfg)) {
+        return;
+    }
+    const int configured_hz =
+        (cfg->has_analog && dsd_analog_width_in_range(DSD_ANALOG_DEMOD_AM, cfg->analog_am_bandwidth_hz))
+            ? cfg->analog_am_bandwidth_hz
+            : 0;
+    const int width_hz = dsd_analog_width_effective_hz(DSD_ANALOG_DEMOD_AM, configured_hz);
+    const int rtl_bw_khz = validate_configured_rtl_bw_khz(cfg->rtl_bw_khz);
+    char err[DSD_ANALOG_ERROR_TEXT_MAX];
+    if (dsd_analog_width_check(DSD_ANALOG_DEMOD_AM, width_hz, rtl_bw_khz * 1000, err, sizeof err) != 0) {
+        dsdcfg_diags_add(diags, DSDCFG_DIAG_ERROR, 0, section ? section : "analog", key ? key : "am_bandwidth_hz", err);
+    }
+}
+
+/* A list policy with nothing to list is refused (issue #527): the loader would apply it as off, which the operator did
+   not ask for. A list refused on its own line has said so already. */
+static void
+validate_composed_tone_policy(const dsdneoUserConfig* cfg, const char* section, const char* key,
+                              dsdcfg_diagnostics_t* diags) {
+    if (!cfg || !diags || !cfg->has_analog || cfg->analog_tone_filter == DSD_TONE_FILTER_OFF
+        || cfg->analog_tone_list_refused || dsd_tone_set_count(&cfg->analog_tone_set) > 0) {
+        return;
+    }
+    char msg[128];
+    DSD_SNPRINTF(msg, sizeof msg, "tone_filter = %s needs a tone_list of CTCSS tones or DCS codes (e.g. 100.0/D023N)",
+                 dsd_tone_filter_mode_name(cfg->analog_tone_filter));
+    dsdcfg_diags_add(diags, DSDCFG_DIAG_ERROR, 0, section ? section : "analog", key ? key : "tone_filter", msg);
+}
+
 static void
 validate_composed_config_base(const dsdneoUserConfig* cfg, dsdcfg_diagnostics_t* diags) {
     validate_composed_trunk_scan_requirements(cfg, "trunk_scan", "targets_csv", diags);
@@ -447,6 +522,8 @@ validate_composed_config_base(const dsdneoUserConfig* cfg, dsdcfg_diagnostics_t*
     validate_composed_lrrp_ports(cfg, "mode", "dmr_lrrp_ports", diags);
     validate_composed_scan_max_visit_ms(cfg, "trunking", "scan_max_visit_ms", diags);
     validate_composed_analog_width(cfg, "analog", "nfm_bandwidth_hz", diags);
+    validate_composed_am_width(cfg, "analog", "am_bandwidth_hz", diags);
+    validate_composed_tone_policy(cfg, "analog", "tone_filter", diags);
 }
 
 static void
@@ -460,6 +537,8 @@ validate_composed_profile_config(const char* profile_name, const dsdneoUserConfi
     validate_composed_lrrp_ports(cfg, section, "mode.dmr_lrrp_ports", diags);
     validate_composed_scan_max_visit_ms(cfg, section, "trunking.scan_max_visit_ms", diags);
     validate_composed_analog_width(cfg, section, "analog.nfm_bandwidth_hz", diags);
+    validate_composed_am_width(cfg, section, "analog.am_bandwidth_hz", diags);
+    validate_composed_tone_policy(cfg, section, "analog.tone_filter", diags);
 }
 
 static void

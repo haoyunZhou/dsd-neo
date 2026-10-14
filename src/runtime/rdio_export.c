@@ -11,6 +11,7 @@
 #include <dsd-neo/platform/posix_compat.h>
 #include <dsd-neo/platform/threading.h>
 #include <dsd-neo/platform/timing.h>
+#include <dsd-neo/runtime/decode_clock.h>
 #include <dsd-neo/runtime/log.h>
 #include <dsd-neo/runtime/rdio_export.h>
 #include <errno.h>
@@ -564,11 +565,11 @@ typedef struct {
 } dsd_rdio_meta_fields;
 
 static void
-dsd_rdio_meta_fields_from_event(const Event_History* event, dsd_rdio_meta_fields* out) {
+dsd_rdio_meta_fields_from_event(const Event_History* event, time_t opened, dsd_rdio_meta_fields* out) {
     if (!out) {
         return;
     }
-    out->start_time = time(NULL);
+    out->start_time = dsd_decode_time();
     out->talkgroup = 0;
     out->source = 0;
     out->freq_hz = 0;
@@ -579,12 +580,22 @@ dsd_rdio_meta_fields_from_event(const Event_History* event, dsd_rdio_meta_fields
     if (!event) {
         return;
     }
-    if (event->event_time > 0) {
+    // The recording is filed by when it began: when its call did, or when the WAV was opened if that came later (per-
+    // call WAV switched on mid-call). Both are decode-clock stamps. event_time is the row's last activity -- the call's
+    // end by the time its WAV closes -- so it stands in only for a row with no start of its own, such as a --playfiles
+    // row, whose event_time the file reader stamped from the recording; that stamp is on the recording's clock, so the
+    // open time is not compared with it. stop_time adds the WAV length to the start, and is never derived by moving a
+    // fallback stamp back: a played file's stamp need not be an end.
+    if (event->event_start_time > 0) {
+        out->start_time = opened > event->event_start_time ? opened : event->event_start_time;
+    } else if (event->event_time > 0) {
         out->start_time = event->event_time;
     }
     out->talkgroup = event->target_id;
     out->source = event->source_id;
-    out->freq_hz = event->channel;
+    // The frequency the call was heard on. Never event->channel: that is a trunk channel number,
+    // an LCN or a dPMR colour code, not Hz. A frequency the sidecar's field cannot hold is unknown.
+    out->freq_hz = (event->freq_hz > 0 && event->freq_hz <= (int64_t)UINT32_MAX) ? (uint32_t)event->freq_hz : 0U;
     out->encrypted = event->enc ? 1 : 0;
     out->short_name = event->sysid_string;
 
@@ -682,8 +693,8 @@ dsd_rdio_finalize_meta_file(FILE* fp, const char* temp_meta_path, const char* ou
 }
 
 static int
-dsd_rdio_write_trunk_recorder_meta(const dsd_opts* opts, const Event_History_I* event_struct, const char* wav_path,
-                                   char* out_meta_path, size_t out_meta_path_size) {
+dsd_rdio_write_trunk_recorder_meta(const dsd_opts* opts, const Event_History_I* event_struct, time_t opened,
+                                   const char* wav_path, char* out_meta_path, size_t out_meta_path_size) {
     if (!opts || !wav_path || wav_path[0] == '\0') {
         return -1;
     }
@@ -695,13 +706,13 @@ dsd_rdio_write_trunk_recorder_meta(const dsd_opts* opts, const Event_History_I* 
 
     const Event_History* event = event_struct ? &event_struct->Event_History_Items[0] : NULL;
     dsd_rdio_meta_fields fields;
-    dsd_rdio_meta_fields_from_event(event, &fields);
+    dsd_rdio_meta_fields_from_event(event, opened, &fields);
     if (fields.talkgroup == 0U) {
         LOG_WARN("Rdio export: skipped %s (missing talkgroup/target ID)\n", wav_path);
         return -1;
     }
     if (fields.start_time <= 0) {
-        fields.start_time = time(NULL);
+        fields.start_time = dsd_decode_time();
     }
 
     unsigned int duration_s = dsd_rdio_wav_duration_s(wav_path);
@@ -928,7 +939,7 @@ dsd_rdio_mode_to_string(int mode) {
 }
 
 int
-dsd_rdio_export_call(const dsd_opts* opts, const Event_History_I* event_struct, const char* wav_path) {
+dsd_rdio_export_call(const dsd_opts* opts, const Event_History_I* event_struct, const char* wav_path, time_t opened) {
     if (!opts || !wav_path || wav_path[0] == '\0') {
         return -1;
     }
@@ -943,7 +954,7 @@ dsd_rdio_export_call(const dsd_opts* opts, const Event_History_I* event_struct, 
     }
 
     char meta_path[DSD_RDIO_PATH_MAX];
-    if (dsd_rdio_write_trunk_recorder_meta(opts, event_struct, wav_path, meta_path, sizeof(meta_path)) != 0) {
+    if (dsd_rdio_write_trunk_recorder_meta(opts, event_struct, opened, wav_path, meta_path, sizeof(meta_path)) != 0) {
         return -1;
     }
 

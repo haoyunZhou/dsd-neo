@@ -30,6 +30,7 @@
 #include <dsd-neo/platform/platform.h>
 #include <dsd-neo/platform/timing.h>
 #include <dsd-neo/runtime/config.h>
+#include <dsd-neo/runtime/decode_clock.h>
 #include <dsd-neo/runtime/rtl_stream_metrics_hooks.h>
 #include <math.h>
 #include <stdint.h>
@@ -64,7 +65,7 @@ throttle_symbol_bin_replay(const dsd_opts* opts, dsd_state* state) {
         return;
     }
 
-    uint64_t now_ns = dsd_time_monotonic_ns();
+    uint64_t now_ns = dsd_realtime_mono_ns();
     uint64_t deadline_ns = state->symbol_replay_next_deadline_ns;
     if (deadline_ns == 0ULL) {
         state->symbol_replay_next_deadline_ns = now_ns + period_ns;
@@ -170,12 +171,13 @@ print_datascope(const dsd_opts* opts, dsd_state* state, const float* sbuf2, int 
     }
     const float scale = 32.0f / span;
     build_datascope_spectrum(sbuf2, count, scale, spectrum);
-    /* dsd_state::symbolcnt is unsigned; the refresh period is a small positive int. */
-    if (state->symbolcnt > (uint32_t)(4800 / opts->scoperate)) {
+    /* The refresh is timed from its own mark: dsd_state::symbolcnt free-runs, and other readers measure spans with it
+       (P25 Phase 2 window continuity, the frame-sync hunt). Both wrap; the refresh period is a small positive int. */
+    if (state->symbolcnt - state->datascope_symbolcnt_mark > (uint32_t)(4800 / opts->scoperate)) {
         dsd_call_snapshot call;
         DSD_MEMSET(&call, 0, sizeof(call));
         (void)dsd_call_state_get(state, 0U, &call);
-        state->symbolcnt = 0;
+        state->datascope_symbolcnt_mark = state->symbolcnt;
         DSD_FPRINTF(stderr, "\n");
         DSD_FPRINTF(stderr, "Demod mode:     %s                Nac:                     %4X\n", modulation, state->nac);
         DSD_FPRINTF(stderr, "Frame Type:    %s        Talkgroup:      %13llu\n", state->ftype,
@@ -766,9 +768,14 @@ replace_previous_dibit_soft(dsd_state* state, const dsd_dibit_soft_t* soft) {
 }
 
 static void DSD_ATTR_USED
-replace_symbol_bin_soft_metric(dsd_state* state, int dibit) {
+replace_symbol_bin_soft_metric(const dsd_opts* opts, dsd_state* state, int dibit) {
     dsd_dibit_soft_t soft;
-    if (state != NULL && state->symbol_replay_has_soft) {
+    if (state != NULL && state->input_fallback_pending && opts->symbolfile == NULL) {
+        /* The capture ended mid-frame and the engine has yet to switch to Pulse (issue #634): the rest of the frame is
+           erasures, not the capture's last dibit repeated at full confidence. */
+        state->symbol_replay_has_soft = 0;
+        fallback_soft_from_dibit(dibit, 0, &soft);
+    } else if (state != NULL && state->symbol_replay_has_soft) {
         soft = state->symbol_replay_soft;
         state->symbol_replay_has_soft = 0;
     } else {
@@ -1065,7 +1072,7 @@ get_dibit_and_analog_signal(dsd_opts* opts, dsd_state* state, int* out_analog_si
     if (opts->audio_in_type == AUDIO_IN_SYMBOL_BIN) {
         //assign dibit from last symbol/dibit read from capture bin
         dibit = state->symbolc;
-        replace_symbol_bin_soft_metric(state, dibit);
+        replace_symbol_bin_soft_metric(opts, state, dibit);
         throttle_symbol_bin_replay(opts, state);
     }
 
@@ -1116,7 +1123,7 @@ getDibitAndSoftSymbol(dsd_opts* opts, dsd_state* state, float* out_soft_symbol) 
 
     if (opts->audio_in_type == AUDIO_IN_SYMBOL_BIN) {
         dibit = state->symbolc;
-        replace_symbol_bin_soft_metric(state, dibit);
+        replace_symbol_bin_soft_metric(opts, state, dibit);
         throttle_symbol_bin_replay(opts, state);
     }
 
