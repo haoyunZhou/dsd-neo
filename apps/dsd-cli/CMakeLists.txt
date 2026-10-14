@@ -8,6 +8,13 @@ target_link_libraries(
     PRIVATE dsd-neo_engine dsd-neo_feature_rtlsdr dsd-neo_feature_codec2 ${LIBS}
 )
 
+if(DSD_ENABLE_API)
+    target_compile_definitions(dsd-neo PRIVATE DSD_CLI_HAS_API=1)
+    target_link_libraries(dsd-neo PRIVATE dsd-neo_api)
+else()
+    target_compile_definitions(dsd-neo PRIVATE DSD_CLI_HAS_API=0)
+endif()
+
 if(DSD_ENABLE_TERMINAL_UI)
     target_compile_definitions(dsd-neo PRIVATE DSD_CLI_HAS_TERMINAL_UI=1)
     target_include_directories(
@@ -46,6 +53,22 @@ if(BUILD_TESTING)
         COMMAND
             ${CMAKE_COMMAND} -D DSD_NEO_CLI=$<TARGET_FILE:dsd-neo> -D
             DSD_NEO_CLI_SMOKE_MODE=invalid-option -P
+            ${PROJECT_SOURCE_DIR}/tests/cmake/RunCliSmoke.cmake
+    )
+
+    add_test(
+        NAME CLI_INVALID_SHORT_OPTION_SMOKE
+        COMMAND
+            ${CMAKE_COMMAND} -D DSD_NEO_CLI=$<TARGET_FILE:dsd-neo> -D
+            DSD_NEO_CLI_SMOKE_MODE=invalid-short-option -P
+            ${PROJECT_SOURCE_DIR}/tests/cmake/RunCliSmoke.cmake
+    )
+
+    add_test(
+        NAME CLI_MISSING_ARGUMENT_SMOKE
+        COMMAND
+            ${CMAKE_COMMAND} -D DSD_NEO_CLI=$<TARGET_FILE:dsd-neo> -D
+            DSD_NEO_CLI_SMOKE_MODE=missing-argument -P
             ${PROJECT_SOURCE_DIR}/tests/cmake/RunCliSmoke.cmake
     )
 endif()

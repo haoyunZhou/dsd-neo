@@ -11,6 +11,7 @@
 #include <dsd-neo/core/frame.h>
 #include <dsd-neo/core/init.h>
 #include <dsd-neo/core/opts.h>
+#include <dsd-neo/core/p25p2_playout.h>
 #include <dsd-neo/core/safe_api.h>
 #include <dsd-neo/core/state.h>
 #include <dsd-neo/core/synctype_ids.h>
@@ -27,6 +28,7 @@
 #include <dsd-neo/protocol/p25/p25_sm_watchdog.h>
 #include <dsd-neo/protocol/p25/p25_trunk_sm.h>
 #include <dsd-neo/runtime/config.h>
+#include <dsd-neo/runtime/decode_clock.h>
 #include <dsd-neo/runtime/frame_sync_hooks.h>
 #include <dsd-neo/runtime/p25_optional_hooks.h>
 #include <dsd-neo/runtime/rigctl_query_hooks.h>
@@ -214,7 +216,7 @@ aloha(int crc_ok) {
 
 static void
 expire_acquisition(dmr_sm_ctx_t* ctx) {
-    ctx->cc_acquire_start_m = ctx->t_cc_sync_m = dsd_time_now_monotonic_s() - ctx->cc_grace_s - 1.0;
+    ctx->cc_acquire_start_m = ctx->t_cc_sync_m = dsd_decode_now_mono_s() - ctx->cc_grace_s - 1.0;
     ctx->cc_retry_after_m = 0.0;
     dmr_sm_tick_ctx(ctx, &g_opts, &g_state);
     dmr_sm_tick_ctx(ctx, &g_opts, &g_state);
@@ -248,8 +250,8 @@ held_call_return(float hangtime) {
         ctx->t_voice_m -= 2.0;
     }
     g_state.last_vc_sync_time = time(NULL) - 3;
-    g_state.last_vc_sync_time_m = dsd_time_now_monotonic_s() - 3.0;
-    g_state.p25_last_vc_tune_time_m = dsd_time_now_monotonic_s() - 4.0;
+    g_state.last_vc_sync_time_m = dsd_decode_now_mono_s() - 3.0;
+    g_state.p25_last_vc_tune_time_m = dsd_decode_now_mono_s() - 4.0;
     dsd_frame_sync_test_handle_no_sync_timeout(&g_opts, &g_state, 1800);
     rc |= expect(g_returns == 1 && g_frequency == 451000000L, "DMR returned to original control channel");
     rc |= expect(!g_state.is_con_plus, "DMR-owned release clears Con+ follow latch");
@@ -340,7 +342,7 @@ pending_and_failed_probes(void) {
     dsd_trunk_tuning_request_publish(pending, DSD_TRUNK_TUNE_RESULT_OK);
     dmr_sm_tick_ctx(ctx, &g_opts, &g_state);
     rc |= expect(ctx->cc_tune_request_id == 0U && g_cc_tunes == count
-                     && dsd_time_now_monotonic_s() - ctx->cc_acquire_start_m < 1.0,
+                     && dsd_decode_now_mono_s() - ctx->cc_acquire_start_m < 1.0,
                  "acquisition grace begins at backend completion");
     aloha(1);
     rc |= expect(g_state.trunk_cc_freq == 452000000L, "completed probe accepts decoded CC");
@@ -486,7 +488,7 @@ standalone_recovery(void) {
     g_state.p25_cc_freq = 851000000L;
     p25_sm_init_ctx(p25, &g_opts, &g_state);
     p25->state = P25_SM_HUNTING;
-    const double old_try = dsd_time_now_monotonic_s() - 20.0;
+    const double old_try = dsd_decode_now_mono_s() - 20.0;
     p25->t_hunt_try_m = old_try;
     const int tunes = g_cc_tunes;
     p25_sm_try_tick(&g_opts, &g_state);
@@ -597,7 +599,7 @@ watchdog_ownership_thread(void) {
     p25_sm_ctx_t* p25 = p25_sm_get_ctx();
     p25_sm_init_ctx(p25, &g_opts, &g_state);
     p25->state = P25_SM_HUNTING;
-    const double old_try = dsd_time_now_monotonic_s() - 20.0;
+    const double old_try = dsd_decode_now_mono_s() - 20.0;
     p25->t_hunt_try_m = old_try;
     dsd_trunk_recovery_note_protocol(&g_state, DSD_TRUNK_RECOVERY_DMR);
     p25_sm_watchdog_start(&g_opts, &g_state);
@@ -721,10 +723,13 @@ seed_skip_watchdog_call(void) {
         expect(p25_sm_emit_active_call(&g_opts, &g_state, 0, 1234, 0, 42, 1, 0), "watchdog fixture voice accepted");
     rc |= expect(ctx->state == P25_SM_TUNED && ctx->vc_is_tdma, "watchdog fixture follows TDMA");
     g_state.p25_p2_audio_allowed[0] = 1;
-    g_state.voice_counter[0] = 1;
+    /* One admitted frame waits in the P25 Phase 2 playout (issue #651). */
     for (int i = 0; i < 160; ++i) {
-        g_state.s_l4[0][i] = 1000;
+        g_state.s_l[i] = 1000;
     }
+    g_state.mbe_short_silenced[0] = 0;
+    dsd_p25p2_playout_reset(&g_state, -1);
+    dsd_p25p2_playout_stage(&g_opts, &g_state, 0, 0, 1U, NULL);
     g_skip_flush.pause_flush = g_skip_flush.entered = g_skip_flush.resume = 0;
     g_skip_flush.skip_started = g_skip_flush.skip_waited = 0;
     g_skip_flush.flushes = g_skip_flush.blocked = g_skip_flush.allowed = g_skip_flush.failures =
@@ -756,9 +761,9 @@ watchdog_call_skip_phases(void) {
             g_result = DSD_TRUNK_TUNE_RESULT_FAILED;
             rc |= expect(dsd_app_command_set_u8(DSD_APP_CMD_SKIP_SLOT, 0) > 0, "watchdog skip queued");
             rc |= expect(dsd_app_drain_cmds(&g_opts, &g_state) == 1, "watchdog skip drained");
-            rc |= expect(dsd_tg_policy_call_skip_active(&g_state, 1234, dsd_time_now_monotonic_s()),
+            rc |= expect(dsd_tg_policy_call_skip_active(&g_state, 1234, dsd_decode_now_mono_s()),
                          "watchdog skip armed before release");
-            rc |= expect(p25_sm_get_ctx()->state == P25_SM_TUNED && g_state.s_l4[0][0] != 0,
+            rc |= expect(p25_sm_get_ctx()->state == P25_SM_TUNED && dsd_p25p2_playout_level(&g_state, 0) > 0,
                          "refused Skip preserves releasable buffered carrier");
             g_result = DSD_TRUNK_TUNE_RESULT_OK;
         }
@@ -824,7 +829,7 @@ watchdog_call_skip_phases(void) {
                        "release before skip commits no skip text");
         }
         if (phase == 2) {
-            rc |= expect(!dsd_tg_policy_call_skip_active(&g_state, 1234, dsd_time_now_monotonic_s()),
+            rc |= expect(!dsd_tg_policy_call_skip_active(&g_state, 1234, dsd_decode_now_mono_s()),
                          "in-flight skip cannot arm an ended call");
             rc |= expect(g_state.ui_msg[0] == '\0', "in-flight skip of an ended call emits no toast");
         }
@@ -971,7 +976,7 @@ hunt_fade_and_avoids(void) {
     aloha(1);
     dmr_sm_ctx_t* ctx = dmr_sm_get_ctx();
     const int tunes = g_cc_tunes;
-    ctx->t_cc_sync_m = dsd_time_now_monotonic_s() - 3.0;
+    ctx->t_cc_sync_m = dsd_decode_now_mono_s() - 3.0;
     dmr_sm_tick_ctx(ctx, &g_opts, &g_state);
     dmr_sm_tick_ctx(ctx, &g_opts, &g_state);
     int rc =
@@ -1013,7 +1018,7 @@ pending_probe_timeout(void) {
     const uint64_t request = g_request;
     trunk_scan_test_set_now(9.0);
     dsd_engine_trunk_scan_tick(&g_opts, &g_state);
-    ctx->cc_tune_deadline_m = dsd_time_now_monotonic_s() - 1.0;
+    ctx->cc_tune_deadline_m = dsd_decode_now_mono_s() - 1.0;
     trunk_scan_test_set_now(10.0);
     dsd_engine_trunk_scan_tick(&g_opts, &g_state);
     int rc = expect(!ctx->cc_tune_request_id && ctx->state == DMR_SM_HUNTING
@@ -1046,7 +1051,7 @@ pending_park_timeout(void) {
     dmr_sm_ctx_t* ctx = dmr_sm_get_ctx();
     const uint64_t request = ctx->cc_tune_request_id;
     int rc = expect(request != 0U, "initial DMR park tracks its backend request");
-    ctx->cc_tune_deadline_m = dsd_time_now_monotonic_s() - 1.0;
+    ctx->cc_tune_deadline_m = dsd_decode_now_mono_s() - 1.0;
     dsd_engine_trunk_scan_tick(&g_opts, &g_state);
     rc |= expect(!ctx->cc_tune_request_id
                      && dsd_trunk_tuning_request_status(request, NULL) == DSD_TRUNK_TUNE_RESULT_FAILED,
@@ -1099,7 +1104,7 @@ visit_hook_defers_tuning_until_decoder_unwinds(void) {
     g_state.lcn_freq_count = 2;
     g_state.trunk_lcn_freq[0] = 451000000L;
     g_state.trunk_lcn_freq[1] = 452000000L;
-    dsd_scan_voice_gate_note_retune(&g_state, dsd_time_now_monotonic_s() - 2.0);
+    dsd_scan_voice_gate_note_retune(&g_state, dsd_decode_now_mono_s() - 2.0);
     p25_sm_tick_guard_enter();
     rc |= expect(dsd_frame_sync_hook_scan_visit_should_yield(&g_opts, &g_state),
                  "continuous conventional DMR yields on an expired -Y visit");
@@ -1108,6 +1113,45 @@ visit_hook_defers_tuning_until_decoder_unwinds(void) {
                  "disabled -Y cap leaves continuous decoding alone");
     p25_sm_tick_guard_leave();
     cleanup();
+    return rc;
+}
+
+/* Issue #651: a Skip or a lockout the tuner accepts ends the calls before the P25 Phase 2 playout drains, in the
+   no-carrier pass of the return to the control channel. What the playout queued for the blocked call stays muted
+   then: the block's verdict is taken while the call is still active. */
+static int
+user_block_mutes_queued_voice(void) {
+    int rc = 0;
+    for (int lockout = 0; lockout < 2; lockout++) {
+        if (setup(0.0f)) {
+            cleanup();
+            return 1;
+        }
+        dsd_engine_trunk_scan_shutdown(&g_opts, &g_state);
+        g_opts.trunk_scan_enabled = 0;
+        dsd_app_frontend_runtime_start(&g_opts, &g_state);
+        // The tuner accepts the return to the control channel.
+        dsd_trunk_tuning_hooks_set((dsd_trunk_tuning_hooks){
+            .tune_to_freq_request = vc_tune, .tune_to_cc_request = cc_tune, .return_to_cc_request = return_to_cc});
+        dsd_udp_audio_hooks_set((dsd_udp_audio_hooks){.blast = skip_audio_sink});
+        rc |= seed_skip_watchdog_call();
+        rc |= expect(dsd_p25p2_playout_level(&g_state, 0) == 1, "user block fixture queues a frame");
+        // A Phase 1 control channel the return tunes to through the trunk tuning hook.
+        g_state.p25_cc_is_tdma = 0;
+        g_result = DSD_TRUNK_TUNE_RESULT_OK;
+        rc |= expect(dsd_app_command_set_u8(lockout ? DSD_APP_CMD_LOCKOUT_SLOT : DSD_APP_CMD_SKIP_SLOT, 0) > 0,
+                     "user block queued");
+        rc |= expect(dsd_app_drain_cmds(&g_opts, &g_state) == 1, "user block drained");
+        rc |= expect(g_skip_flush.audio_blocks == 0, lockout ? "lockout keeps the locked-out call's queued frame silent"
+                                                             : "skip keeps the skipped call's queued frame silent");
+        dsd_call_snapshot call;
+        rc |= expect(dsd_call_state_get(&g_state, 0, &call) > 0 && call.phase == DSD_CALL_PHASE_ENDED,
+                     "user block ends the call");
+        rc |= expect(dsd_p25p2_playout_level(&g_state, 0) == 0, "user block consumes the muted frame");
+        dsd_udp_audio_hooks_set((dsd_udp_audio_hooks){0});
+        dsd_app_frontend_runtime_stop();
+        cleanup();
+    }
     return rc;
 }
 
@@ -1128,6 +1172,7 @@ main(void) {
     rc |= pending_probe_dwell();
     rc |= watchdog_ownership_thread();
     rc |= watchdog_call_skip_phases();
+    rc |= user_block_mutes_queued_voice();
     rc |= probe_grant_and_missing_anchor();
     rc |= cap_plus_idle_preserves_hangtime();
     rc |= hunt_fade_and_avoids();

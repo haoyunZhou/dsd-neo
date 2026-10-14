@@ -20,10 +20,32 @@
 #include <stdint.h>
 
 #include <dsd-neo/core/input_level.h>
+#include <dsd-neo/core/power.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/**
+ * @brief What the I/Q replay batch the decoder's last RTL read took its samples from ran on.
+ *
+ * Under `--iq-replay` the decoder paces the demod: a read hands out samples of one demod block's output, which the
+ * demod published with the stream generation and the profile it ran on (`rtl_stream_replay_batch` in
+ * `<dsd-neo/io/rtl_stream_c.h>`, of which these are the fields DSP reads).
+ */
+typedef struct dsd_rtl_stream_replay_batch {
+    uint32_t generation;        /**< The stream generation it was published under. */
+    int output_kind;            /**< Output kind (dsd_rtl_stream_metrics_hook_output_kind()). */
+    int channel_profile;        /**< Channel profile (dsd_rtl_stream_channel_profile). */
+    int symbol_rate_hz;         /**< Symbol rate in symbols/s. */
+    int levels;                 /**< Symbol levels. */
+    uint64_t media_start_ns;    /**< Capture time of the batch's first sample, time a MUTE omitted included. */
+    uint64_t media_duration_ns; /**< Capture time the batch spans. */
+    uint32_t output_count;      /**< Samples in the batch. */
+    uint32_t first_index;       /**< Index in the batch of the first sample the last read returned. */
+    /** Channel centre in Hz the batch was captured on, which a recorded RETUNE moves (issue #575). */
+    uint32_t center_frequency_hz;
+} dsd_rtl_stream_replay_batch;
 
 typedef struct {
     unsigned int (*output_rate_hz)(void);
@@ -47,14 +69,27 @@ typedef struct {
     int (*apply_demod_profile)(int cqpsk_enable, int symbol_rate_hz, int levels, int channel_profile, int ted_sps);
     /** Channel squelch threshold in mean-power units (rtl_squelch_level's); 0 switches it off. */
     void (*set_channel_squelch)(double mean_power);
+    /** The whole channel squelch setting: a LEVEL threshold or an AUTO margin over the learned floor. */
+    void (*set_channel_squelch_setting)(const dsd_squelch_setting* setting);
     /* Receive family / analog profile request (dsd_rx_family, dsd_analog_demod, width in Hz; 0 = default). */
     int (*apply_analog_profile)(int family, int kind, int width_hz);
+    /* A digital family request that lands the digital family's landing whichever family the front end runs
+       (rtl_stream_request_digital_family_landing()); cqpsk_explicit as for output_rate_for_family. */
+    int (*request_digital_family_landing)(int cqpsk_explicit);
     /* Published analog profile; returns 1 while the analog family is active. */
     int (*analog_profile)(int* out_kind, int* out_width_hz, int* out_lpf_on);
     /* 1 while the front end runs the analog receive family, including under a symbol profile applied on its own. */
     int (*analog_family_active)(void);
-    /* Output rate the front end will have once it runs the family (dsd_rx_family); 0 when unknown. */
-    unsigned int (*output_rate_for_family)(int family, int cqpsk_enable, int symbol_rate_hz);
+    /* 1 while it runs the analog family, or while requests or retunes already outstanding land a family (a digital
+       landing requested live included): a digital retune queued now lands on the digital family's landing
+       (rtl_stream_family_landing_after_pending()). */
+    int (*family_landing_after_pending)(void);
+    /* Output rate the front end will have once it runs the family (dsd_rx_family); 0 when unknown. cqpsk_explicit: the
+       CQPSK state is a trunk-scan target's own choice, which stands over DSD_NEO_CQPSK at the switch. */
+    unsigned int (*output_rate_for_family)(int family, int cqpsk_enable, int symbol_rate_hz, int cqpsk_explicit);
+    /* The batch the decoder's last read took its samples from, while the input is an I/Q replay; 1 with it filled,
+       anything else when there is none (dsd_rtl_stream_metrics_hook_replay_batch()). Decoder thread only. */
+    int (*replay_batch)(dsd_rtl_stream_replay_batch* out);
 } dsd_rtl_stream_metrics_hooks;
 
 typedef enum DSD_ATTR_PACKED dsd_rtl_stream_channel_profile {
@@ -91,6 +126,12 @@ int dsd_rtl_stream_metrics_hook_apply_demod_profile(int cqpsk_enable, int symbol
  */
 int dsd_rtl_stream_metrics_hook_set_channel_squelch(double mean_power);
 /**
+ * @brief Hand the demodulator a whole squelch setting (issue #518 follow-up): through set_channel_squelch_setting, or,
+ * when only set_channel_squelch is installed, as a threshold (an AUTO setting is then off). Returns 0 when forwarded and
+ * -1 when neither is installed or @p setting is NULL.
+ */
+int dsd_rtl_stream_metrics_hook_set_channel_squelch_setting(const dsd_squelch_setting* setting);
+/**
  * @brief Ask the RTL front end for a receive family and, for analog, a demodulator kind and channel width.
  *
  * Queued for the demod thread; switching family re-applies that family's fresh-open defaults. Leaving analog expects
@@ -103,6 +144,23 @@ int dsd_rtl_stream_metrics_hook_set_channel_squelch(double mean_power);
  * @return 0 when accepted, -1 when refused or when no RTL front end is installed.
  */
 int dsd_rtl_stream_metrics_hook_apply_analog_profile(int family, int kind, int width_hz);
+/**
+ * @brief Ask the RTL front end for the digital family, landing where the digital family's prediction says whichever
+ * family it runs where the request applies (issue #583).
+ *
+ * A caller that timed the decoder for that landing (dsd_rtl_stream_metrics_hook_output_rate_for_family()) because the
+ * analog family runs or outstanding work lands a family (dsd_rtl_stream_metrics_hook_family_landing_after_pending())
+ * asks with this rather than dsd_rtl_stream_metrics_hook_apply_analog_profile(DSD_RX_FAMILY_DIGITAL, ...), which
+ * switches only a front end on the analog family: the symbol profile queued after it
+ * (dsd_rtl_stream_metrics_hook_apply_demod_profile()) then lands on that prediction even where a retune that carries
+ * the digital family landed first (rtl_stream_request_digital_family_landing()).
+ *
+ * @param cqpsk_explicit Non-zero when the CQPSK state of the symbol profile that follows is a trunk-scan target's own
+ *                       choice, which stands over DSD_NEO_CQPSK; 0 lands where an open of the mode would.
+ * @return 0 when accepted, -1 when refused or when no RTL front end is installed. With no hook of its own installed
+ *         it asks as dsd_rtl_stream_metrics_hook_apply_analog_profile() does for the digital family.
+ */
+int dsd_rtl_stream_metrics_hook_request_digital_family_landing(int cqpsk_explicit);
 /**
  * @brief Read the published analog receive profile.
  *
@@ -119,17 +177,70 @@ int dsd_rtl_stream_metrics_hook_analog_profile(int* out_kind, int* out_width_hz,
  */
 int dsd_rtl_stream_metrics_hook_analog_family_active(void);
 /**
+ * @brief Report whether a digital retune queued now lands on a receive family's landing: the RTL front end runs the
+ * analog receive family now, or the receive requests and retunes already queued or in flight land a family once they
+ * have landed (issue #583).
+ *
+ * A digital retune queued now lands after that outstanding work: after an analog retune or request it switches the
+ * front end to the digital family, and behind a retune that carries the digital family it lands where that retune does,
+ * the digital family's landing, even on a front end already digital. The engine attaches the digital family to it by
+ * this answer (rtl_stream_family_landing_after_pending()), so a caller timing the decoder for where that retune lands
+ * (rtl_stream_output_rate_for_family(), not the live rate) reads it too, and so does a later timing of the row while
+ * the row's own retune, carrying the family, is outstanding. The answer can fall between two reads, as outstanding
+ * analog work fails on another thread, so a scan row's timing records the decision it made
+ * (dsd_scan_mode_timed_digital_family()), and the engine attaches the family to the row's retune by that decision. A
+ * live request timed by it asks for the landing (dsd_rtl_stream_metrics_hook_request_digital_family_landing()), so the
+ * front end lands there whichever order that request and the outstanding work land in.
+ *
+ * @return 1 when the analog family runs or outstanding work lands a family, 0 otherwise. With no hook of its own
+ *         installed it answers as dsd_rtl_stream_metrics_hook_analog_family_active() does, the live family alone.
+ */
+int dsd_rtl_stream_metrics_hook_family_landing_after_pending(void);
+/**
  * @brief Predict the output rate the RTL front end will have once it runs @p family.
  *
  * A family switch lands on the demod thread after the request returns, so a caller timing the decoder for the new
  * family reads this rather than the current output rate.
  *
  * @param family         dsd_rx_family.
- * @param cqpsk_enable   Non-zero for the CQPSK symbol output (digital family only).
+ * @param cqpsk_enable   Non-zero for the CQPSK symbol output (digital family only). DSD_NEO_CQPSK overrides it when
+ *                       set, as it does where the switch lands, unless @p cqpsk_explicit.
  * @param symbol_rate_hz Digital symbol rate, which decides the digital resampling policy.
+ * @param cqpsk_explicit Non-zero when @p cqpsk_enable is a trunk-scan target's own choice (a P25 target's
+ *                       `modulation`, or a DMR/NXDN target's FSK), which stands over DSD_NEO_CQPSK where the retune
+ *                       the engine queues for it lands, or the live landing a republish of the row asks for
+ *                       (rtl_stream_output_rate_for_family(), issue #583).
  * @return Predicted output rate in Hz, or 0 when it is unknown or no RTL front end is installed.
  */
-unsigned int dsd_rtl_stream_metrics_hook_output_rate_for_family(int family, int cqpsk_enable, int symbol_rate_hz);
+unsigned int dsd_rtl_stream_metrics_hook_output_rate_for_family(int family, int cqpsk_enable, int symbol_rate_hz,
+                                                                int cqpsk_explicit);
+/**
+ * @brief Read what the I/Q replay batch the decoder's last RTL read took its samples from ran on.
+ *
+ * Call it on the decoder thread only, while the RTL stream is open, right after a read that returned samples: the
+ * engine's hook reads the stream's state as only the thread that opens and closes the stream may
+ * (rtl_stream_get_replay_batch()).
+ *
+ * @param out [out] The batch.
+ * @return 1 with @p out filled while the input is an I/Q replay, which the decoder paces; 0 otherwise (a live input,
+ *         no replay read yet, no hook installed, or a NULL @p out), with @p out zeroed.
+ */
+int dsd_rtl_stream_metrics_hook_replay_batch(dsd_rtl_stream_replay_batch* out);
+/**
+ * @brief Run the decode clock's media time to the first sample the decoder's last RTL read returned, while the input is
+ * an I/Q replay, and report the centre that sample was captured on.
+ *
+ * For the readers that take one sample at a time (the analog monitor, M17, EDACS analog): the sample's capture time is
+ * the read's batch span at its index (dsd_decode_clock_batch_media_ns()), which dsd_decode_clock_set_media_ns() takes
+ * (issue #572). The symbol cache does the same for each sample it hands out. Call it on the decoder thread right after a
+ * read that returned samples, as dsd_rtl_stream_metrics_hook_replay_batch(). The caller notes the centre for the
+ * tuned-frequency reading (dsd_opts_note_iq_replay_center(), issue #575).
+ *
+ * @param center_hz_out [out] The batch's capture centre in Hz (`center_frequency_hz`), written only when this returns
+ *                      1; may be NULL.
+ * @return 1 when it set the media time; 0 when there is no replay batch (a live input, or no hook installed).
+ */
+int dsd_rtl_stream_metrics_hook_replay_advance_decode_clock(uint32_t* center_hz_out);
 int dsd_rtl_stream_metrics_hook_cqpsk_status(int* out_cqpsk_enable, int* out_cqpsk_timing_active);
 int dsd_rtl_stream_metrics_hook_request_cqpsk_reacquire(void);
 int dsd_rtl_stream_metrics_hook_cqpsk_timing_bias(void);

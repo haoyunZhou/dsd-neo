@@ -160,8 +160,9 @@ p25p1_apply_nac_update(dsd_state* state, int new_nac) {
         if (valid_nac) {
             state->nac = new_nac;
         }
-        if (state->p2_hardset == 0 && valid_nac) {
+        if (state->p2_hardset == 0 && valid_nac && state->p2_cc != (unsigned long long)new_nac) {
             state->p2_cc = (unsigned long long)new_nac;
+            state->p2_cc_verified = 0U; // a Phase 1 NID proves no Phase 2 seed (issue #575)
         }
         state->debug_header_errors++;
     }
@@ -231,21 +232,12 @@ p25p1_decode_nid_and_duid(dsd_opts* opts, dsd_state* state) {
     return duid;
 }
 
+/* A P25 Phase 1 header, terminator or control frame ends the P25 capture segment on both slots: a Phase 2 slot 2
+   capture left on the carrier belongs to traffic that is over (issue #661). Another protocol's capture is not P25's to
+   close. */
 static void
-p25p1_close_mbe_out_if_open(dsd_opts* opts, dsd_state* state) {
-    if (opts->mbe_out_f != NULL) {
-        closeMbeOutFile(opts, state);
-    }
-}
-
-static void
-p25p1_close_mbe_out_pair_if_open(dsd_opts* opts, dsd_state* state) {
-    if (opts->mbe_out_f != NULL) {
-        closeMbeOutFile(opts, state);
-    }
-    if (opts->mbe_out_fR != NULL) {
-        closeMbeOutFileR(opts, state);
-    }
+p25p1_close_mbe_out(dsd_opts* opts, dsd_state* state) {
+    dsd_mbe_out_close_protocol(opts, state, DSD_MBE_OUT_BOTH, DSD_SYNC_P25P1_POS);
 }
 
 static void
@@ -260,9 +252,7 @@ p25p1_handle_hdu(dsd_opts* opts, dsd_state* state) {
         printFrameInfo(opts, state);
         DSD_FPRINTF(stderr, " HDU\n");
     }
-    if (opts->mbe_out_dir[0] != 0) {
-        p25p1_close_mbe_out_if_open(opts, state);
-    }
+    p25p1_close_mbe_out(opts, state);
 
     mbe_initMbeParms(state->cur_mp, state->prev_mp, state->prev_mp_enhanced);
     state->lastp25type = 2;
@@ -313,9 +303,7 @@ p25p1_handle_tdulc(dsd_opts* opts, dsd_state* state) {
         printFrameInfo(opts, state);
         DSD_FPRINTF(stderr, " TDULC\n");
     }
-    if (opts->mbe_out_dir[0] != 0) {
-        p25p1_close_mbe_out_if_open(opts, state);
-    }
+    p25p1_close_mbe_out(opts, state);
 
     mbe_initMbeParms(state->cur_mp, state->prev_mp, state->prev_mp_enhanced);
     state->lastp25type = 0;
@@ -338,9 +326,7 @@ p25p1_handle_tdu(dsd_opts* opts, dsd_state* state) {
         printFrameInfo(opts, state);
         DSD_FPRINTF(stderr, " TDU\n");
     }
-    if (opts->mbe_out_dir[0] != 0) {
-        p25p1_close_mbe_out_if_open(opts, state);
-    }
+    p25p1_close_mbe_out(opts, state);
 
     mbe_initMbeParms(state->cur_mp, state->prev_mp, state->prev_mp_enhanced);
     state->lastp25type = 0;
@@ -357,9 +343,7 @@ p25p1_handle_tsbk(dsd_opts* opts, dsd_state* state) {
         printFrameInfo(opts, state);
         DSD_FPRINTF(stderr, " TSBK");
     }
-    if (opts->mbe_out_dir[0] != 0) {
-        p25p1_close_mbe_out_pair_if_open(opts, state);
-    }
+    p25p1_close_mbe_out(opts, state);
     if (opts->resume > 0) {
         resumeScan(opts, state);
     }
@@ -377,9 +361,7 @@ p25p1_handle_mpdu(dsd_opts* opts, dsd_state* state) {
         printFrameInfo(opts, state);
         DSD_FPRINTF(stderr, " MPDU\n");
     }
-    if (opts->mbe_out_dir[0] != 0) {
-        p25p1_close_mbe_out_pair_if_open(opts, state);
-    }
+    p25p1_close_mbe_out(opts, state);
     if (opts->resume > 0) {
         resumeScan(opts, state);
     }

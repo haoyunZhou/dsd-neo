@@ -10,6 +10,7 @@
  */
 
 #include <dsd-neo/core/audio.h>
+#include <dsd-neo/core/audio_input_switch.h>
 #include <dsd-neo/core/channel_mode.h>
 #include <dsd-neo/core/constants.h>
 #include <dsd-neo/core/csv_import.h>
@@ -18,15 +19,18 @@
 #include <dsd-neo/core/file_io.h>
 #include <dsd-neo/core/key_set.h>
 #include <dsd-neo/core/opts.h>
+#include <dsd-neo/core/power.h>
 #include <dsd-neo/core/safe_api.h>
 #include <dsd-neo/core/source_alias.h>
 #include <dsd-neo/core/state.h>
 #include <dsd-neo/core/state_ext.h>
 #include <dsd-neo/core/talkgroup_policy.h>
 #include <dsd-neo/dsp/demod_pipeline.h>
+#include <dsd-neo/engine/channel_scan.h>
+#include <dsd-neo/engine/frame_processing.h>
 #include <dsd-neo/engine/p25_bandplan_export.h>
+#include <dsd-neo/engine/trunk_tuning.h>
 #include <dsd-neo/io/control.h>
-#include <dsd-neo/io/rigctl_client.h>
 #include <dsd-neo/io/rtl_stream_c.h>
 #include <dsd-neo/io/udp_socket_connect.h>
 #include <dsd-neo/platform/file_compat.h>
@@ -35,6 +39,8 @@
 #include <dsd-neo/protocol/p25/p25_sm_watchdog.h>
 #include <dsd-neo/runtime/analog_channel.h>
 #include <dsd-neo/runtime/config.h>
+#include <dsd-neo/runtime/decode_clock.h>
+#include <dsd-neo/runtime/input_failure.h>
 #include <dsd-neo/runtime/log.h>
 #include <dsd-neo/runtime/scan_mode.h>
 #include <dsd-neo/runtime/scan_options.h>
@@ -44,6 +50,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include "services.h"
 
 #include <dsd-neo/core/opts_fwd.h>
@@ -55,10 +62,55 @@
 #include <sys/socket.h>
 #endif
 
+/* LOG_INFO lines saying an I/Q replay restarted on the system clock (svc_rtl_stop_locked()). */
+static int g_replay_restart_notices;
+
+/* The input switch the services ask for (issue #634), recorded rather than run: CORE_AUDIO_INPUT_SWITCH tests it. */
+static int g_switch_calls;
+static int g_switch_result;
+static dsd_audio_input_kind g_switch_kind;
+static int g_switch_path_null;
+static char g_switch_path[256];
+static char g_switch_host[256];
+static int g_switch_port;
+static dsd_audio_input_kind g_path_kind = DSD_AUDIO_INPUT_PCM_FILE;
+
+int
+dsd_audio_switch_input(dsd_opts* opts, dsd_state* state, const dsd_audio_input_request* req) {
+    (void)opts;
+    (void)state;
+    g_switch_calls++;
+    g_switch_kind = req->kind;
+    g_switch_path_null = req->path == NULL;
+    DSD_SNPRINTF(g_switch_path, sizeof g_switch_path, "%s", req->path ? req->path : "");
+    DSD_SNPRINTF(g_switch_host, sizeof g_switch_host, "%s", req->host ? req->host : "");
+    g_switch_port = req->port;
+    return g_switch_result;
+}
+
+dsd_audio_input_kind
+dsd_audio_path_input_kind(const char* path) {
+    (void)path;
+    return g_path_kind;
+}
+
+static void
+reset_switch_stub(int result) {
+    g_switch_calls = 0;
+    g_switch_result = result;
+    g_switch_kind = DSD_AUDIO_INPUT_PCM_FILE;
+    g_switch_path_null = 0;
+    g_switch_path[0] = '\0';
+    g_switch_host[0] = '\0';
+    g_switch_port = 0;
+    g_path_kind = DSD_AUDIO_INPUT_PCM_FILE;
+}
+
 void
 dsd_neo_log_write(dsd_neo_log_level_t level, const char* format, ...) {
-    (void)level;
-    (void)format;
+    if (level == LOG_LEVEL_INFO && format && strstr(format, "IQ replay restarted mid-run") != NULL) {
+        g_replay_restart_notices++;
+    }
 }
 
 FILE*
@@ -398,13 +450,6 @@ dsd_event_history_reset(dsd_state* state) {
     }
 }
 
-dsd_socket_t
-Connect(char* hostname, int portno) {
-    (void)hostname;
-    (void)portno;
-    return DSD_INVALID_SOCKET;
-}
-
 static int g_udp_connect_result = -1;
 static int g_udp_connectA_calls = 0;
 static int g_udp_connectA_result = -1;
@@ -427,12 +472,39 @@ udp_socket_connectA(dsd_opts* opts, dsd_state* state) {
     return g_udp_connectA_result;
 }
 
+static int g_io_control_set_freq_result = -1;
+
 int
-io_control_set_freq(dsd_opts* opts, dsd_state* state, long int freq) {
+io_control_set_freq(dsd_opts* opts, const dsd_state* state, long int freq) {
     (void)opts;
     (void)state;
     (void)freq;
-    return -1;
+    return g_io_control_set_freq_result;
+}
+
+/* The engine's carrier boundary and the stream-start source note (issue #575), recorded: these services call them at
+   their success points, and the engine and config-apply tests run the real ones. */
+static int g_carrier_boundary_calls = 0;
+static int g_carrier_boundary_kind = -1;
+static int g_carrier_boundary_guarded = -1;
+static int g_stream_source_notes = 0;
+static int g_stream_source_guarded = -1;
+
+void
+dsd_engine_carrier_boundary(dsd_opts* opts, dsd_state* state, dsd_carrier_boundary_kind kind, int guard_held) {
+    (void)opts;
+    (void)state;
+    g_carrier_boundary_calls++;
+    g_carrier_boundary_kind = (int)kind;
+    g_carrier_boundary_guarded = guard_held;
+}
+
+void
+dsd_engine_note_stream_source(dsd_opts* opts, dsd_state* state, int guard_held) {
+    (void)opts;
+    (void)state;
+    g_stream_source_notes++;
+    g_stream_source_guarded = guard_held;
 }
 
 static int g_p25_tick_guard_depth = 0;
@@ -446,7 +518,25 @@ static int g_rtl_create_calls = 0;
 static int g_rtl_start_calls = 0;
 static int g_rtl_create_result = -1;
 static int g_rtl_start_result = -1;
+/* Issue #578: a device failure (this native code; 0: none) the next start latches before it returns, as an Airspy's
+   monitor thread does when the device stops right after the start launched it (airspy_monitor()). One-shot. */
+static int g_rtl_start_latches_code = 0;
+/* Issue #578: 1 has the next start clear the input failure latch first, as an Airspy that opens does
+   (airspy_source_open()), whether the start then fails or latches a failure after it. One-shot. */
+static int g_rtl_start_clears_latch = 0;
+/* Issue #578: whether the last create was handed an I/Q capture request, and how many creates were. */
+static int g_rtl_create_capture = -1;
+static int g_rtl_create_captures = 0;
 static int g_rtltcp_autotune_result = 0;
+
+/* No rigctl peer is asked anything here (issue #621): the width and -B services' follow finds none, and
+   APP_CONTROL_RIGCTL_PASSBAND and APP_COMMAND_QUEUE drive the peer. */
+int
+dsd_engine_scan_rigctl_apply_modulation(const dsd_opts* opts, const dsd_state* state) {
+    (void)opts;
+    (void)state;
+    return -1;
+}
 
 void
 p25_sm_tick_guard_enter(void) {
@@ -491,9 +581,10 @@ rtl_stream_destroy(RtlSdrContext* ctx) {
 
 int
 rtl_stream_create(dsd_opts* opts, RtlSdrContext** out_ctx) {
-    (void)opts;
     note_rtl_lifecycle_call();
     g_rtl_create_calls++;
+    g_rtl_create_capture = opts ? opts->iq_capture_requested : -1;
+    g_rtl_create_captures += g_rtl_create_capture == 1;
     if (out_ctx) {
         *out_ctx = g_rtl_create_result == 0 ? (RtlSdrContext*)out_ctx : NULL;
     }
@@ -505,7 +596,45 @@ rtl_stream_start(RtlSdrContext* ctx) {
     (void)ctx;
     note_rtl_lifecycle_call();
     g_rtl_start_calls++;
+    if (g_rtl_start_clears_latch) {
+        dsd_input_failure_clear();
+        g_rtl_start_clears_latch = 0;
+    }
+    if (g_rtl_start_latches_code != 0) {
+        dsd_input_failure_report(DSD_INPUT_FAILURE_DEVICE, g_rtl_start_latches_code);
+        g_rtl_start_latches_code = 0;
+    }
     return g_rtl_start_result;
+}
+
+/* What the last start recorded when its analog channel check refused it (issue #578): set by each case. */
+static int g_start_refused;
+static int g_start_refused_kind;
+static int g_start_refused_width_hz;
+static int g_start_refused_rate_hz;
+
+/* Whether the last start opened the I/Q capture writer (issue #578): the wording of a recovery restart's log follows
+   it, which APP_COMMAND_QUEUE checks. */
+int
+rtl_stream_start_opened_capture(void) {
+    return 0;
+}
+
+int
+rtl_stream_start_analog_refusal(int* out_kind, int* out_width_hz, int* out_rate_hz) {
+    if (!g_start_refused) {
+        return 0;
+    }
+    if (out_kind) {
+        *out_kind = g_start_refused_kind;
+    }
+    if (out_width_hz) {
+        *out_width_hz = g_start_refused_width_hz;
+    }
+    if (out_rate_hz) {
+        *out_rate_hz = g_start_refused_rate_hz;
+    }
+    return 1;
 }
 
 int
@@ -535,9 +664,28 @@ rtl_stream_request_ppm(dsd_opts* opts, int ppm) {
     return 0;
 }
 
+/* A restart under a trunk scan puts its configured tuner autogain on the stream (issue #518 follow-up); none runs here. */
+void
+rtl_stream_enforce_tuner_autogain(int onoff) {
+    (void)onoff;
+}
+
+/* The squelch the services hand the demod: a level, or an auto squelch whole (issue #518 follow-up). */
+static int g_squelch_level_pushes;
+static float g_squelch_level_pushed;
+static int g_squelch_setting_pushes;
+static dsd_squelch_setting g_squelch_setting_pushed;
+
 void
 rtl_stream_set_channel_squelch(float level) {
-    (void)level;
+    g_squelch_level_pushes++;
+    g_squelch_level_pushed = level;
+}
+
+void
+rtl_stream_set_channel_squelch_setting(const dsd_squelch_setting* setting) {
+    g_squelch_setting_pushes++;
+    g_squelch_setting_pushed = *setting;
 }
 
 int
@@ -565,14 +713,18 @@ static int g_analog_check_calls;
 static int g_demod_rate_hz;
 static int g_nfm_publish_calls;
 static int g_nfm_publish_width_hz;
+/* The analog kind of the last width published, and what the running front end's check was asked (issue #524). */
+static int g_width_publish_kind;
+static int g_analog_check_kind;
+static int g_analog_check_width_hz;
 /* What the publish answers: -1 is a front end that refused the request after all (a retune moved its rate). */
 static int g_nfm_publish_result;
 
 int
 rtl_stream_check_analog_profile(int family, int kind, int width_hz) {
     (void)family;
-    (void)kind;
-    (void)width_hz;
+    g_analog_check_kind = kind;
+    g_analog_check_width_hz = width_hz;
     g_analog_check_calls++;
     return g_analog_check_result;
 }
@@ -582,10 +734,14 @@ rtl_stream_get_demod_rate_hz(void) {
     return g_demod_rate_hz;
 }
 
+/* The request rate when a case sets one apart from the metrics rate (a retune the metrics have not caught up with);
+   -1 follows g_demod_rate_hz. */
+static int g_request_rate_hz = -1;
+
 /* The rate a running stream holds analog requests to, which a channel-map import holds its nfm rows to. */
 int
 rtl_stream_get_request_rate_hz(void) {
-    return g_demod_rate_hz;
+    return g_request_rate_hz >= 0 ? g_request_rate_hz : g_demod_rate_hz;
 }
 
 /* The analog width view's reading of the unset NFM default where the channel filter runs but the rate cannot realize
@@ -597,12 +753,21 @@ dsd_channel_lpf_legacy_wide_width_hz(int rate_hz) {
 }
 
 int
-svc_publish_nfm_bandwidth(const dsd_opts* opts, const dsd_state* state, int configured_before_hz) {
+svc_publish_analog_bandwidth(const dsd_opts* opts, const dsd_state* state, int kind, int configured_before_hz) {
     (void)state;
     (void)configured_before_hz;
     g_nfm_publish_calls++;
-    g_nfm_publish_width_hz = opts ? opts->analog_nfm_bandwidth_hz : -1;
+    g_width_publish_kind = kind;
+    g_nfm_publish_width_hz =
+        opts ? (kind == DSD_ANALOG_DEMOD_AM ? opts->analog_am_bandwidth_hz : opts->analog_nfm_bandwidth_hz) : -1;
     return g_nfm_publish_result;
+}
+
+/* A channel-map adopt or clear leaves the scan through app-control's record of the leave (symbol_profile.c, not linked
+   here, which APP_COMMAND_QUEUE drives): the engine's leave, as the stubs run it. */
+int
+svc_leave_channel_scan(dsd_opts* opts, dsd_state* state) {
+    return dsd_engine_channel_scan_leave(opts, state);
 }
 
 static int
@@ -650,6 +815,14 @@ expect_str(const char* tag, const char* got, const char* want) {
     return 0;
 }
 
+/* The input failure the session has latched (dsd_input_failure_get()) is @p kind with @p code. */
+static int
+expect_input_failure(const char* tag, int kind, int code) {
+    dsd_input_failure failure;
+    dsd_input_failure_get(&failure);
+    return expect_int(tag, failure.kind, kind) | expect_int(tag, failure.native_code, code);
+}
+
 static int
 test_mute_and_protocol_inversion_toggles(void) {
     int rc = 0;
@@ -680,6 +853,22 @@ test_mute_and_protocol_inversion_toggles(void) {
     rc |= expect_int("m17 protocol inversion toggled independently", opts.inverted_m17, 0);
     rc |= expect_int("ysf inversion unchanged by specific toggles", opts.inverted_ysf, 0);
 
+    return rc;
+}
+
+// Per-call WAV switched on mid-call holds only what follows, so each recording is stamped with the decode time it was
+// opened; the rdio-scanner sidecar starts there rather than at the call's start (#673).
+static int
+test_enable_per_call_wav_stamps_open_time(void) {
+    static dsd_opts opts;
+    DSD_MEMSET(&opts, 0, sizeof(opts));
+    DSD_SNPRINTF(opts.wav_out_dir, sizeof(opts.wav_out_dir), "%s", ".");
+    const time_t opened = (time_t)1700000123;
+    dsd_decode_clock_use_test((uint64_t)opened * UINT64_C(1000000000));
+    (void)svc_enable_per_call_wav(&opts, NULL);
+    int rc = expect_int("slot 1 per-call WAV stamped with its open time", opts.wav_out_open_time == opened, 1);
+    rc |= expect_int("slot 2 per-call WAV stamped with its open time", opts.wav_out_open_timeR == opened, 1);
+    dsd_decode_clock_use_system();
     return rc;
 }
 
@@ -760,6 +949,20 @@ test_p2_trunking_and_slot_controls(void) {
     rc |= expect_int("setmod bandwidth clamps high", opts.setmod_bw, 25000);
     svc_set_rigctl_setmod_bw(&opts, 12500);
     rc |= expect_int("setmod bandwidth stores in range", opts.setmod_bw, 12500);
+    /* Issue #621: the -B command's service stores and clamps the same way with no rigctl peer to ask, and says why it
+       cannot store without options. */
+    {
+        char why[96];
+        rc |= expect_int("setmod apply without a peer",
+                         svc_apply_rigctl_setmod_bw(&opts, &state, 30000, 0, why, sizeof why), 0);
+        rc |= expect_int("setmod apply clamps", opts.setmod_bw, 25000);
+        rc |= expect_str("setmod apply leaves no reason", why, "");
+        rc |= expect_int("setmod apply without options",
+                         svc_apply_rigctl_setmod_bw(NULL, &state, 12500, 0, why, sizeof why), -1);
+        rc |= expect_str("setmod apply without options says why", why,
+                         "Rigctl setmod BW: no decoder options to set it in");
+        svc_set_rigctl_setmod_bw(&opts, 12500);
+    }
 
     svc_toggle_reverse_mute(&opts);
     svc_toggle_lcw_retune(&opts);
@@ -791,17 +994,148 @@ static int
 test_payload_symbol_and_pulse_state(void) {
     int rc = 0;
     static dsd_opts opts;
+    static dsd_state state;
     DSD_MEMSET(&opts, 0, sizeof(opts));
+    DSD_MEMSET(&state, 0, sizeof(state));
 
     rc |= expect_int("pulse output null opts", svc_set_pulse_output(NULL, "1"), -1);
-    rc |= expect_int("pulse input null opts", svc_set_pulse_input(NULL, "1"), -1);
     rc |= expect_int("pulse output valid index", svc_set_pulse_output(&opts, "2"), 0);
     rc |= expect_str("pulse output device set", opts.audio_out_dev, "pulse");
     rc |= expect_int("pulse output type set", opts.audio_out_type, 0);
-    rc |= expect_int("pulse input valid index", svc_set_pulse_input(&opts, "3"), 0);
-    rc |= expect_str("pulse input device set", opts.audio_in_dev, "pulse");
-    rc |= expect_int("pulse input type set", opts.audio_in_type, AUDIO_IN_PULSE);
 
+    /* Pulse input is an input switch (issue #634): the device asked for, "" for the default. */
+    reset_switch_stub(DSD_AUDIO_INPUT_SWITCHED);
+    rc |= expect_int("pulse input null opts", svc_set_pulse_input(NULL, &state, "1"), DSD_AUDIO_INPUT_KEPT);
+    rc |= expect_int("pulse input null device", svc_set_pulse_input(&opts, &state, NULL), DSD_AUDIO_INPUT_KEPT);
+    rc |= expect_int("pulse input asks nothing when refused", g_switch_calls, 0);
+    rc |= expect_int("pulse input valid index", svc_set_pulse_input(&opts, &state, "3"), DSD_AUDIO_INPUT_SWITCHED);
+    rc |= expect_int("pulse input switches", g_switch_calls, 1);
+    rc |= expect_int("pulse input kind", (int)g_switch_kind, (int)DSD_AUDIO_INPUT_PULSE);
+    rc |= expect_str("pulse input device", g_switch_path, "3");
+    reset_switch_stub(DSD_AUDIO_INPUT_KEPT);
+    rc |= expect_int("pulse input failure", svc_set_pulse_input(&opts, &state, ""), DSD_AUDIO_INPUT_KEPT);
+    rc |= expect_str("pulse input default device", g_switch_path, "");
+    rc |= expect_int("pulse input default device given", g_switch_path_null, 0);
+
+    /* Stop replay goes to the configured Pulse device. */
+    reset_switch_stub(DSD_AUDIO_INPUT_SWITCHED);
+    rc |= expect_int("stop playback switches", svc_stop_playback(&opts, &state), DSD_AUDIO_INPUT_SWITCHED);
+    rc |= expect_int("stop playback kind", (int)g_switch_kind, (int)DSD_AUDIO_INPUT_PULSE);
+    rc |= expect_int("stop playback configured device", g_switch_path_null, 1);
+    return rc;
+}
+
+/* The input switch requests the menu services build (issue #634). */
+static int
+test_input_switch_requests(void) {
+    int rc = 0;
+    static dsd_opts opts;
+    static dsd_state state;
+    DSD_MEMSET(&opts, 0, sizeof(opts));
+    DSD_MEMSET(&state, 0, sizeof(state));
+
+    reset_switch_stub(DSD_AUDIO_INPUT_SWITCHED);
+    g_path_kind = DSD_AUDIO_INPUT_SYMBOL_FLT;
+    rc |= expect_int("file in follows -i", svc_open_audio_file_in(&opts, &state, "c.raw"), DSD_AUDIO_INPUT_SWITCHED);
+    rc |= expect_int("file in kind is the path's", (int)g_switch_kind, (int)DSD_AUDIO_INPUT_SYMBOL_FLT);
+    rc |= expect_str("file in path", g_switch_path, "c.raw");
+    reset_switch_stub(DSD_AUDIO_INPUT_SWITCHED);
+    rc |= expect_int("file in empty path", svc_open_audio_file_in(&opts, &state, ""), DSD_AUDIO_INPUT_KEPT);
+    rc |= expect_int("file in null path", svc_open_audio_file_in(&opts, &state, NULL), DSD_AUDIO_INPUT_KEPT);
+    rc |= expect_int("file in asks nothing for no path", g_switch_calls, 0);
+
+    rc |= expect_int("symbol stream", svc_open_symbol_stream_in(&opts, &state, "s.sym"), DSD_AUDIO_INPUT_SWITCHED);
+    rc |= expect_int("symbol stream kind", (int)g_switch_kind, (int)DSD_AUDIO_INPUT_SYMBOL_FLT);
+    rc |= expect_int("symbol bin", svc_open_symbol_in(&opts, &state, "cap.bin"), DSD_AUDIO_INPUT_SWITCHED);
+    rc |= expect_int("symbol bin kind", (int)g_switch_kind, (int)DSD_AUDIO_INPUT_SYMBOL_BIN);
+    rc |= expect_str("symbol bin path", g_switch_path, "cap.bin");
+    reset_switch_stub(DSD_AUDIO_INPUT_KEPT);
+    rc |= expect_int("symbol bin missing file", svc_open_symbol_in(&opts, &state, "missing.bin"), DSD_AUDIO_INPUT_KEPT);
+    rc |= expect_int("symbol bin empty path", svc_open_symbol_in(&opts, &state, ""), DSD_AUDIO_INPUT_KEPT);
+    rc |= expect_int("symbol bin empty path asks nothing", g_switch_calls, 1);
+
+    reset_switch_stub(DSD_AUDIO_INPUT_RESTARTED);
+    rc |= expect_int("udp input", svc_udp_input_config(&opts, &state, "0.0.0.0", 7360), DSD_AUDIO_INPUT_RESTARTED);
+    rc |= expect_int("udp kind", (int)g_switch_kind, (int)DSD_AUDIO_INPUT_UDP);
+    rc |= expect_str("udp bind", g_switch_host, "0.0.0.0");
+    rc |= expect_int("udp port", g_switch_port, 7360);
+    rc |= expect_int("udp null opts", svc_udp_input_config(NULL, &state, "0.0.0.0", 7360), DSD_AUDIO_INPUT_KEPT);
+    rc |= expect_int("udp null state", svc_udp_input_config(&opts, NULL, "0.0.0.0", 7360), DSD_AUDIO_INPUT_KEPT);
+    return rc;
+}
+
+/* The engine modes that read no input a switch would open (issue #634). */
+static int
+test_input_switch_unsupported_modes(void) {
+    int rc = 0;
+    static dsd_opts opts;
+    DSD_MEMSET(&opts, 0, sizeof(opts));
+    rc |= expect_int("live decoding switches", svc_input_switch_unsupported(&opts) == NULL, 1);
+    rc |= expect_int("no session", svc_input_switch_unsupported(NULL) != NULL, 1);
+    opts.playfiles = 1;
+    rc |= expect_int("mbe playback", svc_input_switch_unsupported(&opts) != NULL, 1);
+    opts.playfiles = 0;
+    opts.m17decoderip = 1;
+    rc |= expect_int("m17 ip frames", svc_input_switch_unsupported(&opts) != NULL, 1);
+    opts.m17decoderip = 0;
+    opts.m17encoderbrt = 1;
+    rc |= expect_int("m17 bert", svc_input_switch_unsupported(&opts) != NULL, 1);
+    opts.m17encoderbrt = 0;
+    opts.m17encoderpkt = 1;
+    rc |= expect_int("m17 packet", svc_input_switch_unsupported(&opts) != NULL, 1);
+    opts.m17encoderpkt = 0;
+    opts.m17encoder = 1;
+    rc |= expect_int("m17 stream encoder", svc_input_switch_unsupported(&opts) != NULL, 1);
+
+    DSD_MEMSET(&opts, 0, sizeof(opts));
+    const int playback_types[] = {AUDIO_IN_WAV, AUDIO_IN_SYMBOL_BIN, AUDIO_IN_SYMBOL_FLT};
+    for (size_t i = 0; i < sizeof playback_types / sizeof playback_types[0]; i++) {
+        opts.audio_in_type = playback_types[i];
+        rc |= expect_int("a file is a playback", svc_playback_running(&opts), 1);
+    }
+    const int live_types[] = {AUDIO_IN_PULSE, AUDIO_IN_UDP, AUDIO_IN_TCP, AUDIO_IN_RTL, AUDIO_IN_STDIN};
+    for (size_t i = 0; i < sizeof live_types / sizeof live_types[0]; i++) {
+        opts.audio_in_type = live_types[i];
+        rc |= expect_int("a live input is no playback", svc_playback_running(&opts), 0);
+    }
+    rc |= expect_int("no options, no playback", svc_playback_running(NULL), 0);
+    return rc;
+}
+
+/* The device Input > Switch source > RTL-SDR opens (issue #634). */
+static int
+test_rtl_row_destination(void) {
+    int rc = 0;
+    static dsd_opts opts;
+    char dev[64];
+    DSD_MEMSET(&opts, 0, sizeof(opts));
+
+    DSD_SNPRINTF(opts.audio_in_dev, sizeof opts.audio_in_dev, "%s", "soapy:driver=x");
+    svc_rtl_row_destination(&opts, dev, sizeof dev);
+    rc |= expect_str("a running soapy spec stays", dev, "soapy:driver=x");
+    DSD_SNPRINTF(opts.audio_in_dev, sizeof opts.audio_in_dev, "%s", "airspy");
+    DSD_SNPRINTF(opts.radio_in_dev, sizeof opts.radio_in_dev, "%s", "soapy:driver=x");
+    svc_rtl_row_destination(&opts, dev, sizeof dev);
+    rc |= expect_str("from airspy, the remembered radio", dev, "soapy:driver=x");
+    opts.radio_in_dev[0] = '\0';
+    svc_rtl_row_destination(&opts, dev, sizeof dev);
+    rc |= expect_str("from airspy with nothing remembered: rtl", dev, "rtl");
+    DSD_SNPRINTF(opts.radio_in_dev, sizeof opts.radio_in_dev, "%s", "soapy:driver=x");
+    DSD_SNPRINTF(opts.audio_in_dev, sizeof opts.audio_in_dev, "%s", "pulse");
+    svc_rtl_row_destination(&opts, dev, sizeof dev);
+    rc |= expect_str("pcm goes back to the remembered radio", dev, "soapy:driver=x");
+    DSD_SNPRINTF(opts.radio_in_dev, sizeof opts.radio_in_dev, "%s", "rtltcp:host:1234");
+    DSD_SNPRINTF(opts.audio_in_dev, sizeof opts.audio_in_dev, "%s", "udp:127.0.0.1:7355");
+    svc_rtl_row_destination(&opts, dev, sizeof dev);
+    rc |= expect_str("pcm goes back to rtl_tcp", dev, "rtltcp:host:1234");
+    DSD_SNPRINTF(opts.radio_in_dev, sizeof opts.radio_in_dev, "%s", "airspy:serial=1");
+    svc_rtl_row_destination(&opts, dev, sizeof dev);
+    rc |= expect_str("a remembered airspy is not the rtl row's", dev, "rtl");
+    opts.radio_in_dev[0] = '\0';
+    svc_rtl_row_destination(&opts, dev, sizeof dev);
+    rc |= expect_str("no radio ran: rtl", dev, "rtl");
+    svc_rtl_row_destination(NULL, dev, sizeof dev);
+    rc |= expect_str("no options: rtl", dev, "rtl");
     return rc;
 }
 
@@ -819,6 +1153,10 @@ reset_rtl_restart_stubs(void) {
     g_rtl_start_calls = 0;
     g_rtl_create_result = -1;
     g_rtl_start_result = -1;
+    g_rtl_start_latches_code = 0;
+    g_rtl_start_clears_latch = 0;
+    g_rtl_create_capture = -1;
+    g_rtl_create_captures = 0;
 }
 
 static int
@@ -865,6 +1203,121 @@ test_rtl_restart_quiesces_p25_retunes(void) {
     return rc;
 }
 
+/* Issue #575: the tune and the stream start are where the carrier changes, so they run the carrier boundary there: an
+   accepted tune (applied or pending) runs it, unguarded or under the caller's guard, a refused one does not; and every
+   stream start notes its source, under the restart's guard, which a start that fails never reaches. */
+static int
+test_tune_and_start_run_the_carrier_boundary(void) {
+    static dsd_opts opts;
+    static dsd_state state;
+    int rc = 0;
+    DSD_MEMSET(&opts, 0, sizeof(opts));
+    DSD_MEMSET(&state, 0, sizeof(state));
+    opts.audio_in_type = AUDIO_IN_RTL;
+
+    g_carrier_boundary_calls = 0;
+    g_io_control_set_freq_result = -1;
+    rc |= expect_int("refused tune", svc_rtl_set_freq(&opts, &state, 851000000U), -1);
+    rc |= expect_int("a refused tune is no boundary", g_carrier_boundary_calls, 0);
+    g_io_control_set_freq_result = RTL_STREAM_TUNE_OK;
+    rc |= expect_int("applied tune", svc_rtl_set_freq(&opts, &state, 851000000U), RTL_STREAM_TUNE_OK);
+    rc |= expect_int("an applied tune is a boundary", g_carrier_boundary_calls, 1);
+    rc |= expect_int("a tune's boundary", g_carrier_boundary_kind, (int)DSD_CARRIER_BOUNDARY_TUNE);
+    rc |= expect_int("an unguarded tune's boundary takes the guard", g_carrier_boundary_guarded, 0);
+    g_io_control_set_freq_result = RTL_STREAM_TUNE_TIMEOUT;
+    rc |= expect_int("pending tune", svc_rtl_set_freq_locked(&opts, &state, 851000000U), RTL_STREAM_TUNE_TIMEOUT);
+    rc |= expect_int("a pending tune is a boundary", g_carrier_boundary_calls, 2);
+    rc |= expect_int("a guarded tune's boundary holds the guard", g_carrier_boundary_guarded, 1);
+    g_io_control_set_freq_result = -1;
+
+    reset_rtl_restart_stubs();
+    g_stream_source_notes = 0;
+    rc |= expect_int("failed start", svc_rtl_restart(&opts, &state), -1);
+    rc |= expect_int("a failed start notes no source", g_stream_source_notes, 0);
+    g_rtl_create_result = 0;
+    g_rtl_start_result = 0;
+    rc |= expect_int("started stream", svc_rtl_restart(&opts, &state), 0);
+    rc |= expect_int("a start notes its source", g_stream_source_notes, 1);
+    rc |= expect_int("under the restart's guard", g_stream_source_guarded, 1);
+    state.rtl_ctx = NULL;
+    reset_rtl_restart_stubs();
+    return rc;
+}
+
+/* A restart that leaves an I/Q replay's decode clock while the input is still that replay replays it on the system
+ * clock, which is logged once, at the leave (issue #572). No notice when the clock is not the replay's, or when the
+ * input is no longer the replay. The engine's leave is a stub here, so the source stays REPLAY between restarts. */
+static int
+test_replay_restart_notice(void) {
+    static dsd_opts opts;
+    static dsd_state state;
+    DSD_MEMSET(&opts, 0, sizeof(opts));
+    DSD_MEMSET(&state, 0, sizeof(state));
+    opts.audio_in_type = AUDIO_IN_RTL;
+    opts.iq_replay_requested = 1;
+    DSD_SNPRINTF(opts.audio_in_dev, sizeof(opts.audio_in_dev), "%s", "iqreplay:capture.iq.json");
+    reset_rtl_restart_stubs();
+    g_rtl_create_result = 0;
+    g_rtl_start_result = 0;
+
+    g_replay_restart_notices = 0;
+    dsd_decode_clock_use_replay(1788245497LL);
+    int rc = expect_int("replay restart starts", svc_rtl_restart_locked(&opts, &state), 0);
+    rc |= expect_int("replay restart: one notice", g_replay_restart_notices, 1);
+
+    g_replay_restart_notices = 0;
+    opts.iq_replay_requested = 0;
+    DSD_SNPRINTF(opts.audio_in_dev, sizeof(opts.audio_in_dev), "%s", "rtl:0:851.0125M");
+    rc |= expect_int("restart onto another input starts", svc_rtl_restart_locked(&opts, &state), 0);
+    rc |= expect_int("restart onto another input: no notice", g_replay_restart_notices, 0);
+
+    g_replay_restart_notices = 0;
+    opts.iq_replay_requested = 1;
+    DSD_SNPRINTF(opts.audio_in_dev, sizeof(opts.audio_in_dev), "%s", "iqreplay:capture.iq.json");
+    dsd_decode_clock_use_system();
+    rc |= expect_int("replay restart on the system clock starts", svc_rtl_restart_locked(&opts, &state), 0);
+    rc |= expect_int("replay restart on the system clock: no notice", g_replay_restart_notices, 0);
+
+    state.rtl_ctx = NULL;
+    reset_rtl_restart_stubs();
+    return rc;
+}
+
+/* Issue #575: every stop clears the replay centre the decoder last read (svc_rtl_stop_locked()), so once a live radio
+ * replaces the replay the tuned-frequency reading is the centre DSD-neo tuned it to again, not the capture's. A restart
+ * whose start fails has stopped the replay all the same. */
+static int
+test_stop_clears_the_replay_centre(void) {
+    static dsd_opts opts;
+    static dsd_state state;
+    DSD_MEMSET(&opts, 0, sizeof(opts));
+    DSD_MEMSET(&state, 0, sizeof(state));
+    opts.audio_in_type = AUDIO_IN_RTL;
+    opts.iq_replay_requested = 1;
+    opts.rtlsdr_center_freq = 851012500U;
+    DSD_SNPRINTF(opts.audio_in_dev, sizeof(opts.audio_in_dev), "%s", "iqreplay:capture.iq.json");
+    opts.iq_replay_center_freq = 851500000U;
+    reset_rtl_restart_stubs();
+    g_rtl_create_result = 0;
+    g_rtl_start_result = 0;
+    int rc = expect_int("the replay reads its centre", (int)dsd_opts_tuned_freq_hz(&opts), 851500000);
+
+    opts.iq_replay_requested = 0;
+    DSD_SNPRINTF(opts.audio_in_dev, sizeof(opts.audio_in_dev), "%s", "rtl:0:851.0125M");
+    rc |= expect_int("restart onto a live radio starts", svc_rtl_restart_locked(&opts, &state), 0);
+    rc |= expect_int("the stop clears the replay centre", (int)opts.iq_replay_center_freq, 0);
+    rc |= expect_int("the live radio reads its tuned centre", (int)dsd_opts_tuned_freq_hz(&opts), 851012500);
+
+    opts.iq_replay_center_freq = 851500000U;
+    g_rtl_start_result = -1;
+    rc |= expect_int("a restart whose start fails", svc_rtl_restart_locked(&opts, &state), -1);
+    rc |= expect_int("a failed restart's stop clears the replay centre too", (int)opts.iq_replay_center_freq, 0);
+
+    state.rtl_ctx = NULL;
+    reset_rtl_restart_stubs();
+    return rc;
+}
+
 static int
 test_locked_restarts(void) {
     static dsd_opts opts;
@@ -888,23 +1341,297 @@ test_locked_restarts(void) {
         g_rtl_create_result = 0;
         dsd_airspy_config_defaults(&opts.airspy);
         DSD_SNPRINTF(opts.audio_in_dev, sizeof(opts.audio_in_dev), "airspy");
+        opts.iq_capture_requested = 1;
         dsd_airspy_config next = opts.airspy;
         next.sample_rate = 2500000;
-        const svc_airspy_tuning tuning = {851000000, 12, 0.0, 2};
+        const svc_airspy_tuning tuning = {851000000, 12, 0.0, 2, DSD_SQUELCH_MODE_LEVEL, 0};
         const int result = locked ? svc_airspy_apply_config_locked(&opts, &state, &next, &tuning)
                                   : svc_airspy_apply_config(&opts, &state, &next, &tuning);
         rc |= expect_int("Airspy reopen reports start failure", result, -1);
         rc |= expect_int("Airspy candidate and rollback both restart", g_rtl_start_calls, 2);
         rc |= expect_int("Airspy candidate and rollback both destroyed", g_rtl_destroy_calls, 2);
-        rc |= expect_int("Airspy restart enter count", g_p25_tick_guard_enter_calls, locked ? 0 : 2);
-        rc |= expect_int("Airspy restart leave count", g_p25_tick_guard_leave_calls, locked ? 0 : 2);
+        /* Issue #578: the reopen and the restart of the settings it replaced run inside one hold, so the watchdog
+           never reads the Airspy selection or the tuning half put back. */
+        rc |= expect_int("Airspy restart enter count", g_p25_tick_guard_enter_calls, locked ? 0 : 1);
+        rc |= expect_int("Airspy restart leave count", g_p25_tick_guard_leave_calls, locked ? 0 : 1);
         rc |= expect_int("Airspy restart preserves caller depth", g_p25_tick_guard_depth, locked);
         rc |= expect_int("Airspy restart does not nest", g_p25_tick_guard_errors, 0);
         rc |= expect_int("Airspy lifecycle guarded", g_rtl_lifecycle_outside_guard, 0);
         rc |= expect_int("Airspy restores previous rate", (int)opts.airspy.sample_rate, 0);
         rc |= expect_int("Airspy restores previous frequency", (int)opts.rtlsdr_center_freq, 851000000);
+        /* Issue #578: the reopen records, the restart of the settings it replaced does not write over that. */
+        rc |= expect_int("Airspy rollback keeps the I/Q capture",
+                         g_rtl_create_captures == 1 && g_rtl_create_capture == 0, 1);
+        rc |= expect_int("Airspy rollback leaves the capture off", opts.iq_capture_requested, 0);
+    }
+
+    /* The recovery restart itself: under the caller's hold, without the capture on a radio input, and with it left
+       alone on any other (nothing starts there). */
+    reset_rtl_restart_stubs();
+    DSD_MEMSET(&opts, 0, sizeof(opts));
+    opts.audio_in_type = AUDIO_IN_RTL;
+    opts.iq_capture_requested = 1;
+    g_p25_tick_guard_depth = 1;
+    g_rtl_create_result = 0;
+    g_rtl_start_result = 0;
+    int stopped = -1;
+    rc |= expect_int("recovery restart starts", svc_rtl_restart_recovery_locked(&opts, &state, 1, NULL, &stopped), 0);
+    rc |= expect_int("recovery restart stops the capture", stopped == 1 && opts.iq_capture_requested == 0, 1);
+    rc |= expect_int("recovery restart opens without it", g_rtl_create_capture, 0);
+    rc |= expect_int("recovery restart under the caller's hold",
+                     g_p25_tick_guard_enter_calls == 0 && g_rtl_lifecycle_outside_guard == 0, 1);
+    rc |= expect_int("recovery restart with the capture off",
+                     svc_rtl_restart_recovery_locked(&opts, &state, 1, NULL, &stopped), 0);
+    rc |= expect_int("recovery restart: nothing to stop", stopped, 0);
+    opts.audio_in_type = AUDIO_IN_PULSE;
+    opts.iq_capture_requested = 1;
+    (void)svc_rtl_restart_recovery_locked(&opts, &state, 0, NULL, NULL);
+    rc |= expect_int("recovery restart of PCM leaves the capture", opts.iq_capture_requested, 1);
+    /* A radio stream that ran behind PCM, recording, was stopped by the change: nothing restarts it, but the capture
+       stops all the same, so the next radio start of the session does not write over what it recorded. */
+    rc |= expect_int("recovery of PCM over a stopped stream",
+                     svc_rtl_restart_recovery_locked(&opts, &state, 1, NULL, &stopped), 0);
+    rc |= expect_int("recovery of PCM over a stopped stream stops the capture",
+                     stopped == 1 && opts.iq_capture_requested == 0, 1);
+    rc |= expect_int("recovery restart null options", svc_rtl_restart_recovery_locked(NULL, &state, 1, NULL, &stopped),
+                     -1);
+    rc |= expect_int("recovery restart null options: nothing stopped", stopped, 0);
+
+    /* Issue #578: once the input that ran runs again, the input failure the session had latched before the change comes
+       back over the one the failed start latched (an Airspy that did not open), for a radio input started again and a
+       PCM input alike; a restart that fails leaves the latch as it is, and so does one given nothing to put back. */
+    const dsd_input_failure failure_before = {DSD_INPUT_FAILURE_REFUSED, 111};
+    for (int pcm = 0; pcm <= 1; ++pcm) {
+        const char* label = pcm ? "recovery of PCM puts back the latch" : "recovery restart puts back the latch";
+        opts.audio_in_type = pcm ? AUDIO_IN_PULSE : AUDIO_IN_RTL;
+        g_rtl_start_result = 0;
+        dsd_input_failure_report(DSD_INPUT_FAILURE_DEVICE, -5);
+        rc |= expect_int(label, svc_rtl_restart_recovery_locked(&opts, &state, 1, &failure_before, NULL), 0);
+        rc |= expect_input_failure(label, DSD_INPUT_FAILURE_REFUSED, 111);
+    }
+    opts.audio_in_type = AUDIO_IN_RTL;
+    g_rtl_start_result = -1;
+    dsd_input_failure_report(DSD_INPUT_FAILURE_DEVICE, -5);
+    rc |= expect_int("recovery restart that fails",
+                     svc_rtl_restart_recovery_locked(&opts, &state, 1, &failure_before, NULL) != 0, 1);
+    rc |= expect_input_failure("recovery restart that fails keeps the latch", DSD_INPUT_FAILURE_DEVICE, -5);
+    g_rtl_start_result = 0;
+    rc |= expect_int("recovery restart with nothing to put back",
+                     svc_rtl_restart_recovery_locked(&opts, &state, 1, NULL, NULL), 0);
+    rc |=
+        expect_input_failure("recovery restart with nothing to put back keeps the latch", DSD_INPUT_FAILURE_DEVICE, -5);
+    /* A failure the recovery stream latches itself stands, whether its start then returns success (an Airspy whose
+       monitor thread sees the device stop before the start returns) or fails: the failure from before the change is
+       put back before the start, not over what the start latched. */
+    for (int starts = 1; starts >= 0; --starts) {
+        const char* label =
+            starts ? "recovery start that latches a failure keeps it" : "recovery that fails with its own failure";
+        g_rtl_start_result = starts ? 0 : -1;
+        g_rtl_start_latches_code = -7;
+        dsd_input_failure_report(DSD_INPUT_FAILURE_DEVICE, -5);
+        rc |= expect_int(label, svc_rtl_restart_recovery_locked(&opts, &state, 1, &failure_before, NULL) == 0, starts);
+        rc |= expect_input_failure(label, DSD_INPUT_FAILURE_DEVICE, -7);
+    }
+    /* A recovery that fails latching the very failure that was put back (an Airspy that again does not open, with the
+       code it had before the change) latched it itself: it stands over the change's, here none (the Airspy the change
+       opened cleared the latch before a later step failed). */
+    const dsd_input_failure device_before = {DSD_INPUT_FAILURE_DEVICE, -7};
+    g_rtl_start_result = -1;
+    g_rtl_start_latches_code = -7;
+    dsd_input_failure_clear();
+    rc |= expect_int("recovery that fails with the failure put back",
+                     svc_rtl_restart_recovery_locked(&opts, &state, 1, &device_before, NULL) != 0, 1);
+    rc |= expect_input_failure("recovery that fails with the failure put back keeps it", DSD_INPUT_FAILURE_DEVICE, -7);
+    /* A recovery that clears the latch (an Airspy that opens) and then fails latched no failure of its own: the change's
+       comes back, whether the one put back was a failure or none. */
+    const dsd_input_failure none_before = {DSD_INPUT_FAILURE_NONE, 0};
+    for (int none = 0; none <= 1; ++none) {
+        const char* label = none ? "recovery that clears, then fails, over none" : "recovery that clears, then fails";
+        g_rtl_start_result = -1;
+        g_rtl_start_clears_latch = 1;
+        dsd_input_failure_report(DSD_INPUT_FAILURE_DEVICE, -5);
+        rc |= expect_int(
+            label, svc_rtl_restart_recovery_locked(&opts, &state, 1, none ? &none_before : &failure_before, NULL) != 0,
+            1);
+        rc |= expect_input_failure(label, DSD_INPUT_FAILURE_DEVICE, -5);
+    }
+    g_rtl_start_result = 0;
+    dsd_input_failure_clear();
+    state.rtl_ctx = NULL;
+
+    /* Issue #578: svc_airspy_reopen_locked() selects the Airspy and restarts once, under the caller's hold, and leaves
+       a failed start as it is for the caller to roll back. */
+    reset_rtl_restart_stubs();
+    DSD_MEMSET(&opts, 0, sizeof(opts));
+    DSD_MEMSET(&state, 0, sizeof(state));
+    opts.audio_in_type = AUDIO_IN_RTL;
+    DSD_SNPRINTF(opts.audio_in_dev, sizeof(opts.audio_in_dev), "%s", "rtl:0:851.375M:0:0:48");
+    dsd_airspy_config_defaults(&opts.airspy);
+    dsd_airspy_config next = opts.airspy;
+    next.sample_rate = 2500000;
+    DSD_SNPRINTF(next.serial, sizeof next.serial, "%s", "123456789ABCDEF0");
+    g_p25_tick_guard_depth = 1;
+    g_rtl_create_result = 0;
+    rc |= expect_int("Airspy locked reopen reports start failure", svc_airspy_reopen_locked(&opts, &state, &next), -1);
+    rc |= expect_int("Airspy locked reopen starts once", g_rtl_start_calls, 1);
+    rc |= expect_int("Airspy locked reopen never enters", g_p25_tick_guard_enter_calls, 0);
+    rc |= expect_int("Airspy locked reopen lifecycle guarded", g_rtl_lifecycle_outside_guard, 0);
+    rc |= expect_int("Airspy locked reopen keeps the new rate", (int)opts.airspy.sample_rate, 2500000);
+    rc |= expect_str("Airspy locked reopen selects the Airspy", opts.audio_in_dev, "airspy:serial=123456789ABCDEF0");
+    rc |= expect_int("Airspy locked reopen leaves no stream", state.rtl_ctx == NULL, 1);
+    g_rtl_start_result = 0;
+    rc |= expect_int("Airspy locked reopen that starts", svc_airspy_reopen_locked(&opts, &state, &next), 0);
+    rc |= expect_int("Airspy locked reopen runs", state.rtl_ctx != NULL && opts.rtl_started == 1, 1);
+    next.sample_rate = 1234;
+    rc |=
+        expect_int("Airspy locked reopen refuses invalid settings", svc_airspy_reopen_locked(&opts, &state, &next), -1);
+    rc |= expect_int("invalid settings left the running stream", state.rtl_ctx != NULL && g_rtl_start_calls == 2, 1);
+    state.rtl_ctx = NULL;
+
+    /* Issue #578: a DSP bandwidth is stored and reopened inside one hold (the caller's, for the locked form), and a
+       start that fails is left with no stream and no reason, for the caller that knows the input that ran to roll
+       back. */
+    for (int locked = 0; locked <= 1; ++locked) {
+        reset_rtl_restart_stubs();
+        DSD_MEMSET(&opts, 0, sizeof(opts));
+        DSD_MEMSET(&state, 0, sizeof(state));
+        opts.audio_in_type = AUDIO_IN_RTL;
+        DSD_SNPRINTF(opts.audio_in_dev, sizeof(opts.audio_in_dev), "%s", "rtl:0:851.375M:0:0:48");
+        opts.rtl_dsp_bw_khz = 48;
+        g_p25_tick_guard_depth = locked;
+        g_rtl_create_result = 0;
+        char why[64];
+        const int result = locked ? svc_rtl_set_bandwidth_locked(&opts, &state, 24, why, sizeof why)
+                                  : svc_rtl_set_bandwidth(&opts, &state, 24, why, sizeof why);
+        rc |= expect_int("bandwidth reopen reports the start failure", result, -1);
+        rc |= expect_str("bandwidth reopen that fails gives no reason", why, "");
+        rc |= expect_int("bandwidth reopen left as it failed",
+                         opts.rtl_dsp_bw_khz == 24 && state.rtl_ctx == NULL && g_rtl_start_calls == 1, 1);
+        rc |= expect_int("bandwidth reopen enter count", g_p25_tick_guard_enter_calls, locked ? 0 : 1);
+        rc |= expect_int("bandwidth reopen leave count", g_p25_tick_guard_leave_calls, locked ? 0 : 1);
+        rc |= expect_int("bandwidth reopen preserves caller depth", g_p25_tick_guard_depth, locked);
+        rc |= expect_int("bandwidth reopen does not nest", g_p25_tick_guard_errors, 0);
+        rc |= expect_int("bandwidth reopen lifecycle guarded", g_rtl_lifecycle_outside_guard, 0);
     }
     reset_rtl_restart_stubs();
+    return rc;
+}
+
+/* Issue #578: what a failed stream start is reported as, from the refusal the start recorded (the width, the rate the
+ * device delivered and the fix for what sets it), or, with none, which input did not start. */
+static int
+test_describe_start_failure(void) {
+    static dsd_opts opts;
+    DSD_MEMSET(&opts, 0, sizeof(opts));
+    char why[160];
+    int rc = 0;
+
+    g_start_refused = 1;
+    g_start_refused_kind = DSD_ANALOG_DEMOD_FM;
+    g_start_refused_width_hz = 25000;
+    g_start_refused_rate_hz = 19531;
+    DSD_SNPRINTF(opts.audio_in_dev, sizeof(opts.audio_in_dev), "%s", "airspy");
+    rc |= expect_int("airspy refusal", svc_describe_start_failure(&opts, why, sizeof why), 1);
+    rc |= expect_str("airspy refusal names the delivered rate and the device fix", why,
+                     "NFM 25 kHz does not fit the 19.531 kHz DSP rate (max 16.377 kHz); raise the DSP bandwidth or "
+                     "narrow the NFM width");
+
+    g_start_refused_rate_hz = 24000;
+    DSD_SNPRINTF(opts.audio_in_dev, sizeof(opts.audio_in_dev), "%s", "rtl:0:851.375M:0:0:24");
+    rc |= expect_int("rtl refusal", svc_describe_start_failure(&opts, why, sizeof why), 1);
+    rc |= expect_str("rtl refusal names the DSP bandwidths that fit", why,
+                     "NFM 25 kHz does not fit the 24 kHz DSP rate (max 20.4 kHz); use a 48 kHz DSP bandwidth");
+
+    /* A width the rate fits, refused for a reason the log names (a replay that decimates after the demodulator). */
+    g_start_refused_width_hz = 12500;
+    g_start_refused_rate_hz = 48000;
+    DSD_SNPRINTF(opts.audio_in_dev, sizeof(opts.audio_in_dev), "%s", "iqreplay:capture.json");
+    rc |= expect_int("replay refusal", svc_describe_start_failure(&opts, why, sizeof why), 1);
+    rc |= expect_str("replay refusal points at the log", why, "the I/Q replay input refused NFM 12.5 kHz (see log)");
+    /* The unset AM default is refused as the 6 kHz it runs. */
+    g_start_refused_kind = DSD_ANALOG_DEMOD_AM;
+    g_start_refused_width_hz = 0;
+    g_start_refused_rate_hz = 7500;
+    rc |= expect_int("AM default refusal", svc_describe_start_failure(&opts, why, sizeof why), 1);
+    rc |= expect_str("AM default refusal names its 6 kHz", why,
+                     "AM 6 kHz does not fit the 7.5 kHz DSP rate (max 5.55 kHz); narrow the AM width");
+    /* (The DSD_NEO_CHANNEL_LPF=0 text is covered by APP_COMMAND_QUEUE: dsd_setenv() is stubbed here.) */
+
+    /* No refusal recorded: the input that did not start, as the stream classifies its device string. */
+    g_start_refused = 0;
+
+    static const struct {
+        const char* dev;
+        const char* why;
+    } k_inputs[] = {
+        {"airspy:serial=123456789ABCDEF0", "the Airspy input did not start (see log)"},
+        {"soapy:driver=rtlsdr", "the SoapySDR input did not start (see log)"},
+        {"rtltcp:127.0.0.1:1234", "the rtl_tcp input did not start (see log)"},
+        {"iqreplay:capture.json", "the I/Q replay input did not start (see log)"},
+        {"rtl:0:851.375M", "the RTL-SDR input did not start (see log)"},
+        {"pulse", "the RTL-SDR input did not start (see log)"},
+    };
+
+    for (size_t i = 0; i < sizeof k_inputs / sizeof k_inputs[0]; i++) {
+        DSD_SNPRINTF(opts.audio_in_dev, sizeof(opts.audio_in_dev), "%s", k_inputs[i].dev);
+        rc |= expect_int(k_inputs[i].dev, svc_describe_start_failure(&opts, why, sizeof why), 0);
+        rc |= expect_str(k_inputs[i].dev, why, k_inputs[i].why);
+    }
+
+    /* A stream that started, asked for an analog monitor it did not start on (the scan row a config's reopen resumes):
+       held to the rate it published, and a refusal worded as a start's own. */
+    DSD_SNPRINTF(opts.audio_in_dev, sizeof(opts.audio_in_dev), "%s", "airspy");
+    g_analog_check_calls = 0;
+    g_analog_check_result = -1;
+    g_demod_rate_hz = 19531;
+    rc |= expect_int("started stream refuses the monitor",
+                     svc_check_started_stream_analog(&opts, DSD_ANALOG_DEMOD_FM, 25000, why, sizeof why), -1);
+    rc |= expect_int(
+        "started stream asked for the monitor",
+        g_analog_check_calls == 1 && g_analog_check_kind == DSD_ANALOG_DEMOD_FM && g_analog_check_width_hz == 25000, 1);
+    rc |= expect_str("started stream refusal names the rate it runs", why,
+                     "NFM 25 kHz does not fit the 19.531 kHz DSP rate (max 16.377 kHz); raise the DSP bandwidth or "
+                     "narrow the NFM width");
+    g_analog_check_result = 0;
+    rc |= expect_int("started stream takes the monitor",
+                     svc_check_started_stream_analog(&opts, DSD_ANALOG_DEMOD_FM, 12500, why, sizeof why), 0);
+    rc |= expect_str("started stream that takes it gives no reason", why, "");
+    g_demod_rate_hz = 0;
+    return rc;
+}
+
+/* Issue #578: Input > Switch source > Airspy is held only to the rules every rate shares, since the device sets its own
+ * rate, which its start checks: DSD_NEO_CHANNEL_LPF=0 against an explicit width or the AM default (APP_COMMAND_QUEUE
+ * covers that refusal: dsd_setenv() is stubbed here), never the RTL DSP bandwidth. */
+static int
+test_airspy_input_analog_width(void) {
+    static dsd_opts opts;
+    static dsd_state state;
+    DSD_MEMSET(&opts, 0, sizeof(opts));
+    DSD_MEMSET(&state, 0, sizeof(state));
+    opts.audio_in_type = AUDIO_IN_PULSE;
+    DSD_SNPRINTF(opts.audio_in_dev, sizeof(opts.audio_in_dev), "%s", "pulse");
+    opts.analog_only = 1;
+    opts.analog_demod = DSD_ANALOG_DEMOD_FM;
+    opts.analog_nfm_bandwidth_hz = 25000;
+    opts.rtl_dsp_bw_khz = 12;
+    char why[160];
+    int rc = expect_int("rtl input holds the width to 12 kHz",
+                        svc_check_rtl_input_analog_width(&opts, &state, why, sizeof why), -1);
+    rc |= expect_int("airspy input holds no rate", svc_check_airspy_input_analog_width(&opts, &state, why, sizeof why),
+                     0);
+    rc |= expect_str("airspy input: no reason", why, "");
+    /* AM at 10 kHz on a running RTL-SDR at 8 kHz, which its DSP bandwidth cannot filter: the Airspy may. */
+    opts.audio_in_type = AUDIO_IN_RTL;
+    DSD_SNPRINTF(opts.audio_in_dev, sizeof(opts.audio_in_dev), "%s", "rtl:0:118.1M:0:0:8");
+    opts.rtl_dsp_bw_khz = 8;
+    opts.analog_demod = DSD_ANALOG_DEMOD_AM;
+    opts.analog_am_bandwidth_hz = 10000;
+    rc |= expect_int("AM: rtl input holds the width to 8 kHz",
+                     svc_check_rtl_input_analog_width(&opts, &state, why, sizeof why), -1);
+    rc |= expect_int("AM: airspy input holds no rate",
+                     svc_check_airspy_input_analog_width(&opts, &state, why, sizeof why), 0);
+    rc |= expect_int("null options", svc_check_airspy_input_analog_width(NULL, &state, why, sizeof why), -1);
     return rc;
 }
 
@@ -916,11 +1643,19 @@ test_rtl_service_option_contracts(void) {
     DSD_MEMSET(&opts, 0, sizeof(opts));
     DSD_MEMSET(&state, 0, sizeof(state));
 
-    rc |= expect_int("rtl enable null opts", svc_rtl_enable_input(NULL, &state), -1);
-    rc |= expect_int("rtl enable null state", svc_rtl_enable_input(&opts, NULL), -1);
-    rc |= expect_int("rtl enable restart failure", svc_rtl_enable_input(&opts, &state), -1);
+    /* Issue #578: the switch holds the P25 SM tick guard across its rewrite, its start and any rollback, so the
+       service restarts under the caller's hold. */
+    reset_rtl_restart_stubs();
+    g_p25_tick_guard_depth = 1;
+    rc |= expect_int("rtl enable null opts", svc_rtl_enable_input_locked(NULL, &state), -1);
+    rc |= expect_int("rtl enable null state", svc_rtl_enable_input_locked(&opts, NULL), -1);
+    rc |= expect_int("rtl enable restart failure", svc_rtl_enable_input_locked(&opts, &state), -1);
     rc |= expect_int("rtl enable selects rtl input before restart", opts.audio_in_type, AUDIO_IN_RTL);
     rc |= expect_int("rtl enable leaves stream stopped after create failure", opts.rtl_started, 0);
+    rc |= expect_int(
+        "rtl enable restarts under the caller's hold",
+        g_p25_tick_guard_enter_calls == 0 && g_p25_tick_guard_depth == 1 && g_rtl_lifecycle_outside_guard == 0, 1);
+    reset_rtl_restart_stubs();
 
     DSD_MEMSET(&opts, 0, sizeof(opts));
     DSD_SNPRINTF(opts.audio_in_dev, sizeof opts.audio_in_dev, "%s", "soapy:driver=rtlsdr");
@@ -939,10 +1674,50 @@ test_rtl_service_option_contracts(void) {
     opts.audio_in_type = 0;
     rc |= expect_int("rtl gain clamps high", svc_rtl_set_gain(&opts, &state, 99), 0);
     rc |= expect_int("rtl gain stored", opts.rtl_gain_value, 49);
-    rc |= expect_int("rtl bandwidth invalid defaults", svc_rtl_set_bandwidth(&opts, &state, 7, NULL, 0U), 0);
+    char why[160];
+    rc |= expect_int("rtl bandwidth invalid defaults", svc_rtl_set_bandwidth(&opts, &state, 7, why, sizeof why), 0);
     rc |= expect_int("rtl bandwidth default stored", opts.rtl_dsp_bw_khz, 48);
-    rc |= expect_int("rtl bandwidth valid stored", svc_rtl_set_bandwidth(&opts, &state, 12, NULL, 0U), 0);
+    rc |= expect_int("rtl bandwidth valid stored", svc_rtl_set_bandwidth(&opts, &state, 12, why, sizeof why), 0);
     rc |= expect_int("rtl bandwidth exact stored", opts.rtl_dsp_bw_khz, 12);
+
+    /* Issue #524: under AM an RTL-SDR or rtl_tcp input's DSP bandwidth is the rate the AM width has to fit, the 6 kHz
+     * default included (8 kHz is the narrowest bandwidth that fits it). A bandwidth that cannot is refused before
+     * anything changes, instead of a restart whose stream start refuses it and leaves no input. */
+    opts.analog_only = 1;
+    opts.monitor_input_audio = 1;
+    opts.analog_demod = DSD_ANALOG_DEMOD_AM;
+    opts.rtl_needs_restart = 0;
+    DSD_SNPRINTF(opts.audio_in_dev, sizeof opts.audio_in_dev, "%s", "rtl:0:118.1M:22:0:12");
+    rc |= expect_int("am default refuses a 6 kHz bandwidth", svc_rtl_set_bandwidth(&opts, &state, 6, why, sizeof why),
+                     -1);
+    rc |= expect_int("refused bandwidth not stored", opts.rtl_dsp_bw_khz, 12);
+    rc |= expect_int("refused bandwidth marks no restart", opts.rtl_needs_restart, 0);
+    rc |= expect_int("refusal names the bandwidth, the width and the fix",
+                     strcmp(why, "DSP BW 6 kHz cannot filter AM 6 kHz (max 4.2 kHz); no AM width fits it; keep a "
+                                 "wider DSP bandwidth")
+                         == 0,
+                     1);
+    rc |= expect_int("am default fits an 8 kHz bandwidth", svc_rtl_set_bandwidth(&opts, &state, 8, why, sizeof why), 0);
+    rc |= expect_int("fitting bandwidth stored", opts.rtl_dsp_bw_khz, 8);
+    opts.analog_am_bandwidth_hz = 10000;
+    rc |= expect_int("explicit am width refuses a bandwidth that cannot filter it",
+                     svc_rtl_set_bandwidth(&opts, &state, 12, why, sizeof why), -1);
+    rc |= expect_int("an explicit width that narrowing fixes says so",
+                     strcmp(why, "DSP BW 12 kHz cannot filter AM 10 kHz (max 9.6 kHz); narrow the AM width first") == 0,
+                     1);
+    rc |= expect_int("explicit am width fits 16 kHz", svc_rtl_set_bandwidth(&opts, &state, 16, why, sizeof why), 0);
+    /* A SoapySDR or Airspy device may force another rate: its stream start holds the width to that. */
+    DSD_SNPRINTF(opts.audio_in_dev, sizeof opts.audio_in_dev, "%s", "airspy");
+    rc |= expect_int("airspy bandwidth is left to the device rate",
+                     svc_rtl_set_bandwidth(&opts, &state, 4, why, sizeof why), 0);
+    /* FM (the unset NFM default, which no rate refuses) and digital modes hold no bandwidth. */
+    DSD_SNPRINTF(opts.audio_in_dev, sizeof opts.audio_in_dev, "%s", "rtl");
+    opts.analog_demod = DSD_ANALOG_DEMOD_FM;
+    rc |= expect_int("fm default takes any bandwidth", svc_rtl_set_bandwidth(&opts, &state, 4, why, sizeof why), 0);
+    opts.analog_only = 0;
+    opts.monitor_input_audio = 0;
+    opts.analog_am_bandwidth_hz = 0;
+    opts.rtl_dsp_bw_khz = 12;
 
     rc |= expect_int("rtl squelch stores converted threshold", svc_rtl_set_sql_db(&opts, &state, -12.5), 0);
     rc |= expect_double("rtl squelch level stored", opts.rtl_squelch_level, pow(10.0, -1.25));
@@ -954,6 +1729,26 @@ test_rtl_service_option_contracts(void) {
     rc |= expect_double("rtl squelch zero switches off", opts.rtl_squelch_level, 0.0);
     rc |= expect_int("rtl squelch accepts positive", svc_rtl_set_sql_db(&opts, &state, 3.0), 0);
     rc |= expect_double("rtl squelch positive switches off", opts.rtl_squelch_level, 0.0);
+    /* A level from the menu puts a level squelch in force in place of an auto one, and the demod hears the whole
+       setting (issue #518 follow-up). */
+    opts.rtl_squelch_mode = DSD_SQUELCH_MODE_AUTO;
+    opts.rtl_squelch_margin_db = 6;
+    g_squelch_setting_pushes = 0;
+    g_squelch_level_pushes = 0;
+    rc |= expect_int("rtl squelch level over auto", svc_rtl_set_sql_db(&opts, &state, -60.0), 0);
+    rc |= expect_int("rtl squelch level over auto: mode", opts.rtl_squelch_mode, DSD_SQUELCH_MODE_LEVEL);
+    rc |= expect_int("rtl squelch level over auto: pushed", g_squelch_level_pushes, 1);
+    rc |= expect_double("rtl squelch level over auto: pushed level", (double)g_squelch_level_pushed, 1e-6);
+    /* svc_rtl_push_squelch(): a level as a level, an auto squelch whole. */
+    opts.rtl_squelch_mode = DSD_SQUELCH_MODE_AUTO;
+    svc_rtl_push_squelch(&opts);
+    rc |= expect_int("auto squelch pushed whole", g_squelch_setting_pushes, 1);
+    rc |= expect_int("auto squelch pushed margin", g_squelch_setting_pushed.margin_db, 6);
+    rc |= expect_int("auto squelch pushed no level", g_squelch_level_pushes, 1);
+    opts.rtl_squelch_mode = DSD_SQUELCH_MODE_LEVEL;
+    svc_rtl_push_squelch(&opts);
+    rc |= expect_int("level squelch pushed as a level", g_squelch_level_pushes, 2);
+    svc_rtl_push_squelch(NULL);
     rc |= expect_int("rtl volume invalid defaults", svc_rtl_set_volume_mult(&opts, -1), 0);
     rc |= expect_int("rtl volume default stored", opts.rtl_volume_multiplier, 1);
     rc |= expect_int("rtl volume valid stored", svc_rtl_set_volume_mult(&opts, 3), 0);
@@ -1088,8 +1883,6 @@ test_file_network_and_import_failure_contracts(void) {
     rc |= expect_int("symbol out failed open", svc_open_symbol_out(&opts, &state, "capture.sym"), -1);
     rc |= expect_str("symbol out path still stored", opts.symbol_out_file, "capture.sym");
 
-    rc |= expect_int("symbol in missing file", svc_open_symbol_in(&opts, &state, "missing.sym"), -1);
-    rc |= expect_int("symbol in missing leaves type unchanged", opts.audio_in_type, 0);
     rc |= expect_int("static wav invalid path", svc_open_static_wav(&opts, &state, ""), -1);
     rc |= expect_int("static wav failed open", svc_open_static_wav(&opts, &state, "static.wav"), -1);
     rc |= expect_str("static wav path stored before open", opts.wav_out_file, "static.wav");
@@ -1107,13 +1900,6 @@ test_file_network_and_import_failure_contracts(void) {
     rc |= expect_str("udp output host stored before connect", opts.udp_hostname, "239.0.0.1");
     rc |= expect_int("udp output port stored before connect", opts.udp_portno, 23456);
     rc |= expect_int("udp output type not enabled on connect failure", opts.audio_out_type, 0);
-
-    rc |= expect_int("rigctl invalid port", svc_rigctl_connect(&opts, "localhost", 0), -1);
-    rc |= expect_int("rigctl connect failure", svc_rigctl_connect(&opts, "rig.local", 4532), -1);
-    rc |= expect_str("rigctl host stored before connect", opts.rigctlhostname, "rig.local");
-    rc |= expect_int("rigctl port stored before connect", opts.rigctlportno, 4532);
-    rc |= expect_int("rigctl socket invalid after connect failure", opts.rigctl_sockfd, DSD_INVALID_SOCKET);
-    rc |= expect_int("rigctl disabled after connect failure", opts.use_rigctl, 0);
 
     g_chan_import_result = -1;
     rc |= expect_int("channel import failure", svc_import_channel_map(&opts, &state, "channels.csv"), -1);
@@ -1677,45 +2463,64 @@ test_nfm_bandwidth_services(void) {
     DSD_MEMSET(&opts, 0, sizeof opts);
     DSD_MEMSET(&state, 0, sizeof state);
     DSD_SNPRINTF(opts.audio_in_dev, sizeof opts.audio_in_dev, "%s", "rtl:0:851.375M:0:0:16");
+    opts.audio_in_type = AUDIO_IN_RTL;
     opts.rtl_dsp_bw_khz = 16;
     opts.analog_only = 1;
     char why[128];
 
     /* No stream: the RTL DSP bandwidth is the rate. 12.5 kHz fits 16 kHz, 16 kHz does not. */
-    rc |= expect_int("nfm svc 12500 fits 16 kHz", svc_set_nfm_bandwidth(&opts, &state, 12500, why, sizeof why), 0);
+    rc |= expect_int("nfm svc 12500 fits 16 kHz",
+                     svc_set_analog_bandwidth(&opts, &state, DSD_ANALOG_DEMOD_FM, 12500, 0, why, sizeof why), 0);
     rc |= expect_int("nfm svc 12500 stored", opts.analog_nfm_bandwidth_hz, 12500);
-    rc |=
-        expect_int("nfm svc 16000 refused at 16 kHz", svc_set_nfm_bandwidth(&opts, &state, 16000, why, sizeof why), -1);
+    rc |= expect_int("nfm svc 16000 refused at 16 kHz",
+                     svc_set_analog_bandwidth(&opts, &state, DSD_ANALOG_DEMOD_FM, 16000, 0, why, sizeof why), -1);
     rc |= expect_int("nfm svc 16000 not stored", opts.analog_nfm_bandwidth_hz, 12500);
     rc |= expect_int(
         "nfm svc 16000 reason",
         strcmp(why, "NFM 16 kHz does not fit the 16 kHz DSP rate (max 13.2 kHz); use a 24 or 48 kHz DSP bandwidth")
             == 0,
         1);
-    rc |= expect_int("nfm svc out of range", svc_check_nfm_bandwidth(&opts, &state, 7999, why, sizeof why), -1);
+    rc |= expect_int("nfm svc out of range",
+                     svc_check_analog_bandwidth(&opts, &state, DSD_ANALOG_DEMOD_FM, 7999, why, sizeof why), -1);
     rc |= expect_int("nfm svc range reason", strcmp(why, "NFM bandwidth 7.999 kHz is outside 8 kHz to 25 kHz") == 0, 1);
-    rc |= expect_int("nfm svc default never refused", svc_check_nfm_bandwidth(&opts, &state, 0, why, sizeof why), 0);
+    rc |= expect_int("nfm svc default never refused",
+                     svc_check_analog_bandwidth(&opts, &state, DSD_ANALOG_DEMOD_FM, 0, why, sizeof why), 0);
+
+    /* PCM input, here TCP audio a live switch put the RTL-SDR session on, keeping its device string: no channel filter
+       runs there, so no DSP rate holds the width, which is stored for a switch back to a radio input. */
+    opts.audio_in_type = AUDIO_IN_TCP;
+    rc |= expect_int("nfm svc pcm 16000 not held to the old rate",
+                     svc_set_analog_bandwidth(&opts, &state, DSD_ANALOG_DEMOD_FM, 16000, 0, why, sizeof why), 0);
+    rc |= expect_int("nfm svc pcm 16000 stored", opts.analog_nfm_bandwidth_hz, 16000);
+    rc |= expect_int("nfm svc pcm range still checked",
+                     svc_check_analog_bandwidth(&opts, &state, DSD_ANALOG_DEMOD_FM, 7999, why, sizeof why), -1);
+    opts.analog_nfm_bandwidth_hz = 12500;
+    opts.audio_in_type = AUDIO_IN_RTL;
 
     /* A reopen at another DSP bandwidth is checked against that bandwidth alone. */
     rc |= expect_int("nfm svc 25 kHz at a 48 kHz reopen",
-                     svc_check_nfm_bandwidth_for_rtl_bw(25000, 48, why, sizeof why), 0);
+                     svc_check_analog_bandwidth_for_rtl_bw(DSD_ANALOG_DEMOD_FM, 25000, 48, why, sizeof why), 0);
     rc |= expect_int("nfm svc 25 kHz at a 24 kHz reopen",
-                     svc_check_nfm_bandwidth_for_rtl_bw(25000, 24, why, sizeof why), -1);
+                     svc_check_analog_bandwidth_for_rtl_bw(DSD_ANALOG_DEMOD_FM, 25000, 24, why, sizeof why), -1);
     rc |= expect_int(
         "nfm svc 24 kHz reopen reason",
         strcmp(why, "NFM 25 kHz does not fit the 24 kHz DSP rate (max 20.4 kHz); use a 48 kHz DSP bandwidth") == 0, 1);
-    rc |= expect_int("nfm svc default at any reopen", svc_check_nfm_bandwidth_for_rtl_bw(0, 4, why, sizeof why), 0);
-    rc |= expect_int("nfm svc reopen range", svc_check_nfm_bandwidth_for_rtl_bw(30000, 48, why, sizeof why), -1);
+    rc |= expect_int("nfm svc default at any reopen",
+                     svc_check_analog_bandwidth_for_rtl_bw(DSD_ANALOG_DEMOD_FM, 0, 4, why, sizeof why), 0);
+    rc |= expect_int("nfm svc reopen range",
+                     svc_check_analog_bandwidth_for_rtl_bw(DSD_ANALOG_DEMOD_FM, 30000, 48, why, sizeof why), -1);
 
     /* A running stream answers for itself, and an accepted width is published to it once stored. */
     opts.audio_in_type = AUDIO_IN_RTL;
     state.rtl_ctx = (RtlSdrContext*)fake_ctx;
     g_analog_check_calls = g_nfm_publish_calls = 0;
-    rc |= expect_int("nfm svc live 8000", svc_set_nfm_bandwidth(&opts, &state, 8000, why, sizeof why), 0);
+    rc |= expect_int("nfm svc live 8000",
+                     svc_set_analog_bandwidth(&opts, &state, DSD_ANALOG_DEMOD_FM, 8000, 0, why, sizeof why), 0);
     rc |= expect_int("nfm svc live asks the front end", g_analog_check_calls, 1);
     rc |= expect_int("nfm svc live publish", g_nfm_publish_calls == 1 && g_nfm_publish_width_hz == 8000, 1);
     g_analog_check_result = -1;
-    rc |= expect_int("nfm svc live refusal", svc_set_nfm_bandwidth(&opts, &state, 12500, why, sizeof why), -1);
+    rc |= expect_int("nfm svc live refusal",
+                     svc_set_analog_bandwidth(&opts, &state, DSD_ANALOG_DEMOD_FM, 12500, 0, why, sizeof why), -1);
     rc |= expect_int("nfm svc live refusal keeps the width", opts.analog_nfm_bandwidth_hz, 8000);
     rc |= expect_int("nfm svc live refusal publishes nothing", g_nfm_publish_calls, 1);
     /* The front end refused a width its RTL DSP bandwidth (16 kHz) can filter: something else refused it. */
@@ -1745,29 +2550,32 @@ test_nfm_bandwidth_services(void) {
     for (size_t i = 0; i < sizeof forced_rate_devs / sizeof forced_rate_devs[0]; i++) {
         DSD_SNPRINTF(opts.audio_in_dev, sizeof opts.audio_in_dev, "%s", forced_rate_devs[i].dev);
         g_demod_rate_hz = 24000;
-        rc |=
-            expect_int("nfm svc forced rate refusal", svc_set_nfm_bandwidth(&opts, &state, 25000, why, sizeof why), -1);
+        rc |= expect_int("nfm svc forced rate refusal",
+                         svc_set_analog_bandwidth(&opts, &state, DSD_ANALOG_DEMOD_FM, 25000, 0, why, sizeof why), -1);
         rc |= expect_str("nfm svc forced rate reason", why, forced_rate_devs[i].at_24k);
         g_demod_rate_hz = 8000;
-        rc |= expect_int("nfm svc no width fits", svc_set_nfm_bandwidth(&opts, &state, 8000, why, sizeof why), -1);
+        rc |= expect_int("nfm svc no width fits",
+                         svc_set_analog_bandwidth(&opts, &state, DSD_ANALOG_DEMOD_FM, 8000, 0, why, sizeof why), -1);
         rc |= expect_str("nfm svc no width fits reason", why, forced_rate_devs[i].at_8k);
         /* At a rate that filters it, the refusal is not the rate's. */
         g_demod_rate_hz = 78125;
         rc |= expect_int("nfm svc forced rate other refusal",
-                         svc_set_nfm_bandwidth(&opts, &state, 25000, why, sizeof why), -1);
+                         svc_set_analog_bandwidth(&opts, &state, DSD_ANALOG_DEMOD_FM, 25000, 0, why, sizeof why), -1);
         rc |= expect_int("nfm svc forced rate other reason",
                          strcmp(why, "the RTL front end refused NFM 25 kHz (see log)") == 0, 1);
     }
     g_demod_rate_hz = 0;
     DSD_SNPRINTF(opts.audio_in_dev, sizeof opts.audio_in_dev, "%s", "rtl:0:851.375M:0:0:16");
     g_analog_check_result = 0;
-    rc |= expect_int("nfm svc live 12500", svc_set_nfm_bandwidth(&opts, &state, 12500, why, sizeof why), 0);
+    rc |= expect_int("nfm svc live 12500",
+                     svc_set_analog_bandwidth(&opts, &state, DSD_ANALOG_DEMOD_FM, 12500, 0, why, sizeof why), 0);
     rc |= expect_int("nfm svc live 12500 published", g_nfm_publish_calls == 2 && g_nfm_publish_width_hz == 12500, 1);
 
     /* The front end took the check but refused the request itself (a retune moved its rate in between): refused
        here too, with the previous width put back, never reported as applied. */
     g_nfm_publish_result = -1;
-    rc |= expect_int("nfm svc request refused", svc_set_nfm_bandwidth(&opts, &state, 16000, why, sizeof why), -1);
+    rc |= expect_int("nfm svc request refused",
+                     svc_set_analog_bandwidth(&opts, &state, DSD_ANALOG_DEMOD_FM, 16000, 0, why, sizeof why), -1);
     rc |= expect_int("nfm svc request refused keeps the width", opts.analog_nfm_bandwidth_hz, 12500);
     rc |= expect_str("nfm svc request refused reason", why,
                      "NFM 16 kHz does not fit the 16 kHz DSP rate (max 13.2 kHz); use a 24 or 48 kHz DSP bandwidth");
@@ -1808,20 +2616,170 @@ test_nfm_bandwidth_services(void) {
     return rc;
 }
 
+/*
+ * Issue #524: the AM width goes through the same services as the NFM one. AM always runs its channel filter, so its
+ * unset default (6 kHz) is held to the rate like an explicit width, where the unset NFM default is never refused: with
+ * no stream an RTL-SDR input's DSP bandwidth is that rate, and a reopen at another bandwidth is held to that one. An
+ * accepted width is stored as AM's and published for the AM kind; a running stream is asked about the AM profile.
+ */
+static int
+test_am_bandwidth_services(void) {
+    static dsd_opts opts;
+    static dsd_state state;
+    static void* fake_ctx[2];
+    int rc = 0;
+    DSD_MEMSET(&opts, 0, sizeof opts);
+    DSD_MEMSET(&state, 0, sizeof state);
+    DSD_SNPRINTF(opts.audio_in_dev, sizeof opts.audio_in_dev, "%s", "rtl:0:118.1M:22:0:6");
+    opts.audio_in_type = AUDIO_IN_RTL;
+    opts.rtl_dsp_bw_khz = 6;
+    opts.analog_only = 1;
+    opts.analog_demod = DSD_ANALOG_DEMOD_AM;
+    char why[128];
+
+    rc |= expect_int("am svc default refused at 6 kHz",
+                     svc_check_analog_bandwidth(&opts, &state, DSD_ANALOG_DEMOD_AM, 0, why, sizeof why), -1);
+    rc |= expect_str("am svc default reason", why,
+                     "AM 6 kHz does not fit the 6 kHz DSP rate (max 4.2 kHz); use a 8, 12, 16, 24 or 48 kHz DSP "
+                     "bandwidth");
+    rc |= expect_int("nfm default still passes at 6 kHz",
+                     svc_check_analog_bandwidth(&opts, &state, DSD_ANALOG_DEMOD_FM, 0, why, sizeof why), 0);
+    rc |= expect_int("am svc 5 kHz refused at 6 kHz",
+                     svc_set_analog_bandwidth(&opts, &state, DSD_ANALOG_DEMOD_AM, 5000, 0, why, sizeof why), -1);
+    rc |= expect_int("am svc refused width not stored", opts.analog_am_bandwidth_hz, 0);
+    rc |= expect_int("am svc range",
+                     svc_check_analog_bandwidth(&opts, &state, DSD_ANALOG_DEMOD_AM, 25000, why, sizeof why), -1);
+    rc |= expect_str("am svc range reason", why, "AM bandwidth 25 kHz is outside 5 kHz to 20 kHz");
+
+    DSD_SNPRINTF(opts.audio_in_dev, sizeof opts.audio_in_dev, "%s", "rtl:0:118.1M:22:0:16");
+    opts.rtl_dsp_bw_khz = 16;
+    g_nfm_publish_calls = 0;
+    rc |= expect_int("am svc 10 kHz at 16 kHz",
+                     svc_set_analog_bandwidth(&opts, &state, DSD_ANALOG_DEMOD_AM, 10000, 0, why, sizeof why), 0);
+    rc |= expect_int("am svc stored as AM's", opts.analog_am_bandwidth_hz == 10000 && opts.analog_nfm_bandwidth_hz == 0,
+                     1);
+    rc |= expect_int(
+        "am svc published for AM",
+        g_nfm_publish_calls == 1 && g_width_publish_kind == DSD_ANALOG_DEMOD_AM && g_nfm_publish_width_hz == 10000, 1);
+    rc |= expect_int("am svc 20 kHz refused at 16 kHz",
+                     svc_set_analog_bandwidth(&opts, &state, DSD_ANALOG_DEMOD_AM, 20000, 0, why, sizeof why), -1);
+    rc |= expect_str("am svc 20 kHz reason", why,
+                     "AM 20 kHz does not fit the 16 kHz DSP rate (max 13.2 kHz); use a 24 or 48 kHz DSP bandwidth");
+
+    /* A running stream answers for the AM profile itself. */
+    opts.audio_in_type = AUDIO_IN_RTL;
+    state.rtl_ctx = (RtlSdrContext*)fake_ctx;
+    g_analog_check_calls = 0;
+    rc |= expect_int("am svc live default",
+                     svc_set_analog_bandwidth(&opts, &state, DSD_ANALOG_DEMOD_AM, 0, 0, why, sizeof why), 0);
+    rc |= expect_int(
+        "am svc live asks about AM at its default",
+        g_analog_check_calls == 1 && g_analog_check_kind == DSD_ANALOG_DEMOD_AM && g_analog_check_width_hz == 0, 1);
+    opts.audio_in_type = 0;
+    state.rtl_ctx = NULL;
+
+    /* Under Analog (FM) the AM width is only configuration: stored, and held to no rate. */
+    opts.analog_demod = DSD_ANALOG_DEMOD_FM;
+    rc |= expect_int("am svc under nfm stored unchecked",
+                     svc_set_analog_bandwidth(&opts, &state, DSD_ANALOG_DEMOD_AM, 20000, 0, why, sizeof why), 0);
+    rc |= expect_int("am svc under nfm width", opts.analog_am_bandwidth_hz, 20000);
+
+    /* A reopen at another DSP bandwidth holds the AM default too. */
+    rc |= expect_int("am svc default at a 6 kHz reopen",
+                     svc_check_analog_bandwidth_for_rtl_bw(DSD_ANALOG_DEMOD_AM, 0, 6, why, sizeof why), -1);
+    rc |= expect_int("am svc default at an 8 kHz reopen",
+                     svc_check_analog_bandwidth_for_rtl_bw(DSD_ANALOG_DEMOD_AM, 0, 8, why, sizeof why), 0);
+
+    opts.analog_only = 0;
+    opts.analog_am_bandwidth_hz = 0;
+    return rc;
+}
+
+#ifdef USE_RADIO
+/*
+ * Issue #578: the reason a scan leave's return to the monitor was refused names the width and the rate the stream
+ * publishes, which a row's retune can have moved off the one the DSP bandwidth gives, then what the monitor runs: the
+ * width it kept, the kind's default, or, when the rate refuses that default too, word of it (nothing more when the
+ * default was what the leave asked for). Without a rate that explains it, the log does.
+ */
+static int
+test_describe_monitor_return_refusal(void) {
+    static dsd_opts opts;
+    char why[128];
+    int rc = 0;
+    DSD_MEMSET(&opts, 0, sizeof opts);
+    opts.audio_in_type = AUDIO_IN_RTL;
+    opts.rtl_dsp_bw_khz = 48;
+    DSD_SNPRINTF(opts.audio_in_dev, sizeof opts.audio_in_dev, "%s", "rtl:0:851.375M:0:0:48");
+    g_demod_rate_hz = 16000;
+    svc_describe_monitor_return_refusal(&opts, DSD_ANALOG_DEMOD_FM, 16000, 12500, why, sizeof why);
+    rc |= expect_str("monitor return: kept width", why,
+                     "NFM 16 kHz does not fit the 16 kHz DSP rate; the monitor keeps NFM 12.5 kHz");
+    svc_describe_monitor_return_refusal(&opts, DSD_ANALOG_DEMOD_FM, 16000, 0, why, sizeof why);
+    rc |= expect_str("monitor return: default", why,
+                     "NFM 16 kHz does not fit the 16 kHz DSP rate; the monitor is back on the NFM default");
+    g_demod_rate_hz = 7500;
+    svc_describe_monitor_return_refusal(&opts, DSD_ANALOG_DEMOD_AM, 10000, -1, why, sizeof why);
+    rc |= expect_str("monitor return: AM default refused too", why,
+                     "AM 10 kHz does not fit the 7.5 kHz DSP rate; the AM default does not fit it either");
+    svc_describe_monitor_return_refusal(&opts, DSD_ANALOG_DEMOD_AM, 0, -1, why, sizeof why);
+    rc |= expect_str("monitor return: the AM default refused", why, "AM 6 kHz does not fit the 7.5 kHz DSP rate");
+    g_demod_rate_hz = 0;
+    svc_describe_monitor_return_refusal(&opts, DSD_ANALOG_DEMOD_FM, 16000, 0, why, sizeof why);
+    rc |= expect_str("monitor return: no rate", why,
+                     "the RTL front end refused NFM 16 kHz (see log); the monitor is back on the NFM default");
+    g_demod_rate_hz = 48000;
+    svc_describe_monitor_return_refusal(&opts, DSD_ANALOG_DEMOD_AM, 10000, -1, why, sizeof why);
+    rc |= expect_str("monitor return: a rate that fits", why,
+                     "the RTL front end refused AM 10 kHz (see log); the AM default is refused too");
+    /* A retune the metrics have not caught up with: the request rate the refusal was held to is the one named. */
+    g_demod_rate_hz = 16000;
+    g_request_rate_hz = 12000;
+    svc_describe_monitor_return_refusal(&opts, DSD_ANALOG_DEMOD_FM, 16000, 0, why, sizeof why);
+    rc |= expect_str("monitor return: the request rate, not stale metrics", why,
+                     "NFM 16 kHz does not fit the 12 kHz DSP rate; the monitor is back on the NFM default");
+    g_demod_rate_hz = 48000;
+    g_request_rate_hz = 16000;
+    svc_describe_monitor_return_refusal(&opts, DSD_ANALOG_DEMOD_FM, 16000, 0, why, sizeof why);
+    rc |= expect_str("monitor return: a request rate that refuses, stale metrics that fit", why,
+                     "NFM 16 kHz does not fit the 16 kHz DSP rate; the monitor is back on the NFM default");
+    g_request_rate_hz = -1;
+    /* Off an RTL input the published rate is no rate that input runs at. */
+    opts.audio_in_type = AUDIO_IN_PULSE;
+    g_demod_rate_hz = 16000;
+    svc_describe_monitor_return_refusal(&opts, DSD_ANALOG_DEMOD_FM, 16000, 0, why, sizeof why);
+    rc |= expect_str("monitor return: off RTL", why,
+                     "the RTL front end refused NFM 16 kHz (see log); the monitor is back on the NFM default");
+    g_demod_rate_hz = 0;
+    return rc;
+}
+#endif
+
 int
 main(void) {
     int rc = 0;
     rc |= test_source_alias_services();
     rc |= test_mute_and_protocol_inversion_toggles();
+    rc |= test_enable_per_call_wav_stamps_open_time();
     rc |= test_lrrp_event_log_and_history_state();
     rc |= test_p2_trunking_and_slot_controls();
     rc |= test_payload_symbol_and_pulse_state();
+    rc |= test_input_switch_requests();
+    rc |= test_input_switch_unsupported_modes();
+    rc |= test_rtl_row_destination();
 #ifdef USE_RADIO
     rc |= test_rtl_restart_quiesces_p25_retunes();
+    rc |= test_tune_and_start_run_the_carrier_boundary();
     rc |= test_locked_restarts();
+    rc |= test_replay_restart_notice();
+    rc |= test_stop_clears_the_replay_centre();
+    rc |= test_describe_start_failure();
+    rc |= test_describe_monitor_return_refusal();
+    rc |= test_airspy_input_analog_width();
     rc |= test_rtl_service_option_contracts();
     rc |= test_nfm_bandwidth_services();
     rc |= test_rtl_bandwidth_holds_the_analog_width_in_force();
+    rc |= test_am_bandwidth_services();
 #endif
     rc |= test_file_network_and_import_failure_contracts();
     rc |= test_udp_output_analog_socket_failure();

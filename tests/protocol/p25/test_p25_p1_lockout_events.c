@@ -13,13 +13,13 @@
  */
 
 #include <dsd-neo/core/call_state.h>
-#include <dsd-neo/core/dsd_time.h>
 #include <dsd-neo/core/events.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/state.h>
 #include <dsd-neo/core/synctype_ids.h>
 #include <dsd-neo/protocol/p25/p25_crypto.h>
 #include <dsd-neo/protocol/p25/p25_trunk_sm.h>
+#include <dsd-neo/runtime/decode_clock.h>
 #include <dsd-neo/runtime/trunk_tuning_hooks.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -305,7 +305,7 @@ test_stale_same_key_ess_opens_conventional_call(void) {
     const uint64_t ended_epoch = slot0_epoch();
     rc |= expect("stale fixture lockout recorded", g_state.p25_p1_lockout_epoch.valid != 0U);
 
-    g_state.p25_p1_lockout_epoch.recorded_m = dsd_time_now_monotonic_s() - 1.1;
+    g_state.p25_p1_lockout_epoch.recorded_m = dsd_decode_now_mono_s() - 1.1;
     (void)p25_crypto_resolve(&g_opts, &g_state, DSD_P25_CRYPTO_PHASE1, 0, TEST_ALGID, TEST_KEYID, 0x7777ULL, TEST_TG);
 
     dsd_call_snapshot call;
@@ -336,7 +336,7 @@ test_lockout_ess_window_slides_with_repeats(void) {
     // Four repeats, each 0.9 s after the previous one. Total elapsed since the
     // lockout is 3.6 s, far past the 1.0 s window, yet no gap ever exceeds it.
     for (int i = 0; i < 4; i++) {
-        g_state.p25_p1_lockout_epoch.recorded_m = dsd_time_now_monotonic_s() - 0.9;
+        g_state.p25_p1_lockout_epoch.recorded_m = dsd_decode_now_mono_s() - 0.9;
         (void)p25_crypto_resolve(&g_opts, &g_state, DSD_P25_CRYPTO_PHASE1, 0, TEST_ALGID, TEST_KEYID,
                                  0x2000ULL + (unsigned long long)i, TEST_TG);
         event_ticks();
@@ -388,6 +388,62 @@ test_non_matching_lockout_still_records_epoch(void) {
     rc |= expect("non-matching lockout records epoch", g_state.p25_p1_lockout_epoch.valid != 0U);
     rc |= expect("non-matching lockout records the ended epoch",
                  g_state.p25_p1_lockout_epoch.call_epoch == private_epoch);
+    return rc;
+}
+
+static const Event_History*
+committed_lockout_row(void) {
+    if (g_state.event_history_s == NULL) {
+        return NULL;
+    }
+    for (int i = 1; i < 255; i++) {
+        const Event_History* row = &g_state.event_history_s[0].Event_History_Items[i];
+        if (strstr(row->internal_str, "has been locked out") != NULL) {
+            return row;
+        }
+    }
+    return NULL;
+}
+
+/* The lockout notice for a call the slot has not published -- here the slot holds a private call, so the group
+ * lockout renders the synthetic snapshot -- names the voice channel the grant sent the receiver to (issue #575). It
+ * renders before the release returns to the control channel, so on a radio input the tuner reads that channel too;
+ * off one (an audio input with a rigctl peer) the tuner reads nothing, and only the grant names it. */
+static int
+test_noncanonical_lockout_row_names_the_voice_channel(void) {
+    int rc = 0;
+    for (int radio = 0; radio < 2; radio++) {
+        const int tg = TEST_TG + 300 + radio;
+        reset_test_state();
+        g_opts.audio_in_type = radio ? AUDIO_IN_RTL : AUDIO_IN_PULSE;
+        g_opts.use_rigctl = radio ? 0 : 1;
+        tune_group_grant(tg);
+        rc |= expect("voice-channel fixture tuned", p25_sm_get_ctx()->state == P25_SM_TUNED);
+        if (radio) {
+            g_opts.rtlsdr_center_freq = 851500000U; /* what the tune to the grant wrote */
+        }
+        const dsd_call_observation private_call = {
+            .protocol = DSD_SYNC_P25P1_POS,
+            .slot = 0U,
+            .kind = DSD_CALL_KIND_PRIVATE_VOICE,
+            .ota_target_id = (uint64_t)tg,
+            .policy_target_id = (uint64_t)tg,
+            .service_options = 0x40U,
+            .has_service_metadata = 1U,
+        };
+        (void)dsd_call_state_observe(&g_state, &private_call, DSD_CALL_BOUNDARY_BEGIN);
+
+        g_state.p25_crypto_state[0] = DSD_P25_CRYPTO_BLOCKED;
+        p25_sm_emit_enc(&g_opts, &g_state, 0, TEST_ALGID, TEST_KEYID, tg);
+
+        const Event_History* row = committed_lockout_row();
+        rc |= expect("lockout row committed", row != NULL);
+        if (row != NULL && row->freq_hz != 851500000) {
+            DSD_FPRINTF(stderr, "FAIL: lockout row (%s input) freq %lld, want the voice channel 851500000\n",
+                        radio ? "radio" : "audio", (long long)row->freq_hz);
+            rc = 1;
+        }
+    }
     return rc;
 }
 
@@ -477,6 +533,7 @@ main(void) {
     rc |= test_pre_identity_ess_uses_assignment_identity();
     rc |= test_lockout_ess_window_slides_with_repeats();
     rc |= test_non_matching_lockout_still_records_epoch();
+    rc |= test_noncanonical_lockout_row_names_the_voice_channel();
     rc |= test_identity_pending_ess_still_opens_call();
     rc |= test_reused_key_after_new_assignment_opens_call();
     rc |= test_ess_after_cryptoless_end_still_opens_call();

@@ -10,15 +10,17 @@
  * and next-CC iteration behavior.
  */
 
-#include <dsd-neo/core/dsd_time.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/state.h>
 #include <dsd-neo/protocol/p25/p25_cc_candidates.h>
 #include <dsd-neo/protocol/p25/p25_trunk_sm.h>
 #include <dsd-neo/runtime/config.h>
+#include <dsd-neo/runtime/decode_clock.h>
 #include <dsd-neo/runtime/trunk_tuning_hooks.h>
+#include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 #include "dsd-neo/core/opts_fwd.h"
 #include "dsd-neo/core/safe_api.h"
 #include "dsd-neo/core/state_fwd.h"
@@ -167,7 +169,7 @@ main(int argc, char** argv) {
     // rest on the control channel without asking for a single tune of its own.
     // A decoded control-channel message after the return ends the CC acquisition the release
     // started; without it the next grant is deferred rather than tuned.
-    state.p25_last_cc_msg_time_m = dsd_time_now_monotonic_s();
+    state.p25_last_cc_msg_time_m = dsd_decode_now_mono_s();
     int channel2 = (iden << 12) | 0x0003;
     p25_sm_event(p25_sm_get_ctx(), &opts, &state,
                  &(p25_sm_event_t){.type = P25_SM_EV_GRANT,
@@ -198,6 +200,10 @@ main(int argc, char** argv) {
     rc |= expect_eq("idle eviction keeps context CC return count", p25_sm_get_ctx()->cc_return_count, 1);
 
     dsd_trunk_tuning_hooks_set((dsd_trunk_tuning_hooks){0});
+    if (dsd_test_rmdir(dir) != 0) {
+        DSD_FPRINTF(stderr, "could not remove temp cache directory %s: %s\n", dir, strerror(errno));
+        rc |= 1;
+    }
     return rc;
 }
 

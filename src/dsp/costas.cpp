@@ -17,11 +17,14 @@
  *   - costas = op25_repeater.costas_loop_cc (carrier tracking at symbol rate)
  */
 
+#include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <dsd-neo/dsp/costas.h>
 #include <dsd-neo/dsp/demod_state.h>
 #include <dsd-neo/runtime/config.h>
+#include <iterator>
 #include "dsd-neo/core/safe_api.h"
 #include "dsd-neo/dsp/ted.h"
 #include "mmse_interp.h"
@@ -99,9 +102,10 @@ dsd_sincosf_clamped_half_pi(float phase, float* out_sin, float* out_cos) {
                                           + x2 * (0.00002480158730158730f + x2 * -0.00000027557319223986f))));
 }
 
+/* The range test is the whole guard: +-Inf fails it and goes to libm, and a NaN phase gives NaN on either path. */
 static inline void
 dsd_sincosf_wrapped_two_pi(float phase, float* out_sin, float* out_cos) {
-    if (!std::isfinite(phase) || phase < -kTwoPi || phase > kTwoPi) {
+    if (phase < -kTwoPi || phase > kTwoPi) {
         dsd_sincosf(phase, out_sin, out_cos);
         return;
     }
@@ -130,6 +134,92 @@ dsd_sincosf_wrapped_two_pi(float phase, float* out_sin, float* out_cos) {
     }
 
     dsd_sincosf_clamped_half_pi(phase, out_sin, out_cos);
+}
+
+/*
+ * Sample validation that holds under fast-math.
+ *
+ * The release presets build with -ffast-math, whose -ffinite-math-only lets the compiler assume that no float is Inf
+ * or NaN: std::isfinite() and x != x fold to constants there, and Clang also folds a bit test of a float it computed
+ * or took as an argument. So the Costas and Gardner loops check a sample where they load it, comparing the bits just
+ * loaded from memory as integers, which no floating-point assumption reaches; the test is off the loops' carried
+ * dependency chains. A sample that fails is replaced as bits, so an Inf or NaN never reaches a floating-point
+ * operation.
+ *
+ * The bound is 2^60 rather than infinity. Below it, no product or sum of squares either loop forms comes near
+ * FLT_MAX (2^128): the Costas rotation and |z|^2 stay under 2^123, and the Gardner interpolator, whose MMSE taps sum
+ * to under 1.6 in magnitude, keeps its timing error and symbol magnitude under 2^124. Once the samples pass, nothing
+ * the loops compute is Inf or NaN, so they need no check on a computed value. The chain delivers components near 1
+ * (the RMS AGC bounds its output at 0.85 / sqrt(0.45)); only an Inf, a NaN or an absurdly large value fails.
+ */
+constexpr uint32_t kFloatMagnitudeMask = 0x7FFFFFFFu;
+constexpr uint32_t kFloatExponentMask = 0x7F800000u;
+constexpr uint32_t kSampleMagnitudeLimitBits = 0x5D800000u; /* 2^60 */
+
+static inline uint32_t
+stored_float_bits(const float* value) {
+    uint32_t bits = 0;
+    DSD_MEMCPY(&bits, value, sizeof(bits));
+    return bits;
+}
+
+static inline bool
+sample_bits_in_range(uint32_t bits) {
+    return (bits & kFloatMagnitudeMask) < kSampleMagnitudeLimitBits;
+}
+
+/* Both components of an I/Q pair in range, tested together on the pair's bits: adding 2^31 - limit to a lane's 31-bit
+ * magnitude sets the lane's top bit exactly when the magnitude reaches the limit, and no lane carries into the next. */
+constexpr uint64_t kPairMagnitudeMask = 0x7FFFFFFF7FFFFFFFull;
+constexpr uint64_t kPairLaneBias = (uint64_t)(0x80000000u - kSampleMagnitudeLimitBits) * 0x100000001ull;
+constexpr uint64_t kPairLaneTops = 0x8000000080000000ull;
+
+static inline bool
+pair_bits_in_range(uint64_t bits) {
+    return (((bits & kPairMagnitudeMask) + kPairLaneBias) & kPairLaneTops) == 0;
+}
+
+/* Loads an I/Q pair for the Gardner, each out-of-range component as 0. The pair test is the hot path; the
+ * per-component pass runs only for a bad pair. */
+static inline void
+load_pair_components_or_zero(const float* sample, float* out_r, float* out_j) {
+    float pair[2] = {sample[0], sample[1]};
+    uint64_t bits = 0;
+    DSD_MEMCPY(&bits, pair, sizeof(bits));
+    if (!pair_bits_in_range(bits)) {
+        uint32_t lanes[2] = {0, 0};
+        DSD_MEMCPY(lanes, pair, sizeof(lanes));
+        std::for_each(std::begin(lanes), std::end(lanes), [](uint32_t& lane) {
+            if (!sample_bits_in_range(lane)) {
+                lane = 0;
+            }
+        });
+        DSD_MEMCPY(pair, lanes, sizeof(pair));
+    }
+    *out_r = pair[0];
+    *out_j = pair[1];
+}
+
+/* Loads an I/Q pair for the Costas loop, both components 0 unless both are in range; returns whether they were. Two
+ * scalar tests rather than pair_bits_in_range(): with the packed test here GCC emits a loop 10% slower. */
+static inline bool
+load_pair_or_zero(const float* sample, float* out_r, float* out_j) {
+    uint32_t bits_r = stored_float_bits(sample);
+    uint32_t bits_j = stored_float_bits(sample + 1);
+    const bool in_range = sample_bits_in_range(bits_r) && sample_bits_in_range(bits_j);
+    if (!in_range) {
+        bits_r = 0;
+        bits_j = 0;
+    }
+    DSD_MEMCPY(out_r, &bits_r, sizeof(*out_r));
+    DSD_MEMCPY(out_j, &bits_j, sizeof(*out_j));
+    return in_range;
+}
+
+/* For loop state persisted across blocks, read once per block. */
+static inline bool
+stored_float_is_finite(const float* value) {
+    return (stored_float_bits(value) & kFloatExponentMask) != kFloatExponentMask;
 }
 
 static int
@@ -206,16 +296,12 @@ smoothstep(float edge0, float edge1, float x) {
 
 static inline float
 cqpsk_costas_confidence_from_mag(float mag) {
-    if (!std::isfinite(mag)) {
-        return 0.0f;
-    }
     return smoothstep(kCqpskCostasConfidenceFloorMag, kCqpskCostasConfidenceFullMag, mag);
 }
 
 static inline float
 cqpsk_costas_error_smooth_alpha(float error_raw, float error_smooth) {
-    if (!std::isfinite(error_raw) || !std::isfinite(error_smooth)
-        || std::fabs(error_smooth) <= kCqpskCostasErrorSmoothBootstrap) {
+    if (std::fabs(error_smooth) <= kCqpskCostasErrorSmoothBootstrap) {
         return kCqpskCostasErrorSmoothAlpha;
     }
 
@@ -226,15 +312,16 @@ cqpsk_costas_error_smooth_alpha(float error_raw, float error_smooth) {
     return kCqpskCostasErrorSmoothAlpha + (kCqpskCostasErrorSmoothAlphaMin - kCqpskCostasErrorSmoothAlpha) * kick;
 }
 
+/* For an in-range sample (see sample_bits_in_range()) mag2 is finite; any other goes out as 0 with no confidence. */
 static inline float
-normalize_costas_detector_sample(float real, float imag, float* out_real, float* out_imag) {
-    float mag2 = real * real + imag * imag;
-    if (!std::isfinite(mag2)) {
+normalize_costas_detector_sample(bool in_range, float real, float imag, float* out_real, float* out_imag) {
+    if (!in_range) {
         *out_real = 0.0f;
         *out_imag = 0.0f;
         return 0.0f;
     }
 
+    float mag2 = real * real + imag * imag;
     if (mag2 <= kCqpskCostasConfidenceFloorMag2) {
         *out_real = real;
         *out_imag = imag;
@@ -244,19 +331,12 @@ normalize_costas_detector_sample(float real, float imag, float* out_real, float*
     float mag = sqrtf(mag2);
     float confidence = (mag2 >= kCqpskCostasConfidenceFullMag2) ? 1.0f : cqpsk_costas_confidence_from_mag(mag);
 
+    /* mag > kCqpskCostasConfidenceFloorMag here, so the scale is finite and at most 7.3. */
     float scale = kCqpskCostasDetectorTargetMag / mag;
-    if (!std::isfinite(scale)) {
-        *out_real = 0.0f;
-        *out_imag = 0.0f;
-        return 0.0f;
-    }
     *out_real = real * scale;
     *out_imag = imag * scale;
     return confidence;
 }
-
-/* NaN check helper */
-#define IS_NAN(x) ((x) != (x))
 
 static inline int
 clampi(int value, int min_value, int max_value) {
@@ -299,7 +379,7 @@ struct gardner_loop_context_t {
     float* iq_in;
     float* iq_out;
     float* dl;
-    int buf_len;
+    int out_cap; /* floats iq_out holds */
     int nc;
     int i;
     int o;
@@ -397,13 +477,21 @@ gardner_reinit_state(demod_state* d, ted_state_t* ted, int sps, int is_first_ini
     return 1;
 }
 
+static_assert(sizeof(demod_state::hb_workbuf) / sizeof(float) >= DSD_DEMOD_WORKBUF_LENGTH
+                  && sizeof(demod_state::timing_buf) / sizeof(float) >= DSD_DEMOD_WORKBUF_LENGTH,
+              "the Gardner writes either work buffer up to DSD_DEMOD_WORKBUF_LENGTH floats");
+
 static inline void
 gardner_init_loop_context(demod_state* d, ted_state_t* ted, float gain_mu, float gain_omega,
                           gardner_loop_context_t* ctx) {
     ctx->iq_in = d->lowpassed;
-    ctx->iq_out = d->timing_buf;
+    /* The symbols go to the work buffer the samples are not in: a symbol the last block owed is written before this
+       block's first sample is read, so writing over the input would overwrite that sample. The channel filter leaves
+       its output in timing_buf after an odd half-band pass count. The buffer's capacity bounds the symbols, not the
+       block's length: a one-pair block that pays an owed symbol must still read its sample. */
+    ctx->iq_out = (d->lowpassed == d->timing_buf) ? d->hb_workbuf : d->timing_buf;
+    ctx->out_cap = DSD_DEMOD_WORKBUF_LENGTH;
     ctx->dl = ted->dl;
-    ctx->buf_len = d->lp_len;
     ctx->nc = d->lp_len >> 1;
     ctx->i = 0;
     ctx->o = 0;
@@ -456,15 +544,10 @@ gardner_consume_until_ready(gardner_loop_context_t* ctx) {
     while (ctx->mu > 1.0f && ctx->i < ctx->nc) {
         ctx->mu -= 1.0f;
 
-        const size_t ii = (size_t)ctx->i;
-        float in_r = ctx->iq_in[ii * 2];
-        float in_j = ctx->iq_in[ii * 2 + 1];
-        if (IS_NAN(in_r)) {
-            in_r = 0.0f;
-        }
-        if (IS_NAN(in_j)) {
-            in_j = 0.0f;
-        }
+        /* An out-of-range component (Inf, NaN or absurdly large: see sample_bits_in_range()) enters as 0. */
+        float in_r = 0.0f;
+        float in_j = 0.0f;
+        load_pair_components_or_zero(ctx->iq_in + (size_t)ctx->i * 2, &in_r, &in_j);
 
         gardner_push_delay_sample(ctx, in_r, in_j);
         ctx->i++;
@@ -502,14 +585,12 @@ gardner_interpolate_symbol(const gardner_loop_context_t* ctx, int half_sps, floa
     return 1;
 }
 
+/* Finite: every delay-line sample passed sample_bits_in_range(). */
 static inline float
 gardner_compute_symbol_error(float last_r, float last_j, float sym_r, float sym_j, float mid_r, float mid_j) {
     const float error_real = (last_r - sym_r) * mid_r;
     const float error_imag = (last_j - sym_j) * mid_j;
-    float symbol_error = error_real + error_imag;
-    if (IS_NAN(symbol_error)) {
-        symbol_error = 0.0f;
-    }
+    const float symbol_error = error_real + error_imag;
     return clipf_limit(symbol_error, 1.0f);
 }
 
@@ -554,13 +635,13 @@ static inline void
 costas_prepare_loop_context(const dsd_costas_loop_state_t* c, costas_loop_context_t* ctx) {
     ctx->max_phase = kPi / 2.0f;
     ctx->min_phase = -ctx->max_phase;
-    ctx->phase = std::isfinite(c->phase) ? clampf_range(c->phase, ctx->min_phase, ctx->max_phase) : 0.0f;
+    ctx->phase = stored_float_is_finite(&c->phase) ? clampf_range(c->phase, ctx->min_phase, ctx->max_phase) : 0.0f;
     ctx->freq = c->freq;
     ctx->alpha = c->alpha;
     ctx->beta = c->beta;
     ctx->max_freq = c->max_freq;
     ctx->min_freq = c->min_freq;
-    ctx->error_smooth = std::isfinite(c->error_smooth) ? c->error_smooth : 0.0f;
+    ctx->error_smooth = stored_float_is_finite(&c->error_smooth) ? c->error_smooth : 0.0f;
     ctx->last_error = 0.0f;
     ctx->metrics.err_abs_acc = 0.0f;
     ctx->metrics.err_raw_abs_acc = 0.0f;
@@ -568,8 +649,15 @@ costas_prepare_loop_context(const dsd_costas_loop_state_t* c, costas_loop_contex
     ctx->metrics.zero_conf_count = 0;
 }
 
+/* A sample with an out-of-range component (Inf, NaN or absurdly large: see sample_bits_in_range()) is rotated as 0
+ * and then dropped: it goes out as 0 and counts as a zero-confidence symbol, which holds the loop and restarts the
+ * error smoothing. */
 static inline void
-costas_process_symbol(costas_loop_context_t* ctx, float in_r, float in_j, float* out_r, float* out_j) {
+costas_process_symbol(costas_loop_context_t* ctx, const float* sample, float* out_r, float* out_j) {
+    float in_r = 0.0f;
+    float in_j = 0.0f;
+    const bool in_range = load_pair_or_zero(sample, &in_r, &in_j);
+
     float nco_r = 0.0f;
     float nco_j = 0.0f;
     dsd_sincosf_clamped_half_pi(-ctx->phase, &nco_j, &nco_r);
@@ -579,11 +667,11 @@ costas_process_symbol(costas_loop_context_t* ctx, float in_r, float in_j, float*
 
     float det_r = 0.0f;
     float det_j = 0.0f;
-    const float confidence = normalize_costas_detector_sample(rot_r, rot_j, &det_r, &det_j);
+    const float confidence = normalize_costas_detector_sample(in_range, rot_r, rot_j, &det_r, &det_j);
 
     float error = 0.0f;
     float error_raw = 0.0f;
-    if (confidence <= 0.0f || !std::isfinite(confidence)) {
+    if (confidence <= 0.0f) {
         ctx->error_smooth = 0.0f;
         ctx->metrics.zero_conf_count++;
     } else {
@@ -632,13 +720,21 @@ costas_commit_loop(dsd_costas_loop_state_t* c, const costas_loop_context_t* ctx)
     c->error_smooth = ctx->error_smooth;
 }
 
+/* The sample loop indexes the mirrored delay line at delay_idx and delay_idx + n_taps, so it needs the filter's tap
+ * count within [3, FLL_BAND_EDGE_MAX_TAPS] and delay_idx within [0, n_taps). Every writer of the persisted state keeps
+ * that, so a state outside it is corrupt rather than reachable; it is designed afresh instead of being indexed. */
+static inline int
+fll_delay_line_consistent(const dsd_fll_band_edge_state_t* f) {
+    return f->n_taps >= 3 && f->n_taps <= FLL_BAND_EDGE_MAX_TAPS && f->delay_idx >= 0 && f->delay_idx < f->n_taps;
+}
+
 static inline int
 fll_need_reinit(const dsd_fll_band_edge_state_t* f, int sps, int* is_first_init) {
     const int first_init = !f->initialized;
     if (is_first_init) {
         *is_first_init = first_init;
     }
-    if (first_init) {
+    if (first_init || !fll_delay_line_consistent(f)) {
         return 1;
     }
     return (f->sps > 0 && f->sps != sps) ? 1 : 0;
@@ -658,6 +754,8 @@ fll_configure_loop_params(dsd_fll_band_edge_state_t* f, int sps) {
 
 static inline void
 fll_reinit_state(const demod_state* d, dsd_fll_band_edge_state_t* f, int sps, int is_first_init) {
+    /* Read before the redesign overwrites the state: it names the trigger in the debug log. */
+    const int inconsistent = !is_first_init && !fll_delay_line_consistent(f);
     const float excess_bw = 0.2f;
     const int filter_size = 2 * sps + 1;
     fll_band_edge_design_filter(f, sps, excess_bw, filter_size);
@@ -675,6 +773,9 @@ fll_reinit_state(const demod_state* d, dsd_fll_band_edge_state_t* f, int sps, in
         const float freq_hz = f->freq * (sample_rate / kTwoPi);
         if (is_first_init) {
             DSD_FPRINTF(stderr, "[FLL] init: sps=%d filter_size=%d loop_bw=%.6f\n", sps, filter_size, f->loop_bw);
+        } else if (inconsistent) {
+            DSD_FPRINTF(stderr, "[FLL] inconsistent_state: sps=%d filter_size=%d freq=%.1fHz (preserved)\n", sps,
+                        filter_size, freq_hz);
         } else {
             DSD_FPRINTF(stderr, "[FLL] sps_change: sps=%d filter_size=%d freq=%.1fHz (preserved)\n", sps, filter_size,
                         freq_hz);
@@ -800,6 +901,12 @@ fll_commit_loop(dsd_fll_band_edge_state_t* f, const fll_loop_context_t* ctx) {
  *   - NO NCO rotation applied to input samples
  *   - NO phase error computation or Costas tracking
  *   - Output is raw symbols, not carrier-corrected
+ *
+ * Blocks (issue #572): every block, however short, runs through the state kept
+ * in ted_state (mu, omega, the delay line, the last symbol). A symbol comes out
+ * once mu has run down and one more sample is in, which may be in the next
+ * block, so a stream gives the same symbols however it is cut; a block can make
+ * none. Only the adaptive gain is decided per block.
  */
 extern "C" void
 op25_gardner_cc(struct demod_state* d) {
@@ -808,10 +915,6 @@ op25_gardner_cc(struct demod_state* d) {
     }
 
     ted_state_t* ted = &d->ted_state;
-    if ((d->lp_len >> 1) < 4) {
-        return;
-    }
-
     const int sps = d->ted_sps > 0 ? d->ted_sps : 5;
     float omega = ted->omega;
     int is_first_init = 0;
@@ -827,7 +930,7 @@ op25_gardner_cc(struct demod_state* d) {
     gardner_init_loop_context(d, ted, gain_mu, gain_omega, &ctx);
     ctx.omega = omega;
 
-    while (ctx.o < ctx.buf_len && ctx.i < ctx.nc) {
+    while (ctx.o < ctx.out_cap && ctx.i < ctx.nc) {
         if (!gardner_consume_until_ready(&ctx)) {
             break;
         }
@@ -948,11 +1051,9 @@ op25_costas_loop_cc(struct demod_state* d) {
 
     for (int n = 0; n < pairs; n++) {
         const size_t nn = (size_t)n;
-        const float in_r = iq[nn * 2];
-        const float in_j = iq[nn * 2 + 1];
         float out_r = 0.0f;
         float out_j = 0.0f;
-        costas_process_symbol(&ctx, in_r, in_j, &out_r, &out_j);
+        costas_process_symbol(&ctx, iq + nn * 2, &out_r, &out_j);
         iq[nn * 2] = out_r;
         iq[nn * 2 + 1] = out_j;
     }

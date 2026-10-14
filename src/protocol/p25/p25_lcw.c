@@ -15,7 +15,6 @@
 #include <dsd-neo/core/call_state.h>
 
 #include <dsd-neo/core/constants.h>
-#include <dsd-neo/core/dsd_time.h>
 #include <dsd-neo/core/embedded_alias.h>
 #include <dsd-neo/core/events.h>
 #include <dsd-neo/core/gps.h>
@@ -28,6 +27,7 @@
 #include <dsd-neo/protocol/p25/p25_lcw.h>
 #include <dsd-neo/protocol/p25/p25_trunk_sm.h>
 #include <dsd-neo/runtime/colors.h>
+#include <dsd-neo/runtime/decode_clock.h>
 #include <dsd-neo/runtime/unicode.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -483,8 +483,8 @@ p25_lcw_handle_format_58(p25_lcw_ctx* ctx) {
     int chan_spac = (int)convert_bits_into_output(&ctx->bits[30], 10);
     uint32_t base = (uint32_t)convert_bits_into_output(&ctx->bits[40], 32);
     int trans_off = p25_lcw_signed_offset_units(sign, tx_raw);
-    DSD_FPRINTF(stderr, " Channel Identifier Update; Iden: %X; BW: %X; TX Offset: %d; Spacing: %X; Base: %ld;", iden,
-                bw, trans_off, chan_spac, (long)base * 5L);
+    DSD_FPRINTF(stderr, " Channel Identifier Update; Iden: %X; BW: %X; TX Offset: %d; Spacing: %X; Base: %lld;", iden,
+                bw, trans_off, chan_spac, (long long)base * 5LL);
     p25_lcw_store_fdma_iden(ctx->opts, ctx->state, iden, (long int)base, chan_spac, trans_off, 0);
 }
 
@@ -497,8 +497,8 @@ p25_lcw_handle_format_59(p25_lcw_ctx* ctx) {
     int chan_spac = (int)convert_bits_into_output(&ctx->bits[30], 10);
     uint32_t base = (uint32_t)convert_bits_into_output(&ctx->bits[40], 32);
     int trans_off = p25_lcw_signed_offset_units(sign, tx_raw);
-    DSD_FPRINTF(stderr, " Channel Identifier Update VU; Iden: %X; BW: %X; TX Offset: %d; Spacing: %X; Base: %ld;", iden,
-                bw_vu, trans_off, chan_spac, (long)base * 5L);
+    DSD_FPRINTF(stderr, " Channel Identifier Update VU; Iden: %X; BW: %X; TX Offset: %d; Spacing: %X; Base: %lld;",
+                iden, bw_vu, trans_off, chan_spac, (long long)base * 5LL);
     p25_lcw_store_fdma_iden(ctx->opts, ctx->state, iden, (long int)base, chan_spac, trans_off, bw_vu);
 }
 
@@ -854,7 +854,7 @@ p25_lcw_handle_mfid90_opcode_0f(p25_lcw_ctx* ctx) {
     DSD_MEMSET(ctx->state->dmr_pdu_sf[0], 0, sizeof(ctx->state->dmr_pdu_sf[0]));
     dsd_call_snapshot call;
     const int target = dsd_call_state_get(ctx->state, 0U, &call) > 0 ? (int)call.ota_target_id : 0;
-    p25_sm_emit_end_call_at(ctx->opts, ctx->state, 0, target, (int)src, dsd_time_now_monotonic_s());
+    p25_sm_emit_end_call_at(ctx->opts, ctx->state, 0, target, (int)src, dsd_decode_now_mono_s());
 }
 
 static void

@@ -38,12 +38,14 @@
 
 #include <cstdlib>
 #include <dsd-neo/app_control/trunk_scan_validate.h>
+#include <dsd-neo/core/analog_tone.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/opts_fwd.h>
 #include <dsd-neo/core/safe_api.h>
 #include <dsd-neo/core/state_fwd.h>
+#include <dsd-neo/platform/sockets.h>
 #include <dsd-neo/runtime/scan_options.h>
-#include <initializer_list>
+#include <initializer_list> // IWYU pragma: keep -- braced range-for lists require this header.
 #include <qflags.h>
 #include <stdint.h>
 extern "C" {
@@ -727,16 +729,19 @@ test_metadata_failure_keeps_file() {
 
 } // namespace
 
-/* Issue #526: the channel-map review carries an nfm row's own channel width in Hz, and nothing for a row that inherits
-   the configured width or a digital row. */
+/* Issue #526: the channel-map review carries an analog row's own channel width in Hz -- an nfm row's
+   --nfm-bandwidth-hz, an am row's --am-bandwidth-hz -- and nothing for a row that inherits the configured width or a
+   digital row. */
 static void
 test_channel_review_bandwidth() {
     QTemporaryDir source;
     TestHost host;
     dsd_qt::ImportedFilesModel model(&host);
     QFile file(source.filePath("nfm.csv"));
-    const QByteArray bytes = "channel,frequency_hz,mode,options\n1,154430000,nfm,--nfm-bandwidth-hz 12500\n"
-                             "2,155100000,nfm,\n3,461000000,dmr,\n";
+    const QByteArray bytes =
+        "channel,frequency_hz,mode,options\n1,154430000,nfm,--nfm-bandwidth-hz 12500\n"
+        "2,155100000,nfm,--squelch auto+8\n3,461000000,dmr,\n4,118300000,am,--am-bandwidth-hz 8333\n"
+        "5,121500000,AM,\n6,154800000,nfm,--squelch noise+11\n";
     expect("write nfm map", file.open(QIODevice::WriteOnly) && file.write(bytes) == bytes.size());
     file.close();
     const auto result = model.importFile(source.filePath("nfm.csv"), "Nfm.csv", "chan");
@@ -747,12 +752,62 @@ test_channel_review_bandwidth() {
     }
     const auto review = model.channelProfiles(row);
     const auto rows = review.value("rows").toList();
-    expect("nfm map review", review.value("ok").toBool() && rows.size() == 3);
-    if (rows.size() == 3) {
+    expect("nfm map review", review.value("ok").toBool() && rows.size() == 6);
+    if (rows.size() == 6) {
         expect("reports the row's own width", rows[0].toMap().value("bandwidthHz").toInt() == 12500);
         expect("an inheriting nfm row carries none", !rows[1].toMap().value("bandwidthHz").isValid());
         expect("a digital row carries none", !rows[2].toMap().value("bandwidthHz").isValid());
         expect("the nfm row names its mode", rows[0].toMap().value("mode") == "nfm");
+        expect("reports the am row's own width",
+               rows[3].toMap().value("bandwidthHz").toInt() == 8333 && rows[3].toMap().value("mode") == "am");
+        expect("an inheriting am row carries none, in the canonical spelling",
+               !rows[4].toMap().value("bandwidthHz").isValid() && rows[4].toMap().value("mode") == "am");
+        /* Issue #518 follow-up: a row's own auto squelch reaches the review as its margin; a level carries none. */
+        expect("reports the row's own auto squelch",
+               rows[1].toMap().value("squelchMarginDb").toInt() == 8 && rows[1].toMap().value("squelchDb").isValid());
+        expect("a row without an auto squelch carries no margin", !rows[0].toMap().value("squelchMarginDb").isValid());
+        expect("an auto squelch is not the noise squelch", !rows[1].toMap().value("squelchNoise").toBool());
+        expect("reports the row's own noise squelch", rows[5].toMap().value("squelchMarginDb").toInt() == 11
+                                                          && rows[5].toMap().value("squelchNoise").toBool());
+    }
+    model.remove(row);
+}
+
+/* Issue #527: the channel-map review carries an nfm row's own tone policy (its dsd_tone_filter_mode and its list as
+   displayed), and nothing for a row that runs the configured policy -- an am row, which cannot set one, included. */
+static void
+test_channel_review_tone_filter() {
+    QTemporaryDir source;
+    TestHost host;
+    dsd_qt::ImportedFilesModel model(&host);
+    QFile file(source.filePath("tone.csv"));
+    const QByteArray bytes = "channel,frequency_hz,mode,options\n1,154430000,nfm,--tone-allow 100.0/D023N\n"
+                             "2,155475000,nfm,--tone-block=67\n3,155520000,nfm,--no-tone-filter\n"
+                             "4,155535000,nfm,\n5,118300000,am,\n6,461000000,dmr,\n";
+    expect("write tone map", file.open(QIODevice::WriteOnly) && file.write(bytes) == bytes.size());
+    file.close();
+    const auto result = model.importFile(source.filePath("tone.csv"), "Tone.csv", "chan");
+    expect("tone map imports", result.value("ok").toBool());
+    const int row = model.rowForPath(result.value("path").toString());
+    if (row < 0) {
+        return;
+    }
+    const auto review = model.channelProfiles(row);
+    const auto rows = review.value("rows").toList();
+    expect("tone map review", review.value("ok").toBool() && rows.size() == 6);
+    if (rows.size() == 6) {
+        expect("reports the row's allow list", rows[0].toMap().value("toneFilter").toInt() == DSD_TONE_FILTER_ALLOW
+                                                   && rows[0].toMap().value("toneList") == "100.0 Hz/D023N");
+        expect("reports the row's block list", rows[1].toMap().value("toneFilter").toInt() == DSD_TONE_FILTER_BLOCK
+                                                   && rows[1].toMap().value("toneList") == "67.0 Hz");
+        expect("reports the row's own off", rows[2].toMap().value("toneFilter").isValid()
+                                                && rows[2].toMap().value("toneFilter").toInt() == DSD_TONE_FILTER_OFF
+                                                && rows[2].toMap().value("toneList").toString().isEmpty());
+        for (int i = 3; i < 6; ++i) {
+            expect("a row without its own policy carries none",
+                   !rows[i].toMap().value("toneFilter").isValid()
+                       && rows[i].toMap().value("toneList").toString().isEmpty());
+        }
     }
     model.remove(row);
 }
@@ -792,6 +847,7 @@ test_channel_bundle() {
                profile.value("keySource").toInt() == 2 && profile.value("mappings").toInt() == 1);
         /* #521: the row's own squelch reaches the review; an inheriting row carries none. */
         expect("row review reports the row squelch", profile.value("squelchDb").toInt() == -60);
+        expect("a level squelch carries no auto margin", !profile.value("squelchMarginDb").isValid());
         expect("row review never contains key material",
                !QJsonDocument::fromVariant(profile).toJson().contains("ABCDE"));
     }
@@ -1439,21 +1495,34 @@ test_example_targets() {
     dsd_qt::ImportedFilesModel model(&host);
     const auto result = model.importFile(QStringLiteral(DSD_NEO_TEST_EXAMPLES_DIR "/trunk_scan_targets.csv"),
                                          "Examples.csv", "trunkTargets");
-    expect("shipped example imports all targets", result.value("ok").toBool() && result.value("accepted").toInt() == 9);
+    expect("shipped example imports all targets",
+           result.value("ok").toBool() && result.value("accepted").toInt() == 10);
     if (!result.value("ok").toBool()) {
         return;
     }
     const QString path = result.value("path").toString();
     const auto rows = model.targetPreview(path).value("rows").toList();
-    /* Issue #526: the analog nfm-conventional target previews with its canonical type and its own channel width; a
-       digital target carries no width. */
-    expect("shipped row order retained", rows.size() == 9 && rows[0].toMap().value("id") == "county-p25"
-                                             && rows[7].toMap().value("id") == "field-nxdn48"
-                                             && rows[8].toMap().value("id") == "fire-nfm"
-                                             && rows[8].toMap().value("type") == "nfm-conventional");
-    if (rows.size() == 9) {
+    /* Issue #526: the analog nfm-conventional and am-conventional targets preview with their canonical types and their
+       own channel widths and squelch, which the import's copy keeps; a digital target carries no width. */
+    expect("shipped row order retained",
+           rows.size() == 10 && rows[0].toMap().value("id") == "county-p25"
+               && rows[7].toMap().value("id") == "field-nxdn48" && rows[8].toMap().value("id") == "fire-nfm"
+               && rows[8].toMap().value("type") == "nfm-conventional" && rows[9].toMap().value("id") == "tower-am"
+               && rows[9].toMap().value("type") == "am-conventional");
+    if (rows.size() == 10) {
         expect("previews the nfm target's own width", rows[8].toMap().value("bandwidthHz").toInt() == 12500);
+        expect("previews the am target's own width and auto squelch",
+               rows[9].toMap().value("bandwidthHz").toInt() == 8333
+                   && rows[9].toMap().value("squelchMarginDb").toInt() == 6);
+        expect("an analog target previews no modulation", rows[9].toMap().value("modulation").toString().isEmpty());
         expect("a digital target previews no width", !rows[0].toMap().value("bandwidthHz").isValid());
+        /* Issue #527: the nfm target's own tone policy previews as its mode and displayed list; the am and digital
+           targets run the configured one. */
+        expect("previews the nfm target's own tone policy",
+               rows[8].toMap().value("toneFilter").toInt() == DSD_TONE_FILTER_ALLOW
+                   && rows[8].toMap().value("toneList") == "156.7 Hz/D023N");
+        expect("the am and digital targets carry no tone policy",
+               !rows[9].toMap().value("toneFilter").isValid() && !rows[0].toMap().value("toneFilter").isValid());
     }
     auto* opts = static_cast<dsd_opts*>(std::calloc(1, sizeof(dsd_opts)));
     auto* state = static_cast<dsd_state*>(std::calloc(1, sizeof(dsd_state)));
@@ -1465,6 +1534,9 @@ test_example_targets() {
     }
     opts->trunk_scan_enabled = 1;
     opts->use_rigctl = 1;
+    /* No rigctl peer: the retune fails as it does without one. A zeroed socket field would be descriptor 0, and a
+       retune would write its command to stdin and then wait on stdin for the reply. */
+    opts->rigctl_sockfd = DSD_INVALID_SOCKET;
     opts->rtl_dsp_bw_khz = 48;
     opts->scan_max_visit_ms = 40000;
     DSD_SNPRINTF(opts->trunk_scan_targets_csv, sizeof opts->trunk_scan_targets_csv, "%s", path.toUtf8().constData());
@@ -1476,7 +1548,7 @@ test_example_targets() {
     const bool initialized = dsd_engine_trunk_scan_init(opts, state, error, sizeof error) == 0;
     expect("imported example initializes", initialized);
     if (initialized) {
-        expect("engine owns all nine imported targets", dsd_engine_trunk_scan_target_count(state) == 9);
+        expect("engine owns all ten imported targets", dsd_engine_trunk_scan_target_count(state) == 10);
         expect("first target visit limit applies", opts->scan_max_visit_ms == 20000);
         expect("advance imported target",
                dsd_engine_trunk_scan_control(opts, state, DSD_TRUNK_SCAN_CONTROL_ADVANCE) == 0);
@@ -1525,6 +1597,7 @@ main(int argc, char** argv) {
     test_metadata_failure_keeps_file();
     test_channel_bundle();
     test_channel_review_bandwidth();
+    test_channel_review_tone_filter();
     test_target_bundle();
     test_library_companions();
     test_library_candidate_ranking();

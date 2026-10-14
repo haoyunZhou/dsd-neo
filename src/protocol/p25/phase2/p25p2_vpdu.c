@@ -15,7 +15,6 @@
 #include <dsd-neo/core/bit_packing.h>
 #include <dsd-neo/core/call_state.h>
 #include <dsd-neo/core/constants.h>
-#include <dsd-neo/core/dsd_time.h>
 #include <dsd-neo/core/embedded_alias.h>
 #include <dsd-neo/core/events.h>
 #include <dsd-neo/core/file_io.h>
@@ -35,7 +34,7 @@
 #include <dsd-neo/protocol/p25/p25p2_mac_parse.h>
 #include <dsd-neo/runtime/colors.h>
 #include <dsd-neo/runtime/config.h>
-#include <dsd-neo/runtime/p25_p2_audio_ring.h>
+#include <dsd-neo/runtime/decode_clock.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -48,6 +47,7 @@
 #include "dsd-neo/core/opts_fwd.h"
 #include "dsd-neo/core/safe_api.h"
 #include "dsd-neo/core/state_fwd.h"
+#include "p25p2_frame_internal.h"
 
 static inline void dsd_append(char* dst, size_t dstsz, const char* src);
 
@@ -215,8 +215,7 @@ p25p2_vpdu_voice_repeats_recent_end(dsd_opts* opts, dsd_state* state, int slot, 
                                     uint64_t subscriber_source, int service_options) {
     dsd_call_snapshot current = {0};
     if (dsd_call_state_get(state, (uint8_t)slot, &current) <= 0 || current.phase != DSD_CALL_PHASE_ENDED
-        || !p25_sm_voice_user_repeats_recent_end(slot, (int)target, (int)subscriber_source,
-                                                 dsd_time_now_monotonic_s())) {
+        || !p25_sm_voice_user_repeats_recent_end(slot, (int)target, (int)subscriber_source, dsd_decode_now_mono_s())) {
         return 0;
     }
     p25p2_vpdu_update_voice_crypto(state, slot, service_options, 0,
@@ -466,7 +465,7 @@ p25p2_emit_mac_json_if_enabled(const dsd_state* state, int xch_type, uint8_t mfi
         sum[j] = '\0';
     }
 
-    time_t ts = time(NULL);
+    time_t ts = dsd_decode_time();
     DSD_FPRINTF(stderr,
                 "{\"ts\":%ld,\"proto\":\"p25\",\"mac\":1,\"xch\":\"%s\",\"mfid\":%u,\"op\":%u,\"slot\":%d,\"slot1\":%d,"
                 "\"lenB\":%d,\"lenC\":%d,\"summary\":\"%s\"}\n",
@@ -512,8 +511,10 @@ p25p2_mac_handle_indiv(const struct p25p2_mac_result* res, dsd_opts* opts, dsd_s
     }
 }
 
+/* With trunking off, a grant update naming @p target, a call active on this carrier: its voice channel frequency, kept
+   with that target for the call's own publication (p25_conventional_grant_note(), issue #575). */
 static inline void
-p25_set_playback_vc_freq(const dsd_opts* opts, dsd_state* state, long int freq) {
+p25_set_playback_vc_freq(const dsd_opts* opts, dsd_state* state, uint32_t target, long int freq) {
     if (!opts || !state || opts->trunk_enable != 0) {
         return;
     }
@@ -523,6 +524,7 @@ p25_set_playback_vc_freq(const dsd_opts* opts, dsd_state* state, long int freq) 
     } else {
         state->p25_vc_freq[0] = state->p25_vc_freq[1] = freq;
     }
+    p25_conventional_grant_note(state, target, freq);
 }
 
 static inline void
@@ -571,6 +573,7 @@ typedef struct {
     int skip_rest;
     int end_pdu;
     int iter_idx;
+    int crc_ok; /* 0: a MAC_SIGNAL -F let through with a failed CRC (process_MAC_VPDU_crc()) */
 } p25p2_vpdu_ctx;
 
 static void p25p2_vpdu_emit_json(const p25p2_vpdu_ctx* ctx);
@@ -733,7 +736,7 @@ p25p2_vpdu_update_playback_if_match(const dsd_opts* opts, dsd_state* state, int 
         return;
     }
     if (p25p2_vpdu_active_target_matches(state, (uint64_t)(uint32_t)group)) {
-        p25_set_playback_vc_freq(opts, state, freq);
+        p25_set_playback_vc_freq(opts, state, (uint32_t)group, freq);
     }
 }
 
@@ -930,7 +933,6 @@ p25p2_vpdu_try_group_candidates(dsd_opts* opts, dsd_state* state, const p25p2_vp
 static void
 p25p2_vpdu_gate_slot_audio(dsd_state* state, int slot) {
     state->p25_p2_audio_allowed[slot] = 0;
-    p25_p2_audio_ring_reset(state, slot);
 }
 
 static double
@@ -973,8 +975,8 @@ p25p2_vpdu_elapsed_s(double mono_stamp, time_t wall_stamp, double nowm, double n
 
 static int
 p25p2_vpdu_recent_voice_active(const dsd_state* state, double voice_hold_s) {
-    double nowm = dsd_time_now_monotonic_s();
-    double noww = (double)time(NULL);
+    double nowm = dsd_decode_now_mono_s();
+    double noww = (double)dsd_decode_time();
     double dt = p25p2_vpdu_elapsed_s(state->last_vc_sync_time_m, state->last_vc_sync_time, nowm, noww);
     return dt <= voice_hold_s;
 }
@@ -982,17 +984,16 @@ p25p2_vpdu_recent_voice_active(const dsd_state* state, double voice_hold_s) {
 static int
 p25p2_vpdu_other_slot_audio_with_history(const dsd_state* state, int slot, double mac_hold_s, double voice_hold_s) {
     int other_slot = slot ^ 1;
-    double nowm = dsd_time_now_monotonic_s();
-    double noww = (double)time(NULL);
+    double nowm = dsd_decode_now_mono_s();
+    double noww = (double)dsd_decode_time();
     double dt_mac = p25p2_vpdu_elapsed_s(state->p25_p2_last_mac_active_m[other_slot],
                                          state->p25_p2_last_mac_active[other_slot], nowm, noww);
     int recent_voice = p25p2_vpdu_recent_voice_active(state, voice_hold_s);
     int recent_mac = (state->p25_p2_last_mac_active[other_slot] != 0 && dt_mac <= mac_hold_s) ? 1 : 0;
-    return state->p25_p2_audio_allowed[other_slot] || (state->p25_p2_audio_ring_count[other_slot] > 0) || recent_mac
-           || recent_voice;
+    return state->p25_p2_audio_allowed[other_slot] || recent_mac || recent_voice;
 }
 
-// Whether either logical slot still looks occupied: gated or buffered audio,
+// Whether either logical slot still looks occupied: gated audio,
 // MAC activity inside the hold window, or recent voice on the carrier. A
 // Deny/Queued response heard in a voice channel's signaling answers some
 // unit's request; releasing the carrier over one while a call -- or the
@@ -1012,7 +1013,7 @@ p25p2_vpdu_carrier_occupied_for_response(const dsd_opts* opts, const dsd_state* 
 static int
 p25p2_vpdu_force_release_after_grace(dsd_opts* opts, dsd_state* state) {
     double vc_grace = p25p2_vpdu_cfg_vc_grace_s(0.75);
-    double nowm = dsd_time_now_monotonic_s();
+    double nowm = dsd_decode_now_mono_s();
     double dt_since_tune = (state->p25_last_vc_tune_time_m > 0.0) ? (nowm - state->p25_last_vc_tune_time_m) : 1e9;
     if (dt_since_tune < vc_grace) {
         return 0;
@@ -1167,7 +1168,9 @@ p25p2_vpdu_iter_block_01(p25p2_vpdu_ctx* ctx) {
         }
         // If playing back files, and we still want to see what freqs are in use in the ncurses terminal
         //might only want to do these on a grant update, and not a grant by itself?
-        p25_set_playback_vc_freq(opts, state, freq);
+        // Only for the group of a call active on this carrier, like every other trunking-off writer: a conventional
+        // call takes p25_vc_freq as its own frequency (issue #575).
+        p25p2_vpdu_update_playback_if_match(opts, state, sgroup, freq);
     }
 
     if (len_b < 0) {
@@ -1224,11 +1227,8 @@ p25p2_vpdu_iter_block_02(p25p2_vpdu_ctx* ctx) {
         }
         // If playing back files, and we still want to see what freqs are in use in the ncurses terminal
         //might only want to do these on a grant update, and not a grant by itself?
-        if (opts->trunk_enable == 0) {
-            if (p25p2_vpdu_active_target_matches(state, (uint64_t)(uint32_t)sgroup)) {
-                p25_set_playback_vc_freq(opts, state, freq);
-            }
-        }
+        // Only for the group of a call active on this carrier, as for the implicit grant (issue #575).
+        p25p2_vpdu_update_playback_if_match(opts, state, sgroup, freq);
     }
 
     if (len_b < 0) {
@@ -1401,7 +1401,7 @@ p25p2_vpdu_iter_block_05(p25p2_vpdu_ctx* ctx) {
                                    /*policy_encrypted*/ -1, /*policy_data*/ -1);
         }
         if (opts->trunk_enable == 0 && p25p2_vpdu_active_target_matches(state, target)) {
-            p25_set_playback_vc_freq(opts, state, freq);
+            p25_set_playback_vc_freq(opts, state, (uint32_t)target, freq);
         }
     }
 
@@ -2687,8 +2687,8 @@ p25p2_vpdu_iter_block_29(p25p2_vpdu_ctx* ctx) {
         DSD_FPRINTF(stderr, "\n Identifier Update UHF/VHF\n");
         DSD_FPRINTF(stderr,
                     "  Channel Identifier [%01X] BW [%01X] Transmit Offset [%04X]\n  Channel Spacing [%03X] Base "
-                    "Frequency [%08lX] [%09ld]",
-                    state->p25_chan_iden, bw_vu, trans_off, chan_spac, base_freq, base_freq * 5);
+                    "Frequency [%08lX] [%09lld]",
+                    state->p25_chan_iden, bw_vu, trans_off, chan_spac, base_freq, (long long)base_freq * 5);
     }
 
     if (len_b < 0) {
@@ -2748,8 +2748,8 @@ p25p2_vpdu_iter_block_30(p25p2_vpdu_ctx* ctx) {
         DSD_FPRINTF(stderr, "\n Identifier Update (8.3.1.23)\n");
         DSD_FPRINTF(stderr,
                     "  Channel Identifier [%01X] BW [%01X] Transmit Offset [%04X]\n  Channel Spacing [%03X] Base "
-                    "Frequency [%08lX] [%09ld]",
-                    state->p25_chan_iden, bw, trans_off, chan_spac, base_freq, base_freq * 5);
+                    "Frequency [%08lX] [%09lld]",
+                    state->p25_chan_iden, bw, trans_off, chan_spac, base_freq, (long long)base_freq * 5);
     }
 
     if (len_b < 0) {
@@ -2809,8 +2809,8 @@ p25p2_vpdu_iter_block_31(p25p2_vpdu_ctx* ctx) {
         DSD_FPRINTF(stderr, "\n Identifier Update for TDMA - Abbreviated\n");
         DSD_FPRINTF(stderr,
                     "  Channel Identifier [%01X] Channel Type [%01X] Transmit Offset [%04X]\n  Channel Spacing [%03X] "
-                    "Base Frequency [%08lX] [%09ld]",
-                    state->p25_chan_iden, chan_type, trans_off, chan_spac, base_freq, base_freq * 5);
+                    "Base Frequency [%08lX] [%09lld]",
+                    state->p25_chan_iden, chan_type, trans_off, chan_spac, base_freq, (long long)base_freq * 5);
     }
 
     if (len_b < 0) {
@@ -2875,8 +2875,8 @@ p25p2_vpdu_iter_block_32(p25p2_vpdu_ctx* ctx) {
         DSD_FPRINTF(stderr, "\n Identifier Update for TDMA - Extended\n");
         DSD_FPRINTF(stderr,
                     "  Channel Identifier [%01X] Channel Type [%01X] Transmit Offset [%04X]\n  Channel Spacing [%03X] "
-                    "Base Frequency [%08lX] [%09ld]",
-                    state->p25_chan_iden, chan_type, trans_off, chan_spac, base_freq, base_freq * 5);
+                    "Base Frequency [%08lX] [%09lld]",
+                    state->p25_chan_iden, chan_type, trans_off, chan_spac, base_freq, (long long)base_freq * 5);
         DSD_FPRINTF(stderr, "\n  WACN [%04X] SYSID [%04X]", lwacn, lsysid);
     }
 
@@ -3480,7 +3480,7 @@ p25p2_vpdu_iter_block_44(p25p2_vpdu_ctx* ctx) {
 
         dsd_p25p2_flush_partial_audio_slot(opts, state, released_slot);
         p25p2_vpdu_gate_slot_audio(state, eslot);
-        p25_sm_emit_mac_release(opts, state, released_slot, dsd_time_now_monotonic_s());
+        p25_sm_emit_mac_release(opts, state, released_slot, dsd_decode_now_mono_s());
         p25_crypto_reset_slot(state, released_slot);
         other_audio = p25p2_vpdu_other_slot_audio_with_history(state, eslot, mac_hold, voice_hold);
         if (!other_audio) {
@@ -3537,7 +3537,7 @@ p25p2_vpdu_iter_block_45(p25p2_vpdu_ctx* ctx) {
             p25p2_vpdu_observe_voice(opts, state, slot, DSD_CALL_KIND_GROUP_VOICE, (uint64_t)(uint32_t)gr,
                                      (uint64_t)(uint32_t)src, svc, ctx->pdu_type);
         if (tracked_voice) {
-            state->p25_p2_last_mac_active[slot] = time(NULL);
+            state->p25_p2_last_mac_active[slot] = dsd_decode_time();
             p25p2_vpdu_store_slot_svc(state, slot, svc);
         }
         DSD_FPRINTF(stderr, (MAC[1 + len_a] == 0x21) ? " - Extended " : " - Abbreviated ");
@@ -3596,7 +3596,7 @@ p25p2_vpdu_iter_block_46(p25p2_vpdu_ctx* ctx) {
             p25p2_vpdu_observe_voice(opts, state, slot, DSD_CALL_KIND_PRIVATE_VOICE, (uint64_t)(uint32_t)gr,
                                      (uint64_t)(uint32_t)src, svc, ctx->pdu_type);
         if (tracked_voice) {
-            state->p25_p2_last_mac_active[slot] = time(NULL);
+            state->p25_p2_last_mac_active[slot] = dsd_decode_time();
             p25p2_vpdu_store_slot_svc(state, slot, svc);
         }
 
@@ -3616,16 +3616,23 @@ BLOCK_END:
     ctx->iter_idx = i;
 }
 
+/* @p crc_ok is the broadcast's CRC verdict (process_MAC_VPDU_crc()): one that failed its CRC under -F may still name
+   the system, as it always could, but proves no NAC. */
 static void
-p25p2_vpdu_apply_nsb_identity(dsd_state* state, int lwacn, int lsysid, int lcolorcode) {
-    if (!state || state->p2_hardset != 0) {
+p25p2_vpdu_apply_nsb_identity(dsd_state* state, int lwacn, int lsysid, int lcolorcode, int crc_ok) {
+    if (!state || (lwacn == 0 && lsysid == 0)) {
         return;
     }
-    if (lwacn == 0 && lsysid == 0) {
-        return;
-    }
-    if (p25_update_system_identity(state, (unsigned long long)lwacn, (unsigned long long)lsysid)) {
+    if (state->p2_hardset == 0
+        && p25_update_system_identity(state, (unsigned long long)lwacn, (unsigned long long)lsysid)) {
+        if (state->p2_cc != (unsigned long long)lcolorcode) {
+            state->p2_cc_verified = 0U;
+        }
         state->p2_cc = lcolorcode;
+    }
+    // A broadcast that passed its CRC naming the descrambler's NAC proves it on this carrier (issue #575).
+    if (crc_ok && state->p2_cc == (unsigned long long)lcolorcode) {
+        state->p2_cc_verified = 1U;
     }
 }
 
@@ -3637,7 +3644,8 @@ p25p2_vpdu_note_nsb_system_tdma(dsd_state* state) {
 }
 
 static void
-p25p2_vpdu_accept_nsb_cc(const dsd_opts* opts, dsd_state* state, int lwacn, int lsysid, int lcolorcode, int seed_lcn0) {
+p25p2_vpdu_accept_nsb_cc(const dsd_opts* opts, dsd_state* state, int lwacn, int lsysid, int lcolorcode, int seed_lcn0,
+                         int crc_ok) {
     const long neigh[1] = {state->p25_cc_freq};
     p25_cc_record_neighbor_frequencies(opts, state, neigh, 1);
     p25p2_vpdu_note_nsb_system_tdma(state);
@@ -3645,7 +3653,7 @@ p25p2_vpdu_accept_nsb_cc(const dsd_opts* opts, dsd_state* state, int lwacn, int 
 
     // Only update system identity and potentially reset IDEN tables when values
     // are sane (non-zero) and we have a valid frequency mapping.
-    p25p2_vpdu_apply_nsb_identity(state, lwacn, lsysid, lcolorcode);
+    p25p2_vpdu_apply_nsb_identity(state, lwacn, lsysid, lcolorcode, crc_ok);
 
     if (seed_lcn0 && (state->trunk_lcn_freq[0] == 0 || state->trunk_lcn_freq[0] != state->p25_cc_freq)) {
         state->trunk_lcn_freq[0] = state->p25_cc_freq;
@@ -3692,11 +3700,11 @@ p25p2_vpdu_iter_block_47(p25p2_vpdu_ctx* ctx) {
         int accepted_cc = p25_cc_update_primary_from_network_status(opts, state, cc_freq);
         const int cc_metadata_allowed = accepted_cc || !p25_cc_update_is_voice_tuned(opts);
         if (cc_metadata_allowed) {
-            p25p2_vpdu_apply_nsb_identity(state, lwacn, lsysid, lcolorcode);
+            p25p2_vpdu_apply_nsb_identity(state, lwacn, lsysid, lcolorcode, ctx->crc_ok);
             p25_store_site_lra(state, (uint8_t)lra);
         }
         if (accepted_cc) {
-            p25p2_vpdu_accept_nsb_cc(opts, state, lwacn, lsysid, lcolorcode, 1);
+            p25p2_vpdu_accept_nsb_cc(opts, state, lwacn, lsysid, lcolorcode, 1, ctx->crc_ok);
         } else {
             p25p2_vpdu_log_rejected_nsb_cc("P25 NSB", cc_freq, channel);
         }
@@ -3744,11 +3752,11 @@ p25p2_vpdu_iter_block_48(p25p2_vpdu_ctx* ctx) {
         int accepted_cc = p25_cc_update_primary_from_network_status(opts, state, nf1);
         const int cc_metadata_allowed = accepted_cc || !p25_cc_update_is_voice_tuned(opts);
         if (cc_metadata_allowed) {
-            p25p2_vpdu_apply_nsb_identity(state, lwacn, lsysid, lcolorcode);
+            p25p2_vpdu_apply_nsb_identity(state, lwacn, lsysid, lcolorcode, ctx->crc_ok);
             p25_store_site_lra(state, (uint8_t)lra);
         }
         if (accepted_cc) {
-            p25p2_vpdu_accept_nsb_cc(opts, state, lwacn, lsysid, lcolorcode, 0);
+            p25p2_vpdu_accept_nsb_cc(opts, state, lwacn, lsysid, lcolorcode, 0, ctx->crc_ok);
         } else {
             p25p2_vpdu_log_rejected_nsb_cc("P25 NSB-EXT", nf1, channelt);
         }
@@ -5056,8 +5064,8 @@ p25p2_vpdu_handle_standard_group_regroup_voice_user_abbreviated(p25p2_vpdu_ctx* 
         p25_patch_update(state, supergroup, /*is_patch*/ 1, /*active*/ 1);
         if (p25p2_vpdu_observe_voice(ctx->opts, state, slot, DSD_CALL_KIND_GROUP_VOICE, (uint64_t)(uint32_t)supergroup,
                                      (uint64_t)(uint32_t)source, -1, ctx->pdu_type)) {
-            state->p25_p2_last_mac_active[slot] = time(NULL);
-            state->p25_p2_last_mac_active_m[slot] = dsd_time_now_monotonic_s();
+            state->p25_p2_last_mac_active[slot] = dsd_decode_time();
+            state->p25_p2_last_mac_active_m[slot] = dsd_decode_now_mono_s();
         }
     }
 }
@@ -5587,6 +5595,11 @@ p25p2_vpdu_consume_multifragment_continuation(p25p2_vpdu_ctx* ctx) {
 static int
 p25p2_vpdu_consume_fragment_segment(p25p2_vpdu_ctx* ctx) {
     int opcode = (int)ctx->mac[1 + ctx->len_a];
+    // A superframe whose slot parity is unknown: an assembly is per slot, so a fragment could join the wrong one.
+    if (p25p2_window_slot_unproven() && (p25p2_vpdu_is_standard_multifragment_base(opcode) || opcode == 0x10)) {
+        DSD_FPRINTF(stderr, "\n MAC multi-fragment [%02X] dropped: unaligned superframe", opcode);
+        return 1;
+    }
     if (p25p2_vpdu_is_standard_multifragment_base(opcode)) {
         return p25p2_vpdu_consume_multifragment_base(ctx, opcode);
     }
@@ -5671,6 +5684,12 @@ p25p2_vpdu_print_payload(const dsd_opts* opts, const unsigned long long int mac[
 void
 process_MAC_VPDU(dsd_opts* opts, dsd_state* state, int type, p25_mac_pdu_type pdu_type,
                  unsigned long long int mac[24]) {
+    process_MAC_VPDU_crc(opts, state, type, pdu_type, mac, 1);
+}
+
+void
+process_MAC_VPDU_crc(dsd_opts* opts, dsd_state* state, int type, p25_mac_pdu_type pdu_type,
+                     unsigned long long int mac[24], int crc_ok) {
     unsigned long long int mac_octets[P25P2_MAC_STAGING_OCTETS] = {0};
     for (int bi = 0; bi < P25P2_MAC_OCTETS; bi++) {
         mac_octets[bi] = mac[bi] & 0xFFu;
@@ -5706,6 +5725,7 @@ process_MAC_VPDU(dsd_opts* opts, dsd_state* state, int type, p25_mac_pdu_type pd
         .skip_rest = 0,
         .end_pdu = 0,
         .iter_idx = 0,
+        .crc_ok = crc_ok != 0,
     };
 
     p25p2_vpdu_emit_json(&ctx);
@@ -5714,6 +5734,7 @@ process_MAC_VPDU(dsd_opts* opts, dsd_state* state, int type, p25_mac_pdu_type pd
         ctx.end_pdu = 1;
     }
 
+    const p25p2_retune_token token = p25p2_retune_token_now();
     for (int segment_idx = 0; !ctx.end_pdu && segment_idx < mac_res.segment_count; segment_idx++) {
         ctx.skip_rest = 0;
         ctx.iter_idx = segment_idx;
@@ -5722,6 +5743,11 @@ process_MAC_VPDU(dsd_opts* opts, dsd_state* state, int type, p25_mac_pdu_type pd
         }
         if (!p25p2_vpdu_consume_fragment_segment(&ctx)) {
             p25p2_vpdu_dispatch_blocks(&ctx);
+        }
+        // A segment that retuned (a grant, a return to the control channel) left this channel: the PDU's later
+        // segments describe the one left, so none of them may act on the new assignment (issue #651).
+        if (p25p2_retune_token_changed(&token)) {
+            break;
         }
     }
 

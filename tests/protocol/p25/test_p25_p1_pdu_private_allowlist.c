@@ -28,9 +28,7 @@
 #pragma GCC diagnostic ignored "-Wmissing-prototypes"
 #endif
 
-static int g_seed_count;
 static int g_group_grant_count;
-static int g_enc_lockout_count;
 static int g_last_group_channel;
 static int g_last_group_svc;
 static int g_last_group_tg;
@@ -58,9 +56,7 @@ recent_activity(dsd_state* state, dsd_recent_activity_entry* entry) {
 
 static void
 reset_calls(void) {
-    g_seed_count = 0;
     g_group_grant_count = 0;
-    g_enc_lockout_count = 0;
     g_last_group_channel = 0;
     g_last_group_svc = 0;
     g_last_group_tg = 0;
@@ -205,7 +201,6 @@ p25_emit_enc_lockout_once_typed(dsd_opts* opts, dsd_state* state, uint8_t slot, 
     (void)is_group;
     (void)algid;
     (void)keyid;
-    g_enc_lockout_count++;
 }
 
 void
@@ -213,7 +208,6 @@ void
 p25_sm_seed_cc_from_current_tuner_if_unknown(const dsd_opts* opts, dsd_state* state) {
     (void)opts;
     (void)state;
-    g_seed_count++;
 }
 
 static p25_sm_ctx_t g_sm_ctx;
@@ -253,6 +247,18 @@ p25_sm_apply_group_grant_policy(dsd_opts* opts, dsd_state* state, int channel, i
     if (opts && state && opts->trunk_enable == 1 && opts->trunk_tune_enc_calls == 0 && (svc_bits & 0x40) && tg > 0) {
         p25_emit_enc_lockout_once_typed(opts, state, 0, tg, svc_bits, 1, DSD_ENC_LOCKOUT_ALGID_UNKNOWN, 0);
     }
+}
+
+/* The trunking-off grant frequency kept with the target it named (issue #575). */
+static uint32_t g_conventional_grant_target;
+static long g_conventional_grant_freq;
+
+void
+// NOLINTNEXTLINE(misc-use-internal-linkage)
+p25_conventional_grant_note(dsd_state* state, uint32_t target, long int freq) {
+    (void)state;
+    g_conventional_grant_target = target;
+    g_conventional_grant_freq = freq;
 }
 
 void
@@ -379,6 +385,9 @@ main(void) {
     rc |= expect_true("p1 pdu group priority state", activity.observation.priority == 0U);
     rc |= expect_true("p1 pdu group activity target", activity.observation.ota_target_id == 0x1234U);
     rc |= expect_true("p1 pdu group activity notice", strstr(activity.notice, "TG: 4660") != NULL);
+    rc |= expect_true("p1 pdu group grant reaches the state machine once", g_group_grant_count == 1);
+    rc |= expect_true("p1 pdu group grant fields", g_last_group_tg == 0x1234 && g_last_group_src == 0x010203
+                                                       && g_last_group_channel == 0x100A && g_last_group_svc == 0);
 
     DSD_MEMSET(mpdu, 0, sizeof mpdu);
     mpdu[0] = 0x37;
@@ -412,6 +421,8 @@ main(void) {
     (void)p25_decode_pdu_trunking(&opts, &st, mpdu, sizeof mpdu);
     rc |= expect_true("p1 pdu telephone nontrunk p1 vc freq", st.p25_vc_freq[0] == 851125000);
     rc |= expect_true("p1 pdu telephone p1 leaves slot 2 freq", st.p25_vc_freq[1] == 0);
+    rc |= expect_true("p1 pdu telephone keeps the frequency with the target the grant named",
+                      g_conventional_grant_target == 0x010203U && g_conventional_grant_freq == 851125000);
     rc |= expect_true("p1 pdu telephone no trunk tune hook",
                       g_group_grant_count == 0 && st.p25_sm_tune_count == before + 1);
     rc |= expect_true("p1 pdu telephone activity", recent_activity(&st, &activity));
@@ -442,6 +453,9 @@ main(void) {
     rc |= expect_true("p1 pdu mfid90 activity", recent_activity(&st, &activity));
     rc |= expect_true("p1 pdu mfid90 activity kind", activity.observation.kind == DSD_CALL_KIND_GROUP_VOICE);
     rc |= expect_true("p1 pdu mfid90 activity notice", strstr(activity.notice, "SG: 8738") != NULL);
+    rc |= expect_true("p1 pdu mfid90 grant reaches the state machine once", g_group_grant_count == 1);
+    rc |= expect_true("p1 pdu mfid90 grant fields", g_last_group_tg == 0x2222 && g_last_group_src == 0x040506
+                                                        && g_last_group_channel == 0x100A && g_last_group_svc == 0);
 
     DSD_MEMSET(mpdu, 0, sizeof mpdu);
     mpdu[0] = 0x17; // inbound ALT MBT ISP

@@ -9,16 +9,16 @@
 #include <dsd-neo/core/state_fwd.h>
 #include <dsd-neo/core/synctype_ids.h>
 #include <dsd-neo/dsp/frame_sync.h>
-#include <dsd-neo/platform/timing.h>
 #include <dsd-neo/protocol/nxdn/nxdn.h>
 
 #include <dsd-neo/protocol/nxdn/nxdn_deperm.h>
 #include <dsd-neo/protocol/nxdn/nxdn_lfsr.h>
 #include <dsd-neo/protocol/nxdn/nxdn_voice.h>
+#include <dsd-neo/runtime/decode_clock.h>
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
-#include <time.h>
 #include "nxdn_confirm.h"
 
 static dsd_opts g_opts;
@@ -40,6 +40,9 @@ static int g_last_voice;
 static uint8_t g_dibit_stream[182];
 static uint8_t g_dibit_reliab_stream[182];
 static size_t g_dibit_stream_pos;
+/* The read that adopts a retune its capture recorded, where the carrier boundary moves the carrier count
+   (dsd_engine_carrier_boundary(), issue #575); SIZE_MAX for none. */
+static size_t g_boundary_at = SIZE_MAX;
 static uint8_t g_last_sacch_bit;
 static uint8_t g_last_sacch_reliab;
 static uint8_t g_last_facch_bit;
@@ -83,6 +86,8 @@ static int g_stub_sacch_ok;
 static int g_stub_scch_ok;
 static int g_stub_cac_ok;
 static int g_stub_facch_ok;
+/* The CAC that makes the eleventh failure in a row: the real deperm resets the sync state, synctype included. */
+static int g_stub_cac_resets_sync;
 
 static void
 nxdn_stub_note_crc(dsd_state* state, int crc_ok, nxdn_evidence evidence) {
@@ -115,9 +120,11 @@ reset_state(void) {
     g_stub_scch_ok = 0;
     g_stub_cac_ok = 1;
     g_stub_facch_ok = 1;
+    g_stub_cac_resets_sync = 0;
     DSD_MEMSET(g_dibit_stream, 0, sizeof(g_dibit_stream));
     DSD_MEMSET(g_dibit_reliab_stream, 255, sizeof(g_dibit_reliab_stream));
     g_dibit_stream_pos = 0U;
+    g_boundary_at = SIZE_MAX;
     g_last_sacch_bit = 0;
     g_last_sacch_reliab = 0;
     g_last_facch_bit = 0;
@@ -146,7 +153,9 @@ nxdn_descramble_with_seed(uint8_t dibits[], int len, uint16_t seed) {
 int
 getDibitSoft(dsd_opts* opts, dsd_state* state, dsd_dibit_soft_t* out_soft) {
     (void)opts;
-    (void)state;
+    if (g_dibit_stream_pos == g_boundary_at && state != NULL) {
+        state->carrier_seq++;
+    }
     uint8_t dibit = 0U;
     uint8_t reliab = 255U;
     if (g_dibit_stream_pos < (sizeof(g_dibit_stream) / sizeof(g_dibit_stream[0]))) {
@@ -159,16 +168,6 @@ getDibitSoft(dsd_opts* opts, dsd_state* state, dsd_dibit_soft_t* out_soft) {
         out_soft->reliability = reliab;
     }
     return dibit;
-}
-
-uint64_t
-dsd_time_monotonic_ns(void) {
-    return 42000000000ULL;
-}
-
-uint64_t
-dsd_time_monotonic_ms(void) {
-    return dsd_time_monotonic_ns() / 1000000U;
 }
 
 dsd_nxdn_variant
@@ -188,6 +187,11 @@ printFrameSync(const dsd_opts* opts, const dsd_state* state, const char* framety
     DSD_SNPRINTF(g_last_frame_type, sizeof(g_last_frame_type), "%s", frametype);
 }
 
+/* The capture opener of the revision before issue #661, kept so this harness also links and runs against it: the
+   first frame written creates the capture now, so a voice frame opens nothing here. */
+// NOLINTNEXTLINE(misc-use-internal-linkage): main's dispatcher links against this stub.
+void openMbeOutFile(dsd_opts* opts, dsd_state* state);
+
 void
 openMbeOutFile(dsd_opts* opts, dsd_state* state) {
     (void)state;
@@ -198,6 +202,15 @@ void
 closeMbeOutFile(dsd_opts* opts, dsd_state* state) {
     (void)state;
     opts->mbe_out_f = NULL;
+}
+
+/* NXDN closes only its own capture (issue #661). The owner filter itself is tested in CORE_MBE_FILE_IO; the capture
+   here is an NXDN one, so a close named for any other protocol leaves it open, as the real filter would. */
+void
+dsd_mbe_out_close_protocol(dsd_opts* opts, dsd_state* state, int slot_mask, int synctype) {
+    if (DSD_SYNC_IS_NXDN(synctype) && (slot_mask & DSD_MBE_OUT_SLOT1) != 0 && opts->mbe_out_f != NULL) {
+        closeMbeOutFile(opts, state);
+    }
 }
 
 void
@@ -224,6 +237,9 @@ void
 nxdn_deperm_cac_soft(dsd_opts* opts, dsd_state* state, uint8_t bits[300], const uint8_t reliab[300]) {
     (void)opts;
     nxdn_stub_note_crc(state, g_stub_cac_ok, NXDN_EVIDENCE_STRONG);
+    if (g_stub_cac_resets_sync) {
+        state->synctype = DSD_SYNC_NONE;
+    }
     g_cac_calls++;
     g_last_cac_bit = bits[0];
     g_last_cac_reliab = reliab[0];
@@ -349,6 +365,7 @@ test_control_channel_routes_and_reliability(void) {
     rc |= expect_int("sacch/facch accepted", route_frame(0x32U), 1);
     rc |= expect_int("sacch route", g_sacch_calls, 1);
     rc |= expect_int("facch route", g_facch_calls, 1);
+    rc |= expect_int("facch single part", g_facch_part_mask, 1 << 0);
     rc |= expect_int("voice route", g_voice_calls, 1);
     rc |= expect_int("voice mode", g_last_voice, 2);
     rc |= expect_int("sacch first bit", g_last_sacch_bit, (g_dibit_stream[8] >> 1U) & 1U);
@@ -359,6 +376,7 @@ test_control_channel_routes_and_reliability(void) {
     reset_state();
     rc |= expect_int("facch-both accepted", route_frame(0x20U), 1);
     rc |= expect_int("facch both routes", g_facch_calls, 2);
+    rc |= expect_int("facch both parts", g_facch_part_mask, (1 << 1) | (1 << 2));
     rc |= expect_int("non-superframe sacch mode", g_state.nxdn_sacch_non_superframe, 1);
 
     reset_state();
@@ -423,7 +441,7 @@ test_public_frame_entry_lich_collection(void) {
     rc |= expect_int("frame consumed dibits", (int)g_dibit_stream_pos, 182);
     rc |= expect_int("frame cac route", g_cac_calls, 1);
     rc |= expect_int("frame carrier active", g_state.carrier, 1);
-    rc |= expect_int("frame cc mono timestamp", g_state.last_cc_sync_time_m == 42.0, 1);
+    rc |= expect_int("frame cc mono timestamp", fabs(g_state.last_cc_sync_time_m - 1042.0) < 1e-9, 1);
     rc |= expect_int("frame cac reliability", g_last_cac_reliab, g_dibit_reliab_stream[8]);
 
     reset_state();
@@ -509,19 +527,33 @@ test_lfsr_and_scanner_state(void) {
 
     reset_state();
     DSD_SNPRINTF(g_opts.mbe_out_dir, sizeof(g_opts.mbe_out_dir), "%s", "mbe");
-    rc |= expect_int("voice opens mbe file route", route_frame(0x32U), 1);
-    rc |= expect_int("voice opened mbe file", g_opts.mbe_out_f == stdout, 1);
+    rc |= expect_int("voice route", route_frame(0x32U), 1);
+    /* The vocoder creates the capture with the first frame it records (issue #661). */
+    rc |= expect_int("voice frame opens no mbe file", g_opts.mbe_out_f == NULL, 1);
+    g_opts.mbe_out_f = stdout;
     g_opts.frame_nxdn48 = 1;
     g_active_nxdn_variant = DSD_NXDN_VARIANT_48;
     rc |= expect_int("nxdn48 data closes mbe file route", route_frame(0x01U), 1);
     rc |= expect_int("nxdn48 data closed mbe file", g_opts.mbe_out_f == NULL, 1);
+
+    /* The CAC that resets the sync state after a run of failures still ends NXDN's capture. */
+    reset_state();
+    g_opts.mbe_out_f = stdout;
+    g_opts.frame_nxdn48 = 1;
+    g_active_nxdn_variant = DSD_NXDN_VARIANT_48;
+    g_state.synctype = DSD_SYNC_NXDN_POS;
+    g_stub_cac_ok = 0;
+    g_stub_cac_resets_sync = 1;
+    rc |= expect_int("nxdn48 sync-resetting cac route", route_frame(0x01U), 1);
+    rc |= expect_int("nxdn48 sync-resetting cac reset the synctype", g_state.synctype, DSD_SYNC_NONE);
+    rc |= expect_int("nxdn48 sync-resetting cac closed mbe file", g_opts.mbe_out_f == NULL, 1);
 
     reset_state();
     g_opts.mbe_out_f = stdout;
     g_opts.frame_nxdn48 = 1;
     g_opts.frame_nxdn96 = 1;
     g_active_nxdn_variant = DSD_NXDN_VARIANT_96;
-    g_state.last_vc_sync_time = time(NULL);
+    g_state.last_vc_sync_time = dsd_decode_time();
     rc |= expect_int("full-auto NXDN96 recent data keeps mbe file route", route_frame(0x01U), 1);
     rc |= expect_int("full-auto NXDN96 recent data keeps mbe file", g_opts.mbe_out_f == stdout, 1);
     g_state.last_vc_sync_time = 0;
@@ -564,7 +596,7 @@ test_unconfirmed_frame_is_inert(void) {
     g_stub_facch_ok = 1;
     rc |= expect_int("confirmed voice frame routed", route_frame(0x32U), 1);
     rc |= expect_int("confirmed synthesizes voice", g_voice_calls, 1);
-    rc |= expect_int("confirmed opens mbe file", g_opts.mbe_out_f == stdout, 1);
+    rc |= expect_int("confirmed leaves the mbe file to its first frame", g_opts.mbe_out_f == NULL, 1);
     rc |= expect_int("confirmed extends scanner hold", g_state.last_cc_sync_time > 1000, 1);
 
     return rc;
@@ -608,16 +640,60 @@ test_short_crc_confirms_only_when_repeated(void) {
     return rc;
 }
 
+/* Issue #575: the carrier boundary moved the carrier count while the frame was read (a replay read adopting a recorded
+   retune). Everything after the LICH decodes only once all 174 dibits are in, so a SACCH segment read whole before the
+   move, possibly the one completing a superframe, would decode after the boundary ended that carrier's calls: the frame
+   is dropped, with the SACCH segments gathered, as on a sync loss. */
+static int
+test_frame_split_by_a_carrier_boundary_is_dropped(void) {
+    int rc = 0;
+
+    reset_state();
+    g_state.nxdn_sacch_frame_segment[0][0] = 0;
+    g_state.nxdn_sacch_frame_segcrc[0] = 0;
+    prepare_frame_stream(0x32U, 0);
+    g_boundary_at = 150U; /* past the SACCH and the first FACCH1 */
+    nxdn_frame(&g_opts, &g_state);
+    rc |= expect_int("split frame moved the carrier count", (int)g_state.carrier_seq, 1);
+    rc |= expect_int("split frame read whole", (int)g_dibit_stream_pos, 182);
+    rc |= expect_int("split frame decodes no SACCH", g_sacch_calls, 0);
+    rc |= expect_int("split frame decodes no FACCH1", g_facch_calls, 0);
+    rc |= expect_int("split frame plays no voice", g_voice_calls, 0);
+    rc |= expect_int("split frame drops the SACCH segments", g_state.nxdn_sacch_frame_segment[0][0], 1);
+    rc |= expect_int("split frame drops the SACCH segment CRCs", g_state.nxdn_sacch_frame_segcrc[0], 1);
+    rc |= expect_int("split frame leaves no carrier", g_state.carrier, 0);
+
+    /* The move inside the LICH read: the frame is dropped the same way. */
+    reset_state();
+    prepare_frame_stream(0x32U, 0);
+    g_boundary_at = 4U;
+    nxdn_frame(&g_opts, &g_state);
+    rc |= expect_int("LICH split frame decodes no SACCH", g_sacch_calls, 0);
+    rc |= expect_int("LICH split frame plays no voice", g_voice_calls, 0);
+
+    /* No move: the same frame decodes. */
+    reset_state();
+    prepare_frame_stream(0x32U, 0);
+    nxdn_frame(&g_opts, &g_state);
+    rc |= expect_int("whole frame decodes its SACCH", g_sacch_calls, 1);
+    rc |= expect_int("whole frame plays its voice", g_voice_calls, 1);
+    return rc;
+}
+
 int
 main(void) {
     int rc = 0;
 
+    /* Decode time, in whole seconds past the stamps the cases seed (1000 s). */
+    dsd_decode_clock_use_test(1042000000000ULL);
     rc |= test_control_channel_routes_and_reliability();
     rc |= test_bad_frame_and_filter_gates();
     rc |= test_public_frame_entry_lich_collection();
     rc |= test_lfsr_and_scanner_state();
     rc |= test_unconfirmed_frame_is_inert();
     rc |= test_short_crc_confirms_only_when_repeated();
+    rc |= test_frame_split_by_a_carrier_boundary_is_dropped();
+    dsd_decode_clock_use_system();
 
     if (rc == 0) {
         DSD_FPRINTF(stdout, "NXDN_FRAME_ROUTING: OK\n");

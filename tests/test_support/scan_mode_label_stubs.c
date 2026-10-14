@@ -2,11 +2,14 @@
 /* Copyright (C) 2026 by arancormonk <180709949+arancormonk@users.noreply.github.com> */
 #include <assert.h>
 #include <dsd-neo/app_control/snapshot.h>
+#include <dsd-neo/core/analog_tone.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/opts_fwd.h>
+#include <dsd-neo/core/safe_api.h>
 #include <dsd-neo/core/state.h>
 #include <dsd-neo/core/state_fwd.h>
 #include <dsd-neo/core/talkgroup_policy.h>
+#include <dsd-neo/platform/sockets.h>
 #include <dsd-neo/runtime/analog_channel.h>
 #include <dsd-neo/runtime/config.h>
 #include <dsd-neo/runtime/decode_mode.h>
@@ -38,9 +41,10 @@ dsd_scan_mode_row_options(const dsd_state* state) {
     return state && have_row_options ? &row_options : NULL;
 }
 
+/* As scan_mode.c answers it: the nfm and am classes. */
 int
 dsd_scan_mode_is_analog(dsd_scan_mode mode) {
-    return mode == DSD_SCAN_MODE_NFM;
+    return mode == DSD_SCAN_MODE_NFM || mode == DSD_SCAN_MODE_AM;
 }
 
 void
@@ -49,6 +53,73 @@ dsd_test_scan_labels_configured(const dsd_scan_settings* settings) {
     if (settings) {
         configured_settings = *settings;
     }
+}
+
+void
+dsd_test_scan_labels_input_type(int audio_in_type) {
+    snapshot_opts.audio_in_type = audio_in_type;
+}
+
+void
+dsd_test_scan_labels_tone_policy(int mode, const dsd_tone_set* set) {
+    snapshot_opts.analog_tone_filter = mode;
+    DSD_MEMSET(&snapshot_opts.analog_tone_set, 0, sizeof(snapshot_opts.analog_tone_set));
+    if (set) {
+        snapshot_opts.analog_tone_set = *set;
+    }
+}
+
+void
+dsd_test_scan_labels_scan_row(int scanner, uint32_t session, int row, uint32_t editable, uint32_t listed,
+                              uint32_t edited, const char* target_id) {
+    snapshot_state.scan_row_scanner = (uint8_t)scanner;
+    snapshot_state.scan_row_session = session;
+    snapshot_state.scan_row_index = row;
+    snapshot_state.scan_row_editable = (uint8_t)editable;
+    snapshot_state.scan_row_listed = (uint8_t)listed;
+    snapshot_state.scan_row_edited = (uint8_t)edited;
+    DSD_SNPRINTF(snapshot_state.trunk_scan_active_id, sizeof snapshot_state.trunk_scan_active_id, "%s",
+                 target_id ? target_id : "");
+    snapshot_opts.trunk_scan_enabled = scanner == 1 ? 1 : 0;
+    snapshot_opts.scanner_mode = scanner == 2 ? 1 : 0;
+}
+
+void
+dsd_test_scan_labels_rigctl(int connected, int setmod_bw_hz) {
+    snapshot_opts.use_rigctl = connected ? 1 : 0;
+    snapshot_opts.rigctl_sockfd = connected ? (dsd_socket_t)5 : DSD_INVALID_SOCKET;
+    snapshot_opts.setmod_bw = setmod_bw_hz;
+}
+
+void
+dsd_test_scan_labels_analog(int analog_only, int analog_demod) {
+    snapshot_opts.analog_only = analog_only;
+    snapshot_opts.analog_demod = analog_demod;
+}
+
+void
+dsd_test_scan_labels_rtl_gain(int gain) {
+    snapshot_opts.rtl_gain_value = gain;
+}
+
+void
+dsd_test_scan_labels_squelch(int mode, int margin_db, double level) {
+    snapshot_opts.rtl_squelch_mode = mode;
+    snapshot_opts.rtl_squelch_margin_db = margin_db;
+    snapshot_opts.rtl_squelch_level = level;
+}
+
+void
+dsd_test_scan_labels_scope_seq(uint32_t opts_seq, uint32_t state_seq) {
+    snapshot_opts.scan_row_scope_seq = opts_seq;
+    snapshot_state.scan_row_scope_seq = state_seq;
+}
+
+/* The row class the scope holds: the stubbed active class. */
+dsd_scan_mode
+dsd_scan_mode_row(const dsd_state* state) {
+    assert(state == &snapshot_state || state == NULL);
+    return state ? active_mode : DSD_SCAN_MODE_INHERIT;
 }
 
 void
@@ -75,6 +146,28 @@ dsd_scan_mode_configured_analog_width(const dsd_opts* opts, const dsd_state* sta
         width_hz = kind == DSD_ANALOG_DEMOD_AM ? opts->analog_am_bandwidth_hz : opts->analog_nfm_bandwidth_hz;
     }
     return width_hz > 0 ? width_hz : 0;
+}
+
+/* As scan_mode.c reads it: the stubbed configured view while one is set, dsd_opts otherwise. */
+void
+dsd_scan_mode_configured_tone_policy(const dsd_opts* opts, const dsd_state* state, int* mode, dsd_tone_set* set) {
+    const dsd_scan_settings* configured = dsd_scan_mode_configured_view(state);
+    int configured_mode = DSD_TONE_FILTER_OFF;
+    dsd_tone_set configured_set;
+    DSD_MEMSET(&configured_set, 0, sizeof(configured_set));
+    if (configured) {
+        configured_mode = configured->analog_tone_filter;
+        configured_set = configured->analog_tone_set;
+    } else if (opts) {
+        configured_mode = opts->analog_tone_filter;
+        configured_set = opts->analog_tone_set;
+    }
+    if (mode) {
+        *mode = configured_mode;
+    }
+    if (set) {
+        *set = configured_set;
+    }
 }
 
 void
@@ -114,6 +207,7 @@ dsd_scan_mode_name(dsd_scan_mode mode) {
     switch (mode) {
         case DSD_SCAN_MODE_P25: return "p25";
         case DSD_SCAN_MODE_NFM: return "nfm";
+        case DSD_SCAN_MODE_AM: return "am";
         default: return "";
     }
 }

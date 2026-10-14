@@ -216,6 +216,40 @@ dsd_test_rmdir(const char* path) {
 #endif
 }
 
+/** @brief fdopen(), which the Windows CRT spells _fdopen(). */
+static inline FILE*
+dsd_test_fdopen(int fd, const char* mode) {
+#if DSD_PLATFORM_WIN_NATIVE
+    return _fdopen(fd, mode);
+#else
+    return fdopen(fd, mode);
+#endif
+}
+
+/**
+ * @brief Remove the files a test left in a temp directory, then the directory itself.
+ *
+ * @p files is a NULL-terminated list of names inside @p dir; one that does not exist is skipped. Remove a
+ * subdirectory with its own call first. The directory goes only once it is empty, so a file the list misses, including
+ * one the code under test wrote there, makes this fail: check the result.
+ *
+ * @return 0 once @p dir is removed, -1 otherwise.
+ */
+static inline int
+dsd_test_remove_temp_dir(const char* dir, const char* const* files) {
+    if (!dir || dir[0] == '\0' || !files) {
+        errno = EINVAL;
+        return -1;
+    }
+    for (size_t i = 0; files[i] != NULL; i++) {
+        char path[DSD_TEST_PATH_MAX];
+        if (dsd_test_path_join(path, sizeof(path), dir, files[i]) == 0) {
+            (void)remove(path);
+        }
+    }
+    return dsd_test_rmdir(dir);
+}
+
 /**
  * @brief A fresh temp directory used as the working directory for part of a test.
  *
@@ -344,6 +378,8 @@ dsd_test_capture_stderr_begin(dsd_test_capture_stderr* cap, const char* prefix) 
     if (dsd_dup2(fd, DSD_STDERR_FILENO) < 0) {
         dsd_close(fd);
         dsd_close(saved);
+        (void)remove(cap->path);
+        cap->path[0] = '\0';
         return -1;
     }
     dsd_close(fd);
@@ -356,7 +392,7 @@ dsd_test_capture_stderr_begin(dsd_test_capture_stderr* cap, const char* prefix) 
  * @brief Read what a finished capture collected into @p buf and delete the capture file.
  *
  * Call after dsd_test_capture_stderr_end(). @p buf is always NUL-terminated; output longer than
- * @p buf_size - 1 is truncated.
+ * @p buf_size - 1 is truncated. The capture file is deleted even when it cannot be read.
  *
  * @return 0 on success, -1 otherwise.
  */
@@ -366,14 +402,19 @@ dsd_test_capture_stderr_read(const dsd_test_capture_stderr* cap, char* buf, size
         errno = EINVAL;
         return -1;
     }
-    buf[0] = '\0';
+    DSD_MEMSET(buf, 0, buf_size);
 
     FILE* f = fopen(cap->path, "rb");
     if (!f) {
+        int saved_errno = errno;
+        (void)remove(cap->path);
+        errno = saved_errno;
         return -1;
     }
-    size_t n = fread(buf, 1U, buf_size - 1U, f);
-    buf[n] = '\0';
+    /* buf was zeroed above, so the bytes read end in a NUL whatever their count: the count, which comes from the
+       file, never indexes the caller's buffer. */
+    const size_t read_count = fread(buf, 1U, buf_size - 1U, f);
+    (void)read_count;
     (void)fclose(f);
     (void)remove(cap->path);
     return 0;

@@ -20,7 +20,10 @@
  */
 
 #include <dsd-neo/core/audio.h>
+#include <dsd-neo/core/audio_activity.h>
 #include <dsd-neo/core/audio_filters.h>
+#include <dsd-neo/core/audio_sink.h>
+#include <dsd-neo/core/call_state.h>
 #include <dsd-neo/core/dibit.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/opts_fwd.h>
@@ -28,6 +31,7 @@
 #include <dsd-neo/core/state.h>
 #include <dsd-neo/core/state_fwd.h>
 #include <dsd-neo/core/string_utils.h>
+#include <dsd-neo/core/voice_chain.h>
 #include <dsd-neo/dsp/resampler.h>
 #include <dsd-neo/platform/audio.h>
 #include <dsd-neo/platform/file_compat.h>
@@ -40,10 +44,10 @@
 #include <errno.h>
 #include <math.h>
 #include <sndfile.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/types.h>
 #include "dsd_audio_internal.h"
 
 static int
@@ -227,6 +231,8 @@ dsd_audio_apply_input_sample_rate(dsd_opts* opts, dsd_state* state, int old_effe
 
 void
 closeAudioOutput(dsd_opts* opts) {
+    /* The streams below go; what was reported about them goes with them. */
+    dsd_audio_sink_device_reset();
     /* Close primary audio output stream */
     if (opts->audio_out_stream) {
         dsd_audio_close(opts->audio_out_stream);
@@ -274,7 +280,7 @@ dsd_audio_output_params_init(const dsd_opts* opts, dsd_audio_params* params) {
 /* Raw/analog stream: analog monitor, ProVoice and the -8 source monitor write here. */
 static dsd_audio_stream*
 dsd_audio_open_raw_output_stream(const dsd_opts* opts, dsd_audio_params* params) {
-    params->sample_rate = opts->pulse_raw_rate_out;
+    params->sample_rate = dsd_opts_analog_sink_rate_hz(opts);
     params->channels = opts->pulse_raw_out_channels;
     return dsd_audio_open_output(params);
 }
@@ -480,6 +486,9 @@ openAudioInput(dsd_opts* opts) {
         LOG_ERROR("Failed to open audio input: %s", dsd_audio_get_error());
         return -1;
     }
+    /* Every Pulse open is a new stream, whatever asked for it (a config switch, the end of a playback, a file that
+       ran out): the PCM noise squelch forgets the old stream's references (issue #628). */
+    dsd_opts_note_pcm_stream(opts);
     return 0;
 }
 
@@ -553,94 +562,160 @@ dsd_audio_clamp_pcm16_f32(float sample) {
     return sample;
 }
 
-static float
-dsd_audio_detect_block_peak_left(dsd_state* state) {
-    int n;
-    float max = 0.0F;
+/* One slot's gain state: the auto gain's level and peak history, and the fixed `-g` setting (issue #653). */
+typedef struct {
+    float* gain;
+    float* history;
+    float** history_p;
+    int* history_idx;
+    float fixed;
+} dsd_voice_gain_slot;
 
-    state->audio_out_temp_buf_p = state->audio_out_temp_buf;
-    for (n = 0; n < 160; n++) {
-        float aout_abs = fabsf(*state->audio_out_temp_buf_p);
-        if (aout_abs > max) {
-            max = aout_abs;
-        }
-        state->audio_out_temp_buf_p++;
+static dsd_voice_gain_slot
+dsd_voice_gain_slot_of(const dsd_opts* opts, dsd_state* state, int slot) {
+    dsd_voice_gain_slot g;
+    if (slot == 1) {
+        g.gain = &state->aout_gainR;
+        g.history = state->aout_max_bufR;
+        g.history_p = &state->aout_max_buf_pR;
+        g.history_idx = &state->aout_max_buf_idxR;
+        g.fixed = opts->audio_gainR;
+    } else {
+        g.gain = &state->aout_gain;
+        g.history = state->aout_max_buf;
+        g.history_p = &state->aout_max_buf_p;
+        g.history_idx = &state->aout_max_buf_idx;
+        g.fixed = opts->audio_gain;
     }
-    return max;
+    return g;
 }
 
+enum {
+    DSD_VOICE_GAIN_HISTORY = 25, /* frames of peak history the auto gain looks back over: 500 ms */
+};
+
+/* The peak of @p frame together with the slot's last DSD_VOICE_GAIN_HISTORY - 1 frame peaks, after recording this
+   frame's peak in the history. The ring is walked by index, so a state whose pointer was never set still works. */
 static float
-dsd_audio_update_peak_history_left(dsd_state* state, float block_max) {
+dsd_voice_gain_history_peak(const dsd_voice_gain_slot* g, const float* frame) {
+    float block_max = 0.0F;
+    for (int n = 0; n < DSD_VOICE_FRAME_SAMPLES; n++) {
+        const float a = fabsf(frame[n]);
+        if (a > block_max) {
+            block_max = a;
+        }
+    }
+    int idx = *g->history_idx;
+    if (idx < 0 || idx >= DSD_VOICE_GAIN_HISTORY) {
+        idx = 0;
+    }
+    g->history[idx] = block_max;
+    idx++;
+    if (idx >= DSD_VOICE_GAIN_HISTORY) {
+        idx = 0;
+    }
+    *g->history_idx = idx;
+    *g->history_p = &g->history[idx];
+
     float max = block_max;
-    int i;
-
-    *state->aout_max_buf_p = block_max;
-    state->aout_max_buf_p++;
-    state->aout_max_buf_idx++;
-
-    if (state->aout_max_buf_idx > 24) {
-        state->aout_max_buf_idx = 0;
-        state->aout_max_buf_p = state->aout_max_buf;
-    }
-
-    for (i = 0; i < 25; i++) {
-        float maxbuf = state->aout_max_buf[i];
-        if (maxbuf > max) {
-            max = maxbuf;
+    for (int i = 0; i < DSD_VOICE_GAIN_HISTORY; i++) {
+        if (g->history[i] > max) {
+            max = g->history[i];
         }
     }
     return max;
 }
 
+/* The auto gain: normalize the history's peak to 30000, at most x50; a louder peak cuts the gain at once, a quieter one
+   lets it rise by at most 5% per frame, ramped across the frame. Returns the per-sample step. */
 static float
-dsd_audio_compute_gain_delta_left(const dsd_opts* opts, dsd_state* state) {
-    float gaindelta;
-    float gainfactor;
-    float max;
-
-    if (opts->audio_gain != 0.0F) {
+dsd_voice_auto_gain_step(const dsd_voice_gain_slot* g, const float* frame) {
+    // Only a level no gain law can leave (a zeroed or corrupt state) starts over at unity; a legitimate gain below 1,
+    // set by a peak above 30000, keeps its 5% release.
+    if (!(*g->gain > 0.0F) || !(*g->gain <= 50.0F)) {
+        *g->gain = 1.0F;
+    }
+    const float max = dsd_voice_gain_history_peak(g, frame);
+    float gainfactor = (max > 0.0F) ? (30000.0F / max) : 50.0F;
+    if (gainfactor < *g->gain) {
+        *g->gain = gainfactor;
         return 0.0F;
     }
-
-    max = dsd_audio_detect_block_peak_left(state);
-    max = dsd_audio_update_peak_history_left(state, max);
-
-    if (max > 0.0F) {
-        gainfactor = 30000.0F / max;
-    } else {
+    if (gainfactor > 50.0F) {
         gainfactor = 50.0F;
     }
-
-    if (gainfactor < state->aout_gain) {
-        state->aout_gain = gainfactor;
-        gaindelta = 0.0F;
-    } else {
-        if (gainfactor > 50.0F) {
-            gainfactor = 50.0F;
-        }
-        gaindelta = gainfactor - state->aout_gain;
-        if (gaindelta > (0.05F * state->aout_gain)) {
-            gaindelta = 0.05F * state->aout_gain;
-        }
+    float delta = gainfactor - *g->gain;
+    if (delta > (0.05F * *g->gain)) {
+        delta = 0.05F * *g->gain;
     }
-
-    return gaindelta / 160.0F;
+    return delta / (float)DSD_VOICE_FRAME_SAMPLES;
 }
 
 static void
-dsd_audio_apply_gain_left(const dsd_opts* opts, dsd_state* state, float gaindelta) {
-    int n;
-
-    if (opts->audio_gain < 0) {
+dsd_voice_gain_apply(const dsd_opts* opts, dsd_state* state, int slot, float* frame) {
+    dsd_voice_gain_slot g = dsd_voice_gain_slot_of(opts, state, slot);
+    if (g.fixed < 0.0F) {
         return;
     }
-
-    state->audio_out_temp_buf_p = state->audio_out_temp_buf;
-    for (n = 0; n < 160; n++) {
-        *state->audio_out_temp_buf_p = (state->aout_gain + ((float)n * gaindelta)) * (*state->audio_out_temp_buf_p);
-        state->audio_out_temp_buf_p++;
+    if (g.fixed > 0.0F) {
+        // A fixed gain is a plain multiplier, the same in both output formats.
+        *g.gain = g.fixed;
+        for (int n = 0; n < DSD_VOICE_FRAME_SAMPLES; n++) {
+            frame[n] *= g.fixed;
+        }
+        return;
     }
-    state->aout_gain += 160.0F * gaindelta;
+    const float step = dsd_voice_auto_gain_step(&g, frame);
+    for (int n = 0; n < DSD_VOICE_FRAME_SAMPLES; n++) {
+        frame[n] *= *g.gain + ((float)n * step);
+    }
+    *g.gain += (float)DSD_VOICE_FRAME_SAMPLES * step;
+}
+
+/* The slot's filter state starts over at a reception boundary: a new call on the slot (one nonzero epoch to another)
+   or a frame of another protocol family. Frames before a call is known, and a call's first frames after them, keep
+   it, so no step is cut into a running stream. */
+static void
+dsd_voice_hpf_follow_reception(dsd_state* state, int slot) {
+    dsd_voice_hpf_state* f = &state->voice_hpf[slot];
+    dsd_call_snapshot call;
+    uint64_t epoch = 0;
+    // The protocol the frame was dispatched under, as dsd_mbe_out_frame_protocol() reads it: YSF and scrambled dPMR
+    // decode under a borrowed synctype but stay their own.
+    int protocol = state->frame_dispatch_active ? state->frame_dispatch_synctype : state->synctype;
+    if (dsd_call_state_get(state, (uint8_t)slot, &call) > 0 && call.phase == DSD_CALL_PHASE_ACTIVE) {
+        epoch = call.epoch;
+        protocol = call.protocol;
+    }
+    const int family = dsd_call_state_protocol_family(protocol);
+    const int new_call = epoch != 0U && f->call_epoch != 0U && epoch != f->call_epoch;
+    const int new_family = family != 0 && f->protocol_family != 0 && family != f->protocol_family;
+    if (new_call || new_family) {
+        dsd_voice_hpf_reset(state, slot);
+    }
+    if (epoch != 0U) {
+        f->call_epoch = epoch;
+    }
+    if (family != 0) {
+        f->protocol_family = family;
+    }
+}
+
+void
+dsd_voice_chain_run(const dsd_opts* opts, dsd_state* state, int slot, float* frame) {
+    if (!opts || !state || !frame || slot < 0 || slot > 1) {
+        return;
+    }
+    dsd_voice_hpf_follow_reception(state, slot);
+    if (opts->use_hpf_d == 1) {
+        dsd_voice_hpf_process(state, slot, frame, DSD_VOICE_FRAME_SAMPLES);
+    } else {
+        dsd_voice_hpf_reset(state, slot);
+    }
+    dsd_voice_gain_apply(opts, state, slot, frame);
+    for (int n = 0; n < DSD_VOICE_FRAME_SAMPLES; n++) {
+        frame[n] = dsd_audio_clamp_pcm16_f32(frame[n]);
+    }
 }
 
 static void
@@ -683,8 +758,10 @@ dsd_audio_emit_native_left(dsd_state* state) {
     }
 }
 
-static void
-dsd_audio_emit_output_left(const dsd_opts* opts, dsd_state* state) {
+void
+dsd_voice_stage_short_left(const dsd_opts* opts, dsd_state* state) {
+    // This count describes only this frame, even when its predecessor reached no mixer (issue #654).
+    state->audio_out_idx = 0;
     if (opts->pulse_digi_rate_out > 8000) {
         dsd_audio_emit_upsampled_left(opts, state);
         return;
@@ -694,100 +771,8 @@ dsd_audio_emit_output_left(const dsd_opts* opts, dsd_state* state) {
 
 void
 processAudio(const dsd_opts* opts, dsd_state* state) {
-    float gaindelta = dsd_audio_compute_gain_delta_left(opts, state);
-
-    dsd_audio_apply_gain_left(opts, state, gaindelta);
-    dsd_audio_emit_output_left(opts, state);
-}
-
-static float
-dsd_audio_detect_block_peak_right(dsd_state* state) {
-    int n;
-    float max = 0.0F;
-
-    state->audio_out_temp_buf_pR = state->audio_out_temp_bufR;
-    for (n = 0; n < 160; n++) {
-        float aout_abs = fabsf(*state->audio_out_temp_buf_pR);
-        if (aout_abs > max) {
-            max = aout_abs;
-        }
-        state->audio_out_temp_buf_pR++;
-    }
-    return max;
-}
-
-static float
-dsd_audio_update_peak_history_right(dsd_state* state, float block_max) {
-    float max = block_max;
-    int i;
-
-    *state->aout_max_buf_pR = block_max;
-    state->aout_max_buf_pR++;
-    state->aout_max_buf_idxR++;
-
-    if (state->aout_max_buf_idxR > 24) {
-        state->aout_max_buf_idxR = 0;
-        state->aout_max_buf_pR = state->aout_max_bufR;
-    }
-
-    for (i = 0; i < 25; i++) {
-        float maxbuf = state->aout_max_bufR[i];
-        if (maxbuf > max) {
-            max = maxbuf;
-        }
-    }
-    return max;
-}
-
-static float
-dsd_audio_compute_gain_delta_right(const dsd_opts* opts, dsd_state* state) {
-    float gaindelta;
-    float gainfactor;
-    float max;
-
-    if (opts->audio_gainR != 0.0F) {
-        return 0.0F;
-    }
-
-    max = dsd_audio_detect_block_peak_right(state);
-    max = dsd_audio_update_peak_history_right(state, max);
-
-    if (max > 0.0F) {
-        gainfactor = 30000.0F / max;
-    } else {
-        gainfactor = 50.0F;
-    }
-
-    if (gainfactor < state->aout_gainR) {
-        state->aout_gainR = gainfactor;
-        gaindelta = 0.0F;
-    } else {
-        if (gainfactor > 50.0F) {
-            gainfactor = 50.0F;
-        }
-        gaindelta = gainfactor - state->aout_gainR;
-        if (gaindelta > (0.05F * state->aout_gainR)) {
-            gaindelta = 0.05F * state->aout_gainR;
-        }
-    }
-
-    return gaindelta / 160.0F;
-}
-
-static void
-dsd_audio_apply_gain_right(const dsd_opts* opts, dsd_state* state, float gaindelta) {
-    int n;
-
-    if (opts->audio_gainR < 0) {
-        return;
-    }
-
-    state->audio_out_temp_buf_pR = state->audio_out_temp_bufR;
-    for (n = 0; n < 160; n++) {
-        *state->audio_out_temp_buf_pR = (state->aout_gainR + ((float)n * gaindelta)) * (*state->audio_out_temp_buf_pR);
-        state->audio_out_temp_buf_pR++;
-    }
-    state->aout_gainR += 160.0F * gaindelta;
+    dsd_voice_chain_run(opts, state, 0, state->audio_out_temp_buf);
+    dsd_voice_stage_short_left(opts, state);
 }
 
 static void
@@ -830,8 +815,8 @@ dsd_audio_emit_native_right(dsd_state* state) {
     }
 }
 
-static void
-dsd_audio_emit_output_right(const dsd_opts* opts, dsd_state* state) {
+void
+dsd_voice_stage_short_right(const dsd_opts* opts, dsd_state* state) {
     if (opts->pulse_digi_rate_out > 8000) {
         dsd_audio_emit_upsampled_right(opts, state);
         return;
@@ -841,14 +826,13 @@ dsd_audio_emit_output_right(const dsd_opts* opts, dsd_state* state) {
 
 void
 processAudioR(const dsd_opts* opts, dsd_state* state) {
-    float gaindelta = dsd_audio_compute_gain_delta_right(opts, state);
-
-    dsd_audio_apply_gain_right(opts, state, gaindelta);
-    dsd_audio_emit_output_right(opts, state);
+    dsd_voice_chain_run(opts, state, 1, state->audio_out_temp_bufR);
+    dsd_voice_stage_short_right(opts, state);
 }
 
-void
-writeSynthesizedVoice(dsd_opts* opts, dsd_state* state) {
+// Writes the mono (left) frame in audio_out_temp_buf, clamped to 16 bits in place, as one mono block of @p file.
+static void
+dsd_audio_write_mono_frame_wav(SNDFILE* file, dsd_state* state, const char* context) {
     int n;
     short aout_buf[160];
     short* aout_buf_p;
@@ -867,7 +851,24 @@ writeSynthesizedVoice(dsd_opts* opts, dsd_state* state) {
         state->audio_out_temp_buf_p++;
     }
 
-    dsd_audio_write_wav_short_block(opts->wav_out_f, aout_buf, 160, "writeSynthesizedVoice");
+    dsd_audio_write_wav_short_block(file, aout_buf, 160, context);
+}
+
+void
+writeSynthesizedVoice(const dsd_opts* opts, dsd_state* state) {
+    dsd_audio_write_mono_frame_wav(opts->wav_out_f, state, "writeSynthesizedVoice");
+}
+
+void
+dsd_write_mono_voice_to_slot_wav(dsd_opts* opts, dsd_state* state, int slot) {
+    if (!opts || !state) {
+        return;
+    }
+    if (slot == 1) {
+        dsd_audio_write_mono_frame_wav(opts->wav_out_fR, state, "dsd_write_mono_voice_to_slot_wav slot 2");
+    } else {
+        dsd_audio_write_mono_frame_wav(opts->wav_out_f, state, "dsd_write_mono_voice_to_slot_wav slot 1");
+    }
 }
 
 void
@@ -923,7 +924,15 @@ writeSynthesizedVoiceMS(dsd_opts* opts, dsd_state* state) {
     dsd_audio_write_wav_short_block(opts->wav_out_f, ss, 320, "writeSynthesizedVoiceMS");
 }
 
+// The legacy short output's pending samples (state->audio_out_idx of them) to the output, then none pending.
+static void
+dsd_audio_legacy_write_pending(const dsd_opts* opts, dsd_state* state) {
+    dsd_output_s16_block(opts, state, state->audio_out_buf_p - state->audio_out_idx, (size_t)state->audio_out_idx, 1);
+    state->audio_out_idx = 0;
+}
+
 void
+// cppcheck-suppress constParameterPointer -- signature fixed by dsd-neo/core/audio.h
 playSynthesizedVoice(dsd_opts* opts, dsd_state* state) {
 
     //don't synthesize voice if slot is turned off
@@ -945,30 +954,11 @@ playSynthesizedVoice(dsd_opts* opts, dsd_state* state) {
     }
 
     if (state->audio_out_idx > opts->delay) {
-        if (opts->audio_out == 1 && opts->audio_out_type == 1) {
-            ssize_t written = dsd_write(opts->audio_out_fd, (state->audio_out_buf_p - state->audio_out_idx),
-                                        (size_t)state->audio_out_idx * sizeof(short));
-            if (written < 0) {
-                LOG_WARN("playSynthesizedVoice: failed to write %zu bytes to audio_out_fd",
-                         (size_t)state->audio_out_idx * sizeof(short));
-            }
-            state->audio_out_idx = 0;
-        } else if (opts->audio_out == 1 && opts->audio_out_type == 0) {
-            /* Use audio abstraction layer */
-            if (opts->audio_out_stream) {
-                dsd_audio_write(opts->audio_out_stream, (state->audio_out_buf_p - state->audio_out_idx),
-                                (size_t)state->audio_out_idx);
-            }
-            state->audio_out_idx = 0;
-        } else if (opts->audio_out == 1
-                   && opts->audio_out_type == 8) //UDP Audio Out -- Forgot some things still use this for now
-        {
-            dsd_udp_audio_hook_blast(opts, state, (size_t)state->audio_out_idx * sizeof(short),
-                                     (state->audio_out_buf_p - state->audio_out_idx));
-            state->audio_out_idx = 0;
-        } else {
-            state->audio_out_idx = 0; //failsafe for audio_out == 0
+        // Stamped only when an output below receives the samples: the local stream while open, the raw fd or UDP.
+        if (dsd_audio_activity_armed() && dsd_audio_activity_output_plays(opts, opts->audio_out_stream, 1)) {
+            dsd_audio_activity_note();
         }
+        dsd_audio_legacy_write_pending(opts, state);
     }
 
 end_psv:
@@ -1020,7 +1010,7 @@ closeAudioInDevice(dsd_opts* opts) {
     }
 }
 
-static void
+void
 dsd_audio_reset_symbol_replay_pacing(dsd_state* state) {
     if (!state) {
         return;
@@ -1159,7 +1149,7 @@ dsd_audio_open_headless_wav_input(dsd_opts* opts, int sample_rate_hz, int includ
     return 0;
 }
 
-static void
+void
 dsd_audio_enable_bin_symbol_replay(dsd_state* state) {
     if (!state) {
         return;
@@ -1216,6 +1206,7 @@ dsd_audio_open_fallback_file_input(dsd_opts* opts, dsd_state* state, int old_eff
     }
 
     opts->audio_in_type = AUDIO_IN_WAV;
+    const int raw_sample_rate = opts->wav_sample_rate;
     int configured_file_sample_rate = dsd_opts_requested_file_sample_rate(opts);
     int active_sample_rate = configured_file_sample_rate;
     int opened_as_container = 0;
@@ -1234,6 +1225,10 @@ dsd_audio_open_fallback_file_input(dsd_opts* opts, dsd_state* state, int old_eff
         }
         dsd_audio_apply_input_sample_rate(opts, state, old_effective_input_rate, active_sample_rate);
     }
+    /* A header rate holds for this file only: a switch away from it opens the next PCM input at the raw rate again
+       (issue #634). */
+    opts->wav_header_replaced_rate =
+        (opened_as_container && active_sample_rate != raw_sample_rate) ? raw_sample_rate : 0;
     return 0;
 }
 
@@ -1268,6 +1263,7 @@ openAudioInDevice(dsd_opts* opts, dsd_state* state) {
 
     dsd_audio_release_input_sources(opts);
     dsd_audio_reset_symbol_replay_pacing(state);
+    opts->wav_header_replaced_rate = 0;
 
     named_input_status = dsd_audio_try_open_named_input(opts);
     if (named_input_status < 0) {

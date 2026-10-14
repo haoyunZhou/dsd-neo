@@ -5,7 +5,10 @@
 
 #include "dsd-neo/core/input_level.h"
 
+#include <dsd-neo/core/power.h>
 #include <dsd-neo/platform/atomic_compat.h>
+#include <dsd-neo/runtime/analog_channel.h>
+#include <dsd-neo/runtime/decode_clock.h>
 #include <dsd-neo/runtime/rtl_stream_metrics_hooks.h>
 
 #include <stdint.h>
@@ -103,6 +106,20 @@ dsd_rtl_stream_metrics_hook_set_channel_squelch(double mean_power) {
 }
 
 int
+dsd_rtl_stream_metrics_hook_set_channel_squelch_setting(const dsd_squelch_setting* setting) {
+    if (!setting) {
+        return -1;
+    }
+    if (g_rtl_stream_metrics_hooks.set_channel_squelch_setting) {
+        g_rtl_stream_metrics_hooks.set_channel_squelch_setting(setting);
+        return 0;
+    }
+    /* A threshold alone: a dynamic setting is off there. */
+    return dsd_rtl_stream_metrics_hook_set_channel_squelch(dsd_squelch_mode_is_dynamic(setting->mode) ? 0.0
+                                                                                                      : setting->level);
+}
+
+int
 dsd_rtl_stream_metrics_hook_apply_analog_profile(int family, int kind, int width_hz) {
     if (g_rtl_stream_metrics_hooks.apply_analog_profile) {
         return g_rtl_stream_metrics_hooks.apply_analog_profile(family, kind, width_hz);
@@ -111,6 +128,16 @@ dsd_rtl_stream_metrics_hook_apply_analog_profile(int family, int kind, int width
     (void)kind;
     (void)width_hz;
     return -1;
+}
+
+int
+dsd_rtl_stream_metrics_hook_request_digital_family_landing(int cqpsk_explicit) {
+    if (g_rtl_stream_metrics_hooks.request_digital_family_landing) {
+        return g_rtl_stream_metrics_hooks.request_digital_family_landing(cqpsk_explicit);
+    }
+    /* A table without it (a test's fake front end) gets the plain digital family request, as before the hook existed. */
+    (void)cqpsk_explicit;
+    return dsd_rtl_stream_metrics_hook_apply_analog_profile(DSD_RX_FAMILY_DIGITAL, DSD_ANALOG_DEMOD_FM, 0);
 }
 
 int
@@ -140,15 +167,53 @@ dsd_rtl_stream_metrics_hook_analog_family_active(void) {
     return 0;
 }
 
+int
+dsd_rtl_stream_metrics_hook_family_landing_after_pending(void) {
+    if (g_rtl_stream_metrics_hooks.family_landing_after_pending) {
+        return g_rtl_stream_metrics_hooks.family_landing_after_pending() > 0 ? 1 : 0;
+    }
+    /* A table without it (a test's fake front end) answers for the live family, as the decoder did before it. */
+    return dsd_rtl_stream_metrics_hook_analog_family_active();
+}
+
 unsigned int
-dsd_rtl_stream_metrics_hook_output_rate_for_family(int family, int cqpsk_enable, int symbol_rate_hz) {
+dsd_rtl_stream_metrics_hook_output_rate_for_family(int family, int cqpsk_enable, int symbol_rate_hz,
+                                                   int cqpsk_explicit) {
     if (g_rtl_stream_metrics_hooks.output_rate_for_family) {
-        return g_rtl_stream_metrics_hooks.output_rate_for_family(family, cqpsk_enable, symbol_rate_hz);
+        return g_rtl_stream_metrics_hooks.output_rate_for_family(family, cqpsk_enable, symbol_rate_hz, cqpsk_explicit);
     }
     (void)family;
     (void)cqpsk_enable;
     (void)symbol_rate_hz;
+    (void)cqpsk_explicit;
     return 0U;
+}
+
+int
+dsd_rtl_stream_metrics_hook_replay_batch(dsd_rtl_stream_replay_batch* out) {
+    if (!out) {
+        return 0;
+    }
+    /* The output is zeroed whenever this returns 0, whatever an installed hook left in it. */
+    if (g_rtl_stream_metrics_hooks.replay_batch && g_rtl_stream_metrics_hooks.replay_batch(out) == 1) {
+        return 1;
+    }
+    *out = (dsd_rtl_stream_replay_batch){0};
+    return 0;
+}
+
+int
+dsd_rtl_stream_metrics_hook_replay_advance_decode_clock(uint32_t* center_hz_out) {
+    dsd_rtl_stream_replay_batch batch;
+    if (dsd_rtl_stream_metrics_hook_replay_batch(&batch) != 1) {
+        return 0;
+    }
+    dsd_decode_clock_set_media_ns(dsd_decode_clock_batch_media_ns(batch.media_start_ns, batch.media_duration_ns,
+                                                                  batch.output_count, batch.first_index));
+    if (center_hz_out) {
+        *center_hz_out = batch.center_frequency_hz;
+    }
+    return 1;
 }
 
 int

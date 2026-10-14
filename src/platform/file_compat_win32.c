@@ -11,9 +11,28 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <io.h>
+#include <limits.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <windows.h>
+
+#include "win32_temp_name_internal.h"
+#include "write_frames_internal.h"
+
+/*
+ * The CRT treats a negative descriptor as a caller bug: it raises the invalid-parameter handler, which ends the
+ * process. POSIX reports EBADF instead, and -1 is the usual "no descriptor" value, so the descriptor wrappers answer it
+ * the POSIX way before the CRT sees it.
+ */
+static int
+dsd_fd_is_negative(int fd) {
+    if (fd < 0) {
+        errno = EBADF;
+        return 1;
+    }
+    return 0;
+}
 
 int
 dsd_fileno(FILE* fp) {
@@ -22,32 +41,62 @@ dsd_fileno(FILE* fp) {
 
 int
 dsd_isatty(int fd) {
+    if (dsd_fd_is_negative(fd)) {
+        return 0;
+    }
     return _isatty(fd);
 }
 
 int
+dsd_set_binary_mode(int fd) {
+    if (dsd_fd_is_negative(fd)) {
+        return -1;
+    }
+    return _setmode(fd, _O_BINARY) < 0 ? -1 : 0;
+}
+
+int
 dsd_dup(int oldfd) {
+    if (dsd_fd_is_negative(oldfd)) {
+        return -1;
+    }
     return _dup(oldfd);
 }
 
 int
 dsd_dup2(int oldfd, int newfd) {
-    return _dup2(oldfd, newfd);
+    if (dsd_fd_is_negative(oldfd) || dsd_fd_is_negative(newfd)) {
+        return -1;
+    }
+    /* _dup2 returns 0 on success; POSIX dup2 returns the new descriptor. */
+    if (_dup2(oldfd, newfd) != 0) {
+        return -1;
+    }
+    return newfd;
 }
 
 int
 dsd_close(int fd) {
+    if (dsd_fd_is_negative(fd)) {
+        return -1;
+    }
     return _close(fd);
 }
 
 int
 dsd_fsync(int fd) {
+    if (dsd_fd_is_negative(fd)) {
+        return -1;
+    }
     /* _commit is Windows equivalent of fsync */
     return _commit(fd);
 }
 
 int
 dsd_fstat(int fd, dsd_stat_t* st) {
+    if (dsd_fd_is_negative(fd)) {
+        return -1;
+    }
     return _fstat(fd, st);
 }
 
@@ -85,21 +134,58 @@ dsd_private_open_flags(const char* mode) {
 
     flags |= (strchr(mode, '+') != NULL) ? _O_RDWR : _O_WRONLY;
     flags |= (strchr(mode, 'b') != NULL) ? _O_BINARY : _O_TEXT;
+    if (strchr(mode, 'x') != NULL) {
+        /* C11's exclusive create: only a "w" mode creates, and an existing file is left untouched (EEXIST). */
+        if (mode[0] != 'w') {
+            errno = EINVAL;
+            return -1;
+        }
+        flags |= _O_EXCL;
+    }
     return flags;
 }
 
+/* The mode for the stream over an opened descriptor: _fdopen() has no use for 'x', the descriptor already exists. */
+static int
+dsd_private_stream_mode(const char* mode, char* out, size_t out_size) {
+    size_t n = 0;
+    for (const char* p = mode; *p != '\0'; ++p) {
+        if (*p == 'x') {
+            continue;
+        }
+        if (n + 1U >= out_size) {
+            errno = EINVAL;
+            return -1;
+        }
+        out[n++] = *p;
+    }
+    out[n] = '\0';
+    return 0;
+}
+
 FILE*
-dsd_fopen_private(const char* path, const char* mode) {
+dsd_fopen_private_ex(const char* path, const char* mode, int* out_opened) {
+    if (out_opened) {
+        *out_opened = 0;
+    }
     if (!path || !mode) {
         errno = EINVAL;
         return NULL;
     }
     if (mode[0] == 'r') {
-        return fopen(path, mode);
+        FILE* fp = fopen(path, mode);
+        if (out_opened) {
+            *out_opened = fp != NULL;
+        }
+        return fp;
     }
 
     int flags = dsd_private_open_flags(mode);
     if (flags < 0) {
+        return NULL;
+    }
+    char stream_mode[8];
+    if (dsd_private_stream_mode(mode, stream_mode, sizeof stream_mode) != 0) {
         return NULL;
     }
 
@@ -107,12 +193,23 @@ dsd_fopen_private(const char* path, const char* mode) {
     if (fd < 0) {
         return NULL;
     }
+    /* The file is created or emptied now, whatever becomes of the stream over it. */
+    if (out_opened) {
+        *out_opened = 1;
+    }
 
-    FILE* fp = _fdopen(fd, mode);
+    FILE* fp = _fdopen(fd, stream_mode);
     if (!fp) {
+        int saved_errno = errno ? errno : EINVAL;
         _close(fd);
+        errno = saved_errno;
     }
     return fp;
+}
+
+FILE*
+dsd_fopen_private(const char* path, const char* mode) {
+    return dsd_fopen_private_ex(path, mode, NULL);
 }
 
 static int
@@ -128,8 +225,19 @@ dsd_existing_regular_mode_flags(const char* mode, int* out_flags) {
 static int
 dsd_existing_regular_attrs_ok(const char* path) {
     DWORD attrs = GetFileAttributesA(path);
-    if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0
-        || (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+    if (attrs == INVALID_FILE_ATTRIBUTES) {
+        /* Report a missing file as open() does on POSIX: callers tell "not there yet" (ENOENT) from "unusable". */
+        DWORD err = GetLastError();
+        if (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND) {
+            errno = ENOENT;
+        } else if (err == ERROR_ACCESS_DENIED) {
+            errno = EACCES;
+        } else {
+            errno = EINVAL;
+        }
+        return -1;
+    }
+    if ((attrs & FILE_ATTRIBUTE_DIRECTORY) != 0 || (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
         errno = EINVAL;
         return -1;
     }
@@ -198,18 +306,13 @@ dsd_fopen_private_temp_for_replace(const char* final_path, char* tmp_path, size_
         errno = ENAMETOOLONG;
         return NULL;
     }
-    if (_mktemp_s(tmp_path, tmp_path_size) != 0) {
-        errno = EEXIST;
-        return NULL;
-    }
 
     int flags = dsd_private_open_flags(mode);
     if (flags < 0) {
         return NULL;
     }
-    flags |= _O_EXCL;
 
-    int fd = _open(tmp_path, flags, _S_IREAD | _S_IWRITE);
+    int fd = dsd_win32_temp_open(tmp_path, tmp_path + n - 6, flags);
     if (fd < 0) {
         return NULL;
     }
@@ -236,6 +339,28 @@ dsd_replace_file_with_temp(const char* tmp_path, const char* final_path) {
         return -1;
     }
     return 0;
+}
+
+int
+dsd_rename_noreplace(const char* from, const char* to, int* out_source_left) {
+    if (out_source_left) {
+        *out_source_left = 0;
+    }
+    if (!from || from[0] == '\0' || !to || to[0] == '\0') {
+        errno = EINVAL;
+        return -1;
+    }
+    /* The CRT's rename() refuses an existing destination and keeps the CRT's own path conversion (the UTF-8 locale the
+       runtime selects included), which MoveFileExA() would not. It reports that refusal as EACCES, the errno of every
+       other denial too, so the native error the same call left tells them apart. */
+    _doserrno = 0;
+    if (rename(from, to) == 0) {
+        return 0;
+    }
+    const int saved = errno;
+    const unsigned long native = (unsigned long)_doserrno;
+    errno = (native == ERROR_ALREADY_EXISTS || native == ERROR_FILE_EXISTS) ? EEXIST : saved;
+    return -1;
 }
 
 static int
@@ -387,12 +512,39 @@ dsd_dir_list(const char* dir, dsd_dir_list_cb cb, void* user) {
 
 ssize_t
 dsd_read(int fd, void* buf, size_t count) {
+    if (dsd_fd_is_negative(fd)) {
+        return -1;
+    }
     return (ssize_t)_read(fd, buf, (unsigned int)count);
 }
 
 ssize_t
 dsd_write(int fd, const void* buf, size_t count) {
+    if (dsd_fd_is_negative(fd)) {
+        return -1;
+    }
     return (ssize_t)_write(fd, buf, (unsigned int)count);
+}
+
+static ssize_t
+// cppcheck-suppress constParameterCallback -- signature fixed by dsd_write_frames_ops
+write_frames_win32_write(void* ctx, const void* buf, size_t count) {
+    const int fd = *(const int*)ctx;
+    if (dsd_fd_is_negative(fd)) {
+        return -1;
+    }
+    if (count > (size_t)INT_MAX) {
+        count = (size_t)INT_MAX;
+    }
+    return (ssize_t)_write(fd, buf, (unsigned int)count);
+}
+
+dsd_write_frames_status
+dsd_write_frames(int fd, const void* buf, size_t bytes, size_t frame_bytes, size_t* written) {
+    int fd_copy = fd;
+    /* The CRT descriptors block, and there is no SIGPIPE: a closed pipe is a plain write error. */
+    const dsd_write_frames_ops ops = {write_frames_win32_write, NULL, &fd_copy};
+    return dsd_write_frames_loop(&ops, buf, bytes, frame_bytes, written);
 }
 
 const char*

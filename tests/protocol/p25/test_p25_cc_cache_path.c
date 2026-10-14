@@ -56,23 +56,22 @@ write_cache_fixture(const char* path) {
     DSD_FPRINTF(fp, "cc 851222222\n");
     DSD_FPRINTF(fp, "  cc\t851333333\n");
     DSD_FPRINTF(fp, "notcc 851444444\n");
+    /* Past what strtol() holds: it clamps to LONG_MAX, which is itself 2147483647 Hz where long is 32-bit. */
+    DSD_FPRINTF(fp, "cc 99999999999999999999\n");
+    /* One past the trunk ceiling (2147483647 Hz), which a 64-bit long parses as is. */
+    DSD_FPRINTF(fp, "cc 2147483648\n");
+    /* Under the ceiling, and not LONG_MAX, so a clamped overflow cannot pass for it. */
+    DSD_FPRINTF(fp, "cc 2147483645\n");
     fclose(fp);
     return 1;
 }
 
-int
-main(void) {
+/* The cache file check_cache_loading() writes in the cache directory. */
+static const char* const kCacheFiles[] = {"p25_cc_ABCDE_123_R007_S011.txt", NULL};
+
+static int
+check_cache_loading(const char* cache_root) {
     int rc = 0;
-    char dir[DSD_TEST_PATH_MAX];
-    if (!dsd_test_mkdtemp(dir, sizeof(dir), "dsdneo_cc_path")) {
-        DSD_FPRINTF(stderr, "dsd_test_mkdtemp failed: %s\n", strerror(errno));
-        return 100;
-    }
-    char cache_root[DSD_TEST_PATH_MAX];
-    if (dsd_test_path_join(cache_root, sizeof cache_root, dir, "cache") != 0) {
-        DSD_FPRINTF(stderr, "failed to build cache root path: %s\n", strerror(errno));
-        return 100;
-    }
     setenv("DSD_NEO_CACHE_DIR", cache_root, 1);
     dsd_neo_config_init();
 
@@ -109,12 +108,15 @@ main(void) {
     p25_cc_record_neighbor_frequencies(&opts, NULL, &no_neighbor, 1);
     p25_cc_record_neighbor_frequencies(&opts, &st, &no_neighbor, 1);
 
+    /* Only the marked lines inside 1..2147483647 Hz load: an overflowing or past-the-ceiling line is skipped, not
+     * loaded as a control channel nobody cached. */
     const dsd_trunk_cc_candidates* cc = dsd_trunk_cc_candidates_peek(&st);
     rc |= expect_eq_int("marked cache loaded", st.p25_cc_cache_loaded, 1);
-    rc |= expect_eq_int("loaded marked candidates only", cc ? cc->count : 0, 2);
-    if (cc && cc->count == 2) {
+    rc |= expect_eq_int("loaded marked in-range candidates only", cc ? cc->count : 0, 3);
+    if (cc && cc->count == 3) {
         rc |= expect_eq_long("loaded cache candidate 0", cc->candidates[0], 851222222L);
         rc |= expect_eq_long("loaded cache candidate 1", cc->candidates[1], 851333333L);
+        rc |= expect_eq_long("loaded cache candidate under the ceiling", cc->candidates[2], 2147483645L);
         rc |= expect_eq_int("loaded cache candidate 0 flag", (cc->flags[0] & DSD_TRUNK_CC_CANDIDATE_CURRENT_SITE) != 0,
                             1);
         rc |= expect_eq_int("loaded cache candidate 1 flag", (cc->flags[1] & DSD_TRUNK_CC_CANDIDATE_CURRENT_SITE) != 0,
@@ -122,7 +124,7 @@ main(void) {
     }
 
     p25_cc_record_neighbor_frequencies(&opts, &st, &no_neighbor, 1);
-    rc |= expect_eq_int("already loaded preserves count", cc ? cc->count : 0, 2);
+    rc |= expect_eq_int("already loaded preserves count", cc ? cc->count : 0, 3);
 
     static dsd_state missing;
     DSD_MEMSET(&missing, 0, sizeof missing);
@@ -141,6 +143,30 @@ main(void) {
     rc |= expect_eq_int("add current-site candidate", p25_cc_add_candidate(&st, 852555555L, 1), 1);
     rc |= expect_eq_int("add generic candidate", dsd_trunk_cc_candidates_add(&st, 852666666L, 1, 0), 1);
 
+    return rc;
+}
+
+int
+main(void) {
+    char dir[DSD_TEST_PATH_MAX];
+    if (!dsd_test_mkdtemp(dir, sizeof(dir), "dsdneo_cc_path")) {
+        DSD_FPRINTF(stderr, "dsd_test_mkdtemp failed: %s\n", strerror(errno));
+        return 100;
+    }
+    int rc = 100;
+    char cache_root[DSD_TEST_PATH_MAX];
+    if (dsd_test_path_join(cache_root, sizeof cache_root, dir, "cache") != 0) {
+        DSD_FPRINTF(stderr, "failed to build cache root path: %s\n", strerror(errno));
+    } else {
+        rc = check_cache_loading(cache_root);
+        /* This fails when the test stopped before making the cache directory; anything left in the cache directory
+         * keeps the temp directory from going, which is checked below. */
+        (void)dsd_test_remove_temp_dir(cache_root, kCacheFiles);
+    }
+    if (dsd_test_rmdir(dir) != 0) {
+        DSD_FPRINTF(stderr, "could not remove temp directory %s: %s\n", dir, strerror(errno));
+        rc |= 1;
+    }
     return rc;
 }
 

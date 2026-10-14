@@ -23,19 +23,94 @@ else()
     target_compile_options(dsd-neo_test_assertions INTERFACE -UNDEBUG)
 endif()
 
-
+# A Debug-CRT assertion or abort() opens a modal dialog on Windows, and a test
+# that hits one waits for a click until CTest's timeout. Every MSVC test
+# executable reports them on stderr instead; see test_support/win_crt_report.c.
+# Executables only: link_libraries() below also reaches the test support
+# libraries, and a second copy of the initializer there would be a duplicate
+# definition in every executable that links one.
+if(MSVC)
+    target_sources(
+        dsd-neo_test_assertions
+        INTERFACE
+            "$<$<STREQUAL:$<TARGET_PROPERTY:TYPE>,EXECUTABLE>:${CMAKE_CURRENT_SOURCE_DIR}/test_support/win_crt_report.c>"
+    )
+endif()
 
 link_libraries(dsd-neo_warnings dsd-neo_test_assertions)
 
-# Test fixtures intentionally provide local stand-ins for curses entry points.
-# PDCurses declares those symbols as dllimport and the Windows SDK also defines
-# MOUSE_MOVED; suppress only these fixture-specific MSVC diagnostics.
-add_compile_options(
-    $<$<C_COMPILER_ID:MSVC>:/wd4005>
-    $<$<C_COMPILER_ID:MSVC>:/wd4028>
-    $<$<C_COMPILER_ID:MSVC>:/wd4273>
-)
-add_link_options($<$<C_COMPILER_ID:MSVC>:/ignore:4217>)
+# A Windows main thread gets a 1 MiB stack where Linux gives 8 MiB, so a test
+# with a multi-megabyte local overflows only on Windows (CTest reports it as a
+# segfault). GCC and Clang reject any test stack frame over 768 KiB, which leaves
+# the rest of that megabyte for the calls beneath it.
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    add_compile_options(-Wframe-larger-than=786432)
+endif()
+
+# These tests feed NaN or infinite values to the code under test, or check its
+# output with std::isnan()/isfinite(). In fast-math builds (perf-bench and the
+# optimized CI jobs) those values are undefined in a translation unit and the
+# checks fold away, so the tests' own sources keep IEEE semantics; the
+# production code they exercise keeps the build's flags. The decode-clock test
+# is here because its bounds must round like decode_clock.c, which divides
+# ns / 1e9 exactly where fast-math would multiply by an inexact 1e-9, and the
+# audio2 test because its mono-mixer stub divides by a slot count, which Clang
+# turns into an approximate reciprocal under fast-math.
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    set_source_files_properties(
+        core/test_core_audio2_helpers.c
+        core/test_core_audio_gain.c
+        core/test_core_init_state.c
+        dsp/test_dsp_am_demod.cpp
+        dsp/test_dsp_analog_ctcss.c
+        dsp/test_dsp_analog_audio.c
+        dsp/test_dsp_analog_voice.c
+        dsp/test_dsp_audio_filters.cpp
+        dsp/test_dsp_costas.cpp
+        dsp/test_dsp_demod_segmentation.cpp
+        dsp/test_dsp_firdes.c
+        dsp/test_dsp_simd_widen.cpp
+        dsp/test_dsp_snr_estimator.cpp
+        dsp/test_dsp_squelch_floor.c
+        dsp/test_dsp_nfm_noise_squelch.c
+        dsp/test_dsp_pcm_noise_squelch.c
+        dsp/test_dsp_symbol_replay.c
+        io/test_io_input_level_metrics.c
+        io/test_io_rtl_replay_eof_and_cf32.cpp
+        protocol/m17/test_m17_state_dispatch.c
+        runtime/test_runtime_decode_clock.c
+        runtime/test_runtime_squelch.c
+        ${PROJECT_SOURCE_DIR}/src/runtime/squelch.c
+        PROPERTIES COMPILE_OPTIONS "-fno-fast-math"
+    )
+elseif(MSVC)
+    set_source_files_properties(
+        core/test_core_audio2_helpers.c
+        core/test_core_audio_gain.c
+        core/test_core_init_state.c
+        dsp/test_dsp_am_demod.cpp
+        dsp/test_dsp_analog_ctcss.c
+        dsp/test_dsp_analog_audio.c
+        dsp/test_dsp_analog_voice.c
+        dsp/test_dsp_audio_filters.cpp
+        dsp/test_dsp_costas.cpp
+        dsp/test_dsp_demod_segmentation.cpp
+        dsp/test_dsp_firdes.c
+        dsp/test_dsp_simd_widen.cpp
+        dsp/test_dsp_snr_estimator.cpp
+        dsp/test_dsp_squelch_floor.c
+        dsp/test_dsp_nfm_noise_squelch.c
+        dsp/test_dsp_pcm_noise_squelch.c
+        dsp/test_dsp_symbol_replay.c
+        io/test_io_input_level_metrics.c
+        io/test_io_rtl_replay_eof_and_cf32.cpp
+        protocol/m17/test_m17_state_dispatch.c
+        runtime/test_runtime_decode_clock.c
+        runtime/test_runtime_squelch.c
+        ${PROJECT_SOURCE_DIR}/src/runtime/squelch.c
+        PROPERTIES COMPILE_OPTIONS "/fp:precise"
+    )
+endif()
 
 add_library(dsd-neo_test_support INTERFACE)
 target_include_directories(
@@ -47,12 +122,38 @@ target_link_libraries(dsd-neo_test_support INTERFACE dsd-neo_platform)
 # Shell tools under tools/ run CI on our behalf; the ones with retry or give-up
 # logic get a bash-driven test that fakes the program they wrap, and
 # gcc_fanalyzer.sh one that drives the real compiler over a seeded defect, since
-# its failure mode was reporting a clean run over an empty analysis. Bash only:
-# the scripts themselves are bash, so nothing is lost by skipping them where it
-# is missing.
+# its failure mode was reporting a clean run over an empty analysis. iwyu.sh
+# gets a fake IWYU, since its failure mode was reading a unit that did not
+# compile as clean. Bash only: the scripts themselves are bash, so nothing is
+# lost by skipping them where it is missing. They need bash 4.4 or later (mapfile
+# -d, and empty arrays under set -u in tools/ci_changed_files.sh), and macOS ships
+# 3.2 as /bin/bash, so a newer one is preferred where installed; with only an
+# older one they still register, and fail, rather than vanish.
 if(NOT WIN32)
-    find_program(DSD_NEO_BASH_EXECUTABLE bash)
+    find_program(
+        DSD_NEO_BASH_EXECUTABLE
+        bash
+        HINTS /opt/homebrew/bin /usr/local/bin
+    )
     if(DSD_NEO_BASH_EXECUTABLE)
+        execute_process(
+            COMMAND
+                ${DSD_NEO_BASH_EXECUTABLE} -c
+                [[echo "${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]}"]]
+            OUTPUT_VARIABLE _dsd_neo_bash_version
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_QUIET
+        )
+        if(
+            NOT _dsd_neo_bash_version MATCHES "^[0-9]+\\.[0-9]+$"
+            OR _dsd_neo_bash_version VERSION_LESS 4.4
+        )
+            message(
+                WARNING
+                "${DSD_NEO_BASH_EXECUTABLE} is older than bash 4.4; the TOOLS_* script tests need bash 4.4 and will fail"
+            )
+        endif()
+        unset(_dsd_neo_bash_version)
         add_test(
             NAME TOOLS_CI_ARCH_TOOLCHAIN_PULL_RETRY
             COMMAND
@@ -65,6 +166,27 @@ if(NOT WIN32)
             COMMAND
                 ${DSD_NEO_BASH_EXECUTABLE}
                 ${PROJECT_SOURCE_DIR}/tests/tools/test_ci_changed_files_header_expansion.sh
+            WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        )
+        add_test(
+            NAME TOOLS_CI_CHANGED_FILES_PATHS
+            COMMAND
+                ${DSD_NEO_BASH_EXECUTABLE}
+                ${PROJECT_SOURCE_DIR}/tests/tools/test_ci_changed_files_paths.sh
+            WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        )
+        add_test(
+            NAME TOOLS_PUSH_CHANGED_FILES
+            COMMAND
+                ${DSD_NEO_BASH_EXECUTABLE}
+                ${PROJECT_SOURCE_DIR}/tests/tools/test_push_changed_files.sh
+            WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        )
+        add_test(
+            NAME TOOLS_PRE_PUSH_PATHS
+            COMMAND
+                ${DSD_NEO_BASH_EXECUTABLE}
+                ${PROJECT_SOURCE_DIR}/tests/tools/test_pre_push_paths.sh
             WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         )
         add_test(
@@ -82,6 +204,20 @@ if(NOT WIN32)
             WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         )
         add_test(
+            NAME TOOLS_CHECK_WORKFLOW_DOWNLOAD_PINS
+            COMMAND
+                ${DSD_NEO_BASH_EXECUTABLE}
+                ${PROJECT_SOURCE_DIR}/tests/tools/test_check_workflow_download_pins.sh
+            WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        )
+        add_test(
+            NAME TOOLS_IWYU
+            COMMAND
+                ${DSD_NEO_BASH_EXECUTABLE}
+                ${PROJECT_SOURCE_DIR}/tests/tools/test_iwyu.sh
+            WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        )
+        add_test(
             NAME TOOLS_INSTALL_LINUX_PACKAGE_FAILURE
             COMMAND
                 ${DSD_NEO_BASH_EXECUTABLE}
@@ -91,21 +227,49 @@ if(NOT WIN32)
     endif()
 endif()
 
+# The decode clock alone, for tests that compile protocol, core, app-control or
+# terminal sources directly instead of linking dsd-neo_runtime.
+add_library(
+    dsd-neo_test_decode_clock
+    STATIC
+    ${PROJECT_SOURCE_DIR}/src/runtime/decode_clock.c
+)
+target_include_directories(
+    dsd-neo_test_decode_clock
+    PRIVATE ${PROJECT_SOURCE_DIR}/include
+)
+target_link_libraries(dsd-neo_test_decode_clock PUBLIC dsd-neo_platform)
+
 add_library(
     dsd-neo_test_call_state_support
     STATIC
     ${PROJECT_SOURCE_DIR}/src/core/util/call_state.c
     ${PROJECT_SOURCE_DIR}/src/runtime/state_ext.c
-    ${PROJECT_SOURCE_DIR}/tests/test_support/event_sync_stub.c
 )
 target_include_directories(
     dsd-neo_test_call_state_support
     PRIVATE ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src/core/util
 )
-target_link_libraries(dsd-neo_test_call_state_support PUBLIC dsd-neo_platform)
+# call_state.c stamps call and recent-activity times from the decode clock.
+target_link_libraries(
+    dsd-neo_test_call_state_support
+    PUBLIC dsd-neo_test_decode_clock dsd-neo_platform
+)
 target_compile_definitions(
     dsd-neo_test_call_state_support
     PRIVATE DSD_NEO_TEST_HOOKS
+)
+
+# call_state.c calls dsd_event_sync_slot(). Tests that link it without dsd-neo_core's
+# event code link this no-op; one linking both would define the function twice.
+add_library(
+    dsd-neo_test_event_sync_stub
+    STATIC
+    ${PROJECT_SOURCE_DIR}/tests/test_support/event_sync_stub.c
+)
+target_include_directories(
+    dsd-neo_test_event_sync_stub
+    PRIVATE ${PROJECT_SOURCE_DIR}/include
 )
 
 add_library(
@@ -120,6 +284,31 @@ target_include_directories(
 # Arms the unexpected-truncation counter so a call site that understates a
 # buffer span shows up as a test failure instead of a quiet decode regression.
 target_compile_definitions(dsd-neo_test_bit_packing PRIVATE DSD_NEO_TEST_HOOKS)
+
+# The analog monitor in dsd_symbol.c notes the audible-audio stamp (issue #574), and app-control's notification record
+# reads and arms it; dsd-neo_core holds it, so tests that link the DSP archive or compile notification_status.c without
+# core take this copy of it.
+add_library(
+    dsd-neo_test_audio_activity
+    OBJECT
+    ${PROJECT_SOURCE_DIR}/src/core/audio/audio_activity.c
+)
+target_include_directories(
+    dsd-neo_test_audio_activity
+    PRIVATE ${PROJECT_SOURCE_DIR}/include
+)
+
+# The analog monitor in dsd_symbol.c writes through the audio sinks (issue #659), which dsd-neo_core holds too; tests
+# that link the DSP archive without core take this copy. It needs the platform audio and runtime log those link.
+add_library(
+    dsd-neo_test_audio_sink
+    OBJECT
+    ${PROJECT_SOURCE_DIR}/src/core/audio/audio_sink.c
+)
+target_include_directories(
+    dsd-neo_test_audio_sink
+    PRIVATE ${PROJECT_SOURCE_DIR}/include
+)
 
 add_library(
     dsd-neo_test_p25_shims
@@ -192,6 +381,10 @@ function(dsd_neo_link_dsp_test target_name)
         )
         add_dependencies(${target_name} dsd-neo_proto_tetra)
     endif()
+    target_link_libraries(
+        ${target_name}
+        PRIVATE dsd-neo_test_audio_activity dsd-neo_test_audio_sink
+    )
 
     if(ARGN)
         target_link_libraries(${target_name} PRIVATE ${ARGN})
@@ -335,11 +528,48 @@ dsd_neo_add_public_header_smoke_test(
   dsd-neo/core/dmr_key_map.h
   C
 )
+# The analog sinks' converter (issue #633).
+dsd_neo_add_public_header_smoke_test(
+  dsd-neo_test_headers_public_dsp_rate_converter
+  HEADERS_PUBLIC_DSP_RATE_CONVERTER
+  dsd-neo/dsp/rate_converter.h
+  C
+)
+dsd_neo_add_public_header_smoke_test(
+  dsd-neo_test_headers_public_dsp_rate_converter_cxx
+  HEADERS_PUBLIC_DSP_RATE_CONVERTER_CXX
+  dsd-neo/dsp/rate_converter.h
+  CXX
+)
+dsd_neo_add_public_header_smoke_test(
+  dsd-neo_test_headers_public_dsp_analog_sink
+  HEADERS_PUBLIC_DSP_ANALOG_SINK
+  dsd-neo/dsp/analog_sink.h
+  C
+)
+dsd_neo_add_public_header_smoke_test(
+  dsd-neo_test_headers_public_dsp_analog_sink_cxx
+  HEADERS_PUBLIC_DSP_ANALOG_SINK_CXX
+  dsd-neo/dsp/analog_sink.h
+  CXX
+)
 dsd_neo_add_public_header_smoke_test(
   dsd-neo_test_headers_public_runtime_input_failure
   HEADERS_PUBLIC_RUNTIME_INPUT_FAILURE
   dsd-neo/runtime/input_failure.h
   C
+)
+dsd_neo_add_public_header_smoke_test(
+  dsd-neo_test_headers_public_core_audio_input_switch
+  HEADERS_PUBLIC_CORE_AUDIO_INPUT_SWITCH
+  dsd-neo/core/audio_input_switch.h
+  C
+)
+dsd_neo_add_public_header_smoke_test(
+  dsd-neo_test_headers_public_core_audio_input_switch_cxx
+  HEADERS_PUBLIC_CORE_AUDIO_INPUT_SWITCH_CXX
+  dsd-neo/core/audio_input_switch.h
+  CXX
 )
 dsd_neo_add_public_header_smoke_test(
   dsd-neo_test_headers_public_runtime_analog_channel
@@ -351,6 +581,24 @@ dsd_neo_add_public_header_smoke_test(
   dsd-neo_test_headers_public_runtime_analog_channel_cxx
   HEADERS_PUBLIC_RUNTIME_ANALOG_CHANNEL_CXX
   dsd-neo/runtime/analog_channel.h
+  CXX
+)
+dsd_neo_add_public_header_smoke_test(
+  dsd-neo_test_headers_public_runtime_scan_row_edit
+  HEADERS_PUBLIC_RUNTIME_SCAN_ROW_EDIT
+  dsd-neo/runtime/scan_row_edit.h
+  C
+)
+dsd_neo_add_public_header_smoke_test(
+  dsd-neo_test_headers_public_runtime_squelch
+  HEADERS_PUBLIC_RUNTIME_SQUELCH
+  dsd-neo/runtime/squelch.h
+  C
+)
+dsd_neo_add_public_header_smoke_test(
+  dsd-neo_test_headers_public_runtime_squelch_cxx
+  HEADERS_PUBLIC_RUNTIME_SQUELCH_CXX
+  dsd-neo/runtime/squelch.h
   CXX
 )
 dsd_neo_add_public_header_smoke_test(
@@ -468,12 +716,6 @@ dsd_neo_add_public_header_smoke_test(
   C
 )
 dsd_neo_add_public_header_smoke_test(
-  dsd-neo_test_headers_public_runtime_p25_p2_audio_ring
-  HEADERS_PUBLIC_RUNTIME_P25_P2_AUDIO_RING
-  dsd-neo/runtime/p25_p2_audio_ring.h
-  C
-)
-dsd_neo_add_public_header_smoke_test(
   dsd-neo_test_headers_public_runtime_rtl_stream_io_hooks
   HEADERS_PUBLIC_RUNTIME_RTL_STREAM_IO_HOOKS
   dsd-neo/runtime/rtl_stream_io_hooks.h
@@ -490,6 +732,18 @@ dsd_neo_add_public_header_smoke_test(
   HEADERS_PUBLIC_RUNTIME_RIGCTL_QUERY_HOOKS
   dsd-neo/runtime/rigctl_query_hooks.h
   C
+)
+dsd_neo_add_public_header_smoke_test(
+  dsd-neo_test_headers_public_runtime_rigctl_passband
+  HEADERS_PUBLIC_RUNTIME_RIGCTL_PASSBAND
+  dsd-neo/runtime/rigctl_passband.h
+  C
+)
+dsd_neo_add_public_header_smoke_test(
+  dsd-neo_test_headers_public_runtime_rigctl_passband_cxx
+  HEADERS_PUBLIC_RUNTIME_RIGCTL_PASSBAND_CXX
+  dsd-neo/runtime/rigctl_passband.h
+  CXX
 )
 dsd_neo_add_public_header_smoke_test(
   dsd-neo_test_headers_public_runtime_udp_audio_hooks
@@ -649,6 +903,19 @@ dsd_neo_add_public_header_smoke_test(
   dsd-neo/app_control/call_view.h
   CXX
 )
+# Issue #575: the call history's access-code text, read by the Qt call history.
+dsd_neo_add_public_header_smoke_test(
+  dsd-neo_test_headers_public_app_control_access_code_view
+  HEADERS_PUBLIC_APP_CONTROL_ACCESS_CODE_VIEW
+  dsd-neo/app_control/access_code_view.h
+  C
+)
+dsd_neo_add_public_header_smoke_test(
+  dsd-neo_test_headers_public_app_control_access_code_view_cxx
+  HEADERS_PUBLIC_APP_CONTROL_ACCESS_CODE_VIEW_CXX
+  dsd-neo/app_control/access_code_view.h
+  CXX
+)
 
 dsd_neo_add_public_header_smoke_test(
   dsd-neo_test_headers_public_app_control_scan_timing_view
@@ -675,6 +942,19 @@ dsd_neo_add_public_header_smoke_test(
   dsd-neo/app_control/squelch_view.h
   CXX
 )
+# The shared tuner gain readout under --trunk-scan (issue #518 follow-up).
+dsd_neo_add_public_header_smoke_test(
+  dsd-neo_test_headers_public_app_control_rtl_gain_view
+  HEADERS_PUBLIC_APP_CONTROL_RTL_GAIN_VIEW
+  dsd-neo/app_control/rtl_gain_view.h
+  C
+)
+dsd_neo_add_public_header_smoke_test(
+  dsd-neo_test_headers_public_app_control_rtl_gain_view_cxx
+  HEADERS_PUBLIC_APP_CONTROL_RTL_GAIN_VIEW_CXX
+  dsd-neo/app_control/rtl_gain_view.h
+  CXX
+)
 # Issue #525: the shared analog channel width readout.
 dsd_neo_add_public_header_smoke_test(
   dsd-neo_test_headers_public_app_control_analog_width_view
@@ -686,6 +966,18 @@ dsd_neo_add_public_header_smoke_test(
   dsd-neo_test_headers_public_app_control_analog_width_view_cxx
   HEADERS_PUBLIC_APP_CONTROL_ANALOG_WIDTH_VIEW_CXX
   dsd-neo/app_control/analog_width_view.h
+  CXX
+)
+dsd_neo_add_public_header_smoke_test(
+  dsd-neo_test_headers_public_app_control_scan_row_view
+  HEADERS_PUBLIC_APP_CONTROL_SCAN_ROW_VIEW
+  dsd-neo/app_control/scan_row_view.h
+  C
+)
+dsd_neo_add_public_header_smoke_test(
+  dsd-neo_test_headers_public_app_control_scan_row_view_cxx
+  HEADERS_PUBLIC_APP_CONTROL_SCAN_ROW_VIEW_CXX
+  dsd-neo/app_control/scan_row_view.h
   CXX
 )
 dsd_neo_add_public_header_smoke_test(
@@ -772,11 +1064,66 @@ dsd_neo_add_public_header_smoke_test(
   dsd-neo/core/frame.h
   C
 )
+# Issue #527: the tone-policy types, a type-only header both languages include.
+dsd_neo_add_public_header_smoke_test(
+  dsd-neo_test_headers_public_core_analog_tone
+  HEADERS_PUBLIC_CORE_ANALOG_TONE
+  dsd-neo/core/analog_tone.h
+  C
+)
+dsd_neo_add_public_header_smoke_test(
+  dsd-neo_test_headers_public_core_analog_tone_cxx
+  HEADERS_PUBLIC_CORE_ANALOG_TONE_CXX
+  dsd-neo/core/analog_tone.h
+  CXX
+)
 dsd_neo_add_public_header_smoke_test(
   dsd-neo_test_headers_public_core_file_io
   HEADERS_PUBLIC_CORE_FILE_IO
   dsd-neo/core/file_io.h
   C
+)
+dsd_neo_add_public_header_smoke_test(
+  dsd-neo_test_headers_public_dsp_analog_voice
+  HEADERS_PUBLIC_DSP_ANALOG_VOICE
+  dsd-neo/dsp/analog_voice.h
+  C
+)
+dsd_neo_add_public_header_smoke_test(
+  dsd-neo_test_headers_public_dsp_squelch_floor
+  HEADERS_PUBLIC_DSP_SQUELCH_FLOOR
+  dsd-neo/dsp/squelch_floor.h
+  C
+)
+dsd_neo_add_public_header_smoke_test(
+  dsd-neo_test_headers_public_dsp_squelch_floor_cxx
+  HEADERS_PUBLIC_DSP_SQUELCH_FLOOR_CXX
+  dsd-neo/dsp/squelch_floor.h
+  CXX
+)
+dsd_neo_add_public_header_smoke_test(
+  dsd-neo_test_headers_public_dsp_nfm_noise_squelch
+  HEADERS_PUBLIC_DSP_NFM_NOISE_SQUELCH
+  dsd-neo/dsp/nfm_noise_squelch.h
+  C
+)
+dsd_neo_add_public_header_smoke_test(
+  dsd-neo_test_headers_public_dsp_nfm_noise_squelch_cxx
+  HEADERS_PUBLIC_DSP_NFM_NOISE_SQUELCH_CXX
+  dsd-neo/dsp/nfm_noise_squelch.h
+  CXX
+)
+dsd_neo_add_public_header_smoke_test(
+  dsd-neo_test_headers_public_dsp_pcm_noise_squelch
+  HEADERS_PUBLIC_DSP_PCM_NOISE_SQUELCH
+  dsd-neo/dsp/pcm_noise_squelch.h
+  C
+)
+dsd_neo_add_public_header_smoke_test(
+  dsd-neo_test_headers_public_dsp_pcm_noise_squelch_cxx
+  HEADERS_PUBLIC_DSP_PCM_NOISE_SQUELCH_CXX
+  dsd-neo/dsp/pcm_noise_squelch.h
+  CXX
 )
 dsd_neo_add_public_header_smoke_test(
   dsd-neo_test_headers_public_core_utf16
@@ -819,6 +1166,42 @@ dsd_neo_add_public_header_smoke_test(
   HEADERS_PUBLIC_CORE_CHANNEL_LABEL
   dsd-neo/core/channel_label.h
   C
+)
+dsd_neo_add_public_header_smoke_test(
+  dsd-neo_test_headers_public_core_access_code
+  HEADERS_PUBLIC_CORE_ACCESS_CODE
+  dsd-neo/core/access_code.h
+  C
+)
+dsd_neo_add_public_header_smoke_test(
+  dsd-neo_test_headers_public_core_access_code_cxx
+  HEADERS_PUBLIC_CORE_ACCESS_CODE_CXX
+  dsd-neo/core/access_code.h
+  CXX
+)
+dsd_neo_add_public_header_smoke_test(
+  dsd-neo_test_headers_public_core_crc_provenance
+  HEADERS_PUBLIC_CORE_CRC_PROVENANCE
+  dsd-neo/core/crc_provenance.h
+  C
+)
+dsd_neo_add_public_header_smoke_test(
+  dsd-neo_test_headers_public_core_crc_provenance_cxx
+  HEADERS_PUBLIC_CORE_CRC_PROVENANCE_CXX
+  dsd-neo/core/crc_provenance.h
+  CXX
+)
+dsd_neo_add_public_header_smoke_test(
+  dsd-neo_test_headers_public_core_p25p2_playout
+  HEADERS_PUBLIC_CORE_P25P2_PLAYOUT
+  dsd-neo/core/p25p2_playout.h
+  C
+)
+dsd_neo_add_public_header_smoke_test(
+  dsd-neo_test_headers_public_core_p25p2_playout_cxx
+  HEADERS_PUBLIC_CORE_P25P2_PLAYOUT_CXX
+  dsd-neo/core/p25p2_playout.h
+  CXX
 )
 dsd_neo_add_public_header_smoke_test(
   dsd-neo_test_headers_public_core_talkgroup_policy
@@ -1285,19 +1668,27 @@ target_include_directories(
 target_link_libraries(dsd-neo_test_ysf_frame PRIVATE ${LIBS})
 add_test(NAME YSF_FRAME COMMAND dsd-neo_test_ysf_frame)
 
-add_executable(dsd-neo_test_ysf_dch_decode protocol/ysf/test_ysf_dch_decode.c)
-target_include_directories(
-    dsd-neo_test_ysf_dch_decode
-    PRIVATE ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src/protocol/ysf
-)
-target_link_libraries(
-    dsd-neo_test_ysf_dch_decode
-    PRIVATE
-        dsd-neo_proto_ysf
-        ${_DSD_RUNTIME_CLI_PARSE_LIBS}
-        ${LIBS}
-)
-if(NOT MSVC)
+# The DCH path is driven through GNU ld --wrap seams, like the other wrap tests.
+if(NOT APPLE AND NOT WIN32 AND (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang"))
+    add_executable(
+        dsd-neo_test_ysf_dch_decode
+        protocol/ysf/test_ysf_dch_decode.c
+    )
+    target_include_directories(
+        dsd-neo_test_ysf_dch_decode
+        PRIVATE
+            ${PROJECT_SOURCE_DIR}/include
+            ${PROJECT_SOURCE_DIR}/src/protocol/ysf
+    )
+    target_link_libraries(
+        dsd-neo_test_ysf_dch_decode
+        PRIVATE
+            "-Wl,--start-group"
+            dsd-neo_proto_ysf
+            "-Wl,--end-group"
+            ${LIBS}
+            dsd-neo_test_support
+    )
     target_link_options(
         dsd-neo_test_ysf_dch_decode
         PRIVATE
@@ -1305,8 +1696,41 @@ if(NOT MSVC)
             -Wl,--wrap=processMbeFrame
             -Wl,--wrap=mbe_processAmbe2450Dataf
     )
+    add_test(NAME YSF_DCH_DECODE COMMAND dsd-neo_test_ysf_dch_decode)
+
+    # The same harness with the real vocoder (issue #661): the frames YSF decodes through the borrowed NXDN and P25
+    # Phase 1 decoders reach MBE capture.
+    add_executable(
+        dsd-neo_test_ysf_mbe_capture
+        protocol/ysf/test_ysf_dch_decode.c
+    )
+    target_compile_definitions(
+        dsd-neo_test_ysf_mbe_capture
+        PRIVATE DSD_YSF_TEST_REAL_VOCODER=1
+    )
+    target_include_directories(
+        dsd-neo_test_ysf_mbe_capture
+        PRIVATE
+            ${PROJECT_SOURCE_DIR}/include
+            ${PROJECT_SOURCE_DIR}/src/protocol/ysf
+    )
+    target_link_libraries(
+        dsd-neo_test_ysf_mbe_capture
+        PRIVATE
+            "-Wl,--start-group"
+            dsd-neo_proto_ysf
+            "-Wl,--end-group"
+            ${LIBS}
+            dsd-neo_test_support
+    )
+    target_link_options(
+        dsd-neo_test_ysf_mbe_capture
+        PRIVATE
+            -Wl,--wrap=get_dibit_and_analog_signal
+            -Wl,--wrap=mbe_processAmbe2450Dataf
+    )
+    add_test(NAME YSF_MBE_CAPTURE COMMAND dsd-neo_test_ysf_mbe_capture)
 endif()
-add_test(NAME YSF_DCH_DECODE COMMAND dsd-neo_test_ysf_dch_decode)
 
 add_executable(
     dsd-neo_test_p25_p2_ysf_sync_dispatch
@@ -1450,15 +1874,29 @@ target_include_directories(
         ${PROJECT_SOURCE_DIR}/include
         ${PROJECT_SOURCE_DIR}/src/protocol/nxdn
 )
-target_link_libraries(
-    dsd-neo_test_nxdn_deperm_primitives
-    PRIVATE
-        dsd-neo_proto_nxdn
-        dsd-neo_proto_dmr
-        dsd-neo_proto_p25
-        dsd-neo_core
-        ${LIBS}
-)
+if(NOT APPLE AND (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang"))
+    target_link_libraries(
+        dsd-neo_test_nxdn_deperm_primitives
+        PRIVATE
+            "-Wl,--start-group"
+            dsd-neo_proto_nxdn
+            dsd-neo_proto_dmr
+            dsd-neo_proto_p25
+            dsd-neo_core
+            "-Wl,--end-group"
+            ${LIBS}
+    )
+else()
+    target_link_libraries(
+        dsd-neo_test_nxdn_deperm_primitives
+        PRIVATE
+            dsd-neo_proto_nxdn
+            dsd-neo_proto_dmr
+            dsd-neo_proto_p25
+            dsd-neo_core
+            ${LIBS}
+    )
+endif()
 add_test(
     NAME NXDN_DEPERM_PRIMITIVES
     COMMAND dsd-neo_test_nxdn_deperm_primitives
@@ -1514,6 +1952,7 @@ target_link_libraries(
     PRIVATE
         dsd-neo_proto_nxdn
         dsd-neo_test_call_state_support
+        dsd-neo_test_event_sync_stub
         dsd-neo_test_support
 )
 add_test(NAME NXDN_ELEMENT_BOUNDS COMMAND dsd-neo_test_nxdn_element_bounds)
@@ -1646,6 +2085,23 @@ add_test(
 )
 
 add_executable(
+    dsd-neo_test_runtime_unicode_console_restore
+    runtime/test_runtime_unicode_console_restore.c
+)
+target_include_directories(
+    dsd-neo_test_runtime_unicode_console_restore
+    PRIVATE ${PROJECT_SOURCE_DIR}/include
+)
+target_link_libraries(
+    dsd-neo_test_runtime_unicode_console_restore
+    PRIVATE dsd-neo_runtime
+)
+add_test(
+    NAME RUNTIME_UNICODE_CONSOLE_RESTORE
+    COMMAND dsd-neo_test_runtime_unicode_console_restore
+)
+
+add_executable(
     dsd-neo_test_runtime_unicode_put_scalar
     runtime/test_runtime_unicode_put_scalar.c
 )
@@ -1687,6 +2143,28 @@ target_link_libraries(dsd-neo_test_runtime_cli_frontend PRIVATE dsd-neo_runtime)
 add_test(NAME RUNTIME_CLI_FRONTEND COMMAND dsd-neo_test_runtime_cli_frontend)
 
 add_executable(
+    dsd-neo_test_runtime_cli_frontend_api
+    runtime/test_runtime_cli_frontend_api.c
+    ${PROJECT_SOURCE_DIR}/apps/dsd-cli/frontend.c
+)
+target_compile_definitions(
+    dsd-neo_test_runtime_cli_frontend_api
+    PRIVATE DSD_CLI_HAS_TERMINAL_UI=0 DSD_CLI_HAS_API=1
+)
+target_include_directories(
+    dsd-neo_test_runtime_cli_frontend_api
+    PRIVATE ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/apps/dsd-cli
+)
+target_link_libraries(
+    dsd-neo_test_runtime_cli_frontend_api
+    PRIVATE dsd-neo_runtime
+)
+add_test(
+    NAME RUNTIME_CLI_FRONTEND_API
+    COMMAND dsd-neo_test_runtime_cli_frontend_api
+)
+
+add_executable(
     dsd-neo_test_runtime_input_ring_init
     runtime/test_runtime_input_ring_init.cpp
 )
@@ -1702,6 +2180,32 @@ add_test(
     NAME RUNTIME_INPUT_RING_INIT
     COMMAND dsd-neo_test_runtime_input_ring_init
 )
+
+# A commit between the reader's first look at an empty input ring and its lock is read
+# without waiting out the 10 ms timeout. GNU ld --wrap puts the commit exactly there, so
+# the case exists only where that links, like the other wrap tests.
+if(NOT APPLE AND NOT WIN32 AND (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang"))
+    add_executable(
+        dsd-neo_test_runtime_input_ring_wakeup
+        runtime/test_runtime_input_ring_wakeup.cpp
+    )
+    target_include_directories(
+        dsd-neo_test_runtime_input_ring_wakeup
+        PRIVATE ${PROJECT_SOURCE_DIR}/include
+    )
+    target_link_libraries(
+        dsd-neo_test_runtime_input_ring_wakeup
+        PRIVATE dsd-neo_runtime
+    )
+    target_link_options(
+        dsd-neo_test_runtime_input_ring_wakeup
+        PRIVATE "LINKER:--wrap=dsd_mutex_lock"
+    )
+    add_test(
+        NAME RUNTIME_INPUT_RING_WAKEUP
+        COMMAND dsd-neo_test_runtime_input_ring_wakeup
+    )
+endif()
 
 add_executable(
     dsd-neo_test_runtime_frame_sync_hooks
@@ -1731,23 +2235,6 @@ target_include_directories(
 target_link_libraries(dsd-neo_test_runtime_control_pump PRIVATE dsd-neo_runtime)
 add_test(NAME RUNTIME_CONTROL_PUMP COMMAND dsd-neo_test_runtime_control_pump)
 
-add_executable(
-    dsd-neo_test_runtime_p25_p2_audio_ring
-    runtime/test_runtime_p25_p2_audio_ring.c
-)
-target_include_directories(
-    dsd-neo_test_runtime_p25_p2_audio_ring
-    PRIVATE ${PROJECT_SOURCE_DIR}/include
-)
-target_link_libraries(
-    dsd-neo_test_runtime_p25_p2_audio_ring
-    PRIVATE dsd-neo_runtime
-)
-add_test(
-    NAME RUNTIME_P25_P2_AUDIO_RING
-    COMMAND dsd-neo_test_runtime_p25_p2_audio_ring
-)
-
 if(DSD_ENABLE_TERMINAL_UI)
     add_executable(
         dsd-neo_test_ui_async_lifecycle
@@ -1771,6 +2258,15 @@ if(DSD_ENABLE_TERMINAL_UI)
             ${PROJECT_SOURCE_DIR}/src/ui/terminal
             ${CURSES_INCLUDE_DIRS}
     )
+    # The curses calls this test stubs are declared __declspec(dllimport) by the
+    # DLL build of PDCurses (Windows), and MSVC rejects defining one (C2491);
+    # CURSES_LIBRARY declares them as the library's own, as for the menu tests.
+    if(MSVC)
+        target_compile_definitions(
+            dsd-neo_test_ui_async_lifecycle
+            PRIVATE CURSES_LIBRARY
+        )
+    endif()
     add_test(NAME UI_ASYNC_LIFECYCLE COMMAND dsd-neo_test_ui_async_lifecycle)
 endif()
 
@@ -1786,6 +2282,7 @@ add_executable(
     ${PROJECT_SOURCE_DIR}/src/core/util/enc_lockout.c
     ${PROJECT_SOURCE_DIR}/src/core/util/dsd_state_trunk_lcn.c
     ${PROJECT_SOURCE_DIR}/src/core/util/key_set.c
+    ${PROJECT_SOURCE_DIR}/src/runtime/decode_clock.c
     ${PROJECT_SOURCE_DIR}/src/runtime/decode_mode.c
     ${PROJECT_SOURCE_DIR}/src/runtime/trunk_scan_hooks.c
 )
@@ -1795,12 +2292,14 @@ target_include_directories(
 )
 target_link_libraries(
     dsd-neo_test_app_control_actions
-    PRIVATE dsd-neo_test_call_state_support
+    PRIVATE dsd-neo_test_call_state_support ${DSD_NEO_TEST_MATH_LIB}
 )
 target_sources(
     dsd-neo_test_app_control_actions
     PRIVATE
         ${PROJECT_SOURCE_DIR}/src/runtime/scan_mode.c
+        ${PROJECT_SOURCE_DIR}/src/runtime/squelch.c
+        ${PROJECT_SOURCE_DIR}/src/runtime/rtl_stream_io_hooks.c
         ${PROJECT_SOURCE_DIR}/src/runtime/rtl_stream_metrics_hooks.c
 )
 
@@ -1816,6 +2315,8 @@ add_executable(
     ${PROJECT_SOURCE_DIR}/src/app_control/actions/actions_radio.c
     ${PROJECT_SOURCE_DIR}/src/app_control/symbol_profile.c
     ${PROJECT_SOURCE_DIR}/src/runtime/decode_mode.c
+    # symbol_profile.c records a scan leave (svc_leave_channel_scan()) around the engine's.
+    test_support/channel_scan_stubs.c
 )
 target_compile_definitions(
     dsd-neo_test_app_control_actions_rtl
@@ -1841,6 +2342,8 @@ add_executable(
     ${PROJECT_SOURCE_DIR}/src/core/util/bit_packing.c
     ${PROJECT_SOURCE_DIR}/src/app_control/analog_width_view.c
     ${PROJECT_SOURCE_DIR}/src/app_control/menu_services.c
+    # The width and -B services ask a rigctl peer through the follow (issue #621); the engine side is stubbed.
+    ${PROJECT_SOURCE_DIR}/src/app_control/rigctl_passband.c
     # svc_clear_keys() drops the DMR TG->key ID map through keyring_dmr_tg_map_reset().
     ${PROJECT_SOURCE_DIR}/src/core/vocoder/keyring.c
     ${PROJECT_SOURCE_DIR}/src/core/vocoder/keyring_dmr_tg_map.c
@@ -1872,11 +2375,24 @@ target_sources(
 add_test(NAME UI_MENU_SERVICES COMMAND dsd-neo_test_ui_menu_services)
 
 if(DSD_ENABLE_TERMINAL_UI)
+    # The Tone filter row reads the shared received-tone view, so it and the tone tables come in
+    # as sources: the label goldens run through the real policy text. The width rows read the
+    # analog width view, and it the rigctl passband rule, in every build (issue #621).
     add_executable(
         dsd-neo_test_ui_menu_labels
         ui/test_ui_menu_labels.c
         ${PROJECT_SOURCE_DIR}/src/ui/terminal/menu_labels.c
         ${PROJECT_SOURCE_DIR}/src/core/util/enc_lockout.c
+        ${PROJECT_SOURCE_DIR}/src/app_control/analog_width_view.c
+        ${PROJECT_SOURCE_DIR}/src/app_control/rtl_gain_view.c
+        ${PROJECT_SOURCE_DIR}/src/app_control/rx_tone_view.c
+        ${PROJECT_SOURCE_DIR}/src/app_control/squelch_view.c
+        ${PROJECT_SOURCE_DIR}/src/runtime/analog_channel.c
+        ${PROJECT_SOURCE_DIR}/src/runtime/analog_tones.c
+        ${PROJECT_SOURCE_DIR}/src/runtime/rigctl_passband.c
+        ${PROJECT_SOURCE_DIR}/src/runtime/rtl_stream_io_hooks.c
+        ${PROJECT_SOURCE_DIR}/src/runtime/rtl_stream_metrics_hooks.c
+        ${PROJECT_SOURCE_DIR}/src/runtime/squelch.c
     )
     target_include_directories(
         dsd-neo_test_ui_menu_labels
@@ -1885,9 +2401,15 @@ if(DSD_ENABLE_TERMINAL_UI)
             ${PROJECT_SOURCE_DIR}/src/ui/terminal
             ${CURSES_INCLUDE_DIRS}
     )
+    target_link_libraries(
+        dsd-neo_test_ui_menu_labels
+        PRIVATE ${DSD_NEO_TEST_MATH_LIB}
+    )
     target_sources(
         dsd-neo_test_ui_menu_labels
-        PRIVATE test_support/scan_mode_label_stubs.c
+        PRIVATE
+            test_support/scan_mode_label_stubs.c
+            test_support/squelch_format_stubs.c
     )
     add_test(NAME UI_MENU_LABELS COMMAND dsd-neo_test_ui_menu_labels)
 
@@ -1897,7 +2419,15 @@ if(DSD_ENABLE_TERMINAL_UI)
         ${PROJECT_SOURCE_DIR}/src/ui/terminal/menu_labels.c
         ${PROJECT_SOURCE_DIR}/src/core/util/enc_lockout.c
         ${PROJECT_SOURCE_DIR}/src/app_control/analog_width_view.c
+        ${PROJECT_SOURCE_DIR}/src/app_control/rtl_gain_view.c
+        ${PROJECT_SOURCE_DIR}/src/app_control/rx_tone_view.c
+        ${PROJECT_SOURCE_DIR}/src/app_control/squelch_view.c
         ${PROJECT_SOURCE_DIR}/src/runtime/analog_channel.c
+        ${PROJECT_SOURCE_DIR}/src/runtime/analog_tones.c
+        ${PROJECT_SOURCE_DIR}/src/runtime/rigctl_passband.c
+        ${PROJECT_SOURCE_DIR}/src/runtime/rtl_stream_io_hooks.c
+        ${PROJECT_SOURCE_DIR}/src/runtime/rtl_stream_metrics_hooks.c
+        ${PROJECT_SOURCE_DIR}/src/runtime/squelch.c
     )
     target_include_directories(
         dsd-neo_test_ui_menu_labels_radio
@@ -1906,13 +2436,19 @@ if(DSD_ENABLE_TERMINAL_UI)
             ${PROJECT_SOURCE_DIR}/src/ui/terminal
             ${CURSES_INCLUDE_DIRS}
     )
+    target_link_libraries(
+        dsd-neo_test_ui_menu_labels_radio
+        PRIVATE ${DSD_NEO_TEST_MATH_LIB}
+    )
     target_compile_definitions(
         dsd-neo_test_ui_menu_labels_radio
         PRIVATE USE_RADIO
     )
     target_sources(
         dsd-neo_test_ui_menu_labels_radio
-        PRIVATE test_support/scan_mode_label_stubs.c
+        PRIVATE
+            test_support/scan_mode_label_stubs.c
+            test_support/squelch_format_stubs.c
     )
     add_test(
         NAME UI_MENU_LABELS_RADIO
@@ -1937,6 +2473,26 @@ if(DSD_ENABLE_TERMINAL_UI)
         PRIVATE USE_RADIO
     )
     add_test(NAME UI_MENU_TREE_AUDIT COMMAND dsd-neo_test_ui_menu_tree_audit)
+
+    # The same audit over the tree a build without the radio pipeline compiles: no
+    # RTL-SDR or Airspy rows, and the rows that must not depend on them (issue #621).
+    add_executable(
+        dsd-neo_test_ui_menu_tree_audit_no_radio
+        ui/test_ui_menu_tree_audit.c
+        ${PROJECT_SOURCE_DIR}/src/ui/terminal/menu_items.c
+        ${PROJECT_SOURCE_DIR}/src/ui/terminal/menus/menu_defs.c
+    )
+    target_include_directories(
+        dsd-neo_test_ui_menu_tree_audit_no_radio
+        PRIVATE
+            ${PROJECT_SOURCE_DIR}/include
+            ${PROJECT_SOURCE_DIR}/src/ui/terminal
+            ${CURSES_INCLUDE_DIRS}
+    )
+    add_test(
+        NAME UI_MENU_TREE_AUDIT_NO_RADIO
+        COMMAND dsd-neo_test_ui_menu_tree_audit_no_radio
+    )
 
     add_executable(
         dsd-neo_test_ui_menu_render_helpers
@@ -2062,6 +2618,12 @@ if(DSD_ENABLE_TERMINAL_UI)
         dsd-neo_test_ui_panels_header_footer
         PRIVATE ${CURSES_LIBRARIES}
     )
+    if(MSVC)
+        target_compile_definitions(
+            dsd-neo_test_ui_panels_header_footer
+            PRIVATE CURSES_LIBRARY
+        )
+    endif()
     add_test(
         NAME UI_PANELS_HEADER_FOOTER
         COMMAND dsd-neo_test_ui_panels_header_footer
@@ -2117,6 +2679,21 @@ target_link_libraries(
 )
 add_test(NAME APP_CONTROL_CALL_VIEW COMMAND dsd-neo_test_app_control_call_view)
 
+# Issue #575: a call's access code as every frontend spells it.
+add_executable(
+    dsd-neo_test_app_control_access_code_view
+    ui/test_app_control_access_code_view.c
+    ${PROJECT_SOURCE_DIR}/src/app_control/access_code_view.c
+)
+target_include_directories(
+    dsd-neo_test_app_control_access_code_view
+    PRIVATE ${PROJECT_SOURCE_DIR}/include
+)
+add_test(
+    NAME APP_CONTROL_ACCESS_CODE_VIEW
+    COMMAND dsd-neo_test_app_control_access_code_view
+)
+
 add_executable(
     dsd-neo_test_app_control_scan_timing_view
     ui/test_app_control_scan_timing_view.c
@@ -2148,6 +2725,22 @@ target_link_libraries(
 add_test(
     NAME APP_CONTROL_SQUELCH_VIEW
     COMMAND dsd-neo_test_app_control_squelch_view
+)
+
+# Issue #518 follow-up: the configured tuner gain under --trunk-scan, "(target: X)" while the
+# parked target's own rtl_gain overrides it.
+add_executable(
+    dsd-neo_test_app_control_rtl_gain_view
+    ui/test_app_control_rtl_gain_view.c
+    ${PROJECT_SOURCE_DIR}/src/app_control/rtl_gain_view.c
+)
+target_link_libraries(
+    dsd-neo_test_app_control_rtl_gain_view
+    PRIVATE dsd-neo_core dsd-neo_runtime
+)
+add_test(
+    NAME APP_CONTROL_RTL_GAIN_VIEW
+    COMMAND dsd-neo_test_app_control_rtl_gain_view
 )
 
 # The received-tone text every frontend shows (issue #522), and the configured policy kept
@@ -2186,16 +2779,85 @@ add_test(
     COMMAND dsd-neo_test_app_control_analog_width_view
 )
 
+# Issue #621: the live follow of a rigctl peer's passband, over a stubbed engine apply, -Y stage and P25 SM tick guard.
+add_executable(
+    dsd-neo_test_app_control_rigctl_passband
+    ui/test_app_control_rigctl_passband.c
+    ${PROJECT_SOURCE_DIR}/src/app_control/rigctl_passband.c
+)
+target_include_directories(
+    dsd-neo_test_app_control_rigctl_passband
+    PRIVATE ${PROJECT_SOURCE_DIR}/src/app_control
+)
+target_link_libraries(
+    dsd-neo_test_app_control_rigctl_passband
+    PRIVATE dsd-neo_core dsd-neo_runtime
+)
+add_test(
+    NAME APP_CONTROL_RIGCTL_PASSBAND
+    COMMAND dsd-neo_test_app_control_rigctl_passband
+)
+
+# Issue #518: the scan row on air as the "this channel" editors see it.
+add_executable(
+    dsd-neo_test_app_control_scan_row_view
+    ui/test_app_control_scan_row_view.c
+    ${PROJECT_SOURCE_DIR}/src/app_control/scan_row_view.c
+    ${PROJECT_SOURCE_DIR}/src/app_control/analog_width_view.c
+)
+target_link_libraries(
+    dsd-neo_test_app_control_scan_row_view
+    PRIVATE dsd-neo_core dsd-neo_runtime
+)
+add_test(
+    NAME APP_CONTROL_SCAN_ROW_VIEW
+    COMMAND dsd-neo_test_app_control_scan_row_view
+)
+
+# Issue #518: DSD_APP_CMD_SCAN_ROW_EDIT's follow-ups and rollbacks, over stubbed engine and receiver services.
+add_executable(
+    dsd-neo_test_app_control_scan_row_edit
+    ui/test_app_control_scan_row_edit.c
+    ${PROJECT_SOURCE_DIR}/src/app_control/scan_row_edit.c
+    ${PROJECT_SOURCE_DIR}/src/app_control/scan_row_view.c
+    ${PROJECT_SOURCE_DIR}/src/app_control/analog_width_view.c
+)
+target_include_directories(
+    dsd-neo_test_app_control_scan_row_edit
+    PRIVATE ${PROJECT_SOURCE_DIR}/src/app_control
+)
+target_compile_definitions(
+    dsd-neo_test_app_control_scan_row_edit
+    PRIVATE USE_RADIO
+)
+target_link_libraries(
+    dsd-neo_test_app_control_scan_row_edit
+    PRIVATE dsd-neo_core dsd-neo_runtime
+)
+add_test(
+    NAME APP_CONTROL_SCAN_ROW_EDIT
+    COMMAND dsd-neo_test_app_control_scan_row_edit
+)
+
+# The audible-audio stamp's own source with DSD_NEO_TEST_HOOKS, so the golden record can set its clock (issue #574).
 add_executable(
     dsd-neo_test_app_control_notification_status
     ui/test_app_control_notification_status.c
     ${PROJECT_SOURCE_DIR}/src/app_control/notification_status.c
     ${PROJECT_SOURCE_DIR}/src/app_control/call_view.c
+    ${PROJECT_SOURCE_DIR}/src/core/audio/audio_activity.c
     ${PROJECT_SOURCE_DIR}/src/core/util/synctype.c
 )
 target_include_directories(
     dsd-neo_test_app_control_notification_status
-    PRIVATE ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src/app_control
+    PRIVATE
+        ${PROJECT_SOURCE_DIR}/include
+        ${PROJECT_SOURCE_DIR}/src
+        ${PROJECT_SOURCE_DIR}/src/app_control
+)
+target_compile_definitions(
+    dsd-neo_test_app_control_notification_status
+    PRIVATE DSD_NEO_TEST_HOOKS
 )
 target_link_libraries(
     dsd-neo_test_app_control_notification_status
@@ -2222,6 +2884,12 @@ if(DSD_ENABLE_TERMINAL_UI)
         dsd-neo_test_ui_ncurses_trunk_display_helpers
         PRIVATE ${CURSES_LIBRARIES}
     )
+    if(MSVC)
+        target_compile_definitions(
+            dsd-neo_test_ui_ncurses_trunk_display_helpers
+            PRIVATE CURSES_LIBRARY
+        )
+    endif()
     add_test(
         NAME UI_NCURSES_TRUNK_DISPLAY_HELPERS
         COMMAND dsd-neo_test_ui_ncurses_trunk_display_helpers
@@ -2248,6 +2916,12 @@ if(DSD_ENABLE_TERMINAL_UI)
         dsd-neo_test_ui_ncurses_p25_display_helpers
         PRIVATE dsd-neo_test_call_state_support ${CURSES_LIBRARIES}
     )
+    if(MSVC)
+        target_compile_definitions(
+            dsd-neo_test_ui_ncurses_p25_display_helpers
+            PRIVATE CURSES_LIBRARY
+        )
+    endif()
     add_test(
         NAME UI_NCURSES_P25_DISPLAY_HELPERS
         COMMAND dsd-neo_test_ui_ncurses_p25_display_helpers
@@ -2265,7 +2939,10 @@ if(DSD_ENABLE_TERMINAL_UI)
         ${PROJECT_SOURCE_DIR}/src/app_control/rx_tone_view.c
         ${PROJECT_SOURCE_DIR}/src/runtime/analog_channel.c
         ${PROJECT_SOURCE_DIR}/src/runtime/analog_tones.c
+        ${PROJECT_SOURCE_DIR}/src/runtime/rigctl_passband.c
+        ${PROJECT_SOURCE_DIR}/src/runtime/rtl_stream_io_hooks.c
         ${PROJECT_SOURCE_DIR}/src/runtime/rtl_stream_metrics_hooks.c
+        ${PROJECT_SOURCE_DIR}/src/runtime/squelch.c
     )
     target_compile_definitions(
         dsd-neo_test_ui_ncurses_printer_helpers
@@ -2278,12 +2955,6 @@ if(DSD_ENABLE_TERMINAL_UI)
             ${PROJECT_SOURCE_DIR}/src/ui/terminal
             ${CURSES_INCLUDE_DIRS}
     )
-    if(NOT MSVC)
-        target_compile_options(
-            dsd-neo_test_ui_ncurses_printer_helpers
-            PRIVATE -Wno-unused-function
-        )
-    endif()
     target_link_libraries(
         dsd-neo_test_ui_ncurses_printer_helpers
         PRIVATE
@@ -2312,6 +2983,12 @@ if(DSD_ENABLE_TERMINAL_UI)
         dsd-neo_test_ui_ncurses_printer_helpers
         dsd-neo_proto_tetra
     )
+    if(MSVC)
+        target_compile_definitions(
+            dsd-neo_test_ui_ncurses_printer_helpers
+            PRIVATE CURSES_LIBRARY
+        )
+    endif()
     add_test(
         NAME UI_NCURSES_PRINTER_HELPERS
         COMMAND dsd-neo_test_ui_ncurses_printer_helpers
@@ -2321,6 +2998,8 @@ if(DSD_ENABLE_TERMINAL_UI)
         dsd-neo_test_ui_menu_callbacks
         ui/test_ui_menu_callbacks.c
         ${PROJECT_SOURCE_DIR}/src/ui/terminal/menu_callbacks.c
+        ${PROJECT_SOURCE_DIR}/src/runtime/rtl_stream_io_hooks.c
+        ${PROJECT_SOURCE_DIR}/src/runtime/squelch.c
     )
     target_include_directories(
         dsd-neo_test_ui_menu_callbacks
@@ -2330,14 +3009,27 @@ if(DSD_ENABLE_TERMINAL_UI)
             ${PROJECT_SOURCE_DIR}/src/ui/terminal
             ${CURSES_INCLUDE_DIRS}
     )
+    target_link_libraries(
+        dsd-neo_test_ui_menu_callbacks
+        PRIVATE ${DSD_NEO_TEST_MATH_LIB}
+    )
     add_test(NAME UI_MENU_CALLBACKS COMMAND dsd-neo_test_ui_menu_callbacks)
 
     add_executable(
         dsd-neo_test_ui_menu_actions
         ui/test_ui_menu_actions.c
         ${PROJECT_SOURCE_DIR}/src/ui/terminal/menu_actions.c
+        ${PROJECT_SOURCE_DIR}/src/app_control/scan_row_view.c
         ${PROJECT_SOURCE_DIR}/src/app_control/analog_width_view.c
+        ${PROJECT_SOURCE_DIR}/src/app_control/rtl_gain_view.c
+        ${PROJECT_SOURCE_DIR}/src/app_control/rx_tone_view.c
+        ${PROJECT_SOURCE_DIR}/src/app_control/squelch_view.c
         ${PROJECT_SOURCE_DIR}/src/runtime/analog_channel.c
+        ${PROJECT_SOURCE_DIR}/src/runtime/analog_tones.c
+        ${PROJECT_SOURCE_DIR}/src/runtime/rigctl_passband.c
+        ${PROJECT_SOURCE_DIR}/src/runtime/rtl_stream_io_hooks.c
+        ${PROJECT_SOURCE_DIR}/src/runtime/rtl_stream_metrics_hooks.c
+        ${PROJECT_SOURCE_DIR}/src/runtime/squelch.c
     )
     target_include_directories(
         dsd-neo_test_ui_menu_actions
@@ -2394,6 +3086,20 @@ target_include_directories(
         ${_PUBLIC_INCLUDES}
 )
 add_test(NAME UI_TCP_AUDIO_CONNECT COMMAND dsd-neo_test_ui_tcp_audio_connect)
+
+add_executable(
+    dsd-neo_test_ui_rigctl_connect
+    ui/test_ui_rigctl_connect.c
+    ${PROJECT_SOURCE_DIR}/src/app_control/rigctl_connect.c
+)
+target_include_directories(
+    dsd-neo_test_ui_rigctl_connect
+    PRIVATE
+        ${PROJECT_SOURCE_DIR}/include
+        ${PROJECT_SOURCE_DIR}/src/app_control
+        ${_PUBLIC_INCLUDES}
+)
+add_test(NAME UI_RIGCTL_CONNECT COMMAND dsd-neo_test_ui_rigctl_connect)
 
 add_executable(dsd-neo_test_ui_burst_active_call ui/test_ui_burst_active_call.c)
 target_include_directories(
@@ -2469,6 +3175,7 @@ if(DSD_ENABLE_TERMINAL_UI)
         PRIVATE
             ${PROJECT_SOURCE_DIR}/include
             ${PROJECT_SOURCE_DIR}/src/ui/terminal
+            ${CURSES_INCLUDE_DIRS}
             ${_PUBLIC_INCLUDES}
     )
     target_link_libraries(
@@ -2499,6 +3206,12 @@ if(DSD_ENABLE_TERMINAL_UI)
         dsd-neo_test_ui_prims_status_gamma
         PRIVATE ${CURSES_LIBRARIES} ${DSD_NEO_TEST_MATH_LIB}
     )
+    if(MSVC)
+        target_compile_definitions(
+            dsd-neo_test_ui_prims_status_gamma
+            PRIVATE CURSES_LIBRARY
+        )
+    endif()
     add_test(
         NAME UI_PRIMS_STATUS_GAMMA
         COMMAND dsd-neo_test_ui_prims_status_gamma
@@ -2520,11 +3233,13 @@ if(DSD_ENABLE_TERMINAL_UI)
         dsd-neo_test_ui_snr_meter
         PRIVATE DSD_NEO_TEST_HOOKS PRETTY_COLORS
     )
-    if(DSD_ENABLE_FAST_MATH)
-        target_compile_definitions(
-            dsd-neo_test_ui_snr_meter
-            PRIVATE DSD_NEO_FAST_MATH=1
-        )
+    # ncurses_snr.c is compiled here directly, so it does not inherit the
+    # src/ui/terminal property that keeps its NaN check effective in fast-math
+    # builds; the test's NAN inputs need IEEE semantics as well.
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(dsd-neo_test_ui_snr_meter PRIVATE -fno-fast-math)
+    elseif(MSVC)
+        target_compile_options(dsd-neo_test_ui_snr_meter PRIVATE /fp:precise)
     endif()
     target_link_libraries(
         dsd-neo_test_ui_snr_meter
@@ -2605,10 +3320,15 @@ if(DSD_ENABLE_TERMINAL_UI)
             dsd-neo_test_ui_snr_meter_pdc_wide_no_api
             PRIVATE DSD_NEO_TEST_HOOKS DSD_USE_PDCURSES PDC_WIDE PRETTY_COLORS
         )
-        if(DSD_ENABLE_FAST_MATH)
-            target_compile_definitions(
+        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+            target_compile_options(
                 dsd-neo_test_ui_snr_meter_pdc_wide_no_api
-                PRIVATE DSD_NEO_FAST_MATH=1
+                PRIVATE -fno-fast-math
+            )
+        elseif(MSVC)
+            target_compile_options(
+                dsd-neo_test_ui_snr_meter_pdc_wide_no_api
+                PRIVATE /fp:precise
             )
         endif()
         target_link_libraries(
@@ -2876,6 +3596,17 @@ target_include_directories(
     dsd-neo_test_ui_qt_spectrum_math
     PRIVATE ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src/ui/qt
 )
+# spectrum_math.h takes the floating-point mode of whatever includes it, and
+# dsd-neo_ui_qt keeps IEEE semantics; so does this test, whose bad-frame cases
+# would otherwise check a NaN guard fast-math has compiled out.
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(
+        dsd-neo_test_ui_qt_spectrum_math
+        PRIVATE -fno-fast-math
+    )
+elseif(MSVC)
+    target_compile_options(dsd-neo_test_ui_qt_spectrum_math PRIVATE /fp:precise)
+endif()
 add_test(NAME UI_QT_SPECTRUM_MATH COMMAND dsd-neo_test_ui_qt_spectrum_math)
 
 # The persistence layer itself (json_store atomic writes, the saved-systems
@@ -2912,6 +3643,7 @@ if(DSD_ENABLE_QT_UI)
         ui/test_ui_qt_decryption_profiles.cpp
         ${PROJECT_SOURCE_DIR}/src/ui/qt/decryption_profiles_model.cpp
         ${PROJECT_SOURCE_DIR}/src/ui/qt/saved_systems_model.cpp
+        ${PROJECT_SOURCE_DIR}/src/ui/qt/scan_list_targets.cpp
         ${PROJECT_SOURCE_DIR}/src/ui/qt/scan_lists_model.cpp
         ${PROJECT_SOURCE_DIR}/src/ui/qt/session_args.cpp
         ${PROJECT_SOURCE_DIR}/src/ui/qt/decoder_host.cpp
@@ -2977,7 +3709,9 @@ if(DSD_ENABLE_QT_UI)
         ${PROJECT_SOURCE_DIR}/src/ui/qt/metrics_model.cpp
         ${PROJECT_SOURCE_DIR}/src/app_control/analog_width_view.c
         ${PROJECT_SOURCE_DIR}/src/app_control/call_view.c
+        ${PROJECT_SOURCE_DIR}/src/app_control/scan_row_view.c
         ${PROJECT_SOURCE_DIR}/src/app_control/p25_metrics.c
+        ${PROJECT_SOURCE_DIR}/src/app_control/rtl_gain_view.c
         ${PROJECT_SOURCE_DIR}/src/app_control/squelch_view.c
         ${PROJECT_SOURCE_DIR}/src/app_control/rx_tone_view.c
     )
@@ -3011,6 +3745,7 @@ if(DSD_ENABLE_QT_UI)
         ${PROJECT_SOURCE_DIR}/src/ui/qt/talkgroup_filter_model.cpp
         ${PROJECT_SOURCE_DIR}/src/ui/qt/call_history_model.cpp
         ${PROJECT_SOURCE_DIR}/src/ui/qt/json_store.cpp
+        ${PROJECT_SOURCE_DIR}/src/app_control/access_code_view.c
     )
     target_include_directories(
         dsd-neo_test_ui_qt_talkgroup_list_model
@@ -3040,13 +3775,16 @@ if(DSD_ENABLE_QT_UI)
 
     # The call-history model's ring ingest, driven against synthetic event
     # rings: the slot/seq row keying, merge-versus-duplicate decisions, the
-    # commit_rev rescan gate, and the relaunch (Activity restart) path.
+    # commit_rev rescan gate, and the relaunch (Activity restart) path. The
+    # access-code text comes from app-control (issue #575).
     find_package(Qt6 REQUIRED COMPONENTS Test)
     add_executable(
         dsd-neo_test_ui_qt_call_history_model
         ui/test_ui_qt_call_history_model.cpp
         ${PROJECT_SOURCE_DIR}/src/ui/qt/call_history_model.cpp
+        ${PROJECT_SOURCE_DIR}/src/ui/qt/call_history_filter.cpp
         ${PROJECT_SOURCE_DIR}/src/ui/qt/json_store.cpp
+        ${PROJECT_SOURCE_DIR}/src/app_control/access_code_view.c
     )
     target_include_directories(
         dsd-neo_test_ui_qt_call_history_model
@@ -3129,6 +3867,20 @@ if(DSD_ENABLE_QT_UI)
         NAME UI_QT_SCAN_LIST_TARGETS
         COMMAND dsd-neo_test_ui_qt_scan_list_targets
     )
+
+    # The QML collector policy every process that builds a QML engine applies
+    # before the first one exists (Android main, the QML suites, the C++ tests
+    # that load production QML).
+    add_executable(
+        dsd-neo_test_ui_qt_qml_gc_policy
+        ui/test_ui_qt_qml_gc_policy.cpp
+    )
+    target_include_directories(
+        dsd-neo_test_ui_qt_qml_gc_policy
+        PRIVATE ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src/ui/qt
+    )
+    target_link_libraries(dsd-neo_test_ui_qt_qml_gc_policy PRIVATE Qt6::Core)
+    add_test(NAME UI_QT_QML_GC_POLICY COMMAND dsd-neo_test_ui_qt_qml_gc_policy)
 
     # The imported-files layer behind the CSV pickers: DecoderHost's desktop
     # importDocument() copy/unique-ify/replace semantics and the library model
@@ -3531,6 +4283,7 @@ add_executable(
     ${PROJECT_SOURCE_DIR}/src/core/util/synctype.c
     ${PROJECT_SOURCE_DIR}/src/app_control/call_view.c
     ${PROJECT_SOURCE_DIR}/src/app_control/notification_status.c
+    ${PROJECT_SOURCE_DIR}/src/app_control/telemetry_observers.c
     ${PROJECT_SOURCE_DIR}/src/app_control/ui_snapshot.c
     ${PROJECT_SOURCE_DIR}/src/runtime/trunk_cc_candidates.c
     ${PROJECT_SOURCE_DIR}/tests/test_support/csv_import_stub.c
@@ -3545,7 +4298,10 @@ target_compile_definitions(
 )
 target_link_libraries(
     dsd-neo_test_app_control_snapshot_event_history
-    PRIVATE dsd-neo_test_call_state_support dsd-neo_platform
+    PRIVATE
+        dsd-neo_test_call_state_support
+        dsd-neo_test_audio_activity
+        dsd-neo_platform
 )
 target_link_libraries(
     dsd-neo_test_app_control_snapshot_event_history
@@ -3562,6 +4318,7 @@ add_executable(
     ${PROJECT_SOURCE_DIR}/src/app_control/ui_opts_snapshot.c
     ${PROJECT_SOURCE_DIR}/src/app_control/call_view.c
     ${PROJECT_SOURCE_DIR}/src/app_control/notification_status.c
+    ${PROJECT_SOURCE_DIR}/src/app_control/telemetry_observers.c
     ${PROJECT_SOURCE_DIR}/src/core/util/synctype.c
 )
 target_include_directories(
@@ -3570,7 +4327,10 @@ target_include_directories(
 )
 target_link_libraries(
     dsd-neo_test_app_control_opts_snapshot
-    PRIVATE dsd-neo_test_call_state_support dsd-neo_platform
+    PRIVATE
+        dsd-neo_test_call_state_support
+        dsd-neo_test_audio_activity
+        dsd-neo_platform
 )
 add_test(
     NAME APP_CONTROL_OPTS_SNAPSHOT
@@ -3620,7 +4380,10 @@ target_include_directories(
 target_link_libraries(dsd-neo_test_runtime_freq_parse PRIVATE dsd-neo_runtime)
 add_test(NAME RUNTIME_FREQ_PARSE COMMAND dsd-neo_test_runtime_freq_parse)
 
-# The CTCSS table and its text (issue #522), shared by the detector, the views and the policy.
+# The CTCSS and DCS tables and their text (issues #522, #523), shared by the detectors, the
+# views and the policy: the tone table, the DCS codes, their Golay words against the published
+# reference words, the alias rule and its golden table, the two standard spellings of every
+# code's signal, and the formatters.
 add_executable(
     dsd-neo_test_runtime_analog_tones
     runtime/test_runtime_analog_tones.c
@@ -3668,6 +4431,7 @@ add_executable(
     dsd-neo_test_runtime_bootstrap_interactive
     runtime/test_runtime_bootstrap_interactive.c
     ${PROJECT_SOURCE_DIR}/src/runtime/bootstrap/interactive.c
+    ${PROJECT_SOURCE_DIR}/src/runtime/analog_channel.c
 )
 target_include_directories(
     dsd-neo_test_runtime_bootstrap_interactive
@@ -4365,6 +5129,76 @@ target_link_libraries(
 )
 add_test(NAME CORE_SCAN_PROFILE COMMAND dsd-neo_test_core_scan_profile)
 
+# dsd_parse_double_strict() must refuse NaN and infinities; it is header-only, so
+# the test keeps the IEEE semantics its NaN-rejecting callers are built with.
+add_executable(
+    dsd-neo_test_core_parse_double_strict
+    core/test_core_parse_double_strict.c
+)
+target_include_directories(
+    dsd-neo_test_core_parse_double_strict
+    PRIVATE ${PROJECT_SOURCE_DIR}/include
+)
+target_link_libraries(
+    dsd-neo_test_core_parse_double_strict
+    PRIVATE ${DSD_NEO_TEST_MATH_LIB}
+)
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(
+        dsd-neo_test_core_parse_double_strict
+        PRIVATE -fno-fast-math
+    )
+elseif(MSVC)
+    target_compile_options(
+        dsd-neo_test_core_parse_double_strict
+        PRIVATE /fp:precise
+    )
+endif()
+add_test(
+    NAME CORE_PARSE_DOUBLE_STRICT
+    COMMAND dsd-neo_test_core_parse_double_strict
+)
+
+# Voice band-pass and AGC for the analog monitor (issue #518): every response bound
+# comes from tools/design_voice_filters.py.
+add_executable(dsd-neo_test_dsp_analog_voice dsp/test_dsp_analog_voice.c)
+target_include_directories(
+    dsd-neo_test_dsp_analog_voice
+    PRIVATE ${PROJECT_SOURCE_DIR}/include
+)
+target_link_libraries(
+    dsd-neo_test_dsp_analog_voice
+    PRIVATE dsd-neo_dsp ${DSD_NEO_TEST_MATH_LIB}
+)
+add_test(NAME DSP_ANALOG_VOICE COMMAND dsd-neo_test_dsp_analog_voice)
+
+# The analog monitor's audio chain (issue #518): source gains, fixed gain and AGC,
+# band choice, legacy filter flags, resets and the state-extension slot; and the -6
+# raw WAV's int16 scale (issue #643).
+add_executable(dsd-neo_test_dsp_analog_audio dsp/test_dsp_analog_audio.c)
+target_include_directories(
+    dsd-neo_test_dsp_analog_audio
+    PRIVATE ${PROJECT_SOURCE_DIR}/include
+)
+target_link_libraries(
+    dsd-neo_test_dsp_analog_audio
+    PRIVATE dsd-neo_core ${DSD_NEO_TEST_MATH_LIB}
+)
+add_test(NAME DSP_ANALOG_AUDIO COMMAND dsd-neo_test_dsp_analog_audio)
+
+add_executable(
+    dsd-neo_test_core_parse_bool_strict
+    core/test_core_parse_bool_strict.c
+)
+target_include_directories(
+    dsd-neo_test_core_parse_bool_strict
+    PRIVATE ${PROJECT_SOURCE_DIR}/include
+)
+add_test(
+    NAME CORE_PARSE_BOOL_STRICT
+    COMMAND dsd-neo_test_core_parse_bool_strict
+)
+
 add_executable(dsd-neo_test_core_csv_validate core/test_core_csv_validate.c)
 target_include_directories(
     dsd-neo_test_core_csv_validate
@@ -4416,6 +5250,17 @@ add_test(
     COMMAND dsd-neo_test_core_p25_bandplan_seed
 )
 
+# Issue #575: the tuned-frequency resolver and the I/Q replay predicate (header-only)
+add_executable(
+    dsd-neo_test_core_opts_tuned_freq
+    core/test_core_opts_tuned_freq.c
+)
+target_include_directories(
+    dsd-neo_test_core_opts_tuned_freq
+    PRIVATE ${PROJECT_SOURCE_DIR}/include
+)
+add_test(NAME CORE_OPTS_TUNED_FREQ COMMAND dsd-neo_test_core_opts_tuned_freq)
+
 add_executable(dsd-neo_test_core_channel_label core/test_core_channel_label.c)
 target_include_directories(
     dsd-neo_test_core_channel_label
@@ -4423,6 +5268,15 @@ target_include_directories(
 )
 target_link_libraries(dsd-neo_test_core_channel_label PRIVATE dsd-neo_core)
 add_test(NAME CORE_CHANNEL_LABEL COMMAND dsd-neo_test_core_channel_label)
+
+# Issue #575: the access code a call history row records, per protocol
+add_executable(dsd-neo_test_core_access_code core/test_core_access_code.c)
+target_include_directories(
+    dsd-neo_test_core_access_code
+    PRIVATE ${PROJECT_SOURCE_DIR}/include
+)
+target_link_libraries(dsd-neo_test_core_access_code PRIVATE dsd-neo_core)
+add_test(NAME CORE_ACCESS_CODE COMMAND dsd-neo_test_core_access_code)
 
 add_executable(
     dsd-neo_test_core_state_trunk_lcn_avoid
@@ -4540,12 +5394,34 @@ target_include_directories(
 target_link_libraries(dsd-neo_test_core_audio_input_rate PRIVATE dsd-neo_core)
 add_test(NAME CORE_AUDIO_INPUT_RATE COMMAND dsd-neo_test_core_audio_input_rate)
 
+# A runtime input switch opens the new input before it closes the running one, and one that cannot open changes
+# nothing (issue #634).
+add_executable(
+    dsd-neo_test_core_audio_input_switch
+    core/test_core_audio_input_switch.c
+)
+target_include_directories(
+    dsd-neo_test_core_audio_input_switch
+    PRIVATE
+        ${PROJECT_SOURCE_DIR}/include
+        ${PROJECT_SOURCE_DIR}/tests/test_support
+)
+target_link_libraries(dsd-neo_test_core_audio_input_switch PRIVATE dsd-neo_core)
+add_test(
+    NAME CORE_AUDIO_INPUT_SWITCH
+    COMMAND dsd-neo_test_core_audio_input_switch
+)
+
 add_executable(dsd-neo_test_core_audio_gain core/test_core_audio_gain.c)
 target_include_directories(
     dsd-neo_test_core_audio_gain
     PRIVATE
         ${PROJECT_SOURCE_DIR}/include
         ${PROJECT_SOURCE_DIR}/tests/test_support
+)
+target_link_libraries(
+    dsd-neo_test_core_audio_gain
+    PRIVATE dsd-neo_core dsd-neo_test_support
 )
 target_link_libraries(
     dsd-neo_test_core_audio_gain
@@ -4592,10 +5468,62 @@ if(NOT APPLE AND NOT WIN32 AND (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang"))
     )
 endif()
 
+# openAudioInput() over a recording device layer (GNU ld --wrap), so the test exists only where that links.
+if(NOT APPLE AND NOT WIN32 AND (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang"))
+    add_executable(
+        dsd-neo_test_core_audio_open_input
+        core/test_core_audio_open_input.c
+    )
+    target_include_directories(
+        dsd-neo_test_core_audio_open_input
+        PRIVATE
+            ${PROJECT_SOURCE_DIR}/include
+            ${PROJECT_SOURCE_DIR}/tests/test_support
+    )
+    target_link_libraries(
+        dsd-neo_test_core_audio_open_input
+        PRIVATE dsd-neo_core
+    )
+    target_link_options(
+        dsd-neo_test_core_audio_open_input
+        PRIVATE
+            "LINKER:--wrap=dsd_audio_open_input"
+            "LINKER:--wrap=dsd_audio_close"
+    )
+    add_test(
+        NAME CORE_AUDIO_OPEN_INPUT
+        COMMAND dsd-neo_test_core_audio_open_input
+    )
+endif()
+
+# The stamp's own source with DSD_NEO_TEST_HOOKS, which brings in its test clock seam; the shipped core has none.
+add_executable(
+    dsd-neo_test_core_audio_activity
+    core/test_core_audio_activity.c
+    ${PROJECT_SOURCE_DIR}/src/core/audio/audio_activity.c
+)
+target_include_directories(
+    dsd-neo_test_core_audio_activity
+    PRIVATE ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src
+)
+target_compile_definitions(
+    dsd-neo_test_core_audio_activity
+    PRIVATE DSD_NEO_TEST_HOOKS
+)
+target_link_libraries(
+    dsd-neo_test_core_audio_activity
+    PRIVATE dsd-neo_test_decode_clock dsd-neo_platform
+)
+add_test(NAME CORE_AUDIO_ACTIVITY COMMAND dsd-neo_test_core_audio_activity)
+
 add_executable(
     dsd-neo_test_core_audio2_helpers
     core/test_core_audio2_helpers.c
     ${PROJECT_SOURCE_DIR}/src/core/audio/dsd_audio2.c
+    ${PROJECT_SOURCE_DIR}/src/core/audio/voice_crypto.c
+    ${PROJECT_SOURCE_DIR}/src/core/audio/audio_activity.c
+    ${PROJECT_SOURCE_DIR}/src/core/audio/audio_sink.c
+    ${PROJECT_SOURCE_DIR}/src/core/audio/dmr_mix_media.c
 )
 target_include_directories(
     dsd-neo_test_core_audio2_helpers
@@ -4604,36 +5532,41 @@ target_include_directories(
         ${PROJECT_SOURCE_DIR}/include
         ${PROJECT_SOURCE_DIR}/src
 )
-target_include_directories(
-    dsd-neo_test_core_audio2_helpers
-    SYSTEM
-    PRIVATE ${_MBE_TARGET_INCLUDE_DIRS}
-)
 target_compile_definitions(
     dsd-neo_test_core_audio2_helpers
     PRIVATE DSD_AUDIO2_INTERNAL= MBE_API=
 )
-target_compile_options(
-    dsd-neo_test_core_audio2_helpers
-    PRIVATE $<$<NOT:$<C_COMPILER_ID:MSVC>>:-ffunction-sections;-fdata-sections>
-)
-target_link_options(
-    dsd-neo_test_core_audio2_helpers
-    PRIVATE $<$<NOT:$<C_COMPILER_ID:MSVC>>:-Wl,--gc-sections>
-)
-target_link_libraries(
-    dsd-neo_test_core_audio2_helpers
-    PRIVATE ${DSD_NEO_TEST_MATH_LIB}
-)
-if(NOT MSVC)
-    target_link_options(dsd-neo_test_core_audio2_helpers PRIVATE -Wl,--gc-sections)
-endif()
-
 target_link_libraries(
     dsd-neo_test_core_audio2_helpers
     PRIVATE dsd-neo_test_call_state_support ${DSD_NEO_TEST_MATH_LIB}
 )
 add_test(NAME CORE_AUDIO2_HELPERS COMMAND dsd-neo_test_core_audio2_helpers)
+
+# The digital voice chain (issue #653): the per-slot high-pass and gain every decoded frame runs through, and the alert
+# tone, the same in both output formats.
+add_executable(dsd-neo_test_core_voice_chain core/test_core_voice_chain.c)
+target_include_directories(
+    dsd-neo_test_core_voice_chain
+    PRIVATE ${PROJECT_SOURCE_DIR}/include
+)
+target_link_libraries(
+    dsd-neo_test_core_voice_chain
+    PRIVATE dsd-neo_core ${DSD_NEO_TEST_MATH_LIB}
+)
+add_test(NAME CORE_VOICE_CHAIN COMMAND dsd-neo_test_core_voice_chain)
+
+# The audio sinks' write path: device failure and recovery reports, the -o - descriptor's failure and drops (issue
+# #659). The platform writes and the log are stubbed.
+add_executable(
+    dsd-neo_test_core_audio_sink
+    core/test_core_audio_sink.c
+    ${PROJECT_SOURCE_DIR}/src/core/audio/audio_sink.c
+)
+target_include_directories(
+    dsd-neo_test_core_audio_sink
+    PRIVATE ${PROJECT_SOURCE_DIR}/include
+)
+add_test(NAME CORE_AUDIO_SINK COMMAND dsd-neo_test_core_audio_sink)
 
 add_executable(
     dsd-neo_test_core_misc_power_filters
@@ -4676,6 +5609,21 @@ dsd_neo_link_dsp_test(
 )
 add_test(NAME DSP_WAV_INPUT_EOF COMMAND dsd-neo_test_dsp_wav_input_eof)
 
+# A silent input gives way to a queued command only in the frame-sync hunt and only after a stream pause; a lost TCP
+# input is no socket (issue #634).
+add_executable(dsd-neo_test_dsp_input_interrupt dsp/test_dsp_input_interrupt.c)
+target_include_directories(
+    dsd-neo_test_dsp_input_interrupt
+    PRIVATE ${PROJECT_SOURCE_DIR}/include ${LIBSNDFILE_INCLUDE_DIR}
+)
+dsd_neo_link_dsp_test(
+    dsd-neo_test_dsp_input_interrupt
+    dsd-neo_test_support
+    ${DSD_NEO_TEST_MATH_LIB}
+    ${LIBSNDFILE_LIBRARIES}
+)
+add_test(NAME DSP_INPUT_INTERRUPT COMMAND dsd-neo_test_dsp_input_interrupt)
+
 # The matched filter switching on, off, or to another filter must not move the
 # symbol grid's content position (issue #444); driven through getSymbol() from a WAV
 add_executable(
@@ -4710,6 +5658,8 @@ target_link_libraries(
     dsd-neo_test_dsp_symbol_replay
     PRIVATE
         dsd-neo_dsp_private_test_support
+        dsd-neo_test_audio_activity
+        dsd-neo_test_audio_sink
         dsd-neo_test_support
         ${DSD_NEO_TEST_MATH_LIB}
         ${LIBSNDFILE_LIBRARIES}
@@ -4756,12 +5706,34 @@ target_link_libraries(
         dsd-neo_proto_nxdn
         dsd-neo_proto_dmr
         dsd-neo_feature_codec2
+        dsd-neo_test_support
         ${LIBS}
 )
 add_test(
     NAME CORE_MBE_TRANSFORM_CONTEXT
     COMMAND dsd-neo_test_core_mbe_transform_context
 )
+
+# Issue #656: crypto transforms stay with the protocol that owns the voice; keystream reads stay in the keystream.
+add_executable(
+    dsd-neo_test_core_mbe_crypto_scope
+    core/test_core_mbe_crypto_scope.c
+)
+target_include_directories(
+    dsd-neo_test_core_mbe_crypto_scope
+    PRIVATE ${PROJECT_SOURCE_DIR}/include ${_PUBLIC_INCLUDES}
+)
+target_link_libraries(
+    dsd-neo_test_core_mbe_crypto_scope
+    PRIVATE
+        dsd-neo_core
+        dsd-neo_proto_nxdn
+        dsd-neo_proto_dmr
+        dsd-neo_feature_codec2
+        dsd-neo_test_support
+        ${LIBS}
+)
+add_test(NAME CORE_MBE_CRYPTO_SCOPE COMMAND dsd-neo_test_core_mbe_crypto_scope)
 
 add_executable(
     dsd-neo_test_core_straight_keystream_validation
@@ -4911,6 +5883,39 @@ else()
 endif()
 add_test(NAME CORE_MBE_FILE_IO COMMAND dsd-neo_test_core_mbe_file_io)
 
+# Issue #661: capture and per-call WAV names never land on a taken one. GNU ld --wrap pins the nonce and the decode time
+# so the colliding names are known in advance, as the other wrap tests do.
+if(NOT APPLE AND NOT WIN32 AND (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang"))
+    add_executable(
+        dsd-neo_test_core_mbe_out_collision
+        core/test_core_mbe_out_collision.c
+    )
+    target_include_directories(
+        dsd-neo_test_core_mbe_out_collision
+        PRIVATE
+            ${PROJECT_SOURCE_DIR}/include
+            ${PROJECT_SOURCE_DIR}/tests/test_support
+    )
+    target_link_libraries(
+        dsd-neo_test_core_mbe_out_collision
+        PRIVATE
+            "-Wl,--start-group"
+            ${_DSD_RUNTIME_CLI_PARSE_LIBS}
+            "-Wl,--end-group"
+            ${LIBS}
+            dsd-neo_fec
+            dsd-neo_test_support
+    )
+    target_link_options(
+        dsd-neo_test_core_mbe_out_collision
+        PRIVATE -Wl,--wrap=dsd_nonce_u16 -Wl,--wrap=dsd_decode_time
+    )
+    add_test(
+        NAME CORE_MBE_OUT_COLLISION
+        COMMAND dsd-neo_test_core_mbe_out_collision
+    )
+endif()
+
 add_executable(dsd-neo_test_bit_packing_bounds core/test_bit_packing_bounds.c)
 target_include_directories(
     dsd-neo_test_bit_packing_bounds
@@ -5017,13 +6022,19 @@ if(NOT APPLE AND (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang"))
             "-Wl,--wrap=rtl_stream_prepare_retune_profile_for_target_with_gain"
             "-Wl,--wrap=rtl_stream_prepare_retune_analog_profile_for_target"
             "-Wl,--wrap=rtl_stream_analog_family_active"
+            "-Wl,--wrap=rtl_stream_family_landing_after_pending"
             "-Wl,--wrap=rtl_stream_get_analog_profile"
             "-Wl,--wrap=rtl_stream_get_request_rate_hz"
             "-Wl,--wrap=rtl_stream_request_demod_profile"
             "-Wl,--wrap=SetFreq"
+            "-Wl,--wrap=SetModulation"
+            "-Wl,--wrap=SetModulationKind"
+            "-Wl,--wrap=SetScanRowModulation"
+            "-Wl,--wrap=RigctlMarkSessionPassband"
             "-Wl,--wrap=rtl_stream_request_fsk_reacquire"
             "-Wl,--wrap=rtl_stream_tune"
             "-Wl,--wrap=rtl_stream_tune_tagged"
+            "-Wl,--wrap=p25_sm_tick_guard_try_enter"
             ${LIBS}
             dsd-neo_feature_radio
             dsd-neo_test_support
@@ -5111,7 +6122,7 @@ target_include_directories(
 if(NOT APPLE AND (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang"))
     target_compile_definitions(
         dsd-neo_test_engine_run_setup
-        PRIVATE DSD_NEO_TEST_RTL_START_WRAP=1
+        PRIVATE DSD_NEO_TEST_RTL_START_WRAP=1 DSD_NEO_TEST_RIGCTL_WRAP=1
     )
     target_link_libraries(
         dsd-neo_test_engine_run_setup
@@ -5122,6 +6133,11 @@ if(NOT APPLE AND (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang"))
             "-Wl,--wrap=rtl_stream_create"
             "-Wl,--wrap=rtl_stream_start"
             "-Wl,--wrap=rtl_stream_destroy"
+            "-Wl,--wrap=Connect"
+            "-Wl,--wrap=RigctlRebindPeer"
+            "-Wl,--wrap=SetScanRowModulation"
+            "-Wl,--wrap=RigctlMarkSessionPassband"
+            "-Wl,--wrap=p25_sm_watchdog_start"
             ${LIBS}
             dsd-neo_test_support
     )
@@ -5168,7 +6184,121 @@ if(DSD_HAS_RTLSDR AND NOT APPLE AND (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang"))
     )
 endif()
 
+# An I/Q replay whose capture read fails, through the engine (issue #572): the replay
+# ends by itself with exit code 1. The capture read is wrapped, so the radio archive
+# links as it ships.
+if(DSD_HAS_RADIO AND NOT APPLE AND (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang"))
+    add_executable(
+        dsd-neo_test_engine_replay_read_error
+        engine/test_engine_replay_read_error.c
+    )
+    target_include_directories(
+        dsd-neo_test_engine_replay_read_error
+        PRIVATE ${PROJECT_SOURCE_DIR}/include
+    )
+    target_link_libraries(
+        dsd-neo_test_engine_replay_read_error
+        PRIVATE
+            "-Wl,--start-group"
+            dsd-neo_engine
+            dsd-neo_io_radio
+            dsd-neo_io_iq
+            "-Wl,--end-group"
+            "-Wl,--wrap=dsd_iq_replay_read"
+            ${LIBS}
+            dsd-neo_test_support
+    )
+    add_test(
+        NAME ENGINE_REPLAY_READ_ERROR
+        COMMAND dsd-neo_test_engine_replay_read_error
+    )
+    # The same replay, with its data file cut short under it instead: the real
+    # read reports that as the read error, and the run exits 1.
+    add_test(
+        NAME ENGINE_REPLAY_TRUNCATED_CAPTURE
+        COMMAND dsd-neo_test_engine_replay_read_error truncate
+    )
+    set_tests_properties(
+        ENGINE_REPLAY_READ_ERROR
+        ENGINE_REPLAY_TRUNCATED_CAPTURE
+        PROPERTIES TIMEOUT 60
+    )
+endif()
+
+# Issue #572: a replay run through the engine decodes on its capture's clock, from the
+# committed fixtures' sidecars, in the CLI's initialization order.
+if(DSD_HAS_RADIO)
+    add_executable(
+        dsd-neo_test_engine_replay_decode_clock
+        engine/test_engine_replay_decode_clock.c
+    )
+    target_include_directories(
+        dsd-neo_test_engine_replay_decode_clock
+        PRIVATE ${PROJECT_SOURCE_DIR}/include
+    )
+    target_compile_definitions(
+        dsd-neo_test_engine_replay_decode_clock
+        PRIVATE
+            "DSD_NEO_TEST_IQ_FIXTURE_DIR=\"${PROJECT_SOURCE_DIR}/tests/fixtures/iq\""
+    )
+    if(NOT APPLE AND (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang"))
+        target_link_libraries(
+            dsd-neo_test_engine_replay_decode_clock
+            PRIVATE
+                "-Wl,--start-group"
+                dsd-neo_engine
+                dsd-neo_io_radio
+                dsd-neo_io_iq
+                "-Wl,--end-group"
+                ${LIBS}
+                dsd-neo_test_support
+        )
+    else()
+        target_link_libraries(
+            dsd-neo_test_engine_replay_decode_clock
+            PRIVATE dsd-neo_engine ${LIBS} dsd-neo_test_support
+        )
+    endif()
+    add_test(
+        NAME ENGINE_REPLAY_DECODE_CLOCK
+        COMMAND dsd-neo_test_engine_replay_decode_clock
+    )
+    set_tests_properties(ENGINE_REPLAY_DECODE_CLOCK PROPERTIES TIMEOUT 60)
+endif()
+
 if(NOT APPLE AND (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang"))
+    # The engine loop's side of an input switch: an interrupted hunt, a replaced stream, a fallback (issue #634).
+    add_executable(
+        dsd-neo_test_engine_input_boundary
+        engine/test_engine_input_boundary.c
+    )
+    target_include_directories(
+        dsd-neo_test_engine_input_boundary
+        PRIVATE ${PROJECT_SOURCE_DIR}/include
+    )
+    target_link_libraries(
+        dsd-neo_test_engine_input_boundary
+        PRIVATE
+            "-Wl,--wrap=getFrameSync"
+            "-Wl,--wrap=dsd_audio_switch_input"
+            "-Wl,--wrap=dsd_audio_reconfigure_output_for_input_policy"
+            "-Wl,--wrap=SetScanRowModulation"
+            "-Wl,--wrap=RigctlMarkSessionPassband"
+            "-Wl,--wrap=p25_sm_get_ctx"
+            "-Wl,--wrap=dmr_sm_get_ctx"
+            "-Wl,--wrap=p25_sm_abandon_carrier"
+            "-Wl,--wrap=dmr_sm_abandon_carrier"
+            "-Wl,--wrap=dsd_engine_release_tuned_call_state"
+            "-Wl,--start-group"
+            dsd-neo_engine
+            "-Wl,--end-group"
+            ${LIBS}
+            dsd-neo_test_support
+    )
+    add_test(
+        NAME ENGINE_INPUT_BOUNDARY
+        COMMAND dsd-neo_test_engine_input_boundary
+    )
     add_executable(
         dsd-neo_test_engine_synced_trunk_scan_tick
         engine/test_engine_synced_trunk_scan_tick.c
@@ -5191,50 +6321,64 @@ if(NOT APPLE AND (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang"))
         NAME ENGINE_SYNCED_TRUNK_SCAN_TICK
         COMMAND dsd-neo_test_engine_synced_trunk_scan_tick
     )
-    # The time() wrapper below requires a Unix time symbol.
-    if(NOT WIN32)
-        add_executable(
-            dsd-neo_test_engine_scan_timing
-            engine/test_engine_scan_timing.c
-            ${PROJECT_SOURCE_DIR}/src/app_control/scan_timing_view.c
-        )
-        target_include_directories(
-            dsd-neo_test_engine_scan_timing
-            PRIVATE ${PROJECT_SOURCE_DIR}/include
-        )
-        target_link_libraries(
-            dsd-neo_test_engine_scan_timing
-            PRIVATE
-                "-Wl,--wrap=getFrameSync"
-                "-Wl,--wrap=dsd_engine_scan_tune_to_freq"
-                "-Wl,--wrap=SetFreq"
-                "-Wl,--wrap=time"
-                "-Wl,--start-group"
-                dsd-neo_engine
-                "-Wl,--end-group"
-                ${LIBS}
-                dsd-neo_test_support
-        )
-        add_test(
-            NAME ENGINE_SCAN_TIMING
-            COMMAND dsd-neo_test_engine_scan_timing
-        )
-    endif()
+    add_executable(
+        dsd-neo_test_engine_scan_timing
+        engine/test_engine_scan_timing.c
+        ${PROJECT_SOURCE_DIR}/src/app_control/scan_timing_view.c
+    )
+    target_include_directories(
+        dsd-neo_test_engine_scan_timing
+        PRIVATE ${PROJECT_SOURCE_DIR}/include
+    )
+    target_link_libraries(
+        dsd-neo_test_engine_scan_timing
+        PRIVATE
+            "-Wl,--wrap=getFrameSync"
+            "-Wl,--wrap=dsd_engine_scan_tune_to_freq"
+            "-Wl,--wrap=SetFreq"
+            "-Wl,--start-group"
+            dsd-neo_engine
+            "-Wl,--end-group"
+            ${LIBS}
+            dsd-neo_test_support
+    )
+    add_test(NAME ENGINE_SCAN_TIMING COMMAND dsd-neo_test_engine_scan_timing)
 endif()
+
+# The engine commits and publishes the last call before the frontends' stop hooks.
+add_executable(
+    dsd-neo_test_engine_lifecycle_finalize
+    engine/test_engine_lifecycle_finalize.c
+)
+target_include_directories(
+    dsd-neo_test_engine_lifecycle_finalize
+    PRIVATE ${PROJECT_SOURCE_DIR}/include
+)
+target_link_libraries(
+    dsd-neo_test_engine_lifecycle_finalize
+    PRIVATE dsd-neo_engine ${LIBS} dsd-neo_test_support
+)
+add_test(
+    NAME ENGINE_LIFECYCLE_FINALIZE
+    COMMAND dsd-neo_test_engine_lifecycle_finalize
+)
 
 add_executable(
     dsd-neo_test_engine_trunk_retune_regression
     engine/test_engine_trunk_retune_regression.c
     ${PROJECT_SOURCE_DIR}/src/engine/trunk_tuning.c
+    ${PROJECT_SOURCE_DIR}/src/core/util/channel_modes_rigctl.c
     ${PROJECT_SOURCE_DIR}/src/runtime/decode_mode.c
+    ${PROJECT_SOURCE_DIR}/src/runtime/decode_clock.c
+    ${PROJECT_SOURCE_DIR}/src/runtime/rigctl_passband.c
 )
 target_include_directories(
     dsd-neo_test_engine_trunk_retune_regression
-    PRIVATE ${PROJECT_SOURCE_DIR}/include
+    PRIVATE ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src/engine
 )
 target_link_libraries(
     dsd-neo_test_engine_trunk_retune_regression
-    PRIVATE dsd-neo_feature_radio
+    PRIVATE dsd-neo_feature_radio dsd-neo_platform
 )
 target_sources(
     dsd-neo_test_engine_trunk_retune_regression
@@ -5254,9 +6398,17 @@ add_executable(
     ${PROJECT_SOURCE_DIR}/src/core/util/key_set.c
     ${PROJECT_SOURCE_DIR}/src/core/util/enc_lockout.c
 )
+target_include_directories(
+    dsd-neo_test_engine_channel_scan
+    PRIVATE ${PROJECT_SOURCE_DIR}/src/engine
+)
 target_link_libraries(
     dsd-neo_test_engine_channel_scan
-    PRIVATE dsd-neo_runtime dsd-neo_test_call_state_support dsd-neo_test_support
+    PRIVATE
+        dsd-neo_runtime
+        dsd-neo_test_call_state_support
+        dsd-neo_test_event_sync_stub
+        dsd-neo_test_support
 )
 target_compile_definitions(
     dsd-neo_test_engine_channel_scan
@@ -5314,10 +6466,14 @@ add_executable(
     ${PROJECT_SOURCE_DIR}/src/core/file/p25_bandplan_csv.c
     ${PROJECT_SOURCE_DIR}/src/core/util/key_set.c
     ${PROJECT_SOURCE_DIR}/src/protocol/nxdn/nxdn_trunk_diag.c
+    ${PROJECT_SOURCE_DIR}/src/dsp/analog_tone_policy.c
 )
 target_include_directories(
     dsd-neo_test_engine_trunk_scan
-    PRIVATE ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src/engine
+    PRIVATE
+        ${PROJECT_SOURCE_DIR}/include
+        ${PROJECT_SOURCE_DIR}/src/engine
+        ${PROJECT_SOURCE_DIR}/src/dsp
 )
 target_compile_definitions(
     dsd-neo_test_engine_trunk_scan
@@ -5325,7 +6481,11 @@ target_compile_definitions(
 )
 target_link_libraries(
     dsd-neo_test_engine_trunk_scan
-    PRIVATE dsd-neo_runtime dsd-neo_test_call_state_support dsd-neo_test_support
+    PRIVATE
+        dsd-neo_runtime
+        dsd-neo_test_call_state_support
+        dsd-neo_test_event_sync_stub
+        dsd-neo_test_support
 )
 add_test(NAME ENGINE_TRUNK_SCAN COMMAND dsd-neo_test_engine_trunk_scan)
 
@@ -5493,6 +6653,36 @@ add_executable(
 target_link_libraries(dsd-neo_test_runtime_scan_options PRIVATE dsd-neo_runtime)
 add_test(NAME RUNTIME_SCAN_OPTIONS COMMAND dsd-neo_test_runtime_scan_options)
 
+add_executable(
+    dsd-neo_test_runtime_scan_row_edit
+    runtime/test_runtime_scan_row_edit.c
+)
+target_link_libraries(
+    dsd-neo_test_runtime_scan_row_edit
+    PRIVATE dsd-neo_runtime
+)
+add_test(NAME RUNTIME_SCAN_ROW_EDIT COMMAND dsd-neo_test_runtime_scan_row_edit)
+
+# Issue #518 follow-up: the squelch setting's grammar, text and resolution.
+add_executable(dsd-neo_test_runtime_squelch runtime/test_runtime_squelch.c)
+target_link_libraries(dsd-neo_test_runtime_squelch PRIVATE dsd-neo_runtime)
+add_test(NAME RUNTIME_SQUELCH COMMAND dsd-neo_test_runtime_squelch)
+
+# Issue #621: the passband a rigctl peer that demodulates audio input is asked
+# for, and the opts predicates that say whether one is there.
+add_executable(
+    dsd-neo_test_runtime_rigctl_passband
+    runtime/test_runtime_rigctl_passband.c
+)
+target_link_libraries(
+    dsd-neo_test_runtime_rigctl_passband
+    PRIVATE dsd-neo_runtime
+)
+add_test(
+    NAME RUNTIME_RIGCTL_PASSBAND
+    COMMAND dsd-neo_test_runtime_rigctl_passband
+)
+
 add_executable(dsd-neo_test_scan_mode_replay engine/scan_mode_replay.c)
 target_link_libraries(
     dsd-neo_test_scan_mode_replay
@@ -5528,6 +6718,20 @@ add_test(
 )
 
 add_executable(
+    dsd-neo_test_runtime_input_failure
+    runtime/test_runtime_input_failure.c
+)
+target_include_directories(
+    dsd-neo_test_runtime_input_failure
+    PRIVATE ${PROJECT_SOURCE_DIR}/include
+)
+target_link_libraries(
+    dsd-neo_test_runtime_input_failure
+    PRIVATE dsd-neo_runtime
+)
+add_test(NAME RUNTIME_INPUT_FAILURE COMMAND dsd-neo_test_runtime_input_failure)
+
+add_executable(
     dsd-neo_test_runtime_config_env
     runtime/test_runtime_config_env.cpp
 )
@@ -5539,6 +6743,16 @@ target_link_libraries(
     dsd-neo_test_runtime_config_env
     PRIVATE dsd-neo_runtime dsd-neo_test_support
 )
+# Keep the NaN assertions effective in fast-math builds too: config.cpp already
+# keeps IEEE semantics, and the test's own std::isnan() checks need them as well.
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(
+        dsd-neo_test_runtime_config_env
+        PRIVATE -fno-fast-math
+    )
+elseif(MSVC)
+    target_compile_options(dsd-neo_test_runtime_config_env PRIVATE /fp:precise)
+endif()
 add_test(NAME RUNTIME_CONFIG_ENV COMMAND dsd-neo_test_runtime_config_env)
 
 add_executable(
@@ -5605,6 +6819,7 @@ if(NOT APPLE AND (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang"))
             "-Wl,--wrap=rtl_stream_stop"
             "-Wl,--wrap=rtl_stream_destroy"
             "-Wl,--wrap=rtl_stream_set_channel_squelch"
+            "-Wl,--wrap=rtl_stream_set_channel_squelch_setting"
             "-Wl,--wrap=rtl_stream_output_rate"
     )
 else()
@@ -5695,11 +6910,18 @@ if(NOT APPLE AND NOT WIN32 AND (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang"))
         PRIVATE
             "LINKER:--wrap=dsd_trunk_tuning_hook_tune_to_cc"
             "LINKER:--wrap=io_control_set_freq"
+            "LINKER:--wrap=dmr_data_burst_handler"
+            "LINKER:--wrap=dsd_audio_write"
+            "LINKER:--wrap=dsd_audio_output_health_get"
             "LINKER:--wrap=dsd_tg_policy_call_skip_arm"
             "LINKER:--wrap=dsd_audio_ensure_analog_output"
             "LINKER:--wrap=dsd_audio_ensure_digital_output"
             "LINKER:--wrap=svc_tcp_connect_audio"
+            "LINKER:--wrap=svc_rigctl_connect"
             "LINKER:--wrap=openAudioInput"
+            "LINKER:--wrap=dsd_audio_reconfigure_output_for_input_policy"
+            "LINKER:--wrap=SetScanRowModulation"
+            "LINKER:--wrap=SetModulationKind"
     )
 endif()
 if(
@@ -5715,22 +6937,34 @@ if(
     target_link_options(
         dsd-neo_test_app_command_queue
         PRIVATE
+            "LINKER:--wrap=dsd_symbol_note_timing_rate"
             "LINKER:--wrap=rtl_stream_create"
+            "LINKER:--wrap=rtl_stream_start"
+            "LINKER:--wrap=rtl_stream_start_analog_refusal"
+            "LINKER:--wrap=rtl_stream_start_opened_capture"
             "LINKER:--wrap=rtl_stream_stop"
             "LINKER:--wrap=rtl_stream_destroy"
             "LINKER:--wrap=rtl_stream_set_channel_squelch"
+            "LINKER:--wrap=rtl_stream_set_channel_squelch_setting"
             "LINKER:--wrap=rtl_stream_check_analog_profile"
             "LINKER:--wrap=rtl_stream_request_analog_profile"
             "LINKER:--wrap=rtl_stream_request_demod_profile"
             "LINKER:--wrap=rtl_stream_analog_family_active"
+            "LINKER:--wrap=rtl_stream_family_landing_after_pending"
+            "LINKER:--wrap=rtl_stream_request_digital_family_landing"
             "LINKER:--wrap=rtl_stream_output_rate_for_family"
             "LINKER:--wrap=rtl_stream_set_digital_decode_modes"
             "LINKER:--wrap=rtl_stream_receive_request_seq"
             "LINKER:--wrap=rtl_stream_receive_request_outcome"
             "LINKER:--wrap=rtl_stream_receive_request_refusal"
+            "LINKER:--wrap=rtl_stream_get_analog_profile"
+            "LINKER:--wrap=rtl_stream_get_analog_setting"
             "LINKER:--wrap=rtl_stream_requested_cqpsk"
             "LINKER:--wrap=rtl_stream_get_demod_rate_hz"
+            "LINKER:--wrap=rtl_stream_get_request_rate_hz"
             "LINKER:--wrap=rtl_stream_output_rate"
+            "LINKER:--wrap=p25_sm_tick_guard_enter"
+            "LINKER:--wrap=p25_sm_tick_guard_leave"
     )
 endif()
 add_test(NAME APP_COMMAND_QUEUE COMMAND dsd-neo_test_app_command_queue)
@@ -5972,6 +7206,36 @@ set_tests_properties(
         PASS_REGULAR_EXPRESSION [=[digital_resample = "off"]=]
 )
 
+# Issue #518 follow-up: --print-config comes before the engine reads an RTL-SDR or
+# rtl_tcp spec, so it exported the option defaults (rtl_gain = 0, which a load now
+# applies as AGC) instead of the spec's tuning. It reads the spec first now.
+add_test(
+    NAME RUNTIME_BOOTSTRAP_PRINT_CONFIG_RTL_SPEC
+    COMMAND
+        $<TARGET_FILE:dsd-neo> --no-config -i rtl:0:155.34M:30:5:24:-40:3
+        --print-config
+)
+set_tests_properties(
+    RUNTIME_BOOTSTRAP_PRINT_CONFIG_RTL_SPEC
+    PROPERTIES
+        WORKING_DIRECTORY "${_DSD_BOOTSTRAP_FIXTURE_DIR}"
+        PASS_REGULAR_EXPRESSION
+            [=[rtl_freq = "155340000"[^[]*rtl_gain = 30[^[]*rtl_ppm = 5[^[]*rtl_bw_khz = 24[^[]*rtl_sql = -40[^[]*rtl_volume = 3]=]
+)
+add_test(
+    NAME RUNTIME_BOOTSTRAP_PRINT_CONFIG_RTLTCP_SPEC
+    COMMAND
+        $<TARGET_FILE:dsd-neo> --no-config -i
+        rtltcp:radio.local:1235:851.0125M:12:-2:16:-50:1 --print-config
+)
+set_tests_properties(
+    RUNTIME_BOOTSTRAP_PRINT_CONFIG_RTLTCP_SPEC
+    PROPERTIES
+        WORKING_DIRECTORY "${_DSD_BOOTSTRAP_FIXTURE_DIR}"
+        PASS_REGULAR_EXPRESSION
+            [=[rtltcp_port = 1235[^[]*rtl_freq = "851012500"[^[]*rtl_gain = 12[^[]*rtl_ppm = -2[^[]*rtl_bw_khz = 16[^[]*rtl_sql = -50[^[]*rtl_volume = 1]=]
+)
+
 add_test(
     NAME RUNTIME_BOOTSTRAP_LIST_PROFILES
     COMMAND $<TARGET_FILE:dsd-neo> --config "profiles.ini" --list-profiles
@@ -6043,6 +7307,52 @@ if(DSD_HAS_RADIO)
     )
 endif()
 
+# Issue #524: an AM width (the 6 kHz default included) the input's DSP bandwidth
+# cannot filter is refused before the device opens, with the validator's
+# actionable text, and startup fails. rtl_tcp and RTL-SDR specs carry their DSP
+# bandwidth, so no device or server is needed. RunCliSmoke.cmake checks the
+# non-zero exit code together with the text (and that the stream was never
+# opened), which PASS_REGULAR_EXPRESSION alone cannot.
+if(DSD_HAS_RADIO)
+    add_test(
+        NAME RUNTIME_ANALOG_AM_WIDTH_RATE_REFUSED
+        COMMAND
+            ${CMAKE_COMMAND} -D DSD_NEO_CLI=$<TARGET_FILE:dsd-neo> -D
+            DSD_NEO_CLI_SMOKE_MODE=am-width-rate-refused -P
+            ${CMAKE_CURRENT_SOURCE_DIR}/cmake/RunCliSmoke.cmake
+    )
+    add_test(
+        NAME RUNTIME_ANALOG_AM_WIDTH_RATE_REFUSED_RTL
+        COMMAND
+            ${CMAKE_COMMAND} -D DSD_NEO_CLI=$<TARGET_FILE:dsd-neo> -D
+            DSD_NEO_CLI_SMOKE_MODE=am-width-rate-refused-rtl -P
+            ${CMAKE_CURRENT_SOURCE_DIR}/cmake/RunCliSmoke.cmake
+    )
+    add_test(
+        NAME RUNTIME_ANALOG_AM_DEFAULT_RATE_REFUSED
+        COMMAND
+            ${CMAKE_COMMAND} -D DSD_NEO_CLI=$<TARGET_FILE:dsd-neo> -D
+            DSD_NEO_CLI_SMOKE_MODE=am-default-rate-refused -P
+            ${CMAKE_CURRENT_SOURCE_DIR}/cmake/RunCliSmoke.cmake
+    )
+    # The negative control: a width the 16 kHz DSP rate filters gets as far as
+    # opening the stream (which fails: nothing listens on port 1).
+    add_test(
+        NAME RUNTIME_ANALOG_AM_WIDTH_FITS_LOW_RATE
+        COMMAND
+            ${CMAKE_COMMAND} -D DSD_NEO_CLI=$<TARGET_FILE:dsd-neo> -D
+            DSD_NEO_CLI_SMOKE_MODE=am-width-fits-low-rate -P
+            ${CMAKE_CURRENT_SOURCE_DIR}/cmake/RunCliSmoke.cmake
+    )
+    set_tests_properties(
+        RUNTIME_ANALOG_AM_WIDTH_RATE_REFUSED
+        RUNTIME_ANALOG_AM_WIDTH_RATE_REFUSED_RTL
+        RUNTIME_ANALOG_AM_DEFAULT_RATE_REFUSED
+        RUNTIME_ANALOG_AM_WIDTH_FITS_LOW_RATE
+        PROPERTIES ENVIRONMENT "DSD_NEO_NO_BOOTSTRAP=1" TIMEOUT 30
+    )
+endif()
+
 # P25 helper tests
 add_executable(dsd-neo_test_p25_12_list protocol/p25/test_p25_12_list.c)
 target_include_directories(
@@ -6091,6 +7401,20 @@ target_include_directories(
 )
 target_link_libraries(dsd-neo_test_p25_p2_lfsr PRIVATE dsd-neo_proto_p25)
 add_test(NAME P25_P2_LFSR COMMAND dsd-neo_test_p25_p2_lfsr)
+
+# P25 Phase 2 ESS across a carrier boundary, through the real RS(63,35) decoder (issue #575)
+add_executable(
+    dsd-neo_test_p25_p2_ess_carrier
+    protocol/p25/test_p25_p2_ess_carrier.c
+)
+target_include_directories(
+    dsd-neo_test_p25_p2_ess_carrier
+    PRIVATE
+        ${PROJECT_SOURCE_DIR}/include
+        ${PROJECT_SOURCE_DIR}/src/protocol/p25/phase2
+)
+target_link_libraries(dsd-neo_test_p25_p2_ess_carrier PRIVATE dsd-neo_proto_p25)
+add_test(NAME P25_P2_ESS_CARRIER COMMAND dsd-neo_test_p25_p2_ess_carrier)
 
 add_executable(dsd-neo_test_p25_mac_lengths protocol/p25/test_p25_mac_lengths.c)
 target_include_directories(
@@ -6184,14 +7508,6 @@ target_link_libraries(
     dsd-neo_test_p25_p1_tsbk_handlers
     PRIVATE dsd-neo_test_call_state_support dsd-neo_test_support dsd-neo_runtime
 )
-target_compile_options(
-    dsd-neo_test_p25_p1_tsbk_handlers
-    PRIVATE $<$<NOT:$<C_COMPILER_ID:MSVC>>:-ffunction-sections;-fdata-sections>
-)
-target_link_options(
-    dsd-neo_test_p25_p1_tsbk_handlers
-    PRIVATE $<$<NOT:$<C_COMPILER_ID:MSVC>>:-Wl,--gc-sections>
-)
 add_test(NAME P25_P1_TSBK_HANDLERS COMMAND dsd-neo_test_p25_p1_tsbk_handlers)
 
 # P25 P1 FEC boundaries: Hamming, Golay, RS correction limits
@@ -6219,11 +7535,6 @@ target_include_directories(
     dsd-neo_test_p25_p1_hdu_helpers
     PRIVATE ${PROJECT_SOURCE_DIR}/include
 )
-target_compile_options(
-    dsd-neo_test_p25_p1_hdu_helpers
-    PRIVATE $<$<NOT:$<C_COMPILER_ID:MSVC>>:-ffunction-sections;-fdata-sections>
-)
-target_link_options(dsd-neo_test_p25_p1_hdu_helpers PRIVATE $<$<NOT:$<C_COMPILER_ID:MSVC>>:-Wl,--gc-sections>)
 add_test(NAME P25_P1_HDU_HELPERS COMMAND dsd-neo_test_p25_p1_hdu_helpers)
 
 # P25 P1 common LDU IMBE/status and Hamming helpers
@@ -6235,11 +7546,6 @@ target_include_directories(
     dsd-neo_test_p25_p1_ldu_helpers
     PRIVATE ${PROJECT_SOURCE_DIR}/include
 )
-target_compile_options(
-    dsd-neo_test_p25_p1_ldu_helpers
-    PRIVATE $<$<NOT:$<C_COMPILER_ID:MSVC>>:-ffunction-sections;-fdata-sections>
-)
-target_link_options(dsd-neo_test_p25_p1_ldu_helpers PRIVATE $<$<NOT:$<C_COMPILER_ID:MSVC>>:-Wl,--gc-sections>)
 add_test(NAME P25_P1_LDU_HELPERS COMMAND dsd-neo_test_p25_p1_ldu_helpers)
 
 # P25 P1 LDU1 LCW/LSD packing and soft RS reliability helpers
@@ -6252,11 +7558,6 @@ target_include_directories(
     dsd-neo_test_p25_p1_ldu1_helpers
     PRIVATE ${PROJECT_SOURCE_DIR}/include
 )
-target_compile_options(
-    dsd-neo_test_p25_p1_ldu1_helpers
-    PRIVATE $<$<NOT:$<C_COMPILER_ID:MSVC>>:-ffunction-sections;-fdata-sections>
-)
-target_link_options(dsd-neo_test_p25_p1_ldu1_helpers PRIVATE $<$<NOT:$<C_COMPILER_ID:MSVC>>:-Wl,--gc-sections>)
 add_test(NAME P25_P1_LDU1_HELPERS COMMAND dsd-neo_test_p25_p1_ldu1_helpers)
 
 # P25 P1 LDU2 ESS/LSD packing and soft RS reliability helpers
@@ -6269,11 +7570,6 @@ target_include_directories(
     dsd-neo_test_p25_p1_ldu2_helpers
     PRIVATE ${PROJECT_SOURCE_DIR}/include
 )
-target_compile_options(
-    dsd-neo_test_p25_p1_ldu2_helpers
-    PRIVATE $<$<NOT:$<C_COMPILER_ID:MSVC>>:-ffunction-sections;-fdata-sections>
-)
-target_link_options(dsd-neo_test_p25_p1_ldu2_helpers PRIVATE $<$<NOT:$<C_COMPILER_ID:MSVC>>:-Wl,--gc-sections>)
 add_test(NAME P25_P1_LDU2_HELPERS COMMAND dsd-neo_test_p25_p1_ldu2_helpers)
 
 # P25 P1 MDPU header, candidate, and CRC assembly helpers
@@ -6285,11 +7581,6 @@ target_include_directories(
     dsd-neo_test_p25_p1_mdpu_helpers
     PRIVATE ${PROJECT_SOURCE_DIR}/include
 )
-target_compile_options(
-    dsd-neo_test_p25_p1_mdpu_helpers
-    PRIVATE $<$<NOT:$<C_COMPILER_ID:MSVC>>:-ffunction-sections;-fdata-sections>
-)
-target_link_options(dsd-neo_test_p25_p1_mdpu_helpers PRIVATE $<$<NOT:$<C_COMPILER_ID:MSVC>>:-Wl,--gc-sections>)
 target_link_libraries(
     dsd-neo_test_p25_p1_mdpu_helpers
     PRIVATE dsd-neo_proto_p25 dsd-neo_proto_dmr dsd-neo_test_call_state_support
@@ -6428,7 +7719,7 @@ target_include_directories(
 )
 target_link_libraries(
     dsd-neo_test_p25_lcw_src_zero_guard
-    PRIVATE dsd-neo_proto_p25
+    PRIVATE dsd-neo_proto_p25 dsd-neo_test_support
 )
 add_test(
     NAME P25_LCW_SRC_ZERO_GUARD
@@ -6583,6 +7874,9 @@ target_include_directories(
     SYSTEM
     PRIVATE ${_MBE_TARGET_INCLUDE_DIRS}
 )
+# The test stubs mbe_initMbeParms() instead of linking mbe-neo; see
+# CORE_AUDIO2_HELPERS for why that needs MBE_STATIC.
+target_compile_definitions(dsd-neo_test_p25_p1_sync_dispatch PRIVATE MBE_STATIC)
 add_test(NAME P25_P1_SYNC_DISPATCH COMMAND dsd-neo_test_p25_p1_sync_dispatch)
 
 # P25 P1 TSBK -> vPDU bridge (Group Voice Channel Grant)
@@ -7365,11 +8659,16 @@ if(NOT APPLE AND (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang"))
             dsd-neo_proto_dmr
             dsd-neo_core
             "-Wl,--end-group"
+            dsd-neo_test_support
     )
 else()
     target_link_libraries(
         dsd-neo_test_p25_sm_unified_core
-        PRIVATE dsd-neo_proto_p25 dsd-neo_proto_dmr dsd-neo_core
+        PRIVATE
+            dsd-neo_proto_p25
+            dsd-neo_proto_dmr
+            dsd-neo_core
+            dsd-neo_test_support
     )
 endif()
 add_test(NAME P25_SM_UNIFIED_CORE COMMAND dsd-neo_test_p25_sm_unified_core)
@@ -7457,6 +8756,21 @@ target_link_libraries(
     dsd-neo_test_m17_state_dispatch
     PRIVATE dsd-neo_proto_m17 dsd-neo_test_support
 )
+# Issue #625: the stream encoder's end of stream drains a local output around its dead air; the
+# wraps record the order of writes and drains where the linker can wrap them.
+if(NOT APPLE AND (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang"))
+    target_compile_definitions(
+        dsd-neo_test_m17_state_dispatch
+        PRIVATE DSD_NEO_TEST_AUDIO_WRAP
+    )
+    target_link_options(
+        dsd-neo_test_m17_state_dispatch
+        PRIVATE
+            "-Wl,--wrap=dsd_audio_write"
+            "-Wl,--wrap=dsd_audio_drain"
+            "-Wl,--wrap=dsd_audio_output_health_get"
+    )
+endif()
 add_test(NAME M17_STATE_DISPATCH COMMAND dsd-neo_test_m17_state_dispatch)
 
 add_executable(
@@ -7486,7 +8800,11 @@ target_include_directories(
 )
 target_link_libraries(
     dsd-neo_test_dmr_t3_sm_clamp
-    PRIVATE dsd-neo_test_call_state_support dsd-neo_platform dsd-neo_runtime
+    PRIVATE
+        dsd-neo_test_call_state_support
+        dsd-neo_test_event_sync_stub
+        dsd-neo_platform
+        dsd-neo_runtime
 )
 add_test(NAME DMR_T3_SM_CLAMP COMMAND dsd-neo_test_dmr_t3_sm_clamp)
 
@@ -7506,7 +8824,11 @@ target_include_directories(
 )
 target_link_libraries(
     dsd-neo_test_dmr_t3_sm_release
-    PRIVATE dsd-neo_test_call_state_support dsd-neo_platform dsd-neo_runtime
+    PRIVATE
+        dsd-neo_test_call_state_support
+        dsd-neo_test_event_sync_stub
+        dsd-neo_platform
+        dsd-neo_runtime
 )
 add_test(NAME DMR_T3_SM_RELEASE COMMAND dsd-neo_test_dmr_t3_sm_release)
 
@@ -7526,7 +8848,11 @@ target_include_directories(
 )
 target_link_libraries(
     dsd-neo_test_dmr_t3_sm_return_to_cc_matrix
-    PRIVATE dsd-neo_test_call_state_support dsd-neo_platform dsd-neo_runtime
+    PRIVATE
+        dsd-neo_test_call_state_support
+        dsd-neo_test_event_sync_stub
+        dsd-neo_platform
+        dsd-neo_runtime
 )
 add_test(
     NAME DMR_T3_SM_RETURN_TO_CC_MATRIX
@@ -7550,7 +8876,11 @@ target_include_directories(
 )
 target_link_libraries(
     dsd-neo_test_dmr_t3_shim
-    PRIVATE dsd-neo_test_call_state_support dsd-neo_platform dsd-neo_runtime
+    PRIVATE
+        dsd-neo_test_call_state_support
+        dsd-neo_test_event_sync_stub
+        dsd-neo_platform
+        dsd-neo_runtime
 )
 add_test(NAME DMR_T3_SHIM COMMAND dsd-neo_test_dmr_t3_shim)
 
@@ -7579,6 +8909,7 @@ target_link_libraries(
     dsd-neo_test_dmr_t3_cmove
     PRIVATE
         dsd-neo_test_call_state_support
+        dsd-neo_test_event_sync_stub
         dsd-neo_platform
         dsd-neo_runtime
         ${DSD_NEO_TEST_MATH_LIB}
@@ -7610,6 +8941,7 @@ target_link_libraries(
     dsd-neo_test_dmr_t3_force_release
     PRIVATE
         dsd-neo_test_call_state_support
+        dsd-neo_test_event_sync_stub
         dsd-neo_platform
         dsd-neo_runtime
         ${DSD_NEO_TEST_MATH_LIB}
@@ -7641,6 +8973,7 @@ target_link_libraries(
     dsd-neo_test_dmr_t3_move_release
     PRIVATE
         dsd-neo_test_call_state_support
+        dsd-neo_test_event_sync_stub
         dsd-neo_platform
         dsd-neo_runtime
         ${DSD_NEO_TEST_MATH_LIB}
@@ -7672,6 +9005,7 @@ target_link_libraries(
     dsd-neo_test_dmr_t3_ann_wd_tscc
     PRIVATE
         dsd-neo_test_call_state_support
+        dsd-neo_test_event_sync_stub
         dsd-neo_platform
         dsd-neo_runtime
         ${DSD_NEO_TEST_MATH_LIB}
@@ -7705,6 +9039,26 @@ target_include_directories(
 dsd_neo_link_dsp_test(dsd-neo_test_dsp_resampler)
 add_test(NAME DSP_RESAMPLER COMMAND dsd-neo_test_dsp_resampler)
 
+# The converter that takes analog output to the 48 kHz sinks (issue #633).
+add_executable(dsd-neo_test_dsp_rate_converter dsp/test_dsp_rate_converter.c)
+target_include_directories(
+    dsd-neo_test_dsp_rate_converter
+    PRIVATE ${PROJECT_SOURCE_DIR}/include
+)
+dsd_neo_link_dsp_test(dsd-neo_test_dsp_rate_converter ${DSD_NEO_TEST_MATH_LIB})
+# A failed filter allocation is injected through a GNU ld --wrap of the aligned allocator.
+if(NOT APPLE AND NOT WIN32 AND (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang"))
+    target_compile_definitions(
+        dsd-neo_test_dsp_rate_converter
+        PRIVATE DSD_NEO_TEST_ALIGNED_MALLOC_WRAP
+    )
+    target_link_options(
+        dsd-neo_test_dsp_rate_converter
+        PRIVATE "LINKER:--wrap=dsd_neo_aligned_malloc"
+    )
+endif()
+add_test(NAME DSP_RATE_CONVERTER COMMAND dsd-neo_test_dsp_rate_converter)
+
 add_executable(dsd-neo_test_dsp_firdes dsp/test_dsp_firdes.c)
 target_include_directories(
     dsd-neo_test_dsp_firdes
@@ -7727,6 +9081,137 @@ target_include_directories(
 dsd_neo_link_dsp_test(dsd-neo_test_dsp_analog_ctcss ${DSD_NEO_TEST_MATH_LIB})
 add_test(NAME DSP_ANALOG_CTCSS COMMAND dsd-neo_test_dsp_analog_ctcss)
 set_tests_properties(DSP_ANALOG_CTCSS PROPERTIES TIMEOUT 300)
+
+# CTCSS transmitter tone error (issue #643) through the pure analog receive core: 150.6 Hz read as
+# 150.0 Hz, every tone 0.4 % off its value, the 150.0/151.4 Hz midpoint, the estimate's precision
+# against what it claims, and the cases where a tone the on-value rules acquire must not be pre-empted
+# by one that rests on tone error.
+add_executable(
+    dsd-neo_test_dsp_analog_ctcss_tone_error
+    dsp/test_dsp_analog_ctcss_tone_error.c
+)
+target_include_directories(
+    dsd-neo_test_dsp_analog_ctcss_tone_error
+    PRIVATE
+        ${PROJECT_SOURCE_DIR}/include
+        ${PROJECT_SOURCE_DIR}/src/dsp
+        ${PROJECT_SOURCE_DIR}/tests/dsp
+)
+dsd_neo_link_dsp_test(dsd-neo_test_dsp_analog_ctcss_tone_error ${DSD_NEO_TEST_MATH_LIB})
+add_test(
+    NAME DSP_ANALOG_CTCSS_TONE_ERROR
+    COMMAND dsd-neo_test_dsp_analog_ctcss_tone_error
+)
+set_tests_properties(DSP_ANALOG_CTCSS_TONE_ERROR PROPERTIES TIMEOUT 300)
+
+# The auto squelch's classifier, floor and gate (issue #518 follow-up): plan constants
+# against the design model, noise and carriers, learning, no false opens on noise at
+# every margin, floor tracking and relearning, seeding, the per-channel cache, and the
+# same flags whatever the block cuts.
+add_executable(dsd-neo_test_dsp_squelch_floor dsp/test_dsp_squelch_floor.c)
+target_include_directories(
+    dsd-neo_test_dsp_squelch_floor
+    PRIVATE ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/tests/dsp
+)
+dsd_neo_link_dsp_test(dsd-neo_test_dsp_squelch_floor ${DSD_NEO_TEST_MATH_LIB})
+add_test(NAME DSP_SQUELCH_FLOOR COMMAND dsd-neo_test_dsp_squelch_floor)
+set_tests_properties(DSP_SQUELCH_FLOOR PROPERTIES TIMEOUT 300)
+
+# The NFM noise squelch (issue #518 follow-up): the band rule and its sub-bands'
+# Butterworth response, the calibration, noise that never opens the gate, quieting
+# that follows the CNR and not the level, strong tones that never close it, the
+# hysteresis, the flags' timing, and the same flags whatever the block cuts.
+add_executable(
+    dsd-neo_test_dsp_nfm_noise_squelch
+    dsp/test_dsp_nfm_noise_squelch.c
+)
+target_include_directories(
+    dsd-neo_test_dsp_nfm_noise_squelch
+    PRIVATE ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/tests/dsp
+)
+dsd_neo_link_dsp_test(dsd-neo_test_dsp_nfm_noise_squelch ${DSD_NEO_TEST_MATH_LIB})
+add_test(NAME DSP_NFM_NOISE_SQUELCH COMMAND dsd-neo_test_dsp_nfm_noise_squelch)
+set_tests_properties(DSP_NFM_NOISE_SQUELCH PROPERTIES TIMEOUT 300)
+# The strong-modulation sweep on its own: full-deviation tones in 5 Hz steps on five
+# plans, minutes under the sanitizers.
+add_test(
+    NAME DSP_NFM_NOISE_SQUELCH_SWEEP
+    COMMAND dsd-neo_test_dsp_nfm_noise_squelch --sweep
+)
+set_tests_properties(DSP_NFM_NOISE_SQUELCH_SWEEP PROPERTIES TIMEOUT 600)
+# The PCM noise squelch (issue #628): the band rule and band-passes, learning with the
+# gate closed, noise that never opens it, carriers that open it, quieting that follows
+# the CNR and not the level, gain steps, starting on a carrier, a low-passed source (no
+# band), no room, digital silence, the per-passband cache, stale quieting and the same
+# flags whatever the block cuts. --sweep runs strong modulation on its own.
+add_executable(
+    dsd-neo_test_dsp_pcm_noise_squelch
+    dsp/test_dsp_pcm_noise_squelch.c
+)
+target_include_directories(
+    dsd-neo_test_dsp_pcm_noise_squelch
+    PRIVATE ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/tests/dsp
+)
+dsd_neo_link_dsp_test(dsd-neo_test_dsp_pcm_noise_squelch ${DSD_NEO_TEST_MATH_LIB})
+add_test(NAME DSP_PCM_NOISE_SQUELCH COMMAND dsd-neo_test_dsp_pcm_noise_squelch)
+set_tests_properties(DSP_PCM_NOISE_SQUELCH PROPERTIES TIMEOUT 600)
+add_test(
+    NAME DSP_PCM_NOISE_SQUELCH_SWEEP
+    COMMAND dsd-neo_test_dsp_pcm_noise_squelch --sweep
+)
+set_tests_properties(DSP_PCM_NOISE_SQUELCH_SWEEP PROPERTIES TIMEOUT 600)
+
+# DCS detection (issue #523) through the pure analog receive core, in sample time: every
+# supported code in both polarities through the receiver's DC block and de-emphasis at two
+# SNRs, the alias rule, hold under bit errors, loss on a stop and on the turn-off tone, and
+# random bits, other code words and every CTCSS tone never locking.
+add_executable(dsd-neo_test_dsp_analog_dcs dsp/test_dsp_analog_dcs.c)
+target_include_directories(
+    dsd-neo_test_dsp_analog_dcs
+    PRIVATE
+        ${PROJECT_SOURCE_DIR}/include
+        ${PROJECT_SOURCE_DIR}/src/dsp
+        ${PROJECT_SOURCE_DIR}/tests/dsp
+)
+dsd_neo_link_dsp_test(dsd-neo_test_dsp_analog_dcs ${DSD_NEO_TEST_MATH_LIB})
+add_test(NAME DSP_ANALOG_DCS COMMAND dsd-neo_test_dsp_analog_dcs)
+set_tests_properties(DSP_ANALOG_DCS PROPERTIES TIMEOUT 300)
+
+# The CTCSS/DCS receive policy (issue #527) in sample time with injected detections: disabled,
+# allow and block against a match, a nonmatch, no tone, acquisition, loss and reacquisition, a
+# late blocked value and a carrier drop; the bounded window and its DCS extension.
+add_executable(
+    dsd-neo_test_dsp_analog_tone_policy
+    dsp/test_dsp_analog_tone_policy.c
+)
+target_include_directories(
+    dsd-neo_test_dsp_analog_tone_policy
+    PRIVATE ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src/dsp
+)
+dsd_neo_link_dsp_test(dsd-neo_test_dsp_analog_tone_policy)
+add_test(
+    NAME DSP_ANALOG_TONE_POLICY
+    COMMAND dsd-neo_test_dsp_analog_tone_policy
+)
+
+# The DCS words runtime generates, checked against Golay24.hpp through the explicit layout
+# mapping between the two, with the cited reference words pinned on both sides (issue #523).
+add_executable(
+    dsd-neo_test_dsp_analog_dcs_golay_xcheck
+    dsp/test_dsp_analog_dcs_golay.cpp
+)
+target_include_directories(
+    dsd-neo_test_dsp_analog_dcs_golay_xcheck
+    PRIVATE ${PROJECT_SOURCE_DIR}/include
+)
+target_link_libraries(
+    dsd-neo_test_dsp_analog_dcs_golay_xcheck
+    PRIVATE dsd-neo_runtime
+)
+add_test(
+    NAME DSP_ANALOG_DCS_GOLAY_XCHECK
+    COMMAND dsd-neo_test_dsp_analog_dcs_golay_xcheck
+)
 
 add_executable(dsd-neo_test_dsp_fsk_modem dsp/test_fsk_modem.c)
 target_include_directories(
@@ -7781,10 +9266,73 @@ endif()
 dsd_neo_link_dsp_test(dsd-neo_test_dsp_simd_fir)
 add_test(NAME DSP_SIMD_FIR COMMAND dsd-neo_test_dsp_simd_fir)
 
+add_executable(
+    dsd-neo_test_dsp_fir_segmentation
+    dsp/test_dsp_fir_segmentation.cpp
+)
+target_include_directories(
+    dsd-neo_test_dsp_fir_segmentation
+    PRIVATE ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src
+)
+if(_dsd_neo_dsp_sources MATCHES "simd_fir_avx2\\.cpp")
+    target_compile_definitions(
+        dsd-neo_test_dsp_fir_segmentation
+        PRIVATE DSD_NEO_TEST_HAVE_AVX2_IMPL=1
+    )
+endif()
+dsd_neo_link_dsp_test(dsd-neo_test_dsp_fir_segmentation)
+# The test fences each buffer with NaN and checks the fences with std::isnan(),
+# which fast-math would fold to false; the FIR code under test keeps its flags.
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(
+        dsd-neo_test_dsp_fir_segmentation
+        PRIVATE -fno-fast-math
+    )
+elseif(MSVC)
+    target_compile_options(
+        dsd-neo_test_dsp_fir_segmentation
+        PRIVATE /fp:precise
+    )
+endif()
+add_test(NAME DSP_FIR_SEGMENTATION COMMAND dsd-neo_test_dsp_fir_segmentation)
+
+add_executable(
+    dsd-neo_test_dsp_demod_segmentation
+    dsp/test_dsp_demod_segmentation.cpp
+)
+target_include_directories(
+    dsd-neo_test_dsp_demod_segmentation
+    PRIVATE ${PROJECT_SOURCE_DIR}/include
+)
+dsd_neo_link_dsp_test(dsd-neo_test_dsp_demod_segmentation)
+add_test(
+    NAME DSP_DEMOD_SEGMENTATION
+    COMMAND dsd-neo_test_dsp_demod_segmentation
+)
+
+# The post-demod audio decimator (polyphase and its fallback) streams across
+# blocks; the private test-support DSP build forces the fallback (issue #572).
+add_executable(
+    dsd-neo_test_dsp_audio_decim_segmentation
+    dsp/test_dsp_audio_decim_segmentation.cpp
+)
+target_include_directories(
+    dsd-neo_test_dsp_audio_decim_segmentation
+    PRIVATE ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src/dsp
+)
+target_link_libraries(
+    dsd-neo_test_dsp_audio_decim_segmentation
+    PRIVATE dsd-neo_dsp_private_test_support ${DSD_NEO_TEST_MATH_LIB}
+)
+add_test(
+    NAME DSP_AUDIO_DECIM_SEGMENTATION
+    COMMAND dsd-neo_test_dsp_audio_decim_segmentation
+)
+
 add_executable(dsd-neo_bench_dsp EXCLUDE_FROM_ALL dsp/bench_dsp.cpp)
 target_include_directories(
     dsd-neo_bench_dsp
-    PRIVATE ${PROJECT_SOURCE_DIR}/include
+    PRIVATE ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src/dsp
 )
 dsd_neo_link_dsp_test(dsd-neo_bench_dsp ${DSD_NEO_TEST_MATH_LIB})
 
@@ -7848,6 +9396,48 @@ target_include_directories(
 dsd_neo_link_dsp_test(dsd-neo_test_dsp_iq_dc_block)
 add_test(NAME DSP_IQ_DC_BLOCK COMMAND dsd-neo_test_dsp_iq_dc_block)
 
+# The auto squelch inside full_demod() (issue #518 follow-up): the tracker on the channel
+# filter's plan, flags instead of zeroing, the AM detector, the post-decimator and the
+# resampler carrying the flags, and the same flags whatever the block cuts.
+add_executable(
+    dsd-neo_test_dsp_squelch_auto_demod
+    dsp/test_dsp_squelch_auto_demod.cpp
+)
+target_include_directories(
+    dsd-neo_test_dsp_squelch_auto_demod
+    PRIVATE ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src/dsp
+)
+target_link_libraries(
+    dsd-neo_test_dsp_squelch_auto_demod
+    PRIVATE dsd-neo_dsp_private_test_support ${DSD_NEO_TEST_MATH_LIB}
+)
+add_test(
+    NAME DSP_SQUELCH_AUTO_DEMOD
+    COMMAND dsd-neo_test_dsp_squelch_auto_demod
+)
+
+# The NFM noise squelch inside full_demod() (issue #518 follow-up): on the discriminator's
+# output with the channel filter's plan, flags instead of zeroing, the tracker standing in
+# on AM and narrow channels, a retune or reset starting it over without touching the
+# tracker's floors, the post-decimator carrying its flags, and the same flags whatever the
+# block cuts.
+add_executable(
+    dsd-neo_test_dsp_noise_squelch_demod
+    dsp/test_dsp_noise_squelch_demod.cpp
+)
+target_include_directories(
+    dsd-neo_test_dsp_noise_squelch_demod
+    PRIVATE ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src/dsp
+)
+target_link_libraries(
+    dsd-neo_test_dsp_noise_squelch_demod
+    PRIVATE dsd-neo_dsp_private_test_support ${DSD_NEO_TEST_MATH_LIB}
+)
+add_test(
+    NAME DSP_NOISE_SQUELCH_DEMOD
+    COMMAND dsd-neo_test_dsp_noise_squelch_demod
+)
+
 add_executable(dsd-neo_test_dsp_squelch dsp/test_dsp_squelch.cpp)
 target_include_directories(
     dsd-neo_test_dsp_squelch
@@ -7871,6 +9461,16 @@ target_include_directories(
 )
 dsd_neo_link_dsp_test(dsd-neo_test_dsp_fm_demod_ref)
 add_test(NAME DSP_FM_DEMOD_REF COMMAND dsd-neo_test_dsp_fm_demod_ref)
+
+# The carrier-normalised AM envelope detector (issue #524), alone and through the
+# monitor pipeline with the 6 kHz AM channel filter.
+add_executable(dsd-neo_test_dsp_am_demod dsp/test_dsp_am_demod.cpp)
+target_include_directories(
+    dsd-neo_test_dsp_am_demod
+    PRIVATE ${PROJECT_SOURCE_DIR}/include
+)
+dsd_neo_link_dsp_test(dsd-neo_test_dsp_am_demod ${DSD_NEO_TEST_MATH_LIB})
+add_test(NAME DSP_AM_DEMOD COMMAND dsd-neo_test_dsp_am_demod)
 
 add_executable(dsd-neo_test_dsp_demod_misc dsp/test_dsp_demod_misc.cpp)
 target_include_directories(
@@ -7966,6 +9566,28 @@ if(DSD_HAS_RADIO)
     add_test(
         NAME RTL_SYMBOL_CACHE_GENERATION
         COMMAND dsd-neo_test_rtl_symbol_cache_generation
+    )
+
+    # Issue #572: an I/Q replay's samples run the decode clock as they reach symbol
+    # processing, so a call-state window decides the same whatever the batch sizes.
+    add_executable(
+        dsd-neo_test_rtl_symbol_replay_clock
+        dsp/test_rtl_symbol_replay_clock.c
+        test_support/frame_sync_dsp_stubs.c
+    )
+    target_include_directories(
+        dsd-neo_test_rtl_symbol_replay_clock
+        PRIVATE ${PROJECT_SOURCE_DIR}/include
+    )
+    dsd_neo_link_dsp_test(dsd-neo_test_rtl_symbol_replay_clock
+      dsd-neo_test_call_state_support
+      dsd-neo_test_support
+      ${DSD_NEO_TEST_MATH_LIB}
+      ${LIBSNDFILE_LIBRARIES}
+    )
+    add_test(
+        NAME RTL_SYMBOL_REPLAY_CLOCK
+        COMMAND dsd-neo_test_rtl_symbol_replay_clock
     )
 
     add_executable(
@@ -8201,7 +9823,12 @@ target_link_libraries(
 )
 add_test(NAME DMR_UDT_UTF16_TEXT COMMAND dsd-neo_test_dmr_udt_utf16_text)
 
-add_executable(dsd-neo_test_dmr_event_crc protocol/dmr/test_dmr_event_crc.c)
+add_executable(
+    dsd-neo_test_dmr_event_crc
+    protocol/dmr/test_dmr_event_crc.c
+    test_support/dmr_bptc_test_encoder.c
+    test_support/dmr_rs_test_encoder.c
+)
 target_include_directories(
     dsd-neo_test_dmr_event_crc
     PRIVATE ${PROJECT_SOURCE_DIR}/include
@@ -8243,6 +9870,24 @@ target_link_libraries(
 add_test(
     NAME DMR_FLCO_MONO_CRC_SCOPE
     COMMAND dsd-neo_test_dmr_flco_mono_crc_scope
+)
+
+# DMR embedded LC: a checksum-failed alias/GPS applies nothing and abandons the alias; a failed LC holds no scan (#602)
+add_executable(
+    dsd-neo_test_dmr_embedded_lc_checksum
+    protocol/dmr/test_dmr_embedded_lc_checksum.c
+)
+target_include_directories(
+    dsd-neo_test_dmr_embedded_lc_checksum
+    PRIVATE ${PROJECT_SOURCE_DIR}/include
+)
+target_link_libraries(
+    dsd-neo_test_dmr_embedded_lc_checksum
+    PRIVATE dsd-neo_proto_dmr dsd-neo_test_support
+)
+add_test(
+    NAME DMR_EMBEDDED_LC_CHECKSUM
+    COMMAND dsd-neo_test_dmr_embedded_lc_checksum
 )
 
 add_executable(
@@ -8387,6 +10032,7 @@ add_executable(
     ${PROJECT_SOURCE_DIR}/src/protocol/dmr/dmr_cach.c
     ${PROJECT_SOURCE_DIR}/src/protocol/dmr/dmr_bs.c
     ${PROJECT_SOURCE_DIR}/src/runtime/frame_sync_hooks.c
+    ${PROJECT_SOURCE_DIR}/src/core/audio/dmr_mix_media.c
 )
 target_include_directories(
     dsd-neo_test_dmr_bs_sync_times
@@ -9128,6 +10774,35 @@ add_test(
     COMMAND dsd-neo_test_p25_p2_grant_site_gate
 )
 
+# P25 Phase 2 voice playout: per-slot queues played per burst pair in both formats (issue #651)
+add_executable(dsd-neo_test_core_p25p2_playout core/test_core_p25p2_playout.c)
+target_include_directories(
+    dsd-neo_test_core_p25p2_playout
+    PRIVATE
+        ${PROJECT_SOURCE_DIR}/include
+        ${PROJECT_SOURCE_DIR}/tests/test_support
+)
+target_link_libraries(
+    dsd-neo_test_core_p25p2_playout
+    PRIVATE dsd-neo_core dsd-neo_runtime dsd-neo_test_support
+)
+# A call that ends while its verdict is taken, and a patch going stale while the gate evaluates: GNU ld --wrap puts
+# the change right after the look or the evaluation, so those cases exist only where the wrap links, like the other
+# wrap tests.
+if(NOT APPLE AND NOT WIN32 AND (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang"))
+    target_link_options(
+        dsd-neo_test_core_p25p2_playout
+        PRIVATE
+            "LINKER:--wrap=dsd_call_state_get"
+            "LINKER:--wrap=dsd_tg_policy_evaluate_group_call"
+    )
+    target_compile_definitions(
+        dsd-neo_test_core_p25p2_playout
+        PRIVATE DSD_TEST_WRAP_CALL_STATE
+    )
+endif()
+add_test(NAME CORE_P25P2_PLAYOUT COMMAND dsd-neo_test_core_p25p2_playout)
+
 # P25 SM diagnostic log records
 add_executable(dsd-neo_test_p25_sm_diag_log protocol/p25/test_p25_sm_diag_log.c)
 target_include_directories(
@@ -9184,18 +10859,6 @@ target_include_directories(
 )
 target_link_libraries(dsd-neo_test_p25_sm_tags_ring PRIVATE dsd-neo_proto_p25)
 add_test(NAME P25_SM_TAGS_RING COMMAND dsd-neo_test_p25_sm_tags_ring)
-
-# P25p2 audio jitter ring helpers
-add_executable(
-    dsd-neo_test_p25_p2_audio_ring
-    protocol/p25/test_p25_p2_audio_ring.c
-)
-target_include_directories(
-    dsd-neo_test_p25_p2_audio_ring
-    PRIVATE ${PROJECT_SOURCE_DIR}/include
-)
-target_link_libraries(dsd-neo_test_p25_p2_audio_ring PRIVATE dsd-neo_runtime)
-add_test(NAME P25_P2_AUDIO_RING COMMAND dsd-neo_test_p25_p2_audio_ring)
 
 # P25 traffic-carrier reassignment and stale-update validation
 add_executable(
@@ -9570,6 +11233,7 @@ if(Python3_Interpreter_FOUND)
 endif()
 
 # This matrix drives eot_cc(); it must not call real skipDibit from the unit-test fixture.
+# The local-output wrap counts the analog blocks EDACS writes there (issue #574).
 if(NOT APPLE AND (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang"))
     add_executable(
         dsd-neo_test_edacs_grant_tune_matrix
@@ -9599,6 +11263,8 @@ if(NOT APPLE AND (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang"))
             "-Wl,--wrap=close_and_rename_wav_file"
             "-Wl,--wrap=close_and_rename_wav_file_ex"
             "-Wl,--wrap=open_wav_file"
+            "-Wl,--wrap=dsd_audio_write"
+            "-Wl,--wrap=dsd_audio_output_health_get"
     )
     add_test(
         NAME EDACS_GRANT_TUNE_MATRIX
@@ -9662,6 +11328,44 @@ target_link_libraries(
 )
 add_test(NAME DIBIT_SYMBOL_BIN_SOFT COMMAND dsd-neo_test_dibit_symbol_bin_soft)
 
+# Two-level symbol reliability for the ProVoice soft IMBE decode (issue #588)
+add_executable(
+    dsd-neo_test_dibit_two_level_reliability
+    core/test_dibit_two_level_reliability.c
+    ${PROJECT_SOURCE_DIR}/src/core/frames/dsd_dibit.c
+    ${PROJECT_SOURCE_DIR}/src/core/frames/dsd_dibit_reliability.c
+    test_support/call_state_stubs.c
+)
+# dsd_dibit_reliability.c is compiled here directly, so it does not inherit the
+# src/core property that keeps its NaN rejection effective in fast-math builds.
+# The test's NAN and INFINITY inputs need IEEE semantics too; dsd_dibit.c keeps
+# the global flags, as in the library.
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    set_source_files_properties(
+        core/test_dibit_two_level_reliability.c
+        ${PROJECT_SOURCE_DIR}/src/core/frames/dsd_dibit_reliability.c
+        PROPERTIES COMPILE_OPTIONS "-fno-fast-math;-fno-math-errno"
+    )
+elseif(MSVC)
+    set_source_files_properties(
+        core/test_dibit_two_level_reliability.c
+        ${PROJECT_SOURCE_DIR}/src/core/frames/dsd_dibit_reliability.c
+        PROPERTIES COMPILE_OPTIONS "/fp:precise"
+    )
+endif()
+target_include_directories(
+    dsd-neo_test_dibit_two_level_reliability
+    PRIVATE ${PROJECT_SOURCE_DIR}/include
+)
+target_link_libraries(
+    dsd-neo_test_dibit_two_level_reliability
+    PRIVATE dsd-neo_platform ${DSD_NEO_TEST_MATH_LIB}
+)
+add_test(
+    NAME DIBIT_TWO_LEVEL_RELIABILITY
+    COMMAND dsd-neo_test_dibit_two_level_reliability
+)
+
 add_executable(
     dsd-neo_test_dibit_rtl_fsk_reliability
     core/test_dibit_rtl_fsk_reliability.c
@@ -9724,6 +11428,8 @@ target_link_libraries(
     dsd-neo_test_frame_sync_internal_helpers
     PRIVATE
         dsd-neo_dsp_private_test_support
+        dsd-neo_test_audio_activity
+        dsd-neo_test_audio_sink
         ${DSD_NEO_TEST_MATH_LIB}
         ${LIBSNDFILE_LIBRARIES}
 )
@@ -9914,6 +11620,25 @@ add_test(
     COMMAND dsd-neo_test_p25_p2_release_partial_audio
 )
 
+# P25 Phase 2 voice output end to end: every frame plays once, in order, both slots side by side (issue #651)
+add_executable(
+    dsd-neo_test_p25_p2_voice_output
+    protocol/p25/test_p25_p2_voice_output.c
+)
+target_include_directories(
+    dsd-neo_test_p25_p2_voice_output
+    PRIVATE
+        ${PROJECT_SOURCE_DIR}/include
+        ${PROJECT_SOURCE_DIR}/src/protocol/p25/phase2
+        ${PROJECT_SOURCE_DIR}/tests/test_support
+        ${_PUBLIC_INCLUDES}
+)
+target_link_libraries(
+    dsd-neo_test_p25_p2_voice_output
+    PRIVATE dsd-neo_proto_p25 dsd-neo_test_support
+)
+add_test(NAME P25_P2_VOICE_OUTPUT COMMAND dsd-neo_test_p25_p2_voice_output)
+
 # P25 Tier 3 production dispatch (Protection Parameter, Time/Date, status)
 add_executable(
     dsd-neo_test_protocol_p25_tier3_conformance
@@ -10027,6 +11752,9 @@ add_executable(
     dsd-neo_test_io_rigctl_control
     io/test_io_rigctl_control.c
     ${PROJECT_SOURCE_DIR}/src/io/control/dsd_rigctl.c
+    ${PROJECT_SOURCE_DIR}/src/core/util/channel_modes_rigctl.c
+    ${PROJECT_SOURCE_DIR}/src/runtime/analog_channel.c
+    ${PROJECT_SOURCE_DIR}/src/runtime/rigctl_passband.c
 )
 target_compile_definitions(
     dsd-neo_test_io_rigctl_control
@@ -10040,6 +11768,11 @@ target_link_libraries(
     dsd-neo_test_io_rigctl_control
     PRIVATE ${DSD_NEO_TEST_MATH_LIB} ${DSD_PLATFORM_LIBS}
 )
+# The test stubs the dsd_socket_* layer instead of linking dsd-neo_platform, so
+# the byte-order calls (htons) need Winsock directly on Windows.
+if(WIN32)
+    target_link_libraries(dsd-neo_test_io_rigctl_control PRIVATE ws2_32)
+endif()
 add_test(NAME IO_RIGCTL_CONTROL COMMAND dsd-neo_test_io_rigctl_control)
 
 add_executable(
@@ -10053,7 +11786,11 @@ target_include_directories(
     dsd-neo_test_io_udp_socket_backends
     PRIVATE ${PROJECT_SOURCE_DIR}/include
 )
-target_link_libraries(dsd-neo_test_io_udp_socket_backends PRIVATE ${DSD_PLATFORM_LIBS})
+# Stubs the dsd_socket_* layer like IO_RIGCTL_CONTROL; the byte-order calls
+# (htonl, htons, ntohl, ntohs) need Winsock directly on Windows.
+if(WIN32)
+    target_link_libraries(dsd-neo_test_io_udp_socket_backends PRIVATE ws2_32)
+endif()
 add_test(
     NAME IO_UDP_SOCKET_BACKENDS
     COMMAND dsd-neo_test_io_udp_socket_backends
@@ -10064,7 +11801,10 @@ target_include_directories(
     dsd-neo_test_io_tcp_input
     PRIVATE ${PROJECT_SOURCE_DIR}/include
 )
-target_link_libraries(dsd-neo_test_io_tcp_input PRIVATE dsd-neo_io_audio)
+target_link_libraries(
+    dsd-neo_test_io_tcp_input
+    PRIVATE dsd-neo_io_audio dsd-neo_test_support
+)
 add_test(NAME IO_TCP_INPUT COMMAND dsd-neo_test_io_tcp_input)
 
 add_executable(
@@ -10099,13 +11839,16 @@ target_compile_definitions(
         dsd_fopen_private=test_dsd_fopen_private
         dsd_fileno=test_dsd_fileno
         dsd_fstat=test_dsd_fstat
-        dsd_time_monotonic_ns=test_dsd_time_monotonic_ns
+        dsd_realtime_mono_ns=test_dsd_realtime_mono_ns
 )
 target_include_directories(
     dsd-neo_test_io_rtl_perf
     PRIVATE ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src/io/radio ${PROJECT_SOURCE_DIR}/tests/test_support
 )
-target_link_libraries(dsd-neo_test_io_rtl_perf PRIVATE dsd-neo_test_support)
+target_link_libraries(
+    dsd-neo_test_io_rtl_perf
+    PRIVATE dsd-neo_platform dsd-neo_test_support
+)
 add_test(NAME IO_RTL_PERF COMMAND dsd-neo_test_io_rtl_perf)
 
 add_executable(
@@ -10152,6 +11895,18 @@ target_link_libraries(
     dsd-neo_test_io_iq_capture_writer
     PRIVATE dsd-neo_io_iq dsd-neo_platform dsd-neo_test_support
 )
+# Issue #578: a case fails fdopen() once, after the data file's descriptor opened, through GNU ld's --wrap, so it only
+# exists where that works.
+if(NOT APPLE AND NOT WIN32 AND (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang"))
+    target_compile_definitions(
+        dsd-neo_test_io_iq_capture_writer
+        PRIVATE DSD_TEST_FAULT_FDOPEN
+    )
+    target_link_options(
+        dsd-neo_test_io_iq_capture_writer
+        PRIVATE "LINKER:--wrap=fdopen"
+    )
+endif()
 add_test(NAME IO_IQ_CAPTURE_WRITER COMMAND dsd-neo_test_io_iq_capture_writer)
 
 add_executable(
@@ -10177,6 +11932,13 @@ target_include_directories(
     dsd-neo_test_io_soapy_profile
     PRIVATE ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src/io/radio
 )
+# soapy_profile.cpp is compiled here directly, so it does not inherit the
+# src/io property that keeps its NaN rejection effective in fast-math builds.
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(dsd-neo_test_io_soapy_profile PRIVATE -fno-fast-math)
+elseif(MSVC)
+    target_compile_options(dsd-neo_test_io_soapy_profile PRIVATE /fp:precise)
+endif()
 add_test(NAME IO_SOAPY_PROFILE COMMAND dsd-neo_test_io_soapy_profile)
 
 add_executable(
@@ -10196,13 +11958,55 @@ add_executable(
 )
 target_include_directories(
     dsd-neo_test_platform_file_compat
-    PRIVATE ${PROJECT_SOURCE_DIR}/include
+    PRIVATE ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src/platform
 )
 target_link_libraries(
     dsd-neo_test_platform_file_compat
-    PRIVATE dsd-neo_platform
+    PRIVATE dsd-neo_platform dsd-neo_test_support
 )
 add_test(NAME PLATFORM_FILE_COMPAT COMMAND dsd-neo_test_platform_file_compat)
+
+# PortAudio output device recovery with the real pump thread and locks over a fake PortAudio (issue #659). Needs only
+# the PortAudio header, so it also runs where PulseAudio is the backend.
+if(UNIX)
+    find_path(DSD_NEO_TEST_PORTAUDIO_INCLUDE_DIR portaudio.h)
+    if(DSD_NEO_TEST_PORTAUDIO_INCLUDE_DIR)
+        add_executable(
+            dsd-neo_test_platform_audio_portaudio_recovery
+            platform/test_platform_audio_portaudio_recovery.c
+        )
+        target_include_directories(
+            dsd-neo_test_platform_audio_portaudio_recovery
+            PRIVATE
+                ${PROJECT_SOURCE_DIR}/include
+                ${PROJECT_SOURCE_DIR}/src/platform
+                ${DSD_NEO_TEST_PORTAUDIO_INCLUDE_DIR}
+        )
+        target_link_libraries(
+            dsd-neo_test_platform_audio_portaudio_recovery
+            PRIVATE dsd-neo_platform
+        )
+        add_test(
+            NAME PLATFORM_AUDIO_PORTAUDIO_RECOVERY
+            COMMAND dsd-neo_test_platform_audio_portaudio_recovery
+        )
+    endif()
+endif()
+
+# Whole-frame descriptor writes and the closed-reader SIGPIPE guard (issue #659).
+add_executable(
+    dsd-neo_test_platform_write_frames
+    platform/test_platform_write_frames.c
+)
+target_include_directories(
+    dsd-neo_test_platform_write_frames
+    PRIVATE ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src/platform
+)
+target_link_libraries(
+    dsd-neo_test_platform_write_frames
+    PRIVATE dsd-neo_platform
+)
+add_test(NAME PLATFORM_WRITE_FRAMES COMMAND dsd-neo_test_platform_write_frames)
 
 add_executable(dsd-neo_test_platform_dir_list platform/test_platform_dir_list.c)
 target_include_directories(
@@ -10280,17 +12084,15 @@ if(DSD_AUDIO_BACKEND STREQUAL "pulse")
         dsd-neo_test_platform_audio_pulse_helpers
         platform/test_platform_audio_pulse_helpers.c
     )
+    # The test includes <pulse/channelmap.h> and links libpulse alone, so it
+    # needs the PulseAudio include directory itself: outside /usr/include
+    # (Homebrew on macOS) nothing else on its command line provides it.
     target_include_directories(
         dsd-neo_test_platform_audio_pulse_helpers
-        PRIVATE ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src/platform
-    )
-    target_compile_options(
-        dsd-neo_test_platform_audio_pulse_helpers
-        PRIVATE -ffunction-sections -fdata-sections
-    )
-    target_link_options(
-        dsd-neo_test_platform_audio_pulse_helpers
-        PRIVATE -Wl,--gc-sections
+        PRIVATE
+            ${PROJECT_SOURCE_DIR}/include
+            ${PROJECT_SOURCE_DIR}/src/platform
+            ${PULSEAUDIO_INCLUDE_DIRS}
     )
     target_link_libraries(
         dsd-neo_test_platform_audio_pulse_helpers
@@ -10450,6 +12252,17 @@ if(DSD_HAS_RADIO)
             PRIVATE ${RTLSDR_LIBRARIES} ${CMAKE_THREAD_LIBS_INIT}
         )
     endif()
+    # A failed resampler design is injected through a GNU ld --wrap of the aligned allocator (issue #633).
+    if(NOT APPLE AND NOT WIN32 AND (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang"))
+        target_compile_definitions(
+            dsd-neo_test_io_rtl_demod_config
+            PRIVATE DSD_NEO_TEST_ALIGNED_MALLOC_WRAP
+        )
+        target_link_options(
+            dsd-neo_test_io_rtl_demod_config
+            PRIVATE "LINKER:--wrap=dsd_neo_aligned_malloc"
+        )
+    endif()
     add_test(NAME IO_RTL_DEMOD_CONFIG COMMAND dsd-neo_test_io_rtl_demod_config)
 
     add_executable(
@@ -10546,6 +12359,31 @@ if(DSD_HAS_RADIO)
     add_test(
         NAME IO_RTL_RETUNE_PREPARE
         COMMAND dsd-neo_test_io_rtl_retune_prepare
+    )
+
+    # The auto squelch's plumbing in the RTL stream (issue #518 follow-up): setting, context,
+    # flags through the output ring with the samples, status.
+    add_executable(
+        dsd-neo_test_io_rtl_squelch_plumbing
+        io/test_io_rtl_squelch_plumbing.cpp
+    )
+    target_include_directories(
+        dsd-neo_test_io_rtl_squelch_plumbing
+        PRIVATE ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src/io/radio
+    )
+    target_link_libraries(
+        dsd-neo_test_io_rtl_squelch_plumbing
+        PRIVATE dsd-neo_io_radio_private_test_support dsd-neo_core
+    )
+    if(DSD_HAS_RTLSDR)
+        target_link_libraries(
+            dsd-neo_test_io_rtl_squelch_plumbing
+            PRIVATE ${RTLSDR_LIBRARIES} ${CMAKE_THREAD_LIBS_INIT}
+        )
+    endif()
+    add_test(
+        NAME IO_RTL_SQUELCH_PLUMBING
+        COMMAND dsd-neo_test_io_rtl_squelch_plumbing
     )
 
     add_executable(
@@ -10680,6 +12518,76 @@ if(DSD_HAS_RADIO)
         NAME IO_RTL_REPLAY_EOF_AND_CF32
         COMMAND dsd-neo_test_io_rtl_replay_eof_and_cf32
     )
+
+    # Issue #626: a replay's demod block (one capture chunk) is at most one live transfer,
+    # so the level squelch and every other per-block decision run at a live receiver's
+    # cadence; on nfm_burst_synth a level gate opens and closes within one block of the
+    # carrier's edges.
+    add_executable(
+        dsd-neo_test_io_rtl_replay_chunking
+        io/test_io_rtl_replay_chunking.cpp
+    )
+    target_include_directories(
+        dsd-neo_test_io_rtl_replay_chunking
+        PRIVATE
+            ${PROJECT_SOURCE_DIR}/include
+            ${PROJECT_SOURCE_DIR}/src/io/radio
+            ${PROJECT_SOURCE_DIR}/tests/test_support
+    )
+    target_compile_definitions(
+        dsd-neo_test_io_rtl_replay_chunking
+        PRIVATE
+            "DSD_NEO_TEST_IQ_FIXTURE_DIR=\"${PROJECT_SOURCE_DIR}/tests/fixtures/iq\""
+    )
+    target_link_libraries(
+        dsd-neo_test_io_rtl_replay_chunking
+        PRIVATE
+            dsd-neo_io_radio_private_test_support
+            dsd-neo_io_iq
+            dsd-neo_core
+            dsd-neo_test_support
+    )
+    if(DSD_HAS_RTLSDR)
+        target_link_libraries(
+            dsd-neo_test_io_rtl_replay_chunking
+            PRIVATE ${RTLSDR_LIBRARIES} ${CMAKE_THREAD_LIBS_INIT}
+        )
+    endif()
+    add_test(
+        NAME IO_RTL_REPLAY_CHUNKING
+        COMMAND dsd-neo_test_io_rtl_replay_chunking
+    )
+
+    add_executable(
+        dsd-neo_test_io_rtl_replay_determinism
+        io/test_io_rtl_replay_determinism.cpp
+    )
+    target_include_directories(
+        dsd-neo_test_io_rtl_replay_determinism
+        PRIVATE
+            ${PROJECT_SOURCE_DIR}/include
+            ${PROJECT_SOURCE_DIR}/src/io/radio
+            ${PROJECT_SOURCE_DIR}/tests/test_support
+    )
+    target_link_libraries(
+        dsd-neo_test_io_rtl_replay_determinism
+        PRIVATE
+            dsd-neo_io_radio_private_test_support
+            dsd-neo_io_iq
+            dsd-neo_core
+            dsd-neo_test_support
+    )
+    if(DSD_HAS_RTLSDR)
+        target_link_libraries(
+            dsd-neo_test_io_rtl_replay_determinism
+            PRIVATE ${RTLSDR_LIBRARIES} ${CMAKE_THREAD_LIBS_INIT}
+        )
+    endif()
+    add_test(
+        NAME IO_RTL_REPLAY_DETERMINISM
+        COMMAND dsd-neo_test_io_rtl_replay_determinism
+    )
+    set_tests_properties(IO_RTL_REPLAY_DETERMINISM PROPERTIES TIMEOUT 120)
 
     add_executable(
         dsd-neo_test_io_rtl_preopened_fd
@@ -11089,9 +12997,61 @@ set(_DSD_NEO_BIT_PACKING_TEST_TARGETS
     dsd-neo_test_ysf_frame
 )
 foreach(_target IN LISTS _DSD_NEO_BIT_PACKING_TEST_TARGETS)
-    target_link_libraries(${_target} PRIVATE dsd-neo_test_bit_packing)
+    if(TARGET ${_target})
+        target_link_libraries(${_target} PRIVATE dsd-neo_test_bit_packing)
+    endif()
 endforeach()
 unset(_DSD_NEO_BIT_PACKING_TEST_TARGETS)
+
+# Protocol code reads time through the decode clock (src/runtime/decode_clock.c).
+# These tests compile protocol sources directly without dsd-neo_runtime.
+set(_DSD_NEO_DECODE_CLOCK_TEST_TARGETS
+    dsd-neo_test_dmr_bs_sync_times
+    dsd-neo_test_dmr_locn_time_fallback
+    dsd-neo_test_dmr_lrrp_crc_gating
+    dsd-neo_test_dmr_lrrp_empty_payload_type
+    dsd-neo_test_dmr_lrrp_event_crc_gating
+    dsd-neo_test_dmr_lrrp_ip_udp_lengths
+    dsd-neo_test_dmr_lrrp_position_token_precedence
+    dsd-neo_test_dmr_lrrp_response_token_lengths
+    dsd-neo_test_dmr_lrrp_resync_prefix
+    dsd-neo_test_dmr_lrrp_time_fallback
+    dsd-neo_test_dmr_lrrp_time_valid
+    dsd-neo_test_dmr_lrrp_token_alignment
+    dsd-neo_test_dmr_lrrp_wrapped_document
+    dsd-neo_test_dmr_ms_data
+    dsd-neo_test_dmr_pdu_utf16_text
+    dsd-neo_test_dmr_tms_utf16le
+    dsd-neo_test_dmr_udp_comp_header
+    dsd-neo_test_nxdn_frame_routing
+    dsd-neo_test_p25_p1_hdu_helpers
+    dsd-neo_test_p25_p1_ldu1_helpers
+    dsd-neo_test_p25_p1_ldu2_helpers
+    dsd-neo_test_p25_p1_tdu
+    # Core, app-control and terminal sources compiled in directly. Some exist only
+    # with curses or radio support, hence the TARGET check below.
+    dsd-neo_test_app_control_frontend_metrics
+    dsd-neo_test_core_gps_lrrp_crc_gating
+    dsd-neo_test_dmr_embedded_gps_position_error
+    dsd-neo_test_ui_chooser_navigation
+    dsd-neo_test_ui_dsp_display_radio_compile
+    dsd-neo_test_ui_menu_dynamic_label
+    dsd-neo_test_ui_menu_labels
+    dsd-neo_test_ui_menu_actions
+    dsd-neo_test_ui_menu_labels_radio
+    dsd-neo_test_ui_menu_render_helpers
+    dsd-neo_test_ui_panels_header_footer
+    dsd-neo_test_ui_prims_status_gamma
+    dsd-neo_test_ui_prompt_cursor
+    dsd-neo_test_ui_prompt_secret
+    dsd-neo_test_ui_prompt_validation
+)
+foreach(_target IN LISTS _DSD_NEO_DECODE_CLOCK_TEST_TARGETS)
+    if(TARGET ${_target})
+        target_link_libraries(${_target} PRIVATE dsd-neo_test_decode_clock)
+    endif()
+endforeach()
+unset(_DSD_NEO_DECODE_CLOCK_TEST_TARGETS)
 
 # ---------------------------------------------------------------------------
 # Full-chain modulation decode regression tests
@@ -11104,7 +13064,7 @@ unset(_DSD_NEO_BIT_PACKING_TEST_TARGETS)
 #
 # Fixtures live in tests/fixtures/iq and are regenerated by
 # tools/build_iq_fixtures.py. See docs/testing.md for provenance and the known
-# coverage gaps (ProVoice, X2-TDMA, P25 Phase 2 payload).
+# coverage gaps (X2-TDMA, P25 Phase 2 payload).
 #
 # --iq-replay needs the radio pipeline (rtl_sdr_fm), so these cases only exist
 # in radio-enabled builds; the CLI rejects the flag otherwise.
@@ -11178,16 +13138,25 @@ if(DSD_HAS_RADIO)
         -f1
         "Group Voice Channel User"
     )
+    # The CQPSK fixtures run the front end's CQPSK chain only with -mq after the preset:
+    # -f1 sets C4FM modulation, and the last of -f1 and -mq wins, so "-f1" alone (as these
+    # cases were first registered) and "-mq -f1" both demodulate them on the FSK
+    # discriminator path (REPLAY STREAM cqpsk_symbols=0). Under "-f1 -mq" each reads
+    # about 9,590 CQPSK symbols and no FSK samples. The clean CC decodes the same either
+    # way (18 implicit grants, no irrecoverable header error, against 17 and 1); the voice
+    # capture improves to 8 grants, 51 audio errors and 5 header errors (from 7, 84 and
+    # 147) and the simulcast one to 18 grants and the site identity 41 times (from 3 and
+    # none).
     dsd_neo_add_iq_decode_test(
         DECODE_IQ_P25P1_CQPSK_CC
         p25p1_cqpsk_cc
-        -f1
+        "-f1 -mq"
         "WACN: 92065; SYS: 0D5"
     )
     dsd_neo_add_iq_decode_test(
         DECODE_IQ_P25P1_CQPSK_VOICE
         p25p1_cqpsk_vc
-        -f1
+        "-f1 -mq"
         "Group Voice Channel User"
     )
     # Issue #400: the same capture under -fa, where the SPS hunt is live. P25p1 syncs arrive
@@ -11209,8 +13178,22 @@ if(DSD_HAS_RADIO)
     # same real payload its -f1 sibling above asserts, which is the thing a hunt that holds
     # the profile is supposed to deliver. Both halves hold across dev-debug, asan-ubsan-debug
     # and tsan-debug.
+    #
+    # Under -fa the modulation vote never picks CQPSK on this capture, so the hunt above runs
+    # the FSK discriminator path (cqpsk_symbols=0); the _UNLOCKED case keeps that unlocked
+    # hunt and its negative half. The case itself runs "-fa -mq", the -fa protocol set on the
+    # CQPSK chain (8 grants, 52 audio errors, 5 header errors). The -mq lock lets the hunt
+    # rotate only among profiles with the same timing, which it does without the
+    # "SPS hunt: trying" line, so the negative half there guards against a timing change.
     dsd_neo_add_iq_decode_test(
         DECODE_IQ_P25P1_CQPSK_VOICE_AUTO_HUNT
+        p25p1_cqpsk_vc
+        "-fa -mq"
+        "Group Voice Channel User"
+        "SPS hunt: trying"
+    )
+    dsd_neo_add_iq_decode_test(
+        DECODE_IQ_P25P1_CQPSK_VOICE_AUTO_HUNT_UNLOCKED
         p25p1_cqpsk_vc
         -fa
         "Group Voice Channel User"
@@ -11222,7 +13205,7 @@ if(DSD_HAS_RADIO)
     dsd_neo_add_iq_decode_test(
         DECODE_IQ_P25P1_CQPSK_SIMULCAST_CC
         p25p1_cqpsk_cc_simulcast
-        -f1
+        "-f1 -mq"
         "Group Voice Channel Grant Update - Implicit"
     )
     dsd_neo_add_iq_decode_test(DECODE_IQ_P25P2_CC p25p2_cc -f2 "P25p2 SACCH")
@@ -11252,6 +13235,39 @@ if(DSD_HAS_RADIO)
     )
     dsd_neo_add_iq_decode_test(DECODE_IQ_NXDN48 nxdn48 -fi "Src=901")
     dsd_neo_add_iq_decode_test(DECODE_IQ_NXDN96 nxdn96 -fn "RAN 00")
+    # A call after a scan retune (issue #572): 7.5 s of noise_floor on one channel, the RETUNE, MUTE,
+    # RESET and MUTE a real scan retune records, then all of nxdn48 on the next channel
+    # (DERIVED_RETUNE in tools/build_iq_fixtures.py). -fi holds the receiver on NXDN48, so whatever
+    # the SPS hunt would do, this is the control: the eventful replay path decodes the call at 48 kHz.
+    dsd_neo_add_iq_decode_test(
+        DECODE_IQ_NXDN48_AFTER_RETUNE
+        nxdn48_after_retune
+        -fi
+        "Src=901"
+    )
+    # --iq-info reads the fixture's version 2 sidecar, counts its event timeline and finds it
+    # replayable, with no warning. It prints and exits before the --iq-replay the helper adds runs.
+    dsd_neo_add_iq_decode_test(
+        IQ_INFO_NXDN48_AFTER_RETUNE
+        nxdn48_after_retune
+        "--iq-info \"${_DSD_NEO_IQ_FIXTURE_DIR}/nxdn48_after_retune.iq.json\""
+        "Format: +dsd-neo-iq v2.*Contains retunes: +yes \\(1 retune events\\).*Event timeline: +4 event\\(s\\).*Replay compatible: +yes"
+        "WARNING"
+    )
+    # The same call under -fa: the SPS hunt has to land on 20 sps after the RESET by itself. The 7.5 s
+    # lead-in sits mid-plateau (6.7-8.1 s) of the lead-ins whose hunt reaches the RESET after the same five
+    # steps; the iq-determinism cases (Replay determinism, below) require every replay of it to decode
+    # identically.
+    dsd_neo_add_iq_decode_test(
+        DECODE_IQ_NXDN48_AFTER_RETUNE_AUTO
+        nxdn48_after_retune
+        -fa
+        "Src=901"
+    )
+    set_tests_properties(
+        DECODE_IQ_NXDN48_AFTER_RETUNE_AUTO
+        PROPERTIES LABELS "iq-decode;iq-determinism" TIMEOUT 600
+    )
     # dPMR modulated from the CCH reference vectors, the only dPMR signal in the tree
     # whose content is known rather than guessed (#407). Every CCH CRC-7 in it passes,
     # so this is what a working integrity check has to be validated against. The voice
@@ -11512,6 +13528,45 @@ if(DSD_HAS_RADIO)
         "Src=[0-9]"
     )
     dsd_neo_add_iq_decode_test(DECODE_IQ_DSTAR dstar -fd "SRC: KB7WUK")
+
+    # The -o - audio output (issue #659): a reader that goes away costs stdout audio one logged error, never the
+    # process or the -w recording; the analog monitor writes stdout in the analog-only modes, the -8 source monitor
+    # during digital decoding does not. POSIX only: the pipe case needs true(1) and a SIGPIPE to survive.
+    if(UNIX)
+        function(dsd_neo_add_audio_stdout_test test_name check fixture mode)
+            set(_extra)
+            if(ARGC GREATER 4)
+                set(_extra "-DMIN_BYTES=${ARGV4}")
+            endif()
+            add_test(
+                NAME ${test_name}
+                COMMAND
+                    ${CMAKE_COMMAND} "-DDSD_BIN=$<TARGET_FILE:dsd-neo>"
+                    "-DCHECK=${check}" "-DMODE=${mode}"
+                    "-DFIXTURE=${_DSD_NEO_IQ_FIXTURE_DIR}/${fixture}.iq.json"
+                    "-DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/audio_stdout/${test_name}"
+                    ${_extra} -P
+                    "${CMAKE_CURRENT_SOURCE_DIR}/audio_stdout_check.cmake"
+            )
+            set_tests_properties(
+                ${test_name}
+                PROPERTIES LABELS "iq-decode" TIMEOUT 240
+            )
+        endfunction()
+        dsd_neo_add_audio_stdout_test(DECODE_IQ_STDOUT_CLOSED_PIPE CLOSED_PIPE dstar -fd)
+        # About a second of the 1.5 s tone at 48 kHz mono s16.
+        dsd_neo_add_audio_stdout_test(DECODE_IQ_STDOUT_FM_MONITOR MONITOR nfm_tone_synth -fA 96000)
+        dsd_neo_add_audio_stdout_test(DECODE_IQ_STDOUT_AM_MONITOR MONITOR am_tone_synth -fM 96000)
+        dsd_neo_add_audio_stdout_test(DECODE_IQ_STDOUT_SOURCE_MONITOR MONITOR_8 dstar -fd)
+    endif()
+    # D-STAR voice decodes through the soft AMBE 3600x2400 path (issue #599). The payload is the first frame of the
+    # transmission's first voice superframe, which decodes with nothing to correct.
+    dsd_neo_add_iq_decode_test(
+        DECODE_IQ_DSTAR_AMBE
+        dstar
+        "-fd -Z"
+        "AMBE F709018E901180 err = \\[0\\] \\[0\\]"
+    )
     dsd_neo_add_iq_decode_test(
         DECODE_IQ_YSF
         ysf
@@ -11524,7 +13579,46 @@ if(DSD_HAS_RADIO)
         -fh
         "Site ID \\[02\\]\\[002\\]"
     )
+    # Nothing in a ProVoice frame can fail a check -- the header has no CRC, and the voice's Golay and Hamming
+    # codes are perfect, decoding any input -- so the payload asserted is what -Z prints: the header's
+    # fixed 64-bit field after the LID, and a 7100x4400 voice frame that decoded without a correction.
+    # -fh decodes ProVoice inside the EDACS preset as well (issue #588).
+    dsd_neo_add_iq_decode_test(
+        DECODE_IQ_PROVOICE
+        provoice
+        "-fp -Z"
+        "LID: [0-9A-F][0-9A-F][0-9A-F][0-9A-F] FF83DF1732094ED1"
+    )
+    dsd_neo_add_iq_decode_test(
+        DECODE_IQ_PROVOICE_IMBE
+        provoice
+        "-fp -Z"
+        "IMBE [0-9A-F]+ err = \\[0\\] \\[0\\]  7100"
+    )
+    dsd_neo_add_iq_decode_test(
+        DECODE_IQ_PROVOICE_EDACS
+        provoice
+        "-fh -Z"
+        "LID: [0-9A-F][0-9A-F][0-9A-F][0-9A-F] FF83DF1732094ED1"
+    )
     dsd_neo_add_iq_decode_test(DECODE_IQ_M17 m17 -fz "SRC: N0CALL")
+    # Issue #658: M17's decoded Codec2 voice follows the output format on stdout (s16/f32, mono/stereo) and the fixed
+    # gain. Only a Codec2 build decodes the voice.
+    if(DSD_HAS_CODEC2)
+        add_test(
+            NAME DECODE_IQ_M17_VOICE_OUTPUT
+            COMMAND
+                ${CMAKE_COMMAND} "-DDSD_BIN=$<TARGET_FILE:dsd-neo>"
+                "-DFIXTURE=${_DSD_NEO_IQ_FIXTURE_DIR}/m17.iq.json"
+                "-DEXPECTED=SRC: N0CALL"
+                "-DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/m17_voice_output" -P
+                "${CMAKE_CURRENT_SOURCE_DIR}/iq_m17_voice_output_check.cmake"
+        )
+        set_tests_properties(
+            DECODE_IQ_M17_VOICE_OUTPUT
+            PROPERTIES LABELS "iq-decode" TIMEOUT 300
+        )
+    endif()
 
     # Auto must not be pinned on its starting profile by syncs no protocol turns into a
     # frame (issue #388). Both fixtures are shorter than one full hunt rotation, so the
@@ -11623,24 +13717,58 @@ if(DSD_HAS_RADIO)
         "Src=[0-9]"
     )
 
+    # The M17 encoder's VOX on the dynamic squelch (issue #625): ten seconds of receiver noise
+    # replayed into -fZ with VOX on never key it under --squelch auto or noise (each used to key
+    # on the first frame: the level comparison was off under both, so every read was open). A
+    # level the noise clears keys it: the control that shows the cases would see a key-up.
+    dsd_neo_add_iq_reject_test(
+        DECODE_IQ_M17_ENCODER_VOX_SQL_AUTO_NOISE_FLOOR
+        noise_floor
+        "-fZ -M M17:7:DSD-NEO:TEST:48000:1 --squelch auto"
+        "Exiting"
+        "M17 LSF +[(]ENCODER[)]"
+    )
+    dsd_neo_add_iq_reject_test(
+        DECODE_IQ_M17_ENCODER_VOX_SQL_NOISE_NOISE_FLOOR
+        noise_floor
+        "-fZ -M M17:7:DSD-NEO:TEST:48000:1 --squelch noise"
+        "Exiting"
+        "M17 LSF +[(]ENCODER[)]"
+    )
+    dsd_neo_add_iq_decode_test(
+        DECODE_IQ_M17_ENCODER_VOX_SQL_LEVEL_KEYS
+        noise_floor
+        "-fZ -M M17:7:DSD-NEO:TEST:48000:1 --squelch -40"
+        "M17 LSF +[(]ENCODER[)]"
+    )
+
     # Received-tone detection on the analog FM monitor (issue #522): synthetic NFM with voice
     # and a CTCSS tone, replayed under -fA with -o null, so detection is shown to run with no
     # audio output and no tone policy at all. Each asserts the "Received tone:" log line and
-    # that no other tone was ever reported. CMake regexes have no negative lookahead, so
-    # "any other tone" is spelled out as every value that is not the expected one.
+    # that no other tone, and no DCS code (issue #523), was ever reported. CMake regexes have
+    # no negative lookahead, so "any other tone" is spelled out as every value that is not the
+    # expected one.
     dsd_neo_add_iq_decode_test(
         DECODE_IQ_ANALOG_CTCSS_1000
         nfm_ctcss_synth_1000
         -fA
         "Received tone: CTCSS 100\\.0 Hz"
-        "Received tone: (none|CTCSS ([0-9]|[0-9][0-9]|[02-9][0-9][0-9]|1[1-9][0-9]|10[1-9])\\.[0-9] Hz|CTCSS 100\\.[1-9] Hz)"
+        "Received tone: (none|DCS|CTCSS ([0-9]|[0-9][0-9]|[02-9][0-9][0-9]|1[1-9][0-9]|10[1-9])\\.[0-9] Hz|CTCSS 100\\.[1-9] Hz)"
     )
     dsd_neo_add_iq_decode_test(
         DECODE_IQ_ANALOG_CTCSS_670
         nfm_ctcss_synth_670
         -fA
         "Received tone: CTCSS 67\\.0 Hz"
-        "Received tone: (none|CTCSS ([0-9]|[0-57-9][0-9]|6[0-689]|[0-9][0-9][0-9])\\.[0-9] Hz|CTCSS 67\\.[1-9] Hz)"
+        "Received tone: (none|DCS|CTCSS ([0-9]|[0-57-9][0-9]|6[0-689]|[0-9][0-9][0-9])\\.[0-9] Hz|CTCSS 67\\.[1-9] Hz)"
+    )
+    # A transmitter 0.4 % high on 150.0 Hz (issue #643): 150.6 Hz reads 150.0, never none first, never 151.4.
+    dsd_neo_add_iq_decode_test(
+        DECODE_IQ_ANALOG_CTCSS_1506
+        nfm_ctcss_synth_1506
+        -fA
+        "Received tone: CTCSS 150\\.0 Hz"
+        "Received tone: (none|DCS|CTCSS ([0-9]|[0-9][0-9]|[02-9][0-9][0-9]|1[0-46-9][0-9]|15[1-9])\\.[0-9] Hz|CTCSS 150\\.[1-9] Hz)"
     )
     # The tone stops at 1.2 s while the carrier and voice carry on: 100.0, then none.
     dsd_neo_add_iq_decode_test(
@@ -11648,15 +13776,64 @@ if(DSD_HAS_RADIO)
         nfm_ctcss_synth_drop
         -fA
         "Received tone: CTCSS 100\\.0 Hz.*Received tone: none"
-        "Received tone: CTCSS ([0-9]|[0-9][0-9]|[02-9][0-9][0-9]|1[1-9][0-9]|10[1-9])\\.[0-9] Hz|Received tone: CTCSS 100\\.[1-9] Hz"
+        "Received tone: CTCSS ([0-9]|[0-9][0-9]|[02-9][0-9][0-9]|1[1-9][0-9]|10[1-9])\\.[0-9] Hz|Received tone: CTCSS 100\\.[1-9] Hz|Received tone: DCS"
     )
-    # Voice with no tone: positively "none", and never a tone.
+    # Voice with no tone: positively "none", and never a tone or a code.
     dsd_neo_add_iq_decode_test(
         DECODE_IQ_ANALOG_CTCSS_NOTONE
         nfm_notone_synth
         -fA
         "Received tone: none"
-        "Received tone: CTCSS"
+        "Received tone: (CTCSS|DCS)"
+    )
+    # Received DCS on the analog FM monitor (issue #523): synthetic NFM with voice and a DCS
+    # word at 600 Hz deviation, correct by construction (tools/build_iq_fixtures.py), replayed
+    # the same way. Each asserts the signal the log names by both of its standard spellings,
+    # canonical first -- D023N is also D047I, and the inverted word is the signal of D047N,
+    # also D023I, so it must read "D047N / D023I", never "D023N / D047I" -- and that nothing
+    # else was reported: any label led by another spelling. "Any other code" is spelled out
+    # digit by digit, as for the tones above.
+    dsd_neo_add_iq_decode_test(
+        DECODE_IQ_ANALOG_DCS_023N
+        nfm_dcs_synth_023n
+        -fA
+        "Received tone: DCS D023N / D047I"
+        "Received tone: (none|CTCSS|DCS D([1-7][0-7][0-7]|0[013-7][0-7]|02[0-24-7])[NI]|DCS D023I)"
+    )
+    dsd_neo_add_iq_decode_test(
+        DECODE_IQ_ANALOG_DCS_023I
+        nfm_dcs_synth_023i
+        -fA
+        "Received tone: DCS D047N / D023I"
+        "Received tone: (none|CTCSS|DCS D([1-7][0-7][0-7]|0[0-35-7][0-7]|04[0-6])[NI]|DCS D047I)"
+    )
+    # Malformed: D023N's word two bits wrong in every repetition, no code at all. It must be
+    # rejected: positively "none", and never a code or a tone.
+    dsd_neo_add_iq_decode_test(
+        DECODE_IQ_ANALOG_DCS_NOISY
+        nfm_dcs_synth_noisy
+        -fA
+        "Received tone: none"
+        "Received tone: (CTCSS|DCS)"
+    )
+    # The code stops at 1.2 s with no turn-off tone while the carrier and voice carry on:
+    # D023N (also D047I), then none.
+    dsd_neo_add_iq_decode_test(
+        DECODE_IQ_ANALOG_DCS_DROP
+        nfm_dcs_synth_drop
+        -fA
+        "Received tone: DCS D023N / D047I.*Received tone: none"
+        "Received tone: (CTCSS|DCS D([1-7][0-7][0-7]|0[013-7][0-7]|02[0-24-7])[NI]|DCS D023I)"
+    )
+    # Voice with no code through the narrowest NFM channel: positively "none", and never a
+    # code. DECODE_IQ_ANALOG_CTCSS_NOTONE covers the same voice at the default width, which
+    # fails on a code too, so this case replays it through another channel filter.
+    dsd_neo_add_iq_decode_test(
+        DECODE_IQ_ANALOG_DCS_NOCODE
+        nfm_notone_synth
+        "-fA --nfm-bandwidth-hz 8000"
+        "Received tone: none"
+        "Received tone: DCS"
     )
     # Analog monitor cases like the audio checks further down, so -L analog runs them too.
     set_tests_properties(
@@ -11664,6 +13841,11 @@ if(DSD_HAS_RADIO)
         DECODE_IQ_ANALOG_CTCSS_670
         DECODE_IQ_ANALOG_CTCSS_DROP
         DECODE_IQ_ANALOG_CTCSS_NOTONE
+        DECODE_IQ_ANALOG_DCS_023N
+        DECODE_IQ_ANALOG_DCS_023I
+        DECODE_IQ_ANALOG_DCS_NOISY
+        DECODE_IQ_ANALOG_DCS_DROP
+        DECODE_IQ_ANALOG_DCS_NOCODE
         PROPERTIES LABELS "iq-decode;analog"
     )
     # Issue #525: the tone detector listens behind the NFM channel filter, so the width
@@ -11674,19 +13856,343 @@ if(DSD_HAS_RADIO)
         nfm_ctcss_synth_1000
         "-fA --nfm-bandwidth-hz 8000"
         "Received tone: CTCSS 100\\.0 Hz"
-        "Received tone: (none|CTCSS ([0-9]|[0-9][0-9]|[02-9][0-9][0-9]|1[1-9][0-9]|10[1-9])\\.[0-9] Hz|CTCSS 100\\.[1-9] Hz)"
+        "Received tone: (none|DCS|CTCSS ([0-9]|[0-9][0-9]|[02-9][0-9][0-9]|1[1-9][0-9]|10[1-9])\\.[0-9] Hz|CTCSS 100\\.[1-9] Hz)"
     )
     dsd_neo_add_iq_decode_test(
         DECODE_IQ_ANALOG_CTCSS_1000_NFM_25K
         nfm_ctcss_synth_1000
         "-fA --nfm-bandwidth-hz 25000"
         "Received tone: CTCSS 100\\.0 Hz"
-        "Received tone: (none|CTCSS ([0-9]|[0-9][0-9]|[02-9][0-9][0-9]|1[1-9][0-9]|10[1-9])\\.[0-9] Hz|CTCSS 100\\.[1-9] Hz)"
+        "Received tone: (none|DCS|CTCSS ([0-9]|[0-9][0-9]|[02-9][0-9][0-9]|1[1-9][0-9]|10[1-9])\\.[0-9] Hz|CTCSS 100\\.[1-9] Hz)"
     )
     set_tests_properties(
         DECODE_IQ_ANALOG_CTCSS_1000_NFM_8K
         DECODE_IQ_ANALOG_CTCSS_1000_NFM_25K
         PROPERTIES LABELS "iq-decode;analog"
+    )
+
+    # MBE capture (-d), issue #661: tests/iq_mbe_capture_check.cmake replays a fixture with -d <dir>/caps (no
+    # trailing separator) and checks the files it leaves: inside the folder, each headed by its own extension and
+    # holding whole records, at least one, as a capture created by its first frame does. Frame counts are lower bounds:
+    # the frames a replay captures are fixed for a build, not across them (docs/testing.md "Replay determinism").
+    function(dsd_neo_add_iq_mbe_capture_test test_name fixture mode expected)
+        cmake_parse_arguments(
+            _cap
+            ""
+            "EXT;FILES;MIN_FILES;MIN_FRAMES"
+            ""
+            ${ARGN}
+        )
+        add_test(
+            NAME ${test_name}
+            COMMAND
+                ${CMAKE_COMMAND} "-DDSD_BIN=$<TARGET_FILE:dsd-neo>"
+                "-DMODE=${mode}"
+                "-DFIXTURE=${_DSD_NEO_IQ_FIXTURE_DIR}/${fixture}.iq.json"
+                "-DEXPECTED=${expected}"
+                "-DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/mbe_capture/${test_name}"
+                "-DEXT=${_cap_EXT}" "-DFILES=${_cap_FILES}"
+                "-DMIN_FILES=${_cap_MIN_FILES}"
+                "-DMIN_FRAMES=${_cap_MIN_FRAMES}" -P
+                "${CMAKE_CURRENT_SOURCE_DIR}/iq_mbe_capture_check.cmake"
+        )
+        set_tests_properties(
+            ${test_name}
+            PROPERTIES LABELS "iq-decode;mbe-capture" TIMEOUT 120
+        )
+    endfunction()
+
+    dsd_neo_add_iq_mbe_capture_test(
+        DECODE_IQ_MBE_CAPTURE_DMR
+        dmr_voice
+        -fs
+        "Color Code=02"
+        EXT .amb
+        FILES 1
+        MIN_FRAMES 18
+    )
+    # The clear call under -q: every frame muted, so nothing is captured, not even its first frame.
+    dsd_neo_add_iq_mbe_capture_test(
+        DECODE_IQ_MBE_CAPTURE_DMR_REVERSE_MUTE
+        dmr_voice
+        "-fs -q"
+        "Color Code=02"
+        FILES 0
+    )
+    dsd_neo_add_iq_mbe_capture_test(
+        DECODE_IQ_MBE_CAPTURE_DSTAR
+        dstar
+        -fd
+        "SRC: KB7WUK"
+        EXT .dmb
+        MIN_FILES 1
+        MIN_FRAMES 100
+    )
+    dsd_neo_add_iq_mbe_capture_test(
+        DECODE_IQ_MBE_CAPTURE_NXDN48
+        nxdn48
+        -fi
+        "Src=901"
+        EXT .amb
+        MIN_FILES 1
+        MIN_FRAMES 180
+    )
+    dsd_neo_add_iq_mbe_capture_test(
+        DECODE_IQ_MBE_CAPTURE_P25P1
+        p25p1_c4fm_vc
+        -f1
+        "Group Voice Channel User"
+        EXT .imb
+        MIN_FILES 1
+        MIN_FRAMES 60
+    )
+    dsd_neo_add_iq_mbe_capture_test(
+        DECODE_IQ_MBE_CAPTURE_PROVOICE
+        provoice
+        "-fp -Z"
+        "IMBE [0-9A-F]+ err = "
+        EXT .imb
+        MIN_FILES 1
+        MIN_FRAMES 128
+    )
+    dsd_neo_add_iq_mbe_capture_test(
+        DECODE_IQ_MBE_CAPTURE_DPMR
+        dpmr_synth
+        -fm
+        "Src=7654321"
+        EXT .amb
+        MIN_FILES 1
+        MIN_FRAMES 185
+    )
+    # YSF V/D2 decodes straight through mbelib; its frames are captured once a FICH has verified the transmission.
+    dsd_neo_add_iq_mbe_capture_test(
+        DECODE_IQ_MBE_CAPTURE_YSF
+        ysf
+        -fy
+        "V/D2 RID Mode Repeater CC"
+        EXT .amb
+        MIN_FILES 1
+        MIN_FRAMES 160
+    )
+    # The digital voice chain (issue #653): tests/iq_voice_chain_check.cmake replays a fixture with per-call WAVs (-P)
+    # under integer output to stdout, float output (-y) to stdout and the null output, and requires byte-identical
+    # per-call WAVs from all three, as many float samples as integer ones, a float output the digital high-pass changes,
+    # and, with PLAYBACK_MATCH (one call, mono preset), the integer stdout equal to the per-call WAV's samples.
+    function(dsd_neo_add_iq_voice_chain_test test_name fixture mode expected)
+        cmake_parse_arguments(_chain "PLAYBACK_MATCH" "" "" ${ARGN})
+        set(_match OFF)
+        if(_chain_PLAYBACK_MATCH)
+            set(_match ON)
+        endif()
+        add_test(
+            NAME ${test_name}
+            COMMAND
+                ${CMAKE_COMMAND} "-DDSD_BIN=$<TARGET_FILE:dsd-neo>"
+                "-DMODE=${mode}"
+                "-DFIXTURE=${_DSD_NEO_IQ_FIXTURE_DIR}/${fixture}.iq.json"
+                "-DEXPECTED=${expected}"
+                "-DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/voice_chain/${test_name}"
+                "-DPLAYBACK_MATCH=${_match}" -P
+                "${CMAKE_CURRENT_SOURCE_DIR}/iq_voice_chain_check.cmake"
+        )
+        set_tests_properties(
+            ${test_name}
+            PROPERTIES LABELS "iq-decode;voice-chain" TIMEOUT 300
+        )
+    endfunction()
+
+    dsd_neo_add_iq_voice_chain_test(
+        DECODE_IQ_VOICE_CHAIN_P25P1
+        p25p1_c4fm_vc
+        -f1
+        "Group Voice Channel User"
+        PLAYBACK_MATCH
+    )
+    dsd_neo_add_iq_voice_chain_test(
+        DECODE_IQ_VOICE_CHAIN_P25P1_AUTO
+        p25p1_c4fm_vc
+        -fa
+        "Group Voice Channel User"
+    )
+    dsd_neo_add_iq_voice_chain_test(
+        DECODE_IQ_VOICE_CHAIN_NXDN96
+        nxdn96
+        -fn
+        "RAN 00"
+        PLAYBACK_MATCH
+    )
+    dsd_neo_add_iq_voice_chain_test(
+        DECODE_IQ_VOICE_CHAIN_DMR
+        dmr_voice
+        -fs
+        "Color Code=02"
+    )
+    dsd_neo_add_iq_voice_chain_test(
+        DECODE_IQ_VOICE_CHAIN_DSTAR
+        dstar
+        -fd
+        "SRC: KB7WUK"
+    )
+    dsd_neo_add_iq_voice_chain_test(
+        DECODE_IQ_VOICE_CHAIN_YSF
+        ysf
+        -fy
+        "V/D2 RID Mode Repeater CC"
+    )
+    dsd_neo_add_iq_voice_chain_test(
+        DECODE_IQ_VOICE_CHAIN_PROVOICE
+        provoice
+        "-fp -Z"
+        "IMBE [0-9A-F]+ err = "
+    )
+
+    # Receiver noise under dPMR alone: false FS2 syncs synthesize nothing, so they leave no file.
+    dsd_neo_add_iq_mbe_capture_test(
+        DECODE_IQ_MBE_CAPTURE_NOISE_DPMR
+        noise_floor
+        -fm
+        "Total audio errors: 0"
+        FILES 0
+    )
+    # AUTO cases check what holds whatever the hunt's phase (docs/testing.md): every file is well formed and holds
+    # at least one frame, and YSF is captured at all.
+    dsd_neo_add_iq_mbe_capture_test(
+        DECODE_IQ_MBE_CAPTURE_NOISE_AUTO
+        noise_floor
+        -fa
+        "Total audio errors"
+    )
+    dsd_neo_add_iq_mbe_capture_test(
+        DECODE_IQ_MBE_CAPTURE_YSF_AUTO
+        ysf
+        -fa
+        "V/D2 RID Mode Repeater CC"
+        EXT .amb
+        MIN_FILES 1
+    )
+
+    # Float output (-y), issue #652: tests/iq_float_output_check.cmake replays a fixture with 16-bit output and with
+    # -y, each to stdout (-o -) and a static WAV (-w), and the comparator requires the float stream to be the 16-bit
+    # stream as f32 (s16 / 32768, bit for bit: no NaN, nothing past full scale), audio in it, and identical static WAVs.
+    # BOTH_EARS: a single call plays in both channels; SILENT: both formats mute the same call; SINK null: -o null.
+    add_executable(
+        dsd-neo_test_float_output_compare
+        core/float_output_compare.c
+    )
+    target_link_libraries(
+        dsd-neo_test_float_output_compare
+        PRIVATE dsd-neo_platform
+    )
+    function(
+        dsd_neo_add_iq_float_output_test
+        test_name
+        fixture
+        mode
+        expected
+        channels
+    )
+        cmake_parse_arguments(_flt "BOTH_EARS;SILENT;NULL_SINK" "" "" ${ARGN})
+        set(_sink stdout)
+        if(_flt_NULL_SINK)
+            set(_sink null)
+        endif()
+        add_test(
+            NAME ${test_name}
+            COMMAND
+                ${CMAKE_COMMAND} "-DDSD_BIN=$<TARGET_FILE:dsd-neo>"
+                "-DCOMPARE_BIN=$<TARGET_FILE:dsd-neo_test_float_output_compare>"
+                "-DMODE=${mode}"
+                "-DFIXTURE=${_DSD_NEO_IQ_FIXTURE_DIR}/${fixture}.iq.json"
+                "-DEXPECTED=${expected}"
+                "-DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/float_output/${test_name}"
+                "-DCHANNELS=${channels}" "-DBOTH_EARS=${_flt_BOTH_EARS}"
+                "-DSILENT=${_flt_SILENT}" "-DSINK=${_sink}" -P
+                "${CMAKE_CURRENT_SOURCE_DIR}/iq_float_output_check.cmake"
+        )
+        set_tests_properties(
+            ${test_name}
+            PROPERTIES LABELS "iq-decode;float-output" TIMEOUT 240
+        )
+    endfunction()
+
+    # A single DMR call (slot 2) in both ears: float output's mixer left the idle slot 1's channel silent.
+    dsd_neo_add_iq_float_output_test(
+        DECODE_IQ_FLOAT_OUTPUT_DMR
+        dmr_voice
+        -fs
+        "Color Code=02"
+        2
+        BOTH_EARS
+    )
+    dsd_neo_add_iq_float_output_test(
+        DECODE_IQ_FLOAT_OUTPUT_P25P1
+        p25p1_c4fm_vc
+        -f1
+        "Group Voice Channel User"
+        1
+    )
+    # Stereo FDMA at full level in both ears: float output's mixer halved it.
+    dsd_neo_add_iq_float_output_test(
+        DECODE_IQ_FLOAT_OUTPUT_P25P1_AUTO
+        p25p1_c4fm_vc
+        -fa
+        "Group Voice Channel User"
+        2
+        BOTH_EARS
+    )
+    # -g 50 is the fixed x50 gain in both formats: float output's gain stage divided by zero there.
+    dsd_neo_add_iq_float_output_test(
+        DECODE_IQ_FLOAT_OUTPUT_P25P1_GAIN_50
+        p25p1_c4fm_vc
+        "-f1 -g 50"
+        "Group Voice Channel User"
+        1
+    )
+    dsd_neo_add_iq_float_output_test(
+        DECODE_IQ_FLOAT_OUTPUT_NXDN96
+        nxdn96
+        -fn
+        "RAN 00"
+        1
+    )
+    # Reverse mute under AUTO mutes the clear call in both formats: float output's mixer played it.
+    dsd_neo_add_iq_float_output_test(
+        DECODE_IQ_FLOAT_OUTPUT_NXDN96_AUTO_REVERSE_MUTE
+        nxdn96
+        "-fa -q"
+        "RAN 00"
+        2
+        SILENT
+    )
+    dsd_neo_add_iq_float_output_test(
+        DECODE_IQ_FLOAT_OUTPUT_DSTAR
+        dstar
+        -fd
+        "SRC: KB7WUK"
+        1
+    )
+    dsd_neo_add_iq_float_output_test(
+        DECODE_IQ_FLOAT_OUTPUT_YSF
+        ysf
+        -fy
+        "V/D2 RID Mode Repeater CC"
+        1
+    )
+    dsd_neo_add_iq_float_output_test(
+        DECODE_IQ_FLOAT_OUTPUT_PROVOICE
+        provoice
+        -fp
+        "Decoding only ProVoice frames"
+        1
+    )
+    # The static WAV with no playback (-o null) in both formats.
+    dsd_neo_add_iq_float_output_test(
+        DECODE_IQ_FLOAT_OUTPUT_DMR_NULL_SINK
+        dmr_voice
+        -fs
+        "Color Code=02"
+        2
+        NULL_SINK
     )
 
     # Restart safety: bootstrap + engine lifecycle twice inside one process, the
@@ -11712,6 +14218,307 @@ if(DSD_HAS_RADIO)
     )
     add_test(NAME ENGINE_RESTART COMMAND dsd-neo_test_engine_restart)
     set_tests_properties(ENGINE_RESTART PROPERTIES TIMEOUT 240)
+endif()
+
+# Replay determinism (issue #572). Under --iq-replay the decoder paces the front end and
+# the decode clock follows the capture, so every replay of a capture must decode the
+# same way. dsd-neo_test_replay_jitter runs the real engine on the arguments dsd-neo
+# would get and perturbs only the decoder's side: seeded sleeps after its reads (1.5 s
+# total at most), reads capped at seeded short counts, and, where GNU ld can replace the
+# audio device (--wrap, as CORE_AUDIO_ENSURE_OUTPUT does), an asynchronous sink whose
+# device stalls. It prints the REPLAY STREAM line the runner compares and checks against
+# MIN_FSK/MIN_CQPSK, and a REPLAY WALL line with the real time its engine run took,
+# which a realtime leg's pacing check reads. tests/iq_determinism_check.cmake runs each
+# leg of RUNS, keeps iq_decode_check.cmake's exit-code and sanitizer checks for each,
+# and requires the legs' decoder output to match line for line, capture-time
+# timestamps included.
+if(DSD_HAS_RADIO)
+    add_executable(dsd-neo_test_replay_jitter engine/replay_jitter.c)
+    target_include_directories(
+        dsd-neo_test_replay_jitter
+        PRIVATE ${PROJECT_SOURCE_DIR}/include
+    )
+    target_link_libraries(
+        dsd-neo_test_replay_jitter
+        PRIVATE dsd-neo_engine dsd-neo_io_radio ${LIBS}
+    )
+    set(_DSD_NEO_REPLAY_SINK_WRAP OFF)
+    if(NOT APPLE AND NOT WIN32 AND (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang"))
+        set(_DSD_NEO_REPLAY_SINK_WRAP ON)
+        target_compile_definitions(
+            dsd-neo_test_replay_jitter
+            PRIVATE DSD_NEO_TEST_AUDIO_WRAP
+        )
+        target_link_options(
+            dsd-neo_test_replay_jitter
+            PRIVATE
+                "LINKER:--wrap=dsd_audio_open_output"
+                "LINKER:--wrap=dsd_audio_write"
+                "LINKER:--wrap=dsd_audio_output_health_get"
+                "LINKER:--wrap=dsd_audio_drain"
+                "LINKER:--wrap=dsd_audio_close"
+        )
+    endif()
+
+    # dsd_neo_add_iq_determinism_test(name fixture mode runs expected min_fsk min_cqpsk
+    #                                 min_total [NOT_EXPECTED regex])
+    # runs is the ;-list of legs (see iq_determinism_check.cmake for the leg grammar).
+    # min_total floors FSK samples + 8 x CQPSK symbols, which no hunt split moves.
+    function(
+        dsd_neo_add_iq_determinism_test
+        test_name
+        fixture
+        mode
+        runs
+        expected
+        min_fsk
+        min_cqpsk
+        min_total
+    )
+        cmake_parse_arguments(PARSE_ARGV 8 _det "" "NOT_EXPECTED" "")
+        set(_not_expected_arg)
+        if(DEFINED _det_NOT_EXPECTED)
+            set(_not_expected_arg "-DNOT_EXPECTED=${_det_NOT_EXPECTED}")
+        endif()
+        add_test(
+            NAME ${test_name}
+            COMMAND
+                ${CMAKE_COMMAND}
+                "-DHOST_BIN=$<TARGET_FILE:dsd-neo_test_replay_jitter>"
+                "-DMODE=${mode}"
+                "-DFIXTURE=${_DSD_NEO_IQ_FIXTURE_DIR}/${fixture}.iq.json"
+                "-DRUNS=${runs}" "-DEXPECTED=${expected}" "-DMIN_FSK=${min_fsk}"
+                "-DMIN_CQPSK=${min_cqpsk}" "-DMIN_TOTAL=${min_total}"
+                ${_not_expected_arg} -P
+                "${CMAKE_CURRENT_SOURCE_DIR}/iq_determinism_check.cmake"
+        )
+        set_tests_properties(
+            ${test_name}
+            PROPERTIES LABELS "iq-decode;iq-determinism" TIMEOUT 600
+        )
+    endfunction()
+
+    # A jitter leg that names AFTER_MS must sleep after a read that ended there or
+    # later: a leg whose budget runs out before its case's retune, gap or squelch edge
+    # perturbs nothing past it. Negative control: AFTER_MS 99999 lies past the end of
+    # nfm_burst_synth's 750 ms, so the runner must fail the leg on that check (its
+    # message is printed only by that FATAL_ERROR, which CMake wraps at spaces).
+    add_test(
+        NAME DECODE_IQ_NEG_DETERMINISM_JITTER_AFTER
+        COMMAND
+            ${CMAKE_COMMAND}
+            "-DHOST_BIN=$<TARGET_FILE:dsd-neo_test_replay_jitter>" "-DMODE=-fA"
+            "-DFIXTURE=${_DSD_NEO_IQ_FIXTURE_DIR}/nfm_burst_synth.iq.json"
+            "-DRUNS=fast;jitter:7:120:64:99999" "-DEXPECTED=REPLAY STREAM"
+            "-DMIN_FSK=0" "-DMIN_CQPSK=0" "-DMIN_TOTAL=0" -P
+            "${CMAKE_CURRENT_SOURCE_DIR}/iq_determinism_check.cmake"
+    )
+    set_tests_properties(
+        DECODE_IQ_NEG_DETERMINISM_JITTER_AFTER
+        PROPERTIES
+            LABELS "iq-decode;iq-determinism"
+            TIMEOUT 600
+            PASS_REGULAR_EXPRESSION
+                "before[ \n]+99999[ \n]+ms,[ \n]+perturbed[ \n]+nothing[ \n]+past[ \n]+it"
+    )
+
+    # nxdn48_after_retune under -fa: the SPS hunt, the RETUNE/MUTE/RESET/MUTE group and the
+    # call after it. Two fast replays, two with seeded sleeps after reads and one with short
+    # reads must match the first. Each leg measured fsk_samples=605114 cqpsk_symbols=5342
+    # generation_changes=3 media_ms=13679.666666 (13.5 s of samples plus the two MUTEs): the
+    # hunt runs the front end on its CQPSK path (6000 symbols/s, 8 samples each) for 0.89 s,
+    # so the legs cross output kinds and generations, and the FSK samples and CQPSK symbols
+    # together cover all but 150 of the capture's 648,000 samples. The verbatim REPLAY
+    # STREAM comparison already catches a leg that reads less than the others; the floors
+    # catch every leg reading too little, and are sized to survive a legitimate change to
+    # the hunt's visit and credit accounting. One CQPSK dwell is a fixed 3 passes x 1800 =
+    # 5,400 symbols (DSD_FRAME_SYNC_NO_SYNC_PASS_SYMBOLS), and the hunt's request to leave
+    # the path lands at the next replay block, so the count is about one dwell (with 64 KiB
+    # blocks, 683 ms of this capture, the request landed up to a block late and the count
+    # was 8,189). MIN_CQPSK 5,000 sits just under one dwell, so it still proves the hunt
+    # dwelt on the CQPSK path. The FSK count moves the other way: 648,000 - 150 - 8 x
+    # cqpsk_symbols. MIN_FSK 535,000 is the measured 605,114 less one more full CQPSK dwell
+    # (5,400 x 8 = 43,200 samples, leaving 561,914) and room to spare, and it still holds
+    # 83 % of the capture to the FSK path. The two together, 605,114 + 8 x 5,342 = 647,850
+    # front-end samples, do not depend on that split at all, so MIN_TOTAL 647,000 holds
+    # every leg to all but 1,000 of the capture's 648,000.
+    # The jitter legs must still be sleeping past the RETUNE/MUTE/RESET/MUTE group, which
+    # ends at 7,680 ms of capture time (7.5 s of samples and the two MUTEs): AFTER_MS 7700.
+    set(_nxdn48_retune_min_fsk 535000)
+    set(_nxdn48_retune_min_cqpsk 5000)
+    set(_nxdn48_retune_min_total 647000)
+    dsd_neo_add_iq_determinism_test(
+        DECODE_IQ_NXDN48_AFTER_RETUNE_AUTO_DETERMINISM
+        nxdn48_after_retune
+        -fa
+        "fast;fast;jitter:7:120:128:7700;jitter:11:120:128:7700;short:13"
+        "Src=901"
+        ${_nxdn48_retune_min_fsk}
+        ${_nxdn48_retune_min_cqpsk}
+        ${_nxdn48_retune_min_total}
+    )
+    # Paced at the capture's own rate the decoder reads the same stream: realtime must
+    # match fast, with and without seeded sleeps on top. Each realtime leg takes the
+    # capture's 13.7 s of air time.
+    dsd_neo_add_iq_determinism_test(
+        DECODE_IQ_NXDN48_AFTER_RETUNE_AUTO_DETERMINISM_REALTIME
+        nxdn48_after_retune
+        -fa
+        "fast;realtime"
+        "Src=901"
+        ${_nxdn48_retune_min_fsk}
+        ${_nxdn48_retune_min_cqpsk}
+        ${_nxdn48_retune_min_total}
+    )
+    # This leg runs with SOURCE_DATE_EPOCH set, as in a reproducible build, where
+    # CMake's string(TIMESTAMP) returns that fixed time: the pacing check reads the
+    # host's own REPLAY WALL time, so the setting must not reach it, or every realtime
+    # leg would read 0 ms of elapsed time and fail. The _JITTER leg and the gap leg
+    # below keep the plain environment covered.
+    set_tests_properties(
+        DECODE_IQ_NXDN48_AFTER_RETUNE_AUTO_DETERMINISM_REALTIME
+        PROPERTIES ENVIRONMENT "SOURCE_DATE_EPOCH=1700000000"
+    )
+    dsd_neo_add_iq_determinism_test(
+        DECODE_IQ_NXDN48_AFTER_RETUNE_AUTO_DETERMINISM_REALTIME_JITTER
+        nxdn48_after_retune
+        -fa
+        "fast;realtime+jitter:17:120:128:7700"
+        "Src=901"
+        ${_nxdn48_retune_min_fsk}
+        ${_nxdn48_retune_min_cqpsk}
+        ${_nxdn48_retune_min_total}
+    )
+    # Audio output is real time: a sink whose device stops taking audio must not reach
+    # back into the decoder. Against a sink that takes everything, a stalled one (which
+    # must back up and drop, or the host fails the leg) leaves the decoder's lines and
+    # the audio it handed over (REPLAY SINK) unchanged.
+    if(_DSD_NEO_REPLAY_SINK_WRAP)
+        # The auto squelch gates the analog monitor sample by sample (issue #518): fast,
+        # jittered and realtime replays must hand the sink the same audio, gated at the
+        # same samples (the burst's 280 ms, 14 writes of 960). The monitor reads one
+        # sample at a time, so there is no read for a short-read leg to cut, and 280 ms
+        # of audio cannot back up a stalled sink; the NXDN case below covers that. The
+        # noise squelch gates the same way (its 240 ms, 12 writes), and so does the level
+        # squelch at a live block's cadence (its 260 ms, 13 writes). One read a sample would
+        # spend the jitter budget in the first 30 ms, so the jitter legs sleep after about
+        # one read in 1,500 and must still be sleeping past the carrier's end (550 ms).
+        foreach(
+            _sql_case
+            IN
+            ITEMS
+                "AUTO_NFM;nfm_burst_synth;-fA --squelch auto"
+                "AUTO_AM;am_burst_synth;-fM --squelch auto"
+                "NOISE_NFM;nfm_burst_synth;-fA --squelch noise"
+                "LEVEL_NFM;nfm_burst_synth;-fA --squelch -28"
+                "LEVEL_AM;am_burst_synth;-fM --squelch -30"
+        )
+            list(GET _sql_case 0 _sql_kind)
+            list(GET _sql_case 1 _sql_fixture)
+            list(GET _sql_case 2 _sql_mode)
+            dsd_neo_add_iq_determinism_test(
+                DECODE_IQ_ANALOG_SQL_${_sql_kind}_DETERMINISM
+                ${_sql_fixture}
+                "${_sql_mode}"
+                "sink:free;sink:free+jitter:7:120:1500:550;sink:free+jitter:11:120:1500:550;sink:free+realtime"
+                "monitor_samples=359[0-9][0-9] .*REPLAY SINK: stream=0 rate=48000 channels=1 async=1 writes=1[1-6] "
+                0
+                0
+                0
+            )
+        endforeach()
+        dsd_neo_add_iq_determinism_test(
+            DECODE_IQ_NXDN48_AFTER_RETUNE_AUTO_DETERMINISM_STALLED_SINK
+            nxdn48_after_retune
+            -fa
+            "sink:free;sink:stalled"
+            "Src=901"
+            ${_nxdn48_retune_min_fsk}
+            ${_nxdn48_retune_min_cqpsk}
+            ${_nxdn48_retune_min_total}
+        )
+    endif()
+    # The input-level advisories are decoder lines too, compared like the rest: their 10 s
+    # cooldown runs on decode time (dsd_input_level_publish()), so a replay prints each at the
+    # same capture time however fast it runs. ysf_gap (DERIVED_GAP in
+    # tools/build_iq_fixtures.py) is a sidecar on ysf's data, RF HOT in every block a replay
+    # hands the demod, with a 12 s capture gap (a MUTE) 4 s in: every leg warns as the replay
+    # starts and again 16 s in, right after the gap, and decodes the repeater's frames
+    # between the two. On real time a fast leg finished before the cooldown ran out and
+    # printed only the first. Each leg measured fsk_samples=287933 cqpsk_symbols=0
+    # media_ms=18000 (all but 67 of the capture's 288,000 samples, plus the gap); the floors
+    # sit just under that. The jitter leg must still be sleeping after the gap, which ends at
+    # 16 s of capture time.
+    dsd_neo_add_iq_determinism_test(
+        DECODE_IQ_YSF_GAP_ADVISORY_DETERMINISM
+        ysf_gap
+        -fy
+        "fast;realtime;jitter:29:120:64:16000"
+        "RF Level HOT.*Repeater CC.*RF Level HOT"
+        287000
+        0
+        287000
+    )
+    # The end of a replay must not reach the decoder before it has decoded the last samples.
+    # rf_clip (DERIVED_CLIP in tools/build_iq_fixtures.py) is two replay chunks of an
+    # in-range tone and then one chunk on the cu8 rails. The decoder polls the input level
+    # every 64 symbols, and its poll at symbol 64 (of 70) lands while it decodes the last
+    # chunk, after the read that took its last samples, with the next read the one that
+    # ends the stream: the CLIP advisory comes from that poll. Ending the stream on the read
+    # that took the last samples cleared the level under it, and no leg warned. The short-read
+    # leg cuts that last chunk's 26 symbols into reads of 7 and 19 (seed 16), and the poll
+    # comes after the second. With four reads a jitter leg would hardly sleep. Each leg
+    # measured fsk_samples=0 cqpsk_symbols=70 media_ms=16; MIN_CQPSK 68 and MIN_TOTAL 544
+    # (8 x 68) sit just under it.
+    dsd_neo_add_iq_determinism_test(
+        DECODE_IQ_RF_CLIP_EOF_DETERMINISM
+        rf_clip
+        "-f1 -mq"
+        "fast;realtime;short:16"
+        "RF Level CLIP 100.0%"
+        0
+        68
+        544
+    )
+    # The CQPSK path decoding real frames: p25p2_cc under -f2 runs the front end's CQPSK
+    # chain for the whole capture (fsk_samples=0 cqpsk_symbols=11992 media_ms=2000, so
+    # 95,936 of its 96,000 samples), and fast, short-read and jitter legs must decode its
+    # SACCH the same way. MIN_CQPSK 11,900 and MIN_TOTAL 95,000 sit just under that.
+    # The jitter leg sleeps after about one read in 16 of the decoder's ~690 and must still
+    # be sleeping past 1.5 s.
+    dsd_neo_add_iq_determinism_test(
+        DECODE_IQ_P25P2_CC_DETERMINISM
+        p25p2_cc
+        -f2
+        "fast;short:19;jitter:23:120:16:1500"
+        "P25p2 SACCH"
+        0
+        11900
+        95000
+    )
+
+    # The runner's realtime pacing check reads a leg's wall time from the host's
+    # REPLAY WALL line alone (CMake's own clock reads whole seconds before 3.23, which
+    # made an 85 ms capture's realtime leg 0 ms). Against a stand-in host that prints
+    # a passing leg of a 1 s capture with the REPLAY WALL line each case picks, a
+    # missing line or a line without wall_ms fails the runner, 899 ms fails the 90 %
+    # floor and 900 ms meets it.
+    add_executable(
+        dsd-neo_test_iq_determinism_check_wall
+        engine/test_iq_determinism_check_wall.c
+    )
+    add_test(
+        NAME IQ_DETERMINISM_CHECK_WALL
+        COMMAND
+            ${CMAKE_COMMAND}
+            "-DFAKE_HOST=$<TARGET_FILE:dsd-neo_test_iq_determinism_check_wall>"
+            "-DRUNNER=${CMAKE_CURRENT_SOURCE_DIR}/iq_determinism_check.cmake" -P
+            "${CMAKE_CURRENT_SOURCE_DIR}/cmake/IqDeterminismCheckWall.cmake"
+    )
+    set_tests_properties(
+        IQ_DETERMINISM_CHECK_WALL
+        PROPERTIES LABELS "iq-determinism" TIMEOUT 120
+    )
 endif()
 
 if(DSD_HAS_RADIO)
@@ -11754,8 +14561,9 @@ if(DSD_HAS_RADIO)
     # Issue #521: a row's --squelch-db gates the demodulator end to end. nxdn48_attenuated is
     # nxdn48 replayed 20 dB down (tools/build_iq_fixtures.py --derived-only). Measured post-LPF
     # channel power (demod channel_pwr, fast replay): the leading 0.8 s is digital silence and
-    # the signal-bearing replay block reads -25.8 dB (nxdn48 itself: -5.8 dB). Every threshold
-    # below sits at least 10 dB from that: -10 dB closes the row, -40 dB and off open it. The
+    # the signal reads -25.7 dB in the median replay block, -28.6 to -24.8 dB in every block
+    # once it is on (nxdn48 itself: about -5.8 dB). Every threshold below sits at least 10 dB
+    # from that: -10 dB closes the row, -40 dB and off open it. The
     # host's DSD_NEO_SCAN_REPLAY_DEFAULT_SQL_DB sets the configured default the row overrides
     # (I/Q replay has no other way to take one), so OPEN and OFF prove the row -- not the
     # default -- opened the gate, and INHERIT proves a row without the switch keeps the default.
@@ -11826,140 +14634,307 @@ endif()
 # line; the negative controls at the end of this block show that a missed bound fails.
 # Thresholds sit well clear of the values measured when each case was added;
 # docs/testing.md records those values and what each case pins.
+add_executable(dsd-neo_test_analog_replay engine/analog_replay.c)
+target_include_directories(
+    dsd-neo_test_analog_replay
+    PRIVATE ${PROJECT_SOURCE_DIR}/include ${LIBSNDFILE_INCLUDE_DIR}
+)
+# --analog-iq-gain-db reads the committed fixtures only, from this directory.
+target_compile_definitions(
+    dsd-neo_test_analog_replay
+    PRIVATE
+        "DSD_NEO_TEST_IQ_FIXTURE_DIR=\"${PROJECT_SOURCE_DIR}/tests/fixtures/iq\""
+)
+target_link_libraries(
+    dsd-neo_test_analog_replay
+    PRIVATE
+        dsd-neo_engine
+        dsd-neo_feature_radio
+        ${LIBS}
+        ${DSD_NEO_TEST_MATH_LIB}
+)
+# The RTL read adapters the replay cases count stream time through (USE_RADIO); the --analog-pcm-tap cases need none.
 if(DSD_HAS_RADIO)
-    add_executable(dsd-neo_test_analog_replay engine/analog_replay.c)
-    target_include_directories(
-        dsd-neo_test_analog_replay
-        PRIVATE ${PROJECT_SOURCE_DIR}/include
-    )
-    target_link_libraries(
-        dsd-neo_test_analog_replay
-        PRIVATE dsd-neo_engine dsd-neo_io_radio ${LIBS} ${DSD_NEO_TEST_MATH_LIB}
-    )
+    target_link_libraries(dsd-neo_test_analog_replay PRIVATE dsd-neo_io_radio)
+endif()
 
-    # dsd_neo_add_analog_replay_test(name fixture mode [expected [not_expected]])
-    # expected defaults to "ANALOG AUDIO OK" (pass "" to keep the default); a case
-    # that also asserts a log line names that line instead, since exit code 0 already
-    # means every audio bound held. not_expected is a regex that must not appear.
-    function(dsd_neo_add_analog_replay_test test_name fixture mode)
-        set(_expected "ANALOG AUDIO OK")
-        if(ARGC GREATER 3 AND NOT "${ARGV3}" STREQUAL "")
-            set(_expected "${ARGV3}")
-        endif()
-        set(_not_expected_arg)
-        if(ARGC GREATER 4)
-            set(_not_expected_arg "-DNOT_EXPECTED=${ARGV4}")
-        endif()
-        add_test(
-            NAME ${test_name}
-            COMMAND
-                ${CMAKE_COMMAND}
-                "-DDSD_BIN=$<TARGET_FILE:dsd-neo_test_analog_replay>"
-                "-DMODE=${mode}"
-                "-DFIXTURE=${PROJECT_SOURCE_DIR}/tests/fixtures/iq/${fixture}.iq.json"
-                "-DEXPECTED=${_expected}" ${_not_expected_arg} -P
-                "${CMAKE_CURRENT_SOURCE_DIR}/iq_decode_check.cmake"
-        )
-        set_tests_properties(
-            ${test_name}
-            PROPERTIES LABELS "iq-decode;analog" TIMEOUT 120
-        )
-    endfunction()
+# The host scores a monitor block once however many writes it arrives in (issue #633).
+add_test(
+    NAME ANALOG_REPLAY_SELFTEST
+    COMMAND dsd-neo_test_analog_replay --analog-selftest
+)
 
+# dsd_neo_add_analog_replay_test(name fixture mode [expected [not_expected]])
+# expected defaults to "ANALOG AUDIO OK" (pass "" to keep the default); a case
+# that also asserts a log line names that line instead, since exit code 0 already
+# means every audio bound held. not_expected is a regex that must not appear.
+function(dsd_neo_add_analog_replay_test test_name fixture mode)
+    set(_expected "ANALOG AUDIO OK")
+    if(ARGC GREATER 3 AND NOT "${ARGV3}" STREQUAL "")
+        set(_expected "${ARGV3}")
+    endif()
+    set(_not_expected_arg)
+    if(ARGC GREATER 4)
+        set(_not_expected_arg "-DNOT_EXPECTED=${ARGV4}")
+    endif()
+    add_test(
+        NAME ${test_name}
+        COMMAND
+            ${CMAKE_COMMAND}
+            "-DDSD_BIN=$<TARGET_FILE:dsd-neo_test_analog_replay>"
+            "-DMODE=${mode}"
+            "-DFIXTURE=${PROJECT_SOURCE_DIR}/tests/fixtures/iq/${fixture}.iq.json"
+            "-DEXPECTED=${_expected}" ${_not_expected_arg} -P
+            "${CMAKE_CURRENT_SOURCE_DIR}/iq_decode_check.cmake"
+    )
+    set_tests_properties(
+        ${test_name}
+        PROPERTIES LABELS "iq-decode;analog" TIMEOUT 120
+    )
+endfunction()
+
+# The noise squelch on audio input (issue #628): the host turns a capture into the
+# discriminator audio a scanner's tap or an SDR program with its audio filtering off
+# would send (--analog-pcm-tap RATE, a 16-bit mono WAV) and runs it as -i, so the PCM
+# noise squelch learns its reference from the input and gates the monitor end to end.
+# These need no radio support. On the burst it opens on the same first full window of
+# carrier as the radio squelch (340 ms to the first audible block) and closes within a
+# window of its end (260 ms audible), at every level and through the staged 16 and
+# 12 kHz rates. Every case bounds the stream time consumed, which proves the tap ran.
+set(_pcm_sql_noise_burst_bounds
+    "--analog-audible-dbfs -40 --analog-min-total-ms 700 --analog-max-total-ms 800 --analog-min-first-audible-ms 330 --analog-max-first-audible-ms 380 --analog-min-audible-ms 200 --analog-max-audible-ms 290 --analog-max-clip 0"
+)
+# Plays from the start, as with the squelch off.
+set(_pcm_sql_plays_bounds
+    "--analog-audible-dbfs -40 --analog-min-total-ms 700 --analog-max-first-audible-ms 100 --analog-min-audible-ms 700"
+)
+dsd_neo_add_analog_replay_test(
+    DECODE_PCM_ANALOG_SQL_NOISE_TAP_BURST
+    nfm_burst_synth
+    "-fA --squelch noise --analog-pcm-tap 48000 --analog-max-delivery-error-pct 0.5 ${_pcm_sql_noise_burst_bounds}"
+)
+# A source 10 dB louder measures the same: the reference is learned from the input.
+dsd_neo_add_analog_replay_test(
+    DECODE_PCM_ANALOG_SQL_NOISE_TAP_BURST_HOT
+    nfm_burst_synth
+    "-fA --squelch noise --analog-pcm-tap 48000 --analog-pcm-gain-db 10 ${_pcm_sql_noise_burst_bounds}"
+    "discriminator tap at 48000 Hz, 36000 samples, 0 clipped.*ANALOG AUDIO OK"
+)
+# The staged rates: 16 kHz keeps the whole band, 12 kHz has 3.8-5.4 kHz of it.
+dsd_neo_add_analog_replay_test(
+    DECODE_PCM_ANALOG_SQL_NOISE_TAP_BURST_16K
+    nfm_burst_synth
+    "-fA --squelch noise --analog-pcm-tap 16000 --analog-max-delivery-error-pct 0.5 ${_pcm_sql_noise_burst_bounds}"
+)
+# A rate that does not divide 48 kHz (issue #633): the monitor runs at 44.1 kHz and its
+# audio reaches the 48 kHz sink converted, as long as the input it spans. Before the fix
+# each block went out as its 960 samples, 8% short. The squelch measures the same.
+dsd_neo_add_analog_replay_test(
+    DECODE_PCM_ANALOG_TAP_44K
+    nfm_burst_synth
+    "-fA --analog-pcm-tap 44100 --analog-max-delivery-error-pct 0.5 ${_pcm_sql_plays_bounds}"
+)
+# A 44.1 kHz block lasts 21.8 ms, so the first audible block starts at 326.5 ms where a
+# 20 ms block starts at 340 (the squelch opens in the same window); 261 ms are audible.
+set(_pcm_sql_noise_burst_44k_bounds
+    "--analog-audible-dbfs -40 --analog-min-total-ms 700 --analog-max-total-ms 800 --analog-min-first-audible-ms 315 --analog-max-first-audible-ms 380 --analog-min-audible-ms 200 --analog-max-audible-ms 290 --analog-max-clip 0"
+)
+dsd_neo_add_analog_replay_test(
+    DECODE_PCM_ANALOG_SQL_NOISE_TAP_BURST_44K
+    nfm_burst_synth
+    "-fA --squelch noise --analog-pcm-tap 44100 --analog-max-delivery-error-pct 0.5 ${_pcm_sql_noise_burst_44k_bounds}"
+)
+dsd_neo_add_analog_replay_test(
+    DECODE_PCM_ANALOG_SQL_NOISE_TAP_BURST_12K
+    nfm_burst_synth
+    "-fA --squelch noise --analog-pcm-tap 12000 ${_pcm_sql_noise_burst_bounds}"
+)
+# The burst quiets the band by about 22 dB, as on a radio input: under noise+30 it never
+# opens.
+dsd_neo_add_analog_replay_test(
+    DECODE_PCM_ANALOG_SQL_NOISE_TAP_MARGIN
+    nfm_burst_synth
+    "-fA --squelch noise+30 --analog-pcm-tap 48000 --analog-audible-dbfs -100 --analog-max-audible-ms 0 --analog-min-total-ms 700"
+)
+# Ten seconds of noise never open it, even at the lowest N.
+dsd_neo_add_analog_replay_test(
+    DECODE_PCM_ANALOG_SQL_NOISE_TAP_FLOOR
+    noise_floor
+    "-fA --squelch noise+3 --analog-pcm-tap 48000 --analog-audible-dbfs -100 --analog-max-audible-ms 0 --analog-min-total-ms 9900"
+)
+# Audio low-passed at 3 kHz has nothing above voice: the squelch says so after about a
+# second, closed until then, and plays the rest as with the squelch off (1080 ms to the
+# first audible block measured).
+dsd_neo_add_analog_replay_test(
+    DECODE_PCM_ANALOG_SQL_NOISE_TAP_LOWPASSED
+    noise_floor
+    "-fA --squelch noise --analog-pcm-tap 48000 --analog-pcm-lowpass-hz 3000 --analog-audible-dbfs -40 --analog-min-total-ms 9900 --analog-min-first-audible-ms 500 --analog-max-first-audible-ms 1500 --analog-min-audible-ms 8000"
+    "NOTICE: Noise squelch: nothing above the voice band on this input.*ANALOG AUDIO OK"
+)
+# An 8 kHz input leaves no room above voice: off from the start, and said once.
+dsd_neo_add_analog_replay_test(
+    DECODE_PCM_ANALOG_SQL_NOISE_TAP_NO_ROOM
+    nfm_burst_synth
+    "-fA --squelch noise --analog-pcm-tap 8000 ${_pcm_sql_plays_bounds}"
+    "NOTICE: Noise squelch: a 8000 Hz input leaves no room above the voice band.*ANALOG AUDIO OK"
+)
+# A session that starts on a carrier learns it as the reference, so it errs closed until
+# noise corrects it; nfm_ctcss_real never shows noise, so nothing of it plays.
+dsd_neo_add_analog_replay_test(
+    DECODE_PCM_ANALOG_SQL_NOISE_TAP_STARTS_ON_CARRIER
+    nfm_ctcss_real
+    "-fA --squelch noise --analog-pcm-tap 48000 --analog-audible-dbfs -100 --analog-max-audible-ms 0 --analog-min-total-ms 5900"
+)
+# The auto squelch has no channel power to learn from on audio input: it warns and plays.
+dsd_neo_add_analog_replay_test(
+    DECODE_PCM_ANALOG_SQL_AUTO_OFF
+    nfm_burst_synth
+    "-fA --squelch auto --analog-pcm-tap 48000 ${_pcm_sql_plays_bounds}"
+    "WARNING: --squelch auto needs a radio input.*ANALOG AUDIO OK"
+)
+# A -Y map row's own --squelch noise on audio input gates as -fA does, and an am row that
+# inherits a noise default runs no squelch there (off on AM audio).
+set(_pcm_scan_sql_noise_csv
+    "${CMAKE_CURRENT_BINARY_DIR}/pcm_scan_sql_noise_row.csv"
+)
+file(
+    WRITE "${_pcm_scan_sql_noise_csv}"
+    "channel,frequency_hz,mode,options\n1,150000000,nfm,--squelch noise\n2,150025000,am,\n"
+)
+dsd_neo_add_analog_replay_test(
+    DECODE_PCM_SCAN_SQL_NOISE_ROW
+    nfm_burst_synth
+    "-fa -C ${_pcm_scan_sql_noise_csv} --analog-scan-row 0 --analog-pcm-tap 48000 ${_pcm_sql_noise_burst_bounds}"
+    "Scan row applied: 0 nfm; width 16 kHz; squelch noise [+]10 dB [(]row[)].*ANALOG AUDIO OK"
+)
+dsd_neo_add_analog_replay_test(
+    DECODE_PCM_SCAN_SQL_NOISE_AM_ROW_OFF
+    nfm_burst_synth
+    "-fa --squelch noise -C ${_pcm_scan_sql_noise_csv} --analog-scan-row 1 --analog-pcm-tap 48000 ${_pcm_sql_plays_bounds}"
+    "Scan row applied: 1 am; width 6 kHz; squelch noise [+]10 dB.*ANALOG AUDIO OK"
+)
+
+if(DSD_HAS_RADIO)
     # Under -fA the front end must stay on the monitor path; the host warns when it
     # delivers CQPSK symbols instead (the modulation auto-switch did this before the
     # analog family stood it down; see docs/testing.md).
     set(_analog_off_path "CQPSK symbols instead of monitor samples")
 
-    # 1 kHz at 3 kHz deviation through the default monitor chain: 25.9 dB tone SNR,
-    # 30.5 dB in-band ratio, -36.1 dBFS at the fixed default gain, audible from the
-    # first block, no clipping. The probe on the tone itself must agree with the fit
-    # (0.00 dBc measured), which shows the probe reads a real line at its level.
+    # The monitor's default chain since issue #518 is the voice band-pass (300-3400 Hz,
+    # -v 0x9) and the analog AGC (-n 0), which brings a steady tone's peaks to -10 dBFS
+    # whatever its level and source. FM and AM tones share one RMS window under it, so
+    # the two monitors play the reference tone alike (-13.2 and -13.5 dBFS measured),
+    # and the peak bound pins the AGC's limiting.
+    set(_analog_auto_tone_level
+        "--analog-min-rms-dbfs -14.5 --analog-max-rms-dbfs -12 --analog-max-peak-dbfs -9.5 --analog-max-clip 0"
+    )
+    # Cases that measure the channel itself (its width, a neighbour) run with the voice
+    # filters off and the fixed reference gain: the band-pass's 3.4 kHz low-pass takes
+    # 12.5 kHz 54 dB down, which would hide the channel filter, and the AGC would move
+    # the levels the width bounds hold.
+    set(_analog_channel "-v 0 -n 50")
+
+    # 1 kHz at 3 kHz deviation through the default chain: 37.5 dB tone SNR, 52.3 dB
+    # in-band ratio, -13.2 dBFS RMS at the -10 dBFS peak the AGC holds it to, audible
+    # from the first block, no clipping. The probe on the tone itself must agree with
+    # the fit (0.00 dBc measured), which shows the probe reads a real line at its level.
     dsd_neo_add_analog_replay_test(
         DECODE_IQ_ANALOG_NFM_TONE
         nfm_tone_synth
-        "-fA --analog-expect-tone-hz 1000 --analog-min-snr-db 20 --analog-min-captured-ms 1400 --analog-min-audible-ms 1400 --analog-max-first-audible-ms 100 --analog-min-inband-db 24 --analog-min-rms-dbfs -42 --analog-max-rms-dbfs -30 --analog-max-clip 0 --analog-probe-min-dbc 1000:-1 --analog-probe-max-dbc 1000:1"
+        "-fA --analog-expect-tone-hz 1000 --analog-min-snr-db 30 --analog-min-captured-ms 1400 --analog-min-audible-ms 1400 --analog-max-first-audible-ms 100 --analog-min-inband-db 45 ${_analog_auto_tone_level} --analog-probe-min-dbc 1000:-1 --analog-probe-max-dbc 1000:1"
+        ""
+        "${_analog_off_path}"
+    )
+    # The fixed gain's calibration (issue #518): at -n 50 the reference signal, 1 kHz
+    # at 3 kHz deviation or AM at 50%, plays at -12 dBFS peak and -15 dBFS RMS, live
+    # and in replay alike. Through the band-pass nfm_tone_synth measures -15.9 dBFS RMS
+    # and am_tone_synth -15.0 dBFS (DECODE_IQ_ANALOG_AM_TONE_FIXED50), each held to
+    # +/-1 dB.
+    dsd_neo_add_analog_replay_test(
+        DECODE_IQ_ANALOG_NFM_TONE_FIXED50
+        nfm_tone_synth
+        "-fA -n 50 --analog-expect-tone-hz 1000 --analog-min-captured-ms 1400 --analog-min-rms-dbfs -16.9 --analog-max-rms-dbfs -14.9 --analog-max-clip 0"
         ""
         "${_analog_off_path}"
     )
     # The same tone with an unmodulated carrier 12.5 kHz up at -6 dB. The default
-    # 16 kHz channel filter rejects it: the 12.5 kHz probe reads -64.9 dBc, the same
-    # floor it reads on nfm_tone_synth (-66.7 dBc), so the bound catches a channel
+    # 16 kHz channel filter rejects it: the 12.5 kHz probe reads -76.6 dBc, close to
+    # the floor it reads on nfm_tone_synth (-78.4 dBc), so the bound catches a channel
     # filter that lets the neighbour through, not a finer change.
     dsd_neo_add_analog_replay_test(
         DECODE_IQ_ANALOG_NFM_ADJACENT
         nfm_adjacent_synth
-        "-fA --analog-expect-tone-hz 1000 --analog-min-snr-db 20 --analog-min-captured-ms 1400 --analog-probe-max-dbc 12500:-40"
+        "-fA ${_analog_channel} --analog-expect-tone-hz 1000 --analog-min-snr-db 30 --analog-min-captured-ms 1400 --analog-probe-max-dbc 12500:-40"
         ""
         "${_analog_off_path}"
     )
     # Issue #525: --nfm-bandwidth-hz changes the channel filter a listener hears
     # through. The same 1 kHz tone through an 8 kHz, an explicit 16 kHz and a 25 kHz
-    # channel, each held to NFM_TONE's bounds with its own SNR and in-band floors,
-    # and to the tone's absolute level: -36.1 dBFS at every width (-36.14 at 8 kHz),
-    # bounded to -37.5..-34.5 dBFS, so a width that costs the tone 1.5 dB fails. The
-    # 1 kHz probe's +/-1 dBc is NFM_TONE's self-check of the probe (it is measured
-    # against the fit of the same tone, so it reads 0.00 dBc at any level), not a
-    # level bound. 8 kHz trims the 3 kHz-deviation signal's outer sidebands (tone SNR
-    # 17.0 dB, in-band 28.5 dB), 25 kHz lets in more of the receiver noise (23.6 dB,
-    # 30.4 dB), and an explicit 16 kHz measures the same as the default (25.9 dB,
-    # 30.5 dB): its floors are ones neither other width meets together. That its taps
-    # are the default's bit for bit is DSP_CHANNEL_FILTERS' golden, not this replay's.
-    # The 8 kHz and 25 kHz cases also bound the demodulator noise at 12.5 kHz, where
-    # the channel width shows: -80.4 dBc at 8 kHz and -48.9 dBc at 25 kHz, against
-    # -66.7 dBc at the default. Each bound is one the default fails, so a run that
-    # dropped the width would not pass.
+    # channel (voice filters off, fixed gain), each held to its own SNR and in-band
+    # floors and to the tone's absolute level: -15.9 dBFS at every width, bounded to
+    # -17.5..-14.5 dBFS, so a width that costs the tone 1.5 dB fails. The 1 kHz probe's
+    # +/-1 dBc is NFM_TONE's self-check of the probe (it is measured against the fit of
+    # the same tone, so it reads 0.00 dBc at any level), not a level bound. 8 kHz trims
+    # the 3 kHz-deviation signal's outer sidebands (tone SNR 28.0 dB, in-band 40.8 dB),
+    # 25 kHz lets in more of the receiver noise (35.0 dB, 42.6 dB), and an explicit
+    # 16 kHz measures the same as the default (36.8 dB, 42.7 dB): its 36 dB SNR floor is
+    # one neither other width meets. That its taps are the default's bit for bit is
+    # DSP_CHANNEL_FILTERS' golden, not this replay's. The 8 kHz and 25 kHz cases also
+    # bound the demodulator noise at 12.5 kHz, where the channel width shows: -92.8 dBc
+    # at 8 kHz and -60.6 dBc at 25 kHz, against -78.4 dBc at the default. Each bound is
+    # one the default fails, so a run that dropped the width would not pass.
     set(_analog_tone_bounds
-        "--analog-expect-tone-hz 1000 --analog-min-captured-ms 1400 --analog-min-audible-ms 1400 --analog-max-first-audible-ms 100 --analog-min-rms-dbfs -42 --analog-max-rms-dbfs -30 --analog-max-clip 0 --analog-probe-min-dbc 1000:-1 --analog-probe-max-dbc 1000:1 --analog-probe-min-dbfs 1000:-37.5 --analog-probe-max-dbfs 1000:-34.5"
+        "--analog-expect-tone-hz 1000 --analog-min-captured-ms 1400 --analog-min-audible-ms 1400 --analog-max-first-audible-ms 100 --analog-min-rms-dbfs -22 --analog-max-rms-dbfs -10 --analog-max-clip 0 --analog-probe-min-dbc 1000:-1 --analog-probe-max-dbc 1000:1 --analog-probe-min-dbfs 1000:-17.5 --analog-probe-max-dbfs 1000:-14.5"
     )
     dsd_neo_add_analog_replay_test(
         DECODE_IQ_ANALOG_NFM_TONE_8K
         nfm_tone_synth
-        "-fA --nfm-bandwidth-hz 8000 ${_analog_tone_bounds} --analog-min-snr-db 12 --analog-min-inband-db 24 --analog-probe-max-dbc 12500:-72"
+        "-fA ${_analog_channel} --nfm-bandwidth-hz 8000 ${_analog_tone_bounds} --analog-min-snr-db 22 --analog-min-inband-db 36 --analog-probe-max-dbc 12500:-86"
         ""
         "${_analog_off_path}"
     )
     dsd_neo_add_analog_replay_test(
         DECODE_IQ_ANALOG_NFM_TONE_16K
         nfm_tone_synth
-        "-fA --nfm-bandwidth-hz 16000 ${_analog_tone_bounds} --analog-min-snr-db 25 --analog-min-inband-db 30"
+        "-fA ${_analog_channel} --nfm-bandwidth-hz 16000 ${_analog_tone_bounds} --analog-min-snr-db 36 --analog-min-inband-db 40"
         ""
         "${_analog_off_path}"
     )
     dsd_neo_add_analog_replay_test(
         DECODE_IQ_ANALOG_NFM_TONE_25K
         nfm_tone_synth
-        "-fA --nfm-bandwidth-hz=25000 ${_analog_tone_bounds} --analog-min-snr-db 18 --analog-min-inband-db 24 --analog-probe-min-dbc 12500:-58"
+        "-fA ${_analog_channel} --nfm-bandwidth-hz=25000 ${_analog_tone_bounds} --analog-min-snr-db 30 --analog-min-inband-db 36 --analog-probe-min-dbc 12500:-70"
         ""
         "${_analog_off_path}"
     )
     # The unmodulated neighbour 12.5 kHz up at -6 dB, through the narrowest and the
-    # widest channel. At 8 kHz it reads -79.5 dBc (the default 16 kHz filter leaves
-    # -64.9) and the tone keeps a 17.0 dB SNR; at 25 kHz the neighbour sits inside the
-    # passband and reads -8.2 dBc, so each case's neighbour bound is one the default
+    # widest channel. At 8 kHz it reads -92.6 dBc (the default 16 kHz filter leaves
+    # -76.6) and the tone keeps a 28.0 dB SNR; at 25 kHz the neighbour sits inside the
+    # passband and reads -19.9 dBc, so each case's neighbour bound is one the default
     # width and the other case break. At 25 kHz the beat counts against the tone SNR
-    # (-3.5 dB), so that case pins the tone's level instead: -36.1 dBFS, the same as
-    # at every other width.
+    # (8.2 dB), so that case pins the tone's level instead: -15.9 dBFS, the same as at
+    # every other width.
     dsd_neo_add_analog_replay_test(
         DECODE_IQ_ANALOG_NFM_BW_8K
         nfm_adjacent_synth
-        "-fA --nfm-bandwidth-hz 8000 --analog-expect-tone-hz 1000 --analog-min-snr-db 12 --analog-min-captured-ms 1400 --analog-probe-max-dbc 12500:-72"
+        "-fA ${_analog_channel} --nfm-bandwidth-hz 8000 --analog-expect-tone-hz 1000 --analog-min-snr-db 22 --analog-min-captured-ms 1400 --analog-probe-max-dbc 12500:-86"
         ""
         "${_analog_off_path}"
     )
     dsd_neo_add_analog_replay_test(
         DECODE_IQ_ANALOG_NFM_BW_25K
         nfm_adjacent_synth
-        "-fA --nfm-bandwidth-hz 25000 --analog-expect-tone-hz 1000 --analog-min-captured-ms 1400 --analog-probe-min-dbc 12500:-20 --analog-probe-min-dbfs 1000:-38 --analog-probe-max-dbfs 1000:-34"
+        "-fA ${_analog_channel} --nfm-bandwidth-hz 25000 --analog-expect-tone-hz 1000 --analog-min-captured-ms 1400 --analog-probe-min-dbc 12500:-30 --analog-probe-min-dbfs 1000:-18 --analog-probe-max-dbfs 1000:-14"
         ""
         "${_analog_off_path}"
     )
     # Issue #526: a -Y map row declaring nfm with --nfm-bandwidth-hz 12500 on a digital
     # (-fa) session. The host enters row 0 the way the scanner commits it, so the replay's
     # front end opens on the analog family at the row's width: the neighbour 12.5 kHz up,
-    # which the same row without a width (the default 16 kHz channel) passes at -64.9 dBc,
-    # reads -81.3 dBc through the row's 12.5 kHz channel, with 27.2 dB tone SNR. The
-    # -72 dBc bound sits between the two, so it fails if the row width does not apply.
+    # which the same row without a width (the default 16 kHz channel) passes at -76.6 dBc,
+    # reads -97.3 dBc through the row's 12.5 kHz channel, with 37.4 dB tone SNR (voice
+    # filters off, fixed gain). The -86 dBc bound sits between the two, so it fails if
+    # the row width does not apply.
     set(_scan_nfm_csv "${CMAKE_CURRENT_BINARY_DIR}/scan_mode_nfm_row.csv")
     file(
         WRITE "${_scan_nfm_csv}"
@@ -11968,7 +14943,7 @@ if(DSD_HAS_RADIO)
     dsd_neo_add_analog_replay_test(
         DECODE_IQ_SCAN_NFM_TONE
         nfm_adjacent_synth
-        "-fa -C ${_scan_nfm_csv} --analog-scan-row 0 --analog-expect-tone-hz 1000 --analog-min-snr-db 20 --analog-min-captured-ms 1400 --analog-probe-max-dbc 12500:-72"
+        "-fa ${_analog_channel} -C ${_scan_nfm_csv} --analog-scan-row 0 --analog-expect-tone-hz 1000 --analog-min-snr-db 30 --analog-min-captured-ms 1400 --analog-probe-max-dbc 12500:-86"
         "Scan row applied: 0 nfm; width 12.5 kHz \\(row\\).*ANALOG AUDIO OK"
         "${_analog_off_path}"
     )
@@ -11981,31 +14956,86 @@ if(DSD_HAS_RADIO)
         nfm_tone_synth
         "-fi --analog-max-audible-ms 0 --analog-min-total-ms 1400 --analog-max-total-ms 1600"
     )
-    # Off-air smoke baselines: the monitor delivers the whole excerpt and it keeps its
-    # measured audible time, onset and spectral shape. On nfm_ctcss_real the in-band
-    # ratio is no better than receiver noise (small speech deviation), so that case
-    # tells the two apart by FM quieting instead: the channel measures -44.6 dBFS RMS,
-    # open-squelch noise (noise_floor) -23.3 dBFS.
+    # Off-air smoke baselines at the fixed reference gain (-n 50), so they measure the
+    # excerpt and not the AGC: the monitor delivers the whole excerpt and it keeps its
+    # measured audible time, onset and spectral shape, counted from -40 dBFS, where the
+    # speech stands clear of the quiet carrier between words. On nfm_ctcss_real the
+    # in-band ratio is close to receiver noise's (18.4 dB against 14.6 dB; small speech
+    # deviation), so that case tells the two apart by FM quieting instead: the channel
+    # measures -32.8 dBFS RMS, open-squelch noise (noise_floor) -12.8 dBFS.
     dsd_neo_add_analog_replay_test(
         DECODE_IQ_ANALOG_NFM_REAL_CTCSS_SMOKE
         nfm_ctcss_real
-        "-fA --analog-min-captured-ms 5800 --analog-min-audible-ms 4500 --analog-min-inband-db -4 --analog-max-rms-dbfs -34"
+        "-fA -n 50 --analog-audible-dbfs -40 --analog-min-captured-ms 5800 --analog-min-audible-ms 3500 --analog-min-inband-db 14 --analog-max-rms-dbfs -25"
         ""
         "${_analog_off_path}"
     )
     dsd_neo_add_analog_replay_test(
         DECODE_IQ_ANALOG_NFM_REAL_SQUELCH_A_SMOKE
         nfm_squelch_real_a
-        "-fA --analog-min-captured-ms 3900 --analog-min-audible-ms 900 --analog-min-first-audible-ms 250 --analog-max-first-audible-ms 1000 --analog-min-inband-db 4"
+        "-fA -n 50 --analog-audible-dbfs -40 --analog-min-captured-ms 3900 --analog-min-audible-ms 1200 --analog-min-first-audible-ms 250 --analog-max-first-audible-ms 1000 --analog-min-inband-db 18"
         ""
         "${_analog_off_path}"
     )
     dsd_neo_add_analog_replay_test(
         DECODE_IQ_ANALOG_NFM_REAL_SQUELCH_B_SMOKE
         nfm_squelch_real_b
-        "-fA --analog-min-captured-ms 3900 --analog-min-audible-ms 2000 --analog-min-inband-db 5"
+        "-fA -n 50 --analog-audible-dbfs -40 --analog-min-captured-ms 3900 --analog-min-audible-ms 2500 --analog-min-inband-db 20"
         ""
         "${_analog_off_path}"
+    )
+    # Speech parity (issue #518): under the default chain the AGC brings real NFM and AM
+    # speech to the level digital voice plays at. dmr_voice decodes to -24.9 dBFS RMS;
+    # nfm_ctcss_real (-fA) and am_airband_real (-fM) measure -23.9 dBFS each, and both
+    # are held to that digital level +/-3 dB. DECODE_IQ_ANALOG_NEG_PARITY_FIXED shows the
+    # fixed gain alone misses the window on the NFM excerpt.
+    set(_analog_speech_parity
+        "--analog-min-rms-dbfs -27.9 --analog-max-rms-dbfs -21.9 --analog-max-clip 0"
+    )
+    dsd_neo_add_analog_replay_test(
+        DECODE_IQ_ANALOG_PARITY_NFM_REAL
+        nfm_ctcss_real
+        "-fA --analog-min-captured-ms 5800 ${_analog_speech_parity}"
+        ""
+        "${_analog_off_path}"
+    )
+    dsd_neo_add_analog_replay_test(
+        DECODE_IQ_ANALOG_PARITY_AM_REAL
+        am_airband_real
+        "-fM --analog-min-captured-ms 7800 ${_analog_speech_parity}"
+        ""
+        "${_analog_off_path}"
+    )
+    # The -6 raw WAV on radio input (issue #643): the monitor's samples, at its 1/pi
+    # output scale, are written at the level a PCM input at the reference has, so the
+    # off-air excerpts record audibly: nfm_ctcss_real -28.9 dBFS RMS (-13.9 dBFS peak)
+    # and am_airband_real -18.3 dBFS (-4.5 dBFS peak), unclipped. Written unscaled they
+    # rounded to digital silence: all zero, and -117.8 dBFS (+/-1 LSB). Each bound sits
+    # about 3 dB under its level; DECODE_IQ_ANALOG_NEG_RAW_WAV_RMS shows a missed one fails.
+    dsd_neo_add_analog_replay_test(
+        DECODE_IQ_ANALOG_RAW_WAV_NFM_REAL
+        nfm_ctcss_real
+        "-fA --analog-raw-wav-min-rms-dbfs -32"
+        ""
+        "${_analog_off_path}"
+    )
+    dsd_neo_add_analog_replay_test(
+        DECODE_IQ_ANALOG_RAW_WAV_AM_REAL
+        am_airband_real
+        "-fM --analog-raw-wav-min-rms-dbfs -21.5"
+        ""
+        "${_analog_off_path}"
+    )
+    # The -8 source monitor under digital decoding plays the FSK discriminator output,
+    # which is normalised to +/-30000. The fixed gain used to scale it as RTL monitor
+    # audio (12000x at -n 50) and clipped every sample (141440 clipped, -0.03 dBFS RMS);
+    # with the gain of its own source it plays at -23.4 dBFS RMS and -9.9 dBFS peak,
+    # unclipped and audible throughout, held to +/-3 dB so a gain that drops it out of
+    # hearing fails too.
+    dsd_neo_add_analog_replay_test(
+        DECODE_IQ_ANALOG_SOURCE_MONITOR_FIXED
+        p25p1_c4fm_vc
+        "-fs -8 -n 50 --analog-min-captured-ms 2900 --analog-min-audible-ms 2900 --analog-min-rms-dbfs -26 --analog-max-rms-dbfs -20 --analog-max-peak-dbfs -6 --analog-max-clip 0"
     )
     # A carrier within a few hertz of 0 Hz votes for CQPSK, and the modulation
     # auto-switch used to follow that vote under -fA and move the front end to the
@@ -12023,40 +15053,542 @@ if(DSD_HAS_RADIO)
     # Received CTCSS on the off-air excerpts (issue #522), against the oracle labels in
     # docs/testing.md that the maintainer confirmed. nfm_ctcss_real carries 151.4 Hz: it
     # must lock within the 400 ms bound (300 ms measured) and never report another tone,
-    # least of all the neighbour's 173.8 Hz 12.5 kHz away. "none" is allowed: the excerpt
-    # carries a reverse burst and a short tone gap at 3.7-4.0 s, after which the tone locks
-    # again. The host's tone= field comes from the decoder's publication, not from the log.
+    # least of all the neighbour's 173.8 Hz 12.5 kHz away, nor any DCS code (issue #523).
+    # "none" is allowed: the excerpt carries a reverse burst and a short tone gap at
+    # 3.7-4.0 s, after which the tone locks again. The host's tone= field comes from the
+    # decoder's publication, not from the log.
     dsd_neo_add_analog_replay_test(
         DECODE_IQ_ANALOG_REAL_CTCSS_1514
         nfm_ctcss_real
         "-fA --analog-max-tone-lock-ms 400"
         "Received tone: CTCSS 151[.]4 Hz.*ANALOG METRIC: .* tone=151[.]4 tone_lock_ms=[0-9]+[.][0-9][0-9] tone_lock_pct=[0-9]+[.][0-9][0-9]"
-        "Received tone: CTCSS (([0-9]|[0-9][0-9]|[02-9][0-9][0-9]|1[0-46-9][0-9]|15[02-9])[.][0-9]|151[.][0-35-9]) Hz|${_analog_off_path}"
+        "Received tone: CTCSS (([0-9]|[0-9][0-9]|[02-9][0-9][0-9]|1[0-46-9][0-9]|15[02-9])[.][0-9]|151[.][0-35-9]) Hz|Received tone: DCS|${_analog_off_path}"
     )
-    # No false lock: speech and carrier with no CTCSS (the squelch excerpts carry 150 bit/s
-    # data below 300 Hz, which is neither CTCSS nor DCS), and AM airband voice through the
-    # FM monitor. Each must reach the "none" verdict, which shows detection ran, and never
-    # report a tone.
+    # Received DCS through the host (issue #523): the synthetic DCS fixtures carry the code
+    # from their start, and the host's tone= field reads the publication's code as both of
+    # its standard spellings, canonical first, joined by a slash with no space:
+    # D023N/D047I for the normal word, D047N/D023I for the inverted D023 word. Each locks
+    # within the 10 dB lock bound (360 ms measured, 83% of the run locked) and reports no
+    # other code, no tone and no "none".
+    dsd_neo_add_analog_replay_test(
+        DECODE_IQ_ANALOG_DCS_023N_HOST
+        nfm_dcs_synth_023n
+        "-fA --analog-max-tone-lock-ms 520"
+        "Received tone: DCS D023N / D047I.*ANALOG METRIC: .* tone=D023N/D047I tone_lock_ms=[0-9]+[.][0-9][0-9] tone_lock_pct=[0-9]+[.][0-9][0-9]"
+        "Received tone: (none|CTCSS|DCS D([1-7][0-7][0-7]|0[013-7][0-7]|02[0-24-7])[NI]|DCS D023I)|${_analog_off_path}"
+    )
+    dsd_neo_add_analog_replay_test(
+        DECODE_IQ_ANALOG_DCS_023I_HOST
+        nfm_dcs_synth_023i
+        "-fA --analog-max-tone-lock-ms 520"
+        "Received tone: DCS D047N / D023I.*ANALOG METRIC: .* tone=D047N/D023I tone_lock_ms=[0-9]+[.][0-9][0-9] tone_lock_pct=[0-9]+[.][0-9][0-9]"
+        "Received tone: (none|CTCSS|DCS D([1-7][0-7][0-7]|0[0-35-7][0-7]|04[0-6])[NI]|DCS D047I)|tone=D023|${_analog_off_path}"
+    )
+    # The CTCSS/DCS receive policy (issue #527) at the monitor's sink, through the host's
+    # first-audible and audible-time metrics. An allow list naming the tone on air mutes
+    # while it is checked and plays once it locks: 280 ms of mute measured, bounded to
+    # 100..400 ms (the CTCSS lock target). An allow list and no tone never plays, and says
+    # why once the 800 ms window ends; a block list lets the same traffic through at the
+    # window's end (800 ms measured), never before it. A listed code is muted from the
+    # start, and a list entry matches by the signal: D023I passes the inverted D023 word,
+    # which the detector names D047N. Every muted case pairs its never-audible bound with
+    # stream time, so a replay that delivered nothing could not pass.
+    dsd_neo_add_analog_replay_test(
+        DECODE_IQ_ANALOG_POLICY_ALLOW_MATCH
+        nfm_ctcss_synth_1000
+        "-fA --tone-allow 100.0 --analog-min-first-audible-ms 100 --analog-max-first-audible-ms 400 --analog-min-audible-ms 1600 --analog-min-total-ms 1900"
+        "Tone filter: allowed [(]CTCSS 100[.]0 Hz[)].*ANALOG AUDIO OK"
+        "Tone filter: (rejected|pending)|${_analog_off_path}"
+    )
+    dsd_neo_add_analog_replay_test(
+        DECODE_IQ_ANALOG_POLICY_ALLOW_NOTONE
+        nfm_notone_synth
+        "-fA --tone-allow 100.0 --analog-max-audible-ms 0 --analog-min-total-ms 1900 --analog-max-total-ms 2100"
+        "Tone filter: rejected [(]no tone[)].*ANALOG AUDIO OK"
+        "Tone filter: allowed|${_analog_off_path}"
+    )
+    dsd_neo_add_analog_replay_test(
+        DECODE_IQ_ANALOG_POLICY_BLOCK_NOTONE
+        nfm_notone_synth
+        "-fA --tone-block 100.0 --analog-min-first-audible-ms 780 --analog-max-first-audible-ms 860 --analog-min-audible-ms 1100 --analog-min-total-ms 1900"
+        "Tone filter: allowed [(]no tone[)].*ANALOG AUDIO OK"
+        "Tone filter: rejected|${_analog_off_path}"
+    )
+    dsd_neo_add_analog_replay_test(
+        DECODE_IQ_ANALOG_POLICY_BLOCK_DCS
+        nfm_dcs_synth_023n
+        "-fA --tone-block D023N --analog-max-audible-ms 0 --analog-min-total-ms 1900 --analog-max-total-ms 2100"
+        "Tone filter: rejected [(]DCS D023N / D047I[)].*ANALOG AUDIO OK"
+        "Tone filter: allowed|${_analog_off_path}"
+    )
+    dsd_neo_add_analog_replay_test(
+        DECODE_IQ_ANALOG_POLICY_ALLOW_DCS_ALIAS
+        nfm_dcs_synth_023i
+        "-fA --tone-allow D023I --analog-max-first-audible-ms 600 --analog-min-audible-ms 1300 --analog-min-total-ms 1900"
+        "Tone filter: allowed [(]DCS D047N / D023I[)].*ANALOG AUDIO OK"
+        "Tone filter: rejected|${_analog_off_path}"
+    )
+    # The off-air excerpt with its oracle tone allowed: audible after the lock (280 ms of
+    # mute measured), and for most of the excerpt (5320 of 6000 ms). The excerpt's reverse
+    # burst and tone gap at 3.7-4.0 s mute it until the tone locks again, which is the allow
+    # list's rule for a lost tone ("pending"), never a rejection.
+    dsd_neo_add_analog_replay_test(
+        DECODE_IQ_ANALOG_REAL_CTCSS_POLICY
+        nfm_ctcss_real
+        "-fA --tone-allow 151.4 --analog-min-first-audible-ms 100 --analog-max-first-audible-ms 400 --analog-min-audible-ms 4500 --analog-min-total-ms 5800"
+        "Tone filter: allowed [(]CTCSS 151[.]4 Hz[)].*ANALOG AUDIO OK"
+        "Tone filter: rejected|${_analog_off_path}"
+    )
+    # No false lock: speech and carrier with no CTCSS or DCS (the squelch excerpts carry
+    # 150 bit/s data below 300 Hz, which is neither CTCSS nor DCS: the DCS detector's bit
+    # clock and slicers read it, and must never find a code in it), and AM airband voice
+    # through the FM monitor. Each must reach the "none" verdict, which shows detection ran,
+    # and never report a tone or a code (issues #522, #523).
     dsd_neo_add_analog_replay_test(
         DECODE_IQ_ANALOG_REAL_CTCSS_NOFALSE_SQUELCH_A
         nfm_squelch_real_a
         -fA
         "Received tone: none.*ANALOG METRIC: .* tone=NA tone_lock_ms=NA tone_lock_pct=0[.]00"
-        "Received tone: CTCSS|${_analog_off_path}"
+        "Received tone: (CTCSS|DCS)|${_analog_off_path}"
     )
     dsd_neo_add_analog_replay_test(
         DECODE_IQ_ANALOG_REAL_CTCSS_NOFALSE_SQUELCH_B
         nfm_squelch_real_b
         -fA
         "Received tone: none.*ANALOG METRIC: .* tone=NA tone_lock_ms=NA tone_lock_pct=0[.]00"
-        "Received tone: CTCSS|${_analog_off_path}"
+        "Received tone: (CTCSS|DCS)|${_analog_off_path}"
     )
     dsd_neo_add_analog_replay_test(
         DECODE_IQ_ANALOG_REAL_CTCSS_NOFALSE_AM
         am_airband_real
         -fA
         "Received tone: none.*ANALOG METRIC: .* tone=NA tone_lock_ms=NA tone_lock_pct=0[.]00"
-        "Received tone: CTCSS|${_analog_off_path}"
+        "Received tone: (CTCSS|DCS)|${_analog_off_path}"
+    )
+
+    # Native AM (issue #524). am_tone_synth is a 1 kHz tone at 50% depth on a 0 Hz
+    # carrier with noise 30 dB down across the band: through -fM's default chain it
+    # measures 31.7 dB tone SNR, 50.4 dB in-band ratio and -13.5 dBFS RMS (the AGC holds
+    # the peak at -10 dBFS, as for FM), audible from the first block, unclipped; the
+    # probe on the tone agrees with the fit. The FM monitor finds no tone on it (see the
+    # negative control below), so the level comes from the AM detector.
+    dsd_neo_add_analog_replay_test(
+        DECODE_IQ_ANALOG_AM_TONE
+        am_tone_synth
+        "-fM --analog-expect-tone-hz 1000 --analog-min-snr-db 25 --analog-min-captured-ms 1400 --analog-min-audible-ms 1400 --analog-max-first-audible-ms 100 --analog-min-inband-db 40 ${_analog_auto_tone_level} --analog-probe-min-dbc 1000:-1 --analog-probe-max-dbc 1000:1"
+        ""
+        "${_analog_off_path}"
+    )
+    # The AM reference at the fixed gain's calibration (see NFM_TONE_FIXED50): the
+    # detector's 0.25 x 50% depth, doubled by the default volume trim, plays at
+    # -15.0 dBFS RMS at -n 50.
+    dsd_neo_add_analog_replay_test(
+        DECODE_IQ_ANALOG_AM_TONE_FIXED50
+        am_tone_synth
+        "-fM -n 50 --analog-expect-tone-hz 1000 --analog-min-captured-ms 1400 --analog-min-rms-dbfs -16 --analog-max-rms-dbfs -14 --analog-max-clip 0"
+        ""
+        "${_analog_off_path}"
+    )
+    # The same tone with an unmodulated carrier 8.333 kHz up at -6 dB (the next
+    # 8.33 kHz airband channel), voice filters off at the fixed gain. The default 6 kHz
+    # channel filter rejects it: its beat with the wanted carrier probes at -103.5 dBc.
+    # A 20 kHz channel passes it (+0.3 dBc), which shows the AM width reaches the
+    # filter; each case holds its own bound.
+    dsd_neo_add_analog_replay_test(
+        DECODE_IQ_ANALOG_AM_ADJ_6K
+        am_adjacent_synth
+        "-fM ${_analog_channel} --analog-expect-tone-hz 1000 --analog-min-snr-db 25 --analog-min-captured-ms 1400 --analog-probe-max-dbc 8333:-40"
+        ""
+        "${_analog_off_path}"
+    )
+    dsd_neo_add_analog_replay_test(
+        DECODE_IQ_ANALOG_AM_ADJ_20K
+        am_adjacent_synth
+        "-fM ${_analog_channel} --am-bandwidth-hz 20000 --analog-expect-tone-hz 1000 --analog-min-captured-ms 1400 --analog-probe-min-dbc 8333:-10"
+        ""
+        "${_analog_off_path}"
+    )
+    # AM airband voice (the excerpt DECODE_IQ_ANALOG_NO_MOD_AUTO_SWITCH plays through
+    # the FM monitor) through the AM detector at the fixed reference gain: the whole
+    # excerpt delivered, 5720 ms audible from -40 dBFS, -18.6 dBFS RMS, unclipped, and
+    # speech-shaped (34.4 dB in-band ratio). The excerpt carries no sub-audible tone or
+    # code, so the "Received tone:" forbid only guards against a false report; the
+    # FM-only detection gate is proven by DSP_SYMBOL_REPLAY, which feeds the same
+    # CTCSS-bearing and DCS-bearing monitor audio through the tap on FM (locks) and AM
+    # (publishes nothing), and by RUNTIME_ANALOG_TONES.
+    dsd_neo_add_analog_replay_test(
+        DECODE_IQ_ANALOG_AM_REAL
+        am_airband_real
+        "-fM -n 50 --analog-audible-dbfs -40 --analog-min-captured-ms 7800 --analog-min-audible-ms 4500 --analog-min-inband-db 28 --analog-min-rms-dbfs -24 --analog-max-rms-dbfs -13 --analog-max-clip 0"
+        ""
+        "Received tone:|${_analog_off_path}"
+    )
+    # Issue #526: -Y map rows declaring am on a digital (-fa) session. The host enters
+    # the row the way the scanner commits it, so the replay's front end opens the AM
+    # monitor at the row's width. Row 0 (--am-bandwidth-hz 8333) on am_tone_synth
+    # measures 31.6 dB tone SNR, 43.0 dB in-band ratio and -13.5 dBFS RMS, unclipped,
+    # through the default chain: the FM monitor finds no tone there, so the tone comes
+    # from the AM detector the row selects (the wider channel lets in more of the
+    # fixture's noise than AM_TONE's default 6 kHz, which reads 50.4 dB in-band). Row 1
+    # (--am-bandwidth-hz 20000) on am_adjacent_synth, voice filters off at the fixed
+    # gain, lets the carrier 8.333 kHz up through at +0.3 dBc, which the default 6 kHz
+    # channel rejects at -103.5 dBc and row 0's 8.333 kHz at -93.2 dBc, so the bound
+    # fails if the row width does not apply.
+    set(_scan_am_csv "${CMAKE_CURRENT_BINARY_DIR}/scan_mode_am_rows.csv")
+    file(
+        WRITE "${_scan_am_csv}"
+        "channel,frequency_hz,mode,options\n1,118300000,am,--am-bandwidth-hz 8333\n2,118300000,am,--am-bandwidth-hz 20000\n"
+    )
+    dsd_neo_add_analog_replay_test(
+        DECODE_IQ_SCAN_AM_TONE
+        am_tone_synth
+        "-fa -C ${_scan_am_csv} --analog-scan-row 0 --analog-expect-tone-hz 1000 --analog-min-snr-db 25 --analog-min-captured-ms 1400 --analog-min-audible-ms 1400 --analog-min-inband-db 36 ${_analog_auto_tone_level}"
+        "Scan row applied: 0 am; width 8.333 kHz \\(row\\).*ANALOG AUDIO OK"
+        "${_analog_off_path}"
+    )
+    dsd_neo_add_analog_replay_test(
+        DECODE_IQ_SCAN_AM_WIDTH
+        am_adjacent_synth
+        "-fa ${_analog_channel} -C ${_scan_am_csv} --analog-scan-row 1 --analog-expect-tone-hz 1000 --analog-min-captured-ms 1400 --analog-probe-min-dbc 8333:-10"
+        "Scan row applied: 1 am; width 20 kHz \\(row\\).*ANALOG AUDIO OK"
+        "${_analog_off_path}"
+    )
+    # Issue #518 follow-up: an AM carrier sits at 0 Hz, and the squelch measured it with
+    # mean_power()'s pooled I/Q mean removed, which reads A^2(1 - sin 2phi)/4 and drops
+    # to nothing as the carrier's phase drifts. am_airband_real's carrier runs through
+    # the whole 8 s excerpt at about -13 dB channel power: under an am row's
+    # --squelch-db -20 the old measurement let 5940 ms of it through, chopped; the
+    # carrier measured whole holds the gate open for all of it (7980 ms).
+    set(_scan_am_sql_csv
+        "${CMAKE_CURRENT_BINARY_DIR}/scan_mode_am_squelch_rows.csv"
+    )
+    file(
+        WRITE "${_scan_am_sql_csv}"
+        "channel,frequency_hz,mode,options\n1,118300000,am,--squelch-db -20\n"
+    )
+    dsd_neo_add_analog_replay_test(
+        DECODE_IQ_SCAN_AM_SQUELCH_STEADY_CARRIER
+        am_airband_real
+        "-fa -C ${_scan_am_sql_csv} --analog-scan-row 0 --analog-min-captured-ms 7800"
+        ""
+        "${_analog_off_path}"
+    )
+
+    # The auto squelch (issue #518): a margin over the noise floor the demodulator
+    # learns on each channel, so one setting suits every receiver. nfm_burst_synth and
+    # am_burst_synth (SQUELCH_BURST in tools/build_iq_fixtures.py) hold receiver noise
+    # for 0.3 s, a carrier with the 1 kHz test tone from 0.30 to 0.55 s, then noise to
+    # 0.75 s. Under --squelch auto (+10 dB) the gate learns the floor from the opening
+    # windows, opens 20 ms into the carrier and closes within a window of its end: 320 ms
+    # to the first audible block and 280 ms audible, measured through FM and AM alike.
+    # The _HOT twins replay the same capture 10 dB hotter (--analog-iq-gain-db 10, noise
+    # and carrier alike, as a receiver with more gain records them) and are held to the
+    # same bounds; they measure the same. DECODE_IQ_ANALOG_NEG_SQL_LEVEL_HOT shows a fixed
+    # threshold does not carry over.
+    set(_sql_auto_burst_bounds
+        "--analog-audible-dbfs -40 --analog-min-total-ms 700 --analog-max-total-ms 800 --analog-min-first-audible-ms 300 --analog-max-first-audible-ms 360 --analog-min-audible-ms 240 --analog-max-audible-ms 320 --analog-max-clip 0"
+    )
+    dsd_neo_add_analog_replay_test(
+        DECODE_IQ_ANALOG_SQL_AUTO_NFM_BURST
+        nfm_burst_synth
+        "-fA --squelch auto ${_sql_auto_burst_bounds}"
+        ""
+        "${_analog_off_path}"
+    )
+    dsd_neo_add_analog_replay_test(
+        DECODE_IQ_ANALOG_SQL_AUTO_NFM_BURST_HOT
+        nfm_burst_synth
+        "-fA --squelch auto --analog-iq-gain-db 10 ${_sql_auto_burst_bounds}"
+        "capture scaled by [+]10[.]0 dB, 0 of 72000 bytes clipped.*ANALOG AUDIO OK"
+        "${_analog_off_path}"
+    )
+    # The same with the capture named relative to the working directory (the repository
+    # root, as when replaying by hand): the scaled copy takes a committed fixture
+    # however its path is spelled.
+    add_test(
+        NAME DECODE_IQ_ANALOG_SQL_AUTO_NFM_BURST_HOT_RELATIVE
+        COMMAND
+            ${CMAKE_COMMAND}
+            "-DDSD_BIN=$<TARGET_FILE:dsd-neo_test_analog_replay>"
+            "-DMODE=-fA --squelch auto --analog-iq-gain-db 10 ${_sql_auto_burst_bounds}"
+            "-DFIXTURE=tests/fixtures/iq/nfm_burst_synth.iq.json"
+            "-DEXPECTED=capture scaled by [+]10[.]0 dB, 0 of 72000 bytes clipped.*ANALOG AUDIO OK"
+            "-DNOT_EXPECTED=${_analog_off_path}" -P
+            "${CMAKE_CURRENT_SOURCE_DIR}/iq_decode_check.cmake"
+    )
+    set_tests_properties(
+        DECODE_IQ_ANALOG_SQL_AUTO_NFM_BURST_HOT_RELATIVE
+        PROPERTIES
+            LABELS "iq-decode;analog"
+            TIMEOUT 120
+            WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+    )
+    # Windows: a drive-relative path ("D:tests/...") resolves against the working
+    # directory on that drive.
+    if(WIN32)
+        string(SUBSTRING "${PROJECT_SOURCE_DIR}" 0 2 _dsd_neo_source_drive)
+        add_test(
+            NAME DECODE_IQ_ANALOG_SQL_AUTO_NFM_BURST_HOT_DRIVE_RELATIVE
+            COMMAND
+                ${CMAKE_COMMAND}
+                "-DDSD_BIN=$<TARGET_FILE:dsd-neo_test_analog_replay>"
+                "-DMODE=-fA --squelch auto --analog-iq-gain-db 10 ${_sql_auto_burst_bounds}"
+                "-DFIXTURE=${_dsd_neo_source_drive}tests/fixtures/iq/nfm_burst_synth.iq.json"
+                "-DEXPECTED=capture scaled by [+]10[.]0 dB, 0 of 72000 bytes clipped.*ANALOG AUDIO OK"
+                "-DNOT_EXPECTED=${_analog_off_path}" -P
+                "${CMAKE_CURRENT_SOURCE_DIR}/iq_decode_check.cmake"
+        )
+        set_tests_properties(
+            DECODE_IQ_ANALOG_SQL_AUTO_NFM_BURST_HOT_DRIVE_RELATIVE
+            PROPERTIES
+                LABELS "iq-decode;analog"
+                TIMEOUT 120
+                WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+        )
+        # File names are case-insensitive there: a capture named in other case is the
+        # same committed fixture.
+        add_test(
+            NAME DECODE_IQ_ANALOG_SQL_AUTO_NFM_BURST_HOT_OTHER_CASE
+            COMMAND
+                ${CMAKE_COMMAND}
+                "-DDSD_BIN=$<TARGET_FILE:dsd-neo_test_analog_replay>"
+                "-DMODE=-fA --squelch auto --analog-iq-gain-db 10 ${_sql_auto_burst_bounds}"
+                "-DFIXTURE=${PROJECT_SOURCE_DIR}/tests/fixtures/iq/NFM_BURST_SYNTH.IQ.JSON"
+                "-DEXPECTED=capture scaled by [+]10[.]0 dB, 0 of 72000 bytes clipped.*ANALOG AUDIO OK"
+                "-DNOT_EXPECTED=${_analog_off_path}" -P
+                "${CMAKE_CURRENT_SOURCE_DIR}/iq_decode_check.cmake"
+        )
+        set_tests_properties(
+            DECODE_IQ_ANALOG_SQL_AUTO_NFM_BURST_HOT_OTHER_CASE
+            PROPERTIES LABELS "iq-decode;analog" TIMEOUT 120
+        )
+    endif()
+    dsd_neo_add_analog_replay_test(
+        DECODE_IQ_ANALOG_SQL_AUTO_AM_BURST
+        am_burst_synth
+        "-fM --squelch auto ${_sql_auto_burst_bounds}"
+        ""
+        "${_analog_off_path}"
+    )
+    dsd_neo_add_analog_replay_test(
+        DECODE_IQ_ANALOG_SQL_AUTO_AM_BURST_HOT
+        am_burst_synth
+        "-fM --squelch auto --analog-iq-gain-db 10 ${_sql_auto_burst_bounds}"
+        "capture scaled by [+]10[.]0 dB, 0 of 72000 bytes clipped.*ANALOG AUDIO OK"
+        "${_analog_off_path}"
+    )
+    # The margin is over the floor: each burst's carrier stands about 20 dB above its
+    # channel's noise (it still opens at +20 dB and not at +21, or +22 on AM), so under a
+    # 30 dB margin it never opens, at either level. The silence pattern pairs the
+    # never-audible bound with stream time.
+    set(_sql_auto_silent "--analog-max-audible-ms 0 --analog-min-total-ms 700")
+    dsd_neo_add_analog_replay_test(
+        DECODE_IQ_ANALOG_SQL_AUTO_NFM_MARGIN
+        nfm_burst_synth
+        "-fA --squelch auto+30 ${_sql_auto_silent}"
+        ""
+        "${_analog_off_path}"
+    )
+    dsd_neo_add_analog_replay_test(
+        DECODE_IQ_ANALOG_SQL_AUTO_AM_MARGIN_HOT
+        am_burst_synth
+        "-fM --squelch auto+30 --analog-iq-gain-db 10 ${_sql_auto_silent}"
+        ""
+        "${_analog_off_path}"
+    )
+    # Ten seconds of receiver noise (noise_floor) never open it, through FM or AM.
+    dsd_neo_add_analog_replay_test(
+        DECODE_IQ_ANALOG_SQL_AUTO_NOISE_FLOOR
+        noise_floor
+        "-fA --squelch auto --analog-max-audible-ms 0 --analog-min-total-ms 9900"
+        ""
+        "${_analog_off_path}"
+    )
+    dsd_neo_add_analog_replay_test(
+        DECODE_IQ_ANALOG_SQL_AUTO_AM_NOISE_FLOOR
+        noise_floor
+        "-fM --squelch auto --analog-max-audible-ms 0 --analog-min-total-ms 9900"
+        ""
+        "${_analog_off_path}"
+    )
+    # A carrier is never learned as the floor: the real excerpts hold their carrier
+    # throughout, and auto plays them whole after its first 40 ms window (5940 of the
+    # 6000 ms of nfm_ctcss_real, 7940 of am_airband_real's 8000), within 60 ms of the
+    # audible time with the squelch off (4200 and 5720 ms at -40 dBFS).
+    dsd_neo_add_analog_replay_test(
+        DECODE_IQ_ANALOG_SQL_AUTO_NFM_REAL_CARRIER
+        nfm_ctcss_real
+        "-fA -n 50 --squelch auto --analog-audible-dbfs -40 --analog-min-captured-ms 5900 --analog-min-audible-ms 4100 --analog-max-first-audible-ms 100"
+        ""
+        "${_analog_off_path}"
+    )
+    dsd_neo_add_analog_replay_test(
+        DECODE_IQ_ANALOG_SQL_AUTO_AM_REAL_CARRIER
+        am_airband_real
+        "-fM -n 50 --squelch auto --analog-audible-dbfs -40 --analog-min-captured-ms 7900 --analog-min-audible-ms 5600 --analog-max-first-audible-ms 100"
+        ""
+        "${_analog_off_path}"
+    )
+    # A -Y map row's own --squelch auto on a digital (-fa) session: the row's nfm class
+    # and its auto squelch apply, and the burst gates as under -fA.
+    set(_scan_sql_auto_csv
+        "${CMAKE_CURRENT_BINARY_DIR}/scan_mode_sql_auto_row.csv"
+    )
+    file(
+        WRITE "${_scan_sql_auto_csv}"
+        "channel,frequency_hz,mode,options\n1,150000000,nfm,--squelch auto\n"
+    )
+    dsd_neo_add_analog_replay_test(
+        DECODE_IQ_SCAN_SQL_AUTO_ROW
+        nfm_burst_synth
+        "-fa -C ${_scan_sql_auto_csv} --analog-scan-row 0 ${_sql_auto_burst_bounds}"
+        "Scan row applied: 0 nfm; width 16 kHz; squelch auto [+]10 dB [(]row[)].*ANALOG AUDIO OK"
+        "${_analog_off_path}"
+    )
+
+    # The level squelch on replay (issue #626): a replay hands the demod one live transfer at
+    # a time (5.33 ms here), as a receiver's dongle does, so a fixed level gates the burst
+    # within one such block of the carrier's key and unkey (IO_RTL_REPLAY_CHUNKING pins
+    # the blocks). It used to gate per 64 KiB chunk, 683 ms of these captures: both of the
+    # burst's chunks started on noise and the carrier never played. -28 dB on nfm_burst_synth
+    # and -30 dB on am_burst_synth sit at least 8 dB from each block's noise and carrier
+    # power. The monitor keeps or drops each 20 ms block by the power at its last sample, as
+    # it does live, so the sink's edges fall on its blocks: the first audible block starts at
+    # 280 ms (the block whose end opened, 1.3 ms ahead of the carrier as the channel filter
+    # sees it), the last ends at 540 ms (the 540-560 ms block ends closed and is dropped),
+    # and 260 ms is audible, the whole span, so no block inside it is missing. The bounds
+    # pin those blocks. A -Y row's own --squelch-db gates the same way.
+    set(_sql_level_burst_bounds
+        "--analog-audible-dbfs -40 --analog-min-total-ms 700 --analog-max-total-ms 800 --analog-min-first-audible-ms 270 --analog-max-first-audible-ms 290 --analog-min-last-audible-ms 530 --analog-max-last-audible-ms 550 --analog-min-audible-ms 250 --analog-max-audible-ms 270 --analog-max-clip 0"
+    )
+    dsd_neo_add_analog_replay_test(
+        DECODE_IQ_ANALOG_SQL_LEVEL_NFM_BURST
+        nfm_burst_synth
+        "-fA --squelch -28 ${_sql_level_burst_bounds}"
+        ""
+        "${_analog_off_path}"
+    )
+    dsd_neo_add_analog_replay_test(
+        DECODE_IQ_ANALOG_SQL_LEVEL_AM_BURST
+        am_burst_synth
+        "-fM --squelch -30 ${_sql_level_burst_bounds}"
+        ""
+        "${_analog_off_path}"
+    )
+    set(_scan_sql_level_csv
+        "${CMAKE_CURRENT_BINARY_DIR}/scan_mode_sql_level_row.csv"
+    )
+    file(
+        WRITE "${_scan_sql_level_csv}"
+        "channel,frequency_hz,mode,options\n1,150000000,nfm,--squelch-db -28\n"
+    )
+    dsd_neo_add_analog_replay_test(
+        DECODE_IQ_SCAN_SQL_LEVEL_ROW
+        nfm_burst_synth
+        "-fa -C ${_scan_sql_level_csv} --analog-scan-row 0 ${_sql_level_burst_bounds}"
+        "Scan row applied: 0 nfm; width 16 kHz; squelch -28[.]0 dB [(]row[)].*ANALOG AUDIO OK"
+        "${_analog_off_path}"
+    )
+
+    # The NFM noise squelch (issue #518 follow-up): it opens when the FM discriminator's
+    # noise above voice quiets by N dB (10 by default), as a radio's squelch does, with no
+    # floor to learn and whatever the level. On nfm_burst_synth it opens on the first full
+    # 40 ms window of carrier (340 ms to the first audible block, 20 ms after auto) and
+    # closes within a window of its end (240 ms audible): bounds auto's 320 and 280 ms miss,
+    # so a noise setting run as auto fails them. The _HOT twin replays the capture 10 dB
+    # hotter and measures the same.
+    set(_sql_noise_burst_bounds
+        "--analog-audible-dbfs -40 --analog-min-total-ms 700 --analog-max-total-ms 800 --analog-min-first-audible-ms 330 --analog-max-first-audible-ms 380 --analog-min-audible-ms 200 --analog-max-audible-ms 270 --analog-max-clip 0"
+    )
+    dsd_neo_add_analog_replay_test(
+        DECODE_IQ_ANALOG_SQL_NOISE_NFM_BURST
+        nfm_burst_synth
+        "-fA --squelch noise ${_sql_noise_burst_bounds}"
+        ""
+        "${_analog_off_path}"
+    )
+    dsd_neo_add_analog_replay_test(
+        DECODE_IQ_ANALOG_SQL_NOISE_NFM_BURST_HOT
+        nfm_burst_synth
+        "-fA --squelch noise --analog-iq-gain-db 10 ${_sql_noise_burst_bounds}"
+        "capture scaled by [+]10[.]0 dB, 0 of 72000 bytes clipped.*ANALOG AUDIO OK"
+        "${_analog_off_path}"
+    )
+    # The burst quiets the band by about 22 dB (it opens at noise+20, not at +25): under
+    # noise+30 it never opens, at either level.
+    dsd_neo_add_analog_replay_test(
+        DECODE_IQ_ANALOG_SQL_NOISE_NFM_MARGIN
+        nfm_burst_synth
+        "-fA --squelch noise+30 ${_sql_auto_silent}"
+        ""
+        "${_analog_off_path}"
+    )
+    dsd_neo_add_analog_replay_test(
+        DECODE_IQ_ANALOG_SQL_NOISE_NFM_MARGIN_HOT
+        nfm_burst_synth
+        "-fA --squelch noise+30 --analog-iq-gain-db 10 ${_sql_auto_silent}"
+        ""
+        "${_analog_off_path}"
+    )
+    # Ten seconds of receiver noise never open it, even at the lowest N.
+    dsd_neo_add_analog_replay_test(
+        DECODE_IQ_ANALOG_SQL_NOISE_FLOOR
+        noise_floor
+        "-fA --squelch noise+3 --analog-max-audible-ms 0 --analog-min-total-ms 9900"
+        ""
+        "${_analog_off_path}"
+    )
+    # A real transmission plays whole after the first window: 4160 of nfm_ctcss_real's
+    # 4200 audible ms with the squelch off.
+    dsd_neo_add_analog_replay_test(
+        DECODE_IQ_ANALOG_SQL_NOISE_NFM_REAL_CARRIER
+        nfm_ctcss_real
+        "-fA -n 50 --squelch noise --analog-audible-dbfs -40 --analog-min-captured-ms 5900 --analog-min-audible-ms 4100 --analog-max-first-audible-ms 100"
+        ""
+        "${_analog_off_path}"
+    )
+    # An 8 kHz channel has no band above voice: the floor tracker runs the setting as
+    # auto, and the burst gates exactly as under --squelch auto.
+    dsd_neo_add_analog_replay_test(
+        DECODE_IQ_ANALOG_SQL_NOISE_NARROW_AS_AUTO
+        nfm_burst_synth
+        "-fA --nfm-bandwidth-hz 8000 --squelch noise ${_sql_auto_burst_bounds}"
+        ""
+        "${_analog_off_path}"
+    )
+    # A -Y map row's own --squelch noise on a digital (-fa) session gates as under -fA.
+    set(_scan_sql_noise_csv
+        "${CMAKE_CURRENT_BINARY_DIR}/scan_mode_sql_noise_row.csv"
+    )
+    file(
+        WRITE "${_scan_sql_noise_csv}"
+        "channel,frequency_hz,mode,options\n1,150000000,nfm,--squelch noise\n"
+    )
+    dsd_neo_add_analog_replay_test(
+        DECODE_IQ_SCAN_SQL_NOISE_ROW
+        nfm_burst_synth
+        "-fa -C ${_scan_sql_noise_csv} --analog-scan-row 0 ${_sql_noise_burst_bounds}"
+        "Scan row applied: 0 nfm; width 16 kHz; squelch noise [+]10 dB [(]row[)].*ANALOG AUDIO OK"
+        "${_analog_off_path}"
+    )
+    # The AM monitor has no discriminator to quiet: -fM --squelch noise stops at startup
+    # and says why, before any replay.
+    add_test(
+        NAME DECODE_IQ_ANALOG_SQL_NOISE_AM_REFUSED
+        COMMAND
+            dsd-neo_test_analog_replay --frontend none -fM --squelch noise
+            --iq-replay
+            "${PROJECT_SOURCE_DIR}/tests/fixtures/iq/am_burst_synth.iq.json" -o
+            null
+    )
+    set_tests_properties(
+        DECODE_IQ_ANALOG_SQL_NOISE_AM_REFUSED
+        PROPERTIES
+            LABELS "iq-decode;analog"
+            TIMEOUT 120
+            PASS_REGULAR_EXPRESSION
+                "--squelch noise needs an FM channel and -fM is AM"
+            FAIL_REGULAR_EXPRESSION "ANALOG AUDIO OK|ANALOG METRIC"
     )
 
     # Negative controls: bounds that must NOT hold, run through
@@ -12104,19 +15636,27 @@ if(DSD_HAS_RADIO)
     endfunction()
 
     # DECODE_IQ_ANALOG_NFM_ADJACENT's bound with the channel filter switched off:
-    # the 12.5 kHz neighbour then reads about -8 dBc (-64.9 with the filter), so
+    # the 12.5 kHz neighbour then reads about -20 dBc (-76.6 with the filter), so
     # that bound is not vacuous. The pattern needs the measured level, so a run
     # that delivered no audio ("dBc not measured") does not count. Also the one
     # case spelling host options --opt=VALUE.
     dsd_neo_add_analog_replay_fail_test(
         DECODE_IQ_ANALOG_NEG_ADJACENT_UNFILTERED
         nfm_adjacent_synth
-        "-fA --analog-expect-tone-hz=1000 --analog-probe-max-dbc=12500:-40"
+        "-fA ${_analog_channel} --analog-expect-tone-hz=1000 --analog-probe-max-dbc=12500:-40"
         "ANALOG AUDIO FAIL: probe 12500[.]0 Hz dBc -?[0-9]+[.][0-9]+ [(]limit -40[.]00[)]"
     )
     set_tests_properties(
         DECODE_IQ_ANALOG_NEG_ADJACENT_UNFILTERED
         PROPERTIES ENVIRONMENT "DSD_NEO_CHANNEL_LPF=0"
+    )
+    # The delivery check measures (issue #633): 44.1 kHz audio converted to 48 kHz is a
+    # fraction of a sample from the exact length, so a bound of 0 fires.
+    dsd_neo_add_analog_replay_fail_test(
+        DECODE_PCM_ANALOG_NEG_DELIVERY_EXACT
+        nfm_burst_synth
+        "-fA --analog-pcm-tap 44100 --analog-max-delivery-error-pct 0"
+        "ANALOG AUDIO FAIL: delivery error pct 0[.][0-9]+ [(]limit 0[.]00[)]"
     )
     # The silence pattern (max audible 0 with a stream-time floor) on a replay that
     # is audible throughout: the audible bound must fire, the stream-time one not.
@@ -12128,7 +15668,7 @@ if(DSD_HAS_RADIO)
         ""
         "ANALOG AUDIO FAIL: total ms"
     )
-    # A lower bound above what the tone measures (25.9 dB).
+    # A lower bound above what the tone measures (37.5 dB).
     dsd_neo_add_analog_replay_fail_test(
         DECODE_IQ_ANALOG_NEG_TONE_SNR
         nfm_tone_synth
@@ -12156,6 +15696,71 @@ if(DSD_HAS_RADIO)
         nfm_notone_synth
         "-fA --analog-max-tone-lock-ms 400"
         "ANALOG AUDIO FAIL: tone lock ms not measured"
+    )
+    # DECODE_IQ_ANALOG_AM_TONE's tone bound through the FM monitor: the discriminator
+    # finds no 1 kHz tone on an AM carrier (-21.4 dB measured), so that case's level
+    # is the AM detector's doing.
+    dsd_neo_add_analog_replay_fail_test(
+        DECODE_IQ_ANALOG_NEG_AM_TONE_THROUGH_FM
+        am_tone_synth
+        "-fA --analog-expect-tone-hz 1000 --analog-min-snr-db 25"
+        "ANALOG AUDIO FAIL: tone SNR dB -?[0-9]+[.][0-9]+ [(]limit 25[.]00[)]"
+    )
+    # The speech parity window (DECODE_IQ_ANALOG_PARITY_NFM_REAL) at the fixed gain:
+    # nfm_ctcss_real's small speech deviation plays 9 dB under digital voice there
+    # (-32.8 dBFS RMS), so the window holds only with the AGC.
+    dsd_neo_add_analog_replay_fail_test(
+        DECODE_IQ_ANALOG_NEG_PARITY_FIXED
+        nfm_ctcss_real
+        "-fA -n 50 ${_analog_speech_parity}"
+        "ANALOG AUDIO FAIL: RMS dBFS -[0-9]+[.][0-9]+ [(]limit -27[.]90[)]"
+    )
+    # The raw WAV bound (issue #643) above what nfm_ctcss_real records (-28.9 dBFS RMS)
+    # fails on the level read back from a -6 WAV that holds frames; "not measured" does
+    # not count.
+    dsd_neo_add_analog_replay_fail_test(
+        DECODE_IQ_ANALOG_NEG_RAW_WAV_RMS
+        nfm_ctcss_real
+        "-fA --analog-raw-wav-min-rms-dbfs -20"
+        "ANALOG RAW WAV: frames=[1-9][0-9]* .*ANALOG AUDIO FAIL: raw WAV RMS dBFS -[0-9]+[.][0-9]+ [(]limit -20[.]00[)]"
+    )
+    # The auto squelch's burst bounds under a fixed threshold, on the hot copy: -35 dB
+    # sits 2.5 dB over the burst's noise at its own level (the gate opens on noise at
+    # -38 dB and below) and 7.5 dB under the hot copy's, so there it opens on noise from
+    # the first block and plays the whole replay (740 ms).
+    dsd_neo_add_analog_replay_fail_test(
+        DECODE_IQ_ANALOG_NEG_SQL_LEVEL_HOT
+        nfm_burst_synth
+        "-fA --squelch -35 --analog-iq-gain-db 10 ${_sql_auto_burst_bounds}"
+        "ANALOG AUDIO FAIL: first audible ms 0[.]00 [(]limit 300[.]00[)]"
+    )
+    # The last-audible bound fails on its measured value: the level burst's last audible block
+    # ends at 540 ms, one block past a 520 ms limit, while the first-audible bound holds.
+    dsd_neo_add_analog_replay_fail_test(
+        DECODE_IQ_ANALOG_NEG_LAST_AUDIBLE
+        nfm_burst_synth
+        "-fA --squelch -28 --analog-audible-dbfs -40 --analog-min-first-audible-ms 270 --analog-max-last-audible-ms 520"
+        "ANALOG AUDIO FAIL: last audible ms 540[.]00 [(]limit 520[.]00[)]"
+        1
+        "ANALOG AUDIO FAIL: first audible"
+    )
+    # A gain that would clip the copy stops the host before the replay (exit 2):
+    # noise_floor's 16 LSB noise is already a fifth of full scale.
+    dsd_neo_add_analog_replay_fail_test(
+        DECODE_IQ_ANALOG_NEG_IQ_GAIN_CLIPS
+        noise_floor
+        "-fA --analog-iq-gain-db 10"
+        "--analog-iq-gain-db [+]10[.]0 clips the capture"
+        2
+    )
+    # It scales the committed fixtures only: a capture named anywhere else (here the
+    # first --iq-replay, ahead of the case's own) is refused before anything is read.
+    dsd_neo_add_analog_replay_fail_test(
+        DECODE_IQ_ANALOG_NEG_IQ_GAIN_NOT_A_FIXTURE
+        nfm_burst_synth
+        "-fA --analog-iq-gain-db 10 --iq-replay ${CMAKE_CURRENT_BINARY_DIR}/nfm_burst_synth.iq.json"
+        "scales the committed fixtures [(].*[)] only"
+        2
     )
     # A malformed bound stops the host before the replay (exit 2), rather than being
     # dropped or handed to the CLI parser.
@@ -12376,17 +15981,72 @@ if(DSD_ENABLE_QT_UI)
     endif()
 endif()
 
+# The FFT wrapper is usable without radio hardware or an enabled SDR backend.
+add_executable(dsd-neo_test_io_fft_cache io/test_io_fft_cache.cpp)
+target_include_directories(
+    dsd-neo_test_io_fft_cache
+    PRIVATE ${PROJECT_SOURCE_DIR}/src/io/radio ${PROJECT_SOURCE_DIR}/include
+)
+target_link_libraries(
+    dsd-neo_test_io_fft_cache
+    PRIVATE dsd-neo_pffft dsd-neo_warnings
+)
+if(NOT APPLE AND NOT WIN32 AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_definitions(
+        dsd-neo_test_io_fft_cache
+        PRIVATE DSD_TEST_FFT_ALLOC_WRAP
+    )
+    target_link_options(
+        dsd-neo_test_io_fft_cache
+        PRIVATE "LINKER:--wrap=malloc"
+    )
+endif()
+add_test(NAME IO_FFT_CACHE COMMAND dsd-neo_test_io_fft_cache)
+
 find_package(Python3 QUIET COMPONENTS Interpreter)
 if(Python3_Interpreter_FOUND)
+    add_test(
+        NAME TOOLS_PFFFT_METADATA
+        COMMAND
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/test_pffft_metadata.py
+    )
+    add_test(
+        NAME TOOLS_RELEASE_SBOM_FILENAMES
+        COMMAND
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/test_release_sbom_filenames.py
+    )
+    # Production Android Kotlin on the JVM, one CTest per suite of run_jvm_tests.py. Each compiles Kotlin, which is
+    # memory-hungry, so they never run at once.
     add_test(
         NAME ANDROID_LOCATION_JVM
         COMMAND
             ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/android/run_location_tests.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/android/run_jvm_tests.py --suite
+            location
+    )
+    add_test(
+        NAME ANDROID_DECODER_STATUS_JVM
+        COMMAND
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/android/run_jvm_tests.py --suite
+            decoder_status
+    )
+    add_test(
+        NAME ANDROID_SCREEN_POLICY_JVM
+        COMMAND
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/android/run_jvm_tests.py --suite screen
     )
     set_tests_properties(
         ANDROID_LOCATION_JVM
-        PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 90
+        ANDROID_DECODER_STATUS_JVM
+        ANDROID_SCREEN_POLICY_JVM
+        PROPERTIES
+            SKIP_RETURN_CODE 77
+            TIMEOUT 90
+            RESOURCE_LOCK android_kotlin_jvm
     )
     add_test(
         NAME ANDROID_DIAGNOSTICS_SHARE_PATHS
@@ -12406,6 +16066,40 @@ if(Python3_Interpreter_FOUND)
             WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         )
         set_tests_properties(TOOLS_AIRSPY_PACKAGING PROPERTIES TIMEOUT 120)
+    endif()
+    # tools/noise_squelch_model.py's report on canned results (issue #518 follow-up).
+    # The model imports numpy and scipy, so it registers only where the tests' Python
+    # has them.
+    execute_process(
+        COMMAND ${Python3_EXECUTABLE} -c "import numpy, scipy"
+        RESULT_VARIABLE _dsd_noise_model_py
+        OUTPUT_QUIET
+        ERROR_QUIET
+    )
+    if(_dsd_noise_model_py EQUAL 0)
+        add_test(
+            NAME TOOLS_NOISE_SQUELCH_MODEL_REPORT
+            COMMAND
+                ${Python3_EXECUTABLE}
+                ${PROJECT_SOURCE_DIR}/tests/tools/test_noise_squelch_model.py
+            WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        )
+        set_tests_properties(
+            TOOLS_NOISE_SQUELCH_MODEL_REPORT
+            PROPERTIES TIMEOUT 120
+        )
+        # tools/pcm_noise_squelch_model.py's report and band rule (issue #628).
+        add_test(
+            NAME TOOLS_PCM_NOISE_SQUELCH_MODEL_REPORT
+            COMMAND
+                ${Python3_EXECUTABLE}
+                ${PROJECT_SOURCE_DIR}/tests/tools/test_pcm_noise_squelch_model.py
+            WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        )
+        set_tests_properties(
+            TOOLS_PCM_NOISE_SQUELCH_MODEL_REPORT
+            PROPERTIES TIMEOUT 120
+        )
     endif()
     # The report's per-repeat pairing of the analog columns (issue #518), on canned
     # summaries. Stdlib only, so it runs wherever Python does.
@@ -12433,6 +16127,37 @@ if(Python3_Interpreter_FOUND)
         )
         set_tests_properties(
             TOOLS_REPLAY_AB_ANALOG_METRIC
+            PROPERTIES
+                ENVIRONMENT "DSD_TEST_BASH=${DSD_NEO_BASH_EXECUTABLE}"
+                TIMEOUT 120
+        )
+        # The digital columns, read from a fake host's log (issue #588: ProVoice voice frames).
+        add_test(
+            NAME TOOLS_REPLAY_AB_DIGITAL_METRIC
+            COMMAND
+                ${Python3_EXECUTABLE}
+                ${PROJECT_SOURCE_DIR}/tests/tools/test_replay_ab_report.py
+                ReplayAbDigitalMetric
+            WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        )
+        set_tests_properties(
+            TOOLS_REPLAY_AB_DIGITAL_METRIC
+            PROPERTIES
+                ENVIRONMENT "DSD_TEST_BASH=${DSD_NEO_BASH_EXECUTABLE}"
+                TIMEOUT 120
+        )
+        # Each repeat replays its own realization of the capture: a sidecar copy with
+        # every event shifted by s_r input samples (issue #572).
+        add_test(
+            NAME TOOLS_REPLAY_AB_REALIZATIONS
+            COMMAND
+                ${Python3_EXECUTABLE}
+                ${PROJECT_SOURCE_DIR}/tests/tools/test_replay_ab_report.py
+                ReplayAbRealizations
+            WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        )
+        set_tests_properties(
+            TOOLS_REPLAY_AB_REALIZATIONS
             PROPERTIES
                 ENVIRONMENT "DSD_TEST_BASH=${DSD_NEO_BASH_EXECUTABLE}"
                 TIMEOUT 120
@@ -12610,6 +16335,7 @@ configure_file(
 add_executable(
     dsd-neo_test_io_airspy_source
     io/test_io_airspy_source.cpp
+    io/airspy_sdk_double.cpp
     ${PROJECT_SOURCE_DIR}/src/io/radio/airspy_source.cpp
 )
 target_include_directories(
@@ -12656,6 +16382,7 @@ if(DSD_HAS_AIRSPY)
     add_executable(
         dsd-neo_test_io_rtl_stream_start_failure
         io/test_io_airspy_source.cpp
+        io/airspy_sdk_double.cpp
         ${PROJECT_SOURCE_DIR}/src/io/radio/airspy_source.cpp
     )
     target_include_directories(
@@ -12671,6 +16398,7 @@ if(DSD_HAS_AIRSPY)
         PRIVATE
             dsd-neo_io_radio_private_test_support
             dsd-neo_core
+            dsd-neo_test_support
             dsd-neo_warnings
     )
     if(DSD_HAS_RTLSDR)
@@ -12715,6 +16443,7 @@ if(
         PRIVATE
             "LINKER:--wrap=rtl_stream_create"
             "LINKER:--wrap=rtl_stream_start"
+            "LINKER:--wrap=rtl_stream_start_analog_refusal"
             "LINKER:--wrap=rtl_stream_stop"
             "LINKER:--wrap=rtl_stream_destroy"
             "LINKER:--wrap=rtl_stream_output_rate"
@@ -12733,15 +16462,187 @@ if(
         COMMAND dsd-neo_test_ui_airspy_config_apply M10
     )
     add_test(
+        NAME UI_MENU_AIRSPY_CONFIG_REFUSED_WIDTH
+        COMMAND dsd-neo_test_ui_airspy_config_apply M11
+    )
+    add_test(
         NAME RUNTIME_AIRSPY_CLI_OVERRIDE
         COMMAND dsd-neo_test_ui_airspy_config_apply M2
     )
     set_tests_properties(
         UI_MENU_AIRSPY_CONFIG_FAILURE
         UI_MENU_AIRSPY_CONFIG_TUNING
+        UI_MENU_AIRSPY_CONFIG_REFUSED_WIDTH
         RUNTIME_AIRSPY_CLI_OVERRIDE
         PROPERTIES TIMEOUT 120
     )
+endif()
+
+add_executable(
+    dsd-neo_test_runtime_decode_clock
+    runtime/test_runtime_decode_clock.c
+)
+target_include_directories(
+    dsd-neo_test_runtime_decode_clock
+    PRIVATE ${PROJECT_SOURCE_DIR}/include
+)
+target_link_libraries(dsd-neo_test_runtime_decode_clock PRIVATE dsd-neo_runtime)
+add_test(NAME RUNTIME_DECODE_CLOCK COMMAND dsd-neo_test_runtime_decode_clock)
+
+if(DSD_ENABLE_API)
+    # The API reaches the engine only through app-control, so engine.c and the
+    # radio and protocol archives come after ${LIBS} in CMake's order. Linkers
+    # that default to --as-needed (Debian/Ubuntu) would drop librtlsdr and Codec2
+    # before anything references them; group the static providers ahead of
+    # ${LIBS}, as ENGINE_CHANNEL_SCAN_SQUELCH_GATE does.
+    if(NOT APPLE AND (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang"))
+        set(_dsd_neo_api_test_deps
+            dsd-neo_api
+            dsd-neo_feature_rtlsdr
+            dsd-neo_feature_codec2
+            "-Wl,--start-group"
+            dsd-neo_app_control
+            dsd-neo_engine
+            dsd-neo_dispatch
+            ${_DSD_RUNTIME_CLI_PARSE_LIBS}
+            "-Wl,--end-group"
+            ${LIBS}
+        )
+    else()
+        set(_dsd_neo_api_test_deps
+            dsd-neo_api
+            dsd-neo_engine
+            dsd-neo_feature_rtlsdr
+            dsd-neo_feature_codec2
+            ${LIBS}
+        )
+    endif()
+
+    # The JSON tests feed NaN and infinity to the writer, and the payload test
+    # compiles json.c itself, so it does not inherit src/api's IEEE property.
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+        set(_dsd_neo_api_ieee_option -fno-fast-math)
+    elseif(MSVC)
+        set(_dsd_neo_api_ieee_option /fp:precise)
+    endif()
+
+    add_executable(dsd-neo_test_api_json api/test_json.c)
+    target_include_directories(
+        dsd-neo_test_api_json
+        PRIVATE ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src/api
+    )
+    target_compile_options(
+        dsd-neo_test_api_json
+        PRIVATE ${_dsd_neo_api_ieee_option}
+    )
+    target_link_libraries(dsd-neo_test_api_json PRIVATE dsd-neo_api)
+    add_test(NAME API_JSON COMMAND dsd-neo_test_api_json)
+
+    add_executable(dsd-neo_test_api_commands api/test_commands.c)
+    target_include_directories(
+        dsd-neo_test_api_commands
+        PRIVATE ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src/api
+    )
+    target_compile_definitions(
+        dsd-neo_test_api_commands
+        PRIVATE
+            DSD_API_TEST_COMMANDS_H="${PROJECT_SOURCE_DIR}/include/dsd-neo/app_control/commands.h"
+    )
+    target_link_libraries(
+        dsd-neo_test_api_commands
+        PRIVATE ${_dsd_neo_api_test_deps}
+    )
+    add_test(NAME API_COMMANDS COMMAND dsd-neo_test_api_commands)
+    # Link with --as-needed everywhere so a local Linux build catches an ordering regression.
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        target_link_options(
+            dsd-neo_test_api_commands
+            PRIVATE "LINKER:--as-needed"
+        )
+    endif()
+
+    # The command table against stand-ins for the app-control submit API, so
+    # each case can check the payload bytes it builds.
+    add_executable(
+        dsd-neo_test_api_command_payloads
+        api/test_command_payloads.c
+        ${PROJECT_SOURCE_DIR}/src/api/api_commands.c
+        ${PROJECT_SOURCE_DIR}/src/api/api_response.c
+        ${PROJECT_SOURCE_DIR}/src/api/json.c
+    )
+    target_include_directories(
+        dsd-neo_test_api_command_payloads
+        PRIVATE ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src/api
+    )
+    target_compile_options(
+        dsd-neo_test_api_command_payloads
+        PRIVATE ${_dsd_neo_api_ieee_option}
+    )
+    target_link_libraries(
+        dsd-neo_test_api_command_payloads
+        PRIVATE dsd-neo_runtime dsd-neo_platform
+    )
+    add_test(
+        NAME API_COMMAND_PAYLOADS
+        COMMAND dsd-neo_test_api_command_payloads
+    )
+
+    add_executable(dsd-neo_test_api_server api/test_server.c)
+    target_include_directories(
+        dsd-neo_test_api_server
+        PRIVATE ${PROJECT_SOURCE_DIR}/include
+    )
+    target_link_libraries(
+        dsd-neo_test_api_server
+        PRIVATE ${_dsd_neo_api_test_deps}
+    )
+    add_test(NAME API_SERVER COMMAND dsd-neo_test_api_server)
+    # Link with --as-needed everywhere so a local Linux build catches an ordering regression.
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        target_link_options(
+            dsd-neo_test_api_server
+            PRIVATE "LINKER:--as-needed"
+        )
+    endif()
+    set_tests_properties(API_SERVER PROPERTIES TIMEOUT 120)
+    unset(_dsd_neo_api_test_deps)
+    unset(_dsd_neo_api_ieee_option)
+endif()
+
+# Windows builds the terminal UI against vcpkg's PDCurses, whose include
+# directory dsd-neo_ui_terminal receives as a system directory through
+# PDCurses::PDCurses (MSVC: -external:I, its warnings off). A test that names
+# ${CURSES_INCLUDE_DIRS} itself takes it the same way. Otherwise the Windows
+# SDK's MOUSE_MOVED, which redefines PDCurses' when <windows.h> follows
+# <curses.h> as in ui_async.c, is a C4005 that /WX makes an error in a test
+# build of a source the library compiles cleanly.
+if(WIN32 AND CURSES_INCLUDE_DIRS)
+    get_property(_dsd_neo_test_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
+    foreach(_dsd_neo_test_target IN LISTS _dsd_neo_test_targets)
+        get_target_property(_dsd_neo_test_type ${_dsd_neo_test_target} TYPE)
+        if(_dsd_neo_test_type STREQUAL "INTERFACE_LIBRARY")
+            continue()
+        endif()
+        get_target_property(
+            _dsd_neo_test_includes
+            ${_dsd_neo_test_target}
+            INCLUDE_DIRECTORIES
+        )
+        foreach(_dsd_neo_curses_dir IN LISTS CURSES_INCLUDE_DIRS)
+            if(_dsd_neo_curses_dir IN_LIST _dsd_neo_test_includes)
+                target_include_directories(
+                    ${_dsd_neo_test_target}
+                    SYSTEM
+                    PRIVATE ${_dsd_neo_curses_dir}
+                )
+            endif()
+        endforeach()
+    endforeach()
+    unset(_dsd_neo_test_targets)
+    unset(_dsd_neo_test_target)
+    unset(_dsd_neo_test_type)
+    unset(_dsd_neo_test_includes)
+    unset(_dsd_neo_curses_dir)
 endif()
 
 # Several focused tests provide local stubs for symbols that are also pulled in

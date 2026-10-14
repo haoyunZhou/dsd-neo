@@ -20,6 +20,70 @@
 extern "C" {
 #endif
 
+/**
+ * @brief How the RTL squelch decides (issue #518 follow-up).
+ *
+ * LEVEL compares the channel power against a fixed threshold, as it always has. AUTO learns the channel's noise floor
+ * from windows it classes as noise and opens the gate a margin above it (src/dsp/squelch_floor.c), so the same setting
+ * works whatever the dongle, antenna or gain. NOISE opens an FM channel when the discriminator's output above the voice
+ * band quiets by a threshold (src/dsp/nfm_noise_squelch.c), as a radio's noise squelch does; it needs no floor, and an
+ * AM channel, or an FM one too narrow for the band it measures, runs AUTO instead. AUTO and NOISE are the dynamic modes:
+ * both gate the monitor per sample.
+ */
+typedef enum {
+    DSD_SQUELCH_MODE_LEVEL = 0,
+    DSD_SQUELCH_MODE_AUTO = 1,
+    DSD_SQUELCH_MODE_NOISE = 2,
+} dsd_squelch_mode;
+
+/** @brief Whether @p mode is one of the dynamic modes (AUTO, NOISE), which gate the monitor per sample. */
+static inline int
+dsd_squelch_mode_is_dynamic(int mode) {
+    return mode == DSD_SQUELCH_MODE_AUTO || mode == DSD_SQUELCH_MODE_NOISE;
+}
+
+/** @brief @p mode when it is a dsd_squelch_mode, LEVEL otherwise. */
+static inline int
+dsd_squelch_mode_or_level(int mode) {
+    return dsd_squelch_mode_is_dynamic(mode) ? mode : DSD_SQUELCH_MODE_LEVEL;
+}
+
+/**
+ * @brief The per-sample gate flag a dynamic squelch attaches to each monitor sample: set when the gate was closed for
+ * it. 0 is open, so a buffer of zeros (and every sample under LEVEL) reads open.
+ */
+enum { DSD_SQUELCH_FLAG_CLOSED = 0x01 };
+
+/**
+ * @brief The longest an auto squelch's gate takes to close after a carrier drops, in milliseconds of the samples it
+ * flags (issue #625). While the floor is learned the gate opens for windows classed CARRIER only, and a 40 ms window
+ * holding the drop can still read CARRIER, so the next one closes it: two windows. With a floor, two 20 ms power
+ * sub-windows. The output resampler moves the flags with the audio, under a millisecond. tools/squelch_paths_model.py
+ * measured 78 ms at worst on the plans EDACS and the M17 encoder run, and DSP_SQUELCH_FLOOR pins it. EDACS analog voice
+ * budgets it in its release hold (edacs_analog()).
+ */
+enum { DSD_SQUELCH_CLOSE_DELAY_MS = 85 };
+
+/**
+ * @brief The margin an AUTO squelch opens above the noise floor, and the quieting a NOISE squelch opens at, in whole dB.
+ */
+enum {
+    DSD_SQUELCH_MARGIN_MIN_DB = 3,
+    DSD_SQUELCH_MARGIN_MAX_DB = 30,
+    DSD_SQUELCH_MARGIN_DEFAULT_DB = 10,
+};
+
+/**
+ * @brief A squelch setting: the mode, the threshold a LEVEL squelch compares against (mean-power units, 0 = off), and
+ * the margin a dynamic squelch opens at (whole dB: above the floor under AUTO, of quieting under NOISE). Each field
+ * means something in its own modes only.
+ */
+typedef struct {
+    int mode; /**< dsd_squelch_mode */
+    double level;
+    int margin_db;
+} dsd_squelch_setting;
+
 double raw_pwr(const short* samples, int len, int step);
 double pwr_to_dB(double mean_power);
 double dB_to_pwr(double dB);
@@ -33,12 +97,12 @@ double dB_to_pwr(double dB);
  * decibels reads as a very low threshold rather than as "not gating", which is
  * exactly the confusion this predicate exists to prevent.
  *
- * @param mean_power Stored threshold in mean-power units.
+ * @param level Stored threshold in mean-power units.
  * @return Non-zero when the squelch is off.
  */
 static inline int
-dsd_squelch_is_off(double mean_power) {
-    return !(mean_power > 0.0);
+dsd_squelch_is_off(double level) {
+    return !(level > 0.0);
 }
 
 /**

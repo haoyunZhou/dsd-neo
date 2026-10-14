@@ -11,7 +11,6 @@
 
 #include <dsd-neo/core/audio.h>
 #include <dsd-neo/core/call_state.h>
-#include <dsd-neo/core/dsd_time.h>
 #include <dsd-neo/core/events.h>
 #include <dsd-neo/core/key_presence.h>
 #include <dsd-neo/core/keyring.h>
@@ -20,9 +19,9 @@
 #include <dsd-neo/crypto/dmr_keystream.h>
 #include <dsd-neo/protocol/dmr/dmr.h>
 #include <dsd-neo/runtime/colors.h>
+#include <dsd-neo/runtime/decode_clock.h>
 #include <stdint.h>
 #include <stdio.h>
-#include <time.h>
 #include "dmr_hytera.h"
 #include "dsd-neo/core/opts_fwd.h"
 #include "dsd-neo/core/safe_api.h"
@@ -32,10 +31,10 @@
 static void
 dmr_pi_update_sync_times_if_tuned(const dsd_opts* opts, dsd_state* state) {
     if (opts->trunk_is_tuned == 1) {
-        state->last_vc_sync_time = time(NULL);
-        state->last_vc_sync_time_m = dsd_time_now_monotonic_s();
-        state->last_cc_sync_time = time(NULL);
-        state->last_cc_sync_time_m = dsd_time_now_monotonic_s();
+        state->last_vc_sync_time = dsd_decode_time();
+        state->last_vc_sync_time_m = dsd_decode_now_mono_s();
+        state->last_cc_sync_time = dsd_decode_time();
+        state->last_cc_sync_time_m = dsd_decode_now_mono_s();
     }
 }
 
@@ -53,7 +52,7 @@ dmr_pi_extract_mi40(const uint8_t pi_byte[]) {
 }
 
 static void
-dmr_pi_handle_kirisun(dsd_opts* opts, dsd_state* state, const uint8_t pi_byte[]) {
+dmr_pi_handle_kirisun(dsd_state* state, const uint8_t pi_byte[]) {
     const uint8_t alg = pi_byte[0];
     const uint8_t so = pi_byte[2];
     const uint32_t target = ((uint32_t)pi_byte[7] << 16U) | ((uint32_t)pi_byte[8] << 8U) | ((uint32_t)pi_byte[9] << 0U);
@@ -87,8 +86,8 @@ dmr_pi_handle_kirisun(dsd_opts* opts, dsd_state* state, const uint8_t pi_byte[])
     }
     DSD_FPRINTF(stderr, "%s", KNRM);
 
-    // Use Kirisun-specific LE handling for SB/MI refresh.
-    opts->dmr_le = 3;
+    // Kirisun-specific late-entry handling for this slot's call (issue #657: never the user's opts->dmr_le).
+    dmr_le_vendor_set(state, (uint8_t)(state->currentslot & 1), DMR_LE_VENDOR_KIRISUN_ENC);
 }
 
 static void
@@ -106,7 +105,7 @@ dmr_pi_hytera_print_key(const dsd_state* state, int show_keys) {
 }
 
 static void
-dmr_pi_handle_hytera(dsd_opts* opts, dsd_state* state, const uint8_t pi_byte[]) {
+dmr_pi_handle_hytera(const dsd_opts* opts, dsd_state* state, const uint8_t pi_byte[]) {
     DSD_FPRINTF(stderr, "%s ", KYEL);
     DSD_FPRINTF(stderr, "\n Slot %d", state->currentslot + 1);
     DSD_FPRINTF(stderr, " DMR PI H- ALG ID: %02X; KEY ID: %02X; MI(40): %02X%02X%02X%02X%02X;", pi_byte[0], pi_byte[2],
@@ -132,8 +131,9 @@ dmr_pi_handle_hytera(dsd_opts* opts, dsd_state* state, const uint8_t pi_byte[]) 
         DSD_FPRINTF(stderr, " Hytera Enhanced; ");
         dmr_pi_hytera_print_key(state, opts->show_keys);
 
-        //disable late entry for DMRA (hopefully, there aren't any systems running both DMRA and Hytera Enhanced mixed together)
-        opts->dmr_le = 2;
+        // No DMRA late entry for this slot's call: Hytera Enhanced carries its own MI (issue #657: per slot and per
+        // call, never the user's opts->dmr_le).
+        dmr_le_vendor_set(state, (uint8_t)(state->currentslot & 1), DMR_LE_VENDOR_HYTERA_ENH);
     } else {
         DSD_FPRINTF(stderr, "%s", KRED);
         DSD_FPRINTF(stderr, " (Checksum Err);");
@@ -213,11 +213,15 @@ dmr_pi_handle_dmra_slot(dsd_state* state, const uint8_t pi_byte[], int slot_numb
 
 static void
 dmr_pi_handle_dmra(dsd_state* state, const uint8_t pi_byte[]) {
+    // This CRC-verified PI identifies standard DMRA encryption even when a lost terminator/header hid the call
+    // boundary. Its slot must resume standard SB/MI handling instead of keeping the previous vendor's mode.
     if (state->currentslot == 0) {
+        dmr_le_vendor_reset(state, 0U);
         dmr_pi_handle_dmra_slot(state, pi_byte, 1, &state->payload_algid, &state->payload_keyid, &state->payload_mi);
     }
 
     if (state->currentslot == 1) {
+        dmr_le_vendor_reset(state, 1U);
         dmr_pi_handle_dmra_slot(state, pi_byte, 2, &state->payload_algidR, &state->payload_keyidR, &state->payload_miR);
     }
 }
@@ -280,7 +284,7 @@ dmr_pi(dsd_opts* opts, dsd_state* state, uint8_t PI_BYTE[], uint32_t CRCCorrect,
     dmr_pi_update_sync_times_if_tuned(opts, state);
 
     if (MFID == 0x0A && CRCCorrect == 1) { //Kirisun
-        dmr_pi_handle_kirisun(opts, state, PI_BYTE);
+        dmr_pi_handle_kirisun(state, PI_BYTE);
         dmr_pi_publish_crypto(opts, state);
         return;
     }

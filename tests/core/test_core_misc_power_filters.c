@@ -143,28 +143,35 @@ test_audio_filter_helpers(void) {
     hpf_f(&state, hpf_float, 4);
     assert(hpf_float[1] > 0.0f);
 
+    /* pbf()/pbf_f() are pass-through shims since issue #518 (the monitor's voice band-pass is
+       dsd_analog_audio_process_f()'s): they leave every sample as it was. */
     short pbf_samples[] = {0, 12000, 0, -12000};
     pbf(&state, pbf_samples, 4);
-    assert(pbf_samples[1] != 0);
+    assert(pbf_samples[0] == 0 && pbf_samples[1] == 12000 && pbf_samples[2] == 0 && pbf_samples[3] == -12000);
 
     float pbf_float[] = {0.0f, 12000.0f, 0.0f, -12000.0f};
     pbf_f(&state, pbf_float, 4);
-    assert(fabsf(pbf_float[1]) > 0.0f);
+    assert(fabsf(pbf_float[1] - 12000.0f) < 1e-6f && fabsf(pbf_float[3] + 12000.0f) < 1e-6f);
 
+    /* hpf_dL()/hpf_dR() run the digital voice high-pass (issue #653) on slot 1's and slot 2's state and saturate
+       to int16 where the filter's memory carries a sample past full scale. */
     init_audio_filters(&state, 48000);
-    state.HRCFilterL.coef = 1.0f;
-    state.HRCFilterL.v_in[0] = -32768.0f;
-    state.HRCFilterL.v_out[0] = 40000.0f;
+    state.voice_hpf[0].s1 = 1.0e6;
     short left[] = {32767};
     hpf_dL(&state, left, 1);
     assert(left[0] == 32767);
 
-    state.HRCFilterR.coef = 1.0f;
-    state.HRCFilterR.v_in[0] = 32767.0f;
-    state.HRCFilterR.v_out[0] = -40000.0f;
+    state.voice_hpf[1].s1 = -1.0e6;
     short right[] = {-32768};
     hpf_dR(&state, right, 1);
     assert(right[0] == -32768);
+    /* Each slot keeps its own state: slot 1's history never reached slot 2's. */
+    assert(state.voice_hpf[0].s1 > 1.0e5 && state.voice_hpf[1].s1 < -1.0e5);
+
+    /* An input change starts both slots over. */
+    init_audio_filters(&state, 48000);
+    assert(fabs(state.voice_hpf[0].s1) < 1e-12 && fabs(state.voice_hpf[0].s2) < 1e-12);
+    assert(fabs(state.voice_hpf[1].s1) < 1e-12 && fabs(state.voice_hpf[1].s2) < 1e-12);
 
     short empty[] = {1234};
     lpf(&state, empty, 0);

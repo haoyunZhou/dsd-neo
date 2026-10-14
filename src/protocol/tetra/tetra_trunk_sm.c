@@ -15,9 +15,9 @@
 #include <dsd-neo/protocol/tetra/tetra_trunk_sm.h>
 #include <dsd-neo/protocol/tetra/tetra_mle.h>
 
-#include <dsd-neo/core/dsd_time.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/state.h>
+#include <dsd-neo/runtime/decode_clock.h>
 #include <dsd-neo/runtime/trunk_cc_candidates.h>
 #include <dsd-neo/runtime/trunk_tuning_hooks.h>
 
@@ -65,7 +65,7 @@ static double         g_sm_hangtime_s = 0.0; /* 0 = use opts->trunk_hangtime */
 static inline double
 now_m(void)
 {
-    return dsd_time_now_monotonic_s();
+    return dsd_decode_now_mono_s();
 }
 
 static void

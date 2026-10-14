@@ -26,8 +26,8 @@
 #include <dsd-neo/app_control/frontend.h>
 #include <dsd-neo/app_control/rx_tone_view.h>
 #include <dsd-neo/app_control/scan_timing_view.h>
+#include <dsd-neo/core/analog_tone.h>
 #include <dsd-neo/core/call_state.h>
-#include <dsd-neo/core/dsd_time.h>
 #include <dsd-neo/core/init.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/power.h>
@@ -36,10 +36,16 @@
 #include <dsd-neo/core/state_ext.h>
 #include <dsd-neo/core/synctype_ids.h>
 #include <dsd-neo/core/talkgroup_policy.h>
+#include <dsd-neo/platform/sockets.h>
 #include <dsd-neo/protocol/tetra/tetra_acelp.h>
 #include <dsd-neo/protocol/tetra/tetra_trunk_sm.h>
+#include <dsd-neo/runtime/analog_channel.h>
+#include <dsd-neo/runtime/analog_tones.h>
+#include <dsd-neo/runtime/decode_clock.h>
 #include <dsd-neo/runtime/scan_mode.h>
 #include <dsd-neo/runtime/scan_options.h>
+#include <dsd-neo/runtime/scan_row_edit.h>
+#include <dsd-neo/runtime/squelch.h>
 
 #include <dsd-neo/core/opts_fwd.h>
 #include <dsd-neo/core/state_fwd.h>
@@ -55,6 +61,8 @@ static int g_stub_channel_bandwidth_hz = 0;
 static int g_stub_channel_bandwidth_dsp_limited = 0;
 /* Whether the stubbed front end says a stream runs, and its demod rate (issue #525). */
 static int g_stub_stream_active = 0;
+/* The demodulator kind of the published analog width (issue #524): FM unless a case publishes an AM width. */
+static int g_stub_channel_analog_kind = DSD_ANALOG_DEMOD_FM;
 static int g_stub_demod_rate_hz = 0;
 
 /* The scan-timing view a case feeds the model. Zeroed between cases: reason NONE
@@ -88,6 +96,7 @@ dsd_app_frontend_get_metrics_for_snapshot(const dsd_opts* opts, const dsd_state*
     out->channel_bandwidth_hz = g_stub_channel_bandwidth_hz;
     out->channel_bandwidth_dsp_limited = g_stub_channel_bandwidth_dsp_limited;
     out->stream_active = g_stub_stream_active;
+    out->channel_analog_kind = g_stub_channel_analog_kind;
     out->demod_rate_hz = g_stub_demod_rate_hz;
     return 0;
 }
@@ -288,7 +297,7 @@ test_lead_slot_keeps_earlier_call_and_quality() {
 
     dsd_call_observation call = dsd_call_observation_data(DSD_SYNC_P25P2_POS, 1U, 4242U, 1202U);
     call.kind = DSD_CALL_KIND_GROUP_VOICE;
-    call.observed_m = dsd_time_now_monotonic_s() - 2.0;
+    call.observed_m = dsd_decode_now_mono_s() - 2.0;
     expect("slot 2 opens first", dsd_call_state_observe(&state, &call, DSD_CALL_BOUNDARY_BEGIN) == 1);
     state.p25_p2_voice_err_hist_len = 50;
     state.p25_p2_voice_err_hist_count[1] = 3;
@@ -311,7 +320,7 @@ test_lead_slot_keeps_earlier_call_and_quality() {
                                                              && model.voiceErrsPerFrame() == 2.0
                                                              && model.slot1VoiceErrsPerFrame() == 5.0);
 
-    expect("earlier slot 2 call ends", dsd_call_state_end(&state, 1U, dsd_time_now_monotonic_s()) == 1);
+    expect("earlier slot 2 call ends", dsd_call_state_end(&state, 1U, dsd_decode_now_mono_s()) == 1);
     model.refresh(&opts, &state);
     expect("remaining slot 1 call takes the headline",
            model.slot1CallState() == 2 && model.slot2CallState() == 3 && model.leadSlot() == 1);
@@ -333,7 +342,7 @@ test_lead_slot_change_alone_notifies() {
      * test is descheduled. Restarting an epoch can then change only the lead. */
     dsd_call_observation call = dsd_call_observation_data(DSD_SYNC_P25P2_POS, 0U, 4242U, 1201U);
     call.kind = DSD_CALL_KIND_GROUP_VOICE;
-    call.observed_m = dsd_time_now_monotonic_s() + 60.0;
+    call.observed_m = dsd_decode_now_mono_s() + 60.0;
     expect("initial lead opens", dsd_call_state_observe(&state, &call, DSD_CALL_BOUNDARY_BEGIN) == 1);
     dsd_call_observation other = call;
     other.slot = 1U;
@@ -438,10 +447,23 @@ test_site() {
     expect("DMR verbatim site", model.siteProtocol() == "DMR" && model.dmrColorCode() == 7
                                     && model.dmrSiteText() == "Net 12 Site 3; " && model.dmrRestLsn() == 4
                                     && !model.p25WacnValid());
+    // 16 is "not decoded", which every carrier boundary now leaves (issue #575): no CC 16 on the site line.
+    state.dmr_color_code = 16;
+    model.refresh(&opts, &state);
+    expect("unknown DMR colour code hidden", model.dmrColorCode() == -1 && !model.siteLine().contains("CC"));
     state.synctype = DSD_SYNC_NXDN_POS;
     state.nxdn_last_ran = 64;
     model.refresh(&opts, &state);
     expect("unknown NXDN RAN hidden", model.nxdnRan() == -1 && model.siteLine().isEmpty());
+    // DCR's fixed 7 stands in for a RAN it does not carry (issue #575).
+    state.nxdn_last_ran = 7;
+    state.nxdn_last_ran_stand_in = 1;
+    model.refresh(&opts, &state);
+    expect("DCR stand-in is no RAN", model.nxdnRan() == -1 && !model.siteLine().contains("RAN"));
+    state.nxdn_last_ran_stand_in = 0;
+    model.refresh(&opts, &state);
+    expect("NXDN RAN 7 shown", model.nxdnRan() == 7 && model.siteLine().contains("RAN 7"));
+    state.nxdn_last_ran_stand_in = 1; // the IDAS area below is a stand-in too, shown under its own label
     state.nxdn_last_ran = 0;
     DSD_SNPRINTF(state.nxdn_location_category, sizeof(state.nxdn_location_category), "%s", "Type-D");
     state.nxdn_location_sys_code = 12;
@@ -599,7 +621,7 @@ test_call_skip_metrics() {
     model.refresh(&opts, &snapshot);
     int changes = 0;
     QObject::connect(&model, &dsd_qt::MetricsModel::controlChanged, [&]() { ++changes; });
-    const double now = dsd_time_now_monotonic_s();
+    const double now = dsd_decode_now_mono_s();
     expect("seed metric skip", dsd_tg_policy_call_skip_arm(&state, 100, 1, 0, now) == 0);
     expect("publish skip snapshot", dsd_tg_policy_copy_snapshot(&snapshot, &state) == 0);
     model.refresh(&opts, &snapshot);
@@ -620,6 +642,48 @@ test_call_skip_metrics() {
     model.clear();
     expect("stopped skips unavailable", model.callSkipCount() == 0);
     freeState(&snapshot);
+    freeState(&state);
+}
+
+/*
+ * The call lines, the call-skip count and decodeNowMs read the decode clock the decoder stamps
+ * their inputs on, so under the TEST source they follow it with the real clock untouched: a call
+ * begun at T reads 7 s old at T + 7.5 s, and a skip armed at T lapses once its quiet window has
+ * passed in decode time.
+ */
+static void
+test_decode_clock_readings() {
+    static dsd_opts opts;
+    static dsd_state state;
+    initOpts(&opts);
+    initState(&state);
+    const uint64_t t0_ns = 1000000000000000000ULL; // 1e9 s: far from any platform clock reading.
+    dsd_decode_clock_use_test(t0_ns);
+    dsd_qt::MetricsModel model;
+    int now_changes = 0;
+    QObject::connect(&model, &dsd_qt::MetricsModel::decodeNowMsChanged, [&]() { ++now_changes; });
+
+    dsd_call_observation call = dsd_call_observation_data(DSD_SYNC_P25P2_POS, 0U, 123U, 456U);
+    call.kind = DSD_CALL_KIND_GROUP_VOICE;
+    // No observed_m: the call store stamps the start from the decode clock.
+    expect("decode-clock call begins", dsd_call_state_observe(&state, &call, DSD_CALL_BOUNDARY_BEGIN) == 1);
+    expect("decode-clock skip armed", dsd_tg_policy_call_skip_arm(&state, 100, 1, 0, dsd_decode_now_mono_s()) == 0);
+
+    dsd_decode_clock_test_set_ns(t0_ns + 7500000000ULL);
+    model.refresh(&opts, &state);
+    expect("call line ages on the decode clock", model.slot1CallSeconds() == 7);
+    expect("skip counted inside its decode-time quiet window", model.callSkipCount() == 1);
+    expect("decodeNowMs is the decode clock's wall time", model.decodeNowMs() == 1000000007500LL);
+    expect("decodeNowMs announces a new decode second", now_changes == 1);
+    model.refresh(&opts, &state);
+    expect("the same decode second stays quiet", now_changes == 1);
+
+    dsd_decode_clock_test_set_ns(t0_ns + static_cast<uint64_t>((DSD_TG_CALL_SKIP_QUIET_S + 1.0) * 1e9));
+    model.refresh(&opts, &state);
+    expect("skip lapses on the decode clock", model.callSkipCount() == 0);
+    expect("decodeNowMs announces the next decode second", now_changes == 2);
+
+    dsd_decode_clock_use_system();
     freeState(&state);
 }
 
@@ -654,6 +718,56 @@ test_options_readiness() {
         model.refresh(nullptr, &state);
         expect("losing a snapshot resets readiness", !model.optionsKnown());
     }
+    freeState(&state);
+}
+
+/*
+ * Issue #575: whether the input in force is an I/Q replay, which the spectrum reads to offer no tuning. It is the core
+ * predicate on the same options snapshot as radioInput, and it notifies the control group with tunerControlled, the
+ * other reason a tune is refused.
+ */
+static void
+test_replay_input() {
+    static dsd_opts opts;
+    static dsd_state state;
+    initOpts(&opts);
+    initState(&state);
+    dsd_qt::MetricsModel model;
+    int controls = 0;
+    QObject::connect(&model, &dsd_qt::MetricsModel::controlChanged, [&]() { ++controls; });
+
+    opts.audio_in_type = AUDIO_IN_RTL;
+    DSD_SNPRINTF(opts.audio_in_dev, sizeof opts.audio_in_dev, "%s", "rtl");
+    model.refresh(&opts, &state);
+    expect("a live tuner is not a replay", model.radioInput() && !model.replayInput());
+
+    int before = controls;
+    DSD_SNPRINTF(opts.audio_in_dev, sizeof opts.audio_in_dev, "%s", "iqreplay:capture.iq.json");
+    model.refresh(&opts, &state);
+    expect("an iqreplay spec on the RTL input is a replay", model.radioInput() && model.replayInput());
+    expect("the predicate agrees", model.replayInput() == (dsd_opts_input_is_iq_replay(&opts) != 0));
+    expect("a replay notifies the control group", controls > before);
+
+    /* The replay flag the RTL stream keeps in its own copy is not the predicate: only the input in force counts. */
+    opts.iq_replay_active = 1;
+    DSD_SNPRINTF(opts.audio_in_dev, sizeof opts.audio_in_dev, "%s", "rtl");
+    before = controls;
+    model.refresh(&opts, &state);
+    expect("leaving the replay clears it", !model.replayInput());
+    expect("and notifies the control group", controls > before);
+    opts.iq_replay_active = 0;
+
+    /* A spec string under a non-radio input type is no replay: nothing is being tuned at all. */
+    opts.audio_in_type = AUDIO_IN_WAV;
+    DSD_SNPRINTF(opts.audio_in_dev, sizeof opts.audio_in_dev, "%s", "iqreplay:capture.iq.json");
+    model.refresh(&opts, &state);
+    expect("audio input is not a replay", !model.radioInput() && !model.replayInput());
+
+    opts.audio_in_type = AUDIO_IN_RTL;
+    model.refresh(&opts, &state);
+    expect("replaying again", model.replayInput());
+    model.clear();
+    expect("a cleared model reports no replay", !model.replayInput());
     freeState(&state);
 }
 
@@ -798,9 +912,9 @@ test_scan_timing() {
 }
 
 /*
- * The received sub-audible tone (#522), read through the real app-control view: what the
- * monitor row shows for each state, the configured policy kept apart from it, and the row
- * cleared when the session stops -- which is MetricsModel::clear(), the path UiController
+ * The received sub-audible tone or code (#522, #523), read through the real app-control view:
+ * what the monitor row shows for each state, the configured policy kept apart from it, and the
+ * row cleared when the session stops -- which is MetricsModel::clear(), the path UiController
  * takes on stop, not something the QML fixture can prove.
  */
 static void
@@ -886,7 +1000,59 @@ test_rx_tone() {
     expect("a carrier with no tone reads none",
            model.rxToneStatus() == DSD_APP_RX_TONE_NONE && model.rxToneText() == QStringLiteral("none"));
 
+    /* A received DCS code (#523): both standard spellings of its signal, canonical first, with
+       leading zeros, apart from the configured policy, which neither it nor a gate value
+       moves. */
+    state.analog_rx.tone_state = DSD_ANALOG_TONE_STATE_LOCKED;
+    state.analog_rx.tone_kind = DSD_ANALOG_TONE_KIND_DCS;
+    state.analog_rx.dcs_code = 023;
+    state.analog_rx.dcs_inverted = 0;
+    const int before_code = changes;
+    model.refresh(&opts, &state);
+    expect("a locked code shows both of its spellings",
+           model.rxToneStatus() == DSD_APP_RX_TONE_LOCKED && model.rxToneText() == QStringLiteral("DCS D023N / D047I")
+               && model.rxToneKind() == DSD_ANALOG_TONE_KIND_DCS && model.rxToneDcsCode() == 023
+               && !model.rxToneDcsInverted() && model.rxToneDcsAliasCode() == 047 && model.rxToneDcsAliasInverted()
+               && model.rxToneTenthsHz() == 0);
+    expect("the received code notifies its own group", changes > before_code && configured_changes == 0);
+    state.analog_rx.gate = DSD_ANALOG_TONE_GATE_REJECTED;
+    model.refresh(&opts, &state);
+    expect("a gate value changes neither text for a code",
+           model.rxToneText() == QStringLiteral("DCS D023N / D047I")
+               && model.rxToneConfiguredText() == QStringLiteral("off"));
+    state.analog_rx.gate = DSD_ANALOG_TONE_GATE_OFF;
+    state.analog_rx.dcs_code = 0754;
+    model.refresh(&opts, &state);
+    expect("another code replaces it", model.rxToneText() == QStringLiteral("DCS D754N / D116I")
+                                           && model.rxToneDcsCode() == 0754 && model.rxToneDcsAliasCode() == 0116);
+
+    /* A retune clears the code as it clears a tone. */
+    DSD_MEMSET(&state.analog_rx, 0, sizeof(state.analog_rx));
+    state.analog_rx.generation = 3U;
+    model.refresh(&opts, &state);
+    expect("after a retune the code is gone",
+           model.rxToneStatus() == DSD_APP_RX_TONE_NO_CARRIER && model.rxToneKind() == 0 && model.rxToneDcsCode() == 0
+               && !model.rxToneDcsInverted() && model.rxToneDcsAliasCode() == 0 && !model.rxToneDcsAliasInverted());
+    state.analog_rx.carrier_open = 1;
+
+    /* Stop with a code locked clears it too. */
+    state.analog_rx.tone_state = DSD_ANALOG_TONE_STATE_LOCKED;
+    state.analog_rx.tone_kind = DSD_ANALOG_TONE_KIND_DCS;
+    state.analog_rx.dcs_code = 047;
+    model.refresh(&opts, &state);
+    expect("locked on a code before a stop", model.rxToneDcsCode() == 047 && model.rxToneDcsAliasCode() == 023
+                                                 && model.rxToneText() == QStringLiteral("DCS D047N / D023I"));
+    model.clear();
+    expect("stop clears the received code", !model.rxToneVisible() && model.rxToneText().isEmpty()
+                                                && model.rxToneKind() == 0 && model.rxToneDcsCode() == 0
+                                                && !model.rxToneDcsInverted() && model.rxToneDcsAliasCode() == 0
+                                                && !model.rxToneDcsAliasInverted());
+    expect("stop keeps the configured policy with a code too", model.rxToneConfiguredText() == QStringLiteral("off"));
+    DSD_MEMSET(&state.analog_rx, 0, sizeof(state.analog_rx));
+    state.analog_rx.carrier_open = 1;
+
     /* Stop: clear() returns every rxTone reading to unknown and says so. */
+    model.refresh(&opts, &state);
     state.analog_rx.tone_state = DSD_ANALOG_TONE_STATE_LOCKED;
     state.analog_rx.tone_kind = DSD_ANALOG_TONE_KIND_CTCSS;
     state.analog_rx.ctcss_tenths_hz = 1318;
@@ -905,14 +1071,372 @@ test_rx_tone() {
     freeState(&state);
 }
 
+/*
+ * The Tone filter row (#527) through the real app-control view: shown while a policy is in force where detection runs,
+ * the policy text on its configuration signal and the verdict on its own, neither moving the received tone, and the
+ * verdict gone on stop while the policy stays.
+ */
+static void
+test_tone_filter() {
+    static dsd_opts opts;
+    static dsd_state state;
+    initOpts(&opts);
+    initState(&state);
+    dsd_qt::MetricsModel model;
+    int received = 0;
+    int configured = 0;
+    int verdicts = 0;
+    QObject::connect(&model, &dsd_qt::MetricsModel::rxToneChanged, [&]() { ++received; });
+    QObject::connect(&model, &dsd_qt::MetricsModel::rxToneConfiguredTextChanged, [&]() { ++configured; });
+    QObject::connect(&model, &dsd_qt::MetricsModel::toneFilterChanged, [&]() { ++verdicts; });
+    opts.analog_only = 1;
+    opts.monitor_input_audio = 1;
+    opts.analog_tone_filter = DSD_TONE_FILTER_ALLOW;
+    expect("the list parses", dsd_tone_set_parse("100.0/D023N", &opts.analog_tone_set, nullptr, 0) == 0);
+    state.analog_rx.carrier_open = 1;
+    state.analog_rx.tone_state = DSD_ANALOG_TONE_STATE_ACQUIRING;
+    state.analog_rx.gate = DSD_ANALOG_TONE_GATE_PENDING;
+    model.refresh(&opts, &state);
+    expect("the policy row shows the policy and its check",
+           model.toneFilterVisible() && model.rxToneConfiguredText() == QStringLiteral("allow 100.0 Hz/D023N")
+               && model.toneFilterGate() == DSD_ANALOG_TONE_GATE_PENDING
+               && model.toneFilterStatusText() == QStringLiteral("muted: checking tone"));
+    expect("the policy and its verdict each notify", configured == 1 && verdicts == 1);
+
+    const int received_before = received;
+    const int configured_before = configured;
+    state.analog_rx.tone_state = DSD_ANALOG_TONE_STATE_LOCKED;
+    state.analog_rx.tone_kind = DSD_ANALOG_TONE_KIND_CTCSS;
+    state.analog_rx.ctcss_tenths_hz = 670;
+    state.analog_rx.gate = DSD_ANALOG_TONE_GATE_REJECTED;
+    model.refresh(&opts, &state);
+    expect("a rejected tone", model.toneFilterStatusText() == QStringLiteral("muted: not allowed")
+                                  && model.rxToneText() == QStringLiteral("CTCSS 67.0 Hz"));
+    expect("the verdict never announces the policy", configured == configured_before && received > received_before);
+    state.analog_rx.tone_state = DSD_ANALOG_TONE_STATE_NONE;
+    state.analog_rx.tone_kind = 0;
+    state.analog_rx.ctcss_tenths_hz = 0;
+    state.analog_rx.gate_no_tone = 1;
+    model.refresh(&opts, &state);
+    expect("rejected for want of a tone", model.toneFilterStatusText() == QStringLiteral("muted: no tone"));
+    state.analog_rx.gate = DSD_ANALOG_TONE_GATE_ALLOWED;
+    state.analog_rx.gate_no_tone = 0;
+    model.refresh(&opts, &state);
+    expect("passing", model.toneFilterStatusText() == QStringLiteral("passing"));
+
+    /* Stop: the verdict goes, the policy is configuration and stays. */
+    model.clear();
+    expect("stop clears the verdict",
+           !model.toneFilterVisible() && model.toneFilterStatusText().isEmpty() && model.toneFilterGate() == 0);
+    expect("stop keeps the policy", model.rxToneConfiguredText() == QStringLiteral("allow 100.0 Hz/D023N"));
+    /* A digital mode: no detection, no row, whatever is configured. */
+    opts.analog_only = 0;
+    model.refresh(&opts, &state);
+    expect("no detection, no policy row", !model.toneFilterVisible() && model.toneFilterStatusText().isEmpty());
+    freeState(&state);
+}
+
+/*
+ * What the live tone-filter editor opens on, through the real app-control view: the row is reachable wherever detection
+ * runs, a policy or none (toneFilterEditable); the configured mode and list, spelled as written, on their own signal
+ * and kept across a stop as configuration; and whether a scan row's own policy shadows an edit. Never the row's policy.
+ */
+static void
+test_tone_filter_editor_setting() {
+    static dsd_opts opts;
+    static dsd_state state;
+    initOpts(&opts);
+    initState(&state);
+    dsd_qt::MetricsModel model;
+    int settings = 0;
+    int verdicts = 0;
+    QObject::connect(&model, &dsd_qt::MetricsModel::toneFilterSettingChanged, [&]() { ++settings; });
+    QObject::connect(&model, &dsd_qt::MetricsModel::toneFilterChanged, [&]() { ++verdicts; });
+    expect("the editor opens on off before the first frame",
+           model.toneFilterConfiguredMode() == DSD_TONE_FILTER_OFF && model.toneFilterConfiguredList().isEmpty()
+               && !model.toneFilterEditable() && !model.toneFilterRowOverride());
+    opts.analog_only = 1;
+    opts.monitor_input_audio = 1;
+    opts.audio_in_type = AUDIO_IN_WAV;
+    opts.wav_sample_rate = 48000;
+    model.refresh(&opts, &state);
+    expect("no policy, but the editor is reachable where detection runs",
+           model.toneFilterEditable() && !model.toneFilterVisible()
+               && model.toneFilterConfiguredMode() == DSD_TONE_FILTER_OFF);
+    expect("reachability is session state", verdicts == 1 && settings == 0);
+
+    opts.analog_tone_filter = DSD_TONE_FILTER_BLOCK;
+    expect("the list parses", dsd_tone_set_parse("D023I/100", &opts.analog_tone_set, nullptr, 0) == 0);
+    model.refresh(&opts, &state);
+    expect("the configured policy as written",
+           model.toneFilterConfiguredMode() == DSD_TONE_FILTER_BLOCK
+               && model.toneFilterConfiguredList() == QStringLiteral("100.0/D023I"));
+    expect("the setting announces itself once", settings == 1);
+    model.refresh(&opts, &state);
+    expect("an unchanged setting stays quiet", settings == 1);
+
+    /* An nfm row's own policy on air: the editor still opens on the configured one, and knows the row shadows it. */
+    expect("scope",
+           dsd_scan_mode_begin(&opts, &state) == 0 && dsd_scan_mode_enter(&opts, &state, DSD_SCAN_MODE_NFM) == 0);
+    dsd_scan_option_values row = {};
+    row.present = DSD_SCAN_OPT_TONE;
+    row.tone_filter = DSD_TONE_FILTER_ALLOW;
+    expect("row list", dsd_tone_set_parse("67.0", &row.tone_set, nullptr, 0) == 0);
+    expect("row installed", dsd_scan_mode_options(&opts, &state, &row) == 0);
+    model.refresh(&opts, &state);
+    expect("under a row: the configured policy, shadowed",
+           model.toneFilterConfiguredMode() == DSD_TONE_FILTER_BLOCK
+               && model.toneFilterConfiguredList() == QStringLiteral("100.0/D023I") && model.toneFilterRowOverride());
+    dsd_scan_mode_leave(&opts, &state);
+    model.refresh(&opts, &state);
+    expect("the row gone, nothing shadows", !model.toneFilterRowOverride());
+
+    /* Stop: the configured policy stays for the next session's editor; reachability goes. */
+    const int settings_before = settings;
+    model.clear();
+    expect("stop keeps the configured policy", model.toneFilterConfiguredMode() == DSD_TONE_FILTER_BLOCK
+                                                   && model.toneFilterConfiguredList() == QStringLiteral("100.0/D023I")
+                                                   && settings == settings_before);
+    expect("stop takes the editor away", !model.toneFilterEditable() && !model.toneFilterRowOverride());
+    /* A digital mode: nothing to edit on screen, the setting still read. */
+    opts.analog_only = 0;
+    model.refresh(&opts, &state);
+    expect("no detection, no editor",
+           !model.toneFilterEditable() && model.toneFilterConfiguredList() == QStringLiteral("100.0/D023I"));
+    freeState(&state);
+}
+
+/* Issue #518: the scan row on air for the "this channel" editors, from the app-control scan row view: the name and the
+ * fields it takes, sets in its list and runs an edit of, while the scanner that published it runs. */
+static void
+test_scan_row() {
+    static dsd_opts opts;
+    static dsd_state state;
+    initOpts(&opts);
+    initState(&state);
+    dsd_qt::MetricsModel model;
+    int controls = 0;
+    QObject::connect(&model, &dsd_qt::MetricsModel::controlChanged, [&]() { ++controls; });
+    model.refresh(&opts, &state);
+    expect("no scan row, nothing to edit", !model.scanRowActive() && model.scanRowEditable() == 0);
+    opts.trunk_scan_enabled = 1;
+    state.scan_row_scanner = (uint8_t)DSD_SCAN_ROW_SCANNER_TRUNK_SCAN;
+    state.scan_row_session = 5U;
+    state.scan_row_index = 0;
+    state.scan_row_editable = (uint8_t)(DSD_SCAN_ROW_FIELD_SQUELCH | DSD_SCAN_ROW_FIELD_GAIN);
+    state.scan_row_listed = (uint8_t)DSD_SCAN_ROW_FIELD_SQUELCH;
+    state.scan_row_edited = (uint8_t)DSD_SCAN_ROW_FIELD_GAIN;
+    DSD_SNPRINTF(state.trunk_scan_active_id, sizeof state.trunk_scan_active_id, "%s", "county-p25");
+    const int before = controls;
+    model.refresh(&opts, &state);
+    expect("a trunk target on air",
+           model.scanRowActive() && model.scanRowLabel() == QStringLiteral("county-p25")
+               && model.scanRowEditable() == (DSD_SCAN_ROW_FIELD_SQUELCH | DSD_SCAN_ROW_FIELD_GAIN)
+               && model.scanRowListed() == DSD_SCAN_ROW_FIELD_SQUELCH
+               && model.scanRowEdited() == DSD_SCAN_ROW_FIELD_GAIN);
+    expect("the row announces itself", controls == before + 1);
+    expect("the readings are the row's", model.scanRowSynced());
+    /* The width setting a "this channel" step starts from is the options snapshot's, the row's own while on air. */
+    opts.analog_demod = DSD_ANALOG_DEMOD_FM;
+    opts.analog_nfm_bandwidth_hz = 12500;
+    model.refresh(&opts, &state);
+    expect("the width setting in force", model.analogBandwidthSettingHz() == 12500 && controls == before + 2);
+    opts.analog_nfm_bandwidth_hz = 0;
+    model.refresh(&opts, &state);
+    expect("the default's setting", model.analogBandwidthSettingHz() == 0 && controls == before + 3);
+    /* Options from another row's scope (read between the decoder's two publishes): the row stays on air, and the
+       readings beside it are not its own until the next pair. */
+    state.scan_row_scope_seq = opts.scan_row_scope_seq + 1U;
+    model.refresh(&opts, &state);
+    expect("snapshots of two scopes", model.scanRowActive() && !model.scanRowSynced() && controls == before + 4);
+    state.scan_row_scope_seq = opts.scan_row_scope_seq;
+    model.refresh(&opts, &state);
+    expect("one scope again", model.scanRowSynced() && controls == before + 5);
+    state.scan_row_edited = 0U;
+    model.refresh(&opts, &state);
+    expect("an edit dropped is announced", model.scanRowEdited() == 0 && controls == before + 6);
+    opts.trunk_scan_enabled = 0;
+    model.refresh(&opts, &state);
+    expect("the scanner gone, no row", !model.scanRowActive() && model.scanRowLabel().isEmpty());
+    freeState(&state);
+}
+
+/* Issue #621: on audio input with a rigctl peer (-U) that demodulates it, the analog width is the passband the peer is
+ * asked for. The monitor's Passband row offers it, no DSP rate bounds it, and an unset NFM width stands for -B (or the
+ * peer's own passband without one), which the sheet shows and steps from. Without the peer PCM input filters nothing,
+ * and a radio input has a channel filter instead. */
+static void
+test_rigctl_audio_passband() {
+    static dsd_opts opts;
+    static dsd_state state;
+    initOpts(&opts);
+    initState(&state);
+    dsd_qt::MetricsModel model;
+    int tuner = 0;
+    int controls = 0;
+    QObject::connect(&model, &dsd_qt::MetricsModel::tunerChanged, [&]() { ++tuner; });
+    QObject::connect(&model, &dsd_qt::MetricsModel::controlChanged, [&]() { ++controls; });
+
+    opts.audio_in_type = AUDIO_IN_TCP;
+    opts.analog_only = 0;
+    opts.analog_demod = DSD_ANALOG_DEMOD_FM;
+    opts.analog_nfm_bandwidth_hz = 0;
+    opts.analog_am_bandwidth_hz = 0;
+    opts.setmod_bw = 12500;
+    opts.use_rigctl = 0;
+    opts.rigctl_sockfd = DSD_INVALID_SOCKET;
+
+    /* A digital session with no width set: the peer changes no reading and offers nothing, so the flag alone moves the
+     * tuner group, and the spelling of an unset width (-B 16 kHz, the same width as the default) the control group. */
+    opts.setmod_bw = 16000;
+    model.refresh(&opts, &state);
+    int tuner_before = tuner;
+    int controls_before = controls;
+    opts.use_rigctl = 1;
+    opts.rigctl_sockfd = (dsd_socket_t)5;
+    model.refresh(&opts, &state);
+    expect("digital peer: the passband flag", model.peerPassband() && model.analogBandwidthReading().isEmpty()
+                                                  && !model.nfmBandwidthOffered() && !model.amBandwidthOffered());
+    expect("digital peer: the flag alone moves the tuner group", tuner == tuner_before + 1);
+    expect("digital peer: no analog monitor runs, so no passband is in force", !model.passbandInForce());
+    expect("digital peer: the spelling alone moves the control group",
+           controls == controls_before + 1 && model.nfmBandwidthUnsetText() == QStringLiteral("-B 16 kHz")
+               && model.nfmBandwidthUnsetHz() == 16000);
+    /* An explicit NFM default on the digital session offers the NFM width, and the reading is what the peer is asked
+     * for now, FM at -B, under a typed digital row on air as well: never the configured width, which nothing asks
+     * for (the Passband row's summary and the terminal's field read it). */
+    opts.analog_nfm_bandwidth_hz = 20000;
+    opts.setmod_bw = 12500;
+    expect("digital peer: typed digital row", dsd_scan_mode_enter(&opts, &state, DSD_SCAN_MODE_DMR) == 0);
+    expect("digital peer: typed digital row options", dsd_scan_mode_options(&opts, &state, nullptr) == 0);
+    model.refresh(&opts, &state);
+    expect("digital peer, explicit width: NFM offered", model.nfmBandwidthOffered() && !model.passbandInForce());
+    expect("digital peer, explicit width: the reading is -B",
+           model.analogBandwidthReading() == QStringLiteral("12.5 kHz (-B)") && !model.analogBandwidthAm());
+    dsd_scan_mode_leave(&opts, &state);
+    model.refresh(&opts, &state);
+    expect("digital peer, explicit width, no row: the reading is -B",
+           model.analogBandwidthReading() == QStringLiteral("12.5 kHz (-B)"));
+    opts.analog_nfm_bandwidth_hz = 0;
+    opts.setmod_bw = 16000;
+    model.refresh(&opts, &state);
+    expect("digital peer, no width: no reading", model.analogBandwidthReading().isEmpty());
+    opts.use_rigctl = 0;
+    opts.rigctl_sockfd = DSD_INVALID_SOCKET;
+    opts.setmod_bw = 12500;
+
+    /* The analog FM monitor (-fA) without the peer. */
+    opts.analog_only = 1;
+    model.refresh(&opts, &state);
+    expect("no peer: no passband", !model.peerPassband());
+    expect("no peer: no width offered", !model.nfmBandwidthOffered() && !model.amBandwidthOffered());
+    expect("no peer: PCM input filters nothing",
+           model.analogBandwidthReading() == QStringLiteral("not used on PCM input"));
+    expect("no peer: an unset width reads as the default",
+           model.nfmBandwidthUnsetText() == QStringLiteral("default")
+               && model.amBandwidthUnsetText() == QStringLiteral("default"));
+    expect("no peer: an unset width stands for the kind's default",
+           model.nfmBandwidthUnsetHz() == 16000 && model.amBandwidthUnsetHz() == 6000);
+
+    /* The peer connects: the FM monitor asks it for -B, standing in for the unset NFM width. */
+    opts.use_rigctl = 1;
+    opts.rigctl_sockfd = (dsd_socket_t)5;
+    tuner_before = tuner;
+    controls_before = controls;
+    model.refresh(&opts, &state);
+    expect("peer: the passband", model.peerPassband());
+    expect("peer: the FM monitor runs, so its passband is in force", model.passbandInForce());
+    expect("peer: the NFM width offered, AM's not", model.nfmBandwidthOffered() && !model.amBandwidthOffered());
+    expect("peer: no DSP rate bounds the passband", model.analogBandwidthMaxHz() == 0);
+    expect("peer: -B stands in for the unset width", model.analogBandwidthReading() == QStringLiteral("12.5 kHz (-B)"));
+    expect("peer: an unset NFM width reads as -B, AM's as the default",
+           model.nfmBandwidthUnsetText() == QStringLiteral("-B 12.5 kHz")
+               && model.amBandwidthUnsetText() == QStringLiteral("default"));
+    expect("peer: an unset NFM width steps from -B, AM's from its default",
+           model.nfmBandwidthUnsetHz() == 12500 && model.amBandwidthUnsetHz() == 6000);
+    expect("peer: the flag moves the tuner group", tuner == tuner_before + 1);
+    expect("peer: the stand-ins move the control group", controls == controls_before + 1);
+
+    /* With the NFM width unset a typed digital row on air asks for the same -B, so the reading holds, and the flag
+     * alone moves the tuner group. */
+    expect("peer: typed digital row over -B", dsd_scan_mode_enter(&opts, &state, DSD_SCAN_MODE_DMR) == 0);
+    expect("peer: typed digital row over -B options", dsd_scan_mode_options(&opts, &state, nullptr) == 0);
+    tuner_before = tuner;
+    model.refresh(&opts, &state);
+    expect("peer: under a typed digital row -B is no setting's passband",
+           model.analogBandwidthReading() == QStringLiteral("12.5 kHz (-B)") && !model.passbandInForce());
+    expect("peer: the in-force flag alone moves the tuner group", tuner == tuner_before + 1);
+    dsd_scan_mode_leave(&opts, &state);
+    model.refresh(&opts, &state);
+    expect("peer: the row's leave puts -B back in force", model.passbandInForce());
+
+    /* An explicit NFM width is the passband asked for; -B still names what an unset one would be. */
+    opts.analog_nfm_bandwidth_hz = 20000;
+    model.refresh(&opts, &state);
+    expect("peer: an explicit width is the passband", model.analogBandwidthReading() == QStringLiteral("20 kHz"));
+    expect("peer: the explicit width is configured", model.nfmBandwidthConfiguredHz() == 20000);
+    expect("peer: -B still stands in for an unset width",
+           model.nfmBandwidthUnsetText() == QStringLiteral("-B 12.5 kHz"));
+
+    /* A typed digital row on air keeps the peer following at -B: the reading is not the configured width's, and the
+     * flag alone says so, the configured width staying what a step moves. */
+    expect("peer: typed digital row", dsd_scan_mode_enter(&opts, &state, DSD_SCAN_MODE_DMR) == 0);
+    expect("peer: typed digital row options", dsd_scan_mode_options(&opts, &state, nullptr) == 0);
+    model.refresh(&opts, &state);
+    expect("peer: under a typed digital row the peer follows at -B",
+           model.analogBandwidthReading() == QStringLiteral("12.5 kHz (-B)") && !model.passbandInForce());
+    expect("peer: under a typed digital row the configured width stays", model.nfmBandwidthConfiguredHz() == 20000);
+    dsd_scan_mode_leave(&opts, &state);
+    model.refresh(&opts, &state);
+    expect("peer: the row's leave brings the configured passband back",
+           model.analogBandwidthReading() == QStringLiteral("20 kHz") && model.passbandInForce());
+
+    /* -B moves under the explicit width: the reading holds, and only what an unset width stands for changes. */
+    opts.setmod_bw = 16000;
+    tuner_before = tuner;
+    controls_before = controls;
+    model.refresh(&opts, &state);
+    expect("peer: -B under an explicit width leaves the reading",
+           model.analogBandwidthReading() == QStringLiteral("20 kHz") && tuner == tuner_before);
+    expect("peer: -B under an explicit width moves the stand-in",
+           model.nfmBandwidthUnsetText() == QStringLiteral("-B 16 kHz") && model.nfmBandwidthUnsetHz() == 16000
+               && controls == controls_before + 1);
+
+    /* Neither a width nor -B: the peer keeps its own passband. */
+    opts.analog_nfm_bandwidth_hz = 0;
+    opts.setmod_bw = 0;
+    model.refresh(&opts, &state);
+    expect("peer: without -B the peer's own passband", model.analogBandwidthReading() == QStringLiteral("peer's own"));
+    expect("peer: an unset width stands for the peer's own",
+           model.nfmBandwidthUnsetText() == QStringLiteral("peer's own") && model.nfmBandwidthUnsetHz() == 0);
+
+    /* A radio input has a channel filter, whatever rigctl follows. */
+    opts.setmod_bw = 12500;
+    opts.audio_in_type = AUDIO_IN_RTL;
+    model.refresh(&opts, &state);
+    expect("radio input: no peer passband", !model.peerPassband() && model.radioInput());
+    expect("radio input: an unset width is the default",
+           model.nfmBandwidthUnsetText() == QStringLiteral("default") && model.nfmBandwidthUnsetHz() == 16000);
+
+    opts.use_rigctl = 0;
+    opts.rigctl_sockfd = DSD_INVALID_SOCKET;
+    freeState(&state);
+}
+
 int
 main(int argc, char** argv) {
     QCoreApplication app(argc, argv);
+    test_scan_row();
+    test_rigctl_audio_passband();
     test_options_readiness();
+    test_replay_input();
+    test_decode_clock_readings();
     test_temporary_lockout_metrics();
     test_call_skip_metrics();
     test_scan_timing();
     test_rx_tone();
+    test_tone_filter();
+    test_tone_filter_editor_setting();
     test_direct_key_presence();
     test_decryption_metadata();
     test_site();
@@ -941,7 +1465,7 @@ main(int argc, char** argv) {
     emergency.has_service_metadata = 1;
     emergency.emergency = 1;
     emergency.priority = 3;
-    emergency.observed_m = dsd_time_now_monotonic_s();
+    emergency.observed_m = dsd_decode_now_mono_s();
     dsd_call_state_observe(&state, &emergency, DSD_CALL_BOUNDARY_BEGIN);
     model.refresh(&opts, &state);
     expect("emergency and priority reach metrics", model.slot1CallEmergency() && model.slot1CallPriority() == 3);
@@ -1020,7 +1544,25 @@ main(int argc, char** argv) {
      * asked for. Squelch is stored as mean power and must reach QML as decibels,
      * or a -120 dB threshold renders as 0. */
     expect("gain is reported", model.tunerGainDb() == 30);
+    expect("without a trunk scan the buttons edit the gain in force", model.configuredTunerGainDb() == 30);
+    expect("without a trunk scan no target overrides the gain", !model.tunerGainRowOverride());
     expect("squelch is reported in dB", std::fabs(model.squelchDb() - (-120.0)) < 0.5);
+
+    /* Issue #518 follow-up: under --trunk-scan the buttons edit the configured gain the coordinator publishes, and a
+     * parked target with its own rtl_gain is flagged, from the same app_control view the terminal uses. */
+    opts.trunk_scan_enabled = 1;
+    state.trunk_scan_target_count = 2U;
+    state.trunk_scan_configured_gain = 20;
+    state.trunk_scan_gain_override = 1U;
+    model.refresh(&opts, &state);
+    expect("the target's own gain is the reading", model.tunerGainDb() == 30);
+    expect("the configured gain is what the buttons edit", model.configuredTunerGainDb() == 20);
+    expect("the target's override is flagged", model.tunerGainRowOverride());
+    opts.trunk_scan_enabled = 0;
+    state.trunk_scan_target_count = 0U;
+    state.trunk_scan_configured_gain = 0;
+    state.trunk_scan_gain_override = 0U;
+    model.refresh(&opts, &state);
 
     /* A threshold at the display floor is still a threshold. Only a level that
      * gates nothing is off, and the panel has to be able to tell them apart --
@@ -1100,17 +1642,120 @@ main(int argc, char** argv) {
     expect("a full-scale default reads 0 dB", std::fabs(model.configuredSquelchDb()) < 1e-9);
     expect("a full-scale default is not off", !model.configuredSquelchOff());
     expect("a full-scale default readout", model.squelchReadout() == QStringLiteral("-60.0 dB (row; default 0.0 dB)"));
-    /* A non-radio session has no squelch panel to feed. */
+    /* Audio input takes a squelch too (issue #628): the same readout, flagged for the monitor's Squelch row. */
+    expect("a radio input is not audio input", !model.squelchAudioInput());
     opts.audio_in_type = AUDIO_IN_WAV;
     model.refresh(&opts, &state);
-    expect("non-radio input publishes no squelch override", !model.squelchRowOverride());
-    expect("non-radio input publishes no squelch readout", model.squelchReadout().isEmpty());
+    expect("audio input is flagged", model.squelchAudioInput());
+    expect("audio input publishes the squelch override", model.squelchRowOverride());
+    expect("audio input publishes the readout",
+           model.squelchReadout() == QStringLiteral("-60.0 dB (row; default 0.0 dB)"));
+    /* A symbol file has no squelch to feed. */
+    opts.audio_in_type = AUDIO_IN_SYMBOL_BIN;
+    model.refresh(&opts, &state);
+    expect("a symbol file is not audio input", !model.squelchAudioInput());
+    expect("a symbol file publishes no squelch override", !model.squelchRowOverride());
+    expect("a symbol file publishes no squelch readout", model.squelchReadout().isEmpty());
     opts.audio_in_type = AUDIO_IN_RTL;
     dsd_scan_mode_leave(&opts, &state);
     opts.rtl_squelch_level = dsd_squelch_level_from_sql(-80.0);
     model.refresh(&opts, &state);
     expect("leaving the row clears the badge", !model.squelchRowOverride());
     expect("leaving the row restores the default", std::fabs(model.effectiveSquelchDb() - (-80.0)) < 1e-6);
+    opts.rtl_squelch_margin_db = 7;
+    model.refresh(&opts, &state);
+    expect("a level is not auto",
+           !model.configuredSquelchAuto() && !model.effectiveSquelchAuto() && model.squelchAutoStatus().isEmpty());
+    expect("a level keeps the margin Auto starts from again", model.configuredSquelchMarginDb() == 7);
+    expect("the level beneath is a threshold", !model.configuredSquelchLevelOff());
+
+    /* The auto squelch (issue #518 follow-up): whether each setting is AUTO, its margin and what the one in force
+     * shows come from the same view, and the level beneath it stays what dB goes back to. */
+    opts.rtl_squelch_mode = DSD_SQUELCH_MODE_AUTO;
+    opts.rtl_squelch_margin_db = 12;
+    const int saved_analog_only = opts.analog_only;
+    opts.analog_only = 0;
+    model.refresh(&opts, &state);
+    expect("an auto default is auto on both sides", model.configuredSquelchAuto() && model.effectiveSquelchAuto());
+    expect("its margin on both sides",
+           model.configuredSquelchMarginDb() == 12 && model.effectiveSquelchMarginDb() == 12);
+    expect("the level beneath it stays readable", std::fabs(model.configuredSquelchDb() - (-80.0)) < 1e-6);
+    expect("the level beneath it is not off", !model.configuredSquelchLevelOff());
+    opts.rtl_squelch_level = 0.0;
+    model.refresh(&opts, &state);
+    expect("an off level beneath auto reads off there, not in the setting",
+           model.configuredSquelchLevelOff() && !model.configuredSquelchOff());
+    opts.rtl_squelch_level = dsd_squelch_level_from_sql(-80.0);
+    expect("auto is off on a digital session", model.squelchAutoStatus() == QStringLiteral("off on digital"));
+    expect("the readout is the terminal's", model.squelchReadout() == QStringLiteral("auto +12 dB (off on digital)"));
+    opts.analog_only = 1;
+    state.squelch_auto_active = 1;
+    state.squelch_auto_plan_valid = 1;
+    state.squelch_auto_state = 1;
+    state.squelch_auto_floor_cdb = -7830;
+    model.refresh(&opts, &state);
+    expect("an analog session shows the floor", model.squelchAutoStatus() == QStringLiteral("floor -78.3 dB"));
+    state.squelch_auto_floor_cdb = -7900;
+    model.refresh(&opts, &state);
+    expect("a moving floor reaches the panel", model.squelchAutoStatus() == QStringLiteral("floor -79.0 dB"));
+    /* The noise squelch: its flags, its quieting while it runs, and no Noise offered on the AM monitor on its own. */
+    opts.rtl_squelch_mode = DSD_SQUELCH_MODE_NOISE;
+    state.squelch_noise_active = 1;
+    state.squelch_noise_measured = 1;
+    state.squelch_noise_quieting_cdb = 2310;
+    model.refresh(&opts, &state);
+    expect("a noise default is noise on both sides", model.configuredSquelchNoise() && model.effectiveSquelchNoise());
+    expect("and not auto", !model.configuredSquelchAuto() && !model.effectiveSquelchAuto());
+    expect("the noise squelch shows its quieting", model.squelchAutoStatus() == QStringLiteral("quieting 23 dB"));
+    expect("the readout is the terminal's", model.squelchReadout() == QStringLiteral("noise +12 dB (quieting 23 dB)"));
+    expect("the FM monitor offers Noise", model.squelchNoiseOffered());
+    opts.analog_demod = DSD_ANALOG_DEMOD_AM;
+    state.squelch_noise_active = 0;
+    state.squelch_noise_measured = 0;
+    model.refresh(&opts, &state);
+    expect("the AM monitor offers no Noise", !model.squelchNoiseOffered());
+    expect("a noise setting on AM runs as auto",
+           model.squelchAutoStatus() == QStringLiteral("as auto: floor -79.0 dB"));
+    opts.analog_demod = DSD_ANALOG_DEMOD_FM;
+    state.squelch_noise_quieting_cdb = 0;
+    opts.rtl_squelch_mode = DSD_SQUELCH_MODE_AUTO;
+    opts.audio_in_type = AUDIO_IN_WAV;
+    state.squelch_auto_active = 0;
+    model.refresh(&opts, &state);
+    expect("auto on audio input reads off there",
+           model.configuredSquelchAuto() && model.squelchAutoStatus() == QStringLiteral("off: no radio input"));
+    /* The PCM noise squelch on audio input (issue #628): learning, then its quieting, or off with no band. */
+    opts.rtl_squelch_mode = DSD_SQUELCH_MODE_NOISE;
+    const int saved_monitor = opts.monitor_input_audio;
+    opts.monitor_input_audio = 1;
+    state.squelch_noise_active = 1;
+    state.squelch_noise_state = DSD_SQUELCH_NOISE_STATE_LEARNING;
+    model.refresh(&opts, &state);
+    expect("the PCM noise squelch learns", model.squelchAutoStatus() == QStringLiteral("learning"));
+    expect("the readout is the terminal's", model.squelchReadout() == QStringLiteral("noise +12 dB (learning)"));
+    expect("the PCM FM monitor offers Noise", model.squelchNoiseOffered());
+    state.squelch_noise_state = DSD_SQUELCH_NOISE_STATE_KNOWN;
+    state.squelch_noise_measured = 1;
+    state.squelch_noise_quieting_cdb = 2310;
+    model.refresh(&opts, &state);
+    expect("then shows its quieting", model.squelchAutoStatus() == QStringLiteral("quieting 23 dB"));
+    state.squelch_noise_state = DSD_SQUELCH_NOISE_STATE_NO_BAND;
+    model.refresh(&opts, &state);
+    expect("or why it is off", model.squelchAutoStatus() == QStringLiteral("off: no band above voice"));
+    state.squelch_noise_active = 0;
+    state.squelch_noise_measured = 0;
+    state.squelch_noise_quieting_cdb = 0;
+    state.squelch_noise_state = DSD_SQUELCH_NOISE_STATE_NONE;
+    opts.monitor_input_audio = saved_monitor;
+    opts.audio_in_type = AUDIO_IN_RTL;
+    state.squelch_auto_active = 0;
+    state.squelch_auto_plan_valid = 0;
+    state.squelch_auto_state = 0;
+    state.squelch_auto_floor_cdb = 0;
+    opts.analog_only = saved_analog_only;
+    opts.rtl_squelch_mode = DSD_SQUELCH_MODE_LEVEL;
+    opts.rtl_squelch_margin_db = DSD_SQUELCH_MARGIN_DEFAULT_DB;
+    model.refresh(&opts, &state);
 
     /* Every flag combination must mean the same thing inside a scope. */
     for (int flags = 0; flags < 8; flags++) {
@@ -1136,6 +1781,22 @@ main(int argc, char** argv) {
     expect("the scanner owns the tuner too", model.tunerControlled() && model.scannerMode());
     expect("the scanner is not trunking", !model.trunkingEnabled());
     opts.scanner_mode = 0;
+
+    /* Issue #575: the centre follows an I/Q replay's recorded RETUNEs, which leave rtlsdr_center_freq on the capture's
+     * opening centre: the replay centre the decoder last read wins while there is one. */
+    model.refresh(&opts, &state);
+    expect("a radio reads its tuned centre", std::fabs(model.centerFreqHz() - 769768750.0) < 0.5);
+    char live_dev[sizeof opts.audio_in_dev];
+    DSD_SNPRINTF(live_dev, sizeof live_dev, "%s", opts.audio_in_dev);
+    DSD_SNPRINTF(opts.audio_in_dev, sizeof opts.audio_in_dev, "%s", "iqreplay:capture.iq.json");
+    opts.iq_replay_center_freq = 769893750U;
+    model.refresh(&opts, &state);
+    expect("a replay reads the centre its samples were captured on",
+           std::fabs(model.centerFreqHz() - 769893750.0) < 0.5);
+    opts.iq_replay_center_freq = 0U;
+    DSD_SNPRINTF(opts.audio_in_dev, sizeof opts.audio_in_dev, "%s", live_dev);
+    model.refresh(&opts, &state);
+    expect("with no replay centre the tuned centre reads again", std::fabs(model.centerFreqHz() - 769768750.0) < 0.5);
 
     /* Scan hold and avoids (#380) read whichever rotation is running. Plain trunking
      * follows one system and is not a rotation, so the controls have nothing to act on. */
@@ -1301,14 +1962,20 @@ main(int argc, char** argv) {
         g_stub_stream_active = 1;
         g_stub_demod_rate_hz = 24000;
         model.refresh(&opts, &state);
+        /* Issue #524: the rate still bounds the widths the controls offer outside the preset: a width set for the next
+         * switch is held to it there. */
         expect("digital: no analog width", model.analogBandwidthHz() == 0 && !model.analogBandwidthDspLimited()
-                                               && model.analogBandwidthMaxHz() == 0);
+                                               && model.analogBandwidthMaxHz() == 20400);
+        expect("digital: neither width offered by default",
+               !model.nfmBandwidthOffered() && !model.amBandwidthOffered());
         opts.analog_only = 1;
         opts.analog_demod = DSD_ANALOG_DEMOD_FM;
         model.refresh(&opts, &state);
         expect("analog before a published width reads the default", model.analogBandwidthHz() == 16000);
         expect("the default is configured as 0", model.analogBandwidthConfiguredHz() == 0);
         expect("the widest width the 24 kHz rate filters", model.analogBandwidthMaxHz() == 20400);
+        expect("analog: the NFM width offered, the AM default fits the rate",
+               model.nfmBandwidthOffered() && !model.amBandwidthOffered());
         expect("the reading says it is the default",
                model.analogBandwidthReading() == QStringLiteral("16 kHz (default)"));
 
@@ -1435,6 +2102,111 @@ main(int argc, char** argv) {
         g_stub_stream_active = 0;
         g_stub_demod_rate_hz = 0;
         opts.audio_in_type = AUDIO_IN_RTL;
+    }
+
+    /* Issue #524: under the AM preset the view reads the AM width: the configured one, 6 kHz by default and never
+     * DSP-limited (a rate that cannot filter it is refused), and the running monitor's own width once the front end
+     * publishes an AM one. An FM width still published (a switch to AM not landed yet) is another channel's. The
+     * configured AM width is what the stepper edits, and stays published off a radio. */
+    {
+        opts.audio_in_type = AUDIO_IN_RTL;
+        g_stub_stream_active = 1;
+        g_stub_demod_rate_hz = 16000;
+        opts.analog_only = 1;
+        opts.monitor_input_audio = 1;
+        opts.analog_demod = DSD_ANALOG_DEMOD_AM;
+        model.refresh(&opts, &state);
+        expect("am: the default width", model.analogBandwidthHz() == 6000 && !model.analogBandwidthDspLimited());
+        expect("am: the default is configured as 0", model.analogBandwidthConfiguredHz() == 0);
+        expect("am: the 16 kHz rate bounds the steps at 13.2 kHz", model.analogBandwidthMaxHz() == 13200);
+        expect("am: the reading says it is the default",
+               model.analogBandwidthReading() == QStringLiteral("6 kHz (default)"));
+
+        opts.analog_am_bandwidth_hz = 10000;
+        g_stub_channel_bandwidth_hz = 16000;
+        g_stub_channel_analog_kind = DSD_ANALOG_DEMOD_FM;
+        model.refresh(&opts, &state);
+        expect("am: an FM width is not the AM channel", model.analogBandwidthHz() == 10000);
+        expect("am: the configured AM width", model.analogBandwidthConfiguredHz() == 10000);
+        g_stub_channel_bandwidth_hz = 9000;
+        g_stub_channel_analog_kind = DSD_ANALOG_DEMOD_AM;
+        model.refresh(&opts, &state);
+        expect("am: the AM monitor's width", model.analogBandwidthHz() == 9000);
+        expect("am: the reading is the AM monitor's width", model.analogBandwidthReading() == QStringLiteral("9 kHz"));
+        expect("am: the width is AM's", model.analogBandwidthAm());
+
+        /* Issue #526: an nfm row with its own width over the AM session runs FM. The readings describe the row's NFM
+         * width, the configured widths are the configured view's rather than the row's in dsd_opts, and the AM
+         * preset's own width stays offered; the leave brings AM back. */
+        opts.analog_nfm_bandwidth_hz = 11250;
+        dsd_scan_option_values am_session_row{};
+        am_session_row.present = DSD_SCAN_OPT_BANDWIDTH;
+        am_session_row.channel_bw_hz = 12500;
+        expect("am: nfm row", dsd_scan_mode_enter(&opts, &state, DSD_SCAN_MODE_NFM) == 0);
+        expect("am: nfm row options", dsd_scan_mode_options(&opts, &state, &am_session_row) == 0);
+        g_stub_channel_bandwidth_hz = 12500;
+        g_stub_channel_analog_kind = DSD_ANALOG_DEMOD_FM;
+        model.refresh(&opts, &state);
+        expect("am nfm row: the row's NFM width", !model.analogBandwidthAm() && model.analogBandwidthHz() == 12500);
+        expect("am nfm row: the configured NFM width",
+               model.nfmBandwidthConfiguredHz() == 11250 && model.analogBandwidthConfiguredHz() == 11250);
+        expect("am nfm row: the configured AM width", model.amBandwidthConfiguredHz() == 10000);
+        expect("am nfm row: both widths offered", model.amBandwidthOffered() && model.nfmBandwidthOffered());
+        dsd_scan_mode_leave(&opts, &state);
+        opts.analog_nfm_bandwidth_hz = 0;
+        g_stub_channel_bandwidth_hz = 9000;
+        g_stub_channel_analog_kind = DSD_ANALOG_DEMOD_AM;
+        model.refresh(&opts, &state);
+        expect("am after the nfm row: AM again", model.analogBandwidthAm() && model.analogBandwidthHz() == 9000);
+
+        opts.audio_in_type = AUDIO_IN_PULSE;
+        model.refresh(&opts, &state);
+        expect("am: no width in force off a radio",
+               model.analogBandwidthHz() == 0 && model.analogBandwidthMaxHz() == 0);
+        expect("am: the configured AM width stays off a radio", model.analogBandwidthConfiguredHz() == 10000);
+
+        /* Each kind's configured width is published whichever preset runs, for the control of the kind the preset
+         * does not run: an explicit NFM width under AM, an explicit AM width under a digital mode. */
+        opts.audio_in_type = AUDIO_IN_RTL;
+        opts.analog_nfm_bandwidth_hz = 25000;
+        model.refresh(&opts, &state);
+        expect("am: the configured NFM width under AM", model.nfmBandwidthConfiguredHz() == 25000);
+        expect("am: the configured AM width under AM", model.amBandwidthConfiguredHz() == 10000);
+        opts.analog_only = 0;
+        opts.monitor_input_audio = 0;
+        opts.analog_demod = DSD_ANALOG_DEMOD_FM;
+        model.refresh(&opts, &state);
+        expect("digital: the configured AM width", model.amBandwidthConfiguredHz() == 10000);
+        expect("digital: the configured NFM width", model.nfmBandwidthConfiguredHz() == 25000);
+        expect("digital: the section's width is the NFM one", model.analogBandwidthConfiguredHz() == 25000);
+        expect("digital: both explicit widths offered", model.nfmBandwidthOffered() && model.amBandwidthOffered());
+        opts.analog_nfm_bandwidth_hz = 0;
+
+        /* The unset AM default is offered where the running stream's rate cannot filter it but filters a narrower AM
+         * width (a replay or device at 7.5 kHz filters up to 5.55 kHz): a switch to AM is refused there with word to
+         * narrow the width, which has to be possible before it. */
+        opts.analog_am_bandwidth_hz = 0;
+        g_stub_demod_rate_hz = 7500;
+        model.refresh(&opts, &state);
+        expect("digital at 7.5 kHz: the AM default is offered", model.amBandwidthOffered());
+        expect("digital at 7.5 kHz: the rate bounds the steps", model.analogBandwidthMaxHz() == 5550);
+        expect("digital at 7.5 kHz: the NFM default is not", !model.nfmBandwidthOffered());
+        opts.audio_in_type = AUDIO_IN_PULSE;
+        model.refresh(&opts, &state);
+        expect("pcm: nothing offered", !model.amBandwidthOffered() && model.analogBandwidthMaxHz() == 0);
+        opts.audio_in_type = AUDIO_IN_RTL;
+        g_stub_demod_rate_hz = 16000;
+
+        opts.analog_only = 0;
+        opts.monitor_input_audio = 0;
+        opts.analog_demod = DSD_ANALOG_DEMOD_FM;
+        opts.analog_am_bandwidth_hz = 0;
+        opts.audio_in_type = AUDIO_IN_RTL;
+        g_stub_channel_bandwidth_hz = 0;
+        g_stub_channel_analog_kind = DSD_ANALOG_DEMOD_FM;
+        g_stub_stream_active = 0;
+        g_stub_demod_rate_hz = 0;
+        model.refresh(&opts, &state);
     }
 
     /* A call with no name of its own on a named scan channel: the hero must show

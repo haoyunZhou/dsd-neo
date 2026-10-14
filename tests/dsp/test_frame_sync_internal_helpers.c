@@ -7,6 +7,7 @@
 
 #include <assert.h>
 #include <dsd-neo/core/opts.h>
+#include <dsd-neo/core/power.h>
 #include <dsd-neo/core/safe_api.h>
 #include <dsd-neo/core/state.h>
 #include <dsd-neo/core/state_ext.h>
@@ -17,6 +18,7 @@
 #include <dsd-neo/engine/trunk_scan.h>
 #include <dsd-neo/platform/posix_compat.h>
 #include <dsd-neo/runtime/config.h>
+#include <dsd-neo/runtime/decode_clock.h>
 #include <dsd-neo/runtime/decode_mode.h>
 #include <dsd-neo/runtime/frame_sync_hooks.h>
 #include <dsd-neo/runtime/scan_mode.h>
@@ -531,9 +533,8 @@ test_sps_hunt_consumption_is_exact_across_the_symbolcnt_wrap(void) {
     assert(state.sps_hunt_counter == 980);
     assert(state.sps_hunt_symbolcnt_mark == 4U);
 
-    /* A reset to zero (nxdn_reset_after_cac_fail(), initState(), print_datascope()) looks
-     * like a backwards jump and buys the profile nothing; the mark re-anchors for the next
-     * call. */
+    /* A reset to zero (nxdn_reset_after_cac_fail(), initState()) looks like a backwards
+     * jump and buys the profile nothing; the mark re-anchors for the next call. */
     reset(&opts, &state);
     state.sps_hunt_counter = 1000;
     state.sps_hunt_symbolcnt_mark = 5000U;
@@ -1803,8 +1804,10 @@ test_elapsed_seconds_prefers_monotonic_then_wall_time(void) {
     assert(frame_sync_elapsed_seconds(12.5, (time_t)20, 0.0, (time_t)0) > 1.0e8);
 }
 
+/* A slot is active while its MAC signalling is fresh, or while its audio gate is open until the voice sync is a
+   hangtime old. What the output still holds counts for nothing (issue #651: the P25 Phase 2 playout drains it). */
 static void
-test_p25_slot_activity_honors_ring_and_hangtime(void) {
+test_p25_slot_activity_honors_gate_mac_and_hangtime(void) {
     static dsd_opts opts;
     static dsd_state state;
     int left_active = 0;
@@ -1814,17 +1817,21 @@ test_p25_slot_activity_honors_ring_and_hangtime(void) {
     opts.trunk_hangtime = 2.0f;
     state.p25_p2_last_mac_active_m[0] = 99.8;
     state.p25_p2_last_mac_active_m[1] = 95.0;
-    state.p25_p2_audio_ring_count[0] = 1;
     state.p25_p2_audio_allowed[1] = 1;
-    frame_sync_p25_slot_activity(&opts, &state, (time_t)100, 100.0, 0.75, 0.75, 1.0, &left_active, &right_active);
+    frame_sync_p25_slot_activity(&opts, &state, (time_t)100, 100.0, 0.75, 1.0, &left_active, &right_active);
     assert(left_active == 1);
     assert(right_active == 1);
 
     left_active = 0;
     right_active = 0;
-    frame_sync_p25_slot_activity(&opts, &state, (time_t)100, 100.0, 0.75, 0.75, 2.0, &left_active, &right_active);
+    frame_sync_p25_slot_activity(&opts, &state, (time_t)100, 100.0, 0.75, 2.0, &left_active, &right_active);
     assert(left_active == 1);
     assert(right_active == 0);
+
+    state.p25_p2_last_mac_active_m[0] = 90.0;
+    left_active = 1;
+    frame_sync_p25_slot_activity(&opts, &state, (time_t)100, 100.0, 0.75, 1.0, &left_active, &right_active);
+    assert(left_active == 0);
 }
 
 static void
@@ -2718,6 +2725,11 @@ test_active_profile_metrics_power_gate_and_votes(void) {
     assert(frame_sync_active_profile_modulation(&opts, &state) == 2);
     assert(frame_sync_active_profile_snr_db(&opts, &state) == 103.0);
     assert(frame_sync_should_skip_snr_or_power_gate(&opts, &state) == 1);
+    /* The auto squelch is off on a digital channel (issue #518 follow-up): it never skips a GFSK sync, whatever the
+       level left behind from a level setting. */
+    opts.rtl_squelch_mode = DSD_SQUELCH_MODE_AUTO;
+    assert(frame_sync_should_skip_snr_or_power_gate(&opts, &state) == 0);
+    opts.rtl_squelch_mode = DSD_SQUELCH_MODE_LEVEL;
 
     opts.mod_cli_lock = 1;
     opts.mod_qpsk = 1;
@@ -2930,6 +2942,94 @@ test_modulation_snr_fallback_votes_and_dwell(void) {
     assert(state.rf_mod == 1);
 
     dsd_rtl_stream_metrics_hooks_set(NULL);
+}
+
+/* One auto-switch pass, with the recent sync hamming set first when @p c4fm_hamming: a near-exact C4FM sync pattern,
+   which outvotes the SNR bias. */
+static void
+dwell_auto_switch_pass(dsd_opts* opts, dsd_state* state, int c4fm_hamming) {
+    int lastt = 24;
+    if (c4fm_hamming) {
+        dsd_frame_sync_test_set_recent_hamming(0, 24, 24);
+    }
+    frame_sync_maybe_auto_switch_modulation(opts, state, 24, &lastt);
+}
+
+/* Arm the CQPSK dwell at the decode time @p armed_ns: two CQPSK-leaning passes enter CQPSK from C4FM. */
+static void
+dwell_arm_at(dsd_opts* opts, dsd_state* state, uint64_t armed_ns) {
+    reset(opts, state);
+    opts->frame_p25p1 = 1;
+    state->carrier = 1;
+    state->rf_mod = 0;
+    dsd_frame_sync_reset_mod_state();
+    dsd_decode_clock_use_test(armed_ns);
+    set_fake_snr(-100.0, 4.0, -100.0, 12.0);
+    install_fake_snr_hooks();
+    dwell_auto_switch_pass(opts, state, 0);
+    dwell_auto_switch_pass(opts, state, 0);
+    assert(state->rf_mod == 1);
+    assert(dsd_frame_sync_test_qpsk_dwell_armed());
+}
+
+/*
+ * The CQPSK dwell is a decode decision, so it runs on the decode clock: a replay settles it by capture time, however
+ * fast the capture is read. Driven through the TEST decode clock, with no real time passing, both of its reads hold at
+ * decode +1.9 s and let go at +2.1 s:
+ * - the SNR bias: inside the dwell a C4FM SNR edge casts no vote, past it three votes take the chain back;
+ * - the switch threshold: inside the dwell C4FM needs five votes (here from the sync hamming), past it three, so
+ *   three votes hold and a fourth past the dwell switches.
+ */
+static void
+check_cqpsk_dwell_on_the_decode_clock(uint64_t armed_ns) {
+    static dsd_opts opts;
+    static dsd_state state;
+    int c4fm_votes = -1;
+    int qpsk_votes = -1;
+    int gfsk_votes = -1;
+
+    dwell_arm_at(&opts, &state, armed_ns);
+    set_fake_snr(25.0, -100.0, 5.0, -100.0);
+    dsd_decode_clock_test_set_ns(armed_ns + 1900000000ULL);
+    for (int pass = 0; pass < 3; pass++) {
+        dwell_auto_switch_pass(&opts, &state, 0);
+    }
+    dsd_frame_sync_test_get_mod_votes(&c4fm_votes, &qpsk_votes, &gfsk_votes);
+    assert(state.rf_mod == 1);
+    assert(c4fm_votes == 0);
+    dsd_decode_clock_test_set_ns(armed_ns + 2100000000ULL);
+    dwell_auto_switch_pass(&opts, &state, 0);
+    dwell_auto_switch_pass(&opts, &state, 0);
+    dsd_frame_sync_test_get_mod_votes(&c4fm_votes, &qpsk_votes, &gfsk_votes);
+    assert(state.rf_mod == 1);
+    assert(c4fm_votes == 2);
+    dwell_auto_switch_pass(&opts, &state, 0);
+    assert(state.rf_mod == 0);
+
+    dwell_arm_at(&opts, &state, armed_ns);
+    dsd_decode_clock_test_set_ns(armed_ns + 1900000000ULL);
+    for (int pass = 0; pass < 3; pass++) {
+        dwell_auto_switch_pass(&opts, &state, 1);
+    }
+    dsd_frame_sync_test_get_mod_votes(&c4fm_votes, &qpsk_votes, &gfsk_votes);
+    assert(state.rf_mod == 1);
+    assert(c4fm_votes == 3);
+    dsd_decode_clock_test_set_ns(armed_ns + 2100000000ULL);
+    dwell_auto_switch_pass(&opts, &state, 1);
+    assert(state.rf_mod == 0);
+
+    dsd_rtl_stream_metrics_hooks_set(NULL);
+    dsd_decode_clock_use_system();
+}
+
+/* The dwell holds and lets go the same way at a short decode time and at a replay's capture time, whose ms are far past
+ * INT_MAX, including one whose ms are a whole multiple of 2^32: the stamp is kept full width, so it is armed there
+ * too, not mistaken for the 0 that means disarmed. */
+static void
+test_cqpsk_dwell_runs_on_the_decode_clock(void) {
+    check_cqpsk_dwell_on_the_decode_clock(7000ULL * 1000000000ULL);
+    check_cqpsk_dwell_on_the_decode_clock(1788245497ULL * 1000000000ULL + 123000000ULL); /* 2026-09-01T06:51:37.123Z */
+    check_cqpsk_dwell_on_the_decode_clock(416ULL * 4294967296ULL * 1000000ULL);          /* 416 x 2^32 ms */
 }
 
 static void
@@ -3191,6 +3291,19 @@ test_scan_class_matchers_and_no_sync(void) {
         assert(state->analog_rx.tone_state == DSD_ANALOG_TONE_STATE_INACTIVE);
         assert(state->analog_rx.tone_kind == DSD_ANALOG_TONE_KIND_NONE && state->analog_rx.ctcss_tenths_hz == 0);
         assert(state->analog_rx.carrier_open == 0 && state->analog_rx.generation != tone_generation);
+        /* Nor does a received DCS code (issue #523), through the reset a scan target switch makes
+           (forget 0), which the engine tests' stubs only mirror. */
+        state->analog_rx.carrier_open = 1;
+        state->analog_rx.tone_state = DSD_ANALOG_TONE_STATE_LOCKED;
+        state->analog_rx.tone_kind = DSD_ANALOG_TONE_KIND_DCS;
+        state->analog_rx.dcs_code = 023;
+        state->analog_rx.dcs_inverted = 1;
+        const uint32_t code_generation = state->analog_rx.generation;
+        dsd_frame_sync_reset_acquisition(opts, state, 0);
+        assert(state->analog_rx.tone_state == DSD_ANALOG_TONE_STATE_INACTIVE);
+        assert(state->analog_rx.tone_kind == DSD_ANALOG_TONE_KIND_NONE && state->analog_rx.dcs_code == 0);
+        assert(state->analog_rx.dcs_inverted == 0 && state->analog_rx.carrier_open == 0);
+        assert(state->analog_rx.generation != code_generation);
     }
     dsd_scan_mode_leave(opts, state);
     dsd_state_ext_free_all(state);
@@ -3242,7 +3355,7 @@ main(void) {
     test_the_2400_4_proof_suppression_is_scoped_to_its_arming_protocols();
     test_the_2400_4_proof_suppression_survives_symbolcnt_rollover();
     test_elapsed_seconds_prefers_monotonic_then_wall_time();
-    test_p25_slot_activity_honors_ring_and_hangtime();
+    test_p25_slot_activity_honors_gate_mac_and_hangtime();
     test_hamming_helpers_find_best_patterns();
 #ifdef USE_RADIO
     test_sps_hunt_restores_learned_p25p1_cqpsk();
@@ -3263,6 +3376,7 @@ main(void) {
     test_snr_squelch_only_applies_to_rtl_input();
     test_nxdn_only_profiles_use_gfsk_snr_gate();
     test_modulation_snr_fallback_votes_and_dwell();
+    test_cqpsk_dwell_runs_on_the_decode_clock();
     test_modulation_cli_lock_prevents_votes();
     test_analog_family_never_auto_switches_modulation();
     test_analog_monitor_never_requests_rtl_symbol_profiles();

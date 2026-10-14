@@ -28,13 +28,13 @@
 
 #include <dsd-neo/core/constants.h>
 #include <dsd-neo/core/dibit.h>
-#include <dsd-neo/core/dsd_time.h>
 #include <dsd-neo/core/file_io.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/state.h>
 #include <dsd-neo/core/synctype_ids.h>
 #include <dsd-neo/dsp/frame_sync.h>
 #include <dsd-neo/protocol/nxdn/nxdn.h>
+#include <dsd-neo/runtime/decode_clock.h>
 
 #include <dsd-neo/protocol/nxdn/nxdn_deperm.h>
 #include <dsd-neo/protocol/nxdn/nxdn_lfsr.h>
@@ -42,7 +42,6 @@
 #include <dsd-neo/runtime/colors.h>
 #include <stdint.h>
 #include <stdio.h>
-#include <time.h>
 #include "dsd-neo/core/opts_fwd.h"
 #include "dsd-neo/core/safe_api.h"
 #include "dsd-neo/core/state_fwd.h"
@@ -274,8 +273,8 @@ nxdn_apply_lich_profile(dsd_state* state, nxdn_frame_ctx* ctx) {
  */
 static void
 nxdn_mark_carrier_sync_active(dsd_state* state) {
-    state->last_cc_sync_time = time(NULL);
-    state->last_cc_sync_time_m = dsd_time_now_monotonic_s();
+    state->last_cc_sync_time = dsd_decode_time();
+    state->last_cc_sync_time_m = dsd_decode_now_mono_s();
 }
 
 static void
@@ -422,7 +421,7 @@ nxdn_apply_limazulu_voice_tweak(const dsd_opts* opts, dsd_state* state, const nx
         nxdn_cipher_force(state, 0x1);
     }
 
-    state->last_cc_sync_time = time(NULL) + 2;
+    state->last_cc_sync_time = dsd_decode_time() + 2;
 }
 #else
 static void
@@ -557,11 +556,8 @@ nxdn_process_voice_and_mbe(dsd_opts* opts, dsd_state* state, const nxdn_frame_ct
      * channel. Synthesize only once the frame body has passed a CRC; a real call confirms
      * on its first FACCH, or within two frames of SACCH (issue #398). */
     if (ctx->voice && nxdn_confirm_is_confirmed(state)) {
-        if ((opts->mbe_out_dir[0] != 0) && (opts->mbe_out_f == NULL)) {
-            openMbeOutFile(opts, state);
-        }
-        state->last_vc_sync_time = time(NULL);
-        state->last_vc_sync_time_m = dsd_time_now_monotonic_s();
+        state->last_vc_sync_time = dsd_decode_time();
+        state->last_vc_sync_time_m = dsd_decode_now_mono_s();
         if (state->M == 1 && dsd_key_scalar_present(state, 0)) {
             nxdn_cipher_force(state, 0x1);
         }
@@ -573,11 +569,12 @@ nxdn_process_voice_and_mbe(dsd_opts* opts, dsd_state* state, const nxdn_frame_ct
         return;
     }
     const dsd_nxdn_variant variant = dsd_frame_sync_active_nxdn_variant(opts, state);
-    if (variant == DSD_NXDN_VARIANT_96 && (time(NULL) - state->last_vc_sync_time) > 1) {
-        closeMbeOutFile(opts, state);
+    /* NXDN's own capture only (issue #661), named as NXDN: a failed CAC run can have reset state->synctype by now. */
+    if (variant == DSD_NXDN_VARIANT_96 && (dsd_decode_time() - state->last_vc_sync_time) > 1) {
+        dsd_mbe_out_close_protocol(opts, state, DSD_MBE_OUT_SLOT1, DSD_SYNC_NXDN_POS);
     }
     if (variant == DSD_NXDN_VARIANT_48) {
-        closeMbeOutFile(opts, state);
+        dsd_mbe_out_close_protocol(opts, state, DSD_MBE_OUT_SLOT1, DSD_SYNC_NXDN_POS);
     }
 }
 
@@ -613,6 +610,7 @@ nxdn_frame(dsd_opts* opts, dsd_state* state) {
     int frame_proved = 0;
 
     nxdn_frame_ctx_init(&ctx);
+    const uint32_t carrier_seq = state->carrier_seq;
     nxdn_collect_lich(opts, state, &ctx);
 
     nxdn_prepare_lich_parity(&ctx);
@@ -633,6 +631,17 @@ nxdn_frame(dsd_opts* opts, dsd_state* state) {
         dsd_dibit_soft_t soft = {.reliability = 255};
         ctx.dbuf[i + 8] = (uint8_t)getDibitSoft(opts, state, &soft);
         ctx.dbuf_reliab[i + 8] = soft.reliability;
+    }
+    if (state->carrier_seq != carrier_seq) {
+        /* The carrier boundary moved the carrier count while the frame was read (issue #575). Everything after the
+           LICH decodes only now, so a SACCH segment read whole before the move, possibly the one completing a
+           superframe, would decode after the boundary ended that carrier's calls: the frame is dropped, with the
+           SACCH segments gathered, as on a sync loss. */
+        DSD_MEMSET(state->nxdn_sacch_frame_segment, 1, sizeof(state->nxdn_sacch_frame_segment));
+        DSD_MEMSET(state->nxdn_sacch_frame_segcrc, 1, sizeof(state->nxdn_sacch_frame_segcrc));
+        nxdn_mark_bad_sync(state);
+        DSD_FPRINTF(stderr, "\n");
+        goto END;
     }
 
     nxdn_descramble_with_seed(ctx.dbuf, 182, state->nxdn_pn95_seed);
@@ -656,7 +665,7 @@ nxdn_frame(dsd_opts* opts, dsd_state* state) {
         if (opts->scanner_mode == 1) {
             /* Hold the scanner a little past this frame so the gap to the next one does
              * not read as loss of signal. */
-            state->last_cc_sync_time = time(NULL) + 2;
+            state->last_cc_sync_time = dsd_decode_time() + 2;
         }
     }
 

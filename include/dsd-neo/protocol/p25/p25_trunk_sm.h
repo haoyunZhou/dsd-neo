@@ -348,8 +348,10 @@ void p25_sm_seed_cc_from_current_tuner_if_unknown(const dsd_opts* opts, dsd_stat
  * Owns the watchdog guard; call on the decoder thread without holding it.
  * FAILED/DEFERRED leave the old channel and calls intact. OK/PENDING end the
  * old calls, forget site acquisition data, and retain the new CC through
- * asynchronous completion/recovery. Network band plans and user settings
- * survive. Requires an initialized context and a positive frequency in Hz.
+ * asynchronous completion/recovery. CC acquisition and its grace window start
+ * at the tune request's completion stamp, also when the request completed
+ * before the call returns. Network band plans and user settings survive.
+ * Requires an initialized context and a positive frequency in Hz.
  */
 dsd_trunk_tune_result p25_sm_select_control_channel(p25_sm_ctx_t* ctx, dsd_opts* opts, dsd_state* state, long hz);
 
@@ -653,6 +655,21 @@ int p25_sm_emit_active(dsd_opts* opts, dsd_state* state, int slot);
  */
 int p25_sm_emit_active_call(dsd_opts* opts, dsd_state* state, int slot, int tg, int dst, int src, int is_group,
                             int svc_bits);
+
+/**
+ * @brief Note, with trunking off, the voice channel frequency a grant update named for @p target (issue #575).
+ *
+ * Each slot whose active call has that target keeps the frequency with the target for itself; a slot whose call has
+ * another target, or none, keeps what it had. The conventional publication gives a call this frequency only when the
+ * call has that target (p25_conventional_grant_frequency()).
+ */
+void p25_conventional_grant_note(dsd_state* state, uint32_t target, long int freq);
+
+/**
+ * @brief The voice channel frequency a grant update named, with trunking off, for @p target on @p slot, or 0 when none
+ *        did: another call's grant is never this call's frequency (issue #575).
+ */
+int64_t p25_conventional_grant_frequency(const dsd_state* state, int slot, uint32_t target);
 
 /**
  * @brief Emit an ACTIVE call whose message type carries no source field.

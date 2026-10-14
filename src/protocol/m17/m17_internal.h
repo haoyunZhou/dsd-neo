@@ -9,6 +9,7 @@
 
 #include <dsd-neo/core/opts_fwd.h>
 #include <dsd-neo/core/state_fwd.h>
+#include <dsd-neo/dsp/analog_voice.h>
 
 #include <stddef.h>
 #include <stdint.h>
@@ -57,6 +58,48 @@ uint16_t m17_attach_lsf_crc(uint8_t* m17_lsf, uint8_t* lsf_packed);
 void m17_sync_monitored_tx_call(const dsd_opts* opts, dsd_state* state, uint64_t dst, uint64_t src,
                                 const char* dst_text, const char* src_text, uint8_t can, uint64_t* active_epoch);
 void m17_end_monitored_tx_call(const dsd_opts* opts, dsd_state* state, uint64_t* active_epoch);
+
+/* The stream encoder's microphone chain at codec2's 8 kHz: the voice band-pass, the legacy 960 Hz filters and the AGC,
+   each the chain's own. */
+typedef struct {
+    dsd_voice_bandpass bandpass;
+    dsd_voice_onepole onepole;
+    dsd_voice_agc agc;
+} m17_voice_chain;
+
+/* Design @p chain for 8 kHz microphone audio, the AGC referenced to PCM input (m17.c). */
+void m17_voice_chain_init(m17_voice_chain* chain);
+/* Run @p chain over one codec2 frame of @p nsam samples (m17.c). */
+void m17_voice_chain_process(const dsd_opts* opts, dsd_state* state, m17_voice_chain* chain, short* voice, size_t nsam);
+
+/* The stream encoder's input side: one sample kept in dec of the input-rate audio, through the anti-alias low-pass
+   first, a pass-through when the input already runs at 8 kHz. */
+typedef struct {
+    int dec;
+    float sample;
+    dsd_voice_bandpass lowpass;
+    /* The dynamic squelch on an RTL input (issue #625): whether the last block read the stream's per-sample gate
+       (dsd_squelch_stream_gate_running()), whether any of its samples was heard (1 whenever no gate runs), and the
+       gain that ramps each sample in over 5 ms and out over 10 ms to exact silence, as the monitor's sink does. */
+    int squelch_gated;
+    int squelch_heard;
+    float squelch_gain;
+} m17_encoder_input;
+
+/* Set up @p in for audio at @p input_rate_hz, a multiple of 8000 (m17.c). */
+void m17_encoder_input_init(m17_encoder_input* in, int input_rate_hz);
+/* Read @p nsam 8 kHz samples from the configured audio input into @p out: PCM inputs as they are after the input volume,
+   RTL monitor audio scaled to PCM16 by the analog chain's RTL monitor gain after the `vol` trim. Returns 1 when read, 0
+   when the input stopped, -1 on an input the encoder cannot read, and 2 when a silent UDP input left the read for a
+   queued command, with nothing read (m17.c, issue #634). */
+int m17_encoder_read_block(dsd_opts* opts, dsd_state* state, m17_encoder_input* in, short* out, size_t nsam);
+
+/* Whether a 40 ms encoder read counts as heard for the VOX (issue #625): @p flags_heard (any sample the stream's gate
+   heard) while @p gated, else the level squelch (dsd_squelch_level_open()). */
+int m17_encoder_squelch_heard(const dsd_opts* opts, int gated, int flags_heard);
+/* The VOX: a heard read resets @p sql_hit, a closed one counts it; past 10 closed reads, at a LICH superframe boundary
+   (@p lich_cnt 0), the transmitter unkeys. Returns 1 while keyed. */
+int m17_encoder_vox_keyed(int heard, int lich_cnt, int* sql_hit);
 
 int m17_decode_pkt_should_report_encrypted(const dsd_state* state, uint32_t protocol);
 int m17_pkt_ptr_clamped(int pbc_count);

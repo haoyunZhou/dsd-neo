@@ -12,6 +12,7 @@
 #define DSD_NEO_INCLUDE_DSD_NEO_APP_CONTROL_COMMANDS_H_
 
 #include <dsd-neo/app_control/rr_import_apply.h>
+#include <dsd-neo/app_control/rx_tone_view.h>
 #include <dsd-neo/runtime/config.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -27,7 +28,7 @@ enum dsd_app_command_id {
     DSD_APP_CMD_SLOT_PREF_CYCLE = 12,
 
     DSD_APP_CMD_GAIN_DELTA = 20,  // payload: int32_t delta (+1/-1)
-    DSD_APP_CMD_AGAIN_DELTA = 21, // payload: int32_t delta (+1/-1) for analog gain
+    DSD_APP_CMD_AGAIN_DELTA = 21, // payload: int32_t delta (+1/-1) for analog gain; from auto it steps from 50
 
     DSD_APP_CMD_TRUNK_TOGGLE = 30,
     DSD_APP_CMD_SCANNER_TOGGLE = 31,
@@ -68,21 +69,23 @@ enum dsd_app_command_id {
     DSD_APP_CMD_MOD_TOGGLE = 102,
     DSD_APP_CMD_DMR_RESET = 103,
     DSD_APP_CMD_GAIN_SET = 104,          // payload: int32_t (0..50)
-    DSD_APP_CMD_AGAIN_SET = 105,         // payload: int32_t (0..50)
+    DSD_APP_CMD_AGAIN_SET = 105,         // payload: int32_t (0 = auto, 1..100)
     DSD_APP_CMD_INPUT_WARN_DB_SET = 106, // payload: double
     DSD_APP_CMD_INPUT_MONITOR_TOGGLE = 107,
     DSD_APP_CMD_COSINE_FILTER_TOGGLE = 108,
 
-    DSD_APP_CMD_TCP_CONNECT_AUDIO = 200, // use opts->tcp_hostname/port; sets audio_in_type=AUDIO_IN_TCP
+    // The input switches below (200, 206, 209, 444-447, 461, 463, 521) close the running input and open the new one
+    // (dsd_audio_switch_input(), issue #634); one that cannot open its input keeps the running one and fails.
+    DSD_APP_CMD_TCP_CONNECT_AUDIO = 200, // connect to opts->tcp_hostname/port and switch the input to it
     DSD_APP_CMD_RIGCTL_CONNECT = 201,    // uses opts->tcp_hostname/rigctlportno
     DSD_APP_CMD_RETURN_CC = 202,
     DSD_APP_CMD_CHANNEL_CYCLE = 203,
     DSD_APP_CMD_SYMCAP_SAVE = 204, // auto-name capture file and start
     DSD_APP_CMD_SYMCAP_STOP = 205,
-    DSD_APP_CMD_REPLAY_LAST = 206,
+    DSD_APP_CMD_REPLAY_LAST = 206, // replay opts->symbol_capture_last, the capture closed last
     DSD_APP_CMD_WAV_START = 207,
     DSD_APP_CMD_WAV_STOP = 208,
-    DSD_APP_CMD_STOP_PLAYBACK = 209,
+    DSD_APP_CMD_STOP_PLAYBACK = 209, // a file or symbol playback switches to the configured Pulse input
 
     // Trunk policy toggles
     DSD_APP_CMD_TRUNK_WLIST_TOGGLE = 210,
@@ -134,16 +137,16 @@ enum dsd_app_command_id {
     DSD_APP_CMD_WAV_RAW_OPEN = 441,         // payload: char path[]
     DSD_APP_CMD_DSP_OUT_SET = 442,          // payload: char filename[]
     DSD_APP_CMD_SYMCAP_OPEN = 443,          // payload: char path[]
-    DSD_APP_CMD_SYMBOL_IN_OPEN = 444,       // payload: char path[]
-    DSD_APP_CMD_INPUT_WAV_SET = 445,        // payload: char path[]; sets type=AUDIO_IN_WAV
-    DSD_APP_CMD_INPUT_SYM_STREAM_SET = 446, // payload: char path[]; sets type=AUDIO_IN_SYMBOL_FLT
-    DSD_APP_CMD_INPUT_SET_PULSE = 447,      // sets audio_in_dev="pulse", type=AUDIO_IN_PULSE
+    DSD_APP_CMD_SYMBOL_IN_OPEN = 444,       // payload: char path[]; a symbol capture, replayed at symbol pace
+    DSD_APP_CMD_INPUT_WAV_SET = 445,        // payload: char path[]; a file, opened as -i opens it
+    DSD_APP_CMD_INPUT_SYM_STREAM_SET = 446, // payload: char path[]; a float symbol stream
+    DSD_APP_CMD_INPUT_SET_PULSE = 447,      // the default Pulse input device
 
     // Networking / device configs
     DSD_APP_CMD_UDP_OUT_CFG = 460,           // payload: struct { char host[256]; int32_t port; }
     DSD_APP_CMD_TCP_CONNECT_AUDIO_CFG = 461, // payload: struct { char host[256]; int32_t port; }
     DSD_APP_CMD_RIGCTL_CONNECT_CFG = 462,    // payload: struct { char host[256]; int32_t port; }
-    DSD_APP_CMD_UDP_INPUT_CFG = 463,         // payload: struct { char bind[256]; int32_t port; }
+    DSD_APP_CMD_UDP_INPUT_CFG = 463,         // payload: struct { char bind[256]; int32_t port; }; binds now
 
     // RTL-SDR controls
     DSD_APP_CMD_RTL_ENABLE_INPUT = 480,
@@ -186,6 +189,10 @@ enum dsd_app_command_id {
     DSD_APP_CMD_TRUNK_SET = 496,  // payload: int32_t on(0/1)
     DSD_APP_CMD_AIRSPY_SET = 497, // payload: dsd_app_airspy_setting_payload
     DSD_APP_CMD_AIRSPY_ENABLE_INPUT = 498,
+    // The whole squelch setting (issue #518 follow-up): a level, the auto squelch with its margin over the floor the
+    // demodulator learns, or the noise squelch with its FM quieting. Edits the configured default, as RTL_SET_SQL_DB
+    // does.
+    DSD_APP_CMD_RTL_SET_SQL_SETTING = 499, // payload: dsd_app_squelch_setting_payload
 
     // Rigctl / tuning params
     DSD_APP_CMD_RIGCTL_SET_MOD_BW = 500, // payload: int32_t hz
@@ -204,10 +211,26 @@ enum dsd_app_command_id {
     // 16000 default. Refused with a toast, changing nothing, when out of range or when the front end the analog
     // preset runs on cannot filter it at its DSP rate; applied live to a running analog monitor.
     DSD_APP_CMD_NFM_BANDWIDTH_SET = 508, // payload: int32_t Hz (0 = default)
+    // Configured AM channel-filter width (issue #524): the full RF passband in Hz, 5000..20000, or 0 for the 6000
+    // default. Refused with a toast, changing nothing, when out of range or when a running AM front end cannot
+    // filter it at its DSP rate; applied live while AM is on air, otherwise kept for the next switch to AM.
+    DSD_APP_CMD_AM_BANDWIDTH_SET = 509, // payload: int32_t Hz (0 = default)
+    // Configured CTCSS/DCS receive policy (issue #527, the live tone-filter editor): the mode and its '/'-separated
+    // list, checked by the list parser (dsd_tone_filter_check()), or the mode alone with the configured list kept.
+    // Refused with a toast, changing nothing, when invalid. It edits the configured policy: while a scan row with its
+    // own tone options is on air the row keeps its own, and the toast says the row overrides the edit. Applied from the
+    // monitor's next read of audio. Not coalescible: each queued edit is judged, and applied or refused, on its own.
+    DSD_APP_CMD_TONE_FILTER_SET = 510, // payload: dsd_app_tone_filter_payload
+    // Session edit of one field of the scan row on air ("this channel", issue #518): the squelch, channel width, tone
+    // policy or (a --trunk-scan target's) tuner gain the row runs for the rest of the session, over what its list
+    // sets; the configured defaults are not touched and nothing is saved. Names the row the editor opened on (scanner,
+    // session, row, target id), so an edit that outlives the visit still reaches that row, and one from an earlier
+    // scan is refused. Not coalescible, and no scoped (suspend/resume) command: it changes the row's options itself.
+    DSD_APP_CMD_SCAN_ROW_EDIT = 511, // payload: dsd_app_scan_row_edit_payload
 
     // Pulse audio device selection
     DSD_APP_CMD_PULSE_OUT_SET = 520, // payload: char name[]
-    DSD_APP_CMD_PULSE_IN_SET = 521,  // payload: char name[]
+    DSD_APP_CMD_PULSE_IN_SET = 521,  // payload: char name[]; switches the input to that Pulse device
 
     // Input volume
     DSD_APP_CMD_INPUT_VOL_SET = 530, // payload: int32_t mult (1..16)
@@ -298,6 +321,14 @@ enum dsd_app_command_id {
     DSD_APP_CMD_CONFIG_APPLY = 710,       // payload: dsdneoUserConfig (see runtime/config.h)
     DSD_APP_CMD_CONFIG_METADATA_SET = 711 // payload: dsd_app_config_metadata_payload
 };
+
+/* DSD_APP_CMD_RTL_SET_SQL_SETTING: mode is dsd_squelch_mode (core/power.h); level the LEVEL threshold in mean-power
+   units (0 = off), margin_db the AUTO margin or the NOISE quieting in whole dB (3..30). */
+typedef struct {
+    int32_t mode;
+    int32_t margin_db;
+    double level;
+} dsd_app_squelch_setting_payload;
 
 /* A single edit is merged into decoder-owned settings, avoiding stale snapshot writes. */
 typedef struct {
@@ -494,6 +525,41 @@ typedef struct {
     char path[1024];
 } dsd_app_config_metadata_payload;
 
+/** DSD_APP_CMD_TONE_FILTER_SET: the whole configured tone policy. Allow and block need a list; off keeps the one it is
+ * given (or none). The list is the text dsd_tone_set_parse() reads, as typed; the command validates it. With
+ * @c keep_list the edit is the mode alone: @c list must be "", and the list is the configured one as the decoder holds
+ * it when the edit runs, after every command queued before it (an edit, a loaded config), never a frontend's copy. */
+typedef struct {
+    int32_t mode;                             /* dsd_tone_filter_mode: 0 off, 1 allow, 2 block */
+    int32_t keep_list;                        /* 1 = keep the configured list; 0 = @c list is the list */
+    char list[DSD_APP_TONE_FILTER_LIST_SIZE]; /* NUL-terminated; "" for none */
+} dsd_app_tone_filter_payload;
+
+/** DSD_APP_CMD_SCAN_ROW_EDIT ("this channel", issue #518). The row as the frontends saw it: @c scanner, @c session and
+ * @c row are dsd_state::scan_row_scanner, scan_row_session and scan_row_index, and @c target_id a --trunk-scan target's
+ * id (trunk_scan_active_id; "" for a -Y row). @c field is one DSD_SCAN_ROW_FIELD_* and @c action a
+ * dsd_scan_row_edit_action (runtime/scan_row_edit.h); for SET the field's value: @c squelch_db (whole dB, -100..0,
+ * 0 = off), @c width_hz, @c tone_mode with @c tone_list as typed (checked by dsd_tone_filter_check()), or @c gain_db
+ * (whole dB, 0 = AGC). @c mode is the row's dsd_scan_mode as the editor saw it, for the notice only (the engine checks the
+ * edit against the row's own). */
+typedef struct {
+    uint32_t session;
+    int32_t scanner;
+    int32_t row;
+    int32_t mode;
+    int32_t field;
+    int32_t action;
+    int32_t squelch_db;
+    int32_t width_hz;
+    int32_t tone_mode;
+    int32_t gain_db;
+    int32_t squelch_mode;      /* dsd_squelch_mode: LEVEL (squelch_db), AUTO (squelch_margin_db, nfm and am rows) or
+                                  NOISE (squelch_margin_db, nfm rows) */
+    int32_t squelch_margin_db; /* AUTO: 3..30 dB over the learned floor; NOISE: 3..30 dB of quieting */
+    char target_id[64];
+    char tone_list[DSD_APP_TONE_FILTER_LIST_SIZE];
+} dsd_app_scan_row_edit_payload;
+
 typedef enum {
     DSD_APP_COMMAND_SUBMIT_REJECTED = -1,
     DSD_APP_COMMAND_SUBMIT_QUEUED = 1,
@@ -529,13 +595,32 @@ int dsd_app_command_set_tg_listen_all(const dsd_app_tg_listen_all_payload* paylo
  * accept a newer result matching its context/generation/path before registering
  * the file. Submission rejection must still be handled from the submit return. */
 int dsd_app_tg_export_result_get(dsd_app_tg_export_result* out);
+
+/** How many of the most recent export and decryption results stay readable through the *_results_since() getters. */
+enum { DSD_APP_RESULT_HISTORY = 64 };
+
+/** Copy, oldest first, up to @p cap retained export results whose sequence is above @p after_sequence; returns the
+ * count. Only the last DSD_APP_RESULT_HISTORY are kept, so a reader that falls further behind sees a gap in the
+ * sequence numbers. For a consumer that must see every result, not just the latest (the control API). */
+int dsd_app_tg_export_results_since(uint64_t after_sequence, dsd_app_tg_export_result* out, int cap);
 uint64_t dsd_app_command_session_generation(void);
 int dsd_app_decryption_result_get(dsd_app_decryption_result* out);
+/** dsd_app_tg_export_results_since() for decryption results. */
+int dsd_app_decryption_results_since(uint64_t after_sequence, dsd_app_decryption_result* out, int cap);
 int dsd_app_command_set_hytera_key(const dsd_app_hytera_key_payload* payload);
 int dsd_app_command_set_aes_key(const dsd_app_aes_key_payload* payload);
 int dsd_app_command_dsp_op(const dsd_app_dsp_payload* payload);
 int dsd_app_command_apply_config(const dsdneoUserConfig* config);
 int dsd_app_command_set_config_metadata(const dsd_app_config_metadata_payload* payload);
+/** Submit DSD_APP_CMD_TONE_FILTER_SET with @p mode and @p list (NULL for none) as typed. A list longer than the payload
+ * holds is rejected here (DSD_APP_COMMAND_SUBMIT_REJECTED), never cut to a list nobody typed. */
+int dsd_app_command_set_tone_filter(int32_t mode, const char* list);
+/** Submit DSD_APP_CMD_TONE_FILTER_SET that sets @p mode and keeps the configured list (@c keep_list), read on the
+ * decoder thread when the edit runs: the terminal's Off, which keeps the list the way --no-tone-filter keeps its own.
+ * Allow and block are refused there when no list is configured. */
+int dsd_app_command_set_tone_filter_mode(int32_t mode);
+/** Submit DSD_APP_CMD_SCAN_ROW_EDIT. A payload whose strings are not NUL-terminated is rejected here. */
+int dsd_app_command_scan_row_edit(const dsd_app_scan_row_edit_payload* payload);
 int dsd_app_command_set_rr_apply(const dsd_app_rr_apply_payload* payload);
 int dsd_app_command_set_rr_account(const dsd_app_rr_account_payload* payload);
 

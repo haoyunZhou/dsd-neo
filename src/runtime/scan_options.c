@@ -1,11 +1,15 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 /* Copyright (C) 2026 by arancormonk <180709949+arancormonk@users.noreply.github.com> */
 
+#include <dsd-neo/core/analog_tone.h>
 #include <dsd-neo/core/parse.h>
+#include <dsd-neo/core/power.h>
 #include <dsd-neo/core/safe_api.h>
 #include <dsd-neo/runtime/analog_channel.h>
+#include <dsd-neo/runtime/analog_tones.h>
 #include <dsd-neo/runtime/scan_mode.h>
 #include <dsd-neo/runtime/scan_options.h>
+#include <dsd-neo/runtime/squelch.h>
 #include <errno.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -17,10 +21,11 @@
 #define NXDN          (MODE_BIT(DSD_SCAN_MODE_NXDN48) | MODE_BIT(DSD_SCAN_MODE_NXDN96))
 #define DPMR          MODE_BIT(DSD_SCAN_MODE_DPMR)
 #define NFM           MODE_BIT(DSD_SCAN_MODE_NFM)
+#define AM            MODE_BIT(DSD_SCAN_MODE_AM)
 /* Blank rows and every digital class (INHERIT through M17). */
 #define DIGITAL_MODES 0x1FFU
 /* The analog classes (issue #526): no frames, keys, talkgroups or voice verdicts. */
-#define ANALOG_MODES  NFM
+#define ANALOG_MODES  (NFM | AM)
 /* Every class a row or target can declare. An option that is meaningful whatever the class
  * (squelch, the visit cap) uses this; DIGITAL_MODES keeps key, CRC, force, group, call-policy and
  * voice-gate switches off the analog classes. */
@@ -74,16 +79,24 @@ static int option_set_max_visit(const scan_option_spec* spec, const char* argume
                                 dsd_scan_options* parsed);
 static int option_set_squelch(const scan_option_spec* spec, const char* argument, unsigned int mode,
                               dsd_scan_options* parsed);
+static int option_set_squelch_setting(const scan_option_spec* spec, const char* argument, unsigned int mode,
+                                      dsd_scan_options* parsed);
 static int option_set_bandwidth(const scan_option_spec* spec, const char* argument, unsigned int mode,
                                 dsd_scan_options* parsed);
+static int option_set_tone(const scan_option_spec* spec, const char* argument, unsigned int mode,
+                           dsd_scan_options* parsed);
 static int option_set_path(const scan_option_spec* spec, const char* argument, unsigned int mode,
                            dsd_scan_options* parsed);
 
-#define SQUELCH_HINT   "expects whole dB from -100 to 0 (0 = off)"
+#define SQUELCH_HINT "expects whole dB from -100 to 0 (0 = off)"
+#define SQUELCH_SETTING_HINT                                                                                           \
+    "expects off, whole dB from -100 to 0, auto[+N] (nfm and am rows) or noise[+N] (nfm rows), N from 3 to 30"
 #define OPTION_TEXT(x) #x
 #define OPTION_HZ(x)   OPTION_TEXT(x)
 #define NFM_BANDWIDTH_HINT                                                                                             \
     "expects whole Hz from " OPTION_HZ(DSD_ANALOG_NFM_WIDTH_MIN_HZ) " to " OPTION_HZ(DSD_ANALOG_NFM_WIDTH_MAX_HZ)
+#define AM_BANDWIDTH_HINT                                                                                              \
+    "expects whole Hz from " OPTION_HZ(DSD_ANALOG_AM_WIDTH_MIN_HZ) " to " OPTION_HZ(DSD_ANALOG_AM_WIDTH_MAX_HZ)
 
 static const scan_option_spec specifications[] = {
     {"-b", DSD_SCAN_OPT_BP, DMR, 1, 0, 0, 0, NULL, option_set_bp},
@@ -119,9 +132,20 @@ static const scan_option_spec specifications[] = {
     /* Squelch is a receiver setting, so it is legal on every class and target type, trunked
      * control channels included (issue #521). Units and range are rtl_sql's. */
     {"--squelch-db", DSD_SCAN_OPT_SQUELCH, ANY_MODES, 1, 0, 0, 1, SQUELCH_HINT, option_set_squelch},
+    /* The same option in the squelch grammar (issue #518 follow-up): a level in whole dB, off, auto[+N], a margin over
+     * the floor the demodulator learns for the channel, which only the analog monitor shows, or noise[+N], the FM
+     * discriminator's quieting, which only an nfm row has. One squelch per row: naming both spellings is a
+     * duplicate. */
+    {"--squelch", DSD_SCAN_OPT_SQUELCH, ANY_MODES, 1, 0, 0, 1, SQUELCH_SETTING_HINT, option_set_squelch_setting},
     /* The channel width of the analog demodulator the row runs (issue #526), spelled per kind and
-     * in whole Hz; a row carries one width. */
+     * in whole Hz; a row carries one width, and each spelling is its own class's only. */
     {"--nfm-bandwidth-hz", DSD_SCAN_OPT_BANDWIDTH, NFM, 1, 0, 0, 0, NFM_BANDWIDTH_HINT, option_set_bandwidth},
+    {"--am-bandwidth-hz", DSD_SCAN_OPT_BANDWIDTH, AM, 1, 0, 0, 0, AM_BANDWIDTH_HINT, option_set_bandwidth},
+    /* The CTCSS/DCS receive policy (issue #527): one option in three spellings, so a row names one of them once, and
+     * only on nfm rows and targets, the analog FM monitor that hears tones. The value is the policy. */
+    {"--tone-allow", DSD_SCAN_OPT_TONE, NFM, 1, 0, DSD_TONE_FILTER_ALLOW, 0, NULL, option_set_tone},
+    {"--tone-block", DSD_SCAN_OPT_TONE, NFM, 1, 0, DSD_TONE_FILTER_BLOCK, 0, NULL, option_set_tone},
+    {"--no-tone-filter", DSD_SCAN_OPT_TONE, NFM, 0, 0, DSD_TONE_FILTER_OFF, 0, NULL, option_set_tone},
 };
 
 static int
@@ -389,20 +413,64 @@ option_set_squelch(const scan_option_spec* spec, const char* argument, unsigned 
         return -1;
     }
     parsed->values.squelch_db = db;
+    parsed->values.squelch_mode = DSD_SQUELCH_MODE_LEVEL;
     return 0;
 }
 
-/* The width's range is the kind's, and only the strict decimal spelling is taken. The rate it has
- * to fit is not known here: dsd_scan_option_width_check() holds it to one. */
+/* --squelch: auto[+N] on an analog row, noise[+N] on an nfm row, else what --squelch-db takes (off is 0). */
+static int
+option_set_squelch_setting(const scan_option_spec* spec, const char* argument, unsigned int mode,
+                           dsd_scan_options* parsed) {
+    dsd_squelch_setting setting;
+    if (dsd_squelch_setting_parse(argument, &setting, NULL, 0U) != 0) {
+        return -1;
+    }
+    if (dsd_squelch_setting_is_dynamic(&setting)) {
+        const int kind = dsd_scan_mode_analog_kind((dsd_scan_mode)mode);
+        if (kind < 0 || (setting.mode == DSD_SQUELCH_MODE_NOISE && kind != DSD_ANALOG_DEMOD_FM)) {
+            return -1;
+        }
+        parsed->values.squelch_db = 0;
+        parsed->values.squelch_mode = setting.mode;
+        parsed->values.squelch_margin_db = setting.margin_db;
+        return 0;
+    }
+    if (dsd_squelch_setting_is_off(&setting)) {
+        parsed->values.squelch_db = 0;
+        parsed->values.squelch_mode = DSD_SQUELCH_MODE_LEVEL;
+        return 0;
+    }
+    return option_set_squelch(spec, argument, mode, parsed);
+}
+
+/* The width's range is the kind's -- the demodulator of the one class the spelling is legal on -- and
+ * only the strict decimal spelling is taken. The rate it has to fit is not known here:
+ * dsd_scan_option_width_check() holds it to one. */
 static int
 option_set_bandwidth(const scan_option_spec* spec, const char* argument, unsigned int mode, dsd_scan_options* parsed) {
     (void)spec;
-    (void)mode;
+    const int kind = dsd_scan_mode_analog_kind((dsd_scan_mode)mode);
     int width_hz = 0;
-    if (dsd_analog_width_parse(DSD_ANALOG_DEMOD_FM, argument, &width_hz, NULL, 0U) != 0) {
+    if (kind < 0 || dsd_analog_width_parse(kind, argument, &width_hz, NULL, 0U) != 0) {
         return -1;
     }
     parsed->values.channel_bw_hz = width_hz;
+    parsed->values.channel_bw_kind = kind;
+    return 0;
+}
+
+/* A tone list for --tone-allow/--tone-block, none for --no-tone-filter, whose empty list turns the policy off. Why a
+ * list was refused is option_invalid()'s to say. */
+static int
+option_set_tone(const scan_option_spec* spec, const char* argument, unsigned int mode, dsd_scan_options* parsed) {
+    (void)mode;
+    dsd_tone_set set;
+    DSD_MEMSET(&set, 0, sizeof(set));
+    if (spec->argument && dsd_tone_set_parse(argument, &set, NULL, 0) != 0) {
+        return -1;
+    }
+    parsed->values.tone_filter = spec->value;
+    parsed->values.tone_set = set;
     return 0;
 }
 
@@ -453,6 +521,20 @@ option_force_alias(const scan_option_spec* first, const scan_option_spec* next, 
                || (strcmp(first->name, "--dmr-force-algid") == 0 && strcmp(next->name, "-0") == 0));
 }
 
+/* The diagnostic for a value a setter refused: a tone list says which entry and why, never repeating the text; every
+ * other switch has its fixed hint. */
+static int
+option_invalid(const scan_option_spec* spec, const char* argument, char* error, size_t error_size) {
+    if (spec->field == DSD_SCAN_OPT_TONE) {
+        char why[DSD_TONE_LIST_ERROR_SIZE];
+        dsd_tone_set unused;
+        if (dsd_tone_set_parse(argument, &unused, why, sizeof(why)) != 0) {
+            return option_error(error, error_size, spec->name, why);
+        }
+    }
+    return option_error(error, error_size, spec->name, spec->hint ? spec->hint : "invalid value");
+}
+
 static int
 option_apply(const scan_option_spec* spec, const char* argument, unsigned int mode, dsd_scan_options* parsed,
              scan_force_options* forces, char* error, size_t error_size) {
@@ -461,7 +543,7 @@ option_apply(const scan_option_spec* spec, const char* argument, unsigned int mo
         return option_error(error, error_size, spec->name, "duplicate option");
     }
     if (spec->set(spec, argument, mode, parsed)) {
-        return option_error(error, error_size, spec->name, spec->hint ? spec->hint : "invalid value");
+        return option_invalid(spec, argument, error, error_size);
     }
     if ((parsed->values.present & DSD_SCAN_OPT_FORCE) && spec->field == DSD_SCAN_OPT_FORCE
         && old_force != parsed->values.force) {
@@ -525,6 +607,21 @@ option_mode_allowed(const scan_option_spec* spec, unsigned int mode, int convent
     }
     (void)option_error(error, error_size, spec->name, reason);
     return 0;
+}
+
+uint32_t
+dsd_scan_options_fields_for_mode(unsigned int mode, int conventional) {
+    uint32_t fields = 0U;
+    if (mode > DSD_SCAN_MODE_LAST) {
+        return 0U;
+    }
+    for (size_t i = 0; i < sizeof(specifications) / sizeof(specifications[0]); i++) {
+        const scan_option_spec* spec = &specifications[i];
+        if ((spec->modes & MODE_BIT(mode)) && (!spec->conventional || conventional)) {
+            fields |= spec->field;
+        }
+    }
+    return fields;
 }
 
 static int
@@ -650,15 +747,106 @@ dsd_scan_options_parse(const char* text, unsigned int mode, int conventional, ds
     }
     if (rc == 0) {
         /* Every accepted direct switch arms decryption, including zero-valued keys.
-         * Legacy material-only columns never acquire this policy override. */
+         * Legacy material-only columns never acquire this policy override. The DMR encrypted-audio mute stays the
+         * session's: a call the row's key decrypts plays by the vocoder's verdict (issue #655). */
         if (parsed.values.present & DSD_SCAN_OPT_DIRECT) {
-            parsed.values.present |= DSD_SCAN_OPT_MUTE_DMR | DSD_SCAN_OPT_MUTE_P25;
-            parsed.values.mute_dmr = 0;
+            parsed.values.present |= DSD_SCAN_OPT_MUTE_P25;
         }
         *out = parsed;
     }
     DSD_SECURE_ZERO(&parsed, sizeof(parsed));
     return rc;
+}
+
+/* The tone switch whose list is the last argument of @p text (--tone-allow or --tone-block, its list separate or after
+ * '='), or NULL: none, another switch or argument after it, or text the tokenizer refuses (its parse says why). */
+static const scan_option_spec*
+option_trailing_tone_list(const char* text) {
+    const scan_option_spec* last = NULL;
+    const scan_option_spec* awaiting = NULL;
+    const char* cursor = text;
+    char token[1024];
+    int rc;
+    while ((rc = option_token(&cursor, token, sizeof(token))) == 1) {
+        if (awaiting) {
+            /* This token is the list of the switch before it. */
+            last = awaiting;
+            awaiting = NULL;
+            continue;
+        }
+        last = NULL;
+        char* equals = strncmp(token, "--", 2) == 0 ? strchr(token, '=') : NULL;
+        if (equals) {
+            *equals = '\0';
+        }
+        const scan_option_spec* spec = option_find(token);
+        if (spec && spec->field == DSD_SCAN_OPT_TONE && spec->argument) {
+            if (equals) {
+                last = spec;
+            } else {
+                awaiting = spec;
+            }
+        }
+    }
+    /* A cell may carry direct keys: nothing of it outlives the scan. */
+    DSD_SECURE_ZERO(token, sizeof(token));
+    return rc < 0 ? NULL : last;
+}
+
+/* Whether @p text, after the spaces it starts with, starts with a row option's switch, alone or with its argument after
+ * '=' ("--squelch-db -60", "--nfm-bandwidth-hz=12500"): what an options cell goes on with. */
+static int
+option_starts_switch(const char* text) {
+    const char* cursor = option_skip_space(text);
+    const size_t len = strcspn(cursor, "= \t\r\n\v\f");
+    char name[32];
+    if (len <= 2U || len >= sizeof(name) || strncmp(cursor, "--", 2) != 0) {
+        return 0;
+    }
+    DSD_MEMCPY(name, cursor, len);
+    name[len] = '\0';
+    return option_find(name) != NULL;
+}
+
+/* Whether @p text, a field of the file's own columns, can only be the rest of a tone list a comma cut off: one run of
+ * '/'-separated entries with no space in it ("67.0", "100/D023N", "d047i/161.0"), the first a supported CTCSS tone or
+ * DCS code, alone or followed by a row option's switch, the rest of the options cell the same comma cut off
+ * ("67.0 --squelch-db -60"). A column's own text is left alone: a value no list takes (an RTL gain) and anything else
+ * with a space in it, such as a name that starts with a number or a code ("100 Main St", "D023 Repeater"). */
+static int
+option_is_tone_list_rest(const char* text) {
+    size_t len = strlen(text);
+    while (len > 0U && option_space((unsigned char)text[len - 1U])) {
+        len--;
+    }
+    const size_t first = strcspn(text, "/ \t\r\n\v\f");
+    const size_t run = strcspn(text, " \t\r\n\v\f");
+    char entry[16];
+    if (first == 0U || first >= sizeof(entry) || (run < len && !option_starts_switch(text + run))) {
+        return 0;
+    }
+    DSD_MEMCPY(entry, text, first);
+    entry[first] = '\0';
+    dsd_tone_set unused;
+    return dsd_tone_set_parse(entry, &unused, NULL, 0) == 0;
+}
+
+int
+dsd_scan_options_tone_list_split(const char* options, const char* next, int next_past_header, char* error,
+                                 size_t error_size) {
+    if (!options || !next) {
+        return 0;
+    }
+    const char* rest = option_skip_space(next);
+    if (rest[0] == '\0' || (!next_past_header && !option_is_tone_list_rest(rest))) {
+        return 0;
+    }
+    const scan_option_spec* spec = option_trailing_tone_list(options);
+    if (!spec) {
+        return 0;
+    }
+    (void)option_error(error, error_size, spec->name, "use / between entries, not commas");
+    return 1;
 }
 
 int
@@ -667,9 +855,24 @@ dsd_scan_option_width_check(unsigned int mode, const dsd_scan_option_values* val
     if (error && error_size) {
         error[0] = '\0';
     }
-    /* NFM is the one class a width parses for; any other class has none to hold. */
-    if (!values || !(values->present & DSD_SCAN_OPT_BANDWIDTH) || rate_hz <= 0 || mode != DSD_SCAN_MODE_NFM) {
+    /* Only the analog classes parse a width; any other class has none to hold. */
+    const int kind = mode <= DSD_SCAN_MODE_LAST ? dsd_scan_mode_analog_kind((dsd_scan_mode)mode) : -1;
+    if (!values || !(values->present & DSD_SCAN_OPT_BANDWIDTH) || rate_hz <= 0 || kind < 0) {
         return 0;
     }
-    return dsd_analog_width_check(DSD_ANALOG_DEMOD_FM, values->channel_bw_hz, rate_hz, error, error_size) == 0 ? 0 : -1;
+    return dsd_analog_width_check(kind, values->channel_bw_hz, rate_hz, error, error_size) == 0 ? 0 : -1;
+}
+
+int
+dsd_scan_option_tone_summary(const dsd_scan_option_values* values, char* list, size_t list_size) {
+    if (list && list_size) {
+        list[0] = '\0';
+    }
+    if (!values || !(values->present & DSD_SCAN_OPT_TONE)) {
+        return -1;
+    }
+    if (values->tone_filter != DSD_TONE_FILTER_OFF) {
+        (void)dsd_tone_set_format_display(&values->tone_set, list, list_size);
+    }
+    return values->tone_filter;
 }

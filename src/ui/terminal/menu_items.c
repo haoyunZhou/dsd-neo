@@ -39,6 +39,12 @@
 // ============================================================================
 #ifdef USE_RADIO
 static const NcMenuItem RTL_TUNING_ADV_ITEMS[] = {
+    /* The auto-PPM switch leads its settings. */
+    {.id = "rtl.auto_ppm",
+     .is_enabled = is_non_airspy_input,
+     .label_fn = lbl_rtl_auto_ppm,
+     .help = "Track the PPM correction from a carrier automatically.",
+     .on_select = rtl_toggle_auto_ppm},
     {.id = "rtl.adv.ap_snr",
      .label_fn = lbl_auto_ppm_snr,
      .help = "Minimum SNR before carrier-assisted PPM tracking may adjust the correction.",
@@ -158,8 +164,10 @@ static const NcMenuItem AIRSPY_MENU_ITEMS[] = {
 
 static const NcMenuItem RTL_MENU_ITEMS[] = {
     {.id = "rtl.freq",
+     .is_enabled = rtl_freq_offered,
      .label_fn = lbl_rtl_freq,
-     .help = "Set frequency in Hz; selects a new CC during P25 trunking. Disabled during trunk scan.",
+     .help =
+         "Set frequency in Hz; selects a new CC during P25 trunking. Hidden during trunk scan, which owns the tuner.",
      .on_select = rtl_set_freq},
     {.id = "rtl.gain",
      .is_enabled = is_non_airspy_input,
@@ -176,16 +184,6 @@ static const NcMenuItem RTL_MENU_ITEMS[] = {
      .label_fn = lbl_rtl_bw,
      .help = "DSP bandwidth (the demodulator's sample rate) in kHz: 4, 6, 8, 12, 16, 24 or 48.",
      .on_select = rtl_set_bw},
-    {.id = "rtl.nfm_bw",
-     .is_enabled = is_nfm_width_editable,
-     .label_fn = lbl_rtl_nfm_bw,
-     .help = "NFM channel-filter width in Hz (8000..25000; 0 = default 16000), applied live. It must fit the DSP "
-             "bandwidth.",
-     .on_select = rtl_set_nfm_bw},
-    {.id = "rtl.sql",
-     .label = "Squelch (dB)...",
-     .help = "Post-filter squelch threshold in dB; more negative opens more; 0 switches squelch off.",
-     .on_select = rtl_set_sql},
     /* 'v' is here as well as on Input > Input volume: the key drives whichever of the
        two multipliers matches the live input type, and on RTL that is this row. */
     {.id = "rtl.vol",
@@ -193,11 +191,6 @@ static const NcMenuItem RTL_MENU_ITEMS[] = {
      .help = "Monitor audio sample scaler (0..3). The hotkey cycles it while the RTL front end is the input.",
      .hotkey = "v",
      .on_select = rtl_set_vol},
-    {.id = "rtl.auto_ppm",
-     .is_enabled = is_non_airspy_input,
-     .label_fn = lbl_rtl_auto_ppm,
-     .help = "Track the PPM correction from a carrier automatically.",
-     .on_select = rtl_toggle_auto_ppm},
     {.id = "rtl.tuner_autogain",
      .is_enabled = is_non_airspy_input,
      .label_fn = lbl_rtl_tuner_autogain,
@@ -259,7 +252,7 @@ static const NcMenuItem INPUT_SOURCE_ITEMS[] = {
      .on_select = switch_to_udp},
     {.id = "src.wav",
      .label = "WAV / raw file...",
-     .help = "Decode a WAV or raw PCM file, or a named pipe.",
+     .help = "Decode a WAV or headerless PCM file; .bin, .raw and .sym open as symbol files, as with -i.",
      .on_select = switch_to_wav},
     {.id = "src.sym",
      .label = "Symbol file (.bin/.raw/.sym)...",
@@ -280,6 +273,30 @@ const NcMenuItem INPUT_MENU_ITEMS[] = {
              "on RTL it cycles Input > RTL-SDR > Volume multiplier instead.",
      .hotkey = "v",
      .on_select = io_set_input_volume},
+    {.id = "input.sql",
+     .is_enabled = io_squelch_offered,
+     .label_fn = lbl_input_sql,
+     .help = "Squelch: a threshold in dB (more negative opens more; 0 or off switches it off), auto[+N] (N dB over "
+             "each analog channel's learned noise floor; radio inputs only) or noise[+N] (N dB of FM quieting, as a "
+             "radio's squelch; on audio input it needs the discriminator or unfiltered FM audio); N 3..30, default "
+             "10.",
+     .on_select = act_set_squelch},
+    /* The channel widths sit beside Squelch, outside the RTL-SDR submenu, which audio input hides: on audio input with
+       a rigctl peer (-U) they are the passband the peer is asked for (issue #621). */
+    {.id = "input.nfm_bw",
+     .is_enabled = is_nfm_width_editable,
+     .label_fn = lbl_input_nfm_bw,
+     .help = "NFM width in Hz (8000..25000; 0 = unset), applied live. On a radio input it is the channel filter "
+             "(default 16000) and must fit the DSP bandwidth; on audio input with a rigctl peer (-U) it is the FM "
+             "passband the peer is asked for (unset: -B).",
+     .on_select = act_set_nfm_bw},
+    {.id = "input.am_bw",
+     .is_enabled = is_am_width_editable,
+     .label_fn = lbl_input_am_bw,
+     .help = "AM width in Hz (5000..20000; 0 = default 6000), applied live. On a radio input it is the channel filter "
+             "and must fit the DSP bandwidth; on audio input with a rigctl peer (-U) it is the AM passband the peer is "
+             "asked for.",
+     .on_select = act_set_am_bw},
     {.id = "input.warn",
      .label_fn = lbl_input_warn,
      .help = "Warn in the footer when the input level falls below this many dBFS.",
@@ -298,7 +315,7 @@ const NcMenuItem INPUT_MENU_ITEMS[] = {
      .submenu_len = NC_LEN(AIRSPY_MENU_ITEMS)},
     {.id = "input.rtl",
      .label = "RTL-SDR",
-     .help = "Frequency, gain, PPM, bandwidth, squelch, calibration, device.",
+     .help = "Frequency, gain, PPM, bandwidth, calibration, device.",
      .is_enabled = io_rtl_active,
      .submenu = RTL_MENU_ITEMS,
      .submenu_len = NC_LEN(RTL_MENU_ITEMS)},
@@ -312,17 +329,17 @@ const size_t INPUT_MENU_ITEMS_LEN = NC_LEN(INPUT_MENU_ITEMS);
 static const NcMenuItem DEC_FILTER_ITEMS[] = {
     {.id = "flt.lpf",
      .label_fn = lbl_lpf,
-     .help = "Low-pass filter on the input audio.",
+     .help = "960 Hz low-pass on the analog monitor audio.",
      .hotkey = "V",
      .on_select = act_lpf_toggle},
     {.id = "flt.hpf",
      .label_fn = lbl_hpf,
-     .help = "High-pass filter on the input audio.",
+     .help = "960 Hz high-pass on the analog monitor audio.",
      .hotkey = "B",
      .on_select = act_hpf_toggle},
     {.id = "flt.pbf",
      .label_fn = lbl_pbf,
-     .help = "Pulse-shaping band-pass filter on the input audio.",
+     .help = "Voice band-pass (300-3400 Hz) on the analog monitor audio; takes CTCSS and DCS signalling out.",
      .hotkey = "N",
      .on_select = act_pbf_toggle},
     {.id = "flt.hpfd",
@@ -799,7 +816,7 @@ const NcMenuItem AUDIO_MENU_ITEMS[] = {
      .on_select = io_set_gain_dig},
     {.id = "audio.gain_a",
      .label_fn = lbl_gain_ana,
-     .help = "Analog monitor gain, 0..100.",
+     .help = "Analog monitor gain: 0 is automatic, otherwise 1..100 (50 is the reference level).",
      .hotkey = "* /",
      .on_select = io_set_gain_ana},
     {.id = "audio.monitor",
@@ -814,6 +831,12 @@ const NcMenuItem AUDIO_MENU_ITEMS[] = {
      .label_fn = lbl_audio_lpf,
      .help = "Post-demodulation low-pass cutoff in Hz; 0 turns it off.",
      .on_select = act_set_audio_lpf},
+    {.id = "audio.tone_filter",
+     .label_fn = lbl_tone_filter,
+     .help = "CTCSS/DCS filter on the analog FM monitor: off, allow only or block the listed tones and codes, "
+             "separated by / (e.g. 67.0/100.0/D023N). Off keeps the list; Off and clear list removes it. Edits the "
+             "configured default, applied live; a scan row with its own tone filter keeps it while on air.",
+     .on_select = act_tone_filter},
     {.id = "audio.sep", .kind = NC_ITEM_SEPARATOR},
     {.id = "audio.alert",
      .label_fn = lbl_call_alert,
@@ -850,7 +873,7 @@ static const NcMenuItem REC_SYMCAP_ITEMS[] = {
      .on_select = io_replay_last_symbol_bin},
     {.id = "symcap.stop_play",
      .label_fn = lbl_stop_symbol_playback,
-     .help = "Stop the replay and restore the previous input.",
+     .help = "Stop the replay or file playback and switch to Pulse input.",
      .hotkey = "s",
      .on_select = io_stop_symbol_playback},
 };

@@ -85,6 +85,15 @@ int rtl_demod_digital_resample_target_for(int output_kind, int digital_resample_
 int rtl_demod_monitor_output_rate_for(int resamp_target_hz, int rate_out_hz);
 
 /**
+ * The output resampler's ratio from @p in_rate_hz to @p target_hz, reduced to @p L / @p M (either may be NULL).
+ *
+ * @return 1 when the resampler may run it, 0 when it stays off: an expansion over 12, or a ratio the resampler cannot
+ *         design (dsd_resampler_ratio_designable()). Stream open, retunes and rtl_demod_monitor_output_rate_for() all
+ *         decide by it, so the rate they publish is the rate the samples have.
+ */
+int rtl_demod_resampler_ratio(int in_rate_hz, int target_hz, int* L, int* M);
+
+/**
  * The channel width @p kind is requested at: @p explicit_width_hz when positive, otherwise 0 (the legacy default) for
  * NFM and the kind's default for AM. Only the unset NFM default keeps the historical enable rule and WIDE fallback;
  * every requested width turns the channel filter on and is validated.
@@ -94,12 +103,12 @@ int rtl_demod_analog_requested_width_hz(int kind, int explicit_width_hz);
 /**
  * Check the analog channel a stream would run at @p rate_hz.
  *
- * Refuses a negative @p explicit_width_hz (only 0 selects the default), AM (the radio front end has no AM
- * demodulator yet), a requested width while DSD_NEO_CHANNEL_LPF=0 turns the channel filter off, and a requested width
- * the rate cannot realize (dsd_analog_width_check()). The unset NFM default (@p explicit_width_hz 0 with FM) never
- * fails: it keeps the historical filter behaviour. The unset AM default is checked like an explicit width (see
- * rtl_demod_analog_requested_width_hz()). @p rate_hz <= 0 means no DSP rate is known yet (no stream running): then only
- * the kind, environment and range rules apply, and the next stream open checks the width against the rate it delivers.
+ * Refuses a negative @p explicit_width_hz (only 0 selects the default), a requested width while DSD_NEO_CHANNEL_LPF=0
+ * turns the channel filter off, and a requested width the rate cannot realize (dsd_analog_width_check()). The unset
+ * NFM default (@p explicit_width_hz 0 with FM) never fails: it keeps the historical filter behaviour. The unset AM
+ * default is checked like an explicit width (see rtl_demod_analog_requested_width_hz()). @p rate_hz <= 0 means no DSP
+ * rate is known yet (no stream running): then only the kind, environment and range rules apply, and the next stream
+ * open checks the width against the rate it delivers.
  *
  * @return 0 when the stream may run it, -1 with an actionable message in @p err otherwise.
  */
@@ -167,21 +176,49 @@ int rtl_demod_apply_audio_filters_from_config(struct demod_state* demod);
 /** Recompute the de-emphasis and audio-LPF coefficients for @p demod->rate_out. */
 void rtl_demod_refresh_audio_coefficients(struct demod_state* demod);
 
-/** Return the monitor audio state (de-emphasis, DC, audio LPF, squelch envelope, discriminator) to fresh-open values. */
+/**
+ * Return the monitor audio state (de-emphasis, DC, audio LPF, squelch envelope, FM discriminator history and the AM
+ * carrier estimate) to fresh-open values.
+ */
 void rtl_demod_reset_audio_monitor_state(struct demod_state* demod);
 
-/** Clear the half-band and channel-LPF histories. */
+/** Clear the half-band and channel-LPF histories and their pending counts (each half-band stage's look-ahead and
+ * phase, the channel FIR's held outputs): the single filter reset, dsd_demod_reset_filter_state(). */
 void rtl_demod_clear_filter_histories(struct demod_state* demod);
 
 /** Reset the rational resampler's phase and history. */
 void rtl_demod_reset_resampler_state(struct demod_state* demod);
 
 /**
- * Switch the analog demodulator kind (demodulator and de-emphasis) and reset the monitor audio state.
+ * Switch the analog demodulator kind and reset the monitor audio state.
+ *
+ * FM runs the discriminator with the configured de-emphasis; AM runs the envelope detector (dsd_am_demod()) with no
+ * de-emphasis and without the I/Q DC blocker or I/Q balance (dsd_demod_iq_dc_block_active(),
+ * dsd_demod_iq_balance_active()). Both estimates start over, since AM leaves them where FM last had them.
  *
  * @return 1 when the kind changed, 0 when already on it, -1 for an invalid kind.
  */
 int rtl_demod_set_analog_kind(struct demod_state* demod, int kind);
+
+/**
+ * Note that a configured I/Q DC blocker is bypassed because the AM detector runs (dsd_demod_iq_dc_block_active()).
+ * The first time both hold, per process, this logs a note saying so; the setting itself is kept for FM.
+ *
+ * @param iq_dc_block_enabled Non-zero when the I/Q DC blocker is configured on.
+ * @param am_active           Non-zero when the AM detector runs (dsd_demod_am_active(), or the published AM kind).
+ * @return 1 when the blocker is configured and bypassed for AM, else 0.
+ */
+int rtl_demod_note_am_iq_dc_bypass(int iq_dc_block_enabled, int am_active);
+
+/**
+ * Note that configured I/Q balance is bypassed because the AM detector runs (dsd_demod_iq_balance_active()), as
+ * rtl_demod_note_am_iq_dc_bypass() notes the I/Q DC blocker: once per process, the setting itself kept for FM.
+ *
+ * @param iq_balance_enabled Non-zero when I/Q balance is configured on.
+ * @param am_active          Non-zero when the AM detector runs (dsd_demod_am_active(), or the published AM kind).
+ * @return 1 when I/Q balance is configured and bypassed for AM, else 0.
+ */
+int rtl_demod_note_am_iq_balance_bypass(int iq_balance_enabled, int am_active);
 
 /**
  * Move a running front end to the analog family with the defaults a fresh analog open would choose (monitor output,
@@ -198,6 +235,15 @@ void rtl_demod_enter_analog_family(struct demod_state* demod, struct output_stat
  * so it lands where an open of that mode would.
  */
 int rtl_demod_open_cqpsk_request(int requested_cqpsk);
+
+/**
+ * The CQPSK family a switch from the analog family to a digital mode lands on for @p requested_cqpsk (1 CQPSK, 0 FSK
+ * discriminator, -1 none requested). With @p requested_is_explicit set and a request made (>= 0), the request is a
+ * trunk-scan target's own choice and stands whatever DSD_NEO_CQPSK says, as it does on a retune that stays on the
+ * digital family (issue #583); otherwise the switch lands where an open of the mode would
+ * (rtl_demod_open_cqpsk_request()).
+ */
+int rtl_demod_landing_cqpsk(int requested_cqpsk, int requested_is_explicit);
 
 /**
  * The channel profile a digital open filters with once it lands on @p landing_cqpsk, for a symbol profile whose

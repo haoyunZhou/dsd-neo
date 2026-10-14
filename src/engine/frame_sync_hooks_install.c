@@ -3,12 +3,12 @@
  * Copyright (C) 2026 by arancormonk <180709949+arancormonk@users.noreply.github.com>
  */
 
-#include <dsd-neo/core/dsd_time.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/state.h>
 #include <dsd-neo/engine/frame_processing.h>
 #include <dsd-neo/engine/scan_voice_gate.h>
 #include <dsd-neo/engine/trunk_scan.h>
+#include <dsd-neo/runtime/decode_clock.h>
 #include <dsd-neo/runtime/frame_sync_hooks.h>
 #include <dsd-neo/runtime/trunk_scan_hooks.h>
 
@@ -28,9 +28,9 @@ scan_visit_should_yield_from_frame(const dsd_opts* opts, dsd_state* state) {
     if (opts->trunk_scan_enabled == 1) {
         return dsd_engine_trunk_scan_visit_expired(opts, state);
     }
-    const double now_m = dsd_time_now_monotonic_s();
+    const double now_m = dsd_decode_now_mono_s();
     dsd_engine_scan_visit_tick(opts, state, now_m);
-    dsd_engine_scan_y_timing_tick(opts, state, now_m, dsd_time_now_realtime_s());
+    dsd_engine_scan_y_timing_tick(opts, state, now_m, dsd_decode_now_realtime_s());
     return dsd_engine_scan_visit_expired(opts, state, now_m);
 }
 
@@ -39,8 +39,15 @@ p25_sm_release_from_frame_sync(dsd_opts* opts, dsd_state* state) {
     if (!dsd_trunk_p25_recovery_allowed(opts, state)) {
         return;
     }
+    /* Frame sync runs outside processFrame()'s hold on the tick guard, and a release drains the P25 Phase 2 playout
+       and ends calls the watchdog's tick reads too: it runs under the guard. A no-sync pass that finds the guard taken
+       leaves the release to the next one (issue #651). */
+    if (!p25_sm_tick_guard_try_enter()) {
+        return;
+    }
     state->p25_sm_force_release = 1;
     p25_sm_release(p25_sm_get_ctx(), opts, state, "frame-sync-no-sync");
+    p25_sm_tick_guard_leave();
 }
 
 static void
@@ -71,5 +78,6 @@ dsd_engine_frame_sync_hooks_install(void) {
     hooks.eot_cc = eot_cc;
     hooks.no_carrier = noCarrier;
     hooks.scan_visit_should_yield = scan_visit_should_yield_from_frame;
+    hooks.replay_retune = dsd_engine_leave_replay_carrier;
     dsd_frame_sync_hooks_set(hooks);
 }

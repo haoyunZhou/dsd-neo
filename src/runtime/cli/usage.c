@@ -45,7 +45,6 @@ dsd_cli_usage_section_intro(void) {
     printf("      --p25-min-follow-dwell <s>  P25: Minimum follow dwell after first voice\n");
     printf("      --p25-grant-voice-timeout <s>  P25: Max seconds from grant to voice before returning\n");
     printf("      --p25-mac-hold <s>     P25: Seconds to keep MAC activity eligible for audio after last MAC\n");
-    printf("      --p25-ring-hold <s>    P25: Ring gate window for slot audio activity\n");
     printf("      --p25-cc-grace <s>     P25: CC hunt grace window before treating CC as lost\n");
     printf("      --p25-force-release-extra <s>  P25: Safety-net extra seconds beyond hangtime\n");
     printf("      --p25-force-release-margin <s> P25: Safety-net hard margin seconds beyond extra\n");
@@ -100,7 +99,8 @@ dsd_cli_usage_section_io(void) {
     printf("  -r <files>    Read/Play saved mbe data from file(s)\n");
     printf("  -g <float>    Audio Digital Output Gain  (Default: 0 = Auto;        )\n");
     printf("                                           (Manual:  1 = 2%%; 50 = 100%%)\n");
-    printf("  -n <float>    Audio Analog  Output Gain  (Default: 0 = Auto; 0-100%%  )\n");
+    printf("  -n <float>    Audio Analog  Output Gain  (Default: 0 = Auto;        )\n");
+    printf("                                           (Manual:  1-100; 50 = reference level)\n");
     printf("  -nm           Enable the DMR single-slot mono decoder\n");
     printf("  -6 <file>     Output raw audio .wav file (48K/1). (WARNING! Large File Sizes 1 Hour ~= 360 MB)\n");
     printf("  -7 <dir>      Create/Use Custom directory for Per Call decoded .wav file saving.\n");
@@ -134,9 +134,10 @@ dsd_cli_usage_section_io(void) {
     printf("  -q            Reverse Mute - Mute Unencrypted Voice and Unmute Encrypted Voice\n");
     printf("  -V <num>      TDMA Voice Synthesis: 0=Off, 1=Slot1, 2=Slot2, 3=Both; Default is 3\n");
     printf("  -z <num>      TDMA slot preference: 0=Slot1, 1=Slot2, 2=Auto; default is 2\n");
-    printf("  -y            Enable experimental float audio output (Pulse/UDP/stdout)\n");
-    printf("  -v <hex>      Set Filtering Bitmap Options (Advanced Option)\n");
-    printf("                1 1 1 1 (0xF): PBF/LPF/HPF/HPFD on\n");
+    printf("  -y            Write decoded digital voice to stdout (-o -) and UDP as 32-bit float\n");
+    printf("  -v <hex>      Set Filtering Bitmap Options (Advanced Option; Default: 0x9)\n");
+    printf("                0x1 analog voice band-pass, 0x2 analog low-pass (960 Hz),\n");
+    printf("                0x4 analog high-pass (960 Hz), 0x8 digital high-pass\n");
     printf("\n");
 }
 
@@ -153,9 +154,11 @@ dsd_cli_usage_section_radio_and_encoder(void) {
     printf("                   Note: This is the DSP baseband used to derive capture rate;\n");
     printf("                         it is NOT the tuner IF filter.\n");
     printf("  sq   <val>    RTL-SDR Squelch Threshold (Optional)\n");
-    printf("                 (Negative = dB; 0 = off; Positive = linear mean power)\n");
+    printf("                 (Negative = dB; 0 or off = off; Positive = linear mean power;\n");
+    printf("                  auto[+N] = N dB over the learned noise floor; noise[+N] = N dB of FM\n");
+    printf("                  quieting; see --squelch)\n");
     printf("  vol  <num>    RTL-SDR Sample 'Volume' Multiplier (default = 2)(1,2,3)\n");
-    printf("  bias [on|off] Enable 5V bias tee on compatible dongles (default off)\n");
+    printf("  bias[=on|off] Enable 5V bias tee on compatible dongles (default off)\n");
     printf(" Example: dsd-neo -fs -i rtl -C cap_plus_channel.csv -T\n");
     printf(" Example: dsd-neo -fp -i rtl:0:851.375M:22:-2:24:0:2\n");
     printf("\n");
@@ -201,6 +204,10 @@ dsd_cli_usage_section_radio_and_encoder(void) {
     printf("      --rtltcp-autotune      Enable RTL-TCP adaptive networking (buffer/recv tuning)\n");
     printf("      --rtl-udp-control <port>  Enable external RTL retune control on 127.0.0.1:<port>\n");
     printf("      --rtl-udp-control-bind <ipv4>  Bind RTL retune control to this numeric IPv4 address\n");
+    printf("      --api <port>           Serve the control/telemetry API on 127.0.0.1:<port> (0 = off; docs/api.md)\n");
+    printf("      --api-bind <ipv4>      Bind the API to this numeric IPv4 address (token required off loopback)\n");
+    printf("      --api-token <secret>   Require this token on API connections (visible in the process list)\n");
+    printf("      --api-token-file <p>   Read the API token from this file (one line of 1..255 bytes)\n");
     printf("      --iq-capture <path>    Write I/Q capture data + metadata sidecar\n");
     printf("                             (.iq is added when <path> has no extension)\n");
     printf("      --iq-capture-format <fmt>  Capture format (cu8|cf32)\n");
@@ -241,7 +248,32 @@ dsd_cli_usage_section_decode(void) {
     printf("  -fA           Passive Analog Audio Monitor (NFM on a radio input)\n");
     printf("      --nfm-bandwidth-hz <Hz>  NFM channel-filter width, the full RF passband in whole Hz (8000..25000;\n");
     printf("                               default 16000). Not the tuner or audio bandwidth; it must fit the DSP\n");
-    printf("                               rate (e.g. 25000 needs a 48 kHz DSP bandwidth). No effect on PCM input.\n");
+    printf("                               rate (e.g. 25000 needs a 48 kHz DSP bandwidth). On PCM input it filters\n");
+    printf("                               nothing; with rigctl (-U) it is the FM passband the peer is asked for,\n");
+    printf("                               in place of -B, while the FM monitor runs.\n");
+    printf(
+        "      --tone-allow <list>      Hear only analog FM traffic carrying a listed CTCSS tone or DCS code; mute\n");
+    printf("                               the rest, and traffic with none after the tone check (800 ms, to 1.6 s\n");
+    printf("                               for a DCS code). <list> is '/'-separated standard tones (150.0 too) and\n");
+    printf(
+        "                               codes, e.g. 67.0/100.0/D023N (a bare D023 is D023N). The received tone is\n");
+    printf("                               shown apart; a scanner moves on from rejected traffic.\n");
+    printf("      --tone-block <list>      Mute analog FM traffic carrying a listed tone or code; hear the rest.\n");
+    printf("      --no-tone-filter         No tone filter (the default): ordinary carrier squelch.\n");
+    printf("      --squelch <setting>      Squelch: off, a level in dB (-60), auto[+N] or noise[+N] (N 3..30,\n");
+    printf("                               default 10). auto opens N dB above the noise floor each analog channel\n");
+    printf("                               learns; noise opens an FM channel when its discriminator noise above\n");
+    printf("                               voice quiets by N dB, as a radio's squelch does (auto on AM and on 8 or\n");
+    printf("                               10 kHz FM). Both are the same whatever the dongle, gain or antenna. Wins\n");
+    printf("                               over the input spec's sql field; works with --iq-replay. Off on digital\n");
+    printf("                               channels. On audio input (PCM) noise learns the noise above voice from\n");
+    printf("                               the input and gates the FM monitor; auto needs a radio input.\n");
+    printf("  -fM           Native AM receiver (IQ inputs: RTL-SDR, rtl_tcp, SoapySDR, Airspy, --iq-replay)\n");
+    printf("      --am-bandwidth-hz <Hz>   AM channel-filter width, the full RF passband in whole Hz (5000..20000;\n");
+    printf("                               default 6000). Not the tuner or audio bandwidth; it must fit the DSP\n");
+    printf("                               rate (e.g. 20000 needs a 24 or 48 kHz DSP bandwidth). On PCM input it\n");
+    printf("                               filters nothing; with rigctl (-U) it is the AM passband the peer is\n");
+    printf("                               asked for.\n");
     printf("  -ft           TDMA Trunking P25p1 Control and Voice, P25p2 Trunked Channels, and DMR\n");
     printf("  -fs           DMR TDMA BS and MS Simplex\n");
     printf("  -fr           DMR TDMA BS and MS Simplex using the single-slot mono decoder\n");
@@ -418,17 +450,17 @@ dsd_cli_usage_section_trunking_and_tools(void) {
     printf("      --p25-bandplan-export <file>  Write the learned P25 band plan CSV once at clean shutdown.\n");
     printf("  -T            Enable Trunking Features (NXDN/P25/EDACS/DMR) with RIGCTL/TCP or RTL Input\n");
     printf("  -Y            Enable Scanning Mode with RIGCTL/TCP or RTL Input\n");
-    printf("                 Row mode: p25, dmr, nxdn96, nxdn48, dpmr, dstar, ysf, m17 or nfm (analog);\n");
+    printf("                 Row mode: p25, dmr, nxdn96, nxdn48, dpmr, dstar, ysf, m17, nfm or am (analog);\n");
     printf("                 blank inherits globals.\n");
     printf("                 Scans conventional frequencies; use -T for trunking.\n");
     printf("      --trunk-scan <targets.csv>  Enable single-tuner trunk scan target rotation.\n");
     printf("                 Uses per-target chan_csv values; cannot be combined with global -C or IQ replay.\n");
     printf("      --trunk-scan-dwell-ms <ms>  Set default idle dwell per target (250..600000, default 3000).\n");
     printf("      --trunk-scan-activity-hold-ms <ms>  Set conventional DMR/P25/NXDN activity hold\n");
-    printf("                 and the nfm-conventional carrier tail (250..600000, default 1200).\n");
+    printf("                 and the analog (nfm/am-conventional) carrier tail (250..600000, default 1200).\n");
     printf("      --scan-voice-only  Digital conventional scan rows/targets: hold only for decoded voice.\n");
     printf("                 Trunked targets use idle dwell and protocol call-following timers.\n");
-    printf("                 Analog rows and nfm-conventional targets ignore it and hold on carrier.\n");
+    printf("                 Analog rows and targets ignore it and hold on carrier.\n");
     printf("      --scan-voice-qualify-ms <ms>  Window after sync in which voice must appear or the scan moves on "
            "(100..600000, default 1000).\n");
     printf("      --scan-voice-hold-ms <ms>  Time to stay after the last voice frame (100..600000, default 2000).\n");
@@ -449,7 +481,10 @@ dsd_cli_usage_section_trunking_and_tools(void) {
     printf("      --enc-follow           P25: Follow encrypted grants without key lockout (default)\n");
     printf("  -I <dec>      Specify TG to Hold During Trunking (DMR, P25, NXDN Type-C Trunking)\n");
     printf("  -U <port>     Enable RIGCTL/TCP; Set TCP Port for RIGCTL. (4532 on SDR++)\n");
-    printf("  -B <Hertz>    Set RIGCTL Setmod Bandwidth in Hertz (0 - default - Off)\n");
+    printf("  -B <Hertz>    Set RIGCTL Setmod Bandwidth in Hertz (0 - default - Off): the FM passband the peer is\n");
+    printf("                 asked for wherever it does not demodulate the analog monitor (digital modes, radio\n");
+    printf("                 inputs). On the FM monitor of PCM input it stands in for an unset --nfm-bandwidth-hz\n");
+    printf("                 (0 = the peer's own passband); never used on AM.\n");
     printf("                 P25 - 12000; NXDN48 - 7000; NXDN96: 12000; DMR - 7000-12000; EDACS/PV - 12000-24000;\n");
     printf("                 May vary based on system stregnth, etc.\n");
     printf("  -t <secs>     Voice/sync-loss hangtime in seconds (default 2); also conventional -Y scan speed.\n");

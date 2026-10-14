@@ -9,6 +9,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include <dsd-neo/runtime/analog_channel.h>
+#include <dsd-neo/runtime/decode_clock.h>
 #include <dsd-neo/runtime/rtl_stream_metrics_hooks.h>
 
 static int g_output_rate_calls = 0;
@@ -254,6 +256,7 @@ static int g_family_active_result = 0;
 static int g_rate_for_family_family = -1;
 static int g_rate_for_family_cqpsk = -1;
 static int g_rate_for_family_symbol_rate = -1;
+static int g_rate_for_family_explicit = -1;
 
 static int
 fake_analog_family_active(void) {
@@ -261,10 +264,11 @@ fake_analog_family_active(void) {
 }
 
 static unsigned int
-fake_output_rate_for_family(int family, int cqpsk_enable, int symbol_rate_hz) {
+fake_output_rate_for_family(int family, int cqpsk_enable, int symbol_rate_hz, int cqpsk_explicit) {
     g_rate_for_family_family = family;
     g_rate_for_family_cqpsk = cqpsk_enable;
     g_rate_for_family_symbol_rate = symbol_rate_hz;
+    g_rate_for_family_explicit = cqpsk_explicit;
     return 24000U;
 }
 
@@ -274,7 +278,8 @@ static void
 test_family_hooks(void) {
     dsd_rtl_stream_metrics_hooks_set(NULL);
     assert(dsd_rtl_stream_metrics_hook_analog_family_active() == 0);
-    assert(dsd_rtl_stream_metrics_hook_output_rate_for_family(0, 0, 4800) == 0U);
+    assert(dsd_rtl_stream_metrics_hook_output_rate_for_family(0, 0, 4800, 0) == 0U);
+    assert(dsd_rtl_stream_metrics_hook_output_rate_for_family(0, 1, 4800, 1) == 0U);
 
     dsd_rtl_stream_metrics_hooks hooks = {0};
     hooks.analog_family_active = fake_analog_family_active;
@@ -288,9 +293,206 @@ test_family_hooks(void) {
     assert(dsd_rtl_stream_metrics_hook_analog_family_active() == 0);
     g_family_active_result = 0;
     assert(dsd_rtl_stream_metrics_hook_analog_family_active() == 0);
-    assert(dsd_rtl_stream_metrics_hook_output_rate_for_family(0, 1, 6000) == 24000U);
+    assert(dsd_rtl_stream_metrics_hook_output_rate_for_family(0, 1, 6000, 0) == 24000U);
     assert(g_rate_for_family_family == 0 && g_rate_for_family_cqpsk == 1 && g_rate_for_family_symbol_rate == 6000);
+    assert(g_rate_for_family_explicit == 0);
+    /* A trunk-scan target's own CQPSK choice is forwarded with the rest (issue #583). */
+    assert(dsd_rtl_stream_metrics_hook_output_rate_for_family(0, 0, 4800, 1) == 24000U);
+    assert(g_rate_for_family_cqpsk == 0 && g_rate_for_family_symbol_rate == 4800 && g_rate_for_family_explicit == 1);
     dsd_rtl_stream_metrics_hooks_set(NULL);
+}
+
+static int g_family_landing_after_pending_result = 0;
+static int g_family_landing_after_pending_calls = 0;
+
+static int
+fake_family_landing_after_pending(void) {
+    ++g_family_landing_after_pending_calls;
+    return g_family_landing_after_pending_result;
+}
+
+/* Whether a digital retune queued now lands on a family's landing (issue #583): 0 with no RTL front end installed,
+ * forwarded and folded to 0/1 when its hook is installed, and the live family's answer from a table that installs only
+ * that one (the decoder's timing then follows the live family, as before the hook existed). */
+static void
+test_family_landing_after_pending_hook(void) {
+    dsd_rtl_stream_metrics_hooks_set(NULL);
+    assert(dsd_rtl_stream_metrics_hook_family_landing_after_pending() == 0);
+
+    dsd_rtl_stream_metrics_hooks hooks = {0};
+    hooks.analog_family_active = fake_analog_family_active;
+    hooks.family_landing_after_pending = fake_family_landing_after_pending;
+    dsd_rtl_stream_metrics_hooks_set(&hooks);
+    g_family_active_result = 0;
+    g_family_landing_after_pending_calls = 0;
+    g_family_landing_after_pending_result = 1;
+    assert(dsd_rtl_stream_metrics_hook_family_landing_after_pending() == 1);
+    g_family_landing_after_pending_result = 7;
+    assert(dsd_rtl_stream_metrics_hook_family_landing_after_pending() == 1);
+    g_family_landing_after_pending_result = -1;
+    assert(dsd_rtl_stream_metrics_hook_family_landing_after_pending() == 0);
+    g_family_active_result = 1;
+    g_family_landing_after_pending_result = 0;
+    assert(dsd_rtl_stream_metrics_hook_family_landing_after_pending() == 0);
+    assert(g_family_landing_after_pending_calls == 4);
+
+    hooks.family_landing_after_pending = NULL;
+    dsd_rtl_stream_metrics_hooks_set(&hooks);
+    g_family_active_result = 1;
+    assert(dsd_rtl_stream_metrics_hook_family_landing_after_pending() == 1);
+    g_family_active_result = 0;
+    assert(dsd_rtl_stream_metrics_hook_family_landing_after_pending() == 0);
+    assert(g_family_landing_after_pending_calls == 4);
+    dsd_rtl_stream_metrics_hooks_set(NULL);
+}
+
+static int g_plain_family_calls = 0;
+static int g_plain_family_family = -1;
+static int g_plain_family_kind = -1;
+static int g_plain_family_width_hz = -1;
+static int g_landing_calls = 0;
+static int g_landing_explicit = -1;
+
+static int
+fake_apply_analog_profile(int family, int kind, int width_hz) {
+    ++g_plain_family_calls;
+    g_plain_family_family = family;
+    g_plain_family_kind = kind;
+    g_plain_family_width_hz = width_hz;
+    return 0;
+}
+
+static int
+fake_request_digital_family_landing(int cqpsk_explicit) {
+    ++g_landing_calls;
+    g_landing_explicit = cqpsk_explicit;
+    return 5;
+}
+
+/* The digital family request that lands the digital family's landing whichever family the front end runs (issue
+ * #583): refused with no RTL front end, forwarded with its explicit flag when its hook is installed, and the plain
+ * digital family request from a table that installs only that one (a fake front end from before the hook existed). */
+static void
+test_digital_family_landing_hook(void) {
+    dsd_rtl_stream_metrics_hooks_set(NULL);
+    assert(dsd_rtl_stream_metrics_hook_request_digital_family_landing(0) == -1);
+
+    dsd_rtl_stream_metrics_hooks hooks = {0};
+    hooks.apply_analog_profile = fake_apply_analog_profile;
+    dsd_rtl_stream_metrics_hooks_set(&hooks);
+    assert(dsd_rtl_stream_metrics_hook_request_digital_family_landing(1) == 0);
+    assert(g_plain_family_calls == 1 && g_plain_family_family == DSD_RX_FAMILY_DIGITAL);
+    assert(g_plain_family_kind == DSD_ANALOG_DEMOD_FM && g_plain_family_width_hz == 0);
+
+    hooks.request_digital_family_landing = fake_request_digital_family_landing;
+    dsd_rtl_stream_metrics_hooks_set(&hooks);
+    assert(dsd_rtl_stream_metrics_hook_request_digital_family_landing(1) == 5);
+    assert(g_landing_calls == 1 && g_landing_explicit == 1);
+    assert(dsd_rtl_stream_metrics_hook_request_digital_family_landing(0) == 5);
+    assert(g_landing_calls == 2 && g_landing_explicit == 0);
+    assert(g_plain_family_calls == 1);
+    dsd_rtl_stream_metrics_hooks_set(NULL);
+}
+
+/* A replay batch hook that fills its output even when it reports no batch. */
+static int g_replay_batch_result = 0;
+static int g_replay_batch_calls = 0;
+
+static uint32_t g_replay_batch_first_index = 0U;
+
+static int
+fake_replay_batch(dsd_rtl_stream_replay_batch* out) {
+    ++g_replay_batch_calls;
+    out->generation = 77U;
+    out->output_kind = 1;
+    out->channel_profile = 2;
+    out->symbol_rate_hz = 4800;
+    out->levels = 4;
+    out->media_start_ns = 9000000000ULL;
+    out->media_duration_ns = 21333333ULL;
+    out->output_count = 512U;
+    out->first_index = g_replay_batch_first_index;
+    out->center_frequency_hz = 851012500U;
+    return g_replay_batch_result;
+}
+
+/* The I/Q replay batch the decoder's last read took its samples from: none with no RTL front end installed, forwarded
+ * when its hook reports one, and none, with nothing left in the output, whenever the hook reports anything else. */
+static void
+test_replay_batch_hook(void) {
+    dsd_rtl_stream_replay_batch batch = {.generation = 9U, .output_kind = 9, .levels = 9, .center_frequency_hz = 9U};
+    dsd_rtl_stream_metrics_hooks_set(NULL);
+    assert(dsd_rtl_stream_metrics_hook_replay_batch(&batch) == 0);
+    assert(batch.generation == 0U && batch.output_kind == 0 && batch.channel_profile == 0);
+    assert(batch.symbol_rate_hz == 0 && batch.levels == 0 && batch.center_frequency_hz == 0U);
+    assert(dsd_rtl_stream_metrics_hook_replay_batch(NULL) == 0);
+
+    dsd_rtl_stream_metrics_hooks hooks = {0};
+    hooks.replay_batch = fake_replay_batch;
+    dsd_rtl_stream_metrics_hooks_set(&hooks);
+    g_replay_batch_result = 1;
+    assert(dsd_rtl_stream_metrics_hook_replay_batch(&batch) == 1);
+    assert(batch.generation == 77U && batch.output_kind == 1 && batch.channel_profile == 2);
+    assert(batch.symbol_rate_hz == 4800 && batch.levels == 4);
+    assert(batch.media_start_ns == 9000000000ULL && batch.media_duration_ns == 21333333ULL);
+    assert(batch.output_count == 512U && batch.first_index == 0U);
+    assert(batch.center_frequency_hz == 851012500U);
+    const int results[] = {0, -1, 2};
+    for (size_t i = 0; i < sizeof(results) / sizeof(results[0]); i++) {
+        g_replay_batch_result = results[i];
+        assert(dsd_rtl_stream_metrics_hook_replay_batch(&batch) == 0);
+        assert(batch.generation == 0U && batch.output_kind == 0 && batch.channel_profile == 0);
+        assert(batch.symbol_rate_hz == 0 && batch.levels == 0);
+        assert(batch.media_start_ns == 0U && batch.media_duration_ns == 0U);
+        assert(batch.output_count == 0U && batch.first_index == 0U && batch.center_frequency_hz == 0U);
+    }
+    /* A NULL output never reaches the hook. */
+    assert(dsd_rtl_stream_metrics_hook_replay_batch(NULL) == 0);
+    assert(g_replay_batch_calls == 4);
+    dsd_rtl_stream_metrics_hooks_set(NULL);
+}
+
+/* Issue #572: a reader that takes one replay sample at a time runs the decode clock's media time to that sample's
+ * capture time, the read's batch span at its index; a live read (no batch) runs nothing. Issue #575: it also reports the
+ * centre the batch was captured on, which a live read leaves where it was; a reader that wants no centre passes NULL. */
+static void
+test_replay_advance_decode_clock(void) {
+    const int64_t anchor_s = 1788245497LL;
+    const uint64_t anchor_ns = (uint64_t)anchor_s * 1000000000ULL;
+    dsd_decode_clock_use_replay(anchor_s);
+    uint32_t center_hz = 7U;
+
+    dsd_rtl_stream_metrics_hooks_set(NULL);
+    assert(dsd_rtl_stream_metrics_hook_replay_advance_decode_clock(&center_hz) == 0);
+    assert(dsd_decode_now_mono_ns() == anchor_ns);
+    assert(center_hz == 7U);
+
+    dsd_rtl_stream_metrics_hooks hooks = {0};
+    hooks.replay_batch = fake_replay_batch;
+    dsd_rtl_stream_metrics_hooks_set(&hooks);
+    g_replay_batch_result = 0;
+    assert(dsd_rtl_stream_metrics_hook_replay_advance_decode_clock(&center_hz) == 0);
+    assert(dsd_decode_now_mono_ns() == anchor_ns);
+    assert(center_hz == 7U);
+
+    g_replay_batch_result = 1;
+    g_replay_batch_first_index = 0U;
+    assert(dsd_rtl_stream_metrics_hook_replay_advance_decode_clock(&center_hz) == 1);
+    assert(dsd_decode_now_mono_ns() == anchor_ns + 9000000000ULL);
+    assert(center_hz == 851012500U);
+    g_replay_batch_first_index = 3U;
+    assert(dsd_rtl_stream_metrics_hook_replay_advance_decode_clock(NULL) == 1);
+    assert(dsd_decode_now_mono_ns() == anchor_ns + 9000000000ULL + (21333333ULL * 3ULL) / 512ULL);
+    g_replay_batch_first_index = 511U;
+    center_hz = 0U;
+    assert(dsd_rtl_stream_metrics_hook_replay_advance_decode_clock(&center_hz) == 1);
+    assert(dsd_decode_now_mono_ns() == anchor_ns + 9000000000ULL + (21333333ULL * 511ULL) / 512ULL);
+    assert(center_hz == 851012500U);
+
+    g_replay_batch_first_index = 0U;
+    g_replay_batch_result = 0;
+    dsd_rtl_stream_metrics_hooks_set(NULL);
+    dsd_decode_clock_use_system();
 }
 
 int
@@ -303,6 +505,10 @@ main(void) {
 
     test_analog_profile_outputs();
     test_family_hooks();
+    test_family_landing_after_pending_hook();
+    test_digital_family_landing_hook();
+    test_replay_batch_hook();
+    test_replay_advance_decode_clock();
 
     // Default behavior with hooks unset.
     dsd_rtl_stream_metrics_hooks_set(NULL);

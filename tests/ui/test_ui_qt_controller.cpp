@@ -24,19 +24,24 @@
 #include <cstdlib>
 #include <dsd-neo/app_control/call_view.h>
 #include <dsd-neo/app_control/frontend_runtime.h>
+#include <dsd-neo/app_control/rx_tone_view.h>
 #include <dsd-neo/app_control/snapshot.h>
+#include <dsd-neo/core/analog_tone.h>
 #include <dsd-neo/core/call_state.h>
-#include <dsd-neo/core/dsd_time.h>
 #include <dsd-neo/core/init.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/opts_fwd.h>
+#include <dsd-neo/core/safe_api.h>
 #include <dsd-neo/core/state.h>
 #include <dsd-neo/core/state_ext.h>
 #include <dsd-neo/core/state_fwd.h>
 #include <dsd-neo/core/synctype_ids.h>
 #include <dsd-neo/core/talkgroup_policy.h>
+#include <dsd-neo/runtime/analog_tones.h>
+#include <dsd-neo/runtime/decode_clock.h>
+#include <dsd-neo/runtime/scan_row_edit.h>
 #include <functional>
-#include <initializer_list>
+#include <initializer_list> // IWYU pragma: keep -- braced range-for lists require this header.
 #include <memory>
 #include <stdint.h>
 #include <utility>
@@ -50,6 +55,7 @@
 #include "diagnostics_log.h"
 #include "metrics_model.h"
 #include "p25_network_model.h"
+#include "qml_gc_policy.h"
 #include "session_args.h"
 #include "talkgroup_list_model.h"
 #include "ui_controller.h"
@@ -250,7 +256,7 @@ test_metrics_age_without_decoder_redraw() {
     state.synctype = DSD_SYNC_NONE;
     state.scan_timing.reason = DSD_SCAN_STAY_HANGTIME;
     state.scan_timing.conventional = 1U;
-    state.scan_timing.started_m = dsd_time_now_monotonic_s();
+    state.scan_timing.started_m = dsd_decode_now_mono_s();
     state.scan_timing.deadline_m = state.scan_timing.started_m + 1.0;
     state.scan_timing.span_ms = 1000U;
     dsd_app_telemetry_publish_opts_snapshot(&opts);
@@ -435,6 +441,143 @@ test_nfm_bandwidth_bridge() {
     freeState(&state);
 }
 
+// Issue #524: the Radio sheet's AM width control goes through the real bridge and decoder queue as
+// DSD_APP_CMD_AM_BANDWIDTH_SET with the width as stepped; the decoder stores what it accepts (0 is the default) and
+// refuses the rest with the width unchanged. With no radio running it is configuration only.
+static void
+test_am_bandwidth_bridge() {
+    dsd_qt::CommandBridge bridge;
+    static dsd_opts opts;
+    static dsd_state state;
+    initOpts(&opts);
+    initState(&state);
+    opts.audio_in_type = AUDIO_IN_PULSE;
+    opts.audio_out_type = 9;
+    dsd_app_frontend_runtime_start(nullptr, nullptr);
+    check(bridge.setAmBandwidthHz(8000));
+    check(dsd_app_drain_cmds(&opts, &state) == 1);
+    check(opts.analog_am_bandwidth_hz == 8000);
+    check(bridge.setAmBandwidthHz(25000));
+    check(dsd_app_drain_cmds(&opts, &state) == 1);
+    check(opts.analog_am_bandwidth_hz == 8000);
+    check(bridge.setAmBandwidthHz(0));
+    check(dsd_app_drain_cmds(&opts, &state) == 1);
+    check(opts.analog_am_bandwidth_hz == 0);
+    dsd_app_frontend_runtime_stop();
+    freeState(&state);
+}
+
+// The live tone-filter editor goes through the real bridge and decoder queue as DSD_APP_CMD_TONE_FILTER_SET with the
+// mode and the list as typed; the decoder applies what the list parser accepts and refuses the rest with the policy
+// unchanged. The bridge's inline check is that same parser's answer, empty when the edit would apply, and a list the
+// payload cannot hold is refused before anything is queued.
+static void
+test_tone_filter_bridge() {
+    dsd_qt::CommandBridge bridge;
+    static dsd_opts opts;
+    static dsd_state state;
+    initOpts(&opts);
+    initState(&state);
+    opts.audio_in_type = AUDIO_IN_PULSE;
+    opts.audio_out_type = 9;
+    opts.analog_only = 1;
+    dsd_app_frontend_runtime_start(nullptr, nullptr);
+    check(bridge.toneFilterError(DSD_TONE_FILTER_ALLOW, QStringLiteral("100/d023")).isEmpty());
+    check(bridge.toneFilterError(DSD_TONE_FILTER_OFF, QString()).isEmpty());
+    check(bridge.toneFilterError(DSD_TONE_FILTER_ALLOW, QStringLiteral("100,67"))
+          == QStringLiteral("use / between entries, not commas"));
+    check(bridge.toneFilterError(DSD_TONE_FILTER_BLOCK, QString())
+          == QStringLiteral("block needs a list of CTCSS tones or DCS codes, e.g. 67.0/100.0/D023N"));
+    check(bridge.toneFilterError(DSD_TONE_FILTER_ALLOW, QStringLiteral("100/xyzzy"))
+          == QStringLiteral("entry 2 is not a standard CTCSS tone or DCS code"));
+    check(bridge.setToneFilter(DSD_TONE_FILTER_ALLOW, QStringLiteral("100/d023")));
+    check(dsd_app_drain_cmds(&opts, &state) == 1);
+    dsd_tone_set want = {};
+    check(dsd_tone_set_parse("100.0/D023N", &want, nullptr, 0) == 0);
+    check(opts.analog_tone_filter == DSD_TONE_FILTER_ALLOW && dsd_tone_set_equal(&opts.analog_tone_set, &want));
+    check(bridge.setToneFilter(DSD_TONE_FILTER_BLOCK, QStringLiteral("100,67")));
+    check(dsd_app_drain_cmds(&opts, &state) == 1);
+    check(opts.analog_tone_filter == DSD_TONE_FILTER_ALLOW && dsd_tone_set_equal(&opts.analog_tone_set, &want));
+    const QString overlong(DSD_APP_TONE_FILTER_LIST_SIZE, QLatin1Char('/'));
+    check(!bridge.setToneFilter(DSD_TONE_FILTER_ALLOW, overlong));
+    check(!bridge.toneFilterError(DSD_TONE_FILTER_ALLOW, overlong).isEmpty());
+    check(dsd_app_drain_cmds(&opts, &state) == 0);
+    check(bridge.setToneFilter(DSD_TONE_FILTER_OFF, QString()));
+    check(dsd_app_drain_cmds(&opts, &state) == 1);
+    check(opts.analog_tone_filter == DSD_TONE_FILTER_OFF && dsd_tone_set_count(&opts.analog_tone_set) == 0);
+    dsd_app_frontend_runtime_stop();
+    freeState(&state);
+}
+
+/* Issue #518: the bridge's "this channel" edits. The constants are the engine's; an editor opened with no row on air
+ * sends nothing; an edit naming a row is queued as a DSD_APP_CMD_SCAN_ROW_EDIT carrying the row and the value, which the
+ * decoder refuses with no scan running; text that would not fit is refused before anything is queued. */
+static void
+test_scan_row_edit_bridge() {
+    dsd_qt::CommandBridge bridge;
+    static dsd_opts opts;
+    static dsd_state state;
+    check(dsd_qt::CommandBridge::scanRowFieldSquelch() == DSD_SCAN_ROW_FIELD_SQUELCH);
+    check(dsd_qt::CommandBridge::scanRowFieldWidth() == DSD_SCAN_ROW_FIELD_WIDTH);
+    check(dsd_qt::CommandBridge::scanRowFieldTone() == DSD_SCAN_ROW_FIELD_TONE);
+    check(dsd_qt::CommandBridge::scanRowFieldGain() == DSD_SCAN_ROW_FIELD_GAIN);
+    check(dsd_qt::CommandBridge::scanRowEditSet() == DSD_SCAN_ROW_EDIT_SET);
+    check(dsd_qt::CommandBridge::scanRowEditInherit() == DSD_SCAN_ROW_EDIT_INHERIT);
+    check(dsd_qt::CommandBridge::scanRowEditReset() == DSD_SCAN_ROW_EDIT_RESET);
+    dsd_app_frontend_runtime_start(nullptr, nullptr);
+    check(!bridge.scanRowContext().value("active").toBool());
+    check(!bridge.editScanRow({{"active", false}}, DSD_SCAN_ROW_FIELD_SQUELCH, DSD_SCAN_ROW_EDIT_SET,
+                              {{"squelchDb", -50}}));
+
+    /* A target on air in the published pair: the context carries the row and the tone policy the options run, but
+       only while both snapshots are of that row's scope; between the decoder's two publishes it is not offered. */
+    static dsd_opts published_opts;
+    static dsd_state published_state;
+    initOpts(&published_opts);
+    initState(&published_state);
+    published_opts.trunk_scan_enabled = 1;
+    published_opts.analog_tone_filter = DSD_TONE_FILTER_ALLOW;
+    check(dsd_tone_set_parse("100.0", &published_opts.analog_tone_set, nullptr, 0U) == 0);
+    published_state.scan_row_scanner = (uint8_t)DSD_SCAN_ROW_SCANNER_TRUNK_SCAN;
+    published_state.scan_row_session = 4U;
+    published_state.scan_row_index = 1;
+    published_state.scan_row_editable = (uint8_t)(DSD_SCAN_ROW_FIELD_SQUELCH | DSD_SCAN_ROW_FIELD_TONE);
+    DSD_SNPRINTF(published_state.trunk_scan_active_id, sizeof published_state.trunk_scan_active_id, "%s", "fire");
+    published_opts.scan_row_scope_seq = 11U;
+    published_state.scan_row_scope_seq = 11U;
+    dsd_app_telemetry_publish_opts_snapshot(&published_opts);
+    dsd_app_telemetry_publish_snapshot(&published_state);
+    const QVariantMap context = bridge.scanRowContext();
+    check(context.value("active").toBool() && context.value("key").toString() == QStringLiteral("1:4:1")
+          && context.value("toneMode").toInt() == DSD_TONE_FILTER_ALLOW
+          && context.value("toneList").toString() == QStringLiteral("100.0"));
+    published_state.scan_row_scope_seq = 12U;
+    dsd_app_telemetry_publish_snapshot(&published_state);
+    check(!bridge.scanRowContext().value("active").toBool());
+    published_state.scan_row_scanner = (uint8_t)DSD_SCAN_ROW_SCANNER_NONE;
+    published_state.scan_row_session = 0U;
+    published_state.scan_row_index = -1;
+    published_opts.trunk_scan_enabled = 0;
+    dsd_app_telemetry_publish_opts_snapshot(&published_opts);
+    dsd_app_telemetry_publish_snapshot(&published_state);
+    freeState(&published_state);
+    const QVariantMap row{{"active", true}, {"scanner", 1},           {"session", 3},         {"row", 0},
+                          {"mode", 9},      {"target", "county-p25"}, {"label", "county-p25"}};
+    check(bridge.editScanRow(row, DSD_SCAN_ROW_FIELD_TONE, DSD_SCAN_ROW_EDIT_SET,
+                             {{"toneMode", 1}, {"toneList", "100.0/D023N"}}));
+    state.ui_msg[0] = '\0';
+    check(dsd_app_drain_cmds(&opts, &state) == 1);
+    check(QString::fromUtf8(state.ui_msg) == QStringLiteral("Refused: no scan is running"));
+    check(!bridge.editScanRow(row, DSD_SCAN_ROW_FIELD_TONE, DSD_SCAN_ROW_EDIT_SET,
+                              {{"toneMode", 1}, {"toneList", QString(2000, QLatin1Char('1'))}}));
+    QVariantMap long_target = row;
+    long_target["target"] = QString(100, QLatin1Char('x'));
+    check(!bridge.editScanRow(long_target, DSD_SCAN_ROW_FIELD_SQUELCH, DSD_SCAN_ROW_EDIT_INHERIT, {}));
+    check(dsd_app_drain_cmds(&opts, &state) == 0);
+    dsd_app_frontend_runtime_stop();
+    freeState(&state);
+}
+
 static void
 test_zero_bounds() {
     dsd_qt::CommandBridge bridge;
@@ -471,6 +614,7 @@ test_zero_bounds() {
 
 int
 main(int argc, char** argv) {
+    dsd_qt::applyQmlGcPolicy();
     QGuiApplication app(argc, argv);
     QCoreApplication::setOrganizationName("dsd-neo-test");
     QCoreApplication::setApplicationName("dsd-neo-controller");
@@ -480,6 +624,9 @@ main(int argc, char** argv) {
     test_metrics_age_without_decoder_redraw();
     test_sheet_policy_edits();
     test_nfm_bandwidth_bridge();
+    test_am_bandwidth_bridge();
+    test_tone_filter_bridge();
+    test_scan_row_edit_bridge();
     test_zero_bounds();
     test_auto_start_requests();
     test_initial_usb_record();
@@ -604,12 +751,12 @@ main(int argc, char** argv) {
     call.ota_target_id = 42;
     call.policy_target_id = 42;
     call.ota_source_id = 1;
-    call.observed_m = dsd_time_now_monotonic_s();
+    call.observed_m = dsd_decode_now_mono_s();
     check(dsd_call_state_observe(&state, &call, DSD_CALL_BOUNDARY_BEGIN) == 1);
-    check(!dsd_tg_policy_call_skip_active(&state, 42, dsd_time_now_monotonic_s()));
+    check(!dsd_tg_policy_call_skip_active(&state, 42, dsd_decode_now_mono_s()));
     check(bridge.skipSlot(0));
     check(dsd_app_drain_cmds(&opts, &state) == 1);
-    check(dsd_tg_policy_call_skip_active(&state, 42, dsd_time_now_monotonic_s()));
+    check(dsd_tg_policy_call_skip_active(&state, 42, dsd_decode_now_mono_s()));
     check(dsd_tg_policy_session_avoid_add(&state, 42) == 0);
     check(!bridge.clearTemporaryTgAvoids("invalid context"));
     check(bridge.clearTemporaryTgAvoids(QString::number(context + 1)));
@@ -618,7 +765,7 @@ main(int argc, char** argv) {
     check(bridge.clearTemporaryTgAvoids(QString::number(context)));
     check(dsd_app_drain_cmds(&opts, &state) == 1);
     check(!dsd_tg_policy_session_avoid_contains(&state, 42));
-    check(!dsd_tg_policy_call_skip_active(&state, 42, dsd_time_now_monotonic_s()));
+    check(!dsd_tg_policy_call_skip_active(&state, 42, dsd_decode_now_mono_s()));
     refreshVersion();
     const QString version = QString::number(context);
     check(!bridge.renameTalkgroup(42, 42, version, generation, QString(50, QLatin1Char('x'))));

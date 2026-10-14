@@ -30,6 +30,13 @@ Run the smallest useful set before opening a PR, then broaden it when the change
 
 - Normal C/C++ changes: `cmake --build --preset dev-debug -j` and `ctest --preset dev-debug --output-on-failure`.
 - Normal pre-push check: `tools/preflight_ci.sh` (concurrent lanes sized to the machine, every failure reported at the end; `DSD_HOOK_SERIAL=1` for one-at-a-time streaming output).
+  The hook checks the files `tools/push_changed_files.sh` lists for each pushed ref. When the remote's commit is
+  not in the clone it compares with the remote's default branch, and when no comparison works the push fails
+  instead of going out unchecked. CI's pull-request jobs take their files from `tools/ci_changed_files.sh` the same
+  way: names stay raw (`git diff -z`), and a diff that fails fails the job. When a change touches
+  `tools/ci-dependency-pins.env`, `cmake/Pffft.cmake` or a vendored snapshot, both run cppcheck, clang-tidy, IWYU
+  and GCC `-fanalyzer` over the whole tree, as the push to main does: a dependency's headers can move a finding
+  into a file the change did not touch.
 - Broad or high-risk changes: `tools/quality_preflight.sh`.
 - Sanitizer-sensitive code: `ctest --preset asan-ubsan-debug --output-on-failure` after configuring/building the matching preset.
 - Threading changes: `ctest --preset tsan-debug --output-on-failure` where the affected tests are supported by TSan.
@@ -76,10 +83,18 @@ reason: the stderr and stdin capture helpers in tests, where `dup2()` returns a 
 must not close, and `config_profile_free_context()`, where the analyzer loses the tie between `pctx->n` and the count
 that filled the array.
 
+`tools/iwyu.sh` fails a translation unit that does not compile under IWYU's clang, in strict mode and out of it, and
+prints its diagnostics. IWYU 0.27 exits 0 after a compile error such as a `-Werror` diagnostic and goes on to analyse
+the unit, so the verdict comes from the output: a line that starts with `file:line:col: error:`, `fatal error:` or the
+driver's bare `error:`. The summary counts these as `compile_errors`, apart from include suggestions. Before this check
+matched a located diagnostic, units that failed to compile passed the strict gate as clean.
+`tests/tools/test_iwyu.sh` drives the classification with a fake IWYU.
+
 The repository intentionally blocks or flags patterns that are easy to reintroduce during large edits:
 
 - Use the project safe API wrappers instead of raw C memory/string/formatting APIs in project-owned code.
 - Compare floating-point values with an explicit tolerance, in production code as well as tests. The local Semgrep rule covers scalar `float`/`double` locals, parameters and local array subscripts declared in the same function, plus the float/double members of the shared option, state, config, demod and service structs by name (regenerate the list with `tools/semgrep_float_fields.py` when those structs change). Explicit literal sentinel checks remain allowed. It is a syntactic guardrail, not complete type analysis; CodeQL's `cpp/equality-on-floats` is the type-aware backstop. Strict scans run its positive and negative fixtures in `semgrep/dsd-neo.cpp` before scanning the tree.
+- Read time through `<dsd-neo/runtime/decode_clock.h>`, so every clock read names its domain: `dsd_decode_time()`/`dsd_decode_now_*()` for decode decisions, decoded-output timestamps and anything compared with a decoded stamp, and `dsd_realtime_*()` for sleeps, waits, timeouts, pacing, UI throttles and perf. A raw read (`time()`, `clock_gettime()`, `gettimeofday()`, `dsd_time_monotonic_*()`, `std::chrono` clocks, `QDateTime::current*()`, `QElapsedTimer`, JavaScript `Date.now()`/`new Date()`) stays on the wall clock during an I/Q replay, so a decision made on it changes from run to run. `dsd-neo.no-direct-clock-read` covers C/C++ in `src/`, `include/`, `apps/` and `android/`. It exempts only the files that implement or sit below the two domains: `src/platform/`, `src/runtime/decode_clock.c`, `src/io/iq/iq_capture.c` and `src/io/radio/tcp_quality_metrics.cpp`, which cannot link runtime, and `src/ui/qt/realtime_clock.h`, the Qt frontend's one real-time helper. `dsd-neo.no-direct-clock-read-js` is a text match over the frontend's `.qml` and `.js`, because Semgrep has no QML parser. Tests are outside both rules, since they stub and wrap the platform clock; to step decode time they select the decode clock's TEST source (`docs/testing.md`, "Decode time in unit tests"). Strict scans run the fixtures in `semgrep/dsd-neo.c`, `semgrep/dsd-neo.cpp` and `semgrep/dsd-neo.js`.
 - Write real control characters in format strings. `"\\n"` prints a literal `\` followed by `n` rather than breaking the line; this is easy to reintroduce when rewriting `fprintf` call sites in bulk, and has silently broken DMR console and structured-output dumps more than once. If a literal escape sequence is genuinely intended, emit it outside a format string or annotate the line with a narrow `nosemgrep` comment explaining why.
 - Do not use wide-character conversions (`%lc`, `%ls`, `%C`, `%S`) in format strings, in any of the printf-family or curses `printw`-family wrappers, and do not call the wide-character output functions (`fwprintf`, `wprintf`, `swprintf`, `fputws`, `fputwc`, `putwc`, `putwchar` and their `v` variants). They hand a code unit to the C runtime to encode, and off-air text regularly contains one that has no encoding — a lone surrogate. glibc drops it; the Windows UCRT reports the failed conversion as a string of length -1 and then writes the stack to the stream until the process faults. Decode with `<dsd-neo/core/utf16.h>` and print through `dsd_unicode_fput_scalar()`.
 - Do not execute shells or spawn processes from project-owned C/C++ without explicit design review.

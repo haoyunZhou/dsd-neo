@@ -8,8 +8,10 @@
 #include <dsd-neo/core/audio.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/state.h>
+#include <dsd-neo/dsp/analog_audio.h>
+#include <dsd-neo/runtime/decode_clock.h>
+#include <stddef.h>
 #include <stdint.h>
-#include <time.h>
 #include "../command_dispatch.h"
 #include "dsd-neo/app_control/commands.h"
 #include "dsd-neo/core/opts_fwd.h"
@@ -32,21 +34,22 @@ ui_handle_toggle_mute(dsd_opts* opts, dsd_state* state, const struct dsd_app_com
     }
     if (state) {
         DSD_SNPRINTF(state->ui_msg, sizeof state->ui_msg, "%s", msg);
-        state->ui_msg_expire = time(NULL) + 3;
+        state->ui_msg_expire = dsd_realtime_time() + 3;
     }
     return 1;
 }
 
 static inline void
 apply_gain_delta(dsd_opts* opts, dsd_state* state, int d) {
-    int g = opts->audio_gain + d;
+    /* In 64 bits: a delta can be any int32 (the control API sends what its client asked for). */
+    int64_t g = (int64_t)opts->audio_gain + d;
     if (g < 0) {
         g = 0;
     }
     if (g > 50) {
         g = 50;
     }
-    opts->audio_gain = g;
+    opts->audio_gain = (int)g;
     state->aout_gain = opts->audio_gain;
     state->aout_gainR = opts->audio_gain;
     opts->audio_gainR = opts->audio_gain;
@@ -68,6 +71,19 @@ ui_handle_gain_delta(dsd_opts* opts, dsd_state* state, const struct dsd_app_comm
     return 1;
 }
 
+/* Analog output gain (-n, the menu prompt and the * and / keys alike): 0 is auto (the AGC), 1..100 a fixed gain, 50
+   the reference level. Anything under 1 is auto. */
+static float
+clamp_analog_gain(float g) {
+    if (!(g >= 1.0f)) {
+        return 0.0f;
+    }
+    if (g > 100.0f) {
+        return 100.0f;
+    }
+    return g;
+}
+
 static int
 ui_handle_again_delta(dsd_opts* opts, dsd_state* state, const struct dsd_app_command* c) {
     (void)state;
@@ -75,14 +91,10 @@ ui_handle_again_delta(dsd_opts* opts, dsd_state* state, const struct dsd_app_com
     if (c->n >= (int)sizeof(int32_t)) {
         DSD_MEMCPY(&d, c->data, sizeof(int32_t));
     }
-    int g = opts->audio_gainA + d;
-    if (g < 0) {
-        g = 0;
-    }
-    if (g > 50) {
-        g = 50;
-    }
-    opts->audio_gainA = g;
+    /* From auto a step starts at the reference setting; a step below 1 goes back to auto. In float, so a fractional
+       -n value moves by the step instead of being truncated first. */
+    const float from = dsd_analog_gain_is_auto(opts->audio_gainA) ? 50.0f : opts->audio_gainA;
+    opts->audio_gainA = clamp_analog_gain(from + (float)d);
     return 1;
 }
 
@@ -116,13 +128,7 @@ ui_handle_again_set(dsd_opts* opts, dsd_state* state, const struct dsd_app_comma
     if (c->n >= (int)sizeof(int32_t)) {
         DSD_MEMCPY(&g, c->data, sizeof g);
     }
-    if (g < 0) {
-        g = 0;
-    }
-    if (g > 50) {
-        g = 50;
-    }
-    opts->audio_gainA = g;
+    opts->audio_gainA = clamp_analog_gain((float)g);
     return 1;
 }
 
@@ -170,7 +176,7 @@ ui_handle_input_vol_cycle(dsd_opts* opts, dsd_state* state, const struct dsd_app
         }
         if (state) {
             DSD_SNPRINTF(state->ui_msg, sizeof state->ui_msg, "RTL Monitor Gain: %dX", opts->rtl_volume_multiplier);
-            state->ui_msg_expire = time(NULL) + 2;
+            state->ui_msg_expire = dsd_realtime_time() + 2;
         }
     } else {
         if (opts->input_volume_multiplier == 1 || opts->input_volume_multiplier == 2) {
@@ -180,7 +186,7 @@ ui_handle_input_vol_cycle(dsd_opts* opts, dsd_state* state, const struct dsd_app
         }
         if (state) {
             DSD_SNPRINTF(state->ui_msg, sizeof state->ui_msg, "Input Volume: %dX", opts->input_volume_multiplier);
-            state->ui_msg_expire = time(NULL) + 2;
+            state->ui_msg_expire = dsd_realtime_time() + 2;
         }
     }
     return 1;

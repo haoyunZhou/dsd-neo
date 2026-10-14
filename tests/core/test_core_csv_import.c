@@ -4,11 +4,13 @@
  */
 
 #include <assert.h>
+#include <dsd-neo/core/analog_tone.h>
 #include <dsd-neo/core/csv_import.h>
 #include <dsd-neo/core/csv_validate.h>
 #include <dsd-neo/core/key_set.h>
 #include <dsd-neo/core/keyring.h>
 #include <dsd-neo/core/opts.h>
+#include <dsd-neo/core/power.h>
 #include <dsd-neo/core/source_alias.h>
 #include <dsd-neo/core/state.h>
 #include <dsd-neo/core/state_ext.h>
@@ -17,6 +19,7 @@
 #include <dsd-neo/platform/file_compat.h>
 #include <dsd-neo/platform/posix_compat.h>
 #include <dsd-neo/protocol/nxdn/nxdn_lfsr.h>
+#include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -60,6 +63,38 @@ free_test_state(dsd_state* state) {
         dsd_state_trunk_lcn_free(state);
     }
     free(state);
+}
+
+/* Checks that run while a test's fixture exists count failures rather than assert, so the test still removes the
+ * fixture before a failure ends it. Returns 1 when @p ok is false. */
+static int
+fixture_check(int ok, const char* what) {
+    if (!ok) {
+        DSD_FPRINTF(stderr, "FAIL: %s\n", what);
+        return 1;
+    }
+    return 0;
+}
+
+/* Removes a fixture file the test created; returns 1 (a failed check) when it stays. */
+static int
+remove_fixture(const char* path) {
+    if (remove(path) != 0) {
+        DSD_FPRINTF(stderr, "FAIL: could not remove %s: %s\n", path, strerror(errno));
+        return 1;
+    }
+    return 0;
+}
+
+/* Removes an empty fixture directory with dsd_test_rmdir(), since remove() does not remove a directory on native
+ * Windows; returns 1 (a failed check) when it stays. */
+static int
+remove_fixture_dir(const char* dir) {
+    if (dsd_test_rmdir(dir) != 0) {
+        DSD_FPRINTF(stderr, "FAIL: could not remove directory %s: %s\n", dir, strerror(errno));
+        return 1;
+    }
+    return 0;
 }
 
 static int
@@ -170,7 +205,7 @@ test_channel_import_rejects_directory(void) {
     int rc = csvChanImport(opts, state);
     int failed = (rc == 0 || state->lcn_freq_count != 456);
 
-    (void)remove(dir);
+    failed |= remove_fixture_dir(dir);
     free(opts);
     free_test_state(state);
     return failed;
@@ -317,6 +352,7 @@ test_channel_import_rejects_final_symlink(void) {
 
     FILE* fp = dsd_fopen_private(target, "w");
     if (!fp) {
+        (void)remove(target);
         free(opts);
         free_test_state(state);
         return 1;
@@ -495,8 +531,7 @@ write_text_file(const char* path, const char* text) {
         fclose(fp);
         return -1;
     }
-    fclose(fp);
-    return 0;
+    return fclose(fp) == 0 ? 0 : -1;
 }
 
 static int
@@ -557,6 +592,66 @@ test_channel_import_rejects_malformed_rows_without_reusing_previous_channel(void
     }
 
     (void)remove(tmpl);
+    free(opts);
+    free_test_state(state);
+    return failed;
+}
+
+/* The trunk ceiling is the largest value a 32-bit long holds, so a channel map means the same on Windows as anywhere
+ * else, and it fits the uint32_t tuner path. */
+_Static_assert(DSD_TRUNK_FREQ_MAX_HZ == 2147483647L, "the trunk ceiling is the 32-bit long maximum on every platform");
+
+/* A channel-map row past 2147483647 Hz (DSD_TRUNK_FREQ_MAX_HZ) is refused on every platform: it is not stored in
+ * trunk_chan_map, and its LCN slot holds 0 so the rows after it keep their LCN numbers. The ceiling itself is kept.
+ * Where long is 64-bit such rows used to be stored up to 6 GHz, and a tune past 4294967295 Hz then wrapped in the
+ * uint32_t tuner path. */
+static int
+test_channel_import_refuses_rows_past_the_trunk_ceiling(void) {
+    int failed = 0;
+    dsd_opts* opts = (dsd_opts*)calloc(1, sizeof(*opts));
+    dsd_state* state = (dsd_state*)calloc(1, sizeof(*state));
+    char tmpl[] = "dsd-neo-test-channel-ceiling-XXXXXX";
+
+    if (!opts || !state) {
+        free(opts);
+        free_test_state(state);
+        return 1;
+    }
+    const int fd = dsd_mkstemp(tmpl);
+    if (fd < 0) {
+        free(opts);
+        free_test_state(state);
+        return 1;
+    }
+    (void)dsd_close(fd);
+
+    if (write_text_file(tmpl, "channel,freq\n"
+                              "1,2147483647\n"
+                              "2,2147483648\n"
+                              "3,5000000000\n"
+                              "4,851000000\n")
+        != 0) {
+        (void)remove(tmpl);
+        free(opts);
+        free_test_state(state);
+        return 1;
+    }
+
+    DSD_SNPRINTF(opts->chan_in_file, sizeof(opts->chan_in_file), "%s", tmpl);
+    failed |= fixture_check(csvChanImport(opts, state) == 0, "ceiling channel import succeeds");
+    failed |= fixture_check(state->trunk_chan_map[1] == 2147483647L, "the ceiling row is stored");
+    failed |= fixture_check(state->trunk_chan_map[2] == 0L, "one past the ceiling is not stored");
+    failed |= fixture_check(state->trunk_chan_map[3] == 0L, "a 5 GHz row is not stored");
+    failed |= fixture_check(state->trunk_chan_map[4] == 851000000L, "the row after them is stored");
+    failed |= fixture_check(state->trunk_chan_map_used_count == 2U && state->trunk_chan_map_used[0] == 1U
+                                && state->trunk_chan_map_used[1] == 4U,
+                            "only the in-range rows are mapped");
+    failed |= fixture_check(state->lcn_freq_count == 4 && state->trunk_lcn_freq[0] == 2147483647L
+                                && state->trunk_lcn_freq[1] == 0L && state->trunk_lcn_freq[2] == 0L
+                                && state->trunk_lcn_freq[3] == 851000000L,
+                            "refused rows hold 0 in their LCN slots");
+
+    failed |= remove_fixture(tmpl);
     free(opts);
     free_test_state(state);
     return failed;
@@ -1446,8 +1541,8 @@ test_channel_import_row_key_relative_subdir(void) {
                != 0) {
         (void)remove(key_path);
         (void)remove(map_path);
-        (void)remove(sub_dir);
-        (void)remove(dir_tmpl);
+        (void)dsd_test_rmdir(sub_dir);
+        (void)dsd_test_rmdir(dir_tmpl);
         free(opts);
         free_test_state(state);
         free_test_state(scratch);
@@ -1473,8 +1568,8 @@ test_channel_import_row_key_relative_subdir(void) {
 
     (void)remove(key_path);
     (void)remove(map_path);
-    (void)remove(sub_dir);
-    (void)remove(dir_tmpl);
+    failed |= remove_fixture_dir(sub_dir);
+    failed |= remove_fixture_dir(dir_tmpl);
     free(opts);
     free_test_state(state);
     free_test_state(scratch);
@@ -2147,158 +2242,264 @@ test_p25_bandplan_export_round_trip(void) {
     return failed;
 }
 
-static void
-test_source_csv(void) {
-    const char* path = "source-import.csv";
+/* Writes the first source-alias file: rows the import takes, rows it skips, a 1005-byte row it skips as overlong, and a
+ * row after that. Returns 0, or -1 when a write failed. */
+static int
+write_source_alias_rows(const char* path) {
     FILE* fp = dsd_fopen_private(path, "w");
-    assert(fp);
-    assert(
+    if (!fp) {
+        return -1;
+    }
+    int ok =
         fputs(
             "1234,Header consumed\n\n 1 , One \n2,Two,tags\n3,Three,tags,ignored\n10-20,Range\nbad,No\n20-10,No\n4, \n",
             fp)
-        >= 0);
-    for (int i = 0; i < 1005; ++i) {
-        assert(fputc('x', fp) != EOF);
+        >= 0;
+    for (int i = 0; ok && i < 1005; ++i) {
+        ok = fputc('x', fp) != EOF;
     }
-    assert(fputs("\n5,After long\n", fp) >= 0);
-    assert(fclose(fp) == 0);
-    dsd_state* state = calloc(1, sizeof(*state));
-    assert(state);
-    assert(csvSrcImportPath(path, state) == 0);
-    assert(dsd_source_alias_count(state) == 5);
-    char name[50];
-    assert(dsd_source_alias_lookup(state, 1, name, sizeof(name)) && strcmp(name, "One") == 0);
-    assert(dsd_source_alias_lookup(state, 15, name, sizeof(name)) && strcmp(name, "Range") == 0);
-    assert(dsd_source_alias_lookup(state, 5, name, sizeof(name)) && strcmp(name, "After long") == 0);
-    assert(!dsd_source_alias_lookup(state, 1234, name, sizeof(name)));
-    assert(remove(path) == 0);
-    assert(csvSrcImportPath(path, state) == -1);
-    assert(dsd_source_alias_count(state) == 5 && dsd_source_alias_lookup(state, 1, name, sizeof(name)));
-    fp = dsd_fopen_private(path, "w");
-    assert(fp);
-    assert(fputs("id,name\n99,Replacement\n", fp) >= 0);
-    assert(fclose(fp) == 0);
-    assert(csvSrcImportPath(path, state) == 0 && dsd_source_alias_count(state) == 1);
-    assert(!dsd_source_alias_lookup(state, 1, name, sizeof(name)));
-    assert(dsd_source_alias_lookup(state, 99, name, sizeof(name)));
-    fp = dsd_fopen_private(path, "w");
-    assert(fp);
-    assert(fputs("id,name\n", fp) >= 0);
-    assert(fclose(fp) == 0);
-    dsd_opts* opts = calloc(1, sizeof(*opts));
-    assert(opts);
+    ok = ok && fputs("\n5,After long\n", fp) >= 0;
+    return fclose(fp) == 0 && ok ? 0 : -1;
+}
+
+/* The source-alias checks, which rewrite @p path as they go. Returns 1 when a check failed or a file could not be
+ * written; the caller removes @p path, which a failed write can leave missing. */
+static int
+check_source_csv(const char* path, dsd_opts* opts, dsd_state* state) {
+    if (write_source_alias_rows(path) != 0) {
+        DSD_FPRINTF(stderr, "FAIL: source aliases: could not write %s\n", path);
+        return 1;
+    }
+    char name[50] = {0};
+    int failed = fixture_check(csvSrcImportPath(path, state) == 0, "source aliases: import");
+    failed |= fixture_check(dsd_source_alias_count(state) == 5, "source aliases: 5 aliases");
+    failed |= fixture_check(dsd_source_alias_lookup(state, 1, name, sizeof(name)) && strcmp(name, "One") == 0,
+                            "source aliases: 1 is One");
+    failed |= fixture_check(dsd_source_alias_lookup(state, 15, name, sizeof(name)) && strcmp(name, "Range") == 0,
+                            "source aliases: 15 is in the Range row");
+    failed |= fixture_check(dsd_source_alias_lookup(state, 5, name, sizeof(name)) && strcmp(name, "After long") == 0,
+                            "source aliases: the row after the overlong one imports");
+    failed |= fixture_check(!dsd_source_alias_lookup(state, 1234, name, sizeof(name)),
+                            "source aliases: the header row is not an alias");
+    failed |= fixture_check(remove(path) == 0, "source aliases: remove the file before the missing-file import");
+    failed |= fixture_check(csvSrcImportPath(path, state) == -1, "source aliases: a missing file is refused");
+    failed |= fixture_check(dsd_source_alias_count(state) == 5 && dsd_source_alias_lookup(state, 1, name, sizeof(name)),
+                            "source aliases: a missing file keeps the loaded aliases");
+    if (write_text_file(path, "id,name\n99,Replacement\n") != 0) {
+        DSD_FPRINTF(stderr, "FAIL: source aliases: could not rewrite %s\n", path);
+        return 1;
+    }
+    failed |= fixture_check(csvSrcImportPath(path, state) == 0 && dsd_source_alias_count(state) == 1,
+                            "source aliases: a new file replaces the aliases");
+    failed |= fixture_check(!dsd_source_alias_lookup(state, 1, name, sizeof(name)),
+                            "source aliases: the replaced alias is gone");
+    failed |= fixture_check(dsd_source_alias_lookup(state, 99, name, sizeof(name)),
+                            "source aliases: the new alias is loaded");
+    if (write_text_file(path, "id,name\n") != 0) {
+        DSD_FPRINTF(stderr, "FAIL: source aliases: could not rewrite %s\n", path);
+        return 1;
+    }
     DSD_SNPRINTF(opts->src_in_file, sizeof(opts->src_in_file), "%s", path);
-    assert(csvSrcImport(opts, state) == 0 && dsd_source_alias_loaded(state) && dsd_source_alias_count(state) == 0);
+    failed |= fixture_check(csvSrcImport(opts, state) == 0 && dsd_source_alias_loaded(state)
+                                && dsd_source_alias_count(state) == 0,
+                            "source aliases: a header-only file loads an empty table");
+    return failed;
+}
+
+/* The source-alias file sits in the working directory, so a failed check must not end the test before it is removed. */
+static int
+test_source_csv(void) {
+    const char* path = "source-import.csv";
+    dsd_opts* opts = calloc(1, sizeof(*opts));
+    dsd_state* state = calloc(1, sizeof(*state));
+    int failed = 1;
+    if (opts && state) {
+        failed = check_source_csv(path, opts, state);
+        /* A passing run leaves the file in place, so failing to remove it fails the test; a failed write can leave
+         * nothing to remove. */
+        if (remove(path) != 0 && failed == 0) {
+            DSD_FPRINTF(stderr, "FAIL: could not remove %s: %s\n", path, strerror(errno));
+            failed = 1;
+        }
+    } else {
+        DSD_FPRINTF(stderr, "FAIL: source aliases: out of memory\n");
+    }
     free(opts);
-    assert(remove(path) == 0);
-    dsd_state_ext_free_all(state);
-    free(state);
+    free_test_state(state);
+    return failed;
 }
 
 /* Invalid physical lines must not import their valid prefix or continuation. */
-static void
-test_csv_physical_lines(void) {
-    static const struct {
-        const char* header;
-        const char* first;
-        const char* injected;
-        const char* next;
-        int (*validate)(const char*, dsd_csv_validation*);
-    } cases[] = {
-        {"id,mode,name", "1,A,First", "2,A,Injected", "3,A,Next", dsd_csv_validate_group_file},
-        {"id,key", "1,123", "2,456", "3,789", dsd_csv_validate_key_file_dec},
-        {"id,key", "1,123", "2,456", "3,789", dsd_csv_validate_key_file_hex},
-        {"iden,base_hz,spacing_hz,type,tx_offset_hz,bandwidth_hz,wacn,sysid", "1,851000000,12500,1,0,0,,",
-         "2,852000000,12500,1,0,0,,", "3,853000000,12500,1,0,0,,", dsd_csv_validate_p25_bandplan_file},
-    };
+typedef struct {
+    const char* header;
+    const char* first;
+    const char* injected;
+    const char* next;
+    int (*validate)(const char*, dsd_csv_validation*);
+} physical_lines_case;
 
-    for (size_t kind = 0; kind < sizeof(cases) / sizeof(cases[0]); ++kind) {
+static const physical_lines_case physical_lines_cases[] = {
+    {"id,mode,name", "1,A,First", "2,A,Injected", "3,A,Next", dsd_csv_validate_group_file},
+    {"id,key", "1,123", "2,456", "3,789", dsd_csv_validate_key_file_dec},
+    {"id,key", "1,123", "2,456", "3,789", dsd_csv_validate_key_file_hex},
+    {"iden,base_hz,spacing_hz,type,tx_offset_hz,bandwidth_hz,wacn,sysid", "1,851000000,12500,1,0,0,,",
+     "2,852000000,12500,1,0,0,,", "3,853000000,12500,1,0,0,,", dsd_csv_validate_p25_bandplan_file},
+};
+
+/* Writes one case's file: the header line (unless @p header makes the header itself the invalid line), then a line
+ * that starts with the header or first row and is cut by a NUL byte or padded to 998 bytes, then the injected and next
+ * rows. Returns 0, or -1 when a write failed. */
+static int
+write_physical_lines_fixture(const char* path, const physical_lines_case* c, int header, int nul) {
+    FILE* fp = dsd_fopen_private(path, "wb");
+    if (!fp) {
+        return -1;
+    }
+    int ok = header || DSD_FPRINTF(fp, "%s\n", c->header) > 0;
+    const char* prefix = header ? c->header : c->first;
+    ok = ok && DSD_FPRINTF(fp, "%s,", prefix) > 0;
+    if (nul) {
+        ok = ok && fputc('\0', fp) != EOF;
+    } else {
+        for (size_t n = strlen(prefix) + 1; ok && n < 998; ++n) {
+            ok = fputc('x', fp) != EOF;
+        }
+    }
+    ok = ok && DSD_FPRINTF(fp, "%s\r\n%s\r\n", c->injected, c->next) > 0;
+    return fclose(fp) == 0 && ok ? 0 : -1;
+}
+
+/* Validates and imports one case's file; returns 1 when a check failed. */
+static int
+check_physical_lines_case(size_t kind, const char* path, int header) {
+    dsd_csv_validation counts = {0};
+    int failed = fixture_check(physical_lines_cases[kind].validate(path, &counts) == 0, "physical lines: validate");
+    failed |= fixture_check(counts.accepted == 1 && counts.skipped == (unsigned)!header
+                                && counts.total == 1U + (unsigned)!header,
+                            "physical lines: validation counts only the next row as accepted");
+    dsd_state* state = calloc(1, sizeof(*state));
+    if (!state) {
+        DSD_FPRINTF(stderr, "FAIL: physical lines: out of memory\n");
+        return 1;
+    }
+    if (kind == 0) {
+        char name[50] = {0};
+        failed |= fixture_check(csvGroupImportPath(path, state) == 0, "physical lines: group import");
+        failed |= fixture_check(!dsd_tg_policy_lookup_label(state, 1, NULL, 0, name, sizeof(name)),
+                                "physical lines: group 1 is not imported");
+        failed |= fixture_check(!dsd_tg_policy_lookup_label(state, 2, NULL, 0, name, sizeof(name)),
+                                "physical lines: group 2 is not imported");
+        failed |= fixture_check(dsd_tg_policy_lookup_label(state, 3, NULL, 0, name, sizeof(name))
+                                    && strcmp(name, "Next") == 0,
+                                "physical lines: group 3 imports as Next");
+    } else if (kind == 3) {
+        failed |= fixture_check(csvP25BandplanImportPath(path, state) == 0, "physical lines: band plan import");
+        failed |= fixture_check(state->p25_bandplan_row_count == 1 && state->p25_bandplan_rows[0].iden == 3,
+                                "physical lines: only band plan row 3 imports");
+    } else {
+        failed |= fixture_check(
+            (kind == 1 ? csvKeyImportDecPath(path, 0, state, NULL) : csvKeyImportHexPath(path, 0, state, NULL)) == 0,
+            "physical lines: key import");
+        failed |=
+            fixture_check(!state->rkey_array_loaded[1] && !state->rkey_array_loaded[2] && state->rkey_array_loaded[3],
+                          "physical lines: only key 3 loads");
+    }
+    free_test_state(state);
+    return failed;
+}
+
+static int
+test_csv_physical_lines(void) {
+    int failed = 0;
+    for (size_t kind = 0; kind < sizeof(physical_lines_cases) / sizeof(physical_lines_cases[0]); ++kind) {
         for (int header = 0; header < 2; ++header) {
             for (int nul = 0; nul < 2; ++nul) {
                 char path[DSD_TEST_PATH_MAX];
                 int fd = dsd_test_mkstemp(path, sizeof(path), "csv-physical-lines");
                 assert(fd >= 0);
-                assert(dsd_close(fd) == 0);
-                FILE* fp = dsd_fopen_private(path, "wb");
-                assert(fp);
-                if (!header) {
-                    assert(DSD_FPRINTF(fp, "%s\n", cases[kind].header) > 0);
-                }
-                const char* prefix = header ? cases[kind].header : cases[kind].first;
-                assert(DSD_FPRINTF(fp, "%s,", prefix) > 0);
-                if (nul) {
-                    assert(fputc('\0', fp) != EOF);
+                int case_failed = 0;
+                if (dsd_close(fd) != 0
+                    || write_physical_lines_fixture(path, &physical_lines_cases[kind], header, nul) != 0) {
+                    DSD_FPRINTF(stderr, "FAIL: physical lines: could not write %s\n", path);
+                    case_failed = 1;
                 } else {
-                    for (size_t n = strlen(prefix) + 1; n < 998; ++n) {
-                        assert(fputc('x', fp) != EOF);
-                    }
+                    case_failed = check_physical_lines_case(kind, path, header);
                 }
-                assert(DSD_FPRINTF(fp, "%s\r\n%s\r\n", cases[kind].injected, cases[kind].next) > 0);
-                assert(fclose(fp) == 0);
-                dsd_csv_validation counts;
-                assert(cases[kind].validate(path, &counts) == 0);
-                assert(counts.accepted == 1 && counts.skipped == (unsigned)!header
-                       && counts.total == 1U + (unsigned)!header);
-                dsd_state* state = calloc(1, sizeof(*state));
-                assert(state);
-                if (kind == 0) {
-                    char name[50];
-                    assert(csvGroupImportPath(path, state) == 0);
-                    assert(!dsd_tg_policy_lookup_label(state, 1, NULL, 0, name, sizeof(name)));
-                    assert(!dsd_tg_policy_lookup_label(state, 2, NULL, 0, name, sizeof(name)));
-                    assert(dsd_tg_policy_lookup_label(state, 3, NULL, 0, name, sizeof(name)));
-                    assert(strcmp(name, "Next") == 0);
-                } else if (kind == 3) {
-                    assert(csvP25BandplanImportPath(path, state) == 0);
-                    assert(state->p25_bandplan_row_count == 1 && state->p25_bandplan_rows[0].iden == 3);
-                } else {
-                    assert((kind == 1 ? csvKeyImportDecPath(path, 0, state, NULL)
-                                      : csvKeyImportHexPath(path, 0, state, NULL))
-                           == 0);
-                    assert(!state->rkey_array_loaded[1] && !state->rkey_array_loaded[2] && state->rkey_array_loaded[3]);
+                case_failed |= remove_fixture(path);
+                if (case_failed) {
+                    DSD_FPRINTF(stderr, "  in physical-lines case %zu (header %d, nul %d)\n", kind, header, nul);
+                    failed = 1;
                 }
-                free_test_state(state);
-                assert(remove(path) == 0);
             }
         }
     }
+    return failed;
 }
 
-static void
+/* Writes the mapping file: a header, a row whose third cell is cut by a NUL byte or padded to 998 bytes, and a row
+ * after it. Returns 0, or -1 when a write failed. */
+static int
+write_mapping_lines_fixture(const char* path, int nul) {
+    FILE* fp = dsd_fopen_private(path, "wb");
+    if (!fp) {
+        return -1;
+    }
+    int ok = fputs("id,value\n1,123,", fp) >= 0;
+    if (nul) {
+        ok = ok && fputc('\0', fp) != EOF;
+    } else {
+        for (int n = 6; ok && n < 998; ++n) {
+            ok = fputc(' ', fp) != EOF;
+        }
+    }
+    ok = ok && fputs("2,456\n", fp) >= 0;
+    return fclose(fp) == 0 && ok ? 0 : -1;
+}
+
+/* Imports the mapping file as each mapping table, and with a NUL byte as a channel map; returns 1 when a check
+ * failed. */
+static int
+check_mapping_lines(const char* path, int nul) {
+    dsd_opts* opts = calloc(1, sizeof(*opts));
+    dsd_state* state = calloc(1, sizeof(*state));
+    if (!opts || !state) {
+        DSD_FPRINTF(stderr, "FAIL: mapping lines: out of memory\n");
+        free(opts);
+        free_test_state(state);
+        return 1;
+    }
+    int failed = fixture_check(csvDmrTgKeyImport(state, path) == -1, "mapping lines: the DMR TG key map is refused");
+    failed |= fixture_check(csvVertexKsImport(state, path) == -1, "mapping lines: the Vertex KS map is refused");
+    if (nul) {
+        DSD_SNPRINTF(opts->chan_in_file, sizeof(opts->chan_in_file), "%s", path);
+        state->trunk_chan_map[1] = 851000000;
+        failed |= fixture_check(csvChanImport(opts, state) == -1, "mapping lines: the channel map is refused");
+        failed |= fixture_check(state->trunk_chan_map[1] == 851000000, "mapping lines: channel 1 keeps its frequency");
+    }
+    free(opts);
+    free_test_state(state);
+    return failed;
+}
+
+static int
 test_mapping_and_channel_nul_rows_are_atomic(void) {
     char path[DSD_TEST_PATH_MAX];
     int fd = dsd_test_mkstemp(path, sizeof(path), "csv-mapping-lines");
     assert(fd >= 0);
-    assert(dsd_close(fd) == 0);
-    for (int nul = 0; nul < 2; ++nul) {
-        FILE* fp = dsd_fopen_private(path, "wb");
-        assert(fp);
-        assert(fputs("id,value\n1,123,", fp) >= 0);
-        if (nul) {
-            assert(fputc('\0', fp) != EOF);
-        } else {
-            for (int n = 6; n < 998; ++n) {
-                assert(fputc(' ', fp) != EOF);
-            }
+    int failed = 0;
+    int written = dsd_close(fd) == 0;
+    for (int nul = 0; written && nul < 2; ++nul) {
+        written = write_mapping_lines_fixture(path, nul) == 0;
+        if (written) {
+            failed |= check_mapping_lines(path, nul);
         }
-        assert(fputs("2,456\n", fp) >= 0);
-        assert(fclose(fp) == 0);
-        dsd_state* state = calloc(1, sizeof(*state));
-        assert(state);
-        assert(csvDmrTgKeyImport(state, path) == -1);
-        assert(csvVertexKsImport(state, path) == -1);
-        if (nul) {
-            dsd_opts* opts = calloc(1, sizeof(*opts));
-            assert(opts);
-            DSD_SNPRINTF(opts->chan_in_file, sizeof(opts->chan_in_file), "%s", path);
-            state->trunk_chan_map[1] = 851000000;
-            assert(csvChanImport(opts, state) == -1);
-            assert(state->trunk_chan_map[1] == 851000000);
-            free(opts);
-        }
-        free_test_state(state);
     }
-    assert(remove(path) == 0);
+    if (!written) {
+        DSD_FPRINTF(stderr, "FAIL: mapping lines: could not write %s\n", path);
+        failed = 1;
+    }
+    failed |= remove_fixture(path);
+    return failed;
 }
 
 /* Issue #521: every shipped channel-map example -- including the scoped-options one that
@@ -2308,6 +2509,7 @@ static int
 test_channel_map_examples_import_cleanly(void) {
     static const char* const examples[] = {"capacity_plus_chan.csv",
                                            "connect_plus_chan.csv",
+                                           "conventional_scan_analog.csv",
                                            "conventional_scan_keyed.csv",
                                            "conventional_scan_modes.csv",
                                            "conventional_scan_named.csv",
@@ -2355,7 +2557,11 @@ typedef struct {
     char mode[6][16];
     int bandwidth_hz[6];
     int squelch_db_set[6];
+    int squelch_mode[6];
+    int squelch_margin_db[6];
     int key_source[6];
+    int tone_filter[6];
+    char tone_list[6][96];
 } nfm_profiles;
 
 static void
@@ -2365,29 +2571,39 @@ collect_nfm_profile(const dsd_csv_channel_profile* row, void* context) {
         DSD_SNPRINTF(seen->mode[seen->count], sizeof seen->mode[seen->count], "%s", row->mode);
         seen->bandwidth_hz[seen->count] = row->bandwidth_hz;
         seen->squelch_db_set[seen->count] = row->squelch_db_set;
+        seen->squelch_mode[seen->count] = row->squelch_mode;
+        seen->squelch_margin_db[seen->count] = row->squelch_margin_db;
         seen->key_source[seen->count] = row->key_source;
+        seen->tone_filter[seen->count] = row->tone_filter;
+        DSD_SNPRINTF(seen->tone_list[seen->count], sizeof seen->tone_list[seen->count], "%s", row->tone_list);
     }
     seen->count++;
 }
 
-/* Import @p body as a channel map; returns csvChanImport()'s result and the diagnostics it logged. */
+/* import_channel_map_text() could not write or import the map; csvChanImport() itself returns only 0 or -1. */
+#define CHANNEL_MAP_NOT_IMPORTED (-2)
+
+/* Import @p body as a channel map; returns csvChanImport()'s result and the diagnostics it logged, or
+ * CHANNEL_MAP_NOT_IMPORTED with an empty log when the map could not be written or imported. A failure returns rather
+ * than asserts, so the caller still removes @p path, and it must count as a failed check. */
 static int
 import_channel_map_text(const char* path, const char* body, char* log, size_t log_size) {
-    FILE* fp = dsd_fopen_private(path, "w");
-    assert(fp);
-    assert(fputs(body, fp) >= 0);
-    assert(fclose(fp) == 0);
+    log[0] = '\0';
+    if (write_text_file(path, body) != 0) {
+        DSD_FPRINTF(stderr, "could not write channel map %s\n", path);
+        return CHANNEL_MAP_NOT_IMPORTED;
+    }
     dsd_opts* opts = (dsd_opts*)calloc(1, sizeof(*opts));
     dsd_state* state = (dsd_state*)calloc(1, sizeof(*state));
-    assert(opts && state);
-    DSD_SNPRINTF(opts->chan_in_file, sizeof opts->chan_in_file, "%s", path);
-    int imported = -2;
+    int imported = CHANNEL_MAP_NOT_IMPORTED;
     dsd_test_capture_stderr cap;
-    log[0] = '\0';
-    if (dsd_test_capture_stderr_begin(&cap, "chan_nfm") == 0) {
+    if (opts && state && dsd_test_capture_stderr_begin(&cap, "chan_nfm") == 0) {
+        DSD_SNPRINTF(opts->chan_in_file, sizeof opts->chan_in_file, "%s", path);
         imported = csvChanImport(opts, state);
         (void)dsd_test_capture_stderr_end(&cap);
         (void)dsd_test_capture_stderr_read(&cap, log, log_size);
+    } else {
+        DSD_FPRINTF(stderr, "could not import channel map %s\n", path);
     }
     free(opts);
     free_test_state(state);
@@ -2419,19 +2635,27 @@ test_nfm_channel_map_rows(void) {
                         "1,461000000,DMR,dmr,--scan-max-visit-ms 20000\n"
                         "2,154430000,Fire,NFM,--nfm-bandwidth-hz 12500 --squelch-db -60 --scan-max-visit-ms 5000\n"
                         "3,851012500,P25,p25,\n"
-                        "4,155475000,Ops, nfm ,\n"
+                        "4,155475000,Ops, nfm ,--squelch noise+12\n"
                         "5,150000000,Blank,,\n";
     if (import_channel_map_text(path, mixed, log, sizeof log) != 0 || strstr(log, " row ")) {
         DSD_FPRINTF(stderr, "mixed nfm map: %s\n", log);
         rc = 1;
     }
     nfm_profiles seen = {0};
-    assert(dsd_csv_inspect_channel_profiles(path, &seen, collect_nfm_profile) == 0);
-    assert(seen.count == 5);
-    assert(strcmp(seen.mode[0], "dmr") == 0 && seen.bandwidth_hz[0] == -1);
-    assert(strcmp(seen.mode[1], "nfm") == 0 && seen.bandwidth_hz[1] == 12500 && seen.squelch_db_set[1]);
-    assert(strcmp(seen.mode[3], "nfm") == 0 && seen.bandwidth_hz[3] == -1 && seen.key_source[3] == 0);
-    assert(strcmp(seen.mode[4], "") == 0);
+    rc |= fixture_check(dsd_csv_inspect_channel_profiles(path, &seen, collect_nfm_profile) == 0,
+                        "mixed nfm map: profiles inspected");
+    rc |= fixture_check(seen.count == 5, "mixed nfm map: 5 rows");
+    rc |= fixture_check(strcmp(seen.mode[0], "dmr") == 0 && seen.bandwidth_hz[0] == -1, "mixed nfm map: row 1");
+    rc |= fixture_check(strcmp(seen.mode[1], "nfm") == 0 && seen.bandwidth_hz[1] == 12500 && seen.squelch_db_set[1],
+                        "mixed nfm map: row 2");
+    rc |= fixture_check(strcmp(seen.mode[3], "nfm") == 0 && seen.bandwidth_hz[3] == -1 && seen.key_source[3] == 0,
+                        "mixed nfm map: row 4");
+    rc |= fixture_check(seen.squelch_mode[1] == DSD_SQUELCH_MODE_LEVEL && seen.squelch_margin_db[1] == 0,
+                        "mixed nfm map: row 2's level squelch");
+    rc |= fixture_check(seen.squelch_db_set[3] && seen.squelch_mode[3] == DSD_SQUELCH_MODE_NOISE
+                            && seen.squelch_margin_db[3] == 12,
+                        "mixed nfm map: row 4's noise squelch");
+    rc |= fixture_check(strcmp(seen.mode[4], "") == 0, "mixed nfm map: row 5");
 
     const char* header = "channel,frequency_hz,mode,options\n";
 
@@ -2450,8 +2674,9 @@ test_nfm_channel_map_rows(void) {
         {"1,154430000,fm,\n", "row 2: invalid mode 'fm' (use nfm)"},
         {"1,154430000,Analog,\n", "row 2: invalid mode 'Analog' (use nfm)"},
         {"1,154430000,wfm,\n", "row 2: invalid mode 'wfm' (use nfm)"},
-        {"1,154430000,typo,\n", "row 2: invalid mode; expected p25, dmr, nxdn96, nxdn48, dpmr, dstar, ysf, m17, nfm or "
-                                "an empty cell"},
+        {"1,154430000,typo,\n",
+         "row 2: invalid mode; expected p25, dmr, nxdn96, nxdn48, dpmr, dstar, ysf, m17, nfm, am "
+         "or an empty cell"},
     };
 
     for (size_t i = 0; i < sizeof(refused) / sizeof(refused[0]); i++) {
@@ -2467,8 +2692,207 @@ test_nfm_channel_map_rows(void) {
         "channel,frequency_hz,mode,single_key_hex,options\n1,154430000,nfm,SECRETAB,--squelch-db -60\n"};
     for (size_t i = 0; i < sizeof(keyed) / sizeof(keyed[0]); i++) {
         rc |= expect_import_refused(path, keyed[i], "row 2: key columns are not supported for mode nfm");
-        (void)import_channel_map_text(path, keyed[i], log, sizeof log);
-        assert(strstr(log, "SECRET") == NULL);
+        const int imported = import_channel_map_text(path, keyed[i], log, sizeof log);
+        rc |= fixture_check(imported != CHANNEL_MAP_NOT_IMPORTED && strstr(log, "SECRET") == NULL,
+                            "keyed nfm row: the key text stays out of the log");
+    }
+    assert(remove(path) == 0);
+    return rc;
+}
+
+/* --- Issue #526: am channel-map rows --- */
+
+/* A map mixing am, nfm and digital rows imports with each row's class and its own width, spelled for its kind, which
+ * the preview reports; an am row refuses the settings an analog channel cannot use, and the other kind's width, with a
+ * row diagnostic, and a digital or blank row that names the AM width is told the mode it needs. */
+static int
+test_am_channel_map_rows(void) {
+    char path[DSD_TEST_PATH_MAX];
+    const int fd = dsd_test_mkstemp(path, sizeof path, "am-map-");
+    assert(fd >= 0);
+    dsd_close(fd);
+    char log[4096];
+    int rc = 0;
+    const char* mixed = "channel,frequency_hz,name,mode,options\n"
+                        "1,118300000,Tower, Am ,--am-bandwidth-hz 8333 --squelch-db -55 --scan-max-visit-ms 30000\n"
+                        "2,154430000,Fire,nfm,--nfm-bandwidth-hz 12500 --squelch-db -60\n"
+                        "3,461000000,DMR,dmr,\n"
+                        "4,121500000,Guard,am,\n"
+                        "5,150000000,Blank,,\n";
+    if (import_channel_map_text(path, mixed, log, sizeof log) != 0 || strstr(log, " row ")) {
+        DSD_FPRINTF(stderr, "mixed am map: %s\n", log);
+        rc = 1;
+    }
+    nfm_profiles seen = {0};
+    rc |= fixture_check(dsd_csv_inspect_channel_profiles(path, &seen, collect_nfm_profile) == 0,
+                        "mixed am map: profiles inspected");
+    rc |= fixture_check(seen.count == 5, "mixed am map: 5 rows");
+    rc |= fixture_check(strcmp(seen.mode[0], "am") == 0 && seen.bandwidth_hz[0] == 8333 && seen.squelch_db_set[0],
+                        "mixed am map: row 1");
+    rc |= fixture_check(strcmp(seen.mode[1], "nfm") == 0 && seen.bandwidth_hz[1] == 12500, "mixed am map: row 2");
+    rc |= fixture_check(strcmp(seen.mode[2], "dmr") == 0 && seen.bandwidth_hz[2] == -1, "mixed am map: row 3");
+    rc |= fixture_check(strcmp(seen.mode[3], "am") == 0 && seen.bandwidth_hz[3] == -1 && seen.key_source[3] == 0,
+                        "mixed am map: row 4");
+    rc |= fixture_check(strcmp(seen.mode[4], "") == 0, "mixed am map: row 5");
+
+    const char* header = "channel,frequency_hz,mode,options\n";
+
+    const struct {
+        const char* row;
+        const char* diagnostic;
+    } refused[] = {
+        {"1,118300000,am,-G groups.csv\n", "row 2: -G: not supported for this mode/target"},
+        {"1,118300000,am,--strict-crc\n", "row 2: --strict-crc: not supported for this mode/target"},
+        {"1,118300000,am,-e\n", "row 2: -e: not supported for this mode/target"},
+        {"1,118300000,am,--no-force-key\n", "row 2: --no-force-key: not supported for this mode/target"},
+        {"1,118300000,am,-b 1\n", "row 2: -b: not supported for this mode/target"},
+        {"1,118300000,am,--nfm-bandwidth-hz 12500\n", "row 2: --nfm-bandwidth-hz: not supported for this mode/target"},
+        {"1,154430000,nfm,--am-bandwidth-hz 8333\n", "row 2: --am-bandwidth-hz: not supported for this mode/target"},
+        {"1,118300000,am,--am-bandwidth-hz 25000\n", "row 2: --am-bandwidth-hz: expects whole Hz from 5000 to 20000"},
+        {"1,118300000,am,--squelch noise\n", "row 2: --squelch: expects"},
+        {"1,118300000,am,--am-bandwidth-hz 8333 --am-bandwidth-hz 8333\n",
+         "row 2: --am-bandwidth-hz: duplicate option"},
+        {"1,461000000,dmr,--am-bandwidth-hz 8333\n", "row 2: --am-bandwidth-hz: needs mode am"},
+        {"1,461000000,,--am-bandwidth-hz 8333\n", "row 2: --am-bandwidth-hz: needs mode am"},
+        {"1,118300000,am-conventional,\n", "row 2: invalid mode; expected p25, dmr, nxdn96, nxdn48, dpmr, dstar, ysf, "
+                                           "m17, nfm, am or an empty cell"},
+    };
+
+    for (size_t i = 0; i < sizeof(refused) / sizeof(refused[0]); i++) {
+        char body[256];
+        DSD_SNPRINTF(body, sizeof body, "%s%s", header, refused[i].row);
+        rc |= expect_import_refused(path, body, refused[i].diagnostic);
+    }
+    const char* keyed[] = {
+        "channel,frequency_hz,mode,single_key_dec\n1,118300000,am,SECRET123\n",
+        "channel,frequency_hz,mode,single_key_hex,options\n1,118300000,am,SECRETAB,--squelch-db -60\n"};
+    for (size_t i = 0; i < sizeof(keyed) / sizeof(keyed[0]); i++) {
+        rc |= expect_import_refused(path, keyed[i], "row 2: key columns are not supported for mode am");
+        const int imported = import_channel_map_text(path, keyed[i], log, sizeof log);
+        rc |= fixture_check(imported != CHANNEL_MAP_NOT_IMPORTED && strstr(log, "SECRET") == NULL,
+                            "keyed am row: the key text stays out of the log");
+    }
+    assert(remove(path) == 0);
+    return rc;
+}
+
+/* --- Issue #527: tone lists on nfm channel-map rows --- */
+
+/* A row's tone list is written with '/'. Rows with one import, a column after the options cell included; a list the
+ * parser refuses is refused by entry number, never echoed; and one written with commas -- which the splitter cuts at
+ * the first, dropping the rest past the header or handing it to the next column -- is refused with the hint rather
+ * than imported short, without echoing what the comma cut off. */
+static int
+test_nfm_channel_map_tone_lists(void) {
+    char path[DSD_TEST_PATH_MAX];
+    const int fd = dsd_test_mkstemp(path, sizeof path, "nfm-tone-map-");
+    assert(fd >= 0);
+    dsd_close(fd);
+    char log[4096];
+    int rc = 0;
+    const char* accepted[] = {
+        "channel,frequency_hz,name,mode,options\n"
+        "1,154430000,Fire,nfm,--tone-allow 100.0/D023N --squelch-db -60\n"
+        "2,155475000,Works,nfm,--tone-block=67/d047i\n"
+        "3,155520000,Shared,nfm,--no-tone-filter\n"
+        "4,155535000,Trailing,nfm,--tone-allow 100.0,\n",
+        "channel,frequency_hz,mode,options,name\n1,154430000,nfm,--tone-allow 100.0,Fire\n",
+        "channel,frequency_hz,mode,options,notes\n1,154430000,nfm,--tone-block 100.0,County, north side\n",
+        /* A name after a list that starts with a tone or code but has a space in it is the name's own. */
+        "channel,frequency_hz,mode,options,name\n"
+        "1,154430000,nfm,--tone-allow 100.0,100 Main St\n"
+        "2,155475000,nfm,--tone-allow 67.0,67 Fire\n"
+        "3,155520000,nfm,--tone-block D023N,D023 Repeater\n",
+    };
+    for (size_t i = 0; i < sizeof(accepted) / sizeof(accepted[0]); i++) {
+        if (import_channel_map_text(path, accepted[i], log, sizeof log) != 0 || strstr(log, " row ")) {
+            DSD_FPRINTF(stderr, "tone map %zu: %s\n", i, log);
+            rc = 1;
+        }
+    }
+    /* The channel-map review a frontend shows before an import names each nfm row's own policy with its list as
+     * displayed, and nothing for a row that runs the configured policy, an am row's included. */
+    const char* reviewed = "channel,frequency_hz,name,mode,options\n"
+                           "1,154430000,Fire,nfm,--tone-allow 100.0/D023N --squelch-db -60\n"
+                           "2,155475000,Works,nfm,--tone-block=67/d047i\n"
+                           "3,155520000,Shared,nfm,--no-tone-filter\n"
+                           "4,155535000,Plain,nfm,--squelch-db -60\n"
+                           "5,118300000,Tower,am,--am-bandwidth-hz 8333\n"
+                           "6,461000000,DMR,dmr,\n";
+    if (import_channel_map_text(path, reviewed, log, sizeof log) != 0 || strstr(log, " row ")) {
+        DSD_FPRINTF(stderr, "reviewed tone map: %s\n", log);
+        rc = 1;
+    }
+    nfm_profiles seen = {0};
+    if (dsd_csv_inspect_channel_profiles(path, &seen, collect_nfm_profile) != 0 || seen.count != 6) {
+        DSD_FPRINTF(stderr, "tone review: inspected %zu rows, want 6\n", seen.count);
+        rc = 1;
+    }
+    static const int want_filter[] = {DSD_TONE_FILTER_ALLOW, DSD_TONE_FILTER_BLOCK, DSD_TONE_FILTER_OFF, -1, -1, -1};
+    static const char* const want_list[] = {"100.0 Hz/D023N", "67.0 Hz/D047I", "", "", "", ""};
+    for (size_t i = 0; i < 6; i++) {
+        if (seen.tone_filter[i] != want_filter[i] || strcmp(seen.tone_list[i], want_list[i]) != 0) {
+            DSD_FPRINTF(stderr, "tone review row %zu: %d '%s', want %d '%s'\n", i, seen.tone_filter[i],
+                        seen.tone_list[i], want_filter[i], want_list[i]);
+            rc = 1;
+        }
+    }
+
+    const struct {
+        const char* body;
+        const char* diagnostic;
+    } refused[] = {
+        {"channel,frequency_hz,name,mode,options\n1,154430000,Fire,nfm,--tone-allow 100.0,67.0\n",
+         "row 2: --tone-allow: use / between entries, not commas"},
+        {"channel,frequency_hz,name,mode,options\n1,154430000,Fire,nfm,--tone-block=100.0,SECRET\n",
+         "row 2: --tone-block: use / between entries, not commas"},
+        {"channel,frequency_hz,mode,options,name\n1,154430000,nfm,--tone-allow 100.0,67.0/D023N,Fire\n",
+         "row 2: --tone-allow: use / between entries, not commas"},
+        /* The rest of a split list followed by more of the cell's options: not a name that starts with a tone. */
+        {"channel,frequency_hz,mode,options,name\n1,154430000,nfm,--tone-block 100.0,67.0 --squelch-db -60,Fire\n",
+         "row 2: --tone-block: use / between entries, not commas"},
+        /* The list's rest in a column checked before the options, the mode or an analog row's key column, is named as
+         * the split, not as that column's own error. */
+        {"channel,frequency_hz,options,mode\n1,154430000,--tone-allow 100.0,67.0,nfm\n",
+         "row 2: --tone-allow: use / between entries, not commas"},
+        {"channel,frequency_hz,mode,options,single_key_dec\n1,154430000,nfm,--tone-block D023N,d047i\n",
+         "row 2: --tone-block: use / between entries, not commas"},
+        {"channel,frequency_hz,name,mode,options\n1,154430000,Fire,nfm,--tone-allow 67.0/161.0\n",
+         "row 2: --tone-allow: entry 2 is not a standard CTCSS tone or DCS code"},
+        {"channel,frequency_hz,name,mode,options\n1,154430000,Fire,nfm,--tone-allow 100.0/D023N/D047I\n",
+         "row 2: --tone-allow: entry 3 is the same DCS signal as entry 2 (D023N)"},
+        {"channel,frequency_hz,name,mode,options\n1,461000000,DMR,dmr,--tone-allow 100.0\n",
+         "row 2: --tone-allow: needs mode nfm"},
+        {"channel,frequency_hz,name,mode,options\n1,461000000,Blank,,--no-tone-filter\n",
+         "row 2: --no-tone-filter: needs mode nfm"},
+        /* The AM monitor hears no CTCSS or DCS: an am row refuses the policy as it refuses the NFM width. */
+        {"channel,frequency_hz,name,mode,options\n1,118300000,Tower,am,--tone-allow 100.0\n",
+         "row 2: --tone-allow: not supported for this mode/target"},
+        {"channel,frequency_hz,name,mode,options\n1,118300000,Tower,am,--am-bandwidth-hz 8333 --no-tone-filter\n",
+         "row 2: --no-tone-filter: not supported for this mode/target"},
+    };
+
+    for (size_t i = 0; i < sizeof(refused) / sizeof(refused[0]); i++) {
+        rc |= expect_import_refused(path, refused[i].body, refused[i].diagnostic);
+        const int imported = import_channel_map_text(path, refused[i].body, log, sizeof log);
+        if (imported == CHANNEL_MAP_NOT_IMPORTED || strstr(log, "SECRET") || strstr(log, "161.0")
+            || strstr(log, "D047I")) {
+            DSD_FPRINTF(stderr, "tone refusal %zu echoed the row or was not imported: %s\n", i, log);
+            rc = 1;
+        }
+    }
+    /* The dry run a frontend previews through refuses the same row. */
+    const int dry_run_written = write_text_file(path, refused[0].body) == 0;
+    if (!dry_run_written) {
+        DSD_FPRINTF(stderr, "tone dry run: could not write %s\n", path);
+        rc = 1;
+    }
+    dsd_csv_validation stats = {0};
+    dsd_test_capture_stderr cap;
+    if (dry_run_written && dsd_test_capture_stderr_begin(&cap, "chan_tone_validate") == 0) {
+        rc |= dsd_csv_validate_chan_file(path, &stats) == 0 ? 1 : 0;
+        (void)dsd_test_capture_stderr_end(&cap);
+        (void)remove(cap.path);
     }
     assert(remove(path) == 0);
     return rc;
@@ -2476,15 +2900,27 @@ test_nfm_channel_map_rows(void) {
 
 int
 main(void) {
-    test_csv_physical_lines();
+    if (test_csv_physical_lines() != 0) {
+        return 1;
+    }
     if (test_channel_map_examples_import_cleanly() != 0) {
         return 1;
     }
     if (test_nfm_channel_map_rows() != 0) {
         return 1;
     }
-    test_mapping_and_channel_nul_rows_are_atomic();
-    test_source_csv();
+    if (test_am_channel_map_rows() != 0) {
+        return 1;
+    }
+    if (test_nfm_channel_map_tone_lists() != 0) {
+        return 1;
+    }
+    if (test_mapping_and_channel_nul_rows_are_atomic() != 0) {
+        return 1;
+    }
+    if (test_source_csv() != 0) {
+        return 1;
+    }
     if (test_group_import_missing_file() != 0) {
         return 1;
     }
@@ -2518,6 +2954,9 @@ main(void) {
         return 1;
     }
     if (test_channel_import_rejects_malformed_rows_without_reusing_previous_channel() != 0) {
+        return 1;
+    }
+    if (test_channel_import_refuses_rows_past_the_trunk_ceiling() != 0) {
         return 1;
     }
     if (test_channel_import_extends_past_26_entries() != 0) {

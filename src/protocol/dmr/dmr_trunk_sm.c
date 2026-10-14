@@ -7,20 +7,19 @@
 
 #include <dsd-neo/core/call_state.h>
 #include <dsd-neo/core/constants.h>
-#include <dsd-neo/core/dsd_time.h>
 #include <dsd-neo/core/events.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/state.h>
 #include <dsd-neo/core/synctype_ids.h>
 #include <dsd-neo/protocol/dmr/dmr_trunk_sm.h>
 #include <dsd-neo/runtime/config.h>
+#include <dsd-neo/runtime/decode_clock.h>
 #include <dsd-neo/runtime/rigctl_query_hooks.h>
 #include <dsd-neo/runtime/trunk_cc_candidates.h>
 #include <dsd-neo/runtime/trunk_scan_hooks.h>
 #include <dsd-neo/runtime/trunk_tuning_hooks.h>
 #include <stdint.h>
 #include <stdio.h>
-#include <time.h>
 #include "dsd-neo/core/opts_fwd.h"
 #include "dsd-neo/core/safe_api.h"
 #include "dsd-neo/core/state_fwd.h"
@@ -136,7 +135,7 @@ dmr_sm_begin_cc_acquisition(dmr_sm_ctx_t* ctx, const dsd_opts* opts, const dsd_s
     ctx->cc_freq_hz = freq_hz;
     ctx->cc_probe_freq_hz = freq_hz;
     ctx->cc_acquiring = 1;
-    ctx->cc_acquire_start_m = dsd_time_now_monotonic_s();
+    ctx->cc_acquire_start_m = dsd_decode_now_mono_s();
     ctx->cc_tune_request_id = request_id;
     ctx->cc_tune_deadline_m = ctx->cc_acquire_start_m + DMR_CC_TUNE_TIMEOUT_S;
     ctx->state = DMR_SM_ON_CC;
@@ -200,7 +199,7 @@ dmr_cc_activity_context(const dsd_opts* opts, const dsd_state* state) {
         return NULL;
     }
     dmr_sm_ctx_t* ctx = dmr_sm_get_ctx();
-    if (!dmr_cc_resolve_pending(ctx, opts, dsd_time_now_monotonic_s())) {
+    if (!dmr_cc_resolve_pending(ctx, opts, dsd_decode_now_mono_s())) {
         return NULL;
     }
     return ctx;
@@ -229,9 +228,9 @@ dmr_cc_note_activity_ctx(dmr_sm_ctx_t* ctx, const dsd_opts* opts, dsd_state* sta
     ctx->cc_confirmed = 1;
     ctx->cc_acquiring = 0;
     ctx->cc_retry_after_m = 0.0;
-    ctx->t_cc_sync_m = dsd_time_now_monotonic_s();
+    ctx->t_cc_sync_m = dsd_decode_now_mono_s();
     state->trunk_cc_freq = current;
-    state->last_cc_sync_time = time(NULL);
+    state->last_cc_sync_time = dsd_decode_time();
     state->last_cc_sync_time_m = ctx->t_cc_sync_m;
     dsd_trunk_recovery_note_protocol(state, DSD_TRUNK_RECOVERY_DMR);
     if (acquired && ctx->state == DMR_SM_ON_CC) {
@@ -258,13 +257,13 @@ dmr_sm_note_cc_activity(const dsd_opts* opts, dsd_state* state, long freq_hz) {
 static void
 dmr_cc_note_heartbeat_ctx(dmr_sm_ctx_t* ctx, const dsd_opts* opts, const dsd_state* state) {
     if (!ctx || !opts || !state || opts->trunk_is_tuned == 1 || !ctx->cc_confirmed || ctx->cc_acquiring
-        || !dmr_cc_resolve_pending(ctx, opts, dsd_time_now_monotonic_s())) {
+        || !dmr_cc_resolve_pending(ctx, opts, dsd_decode_now_mono_s())) {
         return;
     }
     /* A heartbeat is in the decode hot path. Attribute it to the completed
      * tuning boundary, without a blocking rigctl round trip per CSBK. */
     if (ctx->cc_rx_freq_hz == ctx->cc_freq_hz && dsd_trunk_tuning_frame_is_current(ctx->cc_rx_generation)) {
-        ctx->t_cc_sync_m = dsd_time_now_monotonic_s();
+        ctx->t_cc_sync_m = dsd_decode_now_mono_s();
         set_state(ctx, opts, DMR_SM_ON_CC, "cc-heartbeat");
     }
 }
@@ -323,8 +322,7 @@ dmr_cc_next_candidate(dmr_sm_ctx_t* ctx, const dsd_opts* opts, dsd_state* state)
         return anchor;
     }
     long candidate = 0;
-    if (dsd_trunk_cc_candidates_next(state, dsd_time_now_monotonic_s(), DSD_TRUNK_CC_CANDIDATE_CURRENT_SITE,
-                                     &candidate)) {
+    if (dsd_trunk_cc_candidates_next(state, dsd_decode_now_mono_s(), DSD_TRUNK_CC_CANDIDATE_CURRENT_SITE, &candidate)) {
         return candidate;
     }
     return anchor;
@@ -361,7 +359,7 @@ dmr_cc_hunt(dmr_sm_ctx_t* ctx, dsd_opts* opts, dsd_state* state, double now_m) {
     }
     ctx->cc_probe_freq_hz = freq;
     ctx->cc_acquiring = 1;
-    ctx->cc_acquire_start_m = dsd_time_now_monotonic_s();
+    ctx->cc_acquire_start_m = dsd_decode_now_mono_s();
     ctx->cc_tune_request_id = request_id;
     ctx->cc_tune_deadline_m = ctx->cc_acquire_start_m + DMR_CC_TUNE_TIMEOUT_S;
     set_state(ctx, opts, DMR_SM_ON_CC, "cc-probe");
@@ -379,7 +377,7 @@ dmr_cc_hunt(dmr_sm_ctx_t* ctx, dsd_opts* opts, dsd_state* state, double now_m) {
 static void
 dmr_sm_release_without_cc(dmr_sm_ctx_t* ctx, dsd_opts* opts, dsd_state* state) {
     if (state) {
-        const double ended_m = dsd_time_now_monotonic_s();
+        const double ended_m = dsd_decode_now_mono_s();
         for (int slot = 0; slot < DSD_CALL_STATE_SLOT_COUNT; ++slot) {
             if (dsd_call_state_end_ex(state, (uint8_t)slot, ended_m, DSD_CALL_END_EXPLICIT) > 0) {
                 dsd_event_sync_slot(opts, state, (uint8_t)slot);
@@ -415,6 +413,7 @@ dmr_sm_clear_released_carrier(dmr_sm_ctx_t* ctx, dsd_opts* opts, dsd_state* stat
     ctx->vc_slot = -1;
     ctx->vc_is_group = 0;
     ctx->vc_identity_published = 0;
+    ctx->vc_crc_flags = 0;
     ctx->t_tune_m = 0.0;
     ctx->t_voice_m = 0.0;
 
@@ -528,7 +527,7 @@ handle_grant(dmr_sm_ctx_t* ctx, dsd_opts* opts, dsd_state* state, const dmr_sm_e
     if (ctx->cc_acquiring && opts->trunk_is_tuned == 0 && dsd_trunk_tuning_frame_is_current(ctx->cc_rx_generation)) {
         dmr_cc_note_activity_ctx(ctx, opts, state, ctx->cc_probe_freq_hz);
     }
-    double now_m = dsd_time_now_monotonic_s();
+    double now_m = dsd_decode_now_mono_s();
 
     dsd_trunk_tune_result tune_result =
         dsd_trunk_tuning_hook_tune_to_freq(opts, state, freq, 0, NULL); // DMR: no TED SPS override
@@ -545,6 +544,8 @@ handle_grant(dmr_sm_ctx_t* ctx, dsd_opts* opts, dsd_state* state, const dmr_sm_e
     ctx->vc_slot = (ev->slot >= 0 && ev->slot <= 1) ? ev->slot : -1;
     ctx->vc_is_group = ev->is_group != 0;
     ctx->vc_identity_published = 0;
+    // Grants are dispatched synchronously from inside the CSBK/MBC burst's CRC scope.
+    ctx->vc_crc_flags = state->event_crc_invalid[state->currentslot & 1];
     ctx->t_tune_m = now_m;
     ctx->t_voice_m = 0.0;
     ctx->cc_acquiring = 0;
@@ -588,7 +589,7 @@ handle_voice_sync(dmr_sm_ctx_t* ctx, const dsd_opts* opts, dsd_state* state, int
         return;
     }
 
-    double now_m = dsd_time_now_monotonic_s();
+    double now_m = dsd_decode_now_mono_s();
     int s = (slot >= 0 && slot <= 1) ? slot : 0;
 
     ctx->slots[s].voice_active = 1;
@@ -615,7 +616,11 @@ handle_voice_sync(dmr_sm_ctx_t* ctx, const dsd_opts* opts, dsd_state* state, int
             .frequency_hz = ctx->vc_freq_hz,
             .observed_m = now_m,
         };
-        if (dsd_call_state_observe(state, &observation, DSD_CALL_BOUNDARY_CONTINUE) >= 0) {
+        const uint8_t saved_crc_invalid = state->event_crc_invalid[s];
+        state->event_crc_invalid[s] = (uint8_t)(saved_crc_invalid | ctx->vc_crc_flags);
+        const int observed = dsd_call_state_observe(state, &observation, DSD_CALL_BOUNDARY_CONTINUE);
+        state->event_crc_invalid[s] = saved_crc_invalid;
+        if (observed >= 0) {
             ctx->vc_identity_published = 1;
         }
     }
@@ -633,7 +638,7 @@ handle_data_sync(dmr_sm_ctx_t* ctx, const dsd_opts* opts, dsd_state* state, int 
         return;
     }
 
-    double now_m = dsd_time_now_monotonic_s();
+    double now_m = dsd_decode_now_mono_s();
     int s = (slot >= 0 && slot <= 1) ? slot : 0;
 
     ctx->slots[s].last_active_m = now_m;
@@ -785,7 +790,7 @@ dmr_sm_init_ctx(dmr_sm_ctx_t* ctx, const dsd_opts* opts, const dsd_state* state)
 
     if (state && state->trunk_cc_freq != 0) {
         ctx->state = DMR_SM_ON_CC;
-        ctx->t_cc_sync_m = dsd_time_now_monotonic_s();
+        ctx->t_cc_sync_m = dsd_decode_now_mono_s();
         ctx->cc_freq_hz = state->trunk_cc_freq;
         ctx->cc_probe_freq_hz = state->trunk_cc_freq;
     } else {
@@ -825,7 +830,7 @@ dmr_sm_tick_ctx(dmr_sm_ctx_t* ctx, dsd_opts* opts, dsd_state* state) {
         dmr_sm_init_ctx(ctx, opts, state);
     }
 
-    double now_m = dsd_time_now_monotonic_s();
+    double now_m = dsd_decode_now_mono_s();
     double hangtime = ctx->hangtime_s;
     double grant_timeout = ctx->grant_timeout_s;
     double cc_grace = ctx->cc_acquiring ? DMR_CC_PROBE_GRACE_S : ctx->cc_grace_s;

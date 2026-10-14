@@ -31,19 +31,26 @@
  *   from the orchestrator's own copy of the -fA options, which the decoder's mode
  *   change never reaches, and still lands on the FSK discriminator (and back on
  *   the monitor when Analog is picked again).
+ * - an M17 encoder (-fZ) session, whose options keep the default digital frame
+ *   flags (issue #625): its stream opens the FM monitor on the WIDE channel, runs
+ *   the auto squelch's tracker there, and keeps both through a published DMR
+ *   profile.
  */
 
+#include <cerrno>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <dsd-neo/core/opts.h>
+#include <dsd-neo/core/power.h>
 #include <dsd-neo/io/iq_capture.h>
 #include <dsd-neo/io/rtl_stream_c.h>
 #include <dsd-neo/platform/timing.h>
 #include <dsd-neo/runtime/analog_channel.h>
 #include <dsd-neo/runtime/log.h>
 #include <memory>
+#include <string>
 #include <vector>
 #include "dsd-neo/core/opts_fwd.h"
 #include "dsd-neo/core/safe_api.h"
@@ -108,6 +115,27 @@ fill_capture_cfg(dsd_iq_capture_config* cfg, const char* data_path, const char* 
     DSD_SNPRINTF(cfg->source_args, sizeof(cfg->source_args), "%s", "dev=0");
 }
 
+/* The files the capture writer puts in a fixture directory. */
+static const char* const kFixtureFiles[] = {"fixture.iq", "fixture.iq.json", nullptr};
+
+/* Every fixture directory made so far, recorded as soon as it exists so that main() removes it whichever way the test
+ * that made it returned. */
+static std::vector<std::string> g_fixture_dirs;
+
+/* Remove every fixture directory with the files in it. One that is not empty afterwards fails the test. */
+static int
+remove_fixture_dirs(void) {
+    int rc = 0;
+    for (const std::string& dir : g_fixture_dirs) {
+        if (dsd_test_remove_temp_dir(dir.c_str(), kFixtureFiles) != 0) {
+            DSD_FPRINTF(stderr, "FAIL: could not remove fixture directory %s: %s\n", dir.c_str(), std::strerror(errno));
+            rc = 1;
+        }
+    }
+    g_fixture_dirs.clear();
+    return rc;
+}
+
 /* @p centred records the carrier on 0 Hz, as the committed analog fixtures do: no fs/4 shift or rotation for the
  * replay to undo. */
 static int
@@ -118,6 +146,7 @@ make_replay_fixture_with(const ReplayRate& rate, const char* tag, const std::vec
         DSD_FPRINTF(stderr, "FAIL: could not create temporary fixture directory\n");
         return 1;
     }
+    g_fixture_dirs.emplace_back(temp_dir);
     char data_path[DSD_TEST_PATH_MAX];
     char metadata_path[DSD_TEST_PATH_MAX];
     if (dsd_test_path_join(data_path, sizeof(data_path), temp_dir, "fixture.iq") != 0
@@ -416,6 +445,74 @@ test_fa_start_switches_to_digital_through_the_stream(void) {
     return rc;
 }
 
+static int
+encoder_squelch_active(void) {
+    rtl_stream_squelch_status st;
+    DSD_MEMSET(&st, 0, sizeof st);
+    return rtl_stream_get_squelch_status(&st) == 0 && st.active && st.plan_valid && !st.noise;
+}
+
+/* Issue #625: a -fZ session's options keep initOpts()'s digital frame flags (-fZ clears analog_only only). Its stream
+ * must open the encoder's FM monitor on the WIDE channel, not the RO2/12K5 front end those flags pick, and under AUTO
+ * run the tracker there; a DMR symbol profile published to it (a config apply, say) changes neither. */
+static int
+test_fz_start_keeps_the_encoder_front_end(void) {
+    const ReplayRate rate48k = {1536000U, 32U, 1U, 48000U};
+    char metadata_path[DSD_TEST_PATH_MAX];
+    const std::vector<uint8_t> payload(393216U, 127U);
+    if (make_replay_fixture_with(rate48k, "dsdneo_analog_open_fz", payload, 0, metadata_path, sizeof(metadata_path))
+        != 0) {
+        return 1;
+    }
+    std::unique_ptr<dsd_opts> opts = std::make_unique<dsd_opts>();
+    prepare_analog_replay_opts(opts.get(), metadata_path, 0);
+    opts->iq_replay_loop = 1;
+    opts->analog_only = 0;
+    opts->monitor_input_audio = 0;
+    opts->m17encoder = 1;
+    opts->frame_dstar = 1;
+    opts->frame_x2tdma = 1;
+    opts->frame_p25p1 = 1;
+    opts->frame_p25p2 = 1;
+    opts->frame_dmr = 1;
+    opts->frame_ysf = 1;
+    opts->mod_c4fm = 1;
+    opts->rtl_squelch_mode = DSD_SQUELCH_MODE_AUTO;
+    opts->rtl_squelch_margin_db = 10;
+    RtlSdrContext* ctx = NULL;
+    if (rtl_stream_create(opts.get(), &ctx) != 0 || !ctx || rtl_stream_start(ctx) != 0) {
+        DSD_FPRINTF(stderr, "FAIL: -fZ: could not start the replay\n");
+        if (ctx) {
+            rtl_stream_destroy(ctx);
+        }
+        return 1;
+    }
+    int rate = 0;
+    int levels = 0;
+    int profile = -1;
+    (void)rtl_stream_get_symbol_profile_full(&rate, &levels, &profile);
+    int rc = expect_int("-fZ start runs the monitor", rtl_stream_get_output_kind(), RTL_STREAM_OUTPUT_AUDIO_MONITOR);
+    rc |= expect_int("-fZ start runs the WIDE channel", profile, RTL_STREAM_CHANNEL_PROFILE_WIDE);
+    rc |= expect_int("-fZ is not the analog family", rtl_stream_get_analog_profile(NULL, NULL, NULL), 0);
+    rc |= expect_int("-fZ runs the auto squelch's tracker", read_until(ctx, encoder_squelch_active), 0);
+
+    rc |= expect_int("DMR symbol profile request",
+                     rtl_stream_request_demod_profile(0, 4800, 4, RTL_STREAM_CHANNEL_PROFILE_12K5, 10, 0), 0);
+    float block[256];
+    for (int i = 0; i < 400; i++) {
+        int got = 0;
+        (void)rtl_stream_read(ctx, block, sizeof(block) / sizeof(block[0]), &got);
+    }
+    (void)rtl_stream_get_symbol_profile_full(&rate, &levels, &profile);
+    rc |= expect_int("-fZ keeps the monitor through a DMR profile", rtl_stream_get_output_kind(),
+                     RTL_STREAM_OUTPUT_AUDIO_MONITOR);
+    rc |= expect_int("-fZ keeps the WIDE channel through a DMR profile", profile, RTL_STREAM_CHANNEL_PROFILE_WIDE);
+    rc |= expect_int("-fZ keeps the tracker through a DMR profile", encoder_squelch_active(), 1);
+    (void)rtl_stream_stop(ctx);
+    (void)rtl_stream_destroy(ctx);
+    return rc;
+}
+
 int
 main(void) {
     dsd_neo_log_set_tap(capture_errors, NULL);
@@ -471,6 +568,8 @@ main(void) {
 
     rc |= test_forced_rate_monitor_audio_is_resampled_once();
     rc |= test_fa_start_switches_to_digital_through_the_stream();
+    rc |= test_fz_start_keeps_the_encoder_front_end();
+    rc |= remove_fixture_dirs();
 
     if (rc == 0) {
         std::printf("IO_RTL_ANALOG_OPEN: OK\n");

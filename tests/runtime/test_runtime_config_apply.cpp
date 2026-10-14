@@ -19,7 +19,9 @@
 
 #include <dsd-neo/app_control/commands.h>
 #include <dsd-neo/app_control/frontend_runtime.h>
+#include <dsd-neo/core/analog_tone.h>
 #include <dsd-neo/core/audio.h>
+#include <dsd-neo/core/audio_input_switch.h>
 #include <dsd-neo/core/call_state.h>
 #include <dsd-neo/core/frontend_types.h>
 #include <dsd-neo/core/init.h>
@@ -35,9 +37,12 @@
 #ifdef USE_RADIO
 #include <dsd-neo/io/rtl_stream_c.h>
 #endif
+#include <dsd-neo/io/udp_input.h>
 #include <dsd-neo/platform/platform.h>
+#include <dsd-neo/runtime/analog_tones.h>
 #include <dsd-neo/runtime/config.h>
 #include <dsd-neo/runtime/exitflag.h>
+#include <dsd-neo/runtime/net_audio_input_hooks.h>
 #include <dsd-neo/runtime/rtl_stream_metrics_hooks.h>
 #include <dsd-neo/runtime/scan_mode.h>
 #include <dsd-neo/runtime/scan_options.h>
@@ -56,8 +61,12 @@
 #include <unistd.h>
 #endif
 #if !DSD_PLATFORM_WIN_NATIVE
+#include <arpa/inet.h>
 #include <dirent.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 #endif
+#include <dsd-neo/platform/sockets.h>
 #include "../../src/app_control/commands_internal.h"
 
 #include "dsd-neo/core/dibit.h"
@@ -192,18 +201,64 @@ reset_tcp_connect_audio_fake(void) {
     g_last_tcp_connect_audio_port = 0;
 }
 
+/* The TCP connect service, faked: a success leaves the options as its input switch does (issue #634), TCP input on
+   the endpoint, named for it; a failure (DSD_AUDIO_INPUT_KEPT) changes nothing. */
 int
-svc_tcp_connect_audio(dsd_opts* opts, const char* host, int port) { // NOLINT(misc-use-internal-linkage)
+// NOLINTNEXTLINE(misc-use-internal-linkage)
+svc_tcp_connect_audio(dsd_opts* opts, dsd_state* state, const char* host, int port) {
+    (void)state;
     g_tcp_connect_audio_calls++;
     DSD_SNPRINTF(g_last_tcp_connect_audio_host, sizeof g_last_tcp_connect_audio_host, "%s", host ? host : "");
     g_last_tcp_connect_audio_port = port;
 
-    if (g_tcp_connect_audio_result == 0 && opts && host && port > 0) {
-        DSD_SNPRINTF(opts->tcp_hostname, sizeof opts->tcp_hostname, "%s", host);
+    if (g_tcp_connect_audio_result == DSD_AUDIO_INPUT_SWITCHED && opts && host && port > 0) {
+        char next_host[sizeof opts->tcp_hostname];
+        DSD_SNPRINTF(next_host, sizeof next_host, "%s", host);
+        DSD_SNPRINTF(opts->tcp_hostname, sizeof opts->tcp_hostname, "%s", next_host);
         opts->tcp_portno = port;
         opts->audio_in_type = AUDIO_IN_TCP;
+        DSD_SNPRINTF(opts->audio_in_dev, sizeof opts->audio_in_dev, "tcp:%s:%d", next_host, port);
     }
     return g_tcp_connect_audio_result;
+}
+
+static int
+write_test_file(const char* path, const void* data, size_t n) {
+    FILE* f = dsd_fopen_private(path, "wb");
+    if (!f) {
+        DSD_FPRINTF(stderr, "FAIL: create %s\n", path);
+        return 1;
+    }
+    const int ok = fwrite(data, 1U, n, f) == n;
+    return (fclose(f) == 0 && ok) ? 0 : 1;
+}
+
+/* A loopback UDP port nothing holds: bound by the system and let go again (issue #634). */
+static int
+free_loopback_udp_port(void) {
+    dsd_socket_t sock = dsd_socket_create(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock == DSD_INVALID_SOCKET) {
+        return -1;
+    }
+    struct sockaddr_in addr;
+    DSD_MEMSET(&addr, 0, sizeof addr);
+    addr.sin_family = AF_INET;
+    addr.sin_port = 0;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    struct sockaddr_in bound;
+    DSD_MEMSET(&bound, 0, sizeof bound);
+#if DSD_PLATFORM_WIN_NATIVE
+    int bound_len = (int)sizeof bound;
+#else
+    socklen_t bound_len = (socklen_t)sizeof bound;
+#endif
+    int port = -1;
+    if (dsd_socket_bind(sock, (struct sockaddr*)&addr, sizeof addr) == 0
+        && getsockname(sock, (struct sockaddr*)&bound, &bound_len) == 0) {
+        port = (int)ntohs(bound.sin_port);
+    }
+    dsd_socket_close(sock);
+    return port;
 }
 
 static void
@@ -395,6 +450,8 @@ create_temp_raw_pcm_wav_suffix(const char* prefix, const short* samples, size_t 
     FILE* fp = dsd_fopen_private(out_path, "wb");
     if (!fp) {
         DSD_FPRINTF(stderr, "FAIL: fopen write failed for %s\n", out_path);
+        /* The open can fail after creating the file (dsd_fopen_private() closes the descriptor when fdopen() fails). */
+        (void)remove(out_path);
         return 1;
     }
 
@@ -594,6 +651,16 @@ __wrap_rtl_stream_set_channel_squelch(float level) {
     return 0;
 }
 
+/* The auto squelch reaches the demod whole (issue #518 follow-up). */
+static int g_wrap_squelch_setting_calls = 0;
+static dsd_squelch_setting g_wrap_last_squelch_setting = {0, 0.0, 0};
+
+void
+__wrap_rtl_stream_set_channel_squelch_setting(const dsd_squelch_setting* setting) {
+    g_wrap_squelch_setting_calls++;
+    g_wrap_last_squelch_setting = *setting;
+}
+
 /* Read back off the context after a restart. Wrapped because the real one walks
  * into the fake context, which is not an RtlSdrContext. */
 uint32_t
@@ -653,6 +720,244 @@ test_config_reapply_converts_rtl_squelch_from_db(void) {
     rc |= expect_true("config re-apply of rtl_sql 0 switches squelch off", opts->rtl_squelch_level == 0.0);
     rc |= expect_float_near("config re-apply of rtl_sql 0 opens the demod gate", g_wrap_last_channel_squelch, 0.0f,
                             1e-9f);
+
+    /* rtl_sql_mode = auto puts the margin over the learned floor in force, whole, and keeps rtl_sql beneath it for a
+       switch back; level again pushes the level. */
+    cfg.rtl_sql = -50;
+    cfg.rtl_sql_mode = DSD_SQUELCH_MODE_AUTO;
+    cfg.rtl_sql_margin_db = 6;
+    DSD_SNPRINTF(cfg.rtl_freq, sizeof cfg.rtl_freq, "%s", "462.125M");
+    g_wrap_squelch_setting_calls = 0;
+    dsd_app_command_submit(DSD_APP_CMD_CONFIG_APPLY, &cfg, sizeof cfg);
+    (void)dsd_app_drain_cmds(opts, state);
+    rc |= expect_true("config re-apply of auto: opts", opts->rtl_squelch_mode == DSD_SQUELCH_MODE_AUTO
+                                                           && opts->rtl_squelch_margin_db == 6
+                                                           && fabs(opts->rtl_squelch_level - 1e-5) < 1e-12);
+    rc |= expect_true("config re-apply of auto: pushed whole",
+                      g_wrap_squelch_setting_calls >= 1 && g_wrap_last_squelch_setting.mode == DSD_SQUELCH_MODE_AUTO
+                          && g_wrap_last_squelch_setting.margin_db == 6);
+    cfg.rtl_sql_mode = DSD_SQUELCH_MODE_LEVEL;
+    DSD_SNPRINTF(cfg.rtl_freq, sizeof cfg.rtl_freq, "%s", "463.125M");
+    g_wrap_last_channel_squelch = -1.0f;
+    dsd_app_command_submit(DSD_APP_CMD_CONFIG_APPLY, &cfg, sizeof cfg);
+    (void)dsd_app_drain_cmds(opts, state);
+    rc |= expect_true("config re-apply of level after auto", opts->rtl_squelch_mode == DSD_SQUELCH_MODE_LEVEL);
+    rc |= expect_float_near("config re-apply of level after auto pushes the level", g_wrap_last_channel_squelch,
+                            (float)pow(10.0, -5.0), 1e-9f);
+
+    free_test_runtime(&runtime);
+    return rc;
+}
+
+/*
+ * Issue #575: a config that reopens the running RTL input on another frequency puts the receiver on another carrier,
+ * which can sync before any no-carrier pass, so the codes the old carrier decoded go. A reopen on the same frequency
+ * (here for a new gain) stays on the carrier and keeps them.
+ */
+static void
+seed_carrier_codes(dsd_state* state) {
+    state->dmr_color_code = 5U;
+    state->nxdn_last_ran = 9U;
+    state->nxdn_last_ran_stand_in = 1U;
+    state->dpmr_color_code = 33;
+    state->p2_cc = 0x293U;
+    state->p2_cc_verified = 1U;
+}
+
+static int
+expect_carrier_codes(const char* what, const dsd_state* state, int forgotten) {
+    const int kept = state->dmr_color_code == 5U && state->nxdn_last_ran == 9U && state->nxdn_last_ran_stand_in == 1U
+                     && state->dpmr_color_code == 33 && state->p2_cc_verified == 1U;
+    const int gone = state->dmr_color_code == 16U && state->nxdn_last_ran == (unsigned int)-1
+                     && state->nxdn_last_ran_stand_in == 0U && state->dpmr_color_code == -1
+                     && state->p2_cc_verified == 0U;
+    return expect_true(what, (forgotten ? gone : kept) && state->p2_cc == 0x293U);
+}
+
+static int
+test_config_reopen_on_another_frequency_forgets_the_carrier_codes(void) {
+    test_runtime runtime;
+    if (alloc_test_runtime(&runtime) != 0) {
+        return 1;
+    }
+    dsd_opts* opts = runtime.opts;
+    dsd_state* state = runtime.state;
+
+    opts->audio_in_type = AUDIO_IN_RTL;
+    opts->rtlsdr_center_freq = 851375000U;
+    opts->rtl_gain_value = 22;
+    opts->rtl_dsp_bw_khz = 24;
+    opts->rtl_volume_multiplier = 2;
+    DSD_SNPRINTF(opts->audio_in_dev, sizeof opts->audio_in_dev, "%s", "rtl:0:851375000:22:0:24:0:2");
+
+    dsdneoUserConfig cfg;
+    DSD_MEMSET(&cfg, 0, sizeof cfg);
+    cfg.has_input = 1;
+    cfg.input_source = DSDCFG_INPUT_RTL;
+    cfg.rtl_device = 0;
+    DSD_SNPRINTF(cfg.rtl_freq, sizeof cfg.rtl_freq, "%s", "851375000");
+    cfg.rtl_gain = 30;
+    cfg.rtl_bw_khz = 24;
+    cfg.rtl_volume = 2;
+
+    int rc = 0;
+    seed_carrier_codes(state);
+    state->p25_vc_freq[0] = 851012500L;
+    state->trunk_vc_freq[0] = 851012500L;
+    dsd_app_command_submit(DSD_APP_CMD_CONFIG_APPLY, &cfg, sizeof cfg);
+    (void)dsd_app_drain_cmds(opts, state);
+    rc |= expect_true("same-frequency reopen ran", strstr(opts->audio_in_dev, ":30:") != NULL);
+    rc |= expect_carrier_codes("same-frequency reopen keeps the codes", state, 0);
+    rc |= expect_true("same-frequency reopen keeps the frequency caches",
+                      state->p25_vc_freq[0] == 851012500L && state->trunk_vc_freq[0] == 851012500L);
+
+    DSD_SNPRINTF(cfg.rtl_freq, sizeof cfg.rtl_freq, "%s", "460.125M");
+    seed_carrier_codes(state);
+    dsd_app_command_submit(DSD_APP_CMD_CONFIG_APPLY, &cfg, sizeof cfg);
+    (void)dsd_app_drain_cmds(opts, state);
+    rc |= expect_true("reopen on another frequency ran", opts->rtlsdr_center_freq == 460125000U);
+    rc |= expect_carrier_codes("reopen on another frequency forgets the codes", state, 1);
+    rc |= expect_true("reopen on another frequency forgets the untrunked frequency caches",
+                      state->p25_vc_freq[0] == 0 && state->trunk_vc_freq[0] == 0);
+
+    free_test_runtime(&runtime);
+    return rc;
+}
+
+/* An active P25 call on slot 0, as the carrier on air carries it. */
+static void
+observe_active_call(dsd_state* state) {
+    dsd_call_observation observation;
+    DSD_MEMSET(&observation, 0, sizeof observation);
+    observation.protocol = DSD_SYNC_P25P1_POS;
+    observation.slot = 0U;
+    observation.kind = DSD_CALL_KIND_GROUP_VOICE;
+    observation.ota_target_id = 4800U;
+    observation.policy_target_id = 4800U;
+    observation.ota_source_id = 4801U;
+    (void)dsd_call_state_observe(state, &observation, DSD_CALL_BOUNDARY_BEGIN);
+}
+
+static int
+call_active(const dsd_state* state) {
+    dsd_call_snapshot call;
+    return dsd_call_state_get(state, 0U, &call) > 0 && call.phase == DSD_CALL_PHASE_ACTIVE;
+}
+
+/*
+ * Issue #575: a config that replaces the radio source moves the receiver to another carrier even where the configured
+ * centre stays: a replay that opened at 851.375 MHz and recorded a retune to 860 MHz, replaced by a live RTL-SDR at
+ * 851.375 MHz, or one RTL-SDR replaced by another. The tuned frequency (dsd_opts_tuned_freq_hz()) and the source are
+ * what is compared, not rtlsdr_center_freq: the outgoing call ends, and the codes and the untrunked frequency caches
+ * go. The same source reopened for a new gain stays on its carrier, and its call stays open.
+ */
+static int
+test_config_source_change_is_a_carrier_boundary(void) {
+    test_runtime runtime;
+    if (alloc_test_runtime(&runtime) != 0) {
+        return 1;
+    }
+    dsd_opts* opts = runtime.opts;
+    dsd_state* state = runtime.state;
+
+    opts->audio_in_type = AUDIO_IN_RTL;
+    opts->rtlsdr_center_freq = 851375000U;
+    opts->iq_replay_center_freq = 860000000U; /* the capture's recorded retune */
+    opts->rtl_gain_value = 22;
+    opts->rtl_dsp_bw_khz = 24;
+    opts->rtl_volume_multiplier = 2;
+    DSD_SNPRINTF(opts->audio_in_dev, sizeof opts->audio_in_dev, "%s", "iqreplay:capture.iq.json");
+
+    dsdneoUserConfig cfg;
+    DSD_MEMSET(&cfg, 0, sizeof cfg);
+    cfg.has_input = 1;
+    cfg.input_source = DSDCFG_INPUT_RTL;
+    cfg.rtl_device = 0;
+    DSD_SNPRINTF(cfg.rtl_freq, sizeof cfg.rtl_freq, "%s", "851375000");
+    cfg.rtl_gain = 22;
+    cfg.rtl_bw_khz = 24;
+    cfg.rtl_volume = 2;
+
+    int rc = 0;
+    observe_active_call(state);
+    seed_carrier_codes(state);
+    state->p25_vc_freq[0] = 860012500L;
+    dsd_app_command_submit(DSD_APP_CMD_CONFIG_APPLY, &cfg, sizeof cfg);
+    (void)dsd_app_drain_cmds(opts, state);
+    rc |= expect_true("replay replaced by a live RTL-SDR", strncmp(opts->audio_in_dev, "rtl:", 4) == 0);
+    rc |= expect_true("replay to live ends the outgoing call", !call_active(state));
+    rc |= expect_carrier_codes("replay to live forgets the codes", state, 1);
+    rc |= expect_true("replay to live forgets the untrunked frequency caches", state->p25_vc_freq[0] == 0);
+
+    cfg.rtl_device = 1;
+    observe_active_call(state);
+    seed_carrier_codes(state);
+    dsd_app_command_submit(DSD_APP_CMD_CONFIG_APPLY, &cfg, sizeof cfg);
+    (void)dsd_app_drain_cmds(opts, state);
+    rc |= expect_true("another RTL-SDR on the same centre ran", opts->rtl_dev_index == 1);
+    rc |= expect_true("another RTL-SDR ends the outgoing call", !call_active(state));
+    rc |= expect_carrier_codes("another RTL-SDR forgets the codes", state, 1);
+
+    cfg.rtl_gain = 30;
+    observe_active_call(state);
+    seed_carrier_codes(state);
+    dsd_app_command_submit(DSD_APP_CMD_CONFIG_APPLY, &cfg, sizeof cfg);
+    (void)dsd_app_drain_cmds(opts, state);
+    rc |= expect_true("the same RTL-SDR reopened for a gain", strstr(opts->audio_in_dev, ":30:") != NULL);
+    rc |= expect_true("a gain-only reopen keeps the call", call_active(state));
+    rc |= expect_carrier_codes("a gain-only reopen keeps the codes", state, 0);
+
+    free_test_runtime(&runtime);
+    return rc;
+}
+
+/*
+ * Issue #575: the carrier boundary lives where a radio stream starts (dsd_engine_note_stream_source()). A device change
+ * (RTL_SET_DEV) restarts the stream on another source: the outgoing call ends and its codes go. The same source restarted
+ * (RTL_RESTART, here after a gain change) keeps its carrier and its call. A command that changes the source and restarts
+ * through svc_rtl_restart() needs no boundary of its own: RTL_RESTART after another device index was written gets it.
+ */
+static int
+test_stream_restart_on_another_source_is_a_carrier_boundary(void) {
+    test_runtime runtime;
+    if (alloc_test_runtime(&runtime) != 0) {
+        return 1;
+    }
+    dsd_opts* opts = runtime.opts;
+    dsd_state* state = runtime.state;
+
+    opts->audio_in_type = AUDIO_IN_RTL;
+    opts->rtl_dev_index = 0;
+    opts->rtlsdr_center_freq = 851375000U;
+    opts->rtl_gain_value = 22;
+    DSD_SNPRINTF(opts->audio_in_dev, sizeof opts->audio_in_dev, "%s", "rtl:0:851375000:22:0:24:0:2");
+
+    int rc = 0;
+    dsd_app_command_submit(DSD_APP_CMD_RTL_RESTART, NULL, 0U); /* the session's stream starts */
+    (void)dsd_app_drain_cmds(opts, state);
+
+    observe_active_call(state);
+    seed_carrier_codes(state);
+    opts->rtl_gain_value = 30;
+    dsd_app_command_submit(DSD_APP_CMD_RTL_RESTART, NULL, 0U);
+    (void)dsd_app_drain_cmds(opts, state);
+    rc |= expect_true("a same-source restart keeps the call", call_active(state));
+    rc |= expect_carrier_codes("a same-source restart keeps the codes", state, 0);
+
+    const int32_t device = 1;
+    dsd_app_command_submit(DSD_APP_CMD_RTL_SET_DEV, &device, sizeof device);
+    (void)dsd_app_drain_cmds(opts, state);
+    rc |= expect_true("the device change ran", opts->rtl_dev_index == 1);
+    rc |= expect_true("a device change ends the outgoing call", !call_active(state));
+    rc |= expect_carrier_codes("a device change forgets the codes", state, 1);
+
+    observe_active_call(state);
+    seed_carrier_codes(state);
+    opts->rtl_dev_index = 2; /* a command with no boundary of its own changes the source ... */
+    dsd_app_command_submit(DSD_APP_CMD_RTL_RESTART, NULL, 0U); /* ... and restarts the stream */
+    (void)dsd_app_drain_cmds(opts, state);
+    rc |= expect_true("a source change through the restart ends the outgoing call", !call_active(state));
+    rc |= expect_carrier_codes("a source change through the restart forgets the codes", state, 1);
 
     free_test_runtime(&runtime);
     return rc;
@@ -722,6 +1027,73 @@ test_config_reapply_under_row_squelch_keeps_the_row(void) {
     return rc;
 }
 #endif
+
+/* Issue #527: the tone policy in a config applied to a running session. While an nfm row's own policy is on air, the
+ * loaded policy becomes the configured default: the row's stays in force, a save writes the loaded one, and leaving the
+ * row puts it on air. With no row, a present [analog] section that sets no tone key turns the policy off, list and
+ * all, as a saved config with the policy off does. */
+static int
+tone_policy_is(const char* label, int mode, const dsd_tone_set* set, int want_mode, const char* want_list) {
+    char list[DSD_TONE_LIST_TEXT_MAX + 1] = "";
+    (void)dsd_tone_set_format(set, list, sizeof list);
+    if (mode != want_mode || strcmp(list, want_list) != 0) {
+        DSD_FPRINTF(stderr, "FAIL: %s (got %d \"%s\" want %d \"%s\")\n", label, mode, list, want_mode, want_list);
+        return 1;
+    }
+    return 0;
+}
+
+static int
+test_config_apply_under_row_tone_policy_keeps_the_row(void) {
+    test_runtime runtime;
+    if (alloc_test_runtime(&runtime) != 0) {
+        return 1;
+    }
+    dsd_opts* opts = runtime.opts;
+    dsd_state* state = runtime.state;
+    int rc = expect_true("row tone scope", dsd_scan_mode_enter(opts, state, DSD_SCAN_MODE_NFM) == 0);
+    dsd_scan_option_values row;
+    DSD_MEMSET(&row, 0, sizeof row);
+    row.present = DSD_SCAN_OPT_TONE;
+    row.tone_filter = DSD_TONE_FILTER_BLOCK;
+    rc |= expect_true("row tone list", dsd_tone_set_parse("67.0", &row.tone_set, NULL, 0) == 0);
+    rc |= expect_true("row tone installed", dsd_scan_mode_options(opts, state, &row) == 0);
+    rc |= tone_policy_is("row tone on air", opts->analog_tone_filter, &opts->analog_tone_set, DSD_TONE_FILTER_BLOCK,
+                         "67.0");
+
+    dsdneoUserConfig cfg;
+    DSD_MEMSET(&cfg, 0, sizeof cfg);
+    cfg.has_analog = 1;
+    cfg.analog_tone_filter = DSD_TONE_FILTER_ALLOW;
+    rc |= expect_true("config tone list", dsd_tone_set_parse("100.0/D023N", &cfg.analog_tone_set, NULL, 0) == 0);
+    dsd_app_command_submit(DSD_APP_CMD_CONFIG_APPLY, &cfg, sizeof cfg);
+    (void)dsd_app_drain_cmds(opts, state);
+
+    int configured_mode = -1;
+    dsd_tone_set configured_set;
+    DSD_MEMSET(&configured_set, 0, sizeof configured_set);
+    dsd_scan_mode_configured_tone_policy(opts, state, &configured_mode, &configured_set);
+    rc |= tone_policy_is("config under a row edits the default", configured_mode, &configured_set,
+                         DSD_TONE_FILTER_ALLOW, "100.0/D023N");
+    rc |= tone_policy_is("config under a row keeps the row in force", opts->analog_tone_filter, &opts->analog_tone_set,
+                         DSD_TONE_FILTER_BLOCK, "67.0");
+    dsdneoUserConfig saved;
+    dsd_snapshot_opts_to_user_config(opts, state, &saved);
+    rc |= tone_policy_is("save under a row writes the default", saved.analog_tone_filter, &saved.analog_tone_set,
+                         DSD_TONE_FILTER_ALLOW, "100.0/D023N");
+    dsd_scan_mode_leave(opts, state);
+    rc |= tone_policy_is("leaving the row puts the default on air", opts->analog_tone_filter, &opts->analog_tone_set,
+                         DSD_TONE_FILTER_ALLOW, "100.0/D023N");
+
+    DSD_MEMSET(&cfg, 0, sizeof cfg);
+    cfg.has_analog = 1;
+    dsd_app_command_submit(DSD_APP_CMD_CONFIG_APPLY, &cfg, sizeof cfg);
+    (void)dsd_app_drain_cmds(opts, state);
+    rc |= tone_policy_is("an [analog] section without tone keys turns the policy off", opts->analog_tone_filter,
+                         &opts->analog_tone_set, DSD_TONE_FILTER_OFF, "");
+    free_test_runtime(&runtime);
+    return rc;
+}
 
 static int
 test_ui_command_queue_applies_fifo(void) {
@@ -798,13 +1170,14 @@ test_ui_command_queue_truncates_oversized_payload_string(void) {
     int applied = dsd_app_drain_cmds(opts, state);
 
     int rc = 0;
+    /* A path the queue cut short, or longer than the input name holds, would name another file: the switch is refused
+       and the input stays (issue #634). The toast stays inside its buffer. */
     rc |= expect_int_eq("oversized string command drain count", applied, 1);
-    rc |= expect_int_eq("oversized string switches input type", opts->audio_in_type, AUDIO_IN_WAV);
-    rc |= expect_int_eq("oversized string is field bounded", (int)strlen(opts->audio_in_dev),
-                        (int)sizeof(opts->audio_in_dev) - 1);
-    rc |= expect_true("oversized string preserves copied prefix",
-                      strspn(opts->audio_in_dev, "x") == strlen(opts->audio_in_dev));
-    rc |= expect_true("oversized string writes toast", strstr(state->ui_msg, "Applied: WAV input") != NULL);
+    rc |= expect_int_eq("oversized string keeps the input type", opts->audio_in_type, AUDIO_IN_PULSE);
+    rc |= expect_true("oversized string keeps the input name", strchr(opts->audio_in_dev, 'x') == NULL);
+    rc |= expect_true("oversized string writes a bounded toast",
+                      strstr(state->ui_msg, "Failed: the path is longer than") != NULL
+                          && memchr(state->ui_msg, '\0', sizeof state->ui_msg) != NULL);
 
     free(oversized);
     free_test_runtime(&runtime);
@@ -1209,8 +1582,8 @@ test_ui_aes_key_command_clears_manual_hytera_fields(void) {
     rc |= expect_int_eq("UI AES disables keyloader", state->keyloader, 0);
     rc |= expect_int_eq("UI AES clears slot 0 payload key ID", state->payload_keyid, 0);
     rc |= expect_int_eq("UI AES clears slot 1 payload key ID", state->payload_keyidR, 0);
-    rc |= expect_int_eq("UI AES unmutes encrypted left", opts->dmr_mute_encL, 0);
-    rc |= expect_int_eq("UI AES unmutes encrypted right", opts->dmr_mute_encR, 0);
+    rc |= expect_int_eq("UI AES leaves encrypted left muted", opts->dmr_mute_encL, 1);
+    rc |= expect_int_eq("UI AES leaves encrypted right muted", opts->dmr_mute_encR, 1);
 
     free_test_runtime(&runtime);
     return rc;
@@ -1264,8 +1637,8 @@ test_ui_aes_key_command_handles_zero_and_short_payloads(void) {
     rc |= expect_u64_eq("zero AES clears Hytera K1", state->K1, 0ULL);
     rc |= expect_int_eq("zero AES clears Hytera segment count", (int)state->hytera_key_segments, 0);
     rc |= expect_int_eq("zero AES clears keyloader", state->keyloader, 0);
-    rc |= expect_int_eq("zero AES unmutes encrypted left", opts->dmr_mute_encL, 0);
-    rc |= expect_int_eq("zero AES unmutes encrypted right", opts->dmr_mute_encR, 0);
+    rc |= expect_int_eq("zero AES leaves encrypted left muted", opts->dmr_mute_encL, 1);
+    rc |= expect_int_eq("zero AES leaves encrypted right muted", opts->dmr_mute_encR, 1);
 
     free_test_runtime(&runtime);
     return rc;
@@ -1329,8 +1702,8 @@ test_ui_hytera_key_command_records_segment_variants(void) {
     rc |= expect_int_eq("zero Hytera command is drained", applied, 1);
     rc |= expect_int_eq("zero Hytera remains a supplied legacy segment", (int)state->hytera_key_segments, 1);
     rc |= expect_int_eq("zero Hytera clears keyloader", state->keyloader, 0);
-    rc |= expect_int_eq("zero Hytera unmutes encrypted left", opts->dmr_mute_encL, 0);
-    rc |= expect_int_eq("zero Hytera unmutes encrypted right", opts->dmr_mute_encR, 0);
+    rc |= expect_int_eq("zero Hytera leaves encrypted left muted", opts->dmr_mute_encL, 1);
+    rc |= expect_int_eq("zero Hytera leaves encrypted right muted", opts->dmr_mute_encR, 1);
 
     p.H = 0x10ULL;
     p.K1 = 0x11ULL;
@@ -1452,8 +1825,8 @@ test_ui_basic_key_commands_reset_payload_mute_state(void) {
     rc |= expect_int_eq("basic key clears keyloader", state->keyloader, 0);
     rc |= expect_int_eq("basic key clears left payload key ID", state->payload_keyid, 0);
     rc |= expect_int_eq("basic key clears right payload key ID", state->payload_keyidR, 0);
-    rc |= expect_int_eq("basic key unmutes encrypted left", opts->dmr_mute_encL, 0);
-    rc |= expect_int_eq("basic key unmutes encrypted right", opts->dmr_mute_encR, 0);
+    rc |= expect_int_eq("basic key leaves encrypted left muted", opts->dmr_mute_encL, 1);
+    rc |= expect_int_eq("basic key leaves encrypted right muted", opts->dmr_mute_encR, 1);
 
     state->keyloader = 1;
     state->payload_keyid = 9;
@@ -1467,8 +1840,8 @@ test_ui_basic_key_commands_reset_payload_mute_state(void) {
     rc |= expect_int_eq("scrambler key command is drained", applied, 1);
     rc |= expect_int_eq("scrambler key command sets R", (int)state->R, (int)scrambler);
     rc |= expect_int_eq("scrambler key clears keyloader", state->keyloader, 0);
-    rc |= expect_int_eq("scrambler key unmutes encrypted left", opts->dmr_mute_encL, 0);
-    rc |= expect_int_eq("scrambler key unmutes encrypted right", opts->dmr_mute_encR, 0);
+    rc |= expect_int_eq("scrambler key leaves encrypted left muted", opts->dmr_mute_encL, 1);
+    rc |= expect_int_eq("scrambler key leaves encrypted right muted", opts->dmr_mute_encR, 1);
 
     DSD_MEMSET(state->static_ks_bits, 0, sizeof state->static_ks_bits);
     state->ken_sc = 0;
@@ -1507,8 +1880,8 @@ test_ui_basic_key_commands_reset_payload_mute_state(void) {
     rc |= expect_int_eq("RC4/DES key clears keyloader", state->keyloader, 0);
     rc |= expect_int_eq("RC4/DES key clears left payload key ID", state->payload_keyid, 0);
     rc |= expect_int_eq("RC4/DES key clears right payload key ID", state->payload_keyidR, 0);
-    rc |= expect_int_eq("RC4/DES key unmutes encrypted left", opts->dmr_mute_encL, 0);
-    rc |= expect_int_eq("RC4/DES key unmutes encrypted right", opts->dmr_mute_encR, 0);
+    rc |= expect_int_eq("RC4/DES key leaves encrypted left muted", opts->dmr_mute_encL, 1);
+    rc |= expect_int_eq("RC4/DES key leaves encrypted right muted", opts->dmr_mute_encR, 1);
 
     free_test_runtime(&runtime);
     return rc;
@@ -1676,6 +2049,17 @@ test_ui_dsp_op_commands_dispatch_through_queue(void) {
     (void)rtl_stream_get_iq_dc(&dc_shift);
     rc |= expect_int_eq("DSP IQ DC shift command drains", applied, 1);
     rc |= expect_int_eq("DSP IQ DC shift applies delta", dc_shift, dc_shift_before_toggle + 3);
+    /* Any int32 delta clamps to the shift's range without overflowing on the way (the control API can send one). */
+    dsp.a = INT32_MAX;
+    dsd_app_command_submit(DSD_APP_CMD_DSP_OP, &dsp, sizeof dsp);
+    (void)dsd_app_drain_cmds(opts, state);
+    (void)rtl_stream_get_iq_dc(&dc_shift);
+    rc |= expect_int_eq("DSP IQ DC shift INT32_MAX clamps high", dc_shift, 15);
+    dsp.a = INT32_MIN;
+    dsd_app_command_submit(DSD_APP_CMD_DSP_OP, &dsp, sizeof dsp);
+    (void)dsd_app_drain_cmds(opts, state);
+    (void)rtl_stream_get_iq_dc(&dc_shift);
+    rc |= expect_int_eq("DSP IQ DC shift INT32_MIN clamps low", dc_shift, 6);
 
     rtl_stream_set_ted_gain(0.1f);
     dsp.op = DSD_APP_DSP_OP_TED_GAIN_SET;
@@ -1795,6 +2179,15 @@ test_ui_slot_and_display_commands_update_state(void) {
     rc |= expect_int_eq("spectrum size command drains", applied, 1);
 #ifdef USE_RADIO
     rc |= expect_int_eq("spectrum size delta rounds to next power of two", rtl_stream_spectrum_get_size(), 256);
+    /* Any int32 delta clamps without overflowing on the way (the control API sends what its client asked for). */
+    spectrum_delta = INT32_MAX;
+    dsd_app_command_submit(DSD_APP_CMD_SPEC_SIZE_DELTA, &spectrum_delta, sizeof spectrum_delta);
+    (void)dsd_app_drain_cmds(opts, state);
+    rc |= expect_int_eq("spectrum size delta INT32_MAX clamps high", rtl_stream_spectrum_get_size(), 1024);
+    spectrum_delta = INT32_MIN;
+    dsd_app_command_submit(DSD_APP_CMD_SPEC_SIZE_DELTA, &spectrum_delta, sizeof spectrum_delta);
+    (void)dsd_app_drain_cmds(opts, state);
+    rc |= expect_int_eq("spectrum size delta INT32_MIN clamps low", rtl_stream_spectrum_get_size(), 64);
 #else
     rc |= expect_int_eq("spectrum size command keeps spectrum enabled without radio",
                         opts->frontend_display.spectrum_view, 1);
@@ -1909,7 +2302,7 @@ test_ui_replay_and_stop_playback_manage_symbol_state(void) {
         return 1;
     }
     const uint8_t bytes[] = {0x01U, 0x02U, 0x03U};
-    ssize_t nwritten = write(fd, bytes, sizeof bytes);
+    ssize_t nwritten = dsd_write(fd, bytes, sizeof bytes);
     (void)dsd_close(fd);
     if (nwritten != (ssize_t)sizeof bytes) {
         DSD_FPRINTF(stderr, "FAIL: write temp symbol replay file\n");
@@ -1925,7 +2318,7 @@ test_ui_replay_and_stop_playback_manage_symbol_state(void) {
     dsd_opts* opts = runtime.opts;
     dsd_state* state = runtime.state;
 
-    DSD_SNPRINTF(opts->audio_in_dev, sizeof opts->audio_in_dev, "%s", sym_path);
+    DSD_SNPRINTF(opts->symbol_capture_last, sizeof opts->symbol_capture_last, "%s", sym_path);
     opts->audio_in_type = AUDIO_IN_PULSE;
     state->symbol_replay_format = DSD_SYMBOL_REPLAY_FORMAT_SOFT;
     state->symbol_replay_header_checked = 1;
@@ -1942,12 +2335,20 @@ test_ui_replay_and_stop_playback_manage_symbol_state(void) {
     rc |= expect_int_eq("replay last clears header checked", state->symbol_replay_header_checked, 0);
     rc |= expect_int_eq("replay last clears soft flag", state->symbol_replay_has_soft, 0);
 
+    /* Stop switches to the Pulse input whatever the output (issue #634). The host may have no capture device: either
+       the switch ran and closed the replay, or it failed and the replay runs on. */
     opts->audio_out_type = 1;
     dsd_app_command_submit(DSD_APP_CMD_STOP_PLAYBACK, NULL, 0);
     applied = dsd_app_drain_cmds(opts, state);
     rc |= expect_int_eq("stop playback command drains", applied, 1);
-    rc |= expect_true("stop playback closes symbol file", opts->symbolfile == NULL);
-    rc |= expect_int_eq("stop playback falls back to stdin without Pulse output", opts->audio_in_type, AUDIO_IN_STDIN);
+    if (opts->audio_in_type == AUDIO_IN_PULSE) {
+        rc |= expect_true("stop playback closes symbol file", opts->symbolfile == NULL);
+    } else {
+        rc |= expect_int_eq("failed stop keeps the replay", opts->audio_in_type, AUDIO_IN_SYMBOL_BIN);
+        rc |= expect_true("failed stop keeps the symbol file", opts->symbolfile != NULL);
+        rc |= expect_true("failed stop says so", strstr(state->ui_msg, "Failed: Stop replay") != NULL);
+    }
+    closeAudioInDevice(opts);
 
     free_test_runtime(&runtime);
     (void)remove(sym_path);
@@ -1982,40 +2383,82 @@ test_ui_io_command_queue_applies_local_input_and_network_payloads(void) {
     rc |= expect_int_eq("TCP command passes port", g_last_tcp_connect_audio_port, 7355);
     rc |= expect_int_eq("TCP command switches input type on success", opts->audio_in_type, AUDIO_IN_TCP);
     rc |= expect_true("TCP command stores host on success", strcmp(opts->tcp_hostname, "example.invalid") == 0);
-    rc |= expect_true("TCP command writes success toast", strstr(state->ui_msg, "TCP audio connected") != NULL);
+    rc |= expect_true("TCP command writes success toast",
+                      strstr(state->ui_msg, "Applied: TCP audio -> example.invalid:7355") != NULL);
 
     struct HostPortPayload tcp_fail = {0};
     DSD_SNPRINTF(tcp_fail.host, sizeof tcp_fail.host, "%s", "fail.invalid");
     tcp_fail.port = 1234;
-    g_tcp_connect_audio_result = -1;
+    g_tcp_connect_audio_result = DSD_AUDIO_INPUT_KEPT;
     dsd_app_command_submit(DSD_APP_CMD_TCP_CONNECT_AUDIO_CFG, &tcp_fail, sizeof tcp_fail);
     applied = dsd_app_drain_cmds(opts, state);
     rc |= expect_int_eq("TCP failure command drain count", applied, 1);
     rc |= expect_int_eq("TCP failure still calls connector", g_tcp_connect_audio_calls, 2);
     rc |=
         expect_true("TCP failure does not replace connected host", strcmp(opts->tcp_hostname, "example.invalid") == 0);
-    rc |= expect_true("TCP failure writes failure toast", strstr(state->ui_msg, "TCP audio connect failed") != NULL);
+    rc |= expect_true("TCP failure writes failure toast",
+                      strstr(state->ui_msg, "Failed: TCP audio -> fail.invalid:1234") != NULL);
 
+    /* UDP binds now, through the real backend, on a loopback port nothing holds (issue #634). */
+    dsd_net_audio_input_hooks hooks;
+    DSD_MEMSET(&hooks, 0, sizeof hooks);
+    hooks.udp_start = udp_input_start;
+    hooks.udp_stop = udp_input_stop;
+    hooks.udp_read_sample = udp_input_read_sample;
+    hooks.udp_read_sample_wait = udp_input_read_sample_wait;
+    dsd_net_audio_input_hooks_set(hooks);
+    const int udp_port = free_loopback_udp_port();
+    rc |= expect_true("a free loopback udp port", udp_port > 0);
     struct HostPortPayload udp = {0};
-    udp.port = 45000;
+    udp.port = udp_port;
     dsd_app_command_submit(DSD_APP_CMD_UDP_INPUT_CFG, &udp, sizeof udp);
     applied = dsd_app_drain_cmds(opts, state);
+    char udp_name[64];
+    DSD_SNPRINTF(udp_name, sizeof udp_name, "udp:127.0.0.1:%d", udp_port);
     rc |= expect_int_eq("UDP input command drain count", applied, 1);
     rc |= expect_int_eq("UDP input switches input type", opts->audio_in_type, AUDIO_IN_UDP);
-    rc |= expect_int_eq("UDP input stores port", opts->udp_in_portno, 45000);
-    rc |= expect_true("UDP input allows empty bind address", opts->udp_in_bindaddr[0] == '\0');
-    rc |= expect_true("UDP input uses logical device name", strcmp(opts->audio_in_dev, "udp") == 0);
-    rc |= expect_true("UDP input toast uses loopback fallback", strstr(state->ui_msg, "127.0.0.1:45000") != NULL);
+    rc |= expect_true("UDP input binds", opts->udp_in_ctx != NULL);
+    rc |= expect_int_eq("UDP input stores port", opts->udp_in_portno, udp_port);
+    rc |= expect_true("UDP input binds the loopback for an empty address",
+                      strcmp(opts->udp_in_bindaddr, "127.0.0.1") == 0);
+    rc |= expect_true("UDP input is named as a saved config reopens it", strcmp(opts->audio_in_dev, udp_name) == 0);
+    rc |= expect_true("UDP input toast uses loopback fallback", strstr(state->ui_msg, udp_name + 4) != NULL);
 
-    const char wav_path[] = "/tmp/dsdneo-input.wav";
-    dsd_app_command_submit(DSD_APP_CMD_INPUT_WAV_SET, wav_path, sizeof wav_path);
-    dsd_app_command_submit(DSD_APP_CMD_INPUT_SYM_STREAM_SET, "capture.sym", sizeof "capture.sym");
-    dsd_app_command_submit(DSD_APP_CMD_INPUT_SET_PULSE, NULL, 0);
-    applied = dsd_app_drain_cmds(opts, state);
-    rc |= expect_int_eq("local input command drain count", applied, 3);
-    rc |= expect_int_eq("Pulse input command wins final type", opts->audio_in_type, AUDIO_IN_PULSE);
-    rc |= expect_true("Pulse input command stores logical device", strcmp(opts->audio_in_dev, "pulse") == 0);
-    rc |= expect_true("Pulse input command writes toast", strstr(state->ui_msg, "Input switched to Pulse") != NULL);
+    /* Files open by -i's rules, from a temporary directory; the last switch, to the default Pulse device, may find
+       no capture device on the host, and then leaves the symbol stream running. */
+    dsd_test_temp_cwd cwd;
+    if (dsd_test_temp_cwd_enter(&cwd, "dsdneo_cfg_local_inputs") != 0) {
+        DSD_FPRINTF(stderr, "FAIL: local input temp directory\n");
+        rc |= 1;
+    } else {
+        static const unsigned char k_raw[32] = {0};
+        rc |= write_test_file("input.pcm", k_raw, sizeof k_raw);
+        rc |= write_test_file("capture.sym", k_raw, sizeof k_raw);
+        dsd_app_command_submit(DSD_APP_CMD_INPUT_WAV_SET, "input.pcm", sizeof "input.pcm");
+        applied = dsd_app_drain_cmds(opts, state);
+        rc |= expect_int_eq("headerless file opens", applied, 1);
+        rc |= expect_int_eq("headerless file is PCM", opts->audio_in_type, AUDIO_IN_WAV);
+        rc |= expect_true("headerless file stops the udp input", opts->udp_in_ctx == NULL);
+        dsd_app_command_submit(DSD_APP_CMD_INPUT_SYM_STREAM_SET, "capture.sym", sizeof "capture.sym");
+        dsd_app_command_submit(DSD_APP_CMD_INPUT_SET_PULSE, NULL, 0);
+        applied = dsd_app_drain_cmds(opts, state);
+        rc |= expect_int_eq("local input command drain count", applied, 2);
+        if (opts->audio_in_type == AUDIO_IN_PULSE) {
+            rc |= expect_true("Pulse input command names the default device", strcmp(opts->audio_in_dev, "pulse") == 0);
+            rc |= expect_true("Pulse input command writes toast",
+                              strstr(state->ui_msg, "Applied: Pulse input -> default device") != NULL);
+        } else {
+            rc |= expect_int_eq("a failed Pulse switch keeps the symbol stream", opts->audio_in_type,
+                                AUDIO_IN_SYMBOL_FLT);
+            rc |= expect_true("a failed Pulse switch says so", strstr(state->ui_msg, "Failed: Pulse input") != NULL);
+        }
+        closeAudioInDevice(opts);
+        (void)remove("input.pcm");
+        (void)remove("capture.sym");
+        rc |= expect_int_eq("local input temp directory removed", dsd_test_temp_cwd_leave(&cwd), 0);
+    }
+    closeAudioInDevice(opts);
+    dsd_net_audio_input_hooks_set((dsd_net_audio_input_hooks){0});
 
     free_test_runtime(&runtime);
     return rc;
@@ -2120,19 +2563,49 @@ test_ui_file_open_commands_report_service_results(void) {
     return rc;
 }
 
+typedef struct {
+    const char* dir;
+    int found;
+} dir_sweep;
+
+static int
+sweep_file_cb(const char* name, void* user) {
+    dir_sweep* sweep = (dir_sweep*)user;
+    char path[DSD_TEST_PATH_MAX];
+    sweep->found++;
+    if (dsd_test_path_join(path, sizeof path, sweep->dir, name) == 0) {
+        (void)remove(path);
+    }
+    return 0;
+}
+
+/* Removes every file left in @p dir and returns how many there were, or -1 when it cannot be read. */
+static int
+remove_files_left_in(const char* dir) {
+    dir_sweep sweep = {dir, 0};
+    if (dsd_dir_list(dir, sweep_file_cb, &sweep) != 0) {
+        return -1;
+    }
+    return sweep.found;
+}
+
 static int
 test_ui_file_capture_commands_manage_handles(void) {
     char wav_dir[DSD_TEST_PATH_MAX] = {0};
     char sym_path[DSD_TEST_PATH_MAX] = {0};
-    if (!dsd_test_mkdtemp(wav_dir, sizeof wav_dir, "dsdneo_queue_wav_dir")
-        || create_removed_temp_path("dsdneo_queue_sym_stop", sym_path, sizeof sym_path) != 0) {
+    if (!dsd_test_mkdtemp(wav_dir, sizeof wav_dir, "dsdneo_queue_wav_dir")) {
         DSD_FPRINTF(stderr, "FAIL: temp capture path setup failed\n");
+        return 1;
+    }
+    if (create_removed_temp_path("dsdneo_queue_sym_stop", sym_path, sizeof sym_path) != 0) {
+        DSD_FPRINTF(stderr, "FAIL: temp capture path setup failed\n");
+        (void)dsd_test_rmdir(wav_dir);
         return 1;
     }
 
     test_runtime runtime;
     if (alloc_test_runtime(&runtime) != 0) {
-        (void)remove(wav_dir);
+        (void)dsd_test_rmdir(wav_dir);
         return 1;
     }
     dsd_opts* opts = runtime.opts;
@@ -2201,20 +2674,52 @@ test_ui_file_capture_commands_manage_handles(void) {
     } else {
         opts->symbol_out_f = sym_fp;
         DSD_SNPRINTF(opts->symbol_out_file, sizeof opts->symbol_out_file, "%s", sym_path);
+        /* As openSymbolOutFile() names the capture it opened. */
+        DSD_SNPRINTF(opts->symbol_out_open_path, sizeof opts->symbol_out_open_path, "%s", sym_path);
         opts->symbol_out_file_is_auto = 1;
         dsd_app_command_submit(DSD_APP_CMD_SYMCAP_STOP, NULL, 0);
         applied = dsd_app_drain_cmds(opts, state);
         rc |= expect_int_eq("symbol capture stop command drains", applied, 1);
         rc |= expect_true("symbol capture stop closes handle", opts->symbol_out_f == NULL);
-        rc |= expect_true("symbol capture stop stages replay input path", strcmp(opts->audio_in_dev, sym_path) == 0);
+        /* The closed capture is what Replay last replays; the running input keeps its name (issue #634). */
+        rc |= expect_true("symbol capture stop records the capture", strcmp(opts->symbol_capture_last, sym_path) == 0);
+        rc |= expect_true("symbol capture stop leaves the input name", strcmp(opts->audio_in_dev, sym_path) != 0);
         rc |= expect_int_eq("symbol capture stop clears auto flag", opts->symbol_out_file_is_auto, 0);
         rc |= expect_int_eq("symbol capture stop event category",
                             state->event_history_s[0].Event_History_Items[1].category, DSD_EVENT_CATEGORY_SYSTEM);
     }
 
+    /* WAV stop and the toggle-off remove their temp pairs, so the directory should be empty by now. When they fail,
+     * close what they left open and remove what they left behind, failing the test for it, so the directory still
+     * goes. */
+    if (opts->wav_out_f != NULL) {
+        sf_close(opts->wav_out_f);
+        opts->wav_out_f = NULL;
+    }
+    if (opts->wav_out_fR != NULL) {
+        sf_close(opts->wav_out_fR);
+        opts->wav_out_fR = NULL;
+    }
+    /* Likewise the symbol capture handle a failed stop left open (already a failed check above): native Windows does
+     * not remove an open file, so it must be closed before sym_path is removed. */
+    if (opts->symbol_out_f != NULL) {
+        fclose(opts->symbol_out_f);
+        opts->symbol_out_f = NULL;
+    }
     free_test_runtime(&runtime);
     (void)remove(sym_path);
-    (void)remove(wav_dir);
+    const int left_in_wav_dir = remove_files_left_in(wav_dir);
+    if (left_in_wav_dir < 0) {
+        DSD_FPRINTF(stderr, "FAIL: could not list WAV temp directory %s: %s\n", wav_dir, strerror(errno));
+        rc |= 1;
+    } else if (left_in_wav_dir > 0) {
+        DSD_FPRINTF(stderr, "FAIL: WAV stop left %d file(s) in %s\n", left_in_wav_dir, wav_dir);
+        rc |= 1;
+    }
+    if (dsd_test_rmdir(wav_dir) != 0) {
+        DSD_FPRINTF(stderr, "FAIL: could not remove WAV temp directory %s: %s\n", wav_dir, strerror(errno));
+        rc |= 1;
+    }
     return rc;
 }
 
@@ -2415,17 +2920,33 @@ test_ui_output_lrrp_and_p25_parameter_commands_dispatch_through_queue(void) {
     dsd_opts* opts = runtime.opts;
     dsd_state* state = runtime.state;
 
+    int rc = 0;
+    rc |= expect_true("no input runs before the Pulse input switch", opts->audio_in_stream == NULL);
+    char in_dev_before[sizeof opts->audio_in_dev];
+    DSD_SNPRINTF(in_dev_before, sizeof in_dev_before, "%s", opts->audio_in_dev);
+    const int in_type_before = opts->audio_in_type;
+
     dsd_app_command_submit(DSD_APP_CMD_PULSE_OUT_SET, "speaker", sizeof "speaker");
     dsd_app_command_submit(DSD_APP_CMD_PULSE_IN_SET, "microphone", sizeof "microphone");
     int applied = dsd_app_drain_cmds(opts, state);
 
-    int rc = 0;
     rc |= expect_int_eq("Pulse I/O command drain count", applied, 2);
     rc |= expect_true("Pulse output selects pulse device", strcmp(opts->audio_out_dev, "pulse") == 0);
     rc |= expect_int_eq("Pulse output selects pulse backend", opts->audio_out_type, 0);
-    rc |= expect_true("Pulse input selects pulse device", strcmp(opts->audio_in_dev, "pulse") == 0);
-    rc |= expect_int_eq("Pulse input selects pulse backend", opts->audio_in_type, AUDIO_IN_PULSE);
-    rc |= expect_true("Pulse input writes toast", strstr(state->ui_msg, "Pulse input") != NULL);
+    /* The switch opens the device (issue #634), which the host may not have; the null audio backend opens any. Either
+       the input runs under the name a saved config reopens, or the one before it runs on. */
+    if (opts->audio_in_stream != NULL) {
+        rc |= expect_true("Pulse input names the device", strcmp(opts->audio_in_dev, "pulse:microphone") == 0);
+        rc |= expect_int_eq("Pulse input selects pulse backend", opts->audio_in_type, AUDIO_IN_PULSE);
+        rc |= expect_true("Pulse input writes toast",
+                          strstr(state->ui_msg, "Applied: Pulse input -> microphone") != NULL);
+    } else {
+        rc |= expect_true("a failed Pulse input switch keeps the input name",
+                          strcmp(opts->audio_in_dev, in_dev_before) == 0);
+        rc |= expect_int_eq("a failed Pulse input switch keeps the input type", opts->audio_in_type, in_type_before);
+        rc |= expect_true("a failed Pulse input switch says so",
+                          strstr(state->ui_msg, "Failed: Pulse input -> microphone") != NULL);
+    }
 
     dsd_app_command_submit(DSD_APP_CMD_LRRP_SET_HOME, NULL, 0);
     applied = dsd_app_drain_cmds(opts, state);
@@ -2982,13 +3503,13 @@ test_ui_rtl_setting_commands_stage_without_live_restart(void) {
     dsd_app_command_submit(DSD_APP_CMD_RTL_SET_SQL_DB, &sql_off, sizeof sql_off);
     (void)dsd_app_drain_cmds(opts, state);
     rc |= expect_true("RTL squelch command accepts off", opts->rtl_squelch_level == 0.0);
-    rc |= expect_true("RTL squelch off toast names it off", strstr(state->ui_msg, "RTL squelch -> off") != NULL);
+    rc |= expect_true("RTL squelch off toast names it off", strstr(state->ui_msg, "squelch -> off") != NULL);
 
     double sql_back = -55.0;
     dsd_app_command_submit(DSD_APP_CMD_RTL_SET_SQL_DB, &sql_back, sizeof sql_back);
     (void)dsd_app_drain_cmds(opts, state);
     rc |= expect_true("RTL squelch toast still states a real threshold",
-                      strstr(state->ui_msg, "RTL squelch -> -55.0 dB") != NULL);
+                      strstr(state->ui_msg, "Applied: squelch -> -55.0 dB") != NULL);
 
     free_test_runtime(&runtime);
     return rc;
@@ -2998,10 +3519,15 @@ test_ui_rtl_setting_commands_stage_without_live_restart(void) {
 
 int
 main(void) {
+    if (dsd_socket_init() != 0) {
+        DSD_FPRINTF(stderr, "FAIL: dsd_socket_init\n");
+        return 1;
+    }
     int rc = 0;
     rc |= test_basic_pulse_config_apply();
     rc |= test_input_warn_db_apply_clamps_to_window();
     rc |= test_output_config_without_frontend_preserves_active_frontend();
+    rc |= test_config_apply_under_row_tone_policy_keeps_the_row();
     rc |= test_ui_command_queue_applies_fifo();
     rc |= test_ui_command_queue_overflow_drops_oldest();
     rc |= test_ui_command_queue_truncates_oversized_payload_string();
@@ -3046,6 +3572,9 @@ main(void) {
 #ifdef DSD_NEO_TEST_RTL_WRAP
     rc |= test_config_reapply_converts_rtl_squelch_from_db();
     rc |= test_config_reapply_under_row_squelch_keeps_the_row();
+    rc |= test_config_reopen_on_another_frequency_forgets_the_carrier_codes();
+    rc |= test_config_source_change_is_a_carrier_boundary();
+    rc |= test_stream_restart_on_another_source_is_a_carrier_boundary();
 #endif
 #endif
     return rc ? 1 : 0;

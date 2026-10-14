@@ -12,19 +12,28 @@
 #include <dsd-neo/app_control/analog_width_view.h>
 #include <dsd-neo/app_control/commands.h>
 #include <dsd-neo/app_control/frontend.h>
+#include <dsd-neo/app_control/rtl_gain_view.h>
+#include <dsd-neo/app_control/rx_tone_view.h>
+#include <dsd-neo/app_control/scan_row_view.h>
 #include <dsd-neo/app_control/snapshot.h>
+#include <dsd-neo/app_control/squelch_view.h>
+#include <dsd-neo/core/analog_tone.h>
 #include <dsd-neo/core/constants.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/opts_fwd.h>
+#include <dsd-neo/core/parse.h>
 #include <dsd-neo/core/power.h>
 #include <dsd-neo/core/state.h>
 #include <dsd-neo/core/talkgroup_policy.h>
 #include <dsd-neo/platform/audio.h>
 #include <dsd-neo/platform/posix_compat.h>
 #include <dsd-neo/runtime/analog_channel.h>
+#include <dsd-neo/runtime/analog_tones.h>
 #include <dsd-neo/runtime/config.h>
 #include <dsd-neo/runtime/decode_mode.h>
 #include <dsd-neo/runtime/scan_mode.h>
+#include <dsd-neo/runtime/scan_row_edit.h>
+#include <dsd-neo/runtime/squelch.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -35,6 +44,7 @@
 #include "dsd-neo/core/safe_api.h"
 #include "dsd-neo/core/state_fwd.h"
 #include "dsd-neo/runtime/call_alert.h"
+#include "dsd-neo/runtime/scan_options.h"
 #include "dsd-neo/ui/menu_core.h"
 #include "menu_callbacks.h"
 #include "menu_env.h"
@@ -655,6 +665,550 @@ act_set_audio_lpf(void* v) {
     ui_prompt_open_int_async("Audio LPF cutoff Hz (0=off)", def, cb_audio_lpf, v);
 }
 
+// ---- "This channel" session edits (issue #518) ----
+
+/* While a scan row is on air and takes a session edit of a row's setting, the squelch, width, gain and tone rows open
+   this chooser first: the configured default (the row's own prompt, as with no scan), this channel's own value for the
+   rest of the session, this channel following the default (offered when its list sets one), or back to the list value
+   (offered when it runs an edit). The edit goes to the row named when the chooser opened, whatever the scan has moved
+   on to since; the command refuses it when that scan has ended. One chooser at a time, so one static context. */
+enum { SCOPE_CHOICE_DEFAULT, SCOPE_CHOICE_SET, SCOPE_CHOICE_INHERIT, SCOPE_CHOICE_RESET, SCOPE_CHOICE_MAX };
+
+typedef struct {
+    uint32_t field;
+    void (*open_default)(void*);
+    dsd_app_scan_row_view view;
+    int count;
+    int actions[SCOPE_CHOICE_MAX];
+    char text[SCOPE_CHOICE_MAX][96];
+    const char* items[SCOPE_CHOICE_MAX];
+    /* The tone policy the this-channel list prompt is open for. */
+    int tone_mode;
+    /* What the row ran when the chooser opened, which its prompts open on whatever the scan has moved on to since: its
+       own options (has_row 0 for none) and the settings in force then. */
+    int has_row;
+    dsd_scan_option_values row;
+    double squelch_level;
+    int squelch_mode;
+    int squelch_margin_db;
+    int width_hz;
+    /* On audio input with a rigctl peer (issue #621), the width is the passband the peer is asked for: peer_passband,
+       and peer_width_hz what the row ran of it (-B standing in for an unset NFM width; 0 off a peer session). */
+    int peer_passband;
+    int peer_width_hz;
+    int gain_db;
+    int tone_filter;
+    dsd_tone_set tone_set;
+} scope_chooser_ctx;
+
+static scope_chooser_ctx g_scope;
+
+static const char* const k_scope_tone_choices[] = {"Off", "Allow list...", "Block list..."};
+
+/* The row options the captured row ran when the chooser opened (its own values, its session edit included). */
+static const dsd_scan_option_values*
+scope_row_options(void) {
+    return g_scope.has_row ? &g_scope.row : NULL;
+}
+
+static void
+scope_submit(int action, const dsd_app_scan_row_edit_payload* values) {
+    dsd_app_scan_row_edit_payload p;
+    if (dsd_app_scan_row_view_payload(&g_scope.view, g_scope.field, action, &p) != 0) {
+        return;
+    }
+    if (values) {
+        p.squelch_db = values->squelch_db;
+        p.squelch_mode = values->squelch_mode;
+        p.squelch_margin_db = values->squelch_margin_db;
+        p.width_hz = values->width_hz;
+        p.tone_mode = values->tone_mode;
+        p.gain_db = values->gain_db;
+        DSD_SNPRINTF(p.tone_list, sizeof p.tone_list, "%s", values->tone_list);
+    }
+    (void)dsd_app_command_scan_row_edit(&p);
+}
+
+/* This channel's squelch as typed: whole dB from -100 to 0 (0 or off = off), auto[+N], which the engine holds to an nfm
+   or am row, or noise[+N], which it holds to an nfm row. Audio input takes no auto (issue #628). A refusal says why,
+   never what was typed. */
+static void
+cb_scope_squelch(void* u, const char* text) {
+    UNUSED(u);
+    if (!text) {
+        return;
+    }
+    const int audio = dsd_squelch_input_kind(dsd_app_get_latest_opts_snapshot()) == DSD_SQUELCH_INPUT_AUDIO;
+    dsd_app_scan_row_edit_payload values = {0};
+    dsd_squelch_setting setting;
+    char why[96];
+    int db = 0;
+    if (dsd_parse_int_strict(text, 10, -100, 0, &db) == 0) {
+        values.squelch_db = db;
+    } else if (dsd_squelch_setting_parse(text, &setting, why, sizeof why) == 0
+               && (dsd_squelch_setting_is_dynamic(&setting) || dsd_squelch_setting_is_off(&setting))
+               && !(audio && setting.mode == DSD_SQUELCH_MODE_AUTO)) {
+        values.squelch_mode = setting.mode;
+        values.squelch_margin_db = dsd_squelch_setting_is_dynamic(&setting) ? setting.margin_db : 0;
+    } else {
+        ui_statusf("%s", audio ? "Squelch on this channel: whole dB from -100 to 0, off or noise[+N]"
+                               : "Squelch on this channel: whole dB from -100 to 0, off, auto[+N] or noise[+N]");
+        return;
+    }
+    scope_submit(DSD_SCAN_ROW_EDIT_SET, &values);
+}
+
+static void
+cb_scope_width(void* u, int ok, int hz) {
+    UNUSED(u);
+    if (ok) {
+        dsd_app_scan_row_edit_payload values = {0};
+        values.width_hz = hz;
+        scope_submit(DSD_SCAN_ROW_EDIT_SET, &values);
+    }
+}
+
+static void
+cb_scope_gain(void* u, int ok, int db) {
+    UNUSED(u);
+    if (ok) {
+        dsd_app_scan_row_edit_payload values = {0};
+        values.gain_db = db;
+        scope_submit(DSD_SCAN_ROW_EDIT_SET, &values);
+    }
+}
+
+static void
+cb_scope_tone_list(void* u, const char* text) {
+    UNUSED(u);
+    if (text) {
+        dsd_app_scan_row_edit_payload values = {0};
+        values.tone_mode = g_scope.tone_mode;
+        DSD_SNPRINTF(values.tone_list, sizeof values.tone_list, "%s", text);
+        scope_submit(DSD_SCAN_ROW_EDIT_SET, &values);
+    }
+}
+
+static void
+chooser_done_scope_tone(void* u, int sel) {
+    if (sel == DSD_TONE_FILTER_OFF) {
+        /* Off keeps the list the row ran, as the configured policy's off does: allow or block takes it up again. */
+        dsd_app_scan_row_edit_payload values = {0};
+        values.tone_mode = DSD_TONE_FILTER_OFF;
+        (void)dsd_tone_set_format(&g_scope.tone_set, values.tone_list, sizeof values.tone_list);
+        scope_submit(DSD_SCAN_ROW_EDIT_SET, &values);
+        return;
+    }
+    if (sel != DSD_TONE_FILTER_ALLOW && sel != DSD_TONE_FILTER_BLOCK) {
+        return;
+    }
+    g_scope.tone_mode = sel;
+    /* The list the row ran when the chooser opened, its own or the configured one it followed. */
+    char list[DSD_APP_TONE_FILTER_LIST_SIZE] = {0};
+    (void)dsd_tone_set_format(&g_scope.tone_set, list, sizeof list);
+    ui_prompt_open_string_async(sel == DSD_TONE_FILTER_ALLOW ? "Allow on this channel (/ between, e.g. 67.0/D023N)"
+                                                             : "Block on this channel (/ between, e.g. 67.0/D023N)",
+                                list, sizeof list, cb_scope_tone_list, u);
+}
+
+static void
+scope_open_squelch(void* u, const dsd_scan_option_values* row) {
+    /* What the row runs: its own squelch, or the default it follows. */
+    char text[DSD_SQUELCH_TEXT_SIZE];
+    if (row && (row->present & DSD_SCAN_OPT_SQUELCH)) {
+        if (dsd_squelch_mode_is_dynamic(row->squelch_mode)) {
+            DSD_SNPRINTF(text, sizeof text, "%s+%d", row->squelch_mode == DSD_SQUELCH_MODE_NOISE ? "noise" : "auto",
+                         row->squelch_margin_db);
+        } else {
+            DSD_SNPRINTF(text, sizeof text, "%d", row->squelch_db);
+        }
+    } else if (dsd_squelch_mode_is_dynamic(g_scope.squelch_mode)) {
+        /* An am row runs an inherited noise default as auto, and refuses noise of its own: offer what it runs. */
+        const int am = dsd_scan_mode_analog_kind((dsd_scan_mode)g_scope.view.mode) == DSD_ANALOG_DEMOD_AM;
+        const int noise = g_scope.squelch_mode == DSD_SQUELCH_MODE_NOISE && !am;
+        DSD_SNPRINTF(text, sizeof text, "%s+%d", noise ? "noise" : "auto",
+                     dsd_squelch_setting_auto(g_scope.squelch_margin_db).margin_db);
+    } else if (dsd_squelch_is_off(g_scope.squelch_level)) {
+        DSD_SNPRINTF(text, sizeof text, "%s", "off");
+    } else {
+        DSD_SNPRINTF(text, sizeof text, "%d", (int)pwr_to_dB(g_scope.squelch_level));
+    }
+    /* Audio input takes a level or noise (issue #628): an auto setting, or noise on an am row, does not run there, so
+       the prompt offers what does run: off. */
+    if (dsd_squelch_input_kind(dsd_app_get_latest_opts_snapshot()) == DSD_SQUELCH_INPUT_AUDIO) {
+        if (strncmp(text, "auto", 4) == 0) {
+            DSD_SNPRINTF(text, sizeof text, "%s", "off");
+        }
+        ui_prompt_open_string_async("Squelch on this channel (dB -100..0, off, noise[+N])", text, sizeof text,
+                                    cb_scope_squelch, u);
+        return;
+    }
+    ui_prompt_open_string_async("Squelch on this channel (dB -100..0, off, auto[+N], noise[+N])", text, sizeof text,
+                                cb_scope_squelch, u);
+}
+
+/* The width rows' words (issues #524, #525, #621), by demodulator and session: the channel filter's bandwidth on a
+   radio input, the passband a rigctl peer (-U) that demodulates audio input is asked for. The scope chooser and the
+   prompts take their titles from here alone, so their wording cannot drift apart. Literals: the chooser and the prompts
+   keep the pointer. The configured NFM passband's prompt names what an unset width asks for (-B, or the peer's own
+   passband), so its title is WIDTH_NFM_PASSBAND_PROMPT_FMT filled in. */
+typedef struct {
+    const char* chooser;      /* the scope chooser */
+    const char* this_channel; /* this channel's own width */
+    const char* configured;   /* the configured width, the default every channel follows; NULL: the format below */
+} width_titles;
+
+#define WIDTH_NFM_PASSBAND_PROMPT_FMT "NFM passband Hz (8000..25000; 0 = %s)"
+
+static const width_titles k_width_titles[2][2] = {
+    /* NFM: on a radio input, on a rigctl peer */
+    {{"NFM bandwidth", "NFM bandwidth Hz on this channel (8000..25000)",
+      "NFM bandwidth Hz (8000..25000; 0 = default 16000)"},
+     {"NFM passband", "NFM passband Hz on this channel (8000..25000)", NULL}},
+    /* AM: on a radio input, on a rigctl peer */
+    {{"AM bandwidth", "AM bandwidth Hz on this channel (5000..20000)",
+      "AM bandwidth Hz (5000..20000; 0 = default 6000)"},
+     {"AM passband", "AM passband Hz on this channel (5000..20000)", "AM passband Hz (5000..20000; 0 = default 6000)"}},
+};
+
+/* The words for analog @p kind (dsd_analog_demod) on a rigctl peer session (@p peer) or not. */
+static const width_titles*
+width_titles_of(int kind, int peer) {
+    return &k_width_titles[kind == DSD_ANALOG_DEMOD_AM ? 1 : 0][peer ? 1 : 0];
+}
+
+static void
+scope_open_width(void* u, const dsd_scan_option_values* row) {
+    const int kind = dsd_scan_mode_analog_kind((dsd_scan_mode)g_scope.view.mode);
+    /* What the row runs: its own width, the configured width it follows, on a rigctl peer the passband that stands in
+       for an unset one (-B, issue #621), else the kind's default. */
+    int hz = (row && (row->present & DSD_SCAN_OPT_BANDWIDTH)) ? row->channel_bw_hz : g_scope.width_hz;
+    if (hz <= 0) {
+        hz = g_scope.peer_width_hz;
+    }
+    if (hz <= 0) {
+        hz = dsd_analog_width_default_hz(kind);
+    }
+    ui_prompt_open_int_async(width_titles_of(kind, g_scope.peer_passband)->this_channel, hz, cb_scope_width, u);
+}
+
+static void
+scope_open_tone(void* u) {
+    const int at = (g_scope.tone_filter >= DSD_TONE_FILTER_OFF && g_scope.tone_filter <= DSD_TONE_FILTER_BLOCK)
+                       ? g_scope.tone_filter
+                       : DSD_TONE_FILTER_OFF;
+    ui_chooser_start_at("Tone filter on this channel", k_scope_tone_choices, 3, at, chooser_done_scope_tone, u);
+}
+
+/* This channel's own value: a prompt opened on what it runs now. */
+static void
+scope_open_set(void* u) {
+    const dsd_scan_option_values* row = scope_row_options();
+    switch (g_scope.field) {
+        case DSD_SCAN_ROW_FIELD_SQUELCH: scope_open_squelch(u, row); return;
+        case DSD_SCAN_ROW_FIELD_WIDTH: scope_open_width(u, row); return;
+        case DSD_SCAN_ROW_FIELD_GAIN:
+            ui_prompt_open_int_async("Gain on this channel (0=AGC, 0..49)", g_scope.gain_db, cb_scope_gain, u);
+            return;
+        case DSD_SCAN_ROW_FIELD_TONE: scope_open_tone(u); return;
+        default: return;
+    }
+}
+
+static void
+chooser_done_scope(void* u, int sel) {
+    if (sel < 0 || sel >= g_scope.count) {
+        return;
+    }
+    switch (g_scope.actions[sel]) {
+        case SCOPE_CHOICE_DEFAULT: g_scope.open_default(u); return;
+        case SCOPE_CHOICE_SET: scope_open_set(u); return;
+        case SCOPE_CHOICE_INHERIT: scope_submit(DSD_SCAN_ROW_EDIT_INHERIT, NULL); return;
+        default: scope_submit(DSD_SCAN_ROW_EDIT_RESET, NULL); return;
+    }
+}
+
+static char*
+scope_add(int action) {
+    const int i = g_scope.count++;
+    g_scope.actions[i] = action;
+    g_scope.items[i] = g_scope.text[i];
+    return g_scope.text[i];
+}
+
+/* Open the scope chooser for @p field under the title @p title when the scan row on air takes a session edit of it
+   (and, for a width, runs the demodulator @p kind is the width of; -1 for any field but the width); otherwise open
+   @p open_default, the row's own prompt, at once. */
+/* What the row on air runs now, captured with it (one snapshot pair, so they agree). */
+static void
+scope_capture(const dsd_opts* opts, const dsd_state* state) {
+    const dsd_scan_option_values* row = dsd_scan_mode_row_options(state);
+    g_scope.has_row = row != NULL;
+    if (row) {
+        g_scope.row = *row;
+    }
+    if (opts) {
+        g_scope.squelch_level = opts->rtl_squelch_level;
+        g_scope.squelch_mode = opts->rtl_squelch_mode;
+        g_scope.squelch_margin_db = opts->rtl_squelch_margin_db;
+        g_scope.width_hz = dsd_opts_analog_width_hz(opts);
+        g_scope.gain_db = opts->rtl_gain_value;
+        g_scope.tone_filter = opts->analog_tone_filter;
+        g_scope.tone_set = opts->analog_tone_set;
+    }
+    /* On audio input with a rigctl peer (issue #621): the passband the row ran, of the width kind it runs. A pair whose
+       options run the other demodulator gives none, so an AM passband never opens an NFM width prompt. */
+    dsd_app_analog_width_view width;
+    (void)dsd_app_analog_width_view_get(opts, state, NULL, &width);
+    g_scope.peer_passband = width.peer_passband;
+    g_scope.peer_width_hz =
+        (width.peer_passband && width.kind == dsd_scan_mode_analog_kind((dsd_scan_mode)g_scope.view.mode))
+            ? width.width_hz
+            : 0;
+}
+
+static void
+scope_or_default(void* v, uint32_t field, int kind, const char* title, void (*open_default)(void*)) {
+    const dsd_opts* opts = dsd_app_get_latest_opts_snapshot();
+    const dsd_state* state = dsd_app_get_latest_snapshot();
+    dsd_app_scan_row_view view;
+    (void)dsd_app_scan_row_view_get(opts, state, &view);
+    if (!dsd_app_scan_row_view_offers(&view, field)
+        || (kind >= 0 && dsd_scan_mode_analog_kind((dsd_scan_mode)view.mode) != kind)) {
+        open_default(v);
+        return;
+    }
+    DSD_MEMSET(&g_scope, 0, sizeof g_scope);
+    g_scope.field = field;
+    g_scope.open_default = open_default;
+    g_scope.view = view;
+    scope_capture(opts, state);
+    DSD_SNPRINTF(scope_add(SCOPE_CHOICE_DEFAULT), sizeof g_scope.text[0], "%s", "All channels (default)...");
+    DSD_SNPRINTF(scope_add(SCOPE_CHOICE_SET), sizeof g_scope.text[0], "This channel (%s)...", view.label);
+    if (view.listed & field) {
+        DSD_SNPRINTF(scope_add(SCOPE_CHOICE_INHERIT), sizeof g_scope.text[0], "%s", "This channel: use the default");
+    }
+    if (view.edited & field) {
+        DSD_SNPRINTF(scope_add(SCOPE_CHOICE_RESET), sizeof g_scope.text[0], "%s",
+                     "This channel: back to the list value");
+    }
+    ui_chooser_start_at(title, g_scope.items, g_scope.count, 0, chooser_done_scope, v);
+}
+
+// ---- Squelch: the configured default, or this channel's (issue #628: radio and audio input) ----
+
+static void
+act_set_squelch_default(void* v) {
+    UiCtx* c = (UiCtx*)v;
+    /* The configured default, as the squelch grammar reads it back: "off" for a squelch that is off rather than
+     * pwr_to_dB()'s -120 floor, so accepting what is shown never turns a disabled squelch into a real threshold, and
+     * "auto+10" or "noise+10" for a dynamic squelch (issue #518 follow-up). The command edits the configured default: a
+     * scan row overriding the squelch (issue #521) keeps its own, so offer the default rather than the row's value. */
+    dsd_app_squelch_view view;
+    char text[DSD_SQUELCH_TEXT_SIZE];
+    (void)dsd_app_squelch_view_get(c->opts, dsd_app_get_latest_snapshot(), &view);
+    (void)dsd_app_squelch_view_configured_text(&view, text, sizeof text);
+    /* Audio input has no channel power for the auto squelch to learn a floor from, so it takes a level or noise. */
+    const char* title = dsd_squelch_input_kind(c->opts) == DSD_SQUELCH_INPUT_AUDIO
+                            ? "Squelch (dB, off or noise[+N])"
+                            : "Squelch (dB, off, auto[+N] or noise[+N])";
+    ui_prompt_open_string_async(title, text, sizeof text, cb_rtl_sql_text, c);
+}
+
+void
+act_set_squelch(void* v) {
+    scope_or_default(v, DSD_SCAN_ROW_FIELD_SQUELCH, -1, "Squelch", act_set_squelch_default);
+}
+
+// ---- Channel widths (issues #524, #525): a radio input's channel filter, or the passband a rigctl peer that
+// demodulates audio input is asked for (issue #621) ----
+
+/* A channel width row of analog @p kind: on a radio input, where the width is the channel filter, and on audio input
+   with a rigctl peer (-U) that demodulates it, where it is the passband the peer is asked for (issue #621). There:
+   while the configured analog preset runs that kind, and under any other preset -- a digital one, or the other analog
+   kind -- while an explicit width of the kind is configured, or, on a radio input, AM's default is one the DSP rate
+   cannot filter (dsd_app_analog_width_offered(), from the running stream's rate; no rate bounds a peer's passband).
+   The configured preset, as the status line's width field reads it (app_control's analog width view): a typed digital
+   scan row on an analog session does not end it, and the width set under the row is the one its leave returns to.
+   Outside the preset a switch to it is held to the width, and where a SoapySDR or Airspy device or an I/Q replay
+   forces a DSP rate that cannot filter it, the refusal says to narrow the width: this row is where that happens, a
+   switch between NFM and AM included. */
+static bool
+is_analog_width_editable(const void* v, int kind) {
+    const UiCtx* c = (const UiCtx*)v;
+    if (!c || !c->opts) {
+        return false;
+    }
+    dsd_frontend_metrics metrics;
+    const dsd_frontend_metrics* running = dsd_app_frontend_get_metrics(&metrics) == 0 ? &metrics : NULL;
+    const dsd_state* snapshot = dsd_app_get_latest_snapshot();
+    dsd_app_analog_width_view view;
+    if (dsd_app_analog_width_view_get(c->opts, snapshot, running, &view) != 0) {
+        return false;
+    }
+    return dsd_app_analog_width_offered(c->opts, snapshot, &view, kind) != 0;
+}
+
+/* The NFM width row (issue #525). */
+bool
+is_nfm_width_editable(const void* v) {
+    return is_analog_width_editable(v, DSD_ANALOG_DEMOD_FM);
+}
+
+/* The AM width row (issue #524). */
+bool
+is_am_width_editable(const void* v) {
+    return is_analog_width_editable(v, DSD_ANALOG_DEMOD_AM);
+}
+
+/* Any value goes to the command as typed: it refuses what it cannot apply, with the reason, rather than the prompt
+   rounding it to something the operator did not ask for. */
+static void
+cb_nfm_bw(void* u, int ok, int hz) {
+    UNUSED(u);
+    if (ok) {
+        (void)dsd_app_command_set_i32(DSD_APP_CMD_NFM_BANDWIDTH_SET, (int32_t)hz);
+    }
+}
+
+/* Any value goes to the command as typed, as for the NFM width. */
+static void
+cb_am_bw(void* u, int ok, int hz) {
+    UNUSED(u);
+    if (ok) {
+        (void)dsd_app_command_set_i32(DSD_APP_CMD_AM_BANDWIDTH_SET, (int32_t)hz);
+    }
+}
+
+/* The scope chooser's title for the width of @p kind: its passband on audio input with a rigctl peer (issue #621), from
+   the snapshot pair the chooser captures, as its this-channel prompt reads it. */
+static const char*
+width_scope_title(int kind) {
+    dsd_app_analog_width_view view;
+    (void)dsd_app_analog_width_view_get(dsd_app_get_latest_opts_snapshot(), dsd_app_get_latest_snapshot(), NULL, &view);
+    return width_titles_of(kind, view.peer_passband)->chooser;
+}
+
+static void
+act_set_nfm_bw_default(void* v) {
+    UiCtx* c = (UiCtx*)v;
+    /* The command edits the configured width: an nfm scan row that sets its own (issue #526) keeps it, so offer the
+       configured width rather than the row's. */
+    const dsd_state* snapshot = dsd_app_get_latest_snapshot();
+    const int configured_hz = dsd_scan_mode_configured_analog_width(c->opts, snapshot, DSD_ANALOG_DEMOD_FM);
+    dsd_app_analog_width_view view;
+    (void)dsd_app_analog_width_view_get(c->opts, snapshot, NULL, &view);
+    const char* title = width_titles_of(DSD_ANALOG_DEMOD_FM, view.peer_passband)->configured;
+    if (!title) {
+        /* On a rigctl peer an unset width asks for -B, or leaves the peer its own passband (issue #621): the prompt
+           names which. Static: the prompt keeps the title pointer, and one prompt is open at a time. */
+        static char peer_title[sizeof WIDTH_NFM_PASSBAND_PROMPT_FMT + DSD_APP_ANALOG_WIDTH_TEXT_MAX];
+        char unset[DSD_APP_ANALOG_WIDTH_TEXT_MAX];
+        (void)dsd_app_analog_width_setting_text(&view, DSD_ANALOG_DEMOD_FM, 0, unset, sizeof unset);
+        DSD_SNPRINTF(peer_title, sizeof peer_title, WIDTH_NFM_PASSBAND_PROMPT_FMT, unset);
+        title = peer_title;
+    }
+    ui_prompt_open_int_async(title, configured_hz, cb_nfm_bw, c);
+}
+
+void
+act_set_nfm_bw(void* v) {
+    scope_or_default(v, DSD_SCAN_ROW_FIELD_WIDTH, DSD_ANALOG_DEMOD_FM, width_scope_title(DSD_ANALOG_DEMOD_FM),
+                     act_set_nfm_bw_default);
+}
+
+static void
+act_set_am_bw_default(void* v) {
+    UiCtx* c = (UiCtx*)v;
+    /* The command edits the configured width, as the NFM row's does. */
+    const dsd_state* snapshot = dsd_app_get_latest_snapshot();
+    const int configured_hz = dsd_scan_mode_configured_analog_width(c->opts, snapshot, DSD_ANALOG_DEMOD_AM);
+    dsd_app_analog_width_view view;
+    (void)dsd_app_analog_width_view_get(c->opts, snapshot, NULL, &view);
+    ui_prompt_open_int_async(width_titles_of(DSD_ANALOG_DEMOD_AM, view.peer_passband)->configured, configured_hz,
+                             cb_am_bw, c);
+}
+
+void
+act_set_am_bw(void* v) {
+    scope_or_default(v, DSD_SCAN_ROW_FIELD_WIDTH, DSD_ANALOG_DEMOD_AM, width_scope_title(DSD_ANALOG_DEMOD_AM),
+                     act_set_am_bw_default);
+}
+
+// ---- Tone filter (issue #527): the live editor of the configured CTCSS/DCS receive policy ----
+
+/* Picker rows: the three modes in dsd_tone_filter_mode order, so a mode's row index is the mode it sets, then off with
+   the configured list removed, the one row that clears it (Off keeps it). */
+static const char* const k_tone_filter_choices[] = {"Off", "Allow list...", "Block list...", "Off and clear list"};
+#define TONE_FILTER_CHOICE_COUNT (sizeof k_tone_filter_choices / sizeof k_tone_filter_choices[0])
+
+enum { TONE_FILTER_CHOICE_CLEAR = DSD_TONE_FILTER_BLOCK + 1 };
+
+_Static_assert(TONE_FILTER_CHOICE_COUNT == (size_t)TONE_FILTER_CHOICE_CLEAR + 1U,
+               "a mode's picker row index is the mode it sets, and the clearing row follows them");
+/* The list policy the prompt is open for, from the picker row chosen just before it. */
+static int g_tone_filter_prompt_mode = DSD_TONE_FILTER_ALLOW;
+
+/* The configured policy the editor opens on (dsd_app_tone_filter_setting_get()): from the snapshot pair, so a scan
+   row's own policy, which runs over dsd_opts while the row is on air, is never offered as the one to edit. Before the
+   first snapshot, the menu's options' own with no state: the pair its row's label (lbl_tone_filter()) reads. */
+static void
+tone_filter_configured(const UiCtx* c, dsd_app_tone_filter_setting* out) {
+    const dsd_opts* opts = dsd_app_get_latest_opts_snapshot();
+    const dsd_state* state = dsd_app_get_latest_snapshot();
+    if (!opts) {
+        opts = c ? c->opts : NULL;
+        state = NULL;
+    }
+    (void)dsd_app_tone_filter_setting_get(opts, state, out);
+}
+
+/* The list as typed goes to the command, which checks it and refuses what it cannot apply with the reason. */
+static void
+cb_tone_filter_list(void* u, const char* text) {
+    UNUSED(u);
+    if (text) {
+        (void)dsd_app_command_set_tone_filter(g_tone_filter_prompt_mode, text);
+    }
+}
+
+static void
+chooser_done_tone_filter(void* u, int sel) {
+    if (sel < 0 || sel >= (int)TONE_FILTER_CHOICE_COUNT) {
+        return;
+    }
+    if (sel == DSD_TONE_FILTER_OFF) {
+        /* Off keeps the configured list, as --no-tone-filter and tone_filter = off keep theirs: the list the decoder
+           holds when the edit runs, after anything queued before it, not this menu's snapshot of it. */
+        (void)dsd_app_command_set_tone_filter_mode(DSD_TONE_FILTER_OFF);
+        return;
+    }
+    if (sel == TONE_FILTER_CHOICE_CLEAR) {
+        (void)dsd_app_command_set_tone_filter(DSD_TONE_FILTER_OFF, "");
+        return;
+    }
+    dsd_app_tone_filter_setting setting;
+    tone_filter_configured((const UiCtx*)u, &setting);
+    g_tone_filter_prompt_mode = sel;
+    ui_prompt_open_string_async(sel == DSD_TONE_FILTER_ALLOW ? "Allow tones/codes (/ between, e.g. 67.0/D023N)"
+                                                             : "Block tones/codes (/ between, e.g. 67.0/D023N)",
+                                setting.list, sizeof setting.list, cb_tone_filter_list, u);
+}
+
+static void
+act_tone_filter_default(void* v) {
+    dsd_app_tone_filter_setting setting;
+    tone_filter_configured((const UiCtx*)v, &setting);
+    const int at = (setting.mode >= 0 && setting.mode < TONE_FILTER_CHOICE_CLEAR) ? setting.mode : 0;
+    ui_chooser_start_at("Tone filter", k_tone_filter_choices, (int)TONE_FILTER_CHOICE_COUNT, at,
+                        chooser_done_tone_filter, v);
+}
+
+void
+act_tone_filter(void* v) {
+    scope_or_default(v, DSD_SCAN_ROW_FIELD_TONE, -1, "Tone filter", act_tone_filter_default);
+}
+
 void
 act_window_freeze_toggle(void* v) {
     UiCtx* c = (UiCtx*)v;
@@ -1033,7 +1587,7 @@ io_set_gain_dig(void* vctx) {
 void
 io_set_gain_ana(void* vctx) {
     UiCtx* c = (UiCtx*)vctx;
-    ui_prompt_open_double_async("Analog output gain (0..100)", c->opts->audio_gainA, cb_gain_ana, c);
+    ui_prompt_open_double_async("Analog output gain (0 = auto, 1..100)", c->opts->audio_gainA, cb_gain_ana, c);
 }
 
 void
@@ -1112,7 +1666,7 @@ switch_to_pulse(void* vctx) {
 void
 switch_to_wav(void* vctx) {
     UiCtx* c = (UiCtx*)vctx;
-    ui_prompt_open_string_async("Enter WAV/RAW filename (or named pipe)", NULL, 1024, cb_switch_to_wav, c);
+    ui_prompt_open_string_async("Enter WAV/PCM filename", NULL, 1024, cb_switch_to_wav, c);
 }
 
 void
@@ -1323,26 +1877,6 @@ is_non_airspy_input(const void* v) {
     return !is_airspy_input(v);
 }
 
-/* The NFM width row, on a radio input, where the width is the channel filter: while the configured analog preset runs
-   FM, and under any other preset while an explicit NFM width is configured. The configured preset, as the status
-   line's "Analog:" field reads it (app_control's analog width view): a typed digital scan row on an analog session does
-   not end it, and the width set under the row is the one its leave returns to. Outside the preset a switch to Analog
-   is held to the explicit width, and where a SoapySDR or Airspy device or an I/Q replay forces a DSP rate that cannot
-   filter it, the refusal says to narrow the width: this row is where that happens. */
-bool
-is_nfm_width_editable(const void* v) {
-    const UiCtx* c = (const UiCtx*)v;
-    if (!c || !c->opts) {
-        return false;
-    }
-    dsd_app_analog_width_view view;
-    if (dsd_app_analog_width_view_get(c->opts, dsd_app_get_latest_snapshot(), NULL, &view) != 0 || !view.radio_input) {
-        return false;
-    }
-    /* An nfm scan row on air (issue #526) runs the width on any session; the configured width is the one edited. */
-    return (view.shown || view.row_analog) ? view.kind == DSD_ANALOG_DEMOD_FM : view.configured_hz > 0;
-}
-
 // NcMenuItem action callbacks require a mutable context signature.
 // cppcheck-suppress-begin constParameterPointer
 void
@@ -1461,10 +1995,18 @@ rtl_set_freq(void* v) {
     ui_prompt_open_int_async("Frequency (Hz)", (int)c->opts->rtlsdr_center_freq, cb_rtl_freq, c);
 }
 
+static void
+rtl_set_gain_default(void* v) {
+    UiCtx* c = (UiCtx*)v;
+    /* The prompt edits the configured gain the row shows first, not a trunk-scan target's own (issue #518 follow-up). */
+    dsd_app_rtl_gain_view view;
+    const int start = dsd_app_rtl_gain_view_get(c->opts, c->state, &view) == 0 ? view.configured_gain : 0;
+    ui_prompt_open_int_async("Gain (0=AGC, 0..49)", start, cb_rtl_gain, c);
+}
+
 void
 rtl_set_gain(void* v) {
-    UiCtx* c = (UiCtx*)v;
-    ui_prompt_open_int_async("Gain (0=AGC, 0..49)", c->opts->rtl_gain_value, cb_rtl_gain, c);
+    scope_or_default(v, DSD_SCAN_ROW_FIELD_GAIN, -1, "Gain", rtl_set_gain_default);
 }
 
 void
@@ -1479,40 +2021,6 @@ void
 rtl_set_bw(void* v) {
     UiCtx* c = (UiCtx*)v;
     ui_prompt_open_int_async("DSP Bandwidth kHz (4,6,8,12,16,24,48)", c->opts->rtl_dsp_bw_khz, cb_rtl_bw, c);
-}
-
-/* Any value goes to the command as typed: it refuses what it cannot apply, with the reason, rather than the prompt
-   rounding it to something the operator did not ask for. */
-static void
-cb_rtl_nfm_bw(void* u, int ok, int hz) {
-    UNUSED(u);
-    if (ok) {
-        (void)dsd_app_command_set_i32(DSD_APP_CMD_NFM_BANDWIDTH_SET, (int32_t)hz);
-    }
-}
-
-void
-rtl_set_nfm_bw(void* v) {
-    UiCtx* c = (UiCtx*)v;
-    /* The command edits the configured width: an nfm scan row that sets its own (issue #526) keeps it, so offer the
-       configured width rather than the row's. */
-    const int configured_hz =
-        dsd_scan_mode_configured_analog_width(c->opts, dsd_app_get_latest_snapshot(), DSD_ANALOG_DEMOD_FM);
-    ui_prompt_open_int_async("NFM bandwidth Hz (8000..25000; 0 = default 16000)", configured_hz, cb_rtl_nfm_bw, c);
-}
-
-void
-rtl_set_sql(void* v) {
-    UiCtx* c = (UiCtx*)v;
-    /* Offer 0 for a squelch that is off rather than pwr_to_dB()'s -120 floor:
-     * accepting the value shown must not turn a disabled squelch into a real
-     * threshold. 0 is also how the `sql` CLI field and rtl_sql spell "off". */
-    /* The command edits the configured default: a scan row overriding the squelch (issue #521)
-     * keeps its own threshold, so offer the default rather than the row's value. */
-    const dsd_scan_settings* configured = dsd_scan_mode_configured_view(dsd_app_get_latest_snapshot());
-    const double level = configured ? configured->rtl_squelch_level : c->opts->rtl_squelch_level;
-    const double shown = dsd_squelch_is_off(level) ? 0.0 : pwr_to_dB(level);
-    ui_prompt_open_double_async("Squelch (dB; 0 = off)", shown, cb_rtl_sql, c);
 }
 
 void
@@ -1677,15 +2185,35 @@ act_lockout_slot2(void* v) {
    roughly by how often they are asked for. The names come from the runtime so
    the picker and the label that reads the mode back cannot disagree. */
 static const dsdneoUserDecodeMode k_decode_mode_choices[] = {
-    DSDCFG_MODE_AUTO,     DSDCFG_MODE_TDMA,     DSDCFG_MODE_P25P1,  DSDCFG_MODE_P25P2,  DSDCFG_MODE_DMR,
-    DSDCFG_MODE_DMR_MONO, DSDCFG_MODE_NXDN48,   DSDCFG_MODE_NXDN96, DSDCFG_MODE_X2TDMA, DSDCFG_MODE_YSF,
-    DSDCFG_MODE_DSTAR,    DSDCFG_MODE_EDACS_PV, DSDCFG_MODE_DPMR,   DSDCFG_MODE_M17,    DSDCFG_MODE_ANALOG,
+    DSDCFG_MODE_AUTO,
+    DSDCFG_MODE_TDMA,
+    DSDCFG_MODE_P25P1,
+    DSDCFG_MODE_P25P2,
+    DSDCFG_MODE_DMR,
+    DSDCFG_MODE_DMR_MONO,
+    DSDCFG_MODE_NXDN48,
+    DSDCFG_MODE_NXDN96,
+    DSDCFG_MODE_X2TDMA,
+    DSDCFG_MODE_YSF,
+    DSDCFG_MODE_DSTAR,
+    DSDCFG_MODE_EDACS_PV,
+    DSDCFG_MODE_DPMR,
+    DSDCFG_MODE_M17,
+    DSDCFG_MODE_ANALOG,
+    /* AM needs an I/Q radio input: see g_decode_mode_am_offered. */
+    DSDCFG_MODE_AM,
 };
 #define DECODE_MODE_CHOICE_COUNT (sizeof k_decode_mode_choices / sizeof k_decode_mode_choices[0])
 /* Filled once: every entry is a pointer into the runtime's own static name table,
-   so there is nothing to refresh between opens. */
+   so there is nothing to refresh between opens but the AM row's. */
 static const char* g_decode_mode_labels[DECODE_MODE_CHOICE_COUNT];
 static int g_decode_mode_labels_ready;
+/* Issue #524: whether the picker last opened on an input that runs AM, an I/Q radio input (the input type alone, as
+   dsd_decode_mode_input_is_iq() reads an open input). On any other input the AM row stays, so no row moves, but it
+   is shown disabled with the reason, and choosing it repeats the reason instead of sending a command the decoder
+   would refuse. With no options snapshot yet the command decides. */
+static int g_decode_mode_am_offered = 1;
+static const char k_decode_mode_am_disabled_label[] = "AM (needs an I/Q radio input)";
 
 static int
 decode_mode_choice_index(dsdneoUserDecodeMode mode) {
@@ -1701,6 +2229,10 @@ static void
 chooser_done_decode_mode(void* u, int sel) {
     UNUSED(u);
     if (sel < 0 || sel >= (int)DECODE_MODE_CHOICE_COUNT) {
+        return;
+    }
+    if (k_decode_mode_choices[sel] == DSDCFG_MODE_AM && !g_decode_mode_am_offered) {
+        ui_statusf("%s", DSD_DECODE_MODE_AM_NEEDS_IQ_TEXT);
         return;
     }
     /* The command toasts "Decoding <mode>" itself once it has applied. */
@@ -1725,6 +2257,9 @@ act_decode_mode(void* v) {
     const dsd_state* snapshot = c ? dsd_app_get_latest_snapshot() : NULL;
     const dsdneoUserDecodeMode now =
         opts_snapshot ? dsd_scan_mode_configured_preset(opts_snapshot, snapshot) : DSDCFG_MODE_AUTO;
+    g_decode_mode_am_offered = !opts_snapshot || dsd_opts_input_is_radio(opts_snapshot);
+    g_decode_mode_labels[decode_mode_choice_index(DSDCFG_MODE_AM)] =
+        g_decode_mode_am_offered ? dsd_decode_mode_display_name(DSDCFG_MODE_AM) : k_decode_mode_am_disabled_label;
     ui_chooser_start_at("Decoder mode", g_decode_mode_labels, (int)DECODE_MODE_CHOICE_COUNT,
                         decode_mode_choice_index(now), chooser_done_decode_mode, NULL);
 }

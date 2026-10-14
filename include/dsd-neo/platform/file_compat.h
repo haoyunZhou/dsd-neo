@@ -51,6 +51,17 @@ int dsd_fileno(FILE* fp);
 int dsd_isatty(int fd);
 
 /**
+ * @brief Disable text translation on an open descriptor used for raw bytes.
+ *
+ * Selects binary mode on Windows; POSIX descriptors already carry raw bytes.
+ * Flush any buffered stdio output before changing its descriptor's mode.
+ *
+ * @param fd    Open file descriptor.
+ * @return 0 on success, -1 on error with errno set.
+ */
+int dsd_set_binary_mode(int fd);
+
+/**
  * @brief Duplicate a file descriptor.
  *
  * @param oldfd     File descriptor to duplicate.
@@ -122,13 +133,31 @@ int dsd_fchmod(int fd, int mode);
  * @brief Open a file for writing/appending with owner-only permissions when created.
  *
  * Supports standard write/append modes such as "w", "wb", "a", "ab", "w+",
- * and "a+". Read-only modes fall back to normal fopen semantics.
+ * and "a+". Read-only modes fall back to normal fopen semantics. An "x" after a
+ * write mode ("wx", "wbx") creates the file exclusively, as C11 fopen() does:
+ * the open fails with EEXIST when @p path already exists, which is left untouched.
  *
  * @param path  File path.
  * @param mode  fopen-compatible mode string.
  * @return FILE stream, or NULL on error.
  */
 FILE* dsd_fopen_private(const char* path, const char* mode);
+
+/**
+ * @brief dsd_fopen_private(), also reporting whether it opened @p path.
+ *
+ * A write mode creates or empties the file once its descriptor opens, before the stream over that descriptor is made,
+ * so an open whose stream cannot be made (fdopen() out of memory) returns NULL with the file already created or
+ * emptied. A caller that must know whether it touched the file (the I/Q capture writer, which reports writing over an
+ * earlier recording) reads @p out_opened. A read mode opens as fopen() does.
+ *
+ * @param path       File path.
+ * @param mode       fopen-compatible mode string.
+ * @param out_opened Set to 1 once @p path was opened, whether or not the stream over it was then made, and 0
+ *                   otherwise. May be NULL.
+ * @return FILE stream, or NULL on error.
+ */
+FILE* dsd_fopen_private_ex(const char* path, const char* mode, int* out_opened);
 
 /**
  * @brief Create a private temporary sibling file for atomic replacement.
@@ -154,6 +183,25 @@ FILE* dsd_fopen_private_temp_for_replace(const char* final_path, char* tmp_path,
  * @return 0 on success, -1 on error with errno set.
  */
 int dsd_replace_file_with_temp(const char* tmp_path, const char* final_path);
+
+/**
+ * @brief Rename @p from to @p to unless @p to already exists.
+ *
+ * Never replaces an existing @p to: the call fails with EEXIST and leaves both files as they were. The rename is
+ * atomic where the platform and filesystem offer a no-replace rename (Linux renameat2(RENAME_NOREPLACE), macOS
+ * renamex_np(RENAME_EXCL), a hard link then an unlink on other POSIX systems; Windows' rename() refuses an existing
+ * name). On a POSIX filesystem that supports neither (no no-replace rename, no hard links) it claims @p to with an
+ * exclusive create and renames onto that claim: @p to briefly exists as an empty file, and only a process that deletes
+ * the claim in between can still be replaced.
+ *
+ * @param from              Existing file.
+ * @param to                New name, in the same directory as @p from.
+ * @param out_source_left   Optional. Set to 1 when @p to was created but @p from could not be removed afterwards (a
+ *                          hard link whose unlink failed): the call still succeeds, and @p from names the same file.
+ *                          Set to 0 otherwise.
+ * @return 0 on success, -1 on error with errno set (EEXIST when @p to exists).
+ */
+int dsd_rename_noreplace(const char* from, const char* to, int* out_source_left);
 
 /**
  * @brief Resolve a user-supplied local file name to an existing file in the current directory.
@@ -241,6 +289,33 @@ ssize_t dsd_read(int fd, void* buf, size_t count);
  * @return Number of bytes written, or -1 on error.
  */
 ssize_t dsd_write(int fd, const void* buf, size_t count);
+
+/** What dsd_write_frames() did with a buffer. */
+typedef enum {
+    DSD_WRITE_FRAMES_OK = 0,      /**< every byte was written */
+    DSD_WRITE_FRAMES_WOULD_BLOCK, /**< the descriptor would block at a frame boundary: the frames before it went out,
+                                       the rest of the buffer did not, and the stream is still frame-aligned */
+    DSD_WRITE_FRAMES_ERROR,       /**< a write failed (errno says why); the stream may end in the middle of a frame */
+} dsd_write_frames_status;
+
+/**
+ * @brief Write a buffer of whole sample frames to a file descriptor.
+ *
+ * Retries interrupted writes and continues after short counts. On a non-blocking descriptor that is full it never
+ * spins: at a frame boundary it returns DSD_WRITE_FRAMES_WOULD_BLOCK at once, and only when a short count left part of
+ * a frame written does it wait (a bounded time) for room to finish that frame. A write that returns 0 is an error
+ * (EIO). A reader that has gone away is an error (EPIPE) and never raises SIGPIPE: on POSIX the signal the write
+ * raises in the calling thread is blocked and consumed (macOS: the descriptor's no-SIGPIPE flag is set), leaving the
+ * process's signal dispositions and any SIGPIPE already pending alone.
+ *
+ * @param fd          File descriptor.
+ * @param buf         Data buffer.
+ * @param bytes       Bytes to write.
+ * @param frame_bytes Bytes per sample frame (0 is taken as 1).
+ * @param written     Optional; receives the bytes written.
+ * @return What happened; errno is set when the result is DSD_WRITE_FRAMES_ERROR.
+ */
+dsd_write_frames_status dsd_write_frames(int fd, const void* buf, size_t bytes, size_t frame_bytes, size_t* written);
 
 /**
  * @brief Get the null device path for this platform.

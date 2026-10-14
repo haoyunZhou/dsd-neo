@@ -88,6 +88,16 @@ option(
 option(DSD_ENABLE_SOAPYSDR "Enable SoapySDR backend support" ON)
 option(DSD_ENABLE_TERMINAL_UI "Enable ncurses/PDCurses terminal frontend" ON)
 option(DSD_ENABLE_QT_UI "Enable the Qt Quick frontend (src/ui/qt)" OFF)
+# The third-party TCP JSON control/telemetry API is desktop-only; Android does
+# not build or link it.
+option(
+    DSD_ENABLE_API
+    "Enable the third-party TCP JSON control/telemetry API"
+    ON
+)
+if(ANDROID)
+    set(DSD_ENABLE_API OFF CACHE BOOL "" FORCE)
+endif()
 set(DSD_SOAPYSDR_MIN_VERSION "0.8.1")
 option(
     DSD_REQUIRE_RTLSDR
@@ -486,6 +496,18 @@ if(DSD_ENABLE_WARNINGS)
                 /wd4459 # declaration hides global declaration
                 /wd4127 # conditional expression is constant
         )
+        # MSVC 19.44 (VS 2022 17.14) reports C5287 (operands are different enum types)
+        # for C enumerators even after both are cast to int, the cast that silences it
+        # on later compilers, which keep the check. Not wrapped in
+        # $<COMPILE_LANGUAGE:C>: Visual Studio generators evaluate that as CXX for
+        # every source of a target that has C++ sources.
+        if(
+            CMAKE_C_COMPILER_ID STREQUAL "MSVC"
+            AND CMAKE_C_COMPILER_VERSION VERSION_GREATER_EQUAL 19.44
+            AND CMAKE_C_COMPILER_VERSION VERSION_LESS 19.50
+        )
+            target_compile_options(dsd-neo_warnings INTERFACE /wd5287)
+        endif()
     endif()
     if(DSD_WARNINGS_AS_ERRORS)
         if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
@@ -587,9 +609,13 @@ endif()
 find_package(LibSndFile REQUIRED)
 find_package(OpenSSL 3.0 REQUIRED)
 
-# Require mbelib-neo 2.x. Its ABI provides the
-# soft-decision frame decode and result-based processing APIs used by dsd-neo.
-set(_DSD_MBE_REQUIRED_VERSION 2.0)
+# Require mbelib-neo 2.3+. Its ABI provides the
+# soft-decision frame decode and result-based processing APIs used by dsd-neo,
+# and 2.2 follows TIA-102.BABA-1 for AMBE 2450 erasures and repeats with
+# deterministic mute noise. 2.3 synthesizes speech at the reference level, so
+# float PCM is int16 / 7 as documented; the vocoder scales it to the int16
+# scale of the voice buffers, which would clip with 2.2's 17 dB hotter speech.
+set(_DSD_MBE_REQUIRED_VERSION 2.3)
 find_package(mbe-neo ${_DSD_MBE_REQUIRED_VERSION} CONFIG REQUIRED)
 if(ANDROID AND TARGET mbe_neo::mbe_static)
     # Every shared library an Android app uses has to be bundled into the APK
@@ -641,9 +667,11 @@ check_c_source_compiles(
 int main(void) {
     const mbe_soft_bit imbe_soft[8][23] = {{{0}}};
     const mbe_soft_bit ambe_soft[4][24] = {{{0}}};
+    const mbe_soft_bit imbe7100_soft[7][24] = {{{0}}};
     const char imbe_fr[8][23] = {{0}};
     const char imbe7100_fr[7][24] = {{0}};
     const char ambe_fr[4][24] = {{0}};
+    char encoded_ambe_fr[4][24] = {{0}};
     char imbe_d[88] = {0};
     char ambe_d[49] = {0};
     char err_str[16] = {0};
@@ -656,17 +684,23 @@ int main(void) {
     mbe_initProcessResult(&result);
     result.c0_errors = 0;
     result.total_errors = 0;
-    result.flags = MBE_PROCESS_FLAG_SOFT_INPUT;
+    result.flags = MBE_PROCESS_FLAG_SOFT_INPUT | MBE_PROCESS_FLAG_PROVOICE;
     (void)mbe_decodeImbe7200x4400Frame(imbe_fr, imbe_d, &result);
     (void)mbe_decodeImbe7100x4400Frame(imbe7100_fr, imbe_d, &result);
     (void)mbe_decodeAmbe3600x2450Frame(ambe_fr, ambe_d, &result);
+    (void)mbe_decodeAmbe3600x2400Frame(ambe_fr, ambe_d, &result);
     (void)mbe_decodeImbe7200x4400SoftFrame(imbe_soft, imbe_d, &result);
+    (void)mbe_decodeImbe7100x4400SoftFrame(imbe7100_soft, imbe_d, &result);
     (void)mbe_decodeAmbe3600x2450SoftFrame(ambe_soft, ambe_d, &result);
+    (void)mbe_decodeAmbe3600x2400SoftFrame(ambe_soft, ambe_d, &result);
     (void)mbe_processImbe4400Dataf(audio, &result, imbe_d, &cur, &prev, &prev_enhanced);
     (void)mbe_processAmbe2450Dataf(audio, &result, ambe_d, &cur, &prev, &prev_enhanced);
     (void)mbe_processAmbe2400Dataf(audio, &result, ambe_d, &cur, &prev, &prev_enhanced);
     (void)mbe_processAmbe3600x2450Framef(audio, &result, ambe_fr, ambe_d, &cur, &prev, &prev_enhanced);
     (void)mbe_processAmbe3600x2450SoftFramef(audio, &result, ambe_soft, ambe_d, &cur, &prev, &prev_enhanced);
+    (void)mbe_processAmbe3600x2400Framef(audio, &result, ambe_fr, ambe_d, &cur, &prev, &prev_enhanced);
+    (void)mbe_processAmbe3600x2400SoftFramef(audio, &result, ambe_soft, ambe_d, &cur, &prev, &prev_enhanced);
+    (void)mbe_encodeAmbe3600x2400Frame(ambe_d, encoded_ambe_fr);
     mbe_synthesizeSilencef(audio);
     mbe_formatProcessResult(err_str, sizeof(err_str), &result);
     return (int)(sizeof(mbe_soft_bit) + sizeof(mbe_process_result));
@@ -690,7 +724,7 @@ unset(_DSD_SAVED_CMAKE_REQUIRED_FLAGS)
 if(NOT DSD_HAVE_MBE_NEO_SOFT_API)
     message(
         FATAL_ERROR
-        "mbe-neo 2.x with the soft-decision/result API is required; update mbelib-neo"
+        "mbe-neo 2.3+ with the soft-decision/result API is required; update mbelib-neo"
     )
 endif()
 if(ANDROID AND (DSD_ANDROID_VENDORED_RTLSDR OR DSD_ENABLE_AIRSPY))
@@ -1301,6 +1335,8 @@ add_custom_target(
         ${CMAKE_COMMAND} -P ${CMAKE_CURRENT_BINARY_DIR}/cmake_uninstall.cmake
 )
 
+include(cmake/Pffft.cmake)
+
 # Install license/notice files with binaries
 install(
     FILES LICENSE COPYRIGHT THIRD_PARTY.md
@@ -1312,9 +1348,10 @@ install(
     RENAME ezpwd-LGPL-2.1-or-later.txt
 )
 install(
-    FILES src/third_party/pffft/COPYING
+    FILES
+        "${DSD_PFFFT_LICENSE_DIR}/pffft-LICENSE.txt"
+        "${DSD_PFFFT_LICENSE_DIR}/pffft-NOTICES.txt"
     DESTINATION ${CMAKE_INSTALL_DOCDIR}/licenses
-    RENAME pffft-FFTPACK.txt
 )
 if(DSD_HAS_AIRSPY)
     install(
@@ -1345,6 +1382,9 @@ add_subdirectory(src/fec)
 add_subdirectory(src/third_party)
 add_subdirectory(src/engine)
 add_subdirectory(src/app_control)
+if(DSD_ENABLE_API)
+    add_subdirectory(src/api)
+endif()
 add_subdirectory(src/ui)
 add_subdirectory(apps)
 # Android app shell (Qt Quick frontend + JNI lifecycle glue).

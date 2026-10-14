@@ -19,10 +19,10 @@
 #include <dsd-neo/protocol/p25/p25_status_symbol.h>
 #include <dsd-neo/protocol/p25/p25p1_check_ldu.h>
 #include <dsd-neo/protocol/p25/p25p1_ldu.h>
+#include <dsd-neo/runtime/decode_clock.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
-#include <time.h>
 
 #include "dsd-neo/core/opts.h"
 #include "dsd-neo/core/opts_fwd.h"
@@ -73,7 +73,6 @@ p25p1_hamming_rs_symbol_reliability(const P25P1SoftDibit* symbol) {
 static int g_hard_rs_result;
 static int g_soft_rs_result;
 static int g_lsd_soft_result;
-static int g_lfsr128_calls;
 static int g_watchdog_calls;
 static int g_write_event_calls;
 static int g_push_event_calls;
@@ -89,6 +88,12 @@ static int g_status_classify_calls;
 static int g_audio_play_calls;
 static int g_active_calls;
 static int g_last_status_dibit;
+static int g_imbe_calls;
+/* What the process_IMBE() stub reports: 1 when the frame reached the vocoder, 0 when it synthesized none. */
+static int g_imbe_dispatched = 1;
+/* The IMBE frame whose read adopts a retune its capture recorded, where the carrier boundary moves the carrier count
+   (dsd_engine_carrier_boundary(), issue #575); -1 for none. */
+static int g_boundary_at_imbe = -1;
 static uint32_t g_last_policy_id;
 static uint8_t g_last_policy_source;
 static dsd_tg_policy_upsert_mode g_last_policy_upsert_mode;
@@ -122,15 +127,9 @@ p25_lsd_fec_16x8_soft(uint8_t* bits16, const int16_t llr16[16]) {
     return g_lsd_soft_result;
 }
 
-uint64_t
-dsd_time_monotonic_ns(void) {
-    return 42000000000ULL;
-}
-
 void
 LFSR128(dsd_state* state) {
     (void)state;
-    g_lfsr128_calls++;
 }
 
 int
@@ -192,11 +191,15 @@ LFSRP(dsd_state* state) {
     (void)state;
 }
 
-void
+int
 process_IMBE(dsd_opts* opts, dsd_state* state, int* status_count) {
     (void)opts;
-    (void)state;
     (void)status_count;
+    if (g_imbe_calls == g_boundary_at_imbe && state != NULL) {
+        state->carrier_seq++;
+    }
+    g_imbe_calls++;
+    return g_imbe_dispatched;
 }
 
 void
@@ -357,7 +360,6 @@ reset_hook_counters(void) {
     g_hard_rs_result = 0;
     g_soft_rs_result = 0;
     g_lsd_soft_result = 1;
-    g_lfsr128_calls = 0;
     g_watchdog_calls = 0;
     g_write_event_calls = 0;
     g_push_event_calls = 0;
@@ -373,6 +375,9 @@ reset_hook_counters(void) {
     g_audio_play_calls = 0;
     g_active_calls = 0;
     g_last_status_dibit = -1;
+    g_imbe_calls = 0;
+    g_imbe_dispatched = 1;
+    g_boundary_at_imbe = -1;
     g_last_policy_id = 0U;
     g_last_policy_source = 0U;
     g_last_policy_upsert_mode = 0;
@@ -588,7 +593,7 @@ test_ldu2_hold_hysteresis_refreshes_only_recent_activity(void) {
     DSD_MEMSET(&opts, 0, sizeof(opts));
     DSD_MEMSET(&state, 0, sizeof(state));
     opts.trunk_hangtime = 0.0;
-    state.last_vc_sync_time = time(NULL);
+    state.last_vc_sync_time = dsd_decode_time();
     state.last_vc_sync_time_m = 17.0;
 
     ldu2_refresh_hold_hysteresis(&opts, &state);
@@ -597,7 +602,7 @@ test_ldu2_hold_hysteresis_refreshes_only_recent_activity(void) {
     DSD_MEMSET(&opts, 0, sizeof(opts));
     DSD_MEMSET(&state, 0, sizeof(state));
     opts.trunk_hangtime = 1.0;
-    state.last_vc_sync_time = time(NULL) - 10;
+    state.last_vc_sync_time = dsd_decode_time() - 10;
     state.last_vc_sync_time_m = 19.0;
 
     ldu2_refresh_hold_hysteresis(&opts, &state);
@@ -630,6 +635,16 @@ test_ldu2_activity_is_independent_of_media_gate(void) {
     ldu2_process_imbe_frame(&opts, &state, &status_count, 1);
     rc |= expect_int("clear frame emits activity", g_active_calls, 2);
     rc |= expect_int("clear frame plays audio", g_audio_play_calls, 1);
+
+    // Issue #654: a frame the vocoder never synthesized (a skipped non-standard c0) still counts as activity but mixes
+    // nothing, so every output format leaves it out alike.
+    g_imbe_dispatched = 0;
+    ldu2_process_imbe_frame(&opts, &state, &status_count, 1);
+    rc |= expect_int("skipped c0 frame emits activity", g_active_calls, 3);
+    rc |= expect_int("skipped c0 frame mixes nothing", g_audio_play_calls, 1);
+    g_imbe_dispatched = 1;
+    ldu2_process_imbe_frame(&opts, &state, &status_count, 1);
+    rc |= expect_int("next synthesized frame plays", g_audio_play_calls, 2);
     return rc;
 }
 
@@ -933,6 +948,10 @@ test_ldu2_encrypted_trunk_lockout_state(void) {
     rc |= expect_int("lockout does not make runtime policy", g_policy_make_calls, 0);
     rc |= expect_int("lockout does not upsert runtime policy", g_policy_upsert_calls, 0);
     rc |= expect_int("lockout logging delegated", g_watchdog_calls, 0);
+    /* With an event log configured, the LDU2 still writes and stages no event of its own. */
+    rc |= expect_int("lockout writes no event", g_write_event_calls, 0);
+    rc |= expect_int("lockout pushes no event history", g_push_event_calls, 0);
+    rc |= expect_int("lockout resets no event history", g_init_event_calls, 0);
 
     reset_hook_counters();
     state.p25_sm_force_release = 0;
@@ -944,9 +963,44 @@ test_ldu2_encrypted_trunk_lockout_state(void) {
     return rc;
 }
 
+/* Issue #575: the carrier boundary moved the carrier count while the LDU2 was read (a replay read adopting a recorded
+   retune). Its encryption sync is read whole by the seventh voice frame but decodes only after the ninth, so it would
+   publish the carrier left's algorithm, key and MI after the boundary ended that call: the LDU's encryption sync and
+   low-speed data are dropped, as on a sync loss. */
+static int
+test_ldu2_split_by_a_carrier_boundary_publishes_no_encryption_sync(void) {
+    static dsd_opts opts;
+    static dsd_state state;
+    int rc = 0;
+
+    DSD_MEMSET(&opts, 0, sizeof(opts));
+    DSD_MEMSET(&state, 0, sizeof(state));
+    reset_hook_counters();
+    processLDU2(&opts, &state);
+    rc |= expect_int("whole LDU2 reads nine voice frames", g_imbe_calls, 9);
+    rc |= expect_int("whole LDU2 checks its encryption sync", (int)state.p25_p1_voice_fec_ok, 1);
+
+    DSD_MEMSET(&state, 0, sizeof(state));
+    reset_hook_counters();
+    state.payload_algid = 0x81;
+    state.payload_keyid = 0x1234;
+    state.payload_miP = 0x0102030405060708ULL;
+    g_boundary_at_imbe = 7; /* the eighth voice frame: the encryption sync and its parity were read before it */
+    processLDU2(&opts, &state);
+    rc |= expect_int("split LDU2 moved the carrier count", (int)state.carrier_seq, 1);
+    rc |= expect_int("split LDU2 still reads the frame", g_imbe_calls, 9);
+    rc |= expect_int("split LDU2 checks no encryption sync",
+                     (int)(state.p25_p1_voice_fec_ok + state.p25_p1_voice_fec_err), 0);
+    rc |= expect_int("split LDU2 publishes no algorithm", state.payload_algid, 0x81);
+    rc |= expect_int("split LDU2 publishes no key", state.payload_keyid, 0x1234);
+    rc |= expect_int("split LDU2 advances no MI", state.payload_miP == 0x0102030405060708ULL, 1);
+    return rc;
+}
+
 int
 main(void) {
     int rc = 0;
+    dsd_decode_clock_use_test(42000000000ULL);
     rc |= test_ldu2_extracts_ess_fields();
     rc |= test_lsd_corrected_byte();
     rc |= test_ldu2_rs_reliability_uses_wire_order();
@@ -962,6 +1016,8 @@ main(void) {
     rc |= test_ldu2_key_reporting_preserves_user_unmute();
     rc |= test_ldu2_lsd_alias_begin_clamps_length();
     rc |= test_ldu2_encrypted_trunk_lockout_state();
+    rc |= test_ldu2_split_by_a_carrier_boundary_publishes_no_encryption_sync();
+    dsd_decode_clock_use_system();
     return rc;
 }
 

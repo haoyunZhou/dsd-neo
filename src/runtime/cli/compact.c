@@ -81,6 +81,7 @@ static const char* const k_skip_exact_no_arg[] = {
     "--dmr-debug-unsynced",
     "--show-keys",
     "--scan-voice-only",
+    "--no-tone-filter",
 };
 
 static const char* const k_skip_exact_next_any[] = {
@@ -124,7 +125,6 @@ static const char* const k_skip_exact_next_any[] = {
     "--p25-min-follow-dwell",
     "--p25-grant-voice-timeout",
     "--p25-mac-hold",
-    "--p25-ring-hold",
     "--p25-cc-grace",
     "--p25-force-release-extra",
     "--p25-force-release-margin",
@@ -137,6 +137,10 @@ static const char* const k_skip_exact_next_any[] = {
     "--scan-voice-hold-ms",
     "--scan-max-visit-ms",
     "--nfm-bandwidth-hz",
+    "--am-bandwidth-hz",
+    "--squelch",
+    "--tone-allow",
+    "--tone-block",
     "--calc-lcn",
     "--calc-step",
     "--calc-cc-freq",
@@ -144,15 +148,16 @@ static const char* const k_skip_exact_next_any[] = {
     "--calc-start-lcn",
 };
 
+/* Their value is taken whatever it starts with, as is that of a free-value option (an API token may begin with '-'
+   and must not reach getopt; see dsd_cli_option_takes_free_value()). */
 static const char* const k_skip_exact_next_nonnull[] = {
     "--iq-capture", "--iq-capture-format", "--iq-capture-max-mb", "--symbol-capture-format",
     "--iq-replay",  "--iq-replay-rate",    "--iq-info",
 };
 
 static const char* const k_skip_exact_next_nonopt[] = {
-    "--lrrp-extra-port", "--rtl-udp-control", "--rtl-udp-control-bind", "--config", "--validate-config",
-    "--tetra-net",
-    "--tetra-key",
+    "--lrrp-extra-port", "--rtl-udp-control", "--rtl-udp-control-bind", "--config", "--validate-config", "--tetra-net",
+    "--tetra-key",       "--api",             "--api-bind",
 };
 
 static const char* const k_skip_prefix[] = {
@@ -171,6 +176,10 @@ static const char* const k_skip_prefix[] = {
     "--lrrp-extra-port=",
     "--rtl-udp-control=",
     "--rtl-udp-control-bind=",
+    "--api=",
+    "--api-bind=",
+    "--api-token=",
+    "--api-token-file=",
     "--iq-capture=",
     "--iq-capture-format=",
     "--iq-capture-max-mb=",
@@ -200,8 +209,20 @@ static const char* const k_skip_prefix[] = {
     "--scan-voice-hold-ms=",
     "--scan-max-visit-ms=",
     "--nfm-bandwidth-hz=",
+    "--am-bandwidth-hz=",
+    "--squelch=",
+    "--tone-allow=",
+    "--tone-block=",
     "--frontend=",
 };
+
+int
+dsd_cli_option_takes_free_value(const char* arg) {
+    static const char* const k_free_value_options[] = {"--api-token", "--api-token-file"};
+    return arg != NULL
+           && compact_matches_exact(arg, k_free_value_options,
+                                    sizeof(k_free_value_options) / sizeof(k_free_value_options[0]));
+}
 
 int
 dsd_cli_compact_args(int argc, char** argv) {
@@ -232,8 +253,9 @@ dsd_cli_compact_args(int argc, char** argv) {
             }
             continue;
         }
-        if (compact_matches_exact(arg, k_skip_exact_next_nonnull,
-                                  sizeof(k_skip_exact_next_nonnull) / sizeof(k_skip_exact_next_nonnull[0]))) {
+        if (dsd_cli_option_takes_free_value(arg)
+            || compact_matches_exact(arg, k_skip_exact_next_nonnull,
+                                     sizeof(k_skip_exact_next_nonnull) / sizeof(k_skip_exact_next_nonnull[0]))) {
             if (compact_has_next_nonnull(i, argc, argv)) {
                 advance = 2;
             }

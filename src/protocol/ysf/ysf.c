@@ -21,6 +21,7 @@
 #include <dsd-neo/core/state.h>
 #include <dsd-neo/core/synctype_ids.h>
 #include <dsd-neo/core/vocoder.h>
+#include <dsd-neo/core/voice_chain.h>
 #include <dsd-neo/fec/block_codes.h>
 #include <dsd-neo/protocol/ysf/ysf.h>
 #include <dsd-neo/runtime/colors.h>
@@ -449,14 +450,9 @@ ysf_ehr(dsd_opts* opts, dsd_state* state, uint8_t dbuf[180], int start, int stop
             ambe_fr[map->low_row][map->low_col] = (char)b2;
         }
 
-        processMbeFrame(opts, state, NULL, ambe_fr, NULL);
+        processMbeFrame(opts, state, DSD_VOICE_PROTOCOL_YSF, NULL, ambe_fr, NULL);
 
         // The vocoder already wrote this frame's per-call WAV block behind its record gate.
-        if (opts->floating_point == 1) //float audio is really quiet now (look into it)
-        {
-
-            DSD_MEMCPY(state->f_l, state->audio_out_temp_buf, sizeof(state->f_l));
-        }
         dsd_play_synthesized_voice(opts, state);
     }
 
@@ -482,14 +478,25 @@ typedef struct {
     int err;
     uint32_t v_error;
     uint8_t fich_decode[32];
+    /* The carrier count (state->carrier_seq) the frame began on (issue #575). */
+    uint32_t carrier_seq;
 } ysf_fich_info;
+
+/* Whether the carrier boundary moved the carrier count since the frame began (issue #575): a replay read adopting a
+   recorded retune. A payload decodes only once read, so a data channel or voice channel read whole before the move
+   would decode after the boundary ended the carrier left's call: from there nothing of the frame decodes or publishes,
+   as on a sync loss. */
+static bool
+ysf_carrier_left(const dsd_state* state, const ysf_fich_info* info) {
+    return state->carrier_seq != info->carrier_seq;
+}
 
 // V/D2 decodes straight through mbelib, so its frames never reach the vocoder's
 // per-call WAV write (-P); they are written here under the same record policy, on
 // slot 0 where YSF publishes its call. Frames that went through processMbeFrame()
 // were already written there.
 static void
-ysf_write_bypassed_call_wav(dsd_opts* opts, dsd_state* state) {
+ysf_write_bypassed_call_wav(const dsd_opts* opts, dsd_state* state) {
     int allow = 0;
     if (opts->wav_out_f != NULL && opts->dmr_stereo_wav == 1
         && dsd_audio_record_policy_gate_slot(opts, state, 0, &allow) == 0 && allow) {
@@ -497,16 +504,23 @@ ysf_write_bypassed_call_wav(dsd_opts* opts, dsd_state* state) {
     }
 }
 
+// V/D2's MBE capture (-d), for the same reason and under the same record policy as its per-call WAV: the frame never
+// reaches the vocoder's capture stage (issue #661).
+static void
+ysf_capture_bypassed_frame(dsd_opts* opts, dsd_state* state, const char ambe_d[49]) {
+    int allow = 0;
+    if (dsd_mbe_out_enabled(opts, 0) && dsd_audio_record_policy_gate_slot(opts, state, 0, &allow) == 0 && allow) {
+        dsd_mbe_out_write(opts, state, 0, DSD_MBE_OUT_FORMAT_AMBE, ambe_d);
+    }
+}
+
+// A frame that bypassed the vocoder (V/D2) runs the gain stage here, in either output format (issue #652); one that
+// went through it was already gained there.
 static void
 ysf_emit_audio_from_temp(dsd_opts* opts, dsd_state* state, bool bypassed_vocoder) {
-    if (opts->floating_point == 0) {
-        if (bypassed_vocoder) {
-            processAudio(opts, state);
-        }
-    } else {
-        DSD_MEMCPY(state->f_l, state->audio_out_temp_buf, sizeof(state->f_l));
-    }
     if (bypassed_vocoder) {
+        dsd_voice_chain_run(opts, state, 0, state->audio_out_temp_buf);
+        dsd_voice_stage_short_left(opts, state);
         ysf_write_bypassed_call_wav(opts, state);
     }
     dsd_play_synthesized_voice(opts, state);
@@ -668,6 +682,9 @@ ysf_print_fich_summary(const dsd_opts* opts, const ysf_fich_info* info) {
     ysf_print_fich_payload(opts, info);
 }
 
+/* A V/D type 1 frame carries five DCH/VCH pairs, one 20 ms AMBE frame per VCH: 100 ms of voice (issue #660). */
+enum { YSF_VD1_CHANNEL_PAIRS = 5 };
+
 static void
 ysf_handle_vd_type1(dsd_opts* opts, dsd_state* state, const ysf_fich_info* info) {
     uint8_t dbuf[190];
@@ -675,7 +692,7 @@ ysf_handle_vd_type1(dsd_opts* opts, dsd_state* state, const ysf_fich_info* info)
     DSD_MEMSET(dbuf, 0, sizeof(dbuf));
     DSD_MEMSET(vbuf, 0, sizeof(vbuf));
 
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < YSF_VD1_CHANNEL_PAIRS; i++) {
         for (int j = 0; j < 36; j++) {
             dbuf[(i * 36) + j] = get_dibit_and_analog_signal(opts, state, NULL);
         }
@@ -683,8 +700,11 @@ ysf_handle_vd_type1(dsd_opts* opts, dsd_state* state, const ysf_fich_info* info)
             vbuf[(i * 36) + j] = get_dibit_and_analog_signal(opts, state, NULL);
         }
     }
+    if (ysf_carrier_left(state, info)) {
+        return;
+    }
 
-    ysf_ehr(opts, state, vbuf, 0, 4);
+    ysf_ehr(opts, state, vbuf, 0, YSF_VD1_CHANNEL_PAIRS);
     ysf_conv_dch(opts, state, info->bn, info->bt, info->fn, info->ft, info->cm, dbuf);
 }
 
@@ -744,6 +764,10 @@ ysf_handle_vd_type2(dsd_opts* opts, dsd_state* state, const ysf_fich_info* info)
         state->errs2 = 0;
 
         ysf_read_type2_vech_bits(opts, state, vech_bits);
+        /* A voice block read across the carrier boundary is dropped with the rest of the frame, as V/D1 drops it. */
+        if (ysf_carrier_left(state, info)) {
+            return;
+        }
         ysf_build_type2_ambe(vech_bits, temp, ambe_d);
 
         state->errs2 = vech_bits[103];
@@ -762,6 +786,7 @@ ysf_handle_vd_type2(dsd_opts* opts, dsd_state* state, const ysf_fich_info* info)
             state->errs2 = 0;
             state->err_str[0] = '\0';
         } else {
+            dsd_mbe_float_to_pcm16_scale(state->audio_out_temp_buf);
             state->errs = ((result.flags & MBE_PROCESS_FLAG_C0_VALID) != 0u) ? result.c0_errors : result.total_errors;
             state->errs2 = result.total_errors;
             mbe_formatProcessResult(state->err_str, sizeof(state->err_str), &result);
@@ -771,7 +796,11 @@ ysf_handle_vd_type2(dsd_opts* opts, dsd_state* state, const ysf_fich_info* info)
             PrintAMBEData(opts, state, ambe_d);
         }
 
+        ysf_capture_bypassed_frame(opts, state, ambe_d);
         ysf_emit_audio_from_temp(opts, state, true);
+    }
+    if (ysf_carrier_left(state, info)) {
+        return;
     }
 
     ysf_conv_dch2(opts, state, info->bn, info->bt, info->fn, info->ft, info->cm, dbuf);
@@ -804,8 +833,8 @@ ysf_read_full_rate_imbe_raw(dsd_opts* opts, dsd_state* state, uint8_t imbe_raw[1
     }
 }
 
-static void
-ysf_decode_full_rate_voice_slot(dsd_opts* opts, dsd_state* state) {
+static bool
+ysf_decode_full_rate_voice_slot(dsd_opts* opts, dsd_state* state, const ysf_fich_info* info) {
     uint8_t imbe_raw[144];
     uint8_t imbe_vch[144];
     char imbe_fr[8][23];
@@ -816,13 +845,18 @@ ysf_decode_full_rate_voice_slot(dsd_opts* opts, dsd_state* state) {
     DSD_MEMSET(imbe_fr, 0, sizeof(imbe_fr));
 
     ysf_read_full_rate_imbe_raw(opts, state, imbe_raw);
+    /* A voice slot read across the carrier boundary is dropped with the rest of the frame, as V/D1 drops it. */
+    if (ysf_carrier_left(state, info)) {
+        return false;
+    }
     dsd_ysf_unpack_full_rate_imbe(imbe_raw, imbe_vch, imbe_fr);
 
     state->synctype = DSD_SYNC_P25P1_POS;
-    processMbeFrame(opts, state, imbe_fr, NULL, NULL);
+    processMbeFrame(opts, state, DSD_VOICE_PROTOCOL_YSF, imbe_fr, NULL, NULL);
     state->synctype = synctype;
 
     ysf_emit_audio_from_temp(opts, state, false);
+    return true;
 }
 
 static void
@@ -837,10 +871,12 @@ ysf_handle_full_rate_voice(dsd_opts* opts, dsd_state* state, const ysf_fich_info
     }
 
     for (int i = 0; i < voice_slots; i++) {
-        ysf_decode_full_rate_voice_slot(opts, state);
+        if (!ysf_decode_full_rate_voice_slot(opts, state, info)) {
+            return;
+        }
     }
 
-    if (is_csd3) {
+    if (is_csd3 && !ysf_carrier_left(state, info)) {
         ysf_conv_dch(opts, state, 2, info->bt, info->fn, info->ft, info->cm, dbuf);
     }
 }
@@ -854,6 +890,9 @@ ysf_handle_full_rate_data(dsd_opts* opts, dsd_state* state, const ysf_fich_info*
         for (int j = 0; j < 36; j++) {
             dbuf_fr[i % 2][((i / 2) * 36) + j] = get_dibit_and_analog_signal(opts, state, NULL);
         }
+    }
+    if (ysf_carrier_left(state, info)) {
+        return;
     }
 
     for (int i = 0; i < 2; i++) {
@@ -904,7 +943,8 @@ ysf_end_call_lifecycle(dsd_opts* opts, dsd_state* state, const ysf_fich_info* in
     // A FICH-verified communication terminator (FI=2) is positive over-the-air end evidence, so
     // the event layer can keep an audible epoch whose callsigns never decoded; EXPLICIT would be
     // indistinguishable from an engine retune and drop that row.
-    if (info->err == 0 && info->fi == 2U && dsd_call_state_end_ex(state, 0U, 0.0, DSD_CALL_END_TERMINATOR) > 0) {
+    if (info->err == 0 && info->fi == 2U && !ysf_carrier_left(state, info)
+        && dsd_call_state_end_ex(state, 0U, 0.0, DSD_CALL_END_TERMINATOR) > 0) {
         dsd_event_sync_slot(opts, state, 0U);
     }
 }
@@ -931,8 +971,19 @@ processYSF(dsd_opts* opts, dsd_state* state) {
     static uint8_t last_fi;
     ysf_fich_info info;
 
+    info.carrier_seq = state->carrier_seq;
     ysf_parse_fich(opts, state, &info, &last_dt, &last_fi);
     ysf_print_fich_summary(opts, &info);
+    if (info.err == 0 && !ysf_carrier_left(state, &info)) {
+        /* Confirmed as soon as the FICH verifies, so this frame's own voice is captured (issue #661); the verdict
+           below reads the flag as before. */
+        state->ysf_fich_confirmed = 1;
+        /* A verified header or terminator bounds the transmission: its capture ends here, even when the terminator
+           of the one before it was lost. */
+        if (info.fi == 0U || info.fi == 2U) {
+            dsd_mbe_out_close_protocol(opts, state, DSD_MBE_OUT_SLOT1, DSD_SYNC_YSF_POS);
+        }
+    }
 
     ysf_update_call_lifecycle(opts, state, &info);
     ysf_dispatch_payload(opts, state, &info);
@@ -946,7 +997,13 @@ processYSF(dsd_opts* opts, dsd_state* state) {
      * dt/fi come from a frame that did check out, ysf_dispatch_payload() lays the rest of the
      * frame out on them, and ysf_handle_vd_type2() synthesizes and plays voice from it. A
      * frame that produced audio must not tell the SPS hunt it validated nothing (#391).
-     * noCarrier() clears the flag with the other per-transmission YSF state. */
+     * noCarrier() clears the flag with the other per-transmission YSF state.
+     *
+     * A frame the carrier boundary split confirms nothing and reports nothing decoded (issue #575): its FICH was the
+     * carrier left's, the boundary restarted the verdict, and the payload was dropped. */
+    if (ysf_carrier_left(state, &info)) {
+        return 0;
+    }
     if (info.err == 0) {
         state->ysf_fich_confirmed = 1;
     }

@@ -45,10 +45,24 @@ jobs:
         env:
           RELEASE_TAG_CREATED: ${{ github.event.created }}
         run: tools/ci_validate_release_tag.sh
+      - name: Check Docker Hub credentials
+        id: dockerhub
+        # Dependabot and fork PRs get no Docker Hub secrets. The login is then skipped
+        # and the pull goes out anonymously.
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "Docker Hub secrets are not set for this run; pulling anonymously."
+          fi
+
       - name: Login to Docker Hub (optional)
-        # Only run on trusted contexts (not forked PRs), otherwise the
-        # `secrets` context is unavailable and would error.
-        if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+        # The QEMU and Ubuntu images below are pulled inside steps.
+        if: steps.dockerhub.outputs.available == 'true'
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f
         continue-on-error: true
         env:
@@ -64,7 +78,7 @@ jobs:
           source tools/ci-dependency-pins.env
           echo "TONISTIIGI_BINFMT_IMAGE=$TONISTIIGI_BINFMT_IMAGE" >> "$GITHUB_ENV"
       - name: Enable QEMU for cross-arch containers
-        uses: docker/setup-qemu-action@1f40c72289eff860ee54a304f1438e3cff362e0a # v4.3.0
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
         with:
           image: ${{ env.TONISTIIGI_BINFMT_IMAGE }}
           platforms: all
@@ -375,7 +389,7 @@ jobs:
               cmake --install build/appimage --prefix AppDir/usr
 
               docdir="AppDir/usr/share/doc/dsd-neo"
-              required=(LICENSE COPYRIGHT THIRD_PARTY.md licenses/ezpwd-LGPL-2.1-or-later.txt licenses/pffft-FFTPACK.txt licenses/libairspy-LICENSE.txt)
+              required=(LICENSE COPYRIGHT THIRD_PARTY.md licenses/ezpwd-LGPL-2.1-or-later.txt licenses/pffft-LICENSE.txt licenses/pffft-NOTICES.txt licenses/libairspy-LICENSE.txt)
               for f in "${required[@]}"; do
                 if [ ! -f "$docdir/$f" ]; then
                   echo "ERROR: missing required license file: $docdir/$f" >&2
@@ -490,14 +504,32 @@ jobs:
           path: ${{ steps.names.outputs.OUT }}
           retention-days: 7
       - name: Generate artifact SBOM
-        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
           file: ${{ steps.names.outputs.OUT }}
           format: spdx-json
           output-file: ${{ steps.names.outputs.OUT }}.spdx.json
           artifact-name: ${{ steps.names.outputs.ART }}.spdx.json
-          upload-artifact: true
+          upload-artifact: false
           upload-release-assets: false
+
+      - name: Record pinned PFFFT in SBOM
+        shell: bash
+        env:
+          SBOM_PATH: ${{ steps.names.outputs.OUT }}.spdx.json
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            python tools/pffft_metadata.py --spdx "$SBOM_PATH"
+          else
+            python3 tools/pffft_metadata.py --spdx "$SBOM_PATH"
+          fi
+
+      - name: Upload enriched SBOM
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.names.outputs.ART }}.spdx.json
+          path: ${{ steps.names.outputs.OUT }}.spdx.json
+          retention-days: 7
       - name: Attest artifact provenance
         if: startsWith(github.ref, 'refs/tags/')
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
@@ -568,11 +600,7 @@ jobs:
         with:
           name: ${{ steps.names.outputs.ART }}.spdx.json
           path: dist
-      - name: Normalize downloaded SBOM filename
-        shell: bash
-        run: |
-          set -euo pipefail
-          mv -f "dist/${{ steps.names.outputs.ART }}.spdx.json" "${{ steps.names.outputs.OUT }}.spdx.json"
+      # upload-artifact preserves the SBOM basename, including the package extension.
       - name: Verify downloaded release files
         shell: bash
         run: |

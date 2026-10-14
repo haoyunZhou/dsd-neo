@@ -36,11 +36,25 @@ void dsd_symbol_matched_filter_reset(dsd_state* state);
  *
  * getSymbol() collects the unsynced samples it reads into `analog_out_f`, in a
  * digital session too, and plays or records the block once it is full. The
- * samples in it belong to the receive family they were read under, so a change
- * between the analog and digital families calls this on the decoder thread; the
- * next block then starts with the new family's samples.
+ * samples in it belong to the receive family they were read under, or on the
+ * analog monitor to its FM or AM detector, so a change between the analog and
+ * digital families, or between FM and AM, calls this on the decoder thread; the
+ * next block then starts with the new family's or kind's samples. On an RTL
+ * front end getSymbol() also drops the block itself, and collects nothing, while
+ * the front end has yet to switch to the monitor an analog decoder is configured
+ * for (issue #582).
  */
 void dsd_symbol_analog_block_reset(dsd_state* state);
+
+/**
+ * @brief Tell the RTL output rescale which rate the symbol timing is in now (issue #634).
+ *
+ * On an RTL monitor output the decoder rescales samplesPerSymbol and symbolCenter whenever the output rate changes,
+ * from the rate it last rescaled them to. An input switch back to the radio from a PCM input calls this with the PCM
+ * input's timing rate, so the next rescale starts from the rate the timing is really in. A no-op in a build without
+ * radio support.
+ */
+void dsd_symbol_note_timing_rate(int rate_hz);
 
 #ifdef __cplusplus
 }

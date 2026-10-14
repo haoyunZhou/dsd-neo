@@ -6,6 +6,8 @@
  * Copyright (C) 2026 by arancormonk <180709949+arancormonk@users.noreply.github.com>
  */
 
+#include <dsd-neo/core/audio.h>
+#include <dsd-neo/core/audio_activity.h>
 #include <dsd-neo/core/call_state.h>
 #include <dsd-neo/core/file_io.h>
 #include <dsd-neo/core/init.h>
@@ -23,7 +25,10 @@
 #include <dsd-neo/platform/file_compat.h>
 #include <dsd-neo/platform/posix_compat.h>
 #include <dsd-neo/protocol/nxdn/nxdn_lfsr.h>
+#include <dsd-neo/runtime/decode_clock.h>
+#include <dsd-neo/runtime/udp_audio_hooks.h>
 #include <errno.h>
+#include <math.h>
 #include <mbelib-neo/mbelib.h>
 #include <sndfile.h>
 #include <stdint.h>
@@ -34,6 +39,50 @@
 #include "dsd-neo/core/opts_fwd.h"
 #include "dsd-neo/core/state_fwd.h"
 #include "mbe_result_context.h"
+#include "test_support.h"
+
+/* The owner a protocol's own decoder passes for a frame decoded under this synctype. A test of a borrowed decoder
+   (YSF, scrambled dPMR) passes the borrower's protocol instead. */
+static dsd_voice_protocol
+owner_of(int synctype) {
+    if (DSD_SYNC_IS_DMR(synctype)) {
+        return DSD_VOICE_PROTOCOL_DMR;
+    }
+    if (DSD_SYNC_IS_P25P1(synctype)) {
+        return DSD_VOICE_PROTOCOL_P25P1;
+    }
+    if (DSD_SYNC_IS_P25P2(synctype)) {
+        return DSD_VOICE_PROTOCOL_P25P2;
+    }
+    if (DSD_SYNC_IS_NXDN(synctype)) {
+        return DSD_VOICE_PROTOCOL_NXDN;
+    }
+    if (DSD_SYNC_IS_DPMR(synctype)) {
+        return DSD_VOICE_PROTOCOL_DPMR;
+    }
+    if (DSD_SYNC_IS_YSF(synctype)) {
+        return DSD_VOICE_PROTOCOL_YSF;
+    }
+    if (DSD_SYNC_IS_DSTAR(synctype)) {
+        return DSD_VOICE_PROTOCOL_DSTAR;
+    }
+    if (DSD_SYNC_IS_X2TDMA(synctype)) {
+        return DSD_VOICE_PROTOCOL_X2TDMA;
+    }
+    if (DSD_SYNC_IS_PROVOICE(synctype)) {
+        return DSD_VOICE_PROTOCOL_PROVOICE;
+    }
+    return DSD_VOICE_PROTOCOL_NONE;
+}
+
+/* These cases check synthesis, crypto and routing against mbelib's own output: a fixed unity gain with the high-pass
+   off (use_hpf_d 0) leaves the voice chain every frame runs through (issue #653) a pass-through. The chain itself is
+   CORE_VOICE_CHAIN's, and its place on each path the voice-chain cases below. */
+static void
+pass_through_voice_chain(dsd_opts* opts) {
+    opts->audio_gain = 1.0f;
+    opts->audio_gainR = 1.0f;
+}
 
 static int
 expect_eq_int(const char* tag, int got, int want) {
@@ -309,6 +358,7 @@ store_expected_process_status(int ret, float audio[160], int* errs, int* errs2, 
         err_str[0] = '\0';
         return;
     }
+    dsd_mbe_float_to_pcm16_scale(audio);
     store_expected_decode_status(ret, errs, errs2, result);
     mbe_formatProcessResult(err_str, err_str_size, result);
 }
@@ -330,6 +380,7 @@ test_keyring_tracks_aes_segment_metadata(void) {
     const int slot1_fallback_key = 0x1400;
 
     DSD_MEMSET(&opts, 0, sizeof(opts));
+    pass_through_voice_chain(&opts);
     DSD_MEMSET(&state, 0, sizeof(state));
     state.currentslot = 0;
     state.payload_keyid = slot0_zero_key;
@@ -566,6 +617,18 @@ init_mbe_state(dsd_state* state, mbe_parms* cur, mbe_parms* prev, mbe_parms* pre
     state->cur_mp2 = cur2;
     state->prev_mp2 = prev2;
     state->prev_mp_enhanced2 = prev_enhanced2;
+    /* The gain stage (processAudio()/processAudioR()) runs in both output formats (issue #652): give it its output
+       buffers, and unity gain so a staged frame is the decoded frame (with opts->audio_gain/R 1, a fixed gain). */
+    static short out_l[100 + (160 * 256)];
+    static short out_r[100 + (160 * 256)];
+    state->audio_out_buf = out_l;
+    state->audio_out_buf_p = out_l + 100;
+    state->audio_out_bufR = out_r;
+    state->audio_out_buf_pR = out_r + 100;
+    state->aout_max_buf_p = state->aout_max_buf;
+    state->aout_max_buf_pR = state->aout_max_bufR;
+    state->aout_gain = 1.0f;
+    state->aout_gainR = 1.0f;
 }
 
 static int
@@ -644,7 +707,7 @@ create_mbe_playback_file(char* path, size_t path_size, const char cookie[4],
         DSD_FPRINTF(stderr, "dsd_mkstemp failed: %s\n", strerror(errno));
         return 1;
     }
-    FILE* f = fdopen(fd, "wb");
+    FILE* f = dsd_test_fdopen(fd, "wb");
     if (!f) {
         DSD_FPRINTF(stderr, "fdopen failed: %s\n", strerror(errno));
         dsd_close(fd);
@@ -655,6 +718,7 @@ create_mbe_playback_file(char* path, size_t path_size, const char cookie[4],
     static dsd_opts opts;
     static dsd_state state;
     DSD_MEMSET(&opts, 0, sizeof(opts));
+    pass_through_voice_chain(&opts);
     DSD_MEMSET(&state, 0, sizeof(state));
     state.errs2 = errs2;
     opts.mbe_out_f = f;
@@ -711,6 +775,7 @@ test_play_mbe_files_processes_imbe_ambe_and_dstar_records(void) {
     static mbe_parms prev2;
     static mbe_parms prev_enhanced2;
     DSD_MEMSET(&opts, 0, sizeof(opts));
+    pass_through_voice_chain(&opts);
     init_mbe_state(&state, &cur, &prev, &prev_enhanced, &cur2, &prev2, &prev_enhanced2);
     state.optind = 1;
     state.synctype = DSD_SYNC_P25P1_POS;
@@ -723,6 +788,7 @@ test_play_mbe_files_processes_imbe_ambe_and_dstar_records(void) {
     rc |= expect_eq_int("play-imbe-path", strcmp(opts.mbe_in_file, imbe_path), 0);
 
     DSD_MEMSET(&opts, 0, sizeof(opts));
+    pass_through_voice_chain(&opts);
     init_mbe_state(&state, &cur, &prev, &prev_enhanced, &cur2, &prev2, &prev_enhanced2);
     state.optind = 1;
 
@@ -734,6 +800,7 @@ test_play_mbe_files_processes_imbe_ambe_and_dstar_records(void) {
     rc |= expect_eq_int("play-amb-path", strcmp(opts.mbe_in_file, amb_path), 0);
 
     DSD_MEMSET(&opts, 0, sizeof(opts));
+    pass_through_voice_chain(&opts);
     init_mbe_state(&state, &cur, &prev, &prev_enhanced, &cur2, &prev2, &prev_enhanced2);
     state.optind = 1;
 
@@ -747,6 +814,83 @@ test_play_mbe_files_processes_imbe_ambe_and_dstar_records(void) {
     (void)remove(imbe_path);
     (void)remove(amb_path);
     (void)remove(dmb_path);
+    return rc;
+}
+
+/* Issue #652: -r playback under float output (-y) played through its own float mixer, which wrote no static WAV: a -w
+ * recording of a replayed .imb held only its header. Playback goes through the one gain stage and the mono mixer in
+ * either output format now, so the static WAV holds the same samples. */
+static int
+test_play_mbe_files_records_the_static_wav_in_either_format(void) {
+    char imbe_path[1024];
+    char imbe_bits[88] = {0};
+    for (int i = 0; i < 88; i++) {
+        imbe_bits[i] = (char)(((i * 5) + 1) & 1);
+    }
+    // No stored errors, so the frame synthesizes audible voice rather than an erasure's silence.
+    int rc = create_mbe_playback_file(imbe_path, sizeof imbe_path, ".imb", saveImbe4400Data, imbe_bits, 0,
+                                      "mbe_play_wav_formats");
+    if (rc != 0) {
+        return rc;
+    }
+    static short recorded[2][4096];
+    sf_count_t frames[2] = {0, 0};
+    for (int floating = 0; floating < 2; floating++) {
+        char wav_path[1024];
+        SNDFILE* wav = create_wav_temp(wav_path, sizeof wav_path, "mbe_play_wav_formats_wav");
+        dsd_opts* opts = calloc(1, sizeof(*opts));
+        dsd_state* state = calloc(1, sizeof(*state));
+        if (!wav || !opts || !state) {
+            if (wav) {
+                sf_close(wav);
+                (void)remove(wav_path);
+            }
+            free(opts);
+            free(state);
+            (void)remove(imbe_path);
+            return 1;
+        }
+        initOpts(opts);
+        initState(state);
+        opts->audio_out = 0;
+        opts->slot1_on = 1;
+        opts->floating_point = floating;
+        opts->wav_out_f = wav;
+        opts->static_wav_file = 1;
+        // The digital high-pass's filter state is set up by the engine, which this test does not run.
+        opts->use_hpf_d = 0;
+        state->optind = 1;
+
+        char* argv[] = {"dsd-neo", imbe_path};
+        playMbeFiles(opts, state, 2, argv);
+
+        sf_close(wav);
+        opts->wav_out_f = NULL;
+        SF_INFO info;
+        DSD_MEMSET(&info, 0, sizeof(info));
+        SNDFILE* written = sf_open(wav_path, SFM_READ, &info);
+        if (written) {
+            frames[floating] = sf_read_short(written, recorded[floating], 4096);
+            sf_close(written);
+        }
+        freeState(state);
+        free(state);
+        free(opts);
+        (void)remove(wav_path);
+    }
+    int audible = 0;
+    for (sf_count_t i = 0; i < frames[0]; i++) {
+        audible |= recorded[0][i] != 0;
+    }
+    rc |= expect_eq_int("-r static wav records the frame in 16-bit output", frames[0] > 0, 1);
+    rc |= expect_eq_int("-r static wav holds audible samples", audible, 1);
+    rc |= expect_eq_int("-r static wav records the frame under -y", frames[1] > 0, 1);
+    rc |= expect_eq_int("-r static wav: same length in both formats", (int)frames[1], (int)frames[0]);
+    if (frames[0] > 0 && frames[0] == frames[1]) {
+        rc |= expect_eq_mem("-r static wav: same samples in both formats", recorded[1], recorded[0],
+                            (size_t)frames[0] * sizeof(short));
+    }
+    (void)remove(imbe_path);
     return rc;
 }
 
@@ -899,7 +1043,10 @@ test_process_mbe_frame_p25p1_suppresses_tail_erasure_hard(void) {
     dsd_close(log_fd);
 
     DSD_MEMSET(&opts, 0, sizeof(opts));
+    pass_through_voice_chain(&opts);
     opts.floating_point = 1;
+    opts.audio_gain = 1.0f;
+    opts.audio_gainR = 1.0f;
     opts.mbe_out_f = mbe_out;
     DSD_SNPRINTF(opts.frame_log_file, sizeof(opts.frame_log_file), "%s", log_path);
     opts.frame_log_file[sizeof(opts.frame_log_file) - 1U] = '\0';
@@ -930,10 +1077,9 @@ test_process_mbe_frame_p25p1_suppresses_tail_erasure_hard(void) {
     DSD_MEMCPY(&prev_enhanced_before, &prev_enhanced, sizeof(prev_enhanced_before));
     load_imbe7200_rows(k_p25p1_tail_erasure_rows, imbe_fr);
 
-    processMbeFrame(&opts, &state, imbe_fr, NULL, NULL);
+    processMbeFrame(&opts, &state, owner_of(state.synctype), imbe_fr, NULL, NULL);
 
     rc |= expect_eq_mem("p25p1-tail-hard silence", state.audio_out_temp_buf, silence, sizeof(silence));
-    rc |= expect_eq_mem("p25p1-tail-hard staged silence", state.f_l, silence, sizeof(silence));
     rc |= expect_eq_mem("p25p1-tail-hard current history", &cur, &cur_before, sizeof(cur));
     rc |= expect_eq_mem("p25p1-tail-hard previous history", &prev, &prev_before, sizeof(prev));
     rc |=
@@ -992,7 +1138,10 @@ test_process_mbe_frame_p25p1_suppresses_tail_erasure_soft(void) {
     mbe_parms prev_enhanced_before;
 
     DSD_MEMSET(&opts, 0, sizeof(opts));
+    pass_through_voice_chain(&opts);
     opts.floating_point = 1;
+    opts.audio_gain = 1.0f;
+    opts.audio_gainR = 1.0f;
     init_mbe_state(&state, &cur, &prev, &prev_enhanced, &cur2, &prev2, &prev_enhanced2);
     state.synctype = DSD_SYNC_P25P1_NEG;
     state.p25_crypto_state[0] = DSD_P25_CRYPTO_CLEAR;
@@ -1016,10 +1165,9 @@ test_process_mbe_frame_p25p1_suppresses_tail_erasure_soft(void) {
     DSD_MEMCPY(&prev_enhanced_before, &prev_enhanced, sizeof(prev_enhanced_before));
     load_imbe7200_soft_rows(k_p25p1_tail_erasure_rows, imbe_soft);
 
-    processMbeFrameSoft(&opts, &state, imbe_soft, NULL, NULL);
+    processMbeFrameSoft(&opts, &state, owner_of(state.synctype), imbe_soft, NULL, NULL);
 
     rc |= expect_eq_mem("p25p1-tail-soft silence", state.audio_out_temp_buf, silence, sizeof(silence));
-    rc |= expect_eq_mem("p25p1-tail-soft staged silence", state.f_l, silence, sizeof(silence));
     rc |= expect_eq_mem("p25p1-tail-soft current history", &cur, &cur_before, sizeof(cur));
     rc |= expect_eq_mem("p25p1-tail-soft previous history", &prev, &prev_before, sizeof(prev));
     rc |=
@@ -1061,13 +1209,17 @@ test_process_mbe_frame_p25p1_tail_erasure_requires_exact_clear_state(void) {
         char imbe_fr[8][23] = {{0}};
 
         DSD_MEMSET(&opts, 0, sizeof(opts));
+        pass_through_voice_chain(&opts);
+        pass_through_voice_chain(&opts);
         opts.floating_point = 1;
+        opts.audio_gain = 1.0f;
+        opts.audio_gainR = 1.0f;
         init_mbe_state(&state, &cur, &prev, &prev_enhanced, &cur2, &prev2, &prev_enhanced2);
         state.synctype = DSD_SYNC_P25P1_POS;
         state.p25_crypto_state[0] = crypto_states[i];
         load_imbe7200_rows(k_p25p1_tail_erasure_rows, imbe_fr);
 
-        processMbeFrame(&opts, &state, imbe_fr, NULL, NULL);
+        processMbeFrame(&opts, &state, owner_of(state.synctype), imbe_fr, NULL, NULL);
 
         rc |= expect_eq_int("p25p1-tail-nonclear errs2", state.errs2, 10);
         rc |= expect_eq_int("p25p1-tail-nonclear vc", state.p25vc, 1);
@@ -1096,26 +1248,29 @@ test_process_mbe_frame_p25p1_normalized_metrics_and_nonmatches(void) {
     char imbe_fr[8][23] = {{0}};
 
     DSD_MEMSET(&opts, 0, sizeof(opts));
+    pass_through_voice_chain(&opts);
     opts.floating_point = 1;
+    opts.audio_gain = 1.0f;
+    opts.audio_gainR = 1.0f;
     init_mbe_state(&state, &cur, &prev, &prev_enhanced, &cur2, &prev2, &prev_enhanced2);
     state.synctype = DSD_SYNC_P25P1_POS;
     state.p25_crypto_state[0] = DSD_P25_CRYPTO_CLEAR;
 
     load_imbe7200_rows(k_p25p1_clean_silence_rows, imbe_fr);
-    processMbeFrame(&opts, &state, imbe_fr, NULL, NULL);
+    processMbeFrame(&opts, &state, owner_of(state.synctype), imbe_fr, NULL, NULL);
     rc |= expect_eq_int("p25p1-metrics clean accepted", (int)state.p25_p1_accepted_frames, 1);
     rc |= expect_eq_int("p25p1-metrics clean", (int)state.p25_p1_clean_frames, 1);
     rc |= expect_eq_int("p25p1-metrics clean corrections", (int)state.p25_p1_accepted_corrections, 0);
 
     load_imbe7200_rows(k_p25p1_corrected_speech_rows, imbe_fr);
-    processMbeFrame(&opts, &state, imbe_fr, NULL, NULL);
+    processMbeFrame(&opts, &state, owner_of(state.synctype), imbe_fr, NULL, NULL);
     rc |= expect_eq_int("p25p1-metrics corrected accepted", (int)state.p25_p1_accepted_frames, 2);
     rc |= expect_eq_int("p25p1-metrics corrected", (int)state.p25_p1_corrected_frames, 1);
     rc |= expect_eq_int("p25p1-metrics corrected corrections", (int)state.p25_p1_accepted_corrections, 8);
 
     state.p25_crypto_state[0] = DSD_P25_CRYPTO_DECRYPTABLE;
     load_imbe7200_rows(k_p25p1_tail_erasure_rows, imbe_fr);
-    processMbeFrame(&opts, &state, imbe_fr, NULL, NULL);
+    processMbeFrame(&opts, &state, owner_of(state.synctype), imbe_fr, NULL, NULL);
     rc |= expect_eq_int("p25p1-metrics concealed accepted", (int)state.p25_p1_accepted_frames, 3);
     rc |= expect_eq_int("p25p1-metrics concealed", (int)state.p25_p1_concealed_frames, 1);
     rc |= expect_eq_int("p25p1-metrics accepted corrections", (int)state.p25_p1_accepted_corrections, 18);
@@ -1131,11 +1286,93 @@ test_process_mbe_frame_p25p1_normalized_metrics_and_nonmatches(void) {
     state.synctype = DSD_SYNC_P25P1_POS;
     state.p25_crypto_state[0] = DSD_P25_CRYPTO_CLEAR;
     load_imbe7200_rows(k_p25p1_dense_fc_rows, imbe_fr);
-    processMbeFrame(&opts, &state, imbe_fr, NULL, NULL);
+    processMbeFrame(&opts, &state, owner_of(state.synctype), imbe_fr, NULL, NULL);
     rc |= expect_eq_int("p25p1-dense-fc errs2", state.errs2, 12);
     rc |= expect_eq_int("p25p1-dense-fc accepted", (int)state.p25_p1_accepted_frames, 1);
     rc |= expect_eq_int("p25p1-dense-fc not suppressed", (int)state.p25_p1_suppressed_tail_frames, 0);
     rc |= expect_eq_int("p25p1-dense-fc not excluded", (int)state.p25_p1_excluded_tail_corrections, 0);
+    return rc;
+}
+
+/* Issue #652: float output (-y) skipped the gain stage and the short staging and copied the raw frame to its own
+ * mixers. One gain stage serves both formats now: the vocoder stages the same gained short frame in either format, on
+ * the mono (P25 Phase 1) and the DMR slot path, so every mixer, recording and the float sink read the same samples. */
+static int
+test_process_mbe_frame_float_output_runs_the_gain_stage(void) {
+    int rc = 0;
+    static dsd_opts opts;
+    static dsd_state state;
+    static mbe_parms cur, prev, prev_enhanced, cur2, prev2, prev_enhanced2;
+    static short staged[2][2][160];
+    for (int path = 0; path < 2; path++) {
+        char imbe_fr[8][23] = {{0}};
+        char ambe_fr[4][24] = {{0}};
+        char decoded[88] = {0};
+        float expected_audio[160] = {0};
+        char expected_err_str[96] = {0};
+        int expected_errs = -1;
+        int expected_errs2 = -1;
+        mbe_process_result result;
+        int ret;
+        if (path == 0) {
+            imbe_fr[0][3] = 1;
+            imbe_fr[2][9] = 1;
+            imbe_fr[5][1] = 1;
+            ret = mbe_decodeImbe7200x4400Frame((const char (*)[23])imbe_fr, decoded, &result);
+        } else {
+            ambe_fr[1][4] = 1;
+            ambe_fr[3][19] = 1;
+            ret = mbe_decodeAmbe3600x2450Frame((const char (*)[24])ambe_fr, decoded, &result);
+        }
+        store_expected_decode_status(ret, &expected_errs, &expected_errs2, &result);
+        mbe_initMbeParms(&cur, &prev, &prev_enhanced);
+        ret = (path == 0) ? mbe_processImbe4400Dataf(expected_audio, &result, decoded, &cur, &prev, &prev_enhanced)
+                          : mbe_processAmbe2450Dataf(expected_audio, &result, decoded, &cur, &prev, &prev_enhanced);
+        store_expected_process_status(ret, expected_audio, &expected_errs, &expected_errs2, expected_err_str,
+                                      sizeof(expected_err_str), &result);
+        rc |= expect_eq_int("float gain stage fixture processes", ret >= 0, 1);
+        for (int floating = 0; floating < 2; floating++) {
+            char tag[96];
+            DSD_MEMSET(&opts, 0, sizeof(opts));
+            opts.floating_point = floating;
+            opts.audio_out = 1;
+            opts.audio_out_type = 9;
+            opts.audio_gain = 2.0f;
+            opts.audio_gainR = 2.0f;
+            init_mbe_state(&state, &cur, &prev, &prev_enhanced, &cur2, &prev2, &prev_enhanced2);
+            state.aout_gain = 2.0f;
+            state.aout_gainR = 2.0f;
+            state.mbe_short_silenced[0] = 1U;
+            if (path == 0) {
+                state.synctype = DSD_SYNC_P25P1_POS;
+                state.p25_crypto_state[0] = DSD_P25_CRYPTO_CLEAR;
+                processMbeFrame(&opts, &state, owner_of(state.synctype), imbe_fr, NULL, NULL);
+            } else {
+                opts.dmr_stereo = 1;
+                state.synctype = DSD_SYNC_DMR_BS_VOICE_POS;
+                state.currentslot = 0;
+                processMbeFrame(&opts, &state, owner_of(state.synctype), NULL, ambe_fr, NULL);
+            }
+            int gained = 1;
+            for (int i = 0; i < 160; i++) {
+                float want = 2.0f * expected_audio[i];
+                want = want > 32767.0f ? 32767.0f : (want < -32768.0f ? -32768.0f : want);
+                const short want_s = (short)want;
+                gained &= state.s_l[i] == want_s;
+            }
+            DSD_SNPRINTF(tag, sizeof(tag), "%s %s: short frame staged through the gain stage", path ? "dmr" : "p25p1",
+                         floating ? "-y" : "s16");
+            rc |= expect_eq_int(tag, gained, 1);
+            DSD_SNPRINTF(tag, sizeof(tag), "%s %s: short frame marked staged", path ? "dmr" : "p25p1",
+                         floating ? "-y" : "s16");
+            rc |= expect_eq_int(tag, state.mbe_short_silenced[0], 0);
+            DSD_MEMCPY(staged[path][floating], state.s_l, sizeof(staged[path][floating]));
+            dsd_state_ext_free_all(&state);
+        }
+        rc |=
+            expect_eq_mem(path ? "dmr: both formats stage the same frame" : "p25p1: both formats stage the same frame",
+                          staged[path][0], staged[path][1], sizeof(staged[path][0]));
+    }
     return rc;
 }
 
@@ -1160,6 +1397,7 @@ test_process_mbe_frame_p25p1_updates_error_history(void) {
     mbe_process_result result;
 
     DSD_MEMSET(&opts, 0, sizeof(opts));
+    pass_through_voice_chain(&opts);
     int ret = mbe_decodeImbe7200x4400Frame((const char (*)[23])imbe_fr, imbe_d, &result);
     store_expected_decode_status(ret, &expected_errs, &expected_errs2, &result);
     rc |= expect_eq_int("hard-p25 fixture decodes", ret >= 0, 1);
@@ -1175,7 +1413,7 @@ test_process_mbe_frame_p25p1_updates_error_history(void) {
     init_mbe_state(&state, &cur, &prev, &prev_enhanced, &cur2, &prev2, &prev_enhanced2);
     state.synctype = DSD_SYNC_P25P1_POS;
     state.p25_crypto_state[0] = DSD_P25_CRYPTO_CLEAR;
-    processMbeFrame(&opts, &state, imbe_fr, NULL, NULL);
+    processMbeFrame(&opts, &state, owner_of(state.synctype), imbe_fr, NULL, NULL);
 
     rc |= expect_eq_int("hard-p25 errs", state.errs, expected_errs);
     rc |= expect_eq_int("hard-p25 errs2", state.errs2, expected_errs2);
@@ -1224,18 +1462,20 @@ test_process_mbe_frame_soft_p25p1_copies_soft_imbe_audio(void) {
     }
 
     DSD_MEMSET(&opts, 0, sizeof(opts));
+    pass_through_voice_chain(&opts);
     opts.floating_point = 1;
+    opts.audio_gain = 1.0f;
+    opts.audio_gainR = 1.0f;
     init_mbe_state(&state, &cur, &prev, &prev_enhanced, &cur2, &prev2, &prev_enhanced2);
     state.synctype = DSD_SYNC_P25P1_POS;
     state.p25_crypto_state[0] = DSD_P25_CRYPTO_CLEAR;
 
-    processMbeFrameSoft(&opts, &state, imbe_soft, NULL, NULL);
+    processMbeFrameSoft(&opts, &state, owner_of(state.synctype), imbe_soft, NULL, NULL);
 
     rc |= expect_eq_int("frame-soft-p25 errs", state.errs, expected_errs);
     rc |= expect_eq_int("frame-soft-p25 errs2", state.errs2, expected_errs2);
     rc |= expect_eq_int("frame-soft-p25 status", strcmp(state.err_str, expected_err_str), 0);
     rc |= expect_eq_mem("frame-soft-p25 temp audio", state.audio_out_temp_buf, expected_audio, sizeof(expected_audio));
-    rc |= expect_eq_mem("frame-soft-p25 staged left", state.f_l, expected_audio, sizeof(expected_audio));
     rc |= expect_eq_int("frame-soft-p25 vc", state.p25vc, 1);
     rc |= expect_eq_int("frame-soft-p25 history len", state.p25_p1_voice_err_hist_len, 50);
     rc |= expect_eq_int("frame-soft-p25 history pos", state.p25_p1_voice_err_hist_pos, 1);
@@ -1281,17 +1521,19 @@ test_process_mbe_frame_soft_nxdn_copies_soft_ambe_audio(void) {
     }
 
     DSD_MEMSET(&opts, 0, sizeof(opts));
+    pass_through_voice_chain(&opts);
     opts.floating_point = 1;
+    opts.audio_gain = 1.0f;
+    opts.audio_gainR = 1.0f;
     init_mbe_state(&state, &cur, &prev, &prev_enhanced, &cur2, &prev2, &prev_enhanced2);
     state.synctype = DSD_SYNC_NXDN_POS;
 
-    processMbeFrameSoft(&opts, &state, NULL, ambe_soft, NULL);
+    processMbeFrameSoft(&opts, &state, owner_of(state.synctype), NULL, ambe_soft, NULL);
 
     rc |= expect_eq_int("frame-soft-nxdn errs", state.errs, expected_errs);
     rc |= expect_eq_int("frame-soft-nxdn errs2", state.errs2, expected_errs2);
     rc |= expect_eq_int("frame-soft-nxdn status", strcmp(state.err_str, expected_err_str), 0);
     rc |= expect_eq_mem("frame-soft-nxdn temp audio", state.audio_out_temp_buf, expected_audio, sizeof(expected_audio));
-    rc |= expect_eq_mem("frame-soft-nxdn staged left", state.f_l, expected_audio, sizeof(expected_audio));
     rc |= expect_eq_int("frame-soft-nxdn no p25 history", state.p25_p1_voice_err_hist_len, 0);
     rc |= expect_eq_int("frame-soft-nxdn debug errors", state.debug_audio_errors, state.errs2);
 
@@ -1345,7 +1587,10 @@ test_process_mbe_frame_p25p1_rc4_transforms_imbe_payload(void) {
     }
 
     DSD_MEMSET(&opts, 0, sizeof(opts));
+    pass_through_voice_chain(&opts);
     opts.floating_point = 1;
+    opts.audio_gain = 1.0f;
+    opts.audio_gainR = 1.0f;
     init_mbe_state(&state, &cur, &prev, &prev_enhanced, &cur2, &prev2, &prev_enhanced2);
     state.synctype = DSD_SYNC_P25P1_POS;
     state.payload_algid = 0xAA;
@@ -1353,7 +1598,7 @@ test_process_mbe_frame_p25p1_rc4_transforms_imbe_payload(void) {
     state.payload_miP = 0x1122334455667788ULL;
     state.dropL = 5;
 
-    processMbeFrame(&opts, &state, imbe_fr, ambe_fr, imbe7100_fr);
+    processMbeFrame(&opts, &state, owner_of(state.synctype), imbe_fr, ambe_fr, imbe7100_fr);
 
     rc |= expect_eq_int("p25p1-rc4 state drop", state.dropL, 16);
     rc |= expect_eq_int("p25p1-rc4 vc", state.p25vc, 1);
@@ -1361,7 +1606,6 @@ test_process_mbe_frame_p25p1_rc4_transforms_imbe_payload(void) {
     rc |= expect_eq_int("p25p1-rc4 errs2", state.errs2, expected_errs2);
     rc |= expect_eq_int("p25p1-rc4 status", strcmp(state.err_str, expected_err_str), 0);
     rc |= expect_eq_mem("p25p1-rc4 temp audio", state.audio_out_temp_buf, expected_audio, sizeof(expected_audio));
-    rc |= expect_eq_mem("p25p1-rc4 staged left", state.f_l, expected_audio, sizeof(expected_audio));
     rc |= expect_eq_int("p25p1-rc4 history len", state.p25_p1_voice_err_hist_len, 50);
     rc |= expect_eq_int("p25p1-rc4 history pos", state.p25_p1_voice_err_hist_pos, 1);
 
@@ -1431,7 +1675,10 @@ test_process_mbe_frame_p25p1_multicrypt_transforms_imbe_payload(void) {
     // Run the full P25p1 AES128 path and compare counters, keystream emission,
     // vocoder status, and staged float audio against the oracle above.
     DSD_MEMSET(&opts, 0, sizeof(opts));
+    pass_through_voice_chain(&opts);
     opts.floating_point = 1;
+    opts.audio_gain = 1.0f;
+    opts.audio_gainR = 1.0f;
     init_mbe_state(&state, &cur, &prev, &prev_enhanced, &cur2, &prev2, &prev_enhanced2);
     state.synctype = DSD_SYNC_P25P1_POS;
     state.payload_algid = 0x89;
@@ -1443,7 +1690,7 @@ test_process_mbe_frame_p25p1_multicrypt_transforms_imbe_payload(void) {
     state.aes_iv[0] = expected_state.aes_iv[0];
     state.aes_iv[15] = expected_state.aes_iv[15];
 
-    processMbeFrame(&opts, &state, imbe_fr, ambe_fr, imbe7100_fr);
+    processMbeFrame(&opts, &state, owner_of(state.synctype), imbe_fr, ambe_fr, imbe7100_fr);
 
     rc |= expect_eq_int("p25p1-multicrypt aes128 state counter", state.octet_counter, expected_state.octet_counter);
     rc |= expect_eq_int("p25p1-multicrypt aes128 vc", state.p25vc, 1);
@@ -1453,14 +1700,16 @@ test_process_mbe_frame_p25p1_multicrypt_transforms_imbe_payload(void) {
     rc |= expect_eq_int("p25p1-multicrypt aes128 status", strcmp(state.err_str, expected_err_str), 0);
     rc |= expect_eq_mem("p25p1-multicrypt aes128 temp audio", state.audio_out_temp_buf, expected_audio,
                         sizeof(expected_audio));
-    rc |= expect_eq_mem("p25p1-multicrypt aes128 staged left", state.f_l, expected_audio, sizeof(expected_audio));
     rc |= expect_eq_int("p25p1-multicrypt aes128 history len", state.p25_p1_voice_err_hist_len, 50);
     rc |= expect_eq_int("p25p1-multicrypt aes128 history pos", state.p25_p1_voice_err_hist_pos, 1);
 
     // DES-XL shares the P25p1 IMBE transform entry point but has a distinct
     // MI/key schedule and octet counter progression, so keep it in this fixture.
     DSD_MEMSET(&opts, 0, sizeof(opts));
+    pass_through_voice_chain(&opts);
     opts.floating_point = 1;
+    opts.audio_gain = 1.0f;
+    opts.audio_gainR = 1.0f;
     init_mbe_state(&state, &cur, &prev, &prev_enhanced, &cur2, &prev2, &prev_enhanced2);
     state.synctype = DSD_SYNC_P25P1_POS;
     state.payload_algid = 0x9F;
@@ -1468,12 +1717,11 @@ test_process_mbe_frame_p25p1_multicrypt_transforms_imbe_payload(void) {
     state.payload_miP = 0x1122334455667788ULL;
     state.xl_is_hdu = 1;
 
-    processMbeFrame(&opts, &state, imbe_fr, ambe_fr, imbe7100_fr);
+    processMbeFrame(&opts, &state, owner_of(state.synctype), imbe_fr, ambe_fr, imbe7100_fr);
 
     rc |= expect_eq_int("p25p1-multicrypt desxl counter", state.octet_counter, 22);
     rc |= expect_eq_int("p25p1-multicrypt desxl vc", state.p25vc, 1);
     rc |= expect_any_nonzero_u8("p25p1-multicrypt desxl keystream", state.ks_octetL, sizeof(state.ks_octetL));
-    rc |= expect_eq_mem("p25p1-multicrypt desxl staged left", state.f_l, state.audio_out_temp_buf, sizeof(state.f_l));
 
     return rc;
 }
@@ -1526,20 +1774,22 @@ test_process_mbe_frame_nxdn_cipher1_transforms_ambe_payload(void) {
     }
 
     DSD_MEMSET(&opts, 0, sizeof(opts));
+    pass_through_voice_chain(&opts);
     opts.floating_point = 1;
+    opts.audio_gain = 1.0f;
+    opts.audio_gainR = 1.0f;
     init_mbe_state(&state, &cur, &prev, &prev_enhanced, &cur2, &prev2, &prev_enhanced2);
     state.synctype = DSD_SYNC_NXDN_POS;
     state.nxdn_cipher_type = 0x01;
     state.R = 0x12345ULL;
 
-    processMbeFrame(&opts, &state, imbe_fr, ambe_fr, imbe7100_fr);
+    processMbeFrame(&opts, &state, owner_of(state.synctype), imbe_fr, ambe_fr, imbe7100_fr);
 
     rc |= expect_eq_int("nxdn-cipher1 state mi", (int)state.payload_miN, (int)expected_state.payload_miN);
     rc |= expect_eq_int("nxdn-cipher1 errs", state.errs, expected_errs);
     rc |= expect_eq_int("nxdn-cipher1 errs2", state.errs2, expected_errs2);
     rc |= expect_eq_int("nxdn-cipher1 status", strcmp(state.err_str, expected_err_str), 0);
     rc |= expect_eq_mem("nxdn-cipher1 temp audio", state.audio_out_temp_buf, expected_audio, sizeof(expected_audio));
-    rc |= expect_eq_mem("nxdn-cipher1 staged left", state.f_l, expected_audio, sizeof(expected_audio));
     rc |= expect_eq_int("nxdn-cipher1 no p25 history", state.p25_p1_voice_err_hist_len, 0);
 
     return rc;
@@ -1594,7 +1844,10 @@ test_process_mbe_frame_nxdn_cipher2_initializes_and_advances_keystream(void) {
     }
 
     DSD_MEMSET(&opts, 0, sizeof(opts));
+    pass_through_voice_chain(&opts);
     opts.floating_point = 1;
+    opts.audio_gain = 1.0f;
+    opts.audio_gainR = 1.0f;
     init_mbe_state(&state, &cur, &prev, &prev_enhanced, &cur2, &prev2, &prev_enhanced2);
     state.synctype = DSD_SYNC_NXDN_POS;
     state.nxdn_cipher_type = 0x02;
@@ -1602,7 +1855,7 @@ test_process_mbe_frame_nxdn_cipher2_initializes_and_advances_keystream(void) {
     state.R = 0x0102030405ULL;
     state.payload_miN = 0x1122334455667788ULL;
 
-    processMbeFrame(&opts, &state, imbe_fr, ambe_fr, imbe7100_fr);
+    processMbeFrame(&opts, &state, owner_of(state.synctype), imbe_fr, ambe_fr, imbe7100_fr);
 
     rc |= expect_eq_int("nxdn-cipher2 state new-iv", state.nxdn_new_iv, 0);
     rc |= expect_eq_int("nxdn-cipher2 state bit-counter", state.bit_counterL, 49);
@@ -1613,13 +1866,12 @@ test_process_mbe_frame_nxdn_cipher2_initializes_and_advances_keystream(void) {
     rc |= expect_eq_int("nxdn-cipher2 errs2", state.errs2, expected_errs2);
     rc |= expect_eq_int("nxdn-cipher2 status", strcmp(state.err_str, expected_err_str), 0);
     rc |= expect_eq_mem("nxdn-cipher2 temp audio", state.audio_out_temp_buf, expected_audio, sizeof(expected_audio));
-    rc |= expect_eq_mem("nxdn-cipher2 staged left", state.f_l, expected_audio, sizeof(expected_audio));
 
     return rc;
 }
 
 static int
-test_process_mbe_frame_nxdn_cipher2_clamps_stale_bit_counter(void) {
+test_process_mbe_frame_nxdn_cipher2_mutes_stale_bit_counter(void) {
     int rc = 0;
     static dsd_opts opts;
     static dsd_state state;
@@ -1632,36 +1884,41 @@ test_process_mbe_frame_nxdn_cipher2_clamps_stale_bit_counter(void) {
     char imbe_fr[8][23] = {{0}};
     char ambe_fr[4][24] = {{0}};
     char imbe7100_fr[7][24] = {{0}};
-    char decoded_ambe_d[49] = {0};
-    int expected_errs = -1;
-    int expected_errs2 = -1;
-    mbe_process_result result;
+    float expected_audio[160] = {0};
+    short expected_short[160] = {0};
 
     ambe_fr[0][9] = 1;
     ambe_fr[1][18] = 1;
     ambe_fr[3][5] = 1;
 
-    int ret = mbe_decodeAmbe3600x2450Frame((const char (*)[24])ambe_fr, decoded_ambe_d, &result);
-    store_expected_decode_status(ret, &expected_errs, &expected_errs2, &result);
-    rc |= expect_eq_int("nxdn-cipher2-clamp fixture decodes", ret >= 0, 1);
-
     DSD_MEMSET(&opts, 0, sizeof(opts));
+    pass_through_voice_chain(&opts);
     opts.floating_point = 1;
+    opts.audio_gain = 1.0f;
+    opts.audio_gainR = 1.0f;
     init_mbe_state(&state, &cur, &prev, &prev_enhanced, &cur2, &prev2, &prev_enhanced2);
     state.synctype = DSD_SYNC_NXDN_POS;
     state.nxdn_cipher_type = 0x02;
     state.R = 1U;
     state.bit_counterL = 2000;
     DSD_MEMSET(state.ks_bitstreamL, 1, sizeof(state.ks_bitstreamL));
+    for (size_t i = 0; i < 160U; i++) {
+        state.audio_out_temp_buf[i] = 1000.0f;
+        state.s_l[i] = 1000;
+    }
 
-    processMbeFrame(&opts, &state, imbe_fr, ambe_fr, imbe7100_fr);
+    processMbeFrame(&opts, &state, owner_of(state.synctype), imbe_fr, ambe_fr, imbe7100_fr);
 
-    rc |= expect_eq_int("nxdn-cipher2-clamp state bit-counter", state.bit_counterL, 1568);
-    rc |= expect_eq_int("nxdn-cipher2-clamp status populated", state.err_str[0] != '\0', 1);
-    rc |= expect_eq_int("nxdn-cipher2-clamp errs updated", state.errs2 >= expected_errs2, 1);
-    rc |= expect_any_nonzero_u8("nxdn-cipher2-clamp temp audio", (const uint8_t*)state.audio_out_temp_buf,
-                                sizeof(state.audio_out_temp_buf));
-    rc |= expect_eq_mem("nxdn-cipher2-clamp staged left", state.f_l, state.audio_out_temp_buf, sizeof(state.f_l));
+    // An exhausted session cannot reuse its final word. Preserve the exhausted
+    // cursor and replace any previous audio with silence until a fresh IV arrives.
+    rc |= expect_eq_int("nxdn-cipher2-exhausted state bit-counter", state.bit_counterL, 2000);
+    rc |= expect_eq_int("nxdn-cipher2-exhausted errs", state.errs, 0);
+    rc |= expect_eq_int("nxdn-cipher2-exhausted errs2", state.errs2, 0);
+    rc |= expect_eq_int("nxdn-cipher2-exhausted status", state.err_str[0], '\0');
+    rc |= expect_eq_int("nxdn-cipher2-exhausted silenced", state.mbe_short_silenced[0], 1);
+    rc |= expect_eq_mem("nxdn-cipher2-exhausted temp audio", state.audio_out_temp_buf, expected_audio,
+                        sizeof(expected_audio));
+    rc |= expect_eq_mem("nxdn-cipher2-exhausted staged left", state.s_l, expected_short, sizeof(expected_short));
 
     return rc;
 }
@@ -1687,7 +1944,10 @@ test_process_mbe_frame_nxdn_cipher3_uses_aes_voice_offset(void) {
     ambe_fr[3][20] = 1;
 
     DSD_MEMSET(&opts, 0, sizeof(opts));
+    pass_through_voice_chain(&opts);
     opts.floating_point = 1;
+    opts.audio_gain = 1.0f;
+    opts.audio_gainR = 1.0f;
     init_mbe_state(&state, &cur, &prev, &prev_enhanced, &cur2, &prev2, &prev_enhanced2);
     state.synctype = DSD_SYNC_NXDN_POS;
     state.nxdn_cipher_type = 0x03U;
@@ -1702,7 +1962,7 @@ test_process_mbe_frame_nxdn_cipher3_uses_aes_voice_offset(void) {
     }
     aes_ofb_keystream_output(state.aes_iv, state.aes_key, expected_keystream, DSD_AES_KEY_256, 15);
 
-    processMbeFrame(&opts, &state, imbe_fr, ambe_fr, imbe7100_fr);
+    processMbeFrame(&opts, &state, owner_of(state.synctype), imbe_fr, ambe_fr, imbe7100_fr);
 
     rc |= expect_eq_int("nxdn-cipher3 state new-iv", state.nxdn_new_iv, 0);
     rc |= expect_eq_int("nxdn-cipher3 state bit-counter", state.bit_counterL, 49);
@@ -1710,7 +1970,6 @@ test_process_mbe_frame_nxdn_cipher3_uses_aes_voice_offset(void) {
     rc |= expect_bits_match("nxdn-cipher3 state voice offset", state.ks_bitstreamL, expected_keystream + 16U,
                             14U * 16U * 8U);
     rc |= expect_bits_differ("nxdn-cipher3 rejects old offset", state.ks_bitstreamL, expected_keystream + 8U, 64U);
-    rc |= expect_eq_mem("nxdn-cipher3 staged left", state.f_l, state.audio_out_temp_buf, sizeof(state.f_l));
 
     return rc;
 }
@@ -1747,25 +2006,160 @@ test_process_mbe_frame_hard_dstar_stages_audio(void) {
     rc |= expect_eq_int("frame-hard-dstar process", ret >= 0, 1);
 
     DSD_MEMSET(&opts, 0, sizeof(opts));
+    pass_through_voice_chain(&opts);
     opts.floating_point = 1;
+    opts.audio_gain = 1.0f;
+    opts.audio_gainR = 1.0f;
     init_mbe_state(&state, &cur, &prev, &prev_enhanced, &cur2, &prev2, &prev_enhanced2);
     state.synctype = DSD_SYNC_DSTAR_VOICE_POS;
 
-    processMbeFrame(&opts, &state, imbe_fr, ambe_fr, imbe7100_fr);
+    processMbeFrame(&opts, &state, owner_of(state.synctype), imbe_fr, ambe_fr, imbe7100_fr);
 
     rc |= expect_eq_int("frame-hard-dstar errs", state.errs, expected_errs);
     rc |= expect_eq_int("frame-hard-dstar errs2", state.errs2, expected_errs2);
     rc |= expect_eq_int("frame-hard-dstar status", strcmp(state.err_str, expected_err_str), 0);
     rc |=
         expect_eq_mem("frame-hard-dstar temp audio", state.audio_out_temp_buf, expected_audio, sizeof(expected_audio));
-    rc |= expect_eq_mem("frame-hard-dstar staged left", state.f_l, expected_audio, sizeof(expected_audio));
     rc |= expect_eq_int("frame-hard-dstar debug errors", state.debug_audio_errors, state.errs2);
 
     return rc;
 }
 
+/* D-STAR voice parameters for a test frame, varied by `variant`. b0's top bit is clear, so the frame is never one of
+ * the tone or silence patterns ((b0 & 0x7E) == 0x7E) and synthesizes speech. */
+static void
+fill_dstar_voice_params(char ambe_d[49], int variant) {
+    for (int i = 0; i < 49; i++) {
+        ambe_d[i] = (char)((((i * 7) + variant) % 3) == 1);
+    }
+    ambe_d[0] = 0;
+}
+
+/* An AMBE 3600x2400 frame in the decoder's plane layout. The encoder is the hard decoder's inverse: every parameter
+ * bit round-trips except ambe_d[24], the spare, which decodes as the second Golay word's scrambled parity. */
+static int
+build_dstar_voice_frame(int variant, char frame[4][24]) {
+    char ambe_d[49];
+    fill_dstar_voice_params(ambe_d, variant);
+    return mbe_encodeAmbe3600x2400Frame(ambe_d, frame);
+}
+
+static int
+audio_frames_differ(const float* a, const float* b) {
+    for (int i = 0; i < 160; i++) {
+        if (fabsf(a[i] - b[i]) > 1e-3f) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+enum { DSTAR_ROUTE_FRAMES = 3 };
+
+/* processDSTAR_HD() hands the superframe behind a D-STAR header to processDSTAR() without changing the synctype, so
+ * those voice frames reach the vocoder as DSD_SYNC_DSTAR_HD_*. They are AMBE 3600x2400 like any other D-STAR voice.
+ * The 2450 decoder shares the ECC, so the parameters and error counts would agree whichever codec ran; only the
+ * synthesis shows the difference, and the model it leaves for the next frame. So two frames behind a header and one
+ * after it are compared with mbelib's own 2400 frame chain, and the 2450 chain must differ from it. */
+static int
+test_process_mbe_frame_dstar_header_voice_decodes_as_ambe2400(void) {
+    static const int sequences[][DSTAR_ROUTE_FRAMES] = {
+        {DSD_SYNC_DSTAR_VOICE_POS, DSD_SYNC_DSTAR_VOICE_POS, DSD_SYNC_DSTAR_VOICE_POS},
+        {DSD_SYNC_DSTAR_HD_POS, DSD_SYNC_DSTAR_HD_POS, DSD_SYNC_DSTAR_VOICE_POS},
+        {DSD_SYNC_DSTAR_HD_NEG, DSD_SYNC_DSTAR_HD_NEG, DSD_SYNC_DSTAR_VOICE_NEG},
+    };
+    int rc = 0;
+    static dsd_opts opts;
+    static dsd_state state;
+    static mbe_parms cur;
+    static mbe_parms prev;
+    static mbe_parms prev_enhanced;
+    static mbe_parms cur2;
+    static mbe_parms prev2;
+    static mbe_parms prev_enhanced2;
+    static mbe_parms ref_cur;
+    static mbe_parms ref_prev;
+    static mbe_parms ref_prev_enhanced;
+    static float ref_audio[DSTAR_ROUTE_FRAMES][160];
+    static float ambe2450_audio[DSTAR_ROUTE_FRAMES][160];
+    static char ref_err_str[DSTAR_ROUTE_FRAMES][96];
+    int ref_errs[DSTAR_ROUTE_FRAMES];
+    int ref_errs2[DSTAR_ROUTE_FRAMES];
+    char frames[DSTAR_ROUTE_FRAMES][4][24];
+    char ambe_d[49];
+    char label[96];
+    mbe_process_result result;
+    int ambe2450_differs = 0;
+
+    for (int f = 0; f < DSTAR_ROUTE_FRAMES; f++) {
+        rc |= expect_eq_int("dstar-route fixture encodes", build_dstar_voice_frame(f, frames[f]), 0);
+    }
+
+    mbe_initMbeParms(&ref_cur, &ref_prev, &ref_prev_enhanced);
+    for (int f = 0; f < DSTAR_ROUTE_FRAMES; f++) {
+        mbe_setThreadRngSeed(599U + (uint32_t)f);
+        int ret = mbe_processAmbe3600x2400Framef(ref_audio[f], &result, (const char (*)[24])frames[f], ambe_d, &ref_cur,
+                                                 &ref_prev, &ref_prev_enhanced);
+        store_expected_process_status(ret, ref_audio[f], &ref_errs[f], &ref_errs2[f], ref_err_str[f],
+                                      sizeof(ref_err_str[f]), &result);
+        rc |= expect_eq_int("dstar-route reference processes", ret >= 0, 1);
+    }
+    static const float silence[160] = {0.0f};
+    rc |= expect_eq_int("dstar-route reference is not silence", audio_frames_differ(ref_audio[1], silence), 1);
+
+    mbe_initMbeParms(&ref_cur, &ref_prev, &ref_prev_enhanced);
+    for (int f = 0; f < DSTAR_ROUTE_FRAMES; f++) {
+        mbe_setThreadRngSeed(599U + (uint32_t)f);
+        int ret = mbe_processAmbe3600x2450Framef(ambe2450_audio[f], &result, (const char (*)[24])frames[f], ambe_d,
+                                                 &ref_cur, &ref_prev, &ref_prev_enhanced);
+        // Compared on the scale of the reference, which the vocoder's int16 scaling applies to.
+        if (ret >= 0) {
+            dsd_mbe_float_to_pcm16_scale(ambe2450_audio[f]);
+        }
+        if (ret >= 0 && audio_frames_differ(ambe2450_audio[f], ref_audio[f])) {
+            ambe2450_differs = 1;
+        }
+    }
+    rc |= expect_eq_int("dstar-route 2450 synthesis differs", ambe2450_differs, 1);
+
+    DSD_MEMSET(&opts, 0, sizeof(opts));
+    pass_through_voice_chain(&opts);
+    opts.floating_point = 1;
+    opts.audio_gain = 1.0f;
+    opts.audio_gainR = 1.0f;
+    for (size_t s = 0; s < sizeof(sequences) / sizeof(sequences[0]); s++) {
+        init_mbe_state(&state, &cur, &prev, &prev_enhanced, &cur2, &prev2, &prev_enhanced2);
+        for (int f = 0; f < DSTAR_ROUTE_FRAMES; f++) {
+            state.synctype = sequences[s][f];
+            mbe_setThreadRngSeed(599U + (uint32_t)f);
+            processMbeFrame(&opts, &state, owner_of(state.synctype), NULL, frames[f], NULL);
+
+            DSD_SNPRINTF(label, sizeof(label), "dstar-route synctype %d frame %d audio", sequences[s][f], f);
+            rc |= expect_eq_mem(label, state.audio_out_temp_buf, ref_audio[f], sizeof(ref_audio[f]));
+            // The gain stage (unity here) stages the frame's short samples in either output format (issue #652).
+            int staged = 1;
+            for (int i = 0; i < 160; i++) {
+                const short want_s = (short)ref_audio[f][i];
+                staged &= state.s_l[i] == want_s;
+            }
+            DSD_SNPRINTF(label, sizeof(label), "dstar-route synctype %d frame %d staged left", sequences[s][f], f);
+            rc |= expect_eq_int(label, staged, 1);
+            DSD_SNPRINTF(label, sizeof(label), "dstar-route synctype %d frame %d errs", sequences[s][f], f);
+            rc |= expect_eq_int(label, state.errs, ref_errs[f]);
+            DSD_SNPRINTF(label, sizeof(label), "dstar-route synctype %d frame %d errs2", sequences[s][f], f);
+            rc |= expect_eq_int(label, state.errs2, ref_errs2[f]);
+            DSD_SNPRINTF(label, sizeof(label), "dstar-route synctype %d frame %d status", sequences[s][f], f);
+            rc |= expect_eq_int(label, strcmp(state.err_str, ref_err_str[f]), 0);
+        }
+        dsd_state_ext_free_all(&state);
+    }
+
+    return rc;
+}
+
 /* X2-TDMA and D-STAR write their WAV straight from the MBE post-processing;
- * like every other protocol there, it honours the call's talkgroup policy. */
+ * like every other protocol there, it honours the call's talkgroup policy.
+ * X2-TDMA writes the per-call WAV of the timeslot it decodes (issue #654). */
 static int
 test_process_mbe_frame_x2_dstar_wav_honors_talkgroup_policy(void) {
     // D-STAR publishes on slot 0 even when a TDMA decode left currentslot at 1;
@@ -1803,8 +2197,14 @@ test_process_mbe_frame_x2_dstar_wav_honors_talkgroup_policy(void) {
                 return 1;
             }
             DSD_MEMSET(&opts, 0, sizeof(opts));
+            pass_through_voice_chain(&opts);
             opts.floating_point = 1;
-            opts.wav_out_f = wav;
+            const int slot2_file = DSD_SYNC_IS_X2TDMA(cases[p].protocol) && cases[p].current_slot == 1;
+            if (slot2_file) {
+                opts.wav_out_fR = wav;
+            } else {
+                opts.wav_out_f = wav;
+            }
             opts.dmr_stereo_wav = 1;
             init_mbe_state(&state, &cur, &prev, &prev_enhanced, &cur2, &prev2, &prev_enhanced2);
             state.synctype = cases[p].protocol;
@@ -1820,10 +2220,11 @@ test_process_mbe_frame_x2_dstar_wav_honors_talkgroup_policy(void) {
                                                .ota_source_id = 1U};
             rc |= expect_eq_int("wav policy call", dsd_call_state_observe(&state, &call, DSD_CALL_BOUNDARY_BEGIN), 1);
 
-            processMbeFrame(&opts, &state, imbe_fr, ambe_fr, imbe7100_fr);
+            processMbeFrame(&opts, &state, owner_of(state.synctype), imbe_fr, ambe_fr, imbe7100_fr);
 
             sf_close(wav);
             opts.wav_out_f = NULL;
+            opts.wav_out_fR = NULL;
             SF_INFO info;
             DSD_MEMSET(&info, 0, sizeof(info));
             SNDFILE* written = sf_open(wav_path, SFM_READ, &info);
@@ -1879,7 +2280,10 @@ test_process_mbe_frame_mbe_capture_honors_record_policy(void) {
                 return 1;
             }
             DSD_MEMSET(&opts, 0, sizeof(opts));
+            pass_through_voice_chain(&opts);
             opts.floating_point = 1;
+            opts.audio_gain = 1.0f;
+            opts.audio_gainR = 1.0f;
             opts.slot1_on = 1;
             opts.slot2_on = 1;
             if (cases[c].right_file) {
@@ -1903,7 +2307,7 @@ test_process_mbe_frame_mbe_capture_honors_record_policy(void) {
                                                .ota_source_id = 1U};
             rc |= expect_eq_int("capture call", dsd_call_state_observe(&state, &call, DSD_CALL_BOUNDARY_BEGIN), 1);
 
-            processMbeFrame(&opts, &state, imbe_fr, ambe_fr, imbe7100_fr);
+            processMbeFrame(&opts, &state, owner_of(state.synctype), imbe_fr, ambe_fr, imbe7100_fr);
 
             (void)fflush(out);
             (void)fseek(out, 0, SEEK_END);
@@ -1953,7 +2357,11 @@ test_process_mbe_frame_p25p1_capture_honors_reverse_mute(void) {
             return 1;
         }
         DSD_MEMSET(&opts, 0, sizeof(opts));
+        pass_through_voice_chain(&opts);
+        pass_through_voice_chain(&opts);
         opts.floating_point = 1;
+        opts.audio_gain = 1.0f;
+        opts.audio_gainR = 1.0f;
         opts.reverse_mute = cases[c].reverse_mute;
         opts.mbe_out_f = out;
         init_mbe_state(&state, &cur, &prev, &prev_enhanced, &cur2, &prev2, &prev_enhanced2);
@@ -1967,7 +2375,7 @@ test_process_mbe_frame_p25p1_capture_honors_reverse_mute(void) {
                                            .ota_source_id = 1U};
         rc |= expect_eq_int("reverse capture call", dsd_call_state_observe(&state, &call, DSD_CALL_BOUNDARY_BEGIN), 1);
 
-        processMbeFrame(&opts, &state, imbe_fr, NULL, NULL);
+        processMbeFrame(&opts, &state, owner_of(cases[c].call_protocol), imbe_fr, NULL, NULL);
 
         (void)fflush(out);
         (void)fseek(out, 0, SEEK_END);
@@ -2015,22 +2423,24 @@ test_process_mbe_frame_hard_dmr_left_stages_audio(void) {
     }
 
     DSD_MEMSET(&opts, 0, sizeof(opts));
+    pass_through_voice_chain(&opts);
     opts.floating_point = 1;
+    opts.audio_gain = 1.0f;
+    opts.audio_gainR = 1.0f;
     opts.dmr_mono = 1;
     opts.dmr_stereo = 1;
     init_mbe_state(&state, &cur, &prev, &prev_enhanced, &cur2, &prev2, &prev_enhanced2);
     state.synctype = DSD_SYNC_DMR_BS_VOICE_POS;
     state.currentslot = 0;
 
-    processMbeFrame(&opts, &state, imbe_fr, ambe_fr, imbe7100_fr);
+    processMbeFrame(&opts, &state, owner_of(state.synctype), imbe_fr, ambe_fr, imbe7100_fr);
 
     rc |= expect_eq_int("frame-hard-dmr errs", state.errs, expected_errs);
     rc |= expect_eq_int("frame-hard-dmr errs2", state.errs2, expected_errs2);
     rc |= expect_eq_int("frame-hard-dmr status", strcmp(state.err_str, expected_err_str), 0);
     rc |= expect_eq_mem("frame-hard-dmr temp audio", state.audio_out_temp_buf, expected_audio, sizeof(expected_audio));
-    rc |= expect_eq_mem("frame-hard-dmr staged left", state.f_l, expected_audio, sizeof(expected_audio));
-    rc |= expect_eq_int("frame-hard-dmr enc flag", state.dmr_encL, 0);
-    rc |= expect_eq_int("frame-hard-dmr inactive right muted", state.dmr_encR, 1);
+    rc |= expect_eq_int("frame-hard-dmr enc flag", state.mbe_slot_muted[0], 0);
+    rc |= expect_eq_int("frame-hard-dmr inactive right muted", state.mbe_slot_muted[1], 1);
     rc |= expect_eq_int("frame-hard-dmr debug errors", state.debug_audio_errors, state.errs2);
 
     return rc;
@@ -2053,7 +2463,7 @@ test_process_mbe_frame_trunked_mono_bs_fallback_gates_to_granted_slot(void) {
     char ambe_fr[4][24] = {{0}};
     char ambe_d[49] = {0};
     float expected_audio[160] = {0};
-    float silent_audio[160] = {0};
+    short silent_audio[160] = {0};
     char expected_err_str[96] = {0};
     int expected_errs = -1;
     int expected_errs2 = -1;
@@ -2079,7 +2489,10 @@ test_process_mbe_frame_trunked_mono_bs_fallback_gates_to_granted_slot(void) {
     }
 
     DSD_MEMSET(&opts, 0, sizeof(opts));
+    pass_through_voice_chain(&opts);
     opts.floating_point = 1;
+    opts.audio_gain = 1.0f;
+    opts.audio_gainR = 1.0f;
     opts.dmr_mono = 1;
     opts.dmr_stereo = 1;
     opts.dmr_stereo_wav = 1;
@@ -2091,22 +2504,30 @@ test_process_mbe_frame_trunked_mono_bs_fallback_gates_to_granted_slot(void) {
     state.dmr_mono_slot = 1;
 
     state.currentslot = 0;
-    processMbeFrame(&opts, &state, NULL, ambe_fr, NULL);
+    processMbeFrame(&opts, &state, owner_of(state.synctype), NULL, ambe_fr, NULL);
 
-    rc |= expect_eq_int("dmr-bs-fallback adjacent slot muted", state.dmr_encL, 1);
-    rc |= expect_eq_mem("dmr-bs-fallback adjacent slot not staged", state.f_l, silent_audio, sizeof(silent_audio));
+    rc |= expect_eq_int("dmr-bs-fallback adjacent slot muted", state.mbe_slot_muted[0], 1);
+    rc |= expect_eq_mem("dmr-bs-fallback adjacent slot not staged", state.s_l, silent_audio, sizeof(silent_audio));
     rc |= expect_eq_int("dmr-bs-fallback adjacent slot debug errors", state.debug_audio_errors, 0);
 
     state.currentslot = 1;
-    processMbeFrame(&opts, &state, NULL, ambe_fr, NULL);
+    processMbeFrame(&opts, &state, owner_of(state.synctype), NULL, ambe_fr, NULL);
 
     rc |= expect_eq_int("dmr-bs-fallback errs", state.errsR, expected_errs);
     rc |= expect_eq_int("dmr-bs-fallback errs2", state.errs2R, expected_errs2);
     rc |= expect_eq_int("dmr-bs-fallback status", strcmp(state.err_strR, expected_err_str), 0);
     rc |=
         expect_eq_mem("dmr-bs-fallback temp audio", state.audio_out_temp_bufR, expected_audio, sizeof(expected_audio));
-    rc |= expect_eq_mem("dmr-bs-fallback staged right", state.f_r, expected_audio, sizeof(expected_audio));
-    rc |= expect_eq_int("dmr-bs-fallback enc flag", state.dmr_encR, 0);
+    {
+        int staged = 1;
+        for (int i = 0; i < 160; i++) {
+            const short want_s = (short)expected_audio[i];
+            staged &= state.s_r[i] == want_s;
+        }
+        // Float output (-y) stages the slot's short frame through the gain stage too (issue #652).
+        rc |= expect_eq_int("dmr-bs-fallback staged right", staged, 1);
+    }
+    rc |= expect_eq_int("dmr-bs-fallback enc flag", state.mbe_slot_muted[1], 0);
     rc |= expect_eq_int("dmr-bs-fallback debug errors", state.debug_audio_errorsR, state.errs2R);
 
     if (wav_out_l) {
@@ -2128,6 +2549,145 @@ test_process_mbe_frame_trunked_mono_bs_fallback_gates_to_granted_slot(void) {
         rc |= 1;
     }
 
+    return rc;
+}
+
+// A P25 Phase 2 frame on slot 2 is recorded into slot 2's per-call WAV whatever opts->dmr_stereo says (issue #651):
+// with dmr_stereo 0 (an AUTO config applied over a -fr session) the mono post path wrote the slot-1 buffer into slot
+// 1's file and left slot 2's file empty.
+static int
+test_process_mbe_frame_p25p2_mono_path_records_slot2_wav(void) {
+    int rc = 0;
+    static dsd_opts opts;
+    static dsd_state state;
+    static mbe_parms cur;
+    static mbe_parms prev;
+    static mbe_parms prev_enhanced;
+    static mbe_parms cur2;
+    static mbe_parms prev2;
+    static mbe_parms prev_enhanced2;
+    char ambe_fr[4][24] = {{0}};
+    char wav_path_l[1024];
+    char wav_path_r[1024];
+    SNDFILE* wav_out_l = create_wav_temp(wav_path_l, sizeof(wav_path_l), "p25p2_mono_wav_l");
+    SNDFILE* wav_out_r = create_wav_temp(wav_path_r, sizeof(wav_path_r), "p25p2_mono_wav_r");
+
+    ambe_fr[0][11] = 1;
+    ambe_fr[2][20] = 1;
+
+    DSD_MEMSET(&opts, 0, sizeof(opts));
+    pass_through_voice_chain(&opts);
+    opts.dmr_stereo = 0;
+    opts.dmr_stereo_wav = 1;
+    opts.static_wav_file = 0;
+    opts.wav_out_f = wav_out_l;
+    opts.wav_out_fR = wav_out_r;
+    init_mbe_state(&state, &cur, &prev, &prev_enhanced, &cur2, &prev2, &prev_enhanced2);
+    state.synctype = DSD_SYNC_P25P2_POS;
+    state.dmr_stereo = 1;
+    state.p25_p2_audio_allowed[1] = 1;
+    state.p25_crypto_state[1] = DSD_P25_CRYPTO_CLEAR;
+    state.currentslot = 1;
+    processMbeFrame(&opts, &state, owner_of(state.synctype), NULL, ambe_fr, NULL);
+
+    if (wav_out_l) {
+        sf_write_sync(wav_out_l);
+        rc |= expect_eq_int("p25p2-mono slot1 wav untouched", (int)sf_seek(wav_out_l, 0, SEEK_END), 0);
+        rc |= expect_eq_int("p25p2-mono slot1 wav close", sf_close(wav_out_l), 0);
+        (void)remove(wav_path_l);
+        opts.wav_out_f = NULL;
+    } else {
+        rc |= 1;
+    }
+    if (wav_out_r) {
+        sf_write_sync(wav_out_r);
+        rc |= expect_eq_int("p25p2-mono slot2 wav frames", (int)sf_seek(wav_out_r, 0, SEEK_END), 160);
+        rc |= expect_eq_int("p25p2-mono slot2 wav close", sf_close(wav_out_r), 0);
+        (void)remove(wav_path_r);
+        opts.wav_out_fR = NULL;
+    } else {
+        rc |= 1;
+    }
+    return rc;
+}
+
+// dsd_state::mbe_short_silenced says whether the current frame's short samples are in s_l/s_r (issue #651): 0 after
+// processAudio(R) staged them, 1 when the vocoder staged silence or skipped short staging.
+static int
+test_process_mbe_frame_p25p2_short_staging_provenance(void) {
+    int rc = 0;
+    static dsd_opts opts;
+    static dsd_state state;
+    static mbe_parms cur;
+    static mbe_parms prev;
+    static mbe_parms prev_enhanced;
+    static mbe_parms cur2;
+    static mbe_parms prev2;
+    static mbe_parms prev_enhanced2;
+    static short out_s[2][2048];
+    static float out_f[2][2048];
+    char ambe_fr[4][24] = {{0}};
+    ambe_fr[0][11] = 1;
+    ambe_fr[2][20] = 1;
+
+    // Stereo post path, clear slot 2: staged, so audio.
+    DSD_MEMSET(&opts, 0, sizeof(opts));
+    pass_through_voice_chain(&opts);
+    opts.dmr_stereo = 1;
+    opts.audio_out = 1;
+    opts.dmr_mute_encL = 1;
+    opts.dmr_mute_encR = 1;
+    init_mbe_state(&state, &cur, &prev, &prev_enhanced, &cur2, &prev2, &prev_enhanced2);
+    state.audio_out_buf = out_s[0];
+    state.audio_out_bufR = out_s[1];
+    state.audio_out_buf_p = out_s[0] + 100;
+    state.audio_out_buf_pR = out_s[1] + 100;
+    state.audio_out_float_buf = out_f[0];
+    state.audio_out_float_bufR = out_f[1];
+    state.audio_out_float_buf_p = out_f[0] + 100;
+    state.audio_out_float_buf_pR = out_f[1] + 100;
+    state.aout_max_buf_p = state.aout_max_buf;
+    state.aout_max_buf_pR = state.aout_max_bufR;
+    state.synctype = DSD_SYNC_P25P2_POS;
+    state.p2_wacn = 1;
+    state.p2_sysid = 1;
+    state.p2_cc = 1;
+    state.payload_algidR = 0x80;
+    state.p25_p2_audio_allowed[1] = 1;
+    state.p25_crypto_state[1] = DSD_P25_CRYPTO_CLEAR;
+    state.mbe_short_silenced[1] = 1U;
+    state.currentslot = 1;
+    processMbeFrame(&opts, &state, owner_of(state.synctype), NULL, ambe_fr, NULL);
+    rc |= expect_eq_int("p25p2 clear slot2 short staged", state.mbe_short_silenced[1], 0);
+
+    // Issue #655: the service options' encryption bit with ALGID 0x80 is a clear call by P25's classification, and
+    // P25 decides P25: the DMR service-options rule no longer silences it.
+    state.dmr_soR = 0x40;
+    state.mbe_short_silenced[1] = 1U;
+    processMbeFrame(&opts, &state, owner_of(state.synctype), NULL, ambe_fr, NULL);
+    rc |= expect_eq_int("p25p2 SO 0x40 ALGID 0x80 clear slot2 short staged", state.mbe_short_silenced[1], 0);
+    state.dmr_soR = 0;
+
+    // The vocoder mutes an encrypted slot it cannot decrypt: silence, so not audio.
+    state.payload_algidR = 0x84;
+    state.p25_crypto_state[1] = DSD_P25_CRYPTO_BLOCKED;
+    processMbeFrame(&opts, &state, owner_of(state.synctype), NULL, ambe_fr, NULL);
+    rc |= expect_eq_int("p25p2 encrypted slot2 short silenced", state.mbe_short_silenced[1], 1);
+
+    // Mono post path (dmr_stereo 0) with every output off: short staging is skipped, so not this frame's audio.
+    opts.dmr_stereo = 0;
+    opts.audio_out = 0;
+    state.payload_algidR = 0x80;
+    state.p25_crypto_state[1] = DSD_P25_CRYPTO_CLEAR;
+    state.p25_p2_audio_allowed[1] = 1;
+    state.mbe_short_silenced[1] = 0U;
+    processMbeFrame(&opts, &state, owner_of(state.synctype), NULL, ambe_fr, NULL);
+    rc |= expect_eq_int("p25p2 mono skipped short staging", state.mbe_short_silenced[1], 1);
+
+    // Mono post path with output on: staged.
+    opts.audio_out = 1;
+    processMbeFrame(&opts, &state, owner_of(state.synctype), NULL, ambe_fr, NULL);
+    rc |= expect_eq_int("p25p2 mono short staged", state.mbe_short_silenced[1], 0);
     return rc;
 }
 
@@ -2175,7 +2735,10 @@ test_process_mbe_frame_dmr_rc4_transforms_left_and_right_slots(void) {
     }
 
     DSD_MEMSET(&opts, 0, sizeof(opts));
+    pass_through_voice_chain(&opts);
     opts.floating_point = 1;
+    opts.audio_gain = 1.0f;
+    opts.audio_gainR = 1.0f;
     opts.dmr_stereo = 1;
     init_mbe_state(&state, &cur, &prev, &prev_enhanced, &cur2, &prev2, &prev_enhanced2);
     state.synctype = DSD_SYNC_DMR_BS_VOICE_POS;
@@ -2186,15 +2749,14 @@ test_process_mbe_frame_dmr_rc4_transforms_left_and_right_slots(void) {
     state.dropL = 4;
 
     // Production processing performs the left-slot transform and stages decoded audio.
-    processMbeFrame(&opts, &state, imbe_fr, ambe_fr, imbe7100_fr);
+    processMbeFrame(&opts, &state, owner_of(state.synctype), imbe_fr, ambe_fr, imbe7100_fr);
 
     rc |= expect_eq_int("dmr-rc4-left state drop", state.dropL, expected_state.dropL);
     rc |= expect_eq_int("dmr-rc4-left errs", state.errs, expected_errs);
     rc |= expect_eq_int("dmr-rc4-left errs2", state.errs2, expected_errs2);
     rc |= expect_eq_int("dmr-rc4-left status", strcmp(state.err_str, expected_err_str), 0);
-    rc |= expect_eq_int("dmr-rc4-left decryptable", state.dmr_encL, 0);
+    rc |= expect_eq_int("dmr-rc4-left decryptable", state.mbe_slot_muted[0], 0);
     rc |= expect_eq_mem("dmr-rc4-left temp audio", state.audio_out_temp_buf, expected_audio, sizeof(expected_audio));
-    rc |= expect_eq_mem("dmr-rc4-left staged", state.f_l, expected_audio, sizeof(expected_audio));
 
     expected_errs = -1;
     expected_errs2 = -1;
@@ -2224,7 +2786,10 @@ test_process_mbe_frame_dmr_rc4_transforms_left_and_right_slots(void) {
     }
 
     DSD_MEMSET(&opts, 0, sizeof(opts));
+    pass_through_voice_chain(&opts);
     opts.floating_point = 1;
+    opts.audio_gain = 1.0f;
+    opts.audio_gainR = 1.0f;
     opts.dmr_stereo = 1;
     init_mbe_state(&state, &cur, &prev, &prev_enhanced, &cur2, &prev2, &prev_enhanced2);
     state.synctype = DSD_SYNC_DMR_BS_VOICE_POS;
@@ -2235,15 +2800,14 @@ test_process_mbe_frame_dmr_rc4_transforms_left_and_right_slots(void) {
     state.dropR = 9;
 
     // The second production pass verifies right-slot state, error counters, and audio staging.
-    processMbeFrame(&opts, &state, imbe_fr, ambe_fr, imbe7100_fr);
+    processMbeFrame(&opts, &state, owner_of(state.synctype), imbe_fr, ambe_fr, imbe7100_fr);
 
     rc |= expect_eq_int("dmr-rc4-right state drop", state.dropR, expected_state.dropR);
     rc |= expect_eq_int("dmr-rc4-right errs", state.errsR, expected_errs);
     rc |= expect_eq_int("dmr-rc4-right errs2", state.errs2R, expected_errs2);
     rc |= expect_eq_int("dmr-rc4-right status", strcmp(state.err_strR, expected_err_str), 0);
-    rc |= expect_eq_int("dmr-rc4-right decryptable", state.dmr_encR, 0);
+    rc |= expect_eq_int("dmr-rc4-right decryptable", state.mbe_slot_muted[1], 0);
     rc |= expect_eq_mem("dmr-rc4-right temp audio", state.audio_out_temp_bufR, expected_audio, sizeof(expected_audio));
-    rc |= expect_eq_mem("dmr-rc4-right staged", state.f_r, expected_audio, sizeof(expected_audio));
 
     return rc;
 }
@@ -2282,7 +2846,10 @@ test_process_mbe_frame_mixed_clear_and_bp(void) {
             store_expected_process_status(ret, expected_audio, &errs, &errs2, expected_error, sizeof(expected_error),
                                           &result);
             init_mbe_state(state, &cur, &prev, &enhanced, &cur2, &prev2, &enhanced2);
+            pass_through_voice_chain(opts);
             opts->floating_point = 1;
+            opts->audio_gain = 1.0f;
+            opts->audio_gainR = 1.0f;
             opts->dmr_stereo = 1;
             state->synctype = DSD_SYNC_DMR_BS_VOICE_POS;
             state->currentslot = slot;
@@ -2290,22 +2857,21 @@ test_process_mbe_frame_mixed_clear_and_bp(void) {
             state->M = scenario == 2;
             state->dmr_fid = state->dmr_fidR = 0x10;
             state->dmr_so = state->dmr_soR = scenario == 1 ? 0x40 : 0;
-            processMbeFrame(opts, state, imbe, ambe, imbe7100);
+            processMbeFrame(opts, state, owner_of(state->synctype), imbe, ambe, imbe7100);
             rc |= expect_eq_int("mixed clear/BP errs", slot ? state->errsR : state->errs, errs);
             rc |= expect_eq_int("mixed clear/BP errs2", slot ? state->errs2R : state->errs2, errs2);
             rc |= expect_eq_int("mixed clear/BP status",
                                 strcmp(slot ? state->err_strR : state->err_str, expected_error), 0);
-            const float* staged = slot ? state->f_r : state->f_l;
             const float* actual = slot ? state->audio_out_temp_bufR : state->audio_out_temp_buf;
+            const short* staged = slot ? state->s_r : state->s_l;
             for (int sample = 0; sample < 160; sample++) {
                 float difference = actual[sample] - expected_audio[sample];
-                float staged_difference = staged[sample] - expected_audio[sample];
-                if (!(difference >= -0.000001f && difference <= 0.000001f)
-                    || !(staged_difference >= -0.000001f && staged_difference <= 0.000001f)) {
+                const short want_s = (short)expected_audio[sample];
+                if (!(difference >= -0.000001f && difference <= 0.000001f) || staged[sample] != want_s) {
                     rc = 1;
                 }
             }
-            rc |= (slot ? state->dmr_encR : state->dmr_encL) != 0;
+            rc |= state->mbe_slot_muted[slot] != 0;
         }
     }
     if (rc) {
@@ -2335,37 +2901,45 @@ test_process_mbe_frame_dmr_reverse_mute_preserves_p25_override(void) {
     ambe_fr[0][2] = 1;
     ambe_fr[2][15] = 1;
 
+    // Issue #657: -q flips the frame's verdict and leaves the user's encrypted-audio mute options as set.
     DSD_MEMSET(&opts, 0, sizeof(opts));
+    pass_through_voice_chain(&opts);
     opts.floating_point = 1;
+    opts.audio_gain = 1.0f;
+    opts.audio_gainR = 1.0f;
     opts.dmr_stereo = 1;
     opts.reverse_mute = 1;
     opts.unmute_encrypted_p25 = 1;
+    opts.dmr_mute_encL = 0;
     init_mbe_state(&state, &cur, &prev, &prev_enhanced, &cur2, &prev2, &prev_enhanced2);
     state.synctype = DSD_SYNC_DMR_BS_VOICE_POS;
     state.currentslot = 0;
 
-    processMbeFrame(&opts, &state, imbe_fr, ambe_fr, imbe7100_fr);
+    processMbeFrame(&opts, &state, owner_of(state.synctype), imbe_fr, ambe_fr, imbe7100_fr);
 
-    rc |= expect_eq_int("reverse-mute-left-enc", state.dmr_encL, 1);
-    rc |= expect_eq_int("reverse-mute-left-mute", opts.dmr_mute_encL, 1);
+    // -q mutes the clear call and writes no option (issue #655).
+    rc |= expect_eq_int("reverse-mute-left-enc", state.mbe_slot_muted[0], 1);
+    rc |= expect_eq_int("reverse-mute-left-mute", opts.dmr_mute_encL, 0);
     rc |= expect_eq_int("reverse-mute-left-preserves-p25-override", opts.unmute_encrypted_p25, 1);
-    rc |= expect_eq_mem("reverse-mute-left-staged", state.f_l, state.audio_out_temp_buf, sizeof(state.f_l));
 
     DSD_MEMSET(&opts, 0, sizeof(opts));
+    pass_through_voice_chain(&opts);
     opts.floating_point = 1;
+    opts.audio_gain = 1.0f;
+    opts.audio_gainR = 1.0f;
     opts.dmr_stereo = 1;
     opts.reverse_mute = 1;
+    opts.dmr_mute_encR = 1;
     init_mbe_state(&state, &cur, &prev, &prev_enhanced, &cur2, &prev2, &prev_enhanced2);
     state.synctype = DSD_SYNC_DMR_BS_VOICE_POS;
     state.currentslot = 1;
     state.dmr_soR = 0x40;
 
-    processMbeFrame(&opts, &state, imbe_fr, ambe_fr, imbe7100_fr);
+    processMbeFrame(&opts, &state, owner_of(state.synctype), imbe_fr, ambe_fr, imbe7100_fr);
 
-    rc |= expect_eq_int("reverse-mute-right-enc", state.dmr_encR, 0);
-    rc |= expect_eq_int("reverse-mute-right-mute", opts.dmr_mute_encR, 0);
+    rc |= expect_eq_int("reverse-mute-right-enc", state.mbe_slot_muted[1], 0);
+    rc |= expect_eq_int("reverse-mute-right-mute", opts.dmr_mute_encR, 1);
     rc |= expect_eq_int("reverse-mute-right-preserves-p25-override", opts.unmute_encrypted_p25, 0);
-    rc |= expect_eq_mem("reverse-mute-right-staged", state.f_r, state.audio_out_temp_bufR, sizeof(state.f_r));
 
     return rc;
 }
@@ -2389,36 +2963,46 @@ test_process_mbe_frame_dmr_missing_alg_key_unmutes_slots(void) {
     ambe_fr[2][18] = 1;
 
     DSD_MEMSET(&opts, 0, sizeof(opts));
+    pass_through_voice_chain(&opts);
     opts.floating_point = 1;
+    opts.audio_gain = 1.0f;
+    opts.audio_gainR = 1.0f;
     opts.dmr_stereo = 1;
+    opts.dmr_mute_encL = 1;
+    opts.dmr_mute_encR = 1;
     init_mbe_state(&state, &cur, &prev, &prev_enhanced, &cur2, &prev2, &prev_enhanced2);
     state.synctype = DSD_SYNC_DMR_BS_VOICE_POS;
     state.currentslot = 0;
     state.dmr_so = 0x40;
     state.R = 0x123456789AULL;
 
-    processMbeFrame(&opts, &state, imbe_fr, ambe_fr, imbe7100_fr);
+    processMbeFrame(&opts, &state, owner_of(state.synctype), imbe_fr, ambe_fr, imbe7100_fr);
 
-    rc |= expect_eq_int("missing-alg-left-unmuted", state.dmr_encL, 0);
-    rc |= expect_eq_int("missing-alg-left-mute-flag", opts.dmr_mute_encL, 0);
+    // No ALG ID: loaded scalar material counts as decrypting the call, as the LC and PI classification count it
+    // (dsd_dmr_missing_alg_key_can_decrypt()), with encrypted audio muted; the mute stays the user's.
+    rc |= expect_eq_int("missing-alg-left-unmuted", state.mbe_slot_muted[0], 0);
+    rc |= expect_eq_int("missing-alg-left-mute-flag", opts.dmr_mute_encL, 1);
     rc |= expect_eq_int("missing-alg-left-debug", state.debug_audio_errors, state.errs2);
-    rc |= expect_eq_mem("missing-alg-left-staged", state.f_l, state.audio_out_temp_buf, sizeof(state.f_l));
 
     DSD_MEMSET(&opts, 0, sizeof(opts));
+    pass_through_voice_chain(&opts);
     opts.floating_point = 1;
+    opts.audio_gain = 1.0f;
+    opts.audio_gainR = 1.0f;
     opts.dmr_stereo = 1;
+    opts.dmr_mute_encL = 1;
+    opts.dmr_mute_encR = 1;
     init_mbe_state(&state, &cur, &prev, &prev_enhanced, &cur2, &prev2, &prev_enhanced2);
     state.synctype = DSD_SYNC_DMR_BS_VOICE_POS;
     state.currentslot = 1;
     state.dmr_soR = 0x40;
     state.RR = 0x2233445566ULL;
 
-    processMbeFrame(&opts, &state, imbe_fr, ambe_fr, imbe7100_fr);
+    processMbeFrame(&opts, &state, owner_of(state.synctype), imbe_fr, ambe_fr, imbe7100_fr);
 
-    rc |= expect_eq_int("missing-alg-right-unmuted", state.dmr_encR, 0);
-    rc |= expect_eq_int("missing-alg-right-mute-flag", opts.dmr_mute_encR, 0);
+    rc |= expect_eq_int("missing-alg-right-unmuted", state.mbe_slot_muted[1], 0);
+    rc |= expect_eq_int("missing-alg-right-mute-flag", opts.dmr_mute_encR, 1);
     rc |= expect_eq_int("missing-alg-right-debug", state.debug_audio_errorsR, state.errs2R);
-    rc |= expect_eq_mem("missing-alg-right-staged", state.f_r, state.audio_out_temp_bufR, sizeof(state.f_r));
 
     return rc;
 }
@@ -2442,7 +3026,10 @@ test_process_mbe_frame_dmr_post_decode_gates_override_enc_flags(void) {
     ambe_fr[3][21] = 1;
 
     DSD_MEMSET(&opts, 0, sizeof(opts));
+    pass_through_voice_chain(&opts);
     opts.floating_point = 1;
+    opts.audio_gain = 1.0f;
+    opts.audio_gainR = 1.0f;
     opts.dmr_stereo = 1;
     init_mbe_state(&state, &cur, &prev, &prev_enhanced, &cur2, &prev2, &prev_enhanced2);
     state.synctype = DSD_SYNC_DMR_BS_VOICE_POS;
@@ -2450,13 +3037,15 @@ test_process_mbe_frame_dmr_post_decode_gates_override_enc_flags(void) {
     state.payload_algid = 0x7E;
     state.baofeng_ap = 1;
 
-    processMbeFrame(&opts, &state, imbe_fr, ambe_fr, imbe7100_fr);
+    processMbeFrame(&opts, &state, owner_of(state.synctype), imbe_fr, ambe_fr, imbe7100_fr);
 
-    rc |= expect_eq_int("forced-clear-left-enc", state.dmr_encL, 0);
-    rc |= expect_eq_mem("forced-clear-left-staged", state.f_l, state.audio_out_temp_buf, sizeof(state.f_l));
+    rc |= expect_eq_int("forced-clear-left-enc", state.mbe_slot_muted[0], 0);
 
     DSD_MEMSET(&opts, 0, sizeof(opts));
+    pass_through_voice_chain(&opts);
     opts.floating_point = 1;
+    opts.audio_gain = 1.0f;
+    opts.audio_gainR = 1.0f;
     opts.dmr_stereo = 1;
     init_mbe_state(&state, &cur, &prev, &prev_enhanced, &cur2, &prev2, &prev_enhanced2);
     state.synctype = DSD_SYNC_P25P2_POS;
@@ -2464,13 +3053,931 @@ test_process_mbe_frame_dmr_post_decode_gates_override_enc_flags(void) {
     state.payload_algidR = 0x80;
     state.p25_p2_audio_allowed[1] = 1;
 
-    processMbeFrame(&opts, &state, imbe_fr, ambe_fr, imbe7100_fr);
+    processMbeFrame(&opts, &state, owner_of(state.synctype), imbe_fr, ambe_fr, imbe7100_fr);
 
-    rc |= expect_eq_int("p25p2-metadata-gate-right-enc", state.dmr_encR, 1);
+    // P25 Phase 2 is judged by P25's rule: a call it has not classified clear or decryptable stays muted.
+    rc |= expect_eq_int("p25p2-metadata-gate-right-enc", state.mbe_slot_muted[1], 1);
     rc |= expect_eq_int("p25p2-metadata-gate-history-len", state.p25_p2_voice_err_hist_len, 50);
     rc |= expect_eq_int("p25p2-metadata-gate-history-pos", state.p25_p2_voice_err_hist_pos[1], 1);
-    rc |= expect_eq_mem("p25p2-metadata-gate-right-staged", state.f_r, state.audio_out_temp_bufR, sizeof(state.f_r));
 
+    return rc;
+}
+
+/* Issue #574: whether the code under test noted the audible-audio stamp since dmr_stamp_clear(). main() arms it. */
+static void
+dmr_stamp_clear(void) {
+    dsd_audio_activity_reset();
+}
+
+static int
+dmr_stamp_noted(void) {
+    uint64_t stamp = 0U;
+    dsd_audio_activity_read(&stamp, NULL);
+    return stamp != 0U;
+}
+
+/* What a stereo DMR mix emitted: its blocks, and per channel the signs its samples took (1 positive, 2 negative). */
+static int g_dmr_mix_blocks = 0;
+static int g_dmr_mix_signs[2];
+
+static void
+dmr_mix_capture_blast(const dsd_opts* opts, dsd_state* state, size_t nsam, const void* data) {
+    (void)state;
+    g_dmr_mix_blocks++;
+    if (data == NULL) {
+        return;
+    }
+    const size_t width = opts->floating_point ? sizeof(float) : sizeof(short);
+    for (size_t i = 0U; i < nsam / width; i++) {
+        const float v = opts->floating_point ? ((const float*)data)[i] : (float)((const short*)data)[i];
+        if (v > 1e-6f) {
+            g_dmr_mix_signs[i & 1U] |= 1;
+        } else if (v < -1e-6f) {
+            g_dmr_mix_signs[i & 1U] |= 2;
+        }
+    }
+}
+
+static void
+dmr_mix_run(dsd_opts* opts, dsd_state* state) {
+    dsd_udp_audio_hooks hooks = {0};
+    hooks.blast = dmr_mix_capture_blast;
+    g_dmr_mix_blocks = 0;
+    g_dmr_mix_signs[0] = 0;
+    g_dmr_mix_signs[1] = 0;
+    dmr_stamp_clear();
+    dsd_udp_audio_hooks_set(hooks);
+    playSynthesizedVoiceSS3(opts, state);
+    dsd_udp_audio_hooks_set((dsd_udp_audio_hooks){0});
+}
+
+static dsd_opts*
+dmr_mix_new_opts(int floating_point, int reverse_mute) {
+    dsd_opts* opts = calloc(1, sizeof(*opts));
+    if (opts) {
+        initOpts(opts);
+        opts->audio_out = 1;
+        opts->audio_out_type = 8;
+        opts->use_hpf_d = 0;
+        opts->floating_point = floating_point;
+        opts->reverse_mute = reverse_mute;
+    }
+    return opts;
+}
+
+// One frame through the vocoder on @p slot, staged as the DMR BS voice burst stages it for the stereo mixes.
+static void
+dmr_mix_stage_frame(dsd_opts* opts, dsd_state* state, int slot, int frame) {
+    char imbe_fr[8][23] = {{0}};
+    char ambe_fr[4][24] = {{0}};
+    char imbe7100_fr[7][24] = {{0}};
+    ambe_fr[0][2] = 1;
+    ambe_fr[2][15] = 1;
+    state->currentslot = slot;
+    processMbeFrame(opts, state, owner_of(state->synctype), imbe_fr, ambe_fr, imbe7100_fr);
+    if (slot == 0) {
+        DSD_MEMCPY(state->s_l4[frame], state->s_l, sizeof(state->s_l4[frame]));
+    } else {
+        DSD_MEMCPY(state->s_r4[frame], state->s_r, sizeof(state->s_r4[frame]));
+    }
+}
+
+static short
+dmr_mix_abs_s16(short v) {
+    return v < -32767 ? (short)32767 : (short)(v < 0 ? -v : v);
+}
+
+// Marks what each slot staged by sign, slot 1 positive and slot 2 negative, so the mix shows which slot each channel
+// carries. Samples the vocoder never staged stay zero.
+static void
+dmr_mix_tag_slots(dsd_state* state) {
+    for (int j = 0; j < 3; j++) {
+        for (int i = 0; i < 160; i++) {
+            state->s_l4[j][i] = dmr_mix_abs_s16(state->s_l4[j][i]);
+            state->s_r4[j][i] = (short)-dmr_mix_abs_s16(state->s_r4[j][i]);
+        }
+    }
+}
+
+/* Issues #574 and #655: the shared stereo DMR mixer follows the vocoder's slot verdict in both output formats.
+ * Without -q a clear slot plays and an encrypted one without a key does not, unless the user turned the encrypted-audio
+ * mute off (dmr_mute_encL/R 0), which both mixes honor alike. -q plays an encrypted slot, decryptable or not, and mutes
+ * a clear one. Forced privacy (Baofeng AP, CSI EE, the Kenwood scrambler) decrypts a slot whose voice carries the
+ * encryption bit, so it plays with or without -q; a slot without the bit is clear, and -q mutes it. Each channel is
+ * checked for the slot it carries: its own when audible, the audible companion's when muted (the mixes mirror one
+ * audible slot into both channels). */
+static const char* const k_dmr_mix_modes[] = {"clear/encrypted", "baofeng_ap", "csi_ee", "ken_sc"};
+
+// One row: @p mode indexes k_dmr_mix_modes, @p so holds each slot's service options.
+static int
+dmr_mix_check_row(int mode, int reverse_mute, int unmute_encrypted, int floating_point, const int so[2]) {
+    dsd_opts* opts = dmr_mix_new_opts(floating_point, reverse_mute);
+    dsd_state* state = calloc(1, sizeof(*state));
+    if (!opts || !state) {
+        free(opts);
+        free(state);
+        return 1;
+    }
+    opts->dmr_mute_encL = unmute_encrypted ? 0 : 1;
+    opts->dmr_mute_encR = unmute_encrypted ? 0 : 1;
+    initState(state);
+    state->synctype = DSD_SYNC_DMR_BS_VOICE_POS;
+    state->dmrburstL = 16;
+    state->dmrburstR = 16;
+    state->baofeng_ap = mode == 1 ? 1 : 0;
+    state->csi_ee = mode == 2 ? 1 : 0;
+    state->ken_sc = mode == 3 ? 1 : 0;
+    state->dmr_so = so[0];
+    state->dmr_soR = so[1];
+    for (int slot = 0; slot < 2; slot++) {
+        for (int frame = 0; frame < 3; frame++) {
+            dmr_mix_stage_frame(opts, state, slot, frame);
+        }
+    }
+    dmr_mix_tag_slots(state);
+    dmr_mix_run(opts, state);
+
+    int audible[2];
+    for (int slot = 0; slot < 2; slot++) {
+        const int clear = so[slot] == 0;
+        // A forced mode decrypts an encrypted call, which -q then keeps audible as an encrypted call (issue #655).
+        const int decryptable = !clear && mode != 0;
+        audible[slot] = reverse_mute ? !clear : (clear || decryptable || unmute_encrypted);
+    }
+    const int any = audible[0] || audible[1];
+    const int want_left = audible[0] ? 1 : (audible[1] ? 2 : 0);
+    const int want_right = audible[1] ? 2 : (audible[0] ? 1 : 0);
+    char tag[128];
+    DSD_SNPRINTF(tag, sizeof(tag), "dmr mix %s %s so=0x%02X/0x%02X reverse_mute=%d unmute_encrypted=%d",
+                 k_dmr_mix_modes[mode], floating_point ? "SS3 -y" : "SS3", so[0], so[1], reverse_mute,
+                 unmute_encrypted);
+    char check[192];
+    int rc = 0;
+    DSD_SNPRINTF(check, sizeof(check), "%s blocks", tag);
+    rc |= expect_eq_int(check, g_dmr_mix_blocks, any ? 3 : 0);
+    DSD_SNPRINTF(check, sizeof(check), "%s left channel slot signs", tag);
+    rc |= expect_eq_int(check, g_dmr_mix_signs[0], want_left);
+    DSD_SNPRINTF(check, sizeof(check), "%s right channel slot signs", tag);
+    rc |= expect_eq_int(check, g_dmr_mix_signs[1], want_right);
+    // The mix stamps audible audio exactly when it plays a slot the vocoder just staged.
+    DSD_SNPRINTF(check, sizeof(check), "%s stamp", tag);
+    rc |= expect_eq_int(check, dmr_stamp_noted(), any);
+    freeState(state);
+    free(state);
+    free(opts);
+    return rc;
+}
+
+static int
+test_dmr_stereo_mixes_follow_vocoder_slot_verdict(void) {
+    static const int service_options[][2] = {{0x00, 0x00}, {0x40, 0x40}, {0x00, 0x40}, {0x40, 0x00}};
+    int rc = 0;
+    for (int mode = 0; mode < 4; mode++) {
+        for (int reverse_mute = 0; reverse_mute <= 1; reverse_mute++) {
+            for (int unmute_encrypted = 0; unmute_encrypted <= 1; unmute_encrypted++) {
+                for (int floating_point = 1; floating_point >= 0; floating_point--) {
+                    for (size_t so = 0U; so < sizeof(service_options) / sizeof(service_options[0]); so++) {
+                        rc |= dmr_mix_check_row(mode, reverse_mute, unmute_encrypted, floating_point,
+                                                service_options[so]);
+                    }
+                }
+            }
+        }
+    }
+    return rc;
+}
+
+static void remove_capture_dir(const char* dir);
+
+// Where the slot 1 MBE capture (-d) stands: its file's write position, or -1 while no frame created it.
+static long
+dmr_capture_position(const dsd_opts* opts) {
+    return opts->mbe_out_f ? ftell(opts->mbe_out_f) : -1L;
+}
+
+/* Issue #657: a call the vocoder decrypts (AES keystream, or the talkgroup key autoload) leaves the user's
+ * encrypted-audio mute options as set, so the next call on the slot, encrypted with a key that is not loaded, stays
+ * muted: FS3 and SS3 play nothing of it, the vocoder stages it as silence, its per-call WAV gate denies it and MBE
+ * capture (-d) writes none of its frames. Before, the decrypted call cleared dmr_mute_encL for the rest of the
+ * session. */
+static int
+dmr_decrypted_then_undecryptable_row(int floating_point, int autoload) {
+    dsd_opts* opts = dmr_mix_new_opts(floating_point, 0);
+    dsd_state* state = calloc(1, sizeof(*state));
+    char dir[DSD_TEST_PATH_MAX];
+    if (!opts || !state || !dsd_test_mkdtemp(dir, sizeof dir, "dsdneo_657_capture")) {
+        free(opts);
+        free(state);
+        return 1;
+    }
+    DSD_SNPRINTF(opts->mbe_out_dir, sizeof opts->mbe_out_dir, "%s", dir);
+    initState(state);
+    char tag[160];
+    int rc = 0;
+    const char* mix = floating_point ? "SS3 -y" : "SS3";
+    const char* how = autoload ? "autoload" : "aes";
+    state->synctype = DSD_SYNC_DMR_BS_VOICE_POS;
+    state->dmrburstL = 16;
+    state->dmrburstR = 16;
+    // Slot 2 carries an encrypted call nothing decrypts, so it never plays and only slot 1 can.
+    state->mbe_slot_muted[1] = 1;
+    if (autoload) {
+        // Basic privacy (no ALG ID) on a talkgroup with a key row: the autoload loads the row's key.
+        const dsd_call_observation call = {
+            .protocol = DSD_SYNC_DMR_BS_VOICE_POS,
+            .slot = 0U,
+            .kind = DSD_CALL_KIND_GROUP_VOICE,
+            .ota_target_id = 4242U,
+            .ota_source_id = 77U,
+        };
+        (void)dsd_call_state_observe(state, &call, DSD_CALL_BOUNDARY_BEGIN);
+        state->rkey_array[4242U] = 0x1122334455ULL;
+        state->dmr_so = 0x40;
+        state->dmr_fid = 0x10;
+    } else {
+        state->payload_algid = 0x24;
+        state->aes_key_loaded[0] = 1;
+        state->A1[0] = 0x0011223344556677ULL;
+        state->A2[0] = 0x8899AABBCCDDEEFFULL;
+        state->A3[0] = 0x1021324354657687ULL;
+        state->A4[0] = 0x98A9BACBDCEDFE0FULL;
+    }
+    for (int frame = 0; frame < 3; frame++) {
+        dmr_mix_stage_frame(opts, state, 0, frame);
+    }
+    dmr_mix_tag_slots(state);
+    dmr_mix_run(opts, state);
+    DSD_SNPRINTF(tag, sizeof(tag), "%s %s decrypted call plays", mix, how);
+    rc |= expect_eq_int(tag, g_dmr_mix_signs[0] & 1, 1);
+    DSD_SNPRINTF(tag, sizeof(tag), "%s %s decrypted call keeps mute options", mix, how);
+    rc |= expect_eq_int(tag, opts->dmr_mute_encL == 1 && opts->dmr_mute_encR == 1, 1);
+    const long captured = dmr_capture_position(opts);
+    DSD_SNPRINTF(tag, sizeof(tag), "%s %s decrypted call captured", mix, how);
+    rc |= expect_eq_int(tag, captured > 0L, 1);
+
+    // The next call on the slot: RC4 (ALG 0x21) with no key loaded.
+    if (autoload) {
+        (void)dsd_call_state_end(state, 0U, 0.0);
+        state->K = 0ULL;
+        state->K1 = 0ULL;
+        state->H = 0ULL;
+        state->hytera_key_segments = 0U;
+        state->rkey_array[4242U] = 0ULL;
+    }
+    state->payload_algid = 0x21;
+    state->dmr_so = 0x40;
+    state->R = 0ULL;
+    state->scalar_key_present[0] = 0;
+    state->aes_key_loaded[0] = 0;
+    for (int frame = 0; frame < 3; frame++) {
+        dmr_mix_stage_frame(opts, state, 0, frame);
+    }
+    DSD_SNPRINTF(tag, sizeof(tag), "%s %s undecryptable call flagged", mix, how);
+    rc |= expect_eq_int(tag, state->mbe_slot_muted[0], 1);
+    DSD_SNPRINTF(tag, sizeof(tag), "%s %s undecryptable call not captured", mix, how);
+    rc |= expect_eq_int(tag, dmr_capture_position(opts) == captured, 1);
+    if (!floating_point) {
+        DSD_SNPRINTF(tag, sizeof(tag), "%s %s undecryptable call staged as silence", mix, how);
+        rc |= expect_eq_int(tag, state->mbe_short_silenced[0], 1);
+    }
+    int allow = -1;
+    state->currentslot = 0;
+    (void)dsd_audio_record_gate_mono(opts, state, &allow);
+    DSD_SNPRINTF(tag, sizeof(tag), "%s %s undecryptable call not recorded", mix, how);
+    rc |= expect_eq_int(tag, allow, 0);
+    dmr_mix_tag_slots(state);
+    dmr_mix_run(opts, state);
+    DSD_SNPRINTF(tag, sizeof(tag), "%s %s undecryptable call not heard", mix, how);
+    rc |= expect_eq_int(tag, g_dmr_mix_blocks, 0);
+    closeMbeOutFile(opts, state);
+    closeMbeOutFileR(opts, state);
+    freeState(state);
+    free(state);
+    free(opts);
+    remove_capture_dir(dir);
+    return rc;
+}
+
+/* Issue #657: reverse mute (-q) with the user's encrypted-audio mute off still mutes a clear call and plays an
+ * undecryptable one, in the vocoder's staging, MBE capture and the per-call WAV gate, without writing the option. */
+static int
+test_dmr_reverse_mute_with_mute_option_off(void) {
+    int rc = 0;
+    for (int encrypted = 0; encrypted <= 1; encrypted++) {
+        dsd_opts* opts = dmr_mix_new_opts(0, 1);
+        dsd_state* state = calloc(1, sizeof(*state));
+        char dir[DSD_TEST_PATH_MAX];
+        if (!opts || !state || !dsd_test_mkdtemp(dir, sizeof dir, "dsdneo_657_rmute")) {
+            free(opts);
+            free(state);
+            return 1;
+        }
+        DSD_SNPRINTF(opts->mbe_out_dir, sizeof opts->mbe_out_dir, "%s", dir);
+        opts->dmr_mute_encL = 0;
+        opts->dmr_mute_encR = 0;
+        initState(state);
+        state->synctype = DSD_SYNC_DMR_BS_VOICE_POS;
+        state->dmr_so = encrypted ? 0x40 : 0x00;
+        dmr_mix_stage_frame(opts, state, 0, 0);
+        const char* what = encrypted ? "undecryptable" : "clear";
+        char tag[128];
+        DSD_SNPRINTF(tag, sizeof(tag), "-q mute option off: %s call staged", what);
+        rc |= expect_eq_int(tag, state->mbe_short_silenced[0], encrypted ? 0 : 1);
+        DSD_SNPRINTF(tag, sizeof(tag), "-q mute option off: %s call captured", what);
+        rc |= expect_eq_int(tag, dmr_capture_position(opts) > 0L, encrypted);
+        int allow = -1;
+        state->currentslot = 0;
+        (void)dsd_audio_record_gate_mono(opts, state, &allow);
+        DSD_SNPRINTF(tag, sizeof(tag), "-q mute option off: %s call recorded", what);
+        rc |= expect_eq_int(tag, allow, encrypted);
+        DSD_SNPRINTF(tag, sizeof(tag), "-q mute option off: %s call keeps the option", what);
+        rc |= expect_eq_int(tag, opts->dmr_mute_encL, 0);
+        closeMbeOutFile(opts, state);
+        freeState(state);
+        free(state);
+        free(opts);
+        remove_capture_dir(dir);
+    }
+    return rc;
+}
+
+static int
+test_dmr_decrypted_call_leaves_mute_options(void) {
+    int rc = 0;
+    for (int floating_point = 1; floating_point >= 0; floating_point--) {
+        for (int autoload = 0; autoload <= 1; autoload++) {
+            rc |= dmr_decrypted_then_undecryptable_row(floating_point, autoload);
+        }
+    }
+    return rc;
+}
+
+/* Issue #574: the DMR mixes stamp audible audio for the media the vocoder staged on a slot since they last ran, only
+ * where that slot plays. dmr_stamp_case() builds a fresh state per case: @p setup stages and gates, the mix runs. */
+typedef struct {
+    dsd_opts* opts;
+    dsd_state* state;
+} dmr_stamp_fixture;
+
+static int
+dmr_stamp_fixture_open(dmr_stamp_fixture* fx, int floating_point) {
+    fx->opts = dmr_mix_new_opts(floating_point, 0);
+    fx->state = calloc(1, sizeof(*fx->state));
+    if (!fx->opts || !fx->state) {
+        free(fx->opts);
+        free(fx->state);
+        return 0;
+    }
+    initState(fx->state);
+    fx->state->synctype = DSD_SYNC_DMR_BS_VOICE_POS;
+    fx->state->dmrburstL = 16;
+    fx->state->dmrburstR = 16;
+    return 1;
+}
+
+static void
+dmr_stamp_fixture_close(dmr_stamp_fixture* fx) {
+    freeState(fx->state);
+    free(fx->state);
+    free(fx->opts);
+}
+
+static void
+dmr_stamp_stage_burst(dmr_stamp_fixture* fx, int slot) {
+    for (int frame = 0; frame < 3; frame++) {
+        dmr_mix_stage_frame(fx->opts, fx->state, slot, frame);
+    }
+}
+
+static int
+dmr_stamp_seed_group_call(dsd_state* state, int slot, uint64_t target) {
+    const dsd_call_observation call = {.protocol = DSD_SYNC_DMR_BS_VOICE_POS,
+                                       .slot = (uint8_t)slot,
+                                       .kind = DSD_CALL_KIND_GROUP_VOICE,
+                                       .ota_target_id = target,
+                                       .policy_target_id = target,
+                                       .ota_source_id = 1U};
+    return dsd_call_state_observe(state, &call, DSD_CALL_BOUNDARY_BEGIN) > 0;
+}
+
+static int
+dmr_stamp_check(const char* mix, const char* what, int want_blocks, int want_stamp) {
+    char tag[160];
+    DSD_SNPRINTF(tag, sizeof(tag), "dmr stamp %s %s: blocks", mix, what);
+    int rc = expect_eq_int(tag, g_dmr_mix_blocks, want_blocks);
+    DSD_SNPRINTF(tag, sizeof(tag), "dmr stamp %s %s: stamp", mix, what);
+    rc |= expect_eq_int(tag, dmr_stamp_noted(), want_stamp);
+    return rc;
+}
+
+enum {
+    DMR_STAMP_CLEAR = 0,
+    DMR_STAMP_ZERO_PCM,
+    DMR_STAMP_IDENTITY_LESS,
+    DMR_STAMP_SLOT_OFF,
+    DMR_STAMP_MONO_OTHER,
+    DMR_STAMP_LOCKOUT,
+    DMR_STAMP_ENC_LOCKOUT,
+    DMR_STAMP_ALLOW_MISS,
+    DMR_STAMP_CALL_SKIP,
+    DMR_STAMP_MUTED_OUTPUT,
+    DMR_STAMP_PURGED,
+    DMR_STAMP_REINIT,
+    DMR_STAMP_CASES
+};
+
+static const char* const k_dmr_stamp_cases[DMR_STAMP_CASES] = {
+    "clear slot 1 burst",
+    "slot 1 burst of decoded zero samples",
+    "identity-less voice epoch",
+    "slot 1 switched off",
+    "DMR mono playing slot 2",
+    "blocked talkgroup",
+    "encryption-lockout talkgroup",
+    "allow-list miss",
+    "skipped call",
+    "output muted",
+    "slot 1 audio purged",
+    "state initialized again",
+};
+
+static int
+dmr_stamp_case(int c, int floating_point) {
+    dmr_stamp_fixture fx;
+    if (!dmr_stamp_fixture_open(&fx, floating_point)) {
+        return 1;
+    }
+    dsd_opts* opts = fx.opts;
+    dsd_state* state = fx.state;
+    int rc = 0;
+    int want_blocks = 3;
+    int want_stamp = 0;
+    if (c == DMR_STAMP_MONO_OTHER) {
+        opts->dmr_mono = 1;
+        state->dmr_mono_slot = 1;
+    }
+    if (c == DMR_STAMP_IDENTITY_LESS) {
+        // Voice confirmed before any link control names the call: the epoch has no talkgroup yet.
+        const dsd_call_observation voice = {
+            .protocol = DSD_SYNC_DMR_BS_VOICE_POS, .slot = 0U, .kind = DSD_CALL_KIND_VOICE};
+        rc |= expect_eq_int("dmr stamp identity-less epoch",
+                            dsd_call_state_observe(state, &voice, DSD_CALL_BOUNDARY_BEGIN) > 0, 1);
+        (void)dsd_call_state_update_media(state, 0U, 1, 0.0);
+    } else if (c >= DMR_STAMP_LOCKOUT && c <= DMR_STAMP_CALL_SKIP) {
+        rc |= expect_eq_int("dmr stamp group call", dmr_stamp_seed_group_call(state, 0, 123U), 1);
+    }
+    switch (c) {
+        case DMR_STAMP_LOCKOUT:
+            rc |= expect_eq_int("dmr stamp block", dsd_tg_policy_set_mode(state, 123, 123, "B"), 0);
+            break;
+        case DMR_STAMP_ENC_LOCKOUT:
+            rc |= expect_eq_int("dmr stamp enc lockout", dsd_tg_policy_set_mode(state, 123, 123, "DE"), 0);
+            break;
+        case DMR_STAMP_ALLOW_MISS:
+            // The idle slot 2 (no talkgroup) misses the allow-list too, so nothing plays at all.
+            opts->trunk_use_allow_list = 1;
+            want_blocks = 0;
+            break;
+        case DMR_STAMP_CALL_SKIP:
+            rc |= expect_eq_int("dmr stamp skip",
+                                dsd_tg_policy_call_skip_arm(state, 123U, 1U, 0, dsd_decode_now_mono_s()), 0);
+            break;
+        default: break;
+    }
+
+    dmr_stamp_stage_burst(&fx, 0);
+
+    switch (c) {
+        case DMR_STAMP_CLEAR:
+        case DMR_STAMP_IDENTITY_LESS: want_stamp = 1; break;
+        case DMR_STAMP_ZERO_PCM:
+            DSD_MEMSET(state->s_l4, 0, sizeof(state->s_l4));
+            want_stamp = 1;
+            break;
+        case DMR_STAMP_SLOT_OFF: opts->slot1_on = 0; break;
+        case DMR_STAMP_MUTED_OUTPUT:
+            opts->audio_out = 0;
+            want_blocks = 0;
+            break;
+        case DMR_STAMP_PURGED: dsd_mbe_purge_slot_audio(state, 0); break;
+        case DMR_STAMP_REINIT:
+            freeState(state);
+            initState(state);
+            state->synctype = DSD_SYNC_DMR_BS_VOICE_POS;
+            break;
+        default: break;
+    }
+
+    dmr_mix_run(opts, state);
+    rc |= dmr_stamp_check(floating_point ? "SS3 -y" : "SS3", k_dmr_stamp_cases[c], want_blocks, want_stamp);
+    if (want_stamp) {
+        // The mix took the slot's media: run again on nothing new, as the skipped-burst path does, it stamps nothing.
+        dmr_mix_run(opts, state);
+        char what[128];
+        DSD_SNPRINTF(what, sizeof(what), "%s, mixed again with nothing new", k_dmr_stamp_cases[c]);
+        rc |= dmr_stamp_check(floating_point ? "SS3 -y" : "SS3", what, 3, 0);
+    }
+    dmr_stamp_fixture_close(&fx);
+    return rc;
+}
+
+/* A held talkgroup unmutes a slot the vocoder muted. After a clear burst, the call on slot 1 turns encrypted with no
+ * key under a hold: SS3 plays the silence the vocoder staged for the muted slot and stamps nothing, in either output
+ * format (#652: FS3 played the float frames the vocoder still staged). */
+static int
+dmr_stamp_held_muted_slot(int floating_point) {
+    dmr_stamp_fixture fx;
+    if (!dmr_stamp_fixture_open(&fx, floating_point)) {
+        return 1;
+    }
+    const char* mix = floating_point ? "SS3 -y" : "SS3";
+    int rc = expect_eq_int("dmr stamp held call", dmr_stamp_seed_group_call(fx.state, 0, 123U), 1);
+    fx.state->tg_hold = 123U;
+    dmr_stamp_stage_burst(&fx, 0);
+    dmr_mix_run(fx.opts, fx.state);
+    rc |= dmr_stamp_check(mix, "held clear burst", 3, 1);
+
+    fx.state->dmr_so = 0x40;
+    dmr_stamp_stage_burst(&fx, 0);
+    rc |= expect_eq_int("dmr stamp held slot muted by the vocoder", fx.state->mbe_slot_muted[0], 1);
+    dmr_mix_run(fx.opts, fx.state);
+    // A hold decides the talkgroup policy, never encryption (issue #655): the held slot stays muted, and the idle
+    // companion is not the held talkgroup, so nothing plays.
+    rc |= dmr_stamp_check(mix, "held burst the vocoder muted", 0, 0);
+    dmr_stamp_fixture_close(&fx);
+    return rc;
+}
+
+static int
+test_dmr_mixes_stamp_vocoder_media(void) {
+    int rc = 0;
+    for (int floating_point = 1; floating_point >= 0; floating_point--) {
+        for (int c = 0; c < DMR_STAMP_CASES; c++) {
+            rc |= dmr_stamp_case(c, floating_point);
+        }
+        rc |= dmr_stamp_held_muted_slot(floating_point);
+    }
+    return rc;
+}
+
+/* Issue #657: both DMR mixes read the slot switches and the slot preference and never write them. A hold on a
+ * switched-off slot's talkgroup leaves it silent (the switch mutes last); with both slots carrying clear voice, the
+ * preferred slot plays on both channels in either format, and Auto plays them side by side. Before, SS3 turned the held
+ * slot's switch back on and reset the preference to Auto every mix, and FS3 let the hold play the switched-off slot and
+ * never applied the preference. */
+static int
+dmr_mix_hold_and_preference_row(int floating_point, int hold, int pref) {
+    dmr_stamp_fixture fx;
+    if (!dmr_stamp_fixture_open(&fx, floating_point)) {
+        return 1;
+    }
+    const char* mix = floating_point ? "SS3 -y" : "SS3";
+    char tag[160];
+    int rc = 0;
+    rc |= expect_eq_int("hold/preference slot 1 call", dmr_stamp_seed_group_call(fx.state, 0, 100U), 1);
+    rc |= expect_eq_int("hold/preference slot 2 call", dmr_stamp_seed_group_call(fx.state, 1, 200U), 1);
+    fx.opts->slot_preference = pref;
+    if (hold) {
+        fx.state->tg_hold = 100U;
+        fx.opts->slot1_on = 0;
+    }
+    dmr_stamp_stage_burst(&fx, 0);
+    dmr_stamp_stage_burst(&fx, 1);
+    dmr_mix_tag_slots(fx.state);
+    dmr_mix_run(fx.opts, fx.state);
+    if (hold) {
+        // Slot 2's talkgroup is not held and slot 1 is off: nothing plays.
+        DSD_SNPRINTF(tag, sizeof(tag), "%s hold on a switched-off slot plays nothing", mix);
+        rc |= expect_eq_int(tag, g_dmr_mix_blocks, 0);
+    } else {
+        const int want_left = (pref == 1) ? 2 : 1;
+        const int want_right = (pref == 0) ? 1 : 2;
+        DSD_SNPRINTF(tag, sizeof(tag), "%s preference %d left channel", mix, pref);
+        rc |= expect_eq_int(tag, g_dmr_mix_signs[0], want_left);
+        DSD_SNPRINTF(tag, sizeof(tag), "%s preference %d right channel", mix, pref);
+        rc |= expect_eq_int(tag, g_dmr_mix_signs[1], want_right);
+    }
+    DSD_SNPRINTF(tag, sizeof(tag), "%s hold=%d preference %d keeps the switches", mix, hold, pref);
+    rc |= expect_eq_int(tag, fx.opts->slot1_on == (hold ? 0 : 1) && fx.opts->slot2_on == 1, 1);
+    DSD_SNPRINTF(tag, sizeof(tag), "%s hold=%d preference %d keeps the preference", mix, hold, pref);
+    rc |= expect_eq_int(tag, fx.opts->slot_preference, pref);
+    dmr_stamp_fixture_close(&fx);
+    return rc;
+}
+
+static int
+test_dmr_mixes_keep_slot_switches_and_preference(void) {
+    int rc = 0;
+    for (int floating_point = 1; floating_point >= 0; floating_point--) {
+        for (int pref = 0; pref <= 2; pref++) {
+            rc |= dmr_mix_hold_and_preference_row(floating_point, 0, pref);
+        }
+        rc |= dmr_mix_hold_and_preference_row(floating_point, 1, 2);
+    }
+    return rc;
+}
+
+/* Issue #574: SS3 stamps only what a channel it emits carries. Its output policy can copy one slot over the other: a
+ * slot preferred over its companion (by a talkgroup hold, or as the only one on a voice burst) plays on both channels,
+ * so the companion's fresh frames it overwrote stamp nothing when the preferred slot staged no media of its own. The
+ * mono sink mixes the same buffers after that copy and follows the same rule. */
+enum { DMR_SS3_STAGE_NONE = 0, DMR_SS3_STAGE_CLEAR, DMR_SS3_STAGE_MUTED };
+
+static int
+test_dmr_ss3_stamps_the_slot_each_channel_carries(void) {
+    static const struct {
+        const char* tag;
+        int hold; // Both slots on the held talkgroup; else no hold and only slot 1 on a voice burst.
+        int stage[2];
+        int want_stamp;
+    } cases[] = {
+        // A hold never unmutes a slot the vocoder muted (issue #655), so clear slot 2 fills both channels.
+        {"hold on both slots, slot 1 muted by the vocoder, clear slot 2 plays",
+         1,
+         {DMR_SS3_STAGE_MUTED, DMR_SS3_STAGE_CLEAR},
+         1},
+        {"slot 1's voice burst preferred, nothing new on it, over clear slot 2",
+         0,
+         {DMR_SS3_STAGE_NONE, DMR_SS3_STAGE_CLEAR},
+         0},
+        {"hold prefers clear slot 1 over muted slot 2", 1, {DMR_SS3_STAGE_CLEAR, DMR_SS3_STAGE_MUTED}, 1},
+        {"slot 1's voice burst preferred, clear, over clear slot 2", 0, {DMR_SS3_STAGE_CLEAR, DMR_SS3_STAGE_CLEAR}, 1},
+    };
+
+    int rc = 0;
+    for (int channels = 2; channels >= 1; channels--) {
+        for (size_t c = 0U; c < sizeof(cases) / sizeof(cases[0]); c++) {
+            dmr_stamp_fixture fx;
+            if (!dmr_stamp_fixture_open(&fx, 0)) {
+                return 1;
+            }
+            fx.opts->pulse_digi_out_channels = channels;
+            if (cases[c].hold) {
+                rc |= expect_eq_int("dmr ss3 copy held call 1", dmr_stamp_seed_group_call(fx.state, 0, 123U), 1);
+                rc |= expect_eq_int("dmr ss3 copy held call 2", dmr_stamp_seed_group_call(fx.state, 1, 123U), 1);
+                fx.state->tg_hold = 123U;
+            } else {
+                fx.state->dmrburstR = 0;
+            }
+            for (int slot = 0; slot < 2; slot++) {
+                if (cases[c].stage[slot] == DMR_SS3_STAGE_NONE) {
+                    continue;
+                }
+                const int so = cases[c].stage[slot] == DMR_SS3_STAGE_MUTED ? 0x40 : 0;
+                if (slot == 0) {
+                    fx.state->dmr_so = so;
+                } else {
+                    fx.state->dmr_soR = so;
+                }
+                dmr_stamp_stage_burst(&fx, slot);
+            }
+            dmr_mix_run(fx.opts, fx.state);
+            char tag[192];
+            DSD_SNPRINTF(tag, sizeof(tag), "dmr ss3 copy %s, %d channel(s): plays", cases[c].tag, channels);
+            rc |= expect_eq_int(tag, g_dmr_mix_blocks, 3);
+            DSD_SNPRINTF(tag, sizeof(tag), "dmr ss3 copy %s, %d channel(s): audio emitted", cases[c].tag, channels);
+            rc |= expect_eq_int(tag, (g_dmr_mix_signs[0] | g_dmr_mix_signs[1]) != 0, cases[c].want_stamp);
+            DSD_SNPRINTF(tag, sizeof(tag), "dmr ss3 copy %s, %d channel(s): stamp", cases[c].tag, channels);
+            rc |= expect_eq_int(tag, dmr_stamp_noted(), cases[c].want_stamp);
+            dmr_stamp_fixture_close(&fx);
+        }
+    }
+    return rc;
+}
+
+/* Issue #574: a Vertex Standard call (ALG 0x07) with a mapped keystream plays in both output formats. The vocoder
+ * applies the keystream, clears the slot's encryption flag and also the encryption bit of the service options, so the
+ * mix follows it. */
+static int
+test_dmr_stereo_mixes_play_a_vertex_keystream_call(void) {
+    int rc = 0;
+    for (int floating_point = 1; floating_point >= 0; floating_point--) {
+        dsd_opts* opts = dmr_mix_new_opts(floating_point, 0);
+        dsd_state* state = calloc(1, sizeof(*state));
+        if (!opts || !state) {
+            free(opts);
+            free(state);
+            return 1;
+        }
+        initState(state);
+        state->synctype = DSD_SYNC_DMR_BS_VOICE_POS;
+        state->dmrburstL = 16;
+        state->dmrburstR = 16;
+        // One mapped keystream of all-zero bits: applying it leaves the voice as decoded.
+        state->vertex_ks_count = 1;
+        state->vertex_ks_key[0] = 0x123456ULL;
+        state->vertex_ks_mod[0] = 49;
+        state->R = 0x123456ULL;
+        state->RR = 0x123456ULL;
+        state->payload_algid = 0x07;
+        state->payload_algidR = 0x07;
+        state->dmr_so = 0x40;
+        state->dmr_soR = 0x40;
+        for (int slot = 0; slot < 2; slot++) {
+            for (int frame = 0; frame < 3; frame++) {
+                dmr_mix_stage_frame(opts, state, slot, frame);
+            }
+        }
+        const char* mix = floating_point ? "SS3 -y" : "SS3";
+        char tag[96];
+        DSD_SNPRINTF(tag, sizeof(tag), "vertex %s slot flags cleared", mix);
+        rc |= expect_eq_int(tag, state->mbe_slot_muted[0] == 0 && state->mbe_slot_muted[1] == 0, 1);
+        DSD_SNPRINTF(tag, sizeof(tag), "vertex %s service-options encryption bits cleared", mix);
+        rc |= expect_eq_int(tag, (state->dmr_so & 0x40) == 0 && (state->dmr_soR & 0x40) == 0, 1);
+        dmr_mix_tag_slots(state);
+        dmr_mix_run(opts, state);
+        DSD_SNPRINTF(tag, sizeof(tag), "vertex %s blocks", mix);
+        rc |= expect_eq_int(tag, g_dmr_mix_blocks, 3);
+        DSD_SNPRINTF(tag, sizeof(tag), "vertex %s left channel carries slot 1", mix);
+        rc |= expect_eq_int(tag, g_dmr_mix_signs[0], 1);
+        DSD_SNPRINTF(tag, sizeof(tag), "vertex %s right channel carries slot 2", mix);
+        rc |= expect_eq_int(tag, g_dmr_mix_signs[1], 2);
+        freeState(state);
+        free(state);
+        free(opts);
+    }
+    return rc;
+}
+
+static int
+dmr_mix_any_nonzero_s16(const short* samples, size_t n) {
+    for (size_t i = 0U; i < n; i++) {
+        if (samples[i] != 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Issue #574: a DMR slot the vocoder mutes stages silence, never its last frame. The stereo mixes copy each slot's
+ * short frame into their superframe buffers every frame, so an unrefreshed frame would replay the last call audio
+ * staged on that slot. A talkgroup hold no longer unmutes the slot (issue #655), so the held encrypted slot stays
+ * muted; the silence also retires the clear frame's media mark, and a clear frame staged after it marks again. */
+static int
+test_dmr_muted_slot_stages_silence_not_its_last_frame(void) {
+    int rc = 0;
+    for (int slot = 0; slot < 2; slot++) {
+        dsd_opts* opts = dmr_mix_new_opts(0, 0);
+        dsd_state* state = calloc(1, sizeof(*state));
+        if (!opts || !state) {
+            free(opts);
+            free(state);
+            return 1;
+        }
+        initState(state);
+        state->synctype = DSD_SYNC_DMR_BS_VOICE_POS;
+        const short* staged = slot == 0 ? state->s_l : state->s_r;
+        const char* name = slot == 0 ? "slot 1" : "slot 2";
+        char tag[96];
+
+        dmr_mix_stage_frame(opts, state, slot, 0);
+        DSD_SNPRINTF(tag, sizeof(tag), "%s clear frame stages samples", name);
+        rc |= expect_eq_int(tag, dmr_mix_any_nonzero_s16(staged, 160), 1);
+
+        // The slot's call turns encrypted with no key loaded, and a talkgroup hold covers it.
+        if (slot == 0) {
+            state->dmr_so = 0x40;
+        } else {
+            state->dmr_soR = 0x40;
+        }
+        const dsd_call_observation call = {.protocol = DSD_SYNC_DMR_BS_VOICE_POS,
+                                           .slot = (uint8_t)slot,
+                                           .kind = DSD_CALL_KIND_GROUP_VOICE,
+                                           .ota_target_id = 123U,
+                                           .policy_target_id = 123U,
+                                           .ota_source_id = 1U};
+        (void)dsd_call_state_observe(state, &call, DSD_CALL_BOUNDARY_BEGIN);
+        dsd_call_snapshot held;
+        DSD_SNPRINTF(tag, sizeof(tag), "%s held call is active", name);
+        rc |= expect_eq_int(tag,
+                            dsd_call_state_get(state, (uint8_t)slot, &held) > 0 && held.phase == DSD_CALL_PHASE_ACTIVE
+                                && held.ota_target_id == 123U,
+                            1);
+        state->tg_hold = 123U;
+        for (int frame = 0; frame < 3; frame++) {
+            dmr_mix_stage_frame(opts, state, slot, frame);
+        }
+        DSD_SNPRINTF(tag, sizeof(tag), "%s encrypted frame is muted", name);
+        rc |= expect_eq_int(tag, state->mbe_slot_muted[slot], 1);
+        DSD_SNPRINTF(tag, sizeof(tag), "%s muted frame stages silence", name);
+        rc |= expect_eq_int(tag, dmr_mix_any_nonzero_s16(staged, 160), 0);
+
+        // The hold decides the talkgroup policy only (issue #655): the held encrypted slot stays muted.
+        dmr_mix_run(opts, state);
+        DSD_SNPRINTF(tag, sizeof(tag), "%s held muted slot stays muted", name);
+        rc |= expect_eq_int(tag, g_dmr_mix_blocks, 0);
+        DSD_SNPRINTF(tag, sizeof(tag), "%s held muted slot plays silence, not its last frame", name);
+        rc |= expect_eq_int(tag, g_dmr_mix_signs[0] | g_dmr_mix_signs[1], 0);
+        DSD_SNPRINTF(tag, sizeof(tag), "%s held muted slot stamps none of the silence it plays", name);
+        rc |= expect_eq_int(tag, dmr_stamp_noted(), 0);
+
+        // The call turns clear again: its next frame replaces the silence and is media once more.
+        if (slot == 0) {
+            state->dmr_so = 0;
+        } else {
+            state->dmr_soR = 0;
+        }
+        for (int frame = 0; frame < 2; frame++) {
+            dmr_mix_stage_frame(opts, state, slot, frame);
+        }
+        DSD_SNPRINTF(tag, sizeof(tag), "%s clear again", name);
+        rc |= expect_eq_int(tag, state->mbe_slot_muted[slot], 0);
+        dmr_mix_run(opts, state);
+        DSD_SNPRINTF(tag, sizeof(tag), "%s held slot clear again plays its frames", name);
+        rc |= expect_eq_int(tag, g_dmr_mix_blocks == 3 && (g_dmr_mix_signs[0] | g_dmr_mix_signs[1]) != 0, 1);
+        DSD_SNPRINTF(tag, sizeof(tag), "%s held slot clear again stamps", name);
+        rc |= expect_eq_int(tag, dmr_stamp_noted(), 1);
+        freeState(state);
+        free(state);
+        free(opts);
+    }
+    return rc;
+}
+
+/* Issue #655: the generic -S keystream clears the slot's service options and ALG ID on every frame, so a burst's later
+ * frames arrive with no encryption evidence. Under -q every frame -S ran on counts as an encrypted call it decrypted:
+ * the whole burst stays audible on both slots, in both mixes, rather than the first frame alone. */
+static int
+test_dmr_straight_keystream_burst_stays_audible_under_reverse_mute(void) {
+    int rc = 0;
+    for (int floating_point = 1; floating_point >= 0; floating_point--) {
+        dsd_opts* opts = dmr_mix_new_opts(floating_point, 1);
+        dsd_state* state = calloc(1, sizeof(*state));
+        if (!opts || !state) {
+            free(opts);
+            free(state);
+            return 1;
+        }
+        initState(state);
+        state->synctype = DSD_SYNC_DMR_BS_VOICE_POS;
+        state->dmrburstL = 16;
+        state->dmrburstR = 16;
+        // An all-zero keystream: applying it leaves the voice as decoded.
+        state->straight_ks = 1;
+        state->straight_mod = 49;
+        state->dmr_so = 0x40;
+        state->dmr_soR = 0x40;
+        state->payload_algid = 0x21;
+        state->payload_algidR = 0x21;
+        const char* mix = floating_point ? "SS3 -y" : "SS3";
+        char tag[128];
+        for (int slot = 0; slot < 2; slot++) {
+            for (int frame = 0; frame < 3; frame++) {
+                dmr_mix_stage_frame(opts, state, slot, frame);
+                DSD_SNPRINTF(tag, sizeof(tag), "-S -q %s slot %d frame %d audible", mix, slot + 1, frame + 1);
+                rc |= expect_eq_int(tag, state->mbe_slot_muted[slot], 0);
+            }
+        }
+        dmr_mix_tag_slots(state);
+        dmr_mix_run(opts, state);
+        DSD_SNPRINTF(tag, sizeof(tag), "-S -q %s blocks", mix);
+        rc |= expect_eq_int(tag, g_dmr_mix_blocks, 3);
+        DSD_SNPRINTF(tag, sizeof(tag), "-S -q %s left channel", mix);
+        rc |= expect_eq_int(tag, g_dmr_mix_signs[0], 1);
+        DSD_SNPRINTF(tag, sizeof(tag), "-S -q %s right channel", mix);
+        rc |= expect_eq_int(tag, g_dmr_mix_signs[1], 2);
+        freeState(state);
+        free(state);
+        free(opts);
+    }
+    return rc;
+}
+
+/* Issue #574: with DMR mono output (--dmr-mono) the vocoder mutes the slot that is not playing and stages silence for
+ * it, as for any muted slot, so its last short frame is never copied into the mix again. */
+static int
+test_dmr_mono_disabled_slot_stages_silence(void) {
+    int rc = 0;
+    for (int slot = 0; slot < 2; slot++) {
+        dsd_opts* opts = dmr_mix_new_opts(0, 0);
+        dsd_state* state = calloc(1, sizeof(*state));
+        if (!opts || !state) {
+            free(opts);
+            free(state);
+            return 1;
+        }
+        initState(state);
+        opts->dmr_mono = 1;
+        state->synctype = DSD_SYNC_DMR_BS_VOICE_POS;
+        state->dmr_mono_slot = (short)slot;
+        const short* staged = slot == 0 ? state->s_l : state->s_r;
+        const char* name = slot == 0 ? "slot 1" : "slot 2";
+        char tag[96];
+
+        dmr_mix_stage_frame(opts, state, slot, 0);
+        DSD_SNPRINTF(tag, sizeof(tag), "dmr mono %s playing stages samples", name);
+        rc |= expect_eq_int(tag, dmr_mix_any_nonzero_s16(staged, 160), 1);
+
+        state->dmr_mono_slot = (short)(slot ^ 1);
+        dmr_mix_stage_frame(opts, state, slot, 1);
+        DSD_SNPRINTF(tag, sizeof(tag), "dmr mono %s off is muted", name);
+        rc |= expect_eq_int(tag, state->mbe_slot_muted[slot], 1);
+        DSD_SNPRINTF(tag, sizeof(tag), "dmr mono %s off stages silence", name);
+        rc |= expect_eq_int(tag, dmr_mix_any_nonzero_s16(staged, 160), 0);
+        freeState(state);
+        free(state);
+        free(opts);
+    }
     return rc;
 }
 
@@ -2494,7 +4001,10 @@ test_process_mbe_frame_dmr_aes_stream_advances_slot_state(void) {
     ambe_fr[3][22] = 1;
 
     DSD_MEMSET(&opts, 0, sizeof(opts));
+    pass_through_voice_chain(&opts);
     opts.floating_point = 1;
+    opts.audio_gain = 1.0f;
+    opts.audio_gainR = 1.0f;
     opts.dmr_stereo = 1;
     opts.dmr_mute_encL = 1;
     init_mbe_state(&state, &cur, &prev, &prev_enhanced, &cur2, &prev2, &prev_enhanced2);
@@ -2509,17 +4019,20 @@ test_process_mbe_frame_dmr_aes_stream_advances_slot_state(void) {
     state.aes_iv[0] = 0xA5;
     state.aes_iv[15] = 0x5A;
 
-    processMbeFrame(&opts, &state, imbe_fr, ambe_fr, imbe7100_fr);
+    processMbeFrame(&opts, &state, owner_of(state.synctype), imbe_fr, ambe_fr, imbe7100_fr);
 
     rc |= expect_eq_int("aes-left-vc", state.DMRvcL, 1);
     rc |= expect_eq_int("aes-left-bit-counter", state.bit_counterL, 56);
-    rc |= expect_eq_int("aes-left-unmutes-slot", opts.dmr_mute_encL, 0);
-    rc |= expect_eq_int("aes-left-enc-cleared", state.dmr_encL, 0);
+    // The keystream decrypts the slot; the user's encrypted-audio mute is left as it was (issue #655).
+    rc |= expect_eq_int("aes-left-keeps-mute-option", opts.dmr_mute_encL, 1);
+    rc |= expect_eq_int("aes-left-enc-cleared", state.mbe_slot_muted[0], 0);
     rc |= expect_any_nonzero_u8("aes-left-keystream-ready", state.ks_octetL, sizeof(state.ks_octetL));
-    rc |= expect_eq_mem("aes-left-staged", state.f_l, state.audio_out_temp_buf, sizeof(state.f_l));
 
     DSD_MEMSET(&opts, 0, sizeof(opts));
+    pass_through_voice_chain(&opts);
     opts.floating_point = 1;
+    opts.audio_gain = 1.0f;
+    opts.audio_gainR = 1.0f;
     opts.dmr_stereo = 1;
     opts.dmr_mute_encR = 1;
     init_mbe_state(&state, &cur, &prev, &prev_enhanced, &cur2, &prev2, &prev_enhanced2);
@@ -2534,14 +4047,13 @@ test_process_mbe_frame_dmr_aes_stream_advances_slot_state(void) {
     state.aes_ivR[0] = 0x3C;
     state.aes_ivR[15] = 0xC3;
 
-    processMbeFrame(&opts, &state, imbe_fr, ambe_fr, imbe7100_fr);
+    processMbeFrame(&opts, &state, owner_of(state.synctype), imbe_fr, ambe_fr, imbe7100_fr);
 
     rc |= expect_eq_int("aes-right-vc", state.DMRvcR, 1);
     rc |= expect_eq_int("aes-right-bit-counter", state.bit_counterR, 56);
-    rc |= expect_eq_int("aes-right-unmutes-slot", opts.dmr_mute_encR, 0);
-    rc |= expect_eq_int("aes-right-enc-cleared", state.dmr_encR, 0);
+    rc |= expect_eq_int("aes-right-keeps-mute-option", opts.dmr_mute_encR, 1);
+    rc |= expect_eq_int("aes-right-enc-cleared", state.mbe_slot_muted[1], 0);
     rc |= expect_any_nonzero_u8("aes-right-keystream-ready", state.ks_octetR, sizeof(state.ks_octetR));
-    rc |= expect_eq_mem("aes-right-staged", state.f_r, state.audio_out_temp_bufR, sizeof(state.f_r));
 
     return rc;
 }
@@ -2576,7 +4088,10 @@ test_process_mbe_frame_activation_gate_and_wide_kid(void) {
     // algid == 0: the BP/HBP TG autoload owns the slot, so the gate must stay shut even with
     // keyloader armed and material imported for the signaled id -- R must survive untouched.
     DSD_MEMSET(&opts, 0, sizeof(opts));
+    pass_through_voice_chain(&opts);
     opts.floating_point = 1;
+    opts.audio_gain = 1.0f;
+    opts.audio_gainR = 1.0f;
     init_mbe_state(&state, &cur, &prev, &prev_enhanced, &cur2, &prev2, &prev_enhanced2);
     state.synctype = DSD_SYNC_DMR_BS_VOICE_POS;
     state.currentslot = 0;
@@ -2585,12 +4100,15 @@ test_process_mbe_frame_activation_gate_and_wide_kid(void) {
     state.rkey_array[0x03] = 0xAAAAAULL;
     state.rkey_array_loaded[0x03] = 1U;
     state.R = 0x99ULL;
-    processMbeFrame(&opts, &state, imbe_fr, ambe_fr, imbe7100_fr);
+    processMbeFrame(&opts, &state, owner_of(state.synctype), imbe_fr, ambe_fr, imbe7100_fr);
     rc |= expect_eq_int("gate-algid-zero-skips-activation", (int)state.R, 0x99);
 
     // algid == 0x80: the scrambler path owns the slot -- same non-activation as algid == 0.
     DSD_MEMSET(&opts, 0, sizeof(opts));
+    pass_through_voice_chain(&opts);
     opts.floating_point = 1;
+    opts.audio_gain = 1.0f;
+    opts.audio_gainR = 1.0f;
     init_mbe_state(&state, &cur, &prev, &prev_enhanced, &cur2, &prev2, &prev_enhanced2);
     state.synctype = DSD_SYNC_DMR_BS_VOICE_POS;
     state.currentslot = 0;
@@ -2600,13 +4118,16 @@ test_process_mbe_frame_activation_gate_and_wide_kid(void) {
     state.rkey_array[0x03] = 0xAAAAAULL;
     state.rkey_array_loaded[0x03] = 1U;
     state.R = 0x99ULL;
-    processMbeFrame(&opts, &state, imbe_fr, ambe_fr, imbe7100_fr);
+    processMbeFrame(&opts, &state, owner_of(state.synctype), imbe_fr, ambe_fr, imbe7100_fr);
     rc |= expect_eq_int("gate-alg80-skips-activation", (int)state.R, 0x99);
 
     // algid == 0x21 with keyloader armed: the gate opens and the signaled id's own material
     // activates, overwriting whatever R held before.
     DSD_MEMSET(&opts, 0, sizeof(opts));
+    pass_through_voice_chain(&opts);
     opts.floating_point = 1;
+    opts.audio_gain = 1.0f;
+    opts.audio_gainR = 1.0f;
     init_mbe_state(&state, &cur, &prev, &prev_enhanced, &cur2, &prev2, &prev_enhanced2);
     state.synctype = DSD_SYNC_DMR_BS_VOICE_POS;
     state.currentslot = 0;
@@ -2616,14 +4137,17 @@ test_process_mbe_frame_activation_gate_and_wide_kid(void) {
     state.rkey_array[0x03] = 0xAAAAAULL;
     state.rkey_array_loaded[0x03] = 1U;
     state.R = 0x99ULL;
-    processMbeFrame(&opts, &state, imbe_fr, ambe_fr, imbe7100_fr);
+    processMbeFrame(&opts, &state, owner_of(state.synctype), imbe_fr, ambe_fr, imbe7100_fr);
     rc |= expect_eq_int("gate-alg21-activates-signaled-key", (int)state.R, (int)0xAAAAAULL);
 
     // Critical 1 regression: 0x0101 truncates to 0x01 if the signaled id is narrowed to a
     // uint8_t before reaching the resolver. Seed a decoy at the truncated index so a
     // reintroduced truncation is caught by the wrong *value*, not merely a missing key.
     DSD_MEMSET(&opts, 0, sizeof(opts));
+    pass_through_voice_chain(&opts);
     opts.floating_point = 1;
+    opts.audio_gain = 1.0f;
+    opts.audio_gainR = 1.0f;
     init_mbe_state(&state, &cur, &prev, &prev_enhanced, &cur2, &prev2, &prev_enhanced2);
     state.synctype = DSD_SYNC_DMR_BS_VOICE_POS;
     state.currentslot = 0;
@@ -2635,7 +4159,7 @@ test_process_mbe_frame_activation_gate_and_wide_kid(void) {
     state.rkey_array[0x01] = 0xBADULL;
     state.rkey_array_loaded[0x01] = 1U;
     state.R = 0x99ULL;
-    processMbeFrame(&opts, &state, imbe_fr, ambe_fr, imbe7100_fr);
+    processMbeFrame(&opts, &state, owner_of(state.synctype), imbe_fr, ambe_fr, imbe7100_fr);
     rc |= expect_eq_int("gate-wide-kid-activates-full-index", (int)state.R, (int)0xCCCCCULL);
 
     return rc;
@@ -2677,7 +4201,10 @@ test_process_mbe_frame_hard_p25p2_right_stages_audio(void) {
     }
 
     DSD_MEMSET(&opts, 0, sizeof(opts));
+    pass_through_voice_chain(&opts);
     opts.floating_point = 1;
+    opts.audio_gain = 1.0f;
+    opts.audio_gainR = 1.0f;
     opts.dmr_mono = 1;
     opts.dmr_stereo = 1;
     init_mbe_state(&state, &cur, &prev, &prev_enhanced, &cur2, &prev2, &prev_enhanced2);
@@ -2687,8 +4214,9 @@ test_process_mbe_frame_hard_p25p2_right_stages_audio(void) {
     state.p2_sysid = 2;
     state.p2_cc = 3;
     state.p25_p2_audio_allowed[1] = 1;
+    state.p25_crypto_state[1] = DSD_P25_CRYPTO_CLEAR;
 
-    processMbeFrame(&opts, &state, imbe_fr, ambe_fr, imbe7100_fr);
+    processMbeFrame(&opts, &state, owner_of(state.synctype), imbe_fr, ambe_fr, imbe7100_fr);
 
     rc |= expect_eq_int("frame-hard-p25p2-r keeps left errs", state.errs, 0);
     rc |= expect_eq_int("frame-hard-p25p2-r errs", state.errsR, expected_errs);
@@ -2696,8 +4224,7 @@ test_process_mbe_frame_hard_p25p2_right_stages_audio(void) {
     rc |= expect_eq_int("frame-hard-p25p2-r status", strcmp(state.err_strR, expected_err_str), 0);
     rc |= expect_eq_mem("frame-hard-p25p2-r temp audio", state.audio_out_temp_bufR, expected_audio,
                         sizeof(expected_audio));
-    rc |= expect_eq_mem("frame-hard-p25p2-r staged right", state.f_r, expected_audio, sizeof(expected_audio));
-    rc |= expect_eq_int("frame-hard-p25p2-r enc flag", state.dmr_encR, 0);
+    rc |= expect_eq_int("frame-hard-p25p2-r enc flag", state.mbe_slot_muted[1], 0);
     rc |= expect_eq_int("frame-hard-p25p2-r debug errors", state.debug_audio_errorsR, state.errs2R);
     rc |= expect_eq_int("frame-hard-p25p2-r history length", state.p25_p2_voice_err_hist_len, 50);
     rc |= expect_eq_int("frame-hard-p25p2-r history position", state.p25_p2_voice_err_hist_pos[1], 1);
@@ -2727,6 +4254,7 @@ test_process_mbe_frame_provoice_updates_debug_errors_without_p25_history(void) {
     mbe_process_result result;
 
     DSD_MEMSET(&opts, 0, sizeof(opts));
+    pass_through_voice_chain(&opts);
     int ret = mbe_decodeImbe7100x4400Frame((const char (*)[24])imbe7100_fr, imbe_d, &result);
     store_expected_decode_status(ret, &expected_errs, &expected_errs2, &result);
     rc |= expect_eq_int("provoice-baseline fixture decodes", ret >= 0, 1);
@@ -2741,7 +4269,7 @@ test_process_mbe_frame_provoice_updates_debug_errors_without_p25_history(void) {
 
     init_mbe_state(&state, &cur, &prev, &prev_enhanced, &cur2, &prev2, &prev_enhanced2);
     state.synctype = DSD_SYNC_PROVOICE_POS;
-    processMbeFrame(&opts, &state, NULL, NULL, imbe7100_fr);
+    processMbeFrame(&opts, &state, owner_of(state.synctype), NULL, NULL, imbe7100_fr);
 
     rc |= expect_eq_int("provoice-baseline errs", state.errs, expected_errs);
     rc |= expect_eq_int("provoice-baseline errs2", state.errs2, expected_errs2);
@@ -2791,20 +4319,22 @@ test_process_mbe_frame_hard_provoice_stages_audio(void) {
     }
 
     DSD_MEMSET(&opts, 0, sizeof(opts));
+    pass_through_voice_chain(&opts);
     opts.floating_point = 1;
+    opts.audio_gain = 1.0f;
+    opts.audio_gainR = 1.0f;
     opts.dmr_mono = 1;
     opts.wav_out_f = wav_out;
     init_mbe_state(&state, &cur, &prev, &prev_enhanced, &cur2, &prev2, &prev_enhanced2);
     state.synctype = DSD_SYNC_PROVOICE_POS;
     state.currentslot = 1;
 
-    processMbeFrame(&opts, &state, imbe_fr, ambe_fr, imbe7100_fr);
+    processMbeFrame(&opts, &state, owner_of(state.synctype), imbe_fr, ambe_fr, imbe7100_fr);
 
     rc |= expect_eq_int("hard-provoice errs", state.errs, expected_errs);
     rc |= expect_eq_int("hard-provoice errs2", state.errs2, expected_errs2);
     rc |= expect_eq_int("hard-provoice status", strcmp(state.err_str, expected_err_str), 0);
     rc |= expect_eq_mem("hard-provoice temp audio", state.audio_out_temp_buf, expected_audio, sizeof(expected_audio));
-    rc |= expect_eq_mem("hard-provoice staged left", state.f_l, expected_audio, sizeof(expected_audio));
     rc |= expect_eq_int("hard-provoice debug errors", state.debug_audio_errors, state.errs2);
     rc |= expect_eq_int("hard-provoice keeps p25 history length", state.p25_p1_voice_err_hist_len, 0);
     rc |= expect_eq_int("hard-provoice stale-slot wav output opened", wav_out != NULL, 1);
@@ -2816,6 +4346,770 @@ test_process_mbe_frame_hard_provoice_stages_audio(void) {
         opts.wav_out_f = NULL;
     }
 
+    return rc;
+}
+
+/*
+ * ProVoice soft decoding (issue #588). With C0 (row 0) zero the PN sequence is fixed, and the demodulator is an XOR
+ * with it, so applying mbelib's own demodulator to the codewords wanted after demodulation gives the frame to
+ * transmit. C1-C3 carry the all-ones Golay(23,12) codeword and C4-C5 zero, so the frame decodes with nothing to
+ * correct; row 6 is uncoded and takes a pattern. Together they give the parameters content that synthesizes sound.
+ */
+static int
+build_clean_provoice_frame(char frame[7][24]) {
+    DSD_MEMSET(frame, 0, (size_t)7 * 24);
+    for (int bit = 1; bit < 24; bit++) {
+        frame[1][bit] = 1;
+    }
+    for (int row = 2; row < 4; row++) {
+        for (int bit = 0; bit < 23; bit++) {
+            frame[row][bit] = 1;
+        }
+    }
+    if (mbe_demodulateImbe7100x4400Data(frame) < 0) {
+        return -1;
+    }
+    for (int bit = 0; bit < 23; bit++) {
+        frame[6][bit] = (char)((bit % 3) == 1);
+    }
+    return 0;
+}
+
+static void
+provoice_soft_from_hard(char hard[7][24], dsd_vocoder_soft_bit soft[7][24], uint8_t reliability) {
+    for (int row = 0; row < 7; row++) {
+        for (int bit = 0; bit < 24; bit++) {
+            soft[row][bit].bit = (uint8_t)hard[row][bit];
+            soft[row][bit].reliability = reliability;
+        }
+    }
+}
+
+static void
+copy_provoice_soft_to_mbelib(const dsd_vocoder_soft_bit src[7][24], mbe_soft_bit dst[7][24]) {
+    for (int row = 0; row < 7; row++) {
+        for (int bit = 0; bit < 24; bit++) {
+            dst[row][bit].bit = src[row][bit].bit;
+            dst[row][bit].reliability = src[row][bit].reliability;
+        }
+    }
+}
+
+static uint32_t
+provoice_lcg_next(uint32_t* rng) {
+    *rng = (*rng * 1664525U) + 1013904223U;
+    return *rng;
+}
+
+/* Random bits at random confidence: what a noisy channel hands the decoder. */
+static void
+fill_random_provoice_frame(uint32_t* rng, char hard[7][24], dsd_vocoder_soft_bit soft[7][24]) {
+    for (int row = 0; row < 7; row++) {
+        for (int bit = 0; bit < 24; bit++) {
+            uint32_t r = provoice_lcg_next(rng);
+            hard[row][bit] = (char)((r >> 31) & 1U);
+            soft[row][bit].bit = (uint8_t)hard[row][bit];
+            soft[row][bit].reliability = (uint8_t)(1U + ((r >> 8) % 255U));
+        }
+    }
+}
+
+typedef struct {
+    uint8_t params[11];
+    float audio[160];
+    int errs;
+    int errs2;
+} provoice_frame_run;
+
+/* Audio that must differ is compared by value: bit-exact equality is what expect_eq_mem() checks, and a difference
+ * has to be more than rounding to count. */
+static int
+provoice_audio_differs(const float* a, const float* b) {
+    for (int i = 0; i < 160; i++) {
+        if (fabsf(a[i] - b[i]) > 1e-3f) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* One ProVoice frame through processMbeFrame (hard_fr) or processMbeFrameSoft (soft_fr) from fresh vocoder state.
+ * The first frame after a reset synthesizes silence, so the frame is decoded twice and the second is kept. The 88
+ * decoded parameter bits come back from the MBE capture, packed as it records them. */
+static int
+run_provoice_frame(char hard_fr[7][24], dsd_vocoder_soft_bit soft_fr[7][24], provoice_frame_run* run) {
+    static dsd_opts opts;
+    static dsd_state state;
+    static mbe_parms cur;
+    static mbe_parms prev;
+    static mbe_parms prev_enhanced;
+    static mbe_parms cur2;
+    static mbe_parms prev2;
+    static mbe_parms prev_enhanced2;
+    uint8_t record[24] = {0};
+
+    /* Cleared before the early return below, so a caller never compares an unfilled run. */
+    DSD_MEMSET(run, 0, sizeof(*run));
+    FILE* out = tmpfile();
+    if (!out) {
+        return 1;
+    }
+    DSD_MEMSET(&opts, 0, sizeof(opts));
+    pass_through_voice_chain(&opts);
+    opts.floating_point = 1;
+    opts.audio_gain = 1.0f;
+    opts.audio_gainR = 1.0f;
+    opts.mbe_out_f = out;
+    init_mbe_state(&state, &cur, &prev, &prev_enhanced, &cur2, &prev2, &prev_enhanced2);
+    state.synctype = DSD_SYNC_PROVOICE_POS;
+
+    mbe_setThreadRngSeed(588U);
+    for (int pass = 0; pass < 2; pass++) {
+        if (soft_fr != NULL) {
+            processMbeFrameSoft(&opts, &state, owner_of(state.synctype), NULL, NULL, soft_fr);
+        } else {
+            processMbeFrame(&opts, &state, owner_of(state.synctype), NULL, NULL, hard_fr);
+        }
+    }
+
+    size_t got = 0U;
+    if (fseek(out, 0, SEEK_SET) == 0) {
+        got = fread(record, 1U, sizeof(record), out);
+    }
+    fclose(out);
+    opts.mbe_out_f = NULL;
+    DSD_MEMCPY(run->params, &record[13], sizeof(run->params));
+    DSD_MEMCPY(run->audio, state.audio_out_temp_buf, sizeof(run->audio));
+    run->errs = state.errs;
+    run->errs2 = state.errs2;
+    dsd_state_ext_free_all(&state);
+    return expect_eq_int("provoice capture record", (int)got, (int)sizeof(record));
+}
+
+static int
+expect_provoice_runs_equal(const char* tag, const provoice_frame_run* got, const provoice_frame_run* want) {
+    char label[96];
+    int rc = 0;
+    DSD_SNPRINTF(label, sizeof(label), "%s params", tag);
+    rc |= expect_eq_mem(label, got->params, want->params, sizeof(got->params));
+    DSD_SNPRINTF(label, sizeof(label), "%s audio", tag);
+    rc |= expect_eq_mem(label, got->audio, want->audio, sizeof(got->audio));
+    DSD_SNPRINTF(label, sizeof(label), "%s errs", tag);
+    rc |= expect_eq_int(label, got->errs, want->errs);
+    DSD_SNPRINTF(label, sizeof(label), "%s errs2", tag);
+    rc |= expect_eq_int(label, got->errs2, want->errs2);
+    return rc;
+}
+
+static int
+test_process_mbe_frame_soft_provoice_matches_hard(void) {
+    int rc = 0;
+    char clean[7][24];
+    char arbitrary[7][24];
+    dsd_vocoder_soft_bit soft[7][24];
+    provoice_frame_run hard_run;
+    provoice_frame_run soft_run;
+    uint32_t rng = 0x1588U;
+
+    /* Nothing to correct: the soft decode matches the hard one whatever the reliabilities say. */
+    rc |= expect_eq_int("soft-provoice clean fixture", build_clean_provoice_frame(clean), 0);
+    provoice_soft_from_hard(clean, soft, 0U);
+    for (int row = 0; row < 7; row++) {
+        for (int bit = 0; bit < 24; bit++) {
+            soft[row][bit].reliability = (uint8_t)(1 + (((row * 24) + bit) * 7) % 255);
+        }
+    }
+    rc |= run_provoice_frame(clean, NULL, &hard_run);
+    rc |= run_provoice_frame(NULL, soft, &soft_run);
+    static const float silence[160] = {0.0f};
+    rc |= expect_eq_int("soft-provoice clean frame needs no correction", hard_run.errs2, 0);
+    rc |= expect_eq_int("soft-provoice clean frame is not silence", provoice_audio_differs(hard_run.audio, silence), 1);
+    rc |= expect_provoice_runs_equal("soft-provoice clean", &soft_run, &hard_run);
+
+    /* Every bit at full confidence: soft maximum likelihood is minimum distance, which for the perfect Golay and
+     * Hamming codes is the hard decode, corrections included. */
+    fill_random_provoice_frame(&rng, arbitrary, soft);
+    provoice_soft_from_hard(arbitrary, soft, 255U);
+    rc |= run_provoice_frame(arbitrary, NULL, &hard_run);
+    rc |= run_provoice_frame(NULL, soft, &soft_run);
+    rc |= expect_eq_int("soft-provoice arbitrary frame has corrections", hard_run.errs2 > 0, 1);
+    rc |= expect_provoice_runs_equal("soft-provoice uniform", &soft_run, &hard_run);
+
+    return rc;
+}
+
+/* Four channel errors in one Golay(23,12) word, one past what it corrects: the hard decode lands on the wrong
+ * codeword, while marking those four bits unreliable lets the soft decode recover the transmitted parameters. */
+static int
+test_process_mbe_frame_soft_provoice_erasures_recover_hard_miscorrection(void) {
+    static const int flipped[] = {12, 15, 18, 21};
+    int rc = 0;
+    char clean[7][24];
+    char corrupted[7][24];
+    dsd_vocoder_soft_bit soft[7][24];
+    provoice_frame_run clean_run;
+    provoice_frame_run hard_run;
+    provoice_frame_run soft_run;
+    provoice_frame_run uniform_run;
+
+    rc |= expect_eq_int("erasure-provoice clean fixture", build_clean_provoice_frame(clean), 0);
+    rc |= run_provoice_frame(clean, NULL, &clean_run);
+
+    DSD_MEMCPY(corrupted, clean, sizeof(corrupted));
+    for (size_t i = 0; i < sizeof(flipped) / sizeof(flipped[0]); i++) {
+        corrupted[2][flipped[i]] ^= 1;
+    }
+    rc |= run_provoice_frame(corrupted, NULL, &hard_run);
+    rc |= expect_eq_int("erasure-provoice hard miscorrects",
+                        memcmp(hard_run.params, clean_run.params, sizeof(clean_run.params)) != 0, 1);
+
+    provoice_soft_from_hard(corrupted, soft, 200U);
+    for (size_t i = 0; i < sizeof(flipped) / sizeof(flipped[0]); i++) {
+        soft[2][flipped[i]].reliability = 8U;
+    }
+    rc |= run_provoice_frame(NULL, soft, &soft_run);
+    rc |= expect_eq_mem("erasure-provoice soft recovers params", soft_run.params, clean_run.params,
+                        sizeof(clean_run.params));
+    rc |= expect_eq_int("erasure-provoice soft counts the four", soft_run.errs2, 4);
+
+    /* The reliabilities are what recover it: the same bits at full confidence decode as the hard path does. */
+    provoice_soft_from_hard(corrupted, soft, 255U);
+    rc |= run_provoice_frame(NULL, soft, &uniform_run);
+    rc |= expect_eq_mem("erasure-provoice uniform follows hard", uniform_run.params, hard_run.params,
+                        sizeof(hard_run.params));
+
+    return rc;
+}
+
+/* The live path must give exactly what mbelib's own ProVoice frame API gives, frame after frame, through repeats and
+ * into muting. Muted frames are where the ProVoice result context shows: they get comfort noise only while the
+ * decode's MBE_PROCESS_FLAG_PROVOICE reaches the 4400 data API, so a parallel run with the flag cleared must differ
+ * there, or this comparison could not catch the context being dropped.
+ *
+ * The sequence is a clean frame, random frames at random confidence, then frames carrying as many errors as the
+ * codes correct: mbelib repeats a frame with two or more C0 errors and 10 + 40 x error rate in all, and a fourth
+ * repeat in a row mutes. */
+enum { PROVOICE_PARITY_RANDOM_FRAMES = 6, PROVOICE_PARITY_FRAMES = 20 };
+
+/* Three errors in the data bits of C0 and of each Golay word, one in each Hamming word's: 14 corrections. */
+static void
+add_correctable_provoice_errors(char frame[7][24]) {
+    static const int golay_rows[][4] = {{0, 13, 15, 17}, {1, 13, 17, 21}, {2, 12, 16, 20}, {3, 12, 16, 20}};
+    for (size_t i = 0; i < sizeof(golay_rows) / sizeof(golay_rows[0]); i++) {
+        for (int k = 1; k < 4; k++) {
+            frame[golay_rows[i][0]][golay_rows[i][k]] ^= 1;
+        }
+    }
+    frame[4][8] ^= 1;
+    frame[5][8] ^= 1;
+}
+
+static int
+run_provoice_library_parity(int soft_path) {
+    const char* tag = soft_path ? "provoice-parity soft" : "provoice-parity hard";
+    static dsd_opts opts;
+    static dsd_state state;
+    static mbe_parms cur;
+    static mbe_parms prev;
+    static mbe_parms prev_enhanced;
+    static mbe_parms cur2;
+    static mbe_parms prev2;
+    static mbe_parms prev_enhanced2;
+    static mbe_parms lib_cur;
+    static mbe_parms lib_prev;
+    static mbe_parms lib_prev_enhanced;
+    static mbe_parms p25_cur;
+    static mbe_parms p25_prev;
+    static mbe_parms p25_prev_enhanced;
+    char label[96];
+    uint32_t rng = 0x5880U;
+    int muted = 0;
+    int rc = 0;
+
+    DSD_MEMSET(&opts, 0, sizeof(opts));
+    pass_through_voice_chain(&opts);
+    opts.floating_point = 1;
+    opts.audio_gain = 1.0f;
+    opts.audio_gainR = 1.0f;
+    init_mbe_state(&state, &cur, &prev, &prev_enhanced, &cur2, &prev2, &prev_enhanced2);
+    state.synctype = DSD_SYNC_PROVOICE_POS;
+    mbe_initMbeParms(&lib_cur, &lib_prev, &lib_prev_enhanced);
+    mbe_initMbeParms(&p25_cur, &p25_prev, &p25_prev_enhanced);
+
+    for (int frame = 0; frame < PROVOICE_PARITY_FRAMES; frame++) {
+        char hard[7][24];
+        dsd_vocoder_soft_bit soft[7][24];
+        mbe_soft_bit lib_soft[7][24];
+        char imbe_d[88];
+        float lib_audio[160] = {0};
+        float p25_audio[160] = {0};
+        char expected_err_str[96] = {0};
+        int expected_errs = -1;
+        int expected_errs2 = -1;
+        mbe_process_result lib_result;
+        mbe_process_result p25_result;
+        const uint32_t seed = 0x5880U + (uint32_t)frame;
+
+        if (frame > 0 && frame <= PROVOICE_PARITY_RANDOM_FRAMES) {
+            fill_random_provoice_frame(&rng, hard, soft);
+        } else {
+            rc |= expect_eq_int("provoice-parity clean fixture", build_clean_provoice_frame(hard), 0);
+            if (frame > PROVOICE_PARITY_RANDOM_FRAMES) {
+                add_correctable_provoice_errors(hard);
+            }
+            provoice_soft_from_hard(hard, soft, 200U);
+        }
+        copy_provoice_soft_to_mbelib((const dsd_vocoder_soft_bit(*)[24])soft, lib_soft);
+
+        mbe_setThreadRngSeed(seed);
+        int lib_ret =
+            soft_path ? mbe_processImbe7100x4400SoftFramef(lib_audio, &lib_result, (const mbe_soft_bit(*)[24])lib_soft,
+                                                           imbe_d, &lib_cur, &lib_prev, &lib_prev_enhanced)
+                      : mbe_processImbe7100x4400Framef(lib_audio, &lib_result, (const char (*)[24])hard, imbe_d,
+                                                       &lib_cur, &lib_prev, &lib_prev_enhanced);
+        store_expected_process_status(lib_ret, lib_audio, &expected_errs, &expected_errs2, expected_err_str,
+                                      sizeof(expected_err_str), &lib_result);
+
+        mbe_setThreadRngSeed(seed);
+        int p25_ret = soft_path
+                          ? mbe_decodeImbe7100x4400SoftFrame((const mbe_soft_bit(*)[24])lib_soft, imbe_d, &p25_result)
+                          : mbe_decodeImbe7100x4400Frame((const char (*)[24])hard, imbe_d, &p25_result);
+        if (p25_ret >= 0) {
+            p25_result.flags &= ~MBE_PROCESS_FLAG_PROVOICE;
+            p25_ret = mbe_processImbe4400Dataf(p25_audio, &p25_result, imbe_d, &p25_cur, &p25_prev, &p25_prev_enhanced);
+        }
+        // Compared on the scale of the reference, which the vocoder's int16 scaling applies to.
+        if (p25_ret >= 0) {
+            dsd_mbe_float_to_pcm16_scale(p25_audio);
+        }
+
+        mbe_setThreadRngSeed(seed);
+        if (soft_path) {
+            processMbeFrameSoft(&opts, &state, owner_of(state.synctype), NULL, NULL, soft);
+        } else {
+            processMbeFrame(&opts, &state, owner_of(state.synctype), NULL, NULL, hard);
+        }
+
+        DSD_SNPRINTF(label, sizeof(label), "%s frame %d library call", tag, frame);
+        rc |= expect_eq_int(label, lib_ret >= 0 && p25_ret >= 0, 1);
+        DSD_SNPRINTF(label, sizeof(label), "%s frame %d audio", tag, frame);
+        rc |= expect_eq_mem(label, state.audio_out_temp_buf, lib_audio, sizeof(lib_audio));
+        DSD_SNPRINTF(label, sizeof(label), "%s frame %d errs", tag, frame);
+        rc |= expect_eq_int(label, state.errs, expected_errs);
+        DSD_SNPRINTF(label, sizeof(label), "%s frame %d errs2", tag, frame);
+        rc |= expect_eq_int(label, state.errs2, expected_errs2);
+        DSD_SNPRINTF(label, sizeof(label), "%s frame %d status", tag, frame);
+        rc |= expect_eq_int(label, strcmp(state.err_str, expected_err_str), 0);
+        if (lib_ret >= 0 && p25_ret >= 0 && (lib_result.flags & MBE_PROCESS_FLAG_MUTE) != 0U) {
+            muted++;
+            DSD_SNPRINTF(label, sizeof(label), "%s frame %d comfort noise differs from P25 noise", tag, frame);
+            rc |= expect_eq_int(label, provoice_audio_differs(p25_audio, lib_audio), 1);
+        }
+    }
+
+    DSD_SNPRINTF(label, sizeof(label), "%s reached a muted frame", tag);
+    rc |= expect_eq_int(label, muted > 0, 1);
+    dsd_state_ext_free_all(&state);
+    return rc;
+}
+
+static int
+test_process_mbe_frame_provoice_matches_library_frame_api(void) {
+    int rc = 0;
+    rc |= run_provoice_library_parity(0);
+    rc |= run_provoice_library_parity(1);
+    return rc;
+}
+
+/*
+ * D-STAR soft decoding (issue #599). Frames come from mbelib's own AMBE 3600x2400 encoder (build_dstar_voice_frame()).
+ * Error counts cover data bits only, hard and soft alike, so channel errors go on data bits: C0's are fr[0][12..23]
+ * and C1's fr[1][11..22]. The rest of each Golay word is parity.
+ */
+static void
+dstar_soft_from_hard(char hard[4][24], dsd_vocoder_soft_bit soft[4][24], uint8_t reliability) {
+    for (int row = 0; row < 4; row++) {
+        for (int bit = 0; bit < 24; bit++) {
+            soft[row][bit].bit = (uint8_t)hard[row][bit];
+            soft[row][bit].reliability = reliability;
+        }
+    }
+}
+
+static void
+copy_dstar_soft_to_mbelib(const dsd_vocoder_soft_bit src[4][24], mbe_soft_bit dst[4][24]) {
+    for (int row = 0; row < 4; row++) {
+        for (int bit = 0; bit < 24; bit++) {
+            dst[row][bit].bit = src[row][bit].bit;
+            dst[row][bit].reliability = src[row][bit].reliability;
+        }
+    }
+}
+
+/* Random bits at random confidence: what a noisy channel hands the decoder. */
+static void
+fill_random_dstar_frame(uint32_t* rng, char hard[4][24], dsd_vocoder_soft_bit soft[4][24]) {
+    for (int row = 0; row < 4; row++) {
+        for (int bit = 0; bit < 24; bit++) {
+            uint32_t r = provoice_lcg_next(rng);
+            hard[row][bit] = (char)((r >> 31) & 1U);
+            soft[row][bit].bit = (uint8_t)hard[row][bit];
+            soft[row][bit].reliability = (uint8_t)(1U + ((r >> 8) % 255U));
+        }
+    }
+}
+
+typedef struct {
+    char params[49];
+    float audio[160];
+    int errs;
+    int errs2;
+    char err_str[96];
+} dstar_frame_run;
+
+/* One D-STAR frame through processMbeFrame (hard_fr) or processMbeFrameSoft (soft_fr) from fresh vocoder state,
+ * decoded twice with the second kept, as run_provoice_frame() does. The 49 decoded parameter bits come back from the
+ * MBE capture: each 8-byte record is the error count, 48 bits MSB first, then the last bit in a byte of its own. */
+static int
+run_dstar_frame(char hard_fr[4][24], dsd_vocoder_soft_bit soft_fr[4][24], dstar_frame_run* run) {
+    static dsd_opts opts;
+    static dsd_state state;
+    static mbe_parms cur;
+    static mbe_parms prev;
+    static mbe_parms prev_enhanced;
+    static mbe_parms cur2;
+    static mbe_parms prev2;
+    static mbe_parms prev_enhanced2;
+    uint8_t record[16] = {0};
+
+    /* Cleared before the early return below, so a caller never compares an unfilled run. */
+    DSD_MEMSET(run, 0, sizeof(*run));
+    FILE* out = tmpfile();
+    if (!out) {
+        return 1;
+    }
+    DSD_MEMSET(&opts, 0, sizeof(opts));
+    pass_through_voice_chain(&opts);
+    opts.floating_point = 1;
+    opts.audio_gain = 1.0f;
+    opts.audio_gainR = 1.0f;
+    opts.mbe_out_f = out;
+    init_mbe_state(&state, &cur, &prev, &prev_enhanced, &cur2, &prev2, &prev_enhanced2);
+    state.synctype = DSD_SYNC_DSTAR_VOICE_POS;
+
+    for (int pass = 0; pass < 2; pass++) {
+        mbe_setThreadRngSeed(599U + (uint32_t)pass);
+        if (soft_fr != NULL) {
+            processMbeFrameSoft(&opts, &state, owner_of(state.synctype), NULL, soft_fr, NULL);
+        } else {
+            processMbeFrame(&opts, &state, owner_of(state.synctype), NULL, hard_fr, NULL);
+        }
+    }
+
+    size_t got = 0U;
+    if (fseek(out, 0, SEEK_SET) == 0) {
+        got = fread(record, 1U, sizeof(record), out);
+    }
+    fclose(out);
+    opts.mbe_out_f = NULL;
+    for (int k = 0; k < 48; k++) {
+        run->params[k] = (char)((record[9 + (k / 8)] >> (7 - (k % 8))) & 1U);
+    }
+    run->params[48] = (char)record[15];
+    DSD_MEMCPY(run->audio, state.audio_out_temp_buf, sizeof(run->audio));
+    run->errs = state.errs;
+    run->errs2 = state.errs2;
+    DSD_SNPRINTF(run->err_str, sizeof(run->err_str), "%s", state.err_str);
+    dsd_state_ext_free_all(&state);
+    return expect_eq_int("dstar capture record", (int)got, (int)sizeof(record));
+}
+
+static int
+expect_dstar_runs_equal(const char* tag, const dstar_frame_run* got, const dstar_frame_run* want) {
+    char label[96];
+    int rc = 0;
+    DSD_SNPRINTF(label, sizeof(label), "%s params", tag);
+    rc |= expect_eq_mem(label, got->params, want->params, sizeof(got->params));
+    DSD_SNPRINTF(label, sizeof(label), "%s audio", tag);
+    rc |= expect_eq_mem(label, got->audio, want->audio, sizeof(got->audio));
+    DSD_SNPRINTF(label, sizeof(label), "%s errs", tag);
+    rc |= expect_eq_int(label, got->errs, want->errs);
+    DSD_SNPRINTF(label, sizeof(label), "%s errs2", tag);
+    rc |= expect_eq_int(label, got->errs2, want->errs2);
+    DSD_SNPRINTF(label, sizeof(label), "%s status", tag);
+    rc |= expect_eq_int(label, strcmp(got->err_str, want->err_str), 0);
+    return rc;
+}
+
+static int
+test_process_mbe_frame_soft_dstar_matches_hard(void) {
+    int rc = 0;
+    char clean[4][24];
+    char arbitrary[4][24];
+    dsd_vocoder_soft_bit soft[4][24];
+    dstar_frame_run hard_run;
+    dstar_frame_run soft_run;
+    uint32_t rng = 0x1599U;
+
+    /* Nothing to correct: the soft decode matches the hard one whatever the reliabilities say. */
+    rc |= expect_eq_int("soft-dstar clean fixture", build_dstar_voice_frame(1, clean), 0);
+    dstar_soft_from_hard(clean, soft, 0U);
+    for (int row = 0; row < 4; row++) {
+        for (int bit = 0; bit < 24; bit++) {
+            soft[row][bit].reliability = (uint8_t)(1 + (((row * 24) + bit) * 7) % 255);
+        }
+    }
+    rc |= run_dstar_frame(clean, NULL, &hard_run);
+    rc |= run_dstar_frame(NULL, soft, &soft_run);
+    static const float silence[160] = {0.0f};
+    rc |= expect_eq_int("soft-dstar clean frame needs no correction", hard_run.errs2, 0);
+    rc |= expect_eq_int("soft-dstar clean frame is not silence", audio_frames_differ(hard_run.audio, silence), 1);
+    rc |= expect_dstar_runs_equal("soft-dstar clean", &soft_run, &hard_run);
+
+    /* Every bit at full confidence: soft maximum likelihood is minimum distance, which for the perfect Golay code is
+     * the hard decode, corrections included. */
+    fill_random_dstar_frame(&rng, arbitrary, soft);
+    dstar_soft_from_hard(arbitrary, soft, 255U);
+    rc |= run_dstar_frame(arbitrary, NULL, &hard_run);
+    rc |= run_dstar_frame(NULL, soft, &soft_run);
+    rc |= expect_eq_int("soft-dstar arbitrary frame has corrections", hard_run.errs2 > 0, 1);
+    rc |= expect_dstar_runs_equal("soft-dstar uniform", &soft_run, &hard_run);
+
+    return rc;
+}
+
+/* Four channel errors in C1, one past what Golay(23,12) corrects: the hard decode lands on the wrong codeword, and
+ * marking the four bits unreliable lets the soft decode recover the transmitted parameters. */
+static int
+test_process_mbe_frame_soft_dstar_erasures_recover_hard_miscorrection(void) {
+    int rc = 0;
+    char clean[4][24];
+    char corrupted[4][24];
+    dsd_vocoder_soft_bit soft[4][24];
+    dstar_frame_run clean_run;
+    dstar_frame_run hard_run;
+    dstar_frame_run soft_run;
+    dstar_frame_run uniform_run;
+
+    rc |= expect_eq_int("erasure-dstar clean fixture", build_dstar_voice_frame(1, clean), 0);
+    rc |= run_dstar_frame(clean, NULL, &clean_run);
+
+    /* Four data bits. Soft recovers the parameters and counts all four; with more than three errors mbelib then
+     * repeats the previous frame rather than playing this one. */
+    static const int data_flips[] = {12, 15, 18, 21};
+    DSD_MEMCPY(corrupted, clean, sizeof(corrupted));
+    for (size_t i = 0; i < sizeof(data_flips) / sizeof(data_flips[0]); i++) {
+        corrupted[1][data_flips[i]] ^= 1;
+    }
+    rc |= run_dstar_frame(corrupted, NULL, &hard_run);
+    rc |= expect_eq_int("erasure-dstar hard miscorrects",
+                        memcmp(hard_run.params, clean_run.params, sizeof(clean_run.params)) != 0, 1);
+
+    dstar_soft_from_hard(corrupted, soft, 200U);
+    for (size_t i = 0; i < sizeof(data_flips) / sizeof(data_flips[0]); i++) {
+        soft[1][data_flips[i]].reliability = 8U;
+    }
+    rc |= run_dstar_frame(NULL, soft, &soft_run);
+    rc |= expect_eq_mem("erasure-dstar soft recovers params", soft_run.params, clean_run.params,
+                        sizeof(clean_run.params));
+    rc |= expect_eq_int("erasure-dstar soft counts the four", soft_run.errs2, 4);
+    rc |= expect_eq_int("erasure-dstar soft repeats", strchr(soft_run.err_str, 'R') != NULL, 1);
+
+    /* The reliabilities are what recover it: the same bits at full confidence decode as the hard path does. */
+    dstar_soft_from_hard(corrupted, soft, 255U);
+    rc |= run_dstar_frame(NULL, soft, &uniform_run);
+    rc |= expect_eq_mem("erasure-dstar uniform follows hard", uniform_run.params, hard_run.params,
+                        sizeof(hard_run.params));
+
+    /* Two data bits and two parity bits. Soft counts only the two data bits, so it plays the recovered frame, which
+     * sounds as the clean frame does; the hard decode plays its miscorrection. */
+    static const int mixed_flips[] = {2, 7, 13, 19};
+    DSD_MEMCPY(corrupted, clean, sizeof(corrupted));
+    for (size_t i = 0; i < sizeof(mixed_flips) / sizeof(mixed_flips[0]); i++) {
+        corrupted[1][mixed_flips[i]] ^= 1;
+    }
+    rc |= run_dstar_frame(corrupted, NULL, &hard_run);
+    rc |= expect_eq_int("erasure-dstar mixed hard miscorrects",
+                        memcmp(hard_run.params, clean_run.params, sizeof(clean_run.params)) != 0, 1);
+    dstar_soft_from_hard(corrupted, soft, 200U);
+    for (size_t i = 0; i < sizeof(mixed_flips) / sizeof(mixed_flips[0]); i++) {
+        soft[1][mixed_flips[i]].reliability = 8U;
+    }
+    rc |= run_dstar_frame(NULL, soft, &soft_run);
+    rc |= expect_eq_mem("erasure-dstar mixed soft recovers params", soft_run.params, clean_run.params,
+                        sizeof(clean_run.params));
+    rc |= expect_eq_int("erasure-dstar mixed soft counts the data bits", soft_run.errs2, 2);
+    rc |= expect_eq_int("erasure-dstar mixed soft plays the frame", strchr(soft_run.err_str, 'R') == NULL, 1);
+    rc |= expect_eq_mem("erasure-dstar mixed soft sounds clean", soft_run.audio, clean_run.audio,
+                        sizeof(clean_run.audio));
+    rc |=
+        expect_eq_int("erasure-dstar mixed hard sounds wrong", audio_frames_differ(hard_run.audio, clean_run.audio), 1);
+
+    return rc;
+}
+
+/* The live path must give exactly what mbelib's own D-STAR frame API gives, frame after frame, through repeats and
+ * into muting. The result context that matters for AMBE 2400 is the C0 error count: a tone frame plays only with
+ * fewer than two C0 errors, and is replaced with comfort noise otherwise. So the sequence carries a tone frame with
+ * two C0 errors, and a parallel reference with MBE_PROCESS_FLAG_C0_VALID cleared, which plays the tone, must differ
+ * there, or this comparison could not catch the context being dropped.
+ *
+ * The sequence is a clean frame, random frames at random confidence, that tone frame, then frames carrying three
+ * errors in each Golay word: mbelib repeats a frame with more than three errors, and mutes once four repeats run. */
+enum {
+    DSTAR_PARITY_RANDOM_FRAMES = 6,
+    DSTAR_PARITY_TONE_FRAME = DSTAR_PARITY_RANDOM_FRAMES + 1,
+    DSTAR_PARITY_FRAMES = 20,
+};
+
+/* A tone frame: b0 is the tone pattern (ambe_d[0..5] set), and ambe_d[6..11], [42] and [43] give tone index 18. */
+static int
+build_dstar_tone_frame(char frame[4][24]) {
+    char ambe_d[49] = {0};
+    for (int i = 0; i < 6; i++) {
+        ambe_d[i] = 1;
+    }
+    ambe_d[8] = 1;
+    ambe_d[9] = 1;
+    ambe_d[10] = 1;
+    for (int i = 12; i < 16; i++) {
+        ambe_d[i] = 1;
+    }
+    return mbe_encodeAmbe3600x2400Frame(ambe_d, frame);
+}
+
+static int
+run_dstar_library_parity(int soft_path, int synctype) {
+    static dsd_opts opts;
+    static dsd_state state;
+    static mbe_parms cur;
+    static mbe_parms prev;
+    static mbe_parms prev_enhanced;
+    static mbe_parms cur2;
+    static mbe_parms prev2;
+    static mbe_parms prev_enhanced2;
+    static mbe_parms lib_cur;
+    static mbe_parms lib_prev;
+    static mbe_parms lib_prev_enhanced;
+    static mbe_parms bare_cur;
+    static mbe_parms bare_prev;
+    static mbe_parms bare_prev_enhanced;
+    char tag[64];
+    char label[128];
+    uint32_t rng = 0x5990U;
+    int muted = 0;
+    int rc = 0;
+
+    DSD_SNPRINTF(tag, sizeof(tag), "dstar-parity %s synctype %d", soft_path ? "soft" : "hard", synctype);
+    DSD_MEMSET(&opts, 0, sizeof(opts));
+    pass_through_voice_chain(&opts);
+    opts.floating_point = 1;
+    opts.audio_gain = 1.0f;
+    opts.audio_gainR = 1.0f;
+    init_mbe_state(&state, &cur, &prev, &prev_enhanced, &cur2, &prev2, &prev_enhanced2);
+    mbe_initMbeParms(&lib_cur, &lib_prev, &lib_prev_enhanced);
+    mbe_initMbeParms(&bare_cur, &bare_prev, &bare_prev_enhanced);
+
+    for (int frame = 0; frame < DSTAR_PARITY_FRAMES; frame++) {
+        char hard[4][24];
+        dsd_vocoder_soft_bit soft[4][24];
+        mbe_soft_bit lib_soft[4][24];
+        char ambe_d[49];
+        float lib_audio[160] = {0};
+        float bare_audio[160] = {0};
+        char expected_err_str[96] = {0};
+        int expected_errs = -1;
+        int expected_errs2 = -1;
+        mbe_process_result lib_result;
+        mbe_process_result bare_result;
+        const uint32_t seed = 0x5990U + (uint32_t)frame;
+
+        if (frame > 0 && frame <= DSTAR_PARITY_RANDOM_FRAMES) {
+            fill_random_dstar_frame(&rng, hard, soft);
+        } else if (frame == DSTAR_PARITY_TONE_FRAME) {
+            rc |= expect_eq_int("dstar-parity tone fixture", build_dstar_tone_frame(hard), 0);
+            hard[0][14] ^= 1;
+            hard[0][20] ^= 1;
+            dstar_soft_from_hard(hard, soft, 200U);
+        } else {
+            rc |= expect_eq_int("dstar-parity clean fixture", build_dstar_voice_frame(frame, hard), 0);
+            if (frame > DSTAR_PARITY_TONE_FRAME) {
+                static const int c0_flips[] = {13, 17, 22};
+                static const int c1_flips[] = {12, 16, 20};
+                for (int k = 0; k < 3; k++) {
+                    hard[0][c0_flips[k]] ^= 1;
+                    hard[1][c1_flips[k]] ^= 1;
+                }
+            }
+            dstar_soft_from_hard(hard, soft, 200U);
+        }
+        copy_dstar_soft_to_mbelib((const dsd_vocoder_soft_bit(*)[24])soft, lib_soft);
+
+        mbe_setThreadRngSeed(seed);
+        int lib_ret =
+            soft_path ? mbe_processAmbe3600x2400SoftFramef(lib_audio, &lib_result, (const mbe_soft_bit(*)[24])lib_soft,
+                                                           ambe_d, &lib_cur, &lib_prev, &lib_prev_enhanced)
+                      : mbe_processAmbe3600x2400Framef(lib_audio, &lib_result, (const char (*)[24])hard, ambe_d,
+                                                       &lib_cur, &lib_prev, &lib_prev_enhanced);
+        store_expected_process_status(lib_ret, lib_audio, &expected_errs, &expected_errs2, expected_err_str,
+                                      sizeof(expected_err_str), &lib_result);
+
+        mbe_setThreadRngSeed(seed);
+        int bare_ret = soft_path
+                           ? mbe_decodeAmbe3600x2400SoftFrame((const mbe_soft_bit(*)[24])lib_soft, ambe_d, &bare_result)
+                           : mbe_decodeAmbe3600x2400Frame((const char (*)[24])hard, ambe_d, &bare_result);
+        if (bare_ret >= 0) {
+            bare_result.flags &= ~MBE_PROCESS_FLAG_C0_VALID;
+            bare_ret =
+                mbe_processAmbe2400Dataf(bare_audio, &bare_result, ambe_d, &bare_cur, &bare_prev, &bare_prev_enhanced);
+        }
+        // Compared on the scale of the reference, which the vocoder's int16 scaling applies to.
+        if (bare_ret >= 0) {
+            dsd_mbe_float_to_pcm16_scale(bare_audio);
+        }
+
+        mbe_setThreadRngSeed(seed);
+        state.synctype = synctype;
+        if (soft_path) {
+            processMbeFrameSoft(&opts, &state, owner_of(state.synctype), NULL, soft, NULL);
+        } else {
+            processMbeFrame(&opts, &state, owner_of(state.synctype), NULL, hard, NULL);
+        }
+
+        DSD_SNPRINTF(label, sizeof(label), "%s frame %d library call", tag, frame);
+        rc |= expect_eq_int(label, lib_ret >= 0 && bare_ret >= 0, 1);
+        DSD_SNPRINTF(label, sizeof(label), "%s frame %d audio", tag, frame);
+        rc |= expect_eq_mem(label, state.audio_out_temp_buf, lib_audio, sizeof(lib_audio));
+        DSD_SNPRINTF(label, sizeof(label), "%s frame %d errs", tag, frame);
+        rc |= expect_eq_int(label, state.errs, expected_errs);
+        DSD_SNPRINTF(label, sizeof(label), "%s frame %d errs2", tag, frame);
+        rc |= expect_eq_int(label, state.errs2, expected_errs2);
+        DSD_SNPRINTF(label, sizeof(label), "%s frame %d status", tag, frame);
+        rc |= expect_eq_int(label, strcmp(state.err_str, expected_err_str), 0);
+        if (frame == DSTAR_PARITY_TONE_FRAME) {
+            DSD_SNPRINTF(label, sizeof(label), "%s tone frame counts two C0 errors", tag);
+            rc |= expect_eq_int(label, state.errs, 2);
+            DSD_SNPRINTF(label, sizeof(label), "%s tone frame differs without the C0 context", tag);
+            rc |= expect_eq_int(label, audio_frames_differ(bare_audio, lib_audio), 1);
+        }
+        if (lib_ret >= 0 && (lib_result.flags & MBE_PROCESS_FLAG_MUTE) != 0U) {
+            muted++;
+        }
+    }
+
+    DSD_SNPRINTF(label, sizeof(label), "%s reached a muted frame", tag);
+    rc |= expect_eq_int(label, muted > 0, 1);
+    dsd_state_ext_free_all(&state);
+    return rc;
+}
+
+static int
+test_process_mbe_frame_dstar_matches_library_frame_api(void) {
+    int rc = 0;
+    rc |= run_dstar_library_parity(0, DSD_SYNC_DSTAR_VOICE_POS);
+    rc |= run_dstar_library_parity(1, DSD_SYNC_DSTAR_VOICE_POS);
+    rc |= run_dstar_library_parity(0, DSD_SYNC_DSTAR_HD_POS);
+    rc |= run_dstar_library_parity(1, DSD_SYNC_DSTAR_HD_NEG);
     return rc;
 }
 
@@ -2839,7 +5133,10 @@ test_process_mbe_frame_ambe2_routes_slot2_error_state(void) {
     mbe_process_result result;
 
     DSD_MEMSET(&opts, 0, sizeof(opts));
+    pass_through_voice_chain(&opts);
     opts.floating_point = 1;
+    opts.audio_gain = 1.0f;
+    opts.audio_gainR = 1.0f;
     int ret = mbe_decodeAmbe3600x2450Frame((const char (*)[24])ambe_fr, ambe_d, &result);
     store_expected_decode_status(ret, &expected_errs, &expected_errs2, &result);
     rc |= expect_eq_int("ambe2-slot2 fixture decodes", ret >= 0, 1);
@@ -2859,7 +5156,7 @@ test_process_mbe_frame_ambe2_routes_slot2_error_state(void) {
     state.errsR = 201;
     state.errs2R = 202;
 
-    processMbeFrame(&opts, &state, NULL, ambe_fr, NULL);
+    processMbeFrame(&opts, &state, owner_of(state.synctype), NULL, ambe_fr, NULL);
 
     rc |= expect_eq_int("ambe2-slot2 keeps slot1 errs", state.errs, 101);
     rc |= expect_eq_int("ambe2-slot2 keeps slot1 errs2", state.errs2, 102);
@@ -2869,8 +5166,10 @@ test_process_mbe_frame_ambe2_routes_slot2_error_state(void) {
     return rc;
 }
 
+/* The superframe behind a D-STAR header reaches the vocoder with the header's synctype, so both kinds of synctype must
+ * ignore the slot a TDMA decode left current. */
 static int
-test_process_mbe_frame_dstar_ignores_stale_stereo_slot_state(void) {
+run_dstar_stale_stereo_slot_case(int synctype) {
     int rc = 0;
     static dsd_opts opts;
     static dsd_state state;
@@ -2886,7 +5185,7 @@ test_process_mbe_frame_dstar_ignores_stale_stereo_slot_state(void) {
     char ambe_fr[4][24] = {{0}};
     char expected_ambe_d[49] = {0};
     float expected_audio[160] = {0};
-    float expected_right_stage[160] = {0};
+    short expected_right_stage[160] = {0};
     char expected_err_str[96] = {0};
     int expected_errs = -1;
     int expected_errs2 = -1;
@@ -2898,7 +5197,10 @@ test_process_mbe_frame_dstar_ignores_stale_stereo_slot_state(void) {
     ambe_fr[3][12] = 1;
 
     DSD_MEMSET(&opts, 0, sizeof(opts));
+    pass_through_voice_chain(&opts);
     opts.floating_point = 1;
+    opts.audio_gain = 1.0f;
+    opts.audio_gainR = 1.0f;
     opts.dmr_stereo = 1;
     opts.wav_out_f = wav_out;
     opts.dmr_stereo_wav = 1;
@@ -2910,13 +5212,13 @@ test_process_mbe_frame_dstar_ignores_stale_stereo_slot_state(void) {
     rc |= expect_eq_int("dstar-second fixture processes", ret >= 0, 1);
 
     init_mbe_state(&state, &cur, &prev, &prev_enhanced, &cur2, &prev2, &prev_enhanced2);
-    state.synctype = DSD_SYNC_DSTAR_VOICE_POS;
+    state.synctype = synctype;
     state.currentslot = 1;
     state.audio_out_temp_bufR[0] = -4321.0F;
-    state.f_r[0] = 1234.0F;
-    expected_right_stage[0] = state.f_r[0];
+    state.s_r[0] = 1234;
+    expected_right_stage[0] = state.s_r[0];
 
-    processMbeFrame(&opts, &state, NULL, ambe_fr, NULL);
+    processMbeFrame(&opts, &state, owner_of(state.synctype), NULL, ambe_fr, NULL);
 
     dsd_call_snapshot call;
     rc |= expect_eq_int("dstar-second canonical slot0", dsd_call_state_get(&state, 0U, &call), 1);
@@ -2927,8 +5229,7 @@ test_process_mbe_frame_dstar_ignores_stale_stereo_slot_state(void) {
     rc |= expect_eq_int("dstar-second errs2", state.errs2, expected_errs2);
     rc |= expect_eq_int("dstar-second status", strcmp(state.err_str, expected_err_str), 0);
     rc |= expect_eq_mem("dstar-second temp audio", state.audio_out_temp_buf, expected_audio, sizeof(expected_audio));
-    rc |= expect_eq_mem("dstar-second staged left", state.f_l, expected_audio, sizeof(expected_audio));
-    rc |= expect_eq_mem("dstar-second leaves stale right unstaged", state.f_r, expected_right_stage,
+    rc |= expect_eq_mem("dstar-second leaves stale right unstaged", state.s_r, expected_right_stage,
                         sizeof(expected_right_stage));
     rc |= expect_eq_int("dstar-second keeps right errs", state.errsR, 0);
     rc |= expect_eq_int("dstar-second wav output opened", wav_out != NULL, 1);
@@ -2941,6 +5242,17 @@ test_process_mbe_frame_dstar_ignores_stale_stereo_slot_state(void) {
     }
 
     dsd_state_ext_free_all(&state);
+    if (rc != 0) {
+        DSD_FPRINTF(stderr, "dstar-second failed for synctype %d\n", synctype);
+    }
+    return rc;
+}
+
+static int
+test_process_mbe_frame_dstar_ignores_stale_stereo_slot_state(void) {
+    int rc = 0;
+    rc |= run_dstar_stale_stereo_slot_case(DSD_SYNC_DSTAR_VOICE_POS);
+    rc |= run_dstar_stale_stereo_slot_case(DSD_SYNC_DSTAR_HD_POS);
     return rc;
 }
 
@@ -2960,13 +5272,16 @@ test_process_mbe_frame_media_protocol_lifecycle(void) {
     dsd_call_snapshot call;
 
     DSD_MEMSET(&opts, 0, sizeof(opts));
+    pass_through_voice_chain(&opts);
     opts.floating_point = 1;
+    opts.audio_gain = 1.0f;
+    opts.audio_gainR = 1.0f;
 
     static const int dstar_header_synctypes[] = {DSD_SYNC_DSTAR_HD_POS, DSD_SYNC_DSTAR_HD_NEG};
     for (size_t i = 0U; i < sizeof(dstar_header_synctypes) / sizeof(dstar_header_synctypes[0]); i++) {
         init_mbe_state(&state, &cur, &prev, &prev_enhanced, &cur2, &prev2, &prev_enhanced2);
         state.synctype = dstar_header_synctypes[i];
-        processMbeFrame(&opts, &state, NULL, ambe_fr, NULL);
+        processMbeFrame(&opts, &state, owner_of(state.synctype), NULL, ambe_fr, NULL);
         rc |= expect_eq_int("dstar-header canonical call", dsd_call_state_get(&state, 0U, &call), 1);
         rc |= expect_eq_int("dstar-header protocol", call.protocol, dstar_header_synctypes[i]);
         rc |= expect_eq_int("dstar-header media", call.media_active, 1);
@@ -2984,7 +5299,7 @@ test_process_mbe_frame_media_protocol_lifecycle(void) {
     rc |= expect_eq_int("dstar-data initial call", dsd_call_state_get(&state, 0U, &call), 1);
     const uint64_t dstar_data_epoch = call.epoch;
     state.synctype = DSD_SYNC_DSTAR_HD_POS;
-    processMbeFrame(&opts, &state, NULL, ambe_fr, NULL);
+    processMbeFrame(&opts, &state, owner_of(state.synctype), NULL, ambe_fr, NULL);
     rc |= expect_eq_int("dstar-data retained call", dsd_call_state_get(&state, 0U, &call), 1);
     rc |= expect_eq_int("dstar-data retained epoch", call.epoch == dstar_data_epoch, 1);
     rc |= expect_eq_int("dstar-data retained kind", call.kind, DSD_CALL_KIND_DATA);
@@ -3003,7 +5318,7 @@ test_process_mbe_frame_media_protocol_lifecycle(void) {
         rc |= expect_eq_int("clear-dpmr initial call", dsd_call_state_get(&state, 0U, &call), 1);
         const uint64_t epoch = call.epoch;
         state.synctype = clear_dpmr_synctypes[i];
-        processMbeFrame(&opts, &state, NULL, ambe_fr, NULL);
+        processMbeFrame(&opts, &state, owner_of(state.synctype), NULL, ambe_fr, NULL);
         rc |= expect_eq_int("clear-dpmr retained call", dsd_call_state_get(&state, 0U, &call), 1);
         rc |= expect_eq_int("clear-dpmr retained epoch", call.epoch == epoch, 1);
         rc |= expect_eq_int("clear-dpmr retained protocol", call.protocol, clear_dpmr_synctypes[i]);
@@ -3021,7 +5336,7 @@ test_process_mbe_frame_media_protocol_lifecycle(void) {
     rc |= expect_eq_int("cross-protocol stale call", dsd_call_state_get(&state, 0U, &call), 1);
     const uint64_t stale_epoch = call.epoch;
     state.synctype = DSD_SYNC_DSTAR_VOICE_POS;
-    processMbeFrame(&opts, &state, NULL, ambe_fr, NULL);
+    processMbeFrame(&opts, &state, owner_of(state.synctype), NULL, ambe_fr, NULL);
     rc |= expect_eq_int("cross-protocol replacement", dsd_call_state_get(&state, 0U, &call), 1);
     rc |= expect_eq_int("cross-protocol replacement epoch", call.epoch != stale_epoch, 1);
     rc |= expect_eq_int("cross-protocol replacement protocol", call.protocol, DSD_SYNC_DSTAR_VOICE_POS);
@@ -3049,10 +5364,12 @@ test_process_mbe_frame_media_protocol_lifecycle(void) {
         rc |= expect_eq_int("decoder-override initial call", dsd_call_state_get(&state, 0U, &call), 1);
         const uint64_t epoch = call.epoch;
         state.synctype = decoder_overrides[i].decoder_protocol;
+        // The borrowed decoder's frame stays the borrower's.
+        const dsd_voice_protocol owner = owner_of(decoder_overrides[i].call_protocol);
         if (DSD_SYNC_IS_P25P1(state.synctype)) {
-            processMbeFrame(&opts, &state, imbe_fr, NULL, NULL);
+            processMbeFrame(&opts, &state, owner, imbe_fr, NULL, NULL);
         } else {
-            processMbeFrame(&opts, &state, NULL, ambe_fr, NULL);
+            processMbeFrame(&opts, &state, owner, NULL, ambe_fr, NULL);
         }
         rc |= expect_eq_int("decoder-override retained call", dsd_call_state_get(&state, 0U, &call), 1);
         rc |= expect_eq_int("decoder-override retained epoch", call.epoch == epoch, 1);
@@ -3082,7 +5399,7 @@ test_process_mbe_frame_x2_slot2_uses_right_error_state_and_stages_audio(void) {
     char ambe_fr[4][24] = {{0}};
     char ambe_d[49] = {0};
     float expected_audio[160] = {0};
-    float expected_right_stage[160] = {0};
+    short expected_right_stage[160] = {0};
     char expected_err_str[96] = {0};
     int expected_errs = -1;
     int expected_errs2 = -1;
@@ -3095,7 +5412,10 @@ test_process_mbe_frame_x2_slot2_uses_right_error_state_and_stages_audio(void) {
     ambe_fr[2][17] = 1;
 
     DSD_MEMSET(&opts, 0, sizeof(opts));
+    pass_through_voice_chain(&opts);
     opts.floating_point = 1;
+    opts.audio_gain = 1.0f;
+    opts.audio_gainR = 1.0f;
     opts.dmr_stereo = 1;
     opts.mbe_out_f = mbe_out;
     opts.wav_out_f = wav_out;
@@ -3123,10 +5443,10 @@ test_process_mbe_frame_x2_slot2_uses_right_error_state_and_stages_audio(void) {
     state.RR = 0x0102030405ULL;
     state.dropR = 5;
     state.audio_out_temp_bufR[0] = -4321.0F;
-    state.f_r[0] = 1234.0F;
-    expected_right_stage[0] = state.f_r[0];
+    state.s_r[0] = 1234;
+    expected_right_stage[0] = state.s_r[0];
 
-    processMbeFrame(&opts, &state, NULL, ambe_fr, NULL);
+    processMbeFrame(&opts, &state, owner_of(state.synctype), NULL, ambe_fr, NULL);
 
     rc |= expect_eq_int("x2-slot2 keeps slot1 errs", state.errs, 101);
     rc |= expect_eq_int("x2-slot2 keeps slot1 errs2", state.errs2, 102);
@@ -3135,8 +5455,7 @@ test_process_mbe_frame_x2_slot2_uses_right_error_state_and_stages_audio(void) {
     rc |= expect_eq_int("x2-slot2 ignores dmr crypto state", state.dropR, 5);
     rc |= expect_eq_int("x2-slot2 status", strcmp(state.err_strR, expected_err_str), 0);
     rc |= expect_eq_mem("x2-slot2 temp audio", state.audio_out_temp_buf, expected_audio, sizeof(expected_audio));
-    rc |= expect_eq_mem("x2-slot2 staged left", state.f_l, expected_audio, sizeof(expected_audio));
-    rc |= expect_eq_mem("x2-slot2 leaves stale right unstaged", state.f_r, expected_right_stage,
+    rc |= expect_eq_mem("x2-slot2 leaves stale right unstaged", state.s_r, expected_right_stage,
                         sizeof(expected_right_stage));
     rc |= expect_eq_int("x2-slot2 mbe output opened", mbe_out != NULL, 1);
     if (mbe_out) {
@@ -3164,12 +5483,1013 @@ test_process_mbe_frame_x2_slot2_uses_right_error_state_and_stages_audio(void) {
     rc |= expect_eq_int("x2-slot2 wav output opened", wav_out != NULL, 1);
     if (wav_out) {
         sf_write_sync(wav_out);
-        rc |= expect_eq_int("x2-slot2 wav frames", (int)sf_seek(wav_out, 0, SEEK_END), 160);
+        // The static WAV (-w) is the mixer's, in its stereo format: the vocoder writes no mono block there (issue #654).
+        rc |=
+            expect_eq_int("x2-slot2 vocoder leaves the static wav to the mixer", (int)sf_seek(wav_out, 0, SEEK_END), 0);
         rc |= expect_eq_int("x2-slot2 wav close", sf_close(wav_out), 0);
         (void)remove(wav_path);
         opts.wav_out_f = NULL;
     }
 
+    return rc;
+}
+
+/* Issue #661: MBE capture saves a frame by that frame's own verdict, classified before the save, not by the verdict
+   the previous frame on the slot left (or the 0 a carrier reset leaves). Each case runs frames through the real
+   vocoder into an attached capture and checks how many records each frame added. */
+typedef struct {
+    const char* tag;
+    int synctype;
+    int slot;
+    int stereo;
+    int reverse_mute;
+    int so_first;  /* service options of the first frame (0x40: encrypted) */
+    int so_second; /* and of the second */
+    long want_after_first;
+    long want_after_second;
+} capture_verdict_case;
+
+static long
+capture_records(FILE* out, long record) {
+    (void)fflush(out);
+    (void)fseek(out, 0, SEEK_END);
+    return ftell(out) / record;
+}
+
+static int
+run_capture_verdict_case(const capture_verdict_case* c) {
+    static dsd_opts opts;
+    static dsd_state state;
+    static mbe_parms cur;
+    static mbe_parms prev;
+    static mbe_parms prev_enhanced;
+    static mbe_parms cur2;
+    static mbe_parms prev2;
+    static mbe_parms prev_enhanced2;
+    char ambe_fr[4][24] = {{0}};
+    ambe_fr[0][0] = 1;
+    ambe_fr[2][9] = 1;
+
+    FILE* out = tmpfile();
+    if (!out) {
+        return 1;
+    }
+    DSD_MEMSET(&opts, 0, sizeof(opts));
+    pass_through_voice_chain(&opts);
+    opts.floating_point = 1;
+    opts.audio_gain = 1.0f;
+    opts.audio_gainR = 1.0f;
+    opts.slot1_on = 1;
+    opts.slot2_on = 1;
+    opts.dmr_stereo = c->stereo;
+    opts.reverse_mute = c->reverse_mute;
+    /* The defaults: encrypted audio muted on both slots. */
+    opts.dmr_mute_encL = 1;
+    opts.dmr_mute_encR = 1;
+    if (c->slot == 1) {
+        opts.mbe_out_fR = out;
+    } else {
+        opts.mbe_out_f = out;
+    }
+    init_mbe_state(&state, &cur, &prev, &prev_enhanced, &cur2, &prev2, &prev_enhanced2);
+    state.synctype = c->synctype;
+    state.lastsynctype = c->synctype;
+    state.currentslot = c->slot;
+    state.dmr_stereo = c->stereo;
+    /* A carrier reset left the slot verdicts clear. */
+    state.mbe_slot_muted[0] = 0;
+    state.mbe_slot_muted[1] = 0;
+    /* P25 Phase 2: a clear call its decode gate admits, on a system whose identity is known. */
+    state.p25_crypto_state[c->slot] = DSD_P25_CRYPTO_CLEAR;
+    state.p25_p2_audio_allowed[c->slot] = 1;
+    state.p2_wacn = 0xBEE00;
+    state.p2_sysid = 0x123;
+    state.p2_cc = 0x456;
+
+    int rc = 0;
+    if (c->slot == 1) {
+        state.dmr_soR = c->so_first;
+    } else {
+        state.dmr_so = c->so_first;
+    }
+    processMbeFrame(&opts, &state, owner_of(state.synctype), NULL, ambe_fr, NULL);
+    const long after_first = capture_records(out, 8);
+    if (c->slot == 1) {
+        state.dmr_soR = c->so_second;
+    } else {
+        state.dmr_so = c->so_second;
+    }
+    processMbeFrame(&opts, &state, owner_of(state.synctype), NULL, ambe_fr, NULL);
+    const long after_second = capture_records(out, 8);
+    if (after_first != c->want_after_first || after_second != c->want_after_second) {
+        DSD_FPRINTF(stderr, "capture verdict %s: records %ld then %ld (want %ld then %ld)\n", c->tag, after_first,
+                    after_second, c->want_after_first, c->want_after_second);
+        rc = 1;
+    }
+    fclose(out);
+    opts.mbe_out_f = NULL;
+    opts.mbe_out_fR = NULL;
+    dsd_state_ext_free_all(&state);
+    return rc;
+}
+
+static int
+test_process_mbe_frame_capture_follows_each_frames_verdict(void) {
+    static const capture_verdict_case cases[] = {
+        /* -q mutes a clear call: none of its frames, the first included, is captured. */
+        {"dmr slot 1 clear under -q", DSD_SYNC_DMR_BS_VOICE_POS, 0, 1, 1, 0x00, 0x00, 0, 0},
+        {"dmr slot 2 clear under -q", DSD_SYNC_DMR_BS_VOICE_POS, 1, 1, 1, 0x00, 0x00, 0, 0},
+        /* An encrypted call without a key, starting after a carrier reset. */
+        {"dmr slot 1 encrypted after reset", DSD_SYNC_DMR_BS_VOICE_POS, 0, 1, 0, 0x40, 0x40, 0, 0},
+        {"dmr slot 2 encrypted after reset", DSD_SYNC_DMR_BS_VOICE_POS, 1, 1, 0, 0x40, 0x40, 0, 0},
+        /* A clear call after an encrypted one on the slot keeps its first frame. */
+        {"dmr slot 1 clear after encrypted", DSD_SYNC_DMR_BS_VOICE_POS, 0, 1, 0, 0x40, 0x00, 0, 1},
+        {"dmr slot 2 clear after encrypted", DSD_SYNC_DMR_BS_VOICE_POS, 1, 1, 0, 0x40, 0x00, 0, 1},
+        /* P25 Phase 2 records by its own rule in every preset: -q keeps a clear call out, stereo or not. */
+        {"p25p2 slot 1 clear under -q, stereo off", DSD_SYNC_P25P2_POS, 0, 0, 1, 0x00, 0x00, 0, 0},
+        {"p25p2 slot 2 clear under -q, stereo off", DSD_SYNC_P25P2_POS, 1, 0, 1, 0x00, 0x00, 0, 0},
+        {"p25p2 slot 1 clear under -q, stereo on", DSD_SYNC_P25P2_POS, 0, 1, 1, 0x00, 0x00, 0, 0},
+        {"p25p2 slot 2 clear, stereo off", DSD_SYNC_P25P2_POS, 1, 0, 0, 0x00, 0x00, 1, 2},
+        {"p25p2 slot 1 clear, stereo on", DSD_SYNC_P25P2_POS, 0, 1, 0, 0x00, 0x00, 1, 2},
+    };
+    int rc = 0;
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        rc |= run_capture_verdict_case(&cases[i]);
+    }
+    return rc;
+}
+
+/* Issue #655: one verdict per frame, judged by the protocol that owns the call, decides short staging and MBE capture
+   (and the per-call WAV and the mixers, which read the same dsd_state::mbe_slot_muted). The DMR service options and
+   ALG ID decide DMR alone; P25 is judged by its own classification; YSF and scrambled dPMR keep their own rules while
+   they decode through a borrowed NXDN or P25 Phase 1 decoder; -q classifies the transmission, so a call a key decrypts
+   stays audible; and the user's encrypted-audio mute is honored by every output alike. Each case runs one frame in
+   short output through the real vocoder, with an attached capture. */
+enum { OWNER_DMR = 0, OWNER_NXDN, OWNER_DPMR, OWNER_P25P1, OWNER_YSF, OWNER_PROVOICE };
+
+typedef struct {
+    const char* tag;
+    int owner;
+    int synctype; /* the decoder the frame runs through */
+    int stereo;   /* opts->dmr_stereo: no -f, -fa, -fs (1) or a mono preset such as -fn, -fm, -fy (0) */
+    int reverse_mute;
+    int unmute_encrypted; /* the user's toggle: dmr_mute_encL/R 0 */
+    int so;
+    int algid;
+    int nxdn_cipher;
+    unsigned long long scalar_key;
+    int basic_key;
+    int forced_privacy; /* -4 */
+    int p25_crypto;
+    int want_muted;
+} owner_verdict_case;
+
+static int
+owner_verdict_dispatch_synctype(int owner) {
+    switch (owner) {
+        case OWNER_NXDN: return DSD_SYNC_NXDN_POS;
+        case OWNER_DPMR: return DSD_SYNC_DPMR_FS2_POS;
+        case OWNER_P25P1: return DSD_SYNC_P25P1_POS;
+        case OWNER_YSF: return DSD_SYNC_YSF_POS;
+        case OWNER_PROVOICE: return DSD_SYNC_PROVOICE_POS;
+        case OWNER_DMR:
+        default: return DSD_SYNC_DMR_BS_VOICE_POS;
+    }
+}
+
+static int
+run_owner_verdict_case(const owner_verdict_case* c, int floating, int dispatched) {
+    static dsd_opts opts;
+    static dsd_state state;
+    static mbe_parms cur;
+    static mbe_parms prev;
+    static mbe_parms prev_enhanced;
+    static mbe_parms cur2;
+    static mbe_parms prev2;
+    static mbe_parms prev_enhanced2;
+    static short out_s[2][2048];
+    static float out_f[2][2048];
+    char imbe_fr[8][23] = {{0}};
+    char ambe_fr[4][24] = {{0}};
+    char imbe7100_fr[7][24] = {{0}};
+    load_imbe7200_rows(k_p25p1_corrected_speech_rows, imbe_fr);
+    ambe_fr[0][11] = 1;
+    ambe_fr[2][20] = 1;
+    imbe7100_fr[0][3] = 1;
+    imbe7100_fr[4][9] = 1;
+
+    FILE* out = tmpfile();
+    if (!out) {
+        return 1;
+    }
+    DSD_MEMSET(&opts, 0, sizeof(opts));
+    opts.audio_out = 1;
+    opts.slot1_on = 1;
+    opts.slot2_on = 1;
+    opts.dmr_stereo = c->stereo;
+    opts.reverse_mute = (uint8_t)c->reverse_mute;
+    opts.dmr_mute_encL = c->unmute_encrypted ? 0 : 1;
+    opts.dmr_mute_encR = c->unmute_encrypted ? 0 : 1;
+    opts.trunk_tune_enc_calls = 1;
+    opts.mbe_out_f = out;
+    init_mbe_state(&state, &cur, &prev, &prev_enhanced, &cur2, &prev2, &prev_enhanced2);
+    state.audio_out_buf = out_s[0];
+    state.audio_out_bufR = out_s[1];
+    state.audio_out_buf_p = out_s[0] + 100;
+    state.audio_out_buf_pR = out_s[1] + 100;
+    state.audio_out_float_buf = out_f[0];
+    state.audio_out_float_bufR = out_f[1];
+    state.audio_out_float_buf_p = out_f[0] + 100;
+    state.audio_out_float_buf_pR = out_f[1] + 100;
+    state.aout_max_buf_p = state.aout_max_buf;
+    state.aout_max_buf_pR = state.aout_max_bufR;
+    state.frame_dispatch_active = 1;
+    state.frame_dispatch_synctype = owner_verdict_dispatch_synctype(c->owner);
+    state.frame_dispatch_active = dispatched;
+    opts.floating_point = floating;
+    state.synctype = c->synctype;
+    state.lastsynctype = c->synctype;
+    state.currentslot = 0;
+    state.ysf_fich_confirmed = 1;
+    state.dmr_so = c->so;
+    state.payload_algid = c->algid;
+    state.dmr_fid = 0x10;
+    state.nxdn_cipher_type = c->nxdn_cipher;
+    state.R = c->scalar_key;
+    state.K = (unsigned long long)c->basic_key;
+    state.M = c->forced_privacy;
+    state.p25_crypto_state[0] = (dsd_p25_crypto_state)c->p25_crypto;
+    state.mbe_short_silenced[0] = 0U;
+
+    processMbeFrame(&opts, &state, owner_of(owner_verdict_dispatch_synctype(c->owner)), imbe_fr, ambe_fr, imbe7100_fr);
+
+    int rc = 0;
+    char tag[192];
+    DSD_SNPRINTF(tag, sizeof tag, "owner verdict %s: verdict", c->tag);
+    rc |= expect_eq_int(tag, state.mbe_slot_muted[0], c->want_muted);
+    DSD_SNPRINTF(tag, sizeof tag, "owner verdict %s: short staging", c->tag);
+    rc |= expect_eq_int(tag, state.mbe_short_silenced[0], c->want_muted);
+    (void)fflush(out);
+    (void)fseek(out, 0, SEEK_END);
+    DSD_SNPRINTF(tag, sizeof tag, "owner verdict %s: captured", c->tag);
+    rc |= expect_eq_int(tag, ftell(out) > 0, !c->want_muted);
+    DSD_SNPRINTF(tag, sizeof tag, "owner verdict %s: options untouched", c->tag);
+    rc |= expect_eq_int(
+        tag, opts.dmr_mute_encL == (c->unmute_encrypted ? 0 : 1) && opts.dmr_mute_encR == (c->unmute_encrypted ? 0 : 1),
+        1);
+    fclose(out);
+    opts.mbe_out_f = NULL;
+    dsd_state_ext_free_all(&state);
+    return rc;
+}
+
+static int
+test_process_mbe_frame_verdict_by_owning_protocol(void) {
+    enum { CLR = DSD_P25_CRYPTO_CLEAR, BLK = DSD_P25_CRYPTO_BLOCKED, UNK = DSD_P25_CRYPTO_UNKNOWN };
+
+    static const owner_verdict_case cases[] = {
+        /* NXDN in AUTO: its cipher decides, not DMR service options NXDN never sets (item 1). */
+        {"auto nxdn cipher 1 no key", OWNER_NXDN, DSD_SYNC_NXDN_POS, 1, 0, 0, 0, 0, 1, 0, 0, 0, UNK, 1},
+        {"auto nxdn cipher 1 keyed", OWNER_NXDN, DSD_SYNC_NXDN_POS, 1, 0, 0, 0, 0, 1, 1234, 0, 0, UNK, 0},
+        {"auto nxdn cipher 3 no key", OWNER_NXDN, DSD_SYNC_NXDN_POS, 1, 0, 0, 0, 0, 3, 0, 0, 0, UNK, 1},
+        {"auto nxdn clear with stale dmr so", OWNER_NXDN, DSD_SYNC_NXDN_POS, 1, 0, 0, 0x40, 0x21, 0, 0, 0, 0, UNK, 0},
+        {"auto nxdn encrypted unmuted by user", OWNER_NXDN, DSD_SYNC_NXDN_POS, 1, 0, 1, 0, 0, 1, 0, 0, 0, UNK, 0},
+        {"-fn nxdn cipher 1 no key", OWNER_NXDN, DSD_SYNC_NXDN_POS, 0, 0, 0, 0, 0, 1, 0, 0, 0, UNK, 1},
+        {"-fn nxdn clear under -q", OWNER_NXDN, DSD_SYNC_NXDN_POS, 0, 1, 0, 0, 0, 0, 0, 0, 0, UNK, 1},
+        {"-fn nxdn keyed under -q", OWNER_NXDN, DSD_SYNC_NXDN_POS, 0, 1, 0, 0, 0, 1, 1234, 0, 0, UNK, 0},
+        /* dPMR: a scrambled half decodes through the NXDN decoder and is judged as scrambled dPMR (items 1, 7). */
+        {"auto scrambled dpmr no key", OWNER_DPMR, DSD_SYNC_NXDN_POS, 1, 0, 0, 0, 0, 1, 0, 0, 0, UNK, 1},
+        {"auto scrambled dpmr keyed", OWNER_DPMR, DSD_SYNC_NXDN_POS, 1, 0, 0, 0, 0, 1, 1234, 0, 0, UNK, 0},
+        {"-fm clear dpmr half", OWNER_DPMR, DSD_SYNC_DPMR_FS2_POS, 0, 0, 0, 0, 0, 0, 0, 0, 0, UNK, 0},
+        {"auto clear dpmr half", OWNER_DPMR, DSD_SYNC_DPMR_FS2_POS, 1, 0, 0, 0, 0, 0, 0, 0, 0, UNK, 0},
+        /* P25 Phase 1: SO 0x40 with ALGID 0x80 is clear by P25's classification (item 2). */
+        {"p25p1 so 0x40 algid 0x80 clear, stereo", OWNER_P25P1, DSD_SYNC_P25P1_POS, 1, 0, 0, 0x40, 0x80, 0, 0, 0, 0,
+         CLR, 0},
+        {"p25p1 so 0x40 algid 0x80 clear, mono", OWNER_P25P1, DSD_SYNC_P25P1_POS, 0, 0, 0, 0x40, 0x80, 0, 0, 0, 0, CLR,
+         0},
+        {"p25p1 locked out, stereo", OWNER_P25P1, DSD_SYNC_P25P1_POS, 1, 0, 0, 0x40, 0x84, 0, 0, 0, 0, BLK, 1},
+        {"p25p1 clear under -q", OWNER_P25P1, DSD_SYNC_P25P1_POS, 1, 1, 0, 0, 0x80, 0, 0, 0, 0, CLR, 1},
+        /* YSF full rate and V/D1 borrow a decoder; YSF classifies no encryption, so they play (item 3). */
+        {"-fy ysf full rate", OWNER_YSF, DSD_SYNC_P25P1_POS, 0, 0, 0, 0, 0, 0, 0, 0, 0, UNK, 0},
+        {"-fy ysf full rate under -q", OWNER_YSF, DSD_SYNC_P25P1_POS, 0, 1, 0, 0, 0, 0, 0, 0, 0, UNK, 0},
+        {"auto ysf full rate with stale dmr so", OWNER_YSF, DSD_SYNC_P25P1_POS, 1, 0, 0, 0x40, 0x21, 0, 0, 0, 0, UNK,
+         0},
+        {"auto ysf v/d1 with stale nxdn cipher", OWNER_YSF, DSD_SYNC_NXDN_POS, 1, 0, 0, 0, 0, 1, 0, 0, 0, UNK, 0},
+        /* DMR: -q classifies the transmission (item 5), the user's unmute plays an undecryptable call (item 4). */
+        {"dmr keyed rc4 under -q", OWNER_DMR, DSD_SYNC_DMR_BS_VOICE_POS, 1, 1, 0, 0x40, 0x21, 0, 0x1234567890ULL, 0, 0,
+         UNK, 0},
+        {"dmr keyed rc4", OWNER_DMR, DSD_SYNC_DMR_BS_VOICE_POS, 1, 0, 0, 0x40, 0x21, 0, 0x1234567890ULL, 0, 0, UNK, 0},
+        {"dmr clear under -q", OWNER_DMR, DSD_SYNC_DMR_BS_VOICE_POS, 1, 1, 0, 0, 0, 0, 0, 0, 0, UNK, 1},
+        {"dmr undecryptable under -q", OWNER_DMR, DSD_SYNC_DMR_BS_VOICE_POS, 1, 1, 0, 0x40, 0x24, 0, 0, 0, 0, UNK, 0},
+        {"dmr undecryptable", OWNER_DMR, DSD_SYNC_DMR_BS_VOICE_POS, 1, 0, 0, 0x40, 0x24, 0, 0, 0, 0, UNK, 1},
+        {"dmr undecryptable unmuted by user", OWNER_DMR, DSD_SYNC_DMR_BS_VOICE_POS, 1, 0, 1, 0x40, 0x24, 0, 0, 0, 0,
+         UNK, 0},
+        /* Forced Basic Privacy (-4 -b) over a signalled ALG ID its key cannot match still plays what it decoded. */
+        {"dmr forced bp over alg 0x21", OWNER_DMR, DSD_SYNC_DMR_BS_VOICE_POS, 1, 0, 0, 0x40, 0x21, 0, 0, 5, 1, UNK, 0},
+        /* ProVoice classifies no encryption: -q never mutes it, in AUTO either. */
+        {"auto provoice under -q", OWNER_PROVOICE, DSD_SYNC_PROVOICE_POS, 1, 1, 0, 0x40, 0x21, 0, 0, 0, 0, UNK, 0},
+    };
+    int rc = 0;
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        for (int floating = 0; floating <= 1; floating++) {
+            for (int dispatched = 0; dispatched <= 1; dispatched++) {
+                rc |= run_owner_verdict_case(&cases[i], floating, dispatched);
+            }
+        }
+    }
+    return rc;
+}
+
+typedef struct {
+    int count;
+    int with_suffix;
+    const char* suffix;
+} capture_dir_ctx;
+
+static int
+count_capture_dir_entry(const char* name, void* user) {
+    capture_dir_ctx* ctx = (capture_dir_ctx*)user;
+    ctx->count++;
+    const size_t n = strlen(name);
+    const size_t k = strlen(ctx->suffix);
+    if (n >= k && strcmp(name + n - k, ctx->suffix) == 0) {
+        ctx->with_suffix++;
+    }
+    return 0;
+}
+
+static int
+remove_capture_dir_entry(const char* name, void* user) {
+    char path[DSD_TEST_PATH_MAX * 2];
+    DSD_SNPRINTF(path, sizeof path, "%s%c%s", (const char*)user, dsd_test_path_sep(), name);
+    (void)remove(path);
+    return 0;
+}
+
+static void
+remove_capture_dir(const char* dir) {
+    (void)dsd_dir_list(dir, remove_capture_dir_entry, (void*)dir);
+    (void)dsd_test_rmdir(dir);
+}
+
+/* Issue #661: the writer creates the capture with the vocoder's first frame. A frame YSF decoded through the borrowed
+   NXDN decoder belongs to YSF's capture, a real NXDN frame to its own; X2 records both slots in one file; DMR mono
+   writes only the slot it plays, into that slot's file. */
+static int
+test_process_mbe_frame_capture_files_follow_the_frame(void) {
+    static dsd_opts opts;
+    static dsd_state state;
+    static mbe_parms cur;
+    static mbe_parms prev;
+    static mbe_parms prev_enhanced;
+    static mbe_parms cur2;
+    static mbe_parms prev2;
+    static mbe_parms prev_enhanced2;
+    char ambe_fr[4][24] = {{0}};
+    ambe_fr[0][0] = 1;
+    ambe_fr[2][9] = 1;
+    int rc = 0;
+
+    char dir[DSD_TEST_PATH_MAX];
+    if (!dsd_test_mkdtemp(dir, sizeof dir, "dsdneo_capture_owner")) {
+        return 1;
+    }
+
+    /* YSF V/D1 (NXDN decoder borrowed), then real NXDN. */
+    DSD_MEMSET(&opts, 0, sizeof(opts));
+    pass_through_voice_chain(&opts);
+    opts.floating_point = 1;
+    opts.audio_gain = 1.0f;
+    opts.audio_gainR = 1.0f;
+    DSD_SNPRINTF(opts.mbe_out_dir, sizeof opts.mbe_out_dir, "%s", dir);
+    init_mbe_state(&state, &cur, &prev, &prev_enhanced, &cur2, &prev2, &prev_enhanced2);
+    state.ysf_fich_confirmed = 1;
+    state.frame_dispatch_active = 1;
+    state.frame_dispatch_synctype = DSD_SYNC_YSF_POS;
+    state.synctype = DSD_SYNC_NXDN_POS;
+    processMbeFrame(&opts, &state, DSD_VOICE_PROTOCOL_YSF, NULL, ambe_fr, NULL);
+    rc |= expect_eq_int("borrowed frame captured by ysf", opts.mbe_out_owner, dsd_mbe_out_owner_of(DSD_SYNC_YSF_NEG));
+    state.frame_dispatch_synctype = DSD_SYNC_NXDN_POS;
+    processMbeFrame(&opts, &state, owner_of(state.synctype), NULL, ambe_fr, NULL);
+    rc |=
+        expect_eq_int("real nxdn frame captured by nxdn", opts.mbe_out_owner, dsd_mbe_out_owner_of(DSD_SYNC_NXDN_NEG));
+    closeMbeOutFile(&opts, &state);
+    capture_dir_ctx ctx = {0, 0, ".amb"};
+    (void)dsd_dir_list(dir, count_capture_dir_entry, &ctx);
+    rc |= expect_eq_int("ysf and nxdn captures apart", ctx.with_suffix, 2);
+    dsd_state_ext_free_all(&state);
+    remove_capture_dir(dir);
+    (void)dsd_mkdir(dir, 0700);
+
+    /* X2: slot 1 and slot 2 frames, one file. */
+    DSD_MEMSET(&opts, 0, sizeof(opts));
+    pass_through_voice_chain(&opts);
+    opts.floating_point = 1;
+    opts.audio_gain = 1.0f;
+    opts.audio_gainR = 1.0f;
+    DSD_SNPRINTF(opts.mbe_out_dir, sizeof opts.mbe_out_dir, "%s", dir);
+    init_mbe_state(&state, &cur, &prev, &prev_enhanced, &cur2, &prev2, &prev_enhanced2);
+    state.synctype = DSD_SYNC_X2TDMA_VOICE_POS;
+    state.currentslot = 0;
+    processMbeFrame(&opts, &state, owner_of(state.synctype), NULL, ambe_fr, NULL);
+    state.currentslot = 1;
+    processMbeFrame(&opts, &state, owner_of(state.synctype), NULL, ambe_fr, NULL);
+    rc |= expect_eq_int("x2 writes no slot 2 file", opts.mbe_out_fR == NULL ? 1 : 0, 1);
+    closeMbeOutFile(&opts, &state);
+    capture_dir_ctx x2_ctx = {0, 0, "_S1.amb"};
+    (void)dsd_dir_list(dir, count_capture_dir_entry, &x2_ctx);
+    rc |= expect_eq_int("x2 one file for both slots", x2_ctx.count, 1);
+    rc |= expect_eq_int("x2 file is slot 1's", x2_ctx.with_suffix, 1);
+    dsd_state_ext_free_all(&state);
+    remove_capture_dir(dir);
+    (void)dsd_mkdir(dir, 0700);
+
+    /* DMR mono playing slot 2: a slot 1 frame writes nothing, a slot 2 frame creates the slot 2 file. */
+    DSD_MEMSET(&opts, 0, sizeof(opts));
+    pass_through_voice_chain(&opts);
+    opts.floating_point = 1;
+    opts.audio_gain = 1.0f;
+    opts.audio_gainR = 1.0f;
+    opts.dmr_mono = 1;
+    DSD_SNPRINTF(opts.mbe_out_dir, sizeof opts.mbe_out_dir, "%s", dir);
+    init_mbe_state(&state, &cur, &prev, &prev_enhanced, &cur2, &prev2, &prev_enhanced2);
+    state.synctype = DSD_SYNC_DMR_BS_VOICE_POS;
+    state.dmr_mono_slot = 1;
+    state.currentslot = 0;
+    processMbeFrame(&opts, &state, owner_of(state.synctype), NULL, ambe_fr, NULL);
+    rc |= expect_eq_int("dmr mono: slot not played creates nothing", opts.mbe_out_f == NULL ? 1 : 0, 1);
+    state.currentslot = 1;
+    processMbeFrame(&opts, &state, owner_of(state.synctype), NULL, ambe_fr, NULL);
+    rc |= expect_eq_int("dmr mono: played slot creates its file", opts.mbe_out_fR != NULL ? 1 : 0, 1);
+    closeMbeOutFileR(&opts, &state);
+    capture_dir_ctx mono_ctx = {0, 0, "_S2.amb"};
+    (void)dsd_dir_list(dir, count_capture_dir_entry, &mono_ctx);
+    rc |= expect_eq_int("dmr mono: one file", mono_ctx.count, 1);
+    rc |= expect_eq_int("dmr mono: slot 2's", mono_ctx.with_suffix, 1);
+    dsd_state_ext_free_all(&state);
+    remove_capture_dir(dir);
+    return rc;
+}
+
+/* Issue #654: the mono mixer blocks one run played, counted through the UDP blast hook. */
+static int g_mono_mix_blocks = 0;
+static size_t g_mono_mix_bytes = 0;
+
+static void
+mono_mix_count_blast(const dsd_opts* opts, dsd_state* state, size_t nsam, const void* data) {
+    (void)opts;
+    (void)state;
+    (void)data;
+    g_mono_mix_blocks++;
+    g_mono_mix_bytes += nsam;
+}
+
+static SNDFILE*
+create_wav_temp_channels(char* path, size_t path_size, const char* prefix, int channels) {
+    int fd = create_playback_temp(path, path_size, prefix);
+    if (fd < 0) {
+        return NULL;
+    }
+    dsd_close(fd);
+    SF_INFO info;
+    DSD_MEMSET(&info, 0, sizeof(info));
+    info.samplerate = 8000;
+    info.channels = channels;
+    info.format = SF_FORMAT_WAV | SF_FORMAT_PCM_16;
+    SNDFILE* wav = sf_open(path, SFM_WRITE, &info);
+    if (wav == NULL) {
+        (void)remove(path);
+    }
+    return wav;
+}
+
+/* Reads up to @p cap samples of a closed WAV; returns its frame count (-1 when unreadable) and its channels. */
+static long
+read_wav_back(const char* path, short* samples, size_t cap, int* channels) {
+    SF_INFO info;
+    DSD_MEMSET(&info, 0, sizeof(info));
+    SNDFILE* wav = sf_open(path, SFM_READ, &info);
+    if (wav == NULL) {
+        return -1;
+    }
+    const size_t want = (size_t)info.frames * (size_t)info.channels;
+    (void)sf_read_short(wav, samples, (sf_count_t)(want < cap ? want : cap));
+    sf_close(wav);
+    *channels = info.channels;
+    return (long)info.frames;
+}
+
+enum { X2_SEQ_FRAMES = 5 };
+
+/* One X2-TDMA scenario: a frame sequence over both timeslots, each through the vocoder and then the mono mixer the
+ * output format dispatches to, as x2tdma_process_voice_frame() runs them. */
+static int
+x2_sequence_check(int floating_point, int channels, int per_call, int slot1_on, int slot2_on) {
+    static const int slots[X2_SEQ_FRAMES] = {0, 1, 0, 1, 0};
+    static short expected[X2_SEQ_FRAMES][160];
+    static short got[X2_SEQ_FRAMES * 320];
+    char tag[192];
+    char label[256];
+    DSD_SNPRINTF(tag, sizeof(tag), "x2 sequence %s %dch %s V%d%d", floating_point ? "float" : "short", channels,
+                 per_call ? "-P" : "-w", slot1_on, slot2_on);
+
+    dsd_opts* opts = dmr_mix_new_opts(floating_point, 0);
+    dsd_state* state = calloc(1, sizeof(*state));
+    if (!opts || !state) {
+        free(opts);
+        free(state);
+        return 1;
+    }
+    initState(state);
+    opts->pulse_digi_out_channels = channels;
+    opts->pulse_digi_rate_out = 8000;
+    opts->slot1_on = slot1_on;
+    opts->slot2_on = slot2_on;
+
+    char path[2][1024];
+    SNDFILE* wav[2] = {NULL, NULL};
+    if (per_call) {
+        wav[0] = create_wav_temp_channels(path[0], sizeof(path[0]), "x2_seq_s1", 1);
+        wav[1] = create_wav_temp_channels(path[1], sizeof(path[1]), "x2_seq_s2", 1);
+        opts->wav_out_f = wav[0];
+        opts->wav_out_fR = wav[1];
+        opts->dmr_stereo_wav = 1;
+        opts->static_wav_file = 0;
+    } else {
+        wav[0] = create_wav_temp_channels(path[0], sizeof(path[0]), "x2_seq_static", 2);
+        opts->wav_out_f = wav[0];
+        opts->dmr_stereo_wav = 0;
+        opts->static_wav_file = 1;
+    }
+    if (wav[0] == NULL || (per_call && wav[1] == NULL)) {
+        for (int w = 0; w < 2; w++) {
+            if (wav[w] != NULL) {
+                sf_close(wav[w]);
+                (void)remove(path[w]);
+            }
+        }
+        freeState(state);
+        free(state);
+        free(opts);
+        return 1;
+    }
+
+    state->synctype = DSD_SYNC_X2TDMA_VOICE_POS;
+    state->lastsynctype = DSD_SYNC_X2TDMA_VOICE_POS;
+    dsd_udp_audio_hooks hooks = {0};
+    hooks.blast = mono_mix_count_blast;
+    dsd_udp_audio_hooks_set(hooks);
+
+    int rc = 0;
+    int played[X2_SEQ_FRAMES] = {0};
+    int nonzero = 0;
+    for (int f = 0; f < X2_SEQ_FRAMES; f++) {
+        char ambe_fr[4][24] = {{0}};
+        // Each timeslot carries its own voice, decoded through its own history.
+        if (slots[f] == 0) {
+            ambe_fr[0][2] = 1;
+            ambe_fr[2][15] = 1;
+        } else {
+            ambe_fr[1][3] = 1;
+            ambe_fr[2][17] = 1;
+            ambe_fr[0][5] = 1;
+        }
+        state->currentslot = slots[f];
+        processMbeFrame(opts, state, owner_of(state->synctype), NULL, ambe_fr, NULL);
+        // What this frame's recordings must hold: the 16-bit mono frame the vocoder staged (after the short gain).
+        for (int i = 0; i < 160; i++) {
+            float v = state->audio_out_temp_buf[i];
+            v = v > 32767.0f ? 32767.0f : (v < -32768.0f ? -32768.0f : v);
+            expected[f][i] = (short)v;
+            nonzero |= expected[f][i] != 0;
+        }
+        g_mono_mix_blocks = 0;
+        g_mono_mix_bytes = 0;
+        dsd_play_synthesized_voice(opts, state);
+        played[f] = g_mono_mix_blocks;
+        const int want = slots[f] == 1 ? slot2_on : slot1_on;
+        DSD_SNPRINTF(label, sizeof(label), "%s frame %d (slot %d) playback", tag, f, slots[f] + 1);
+        rc |= expect_eq_int(label, played[f], want);
+        if (want) {
+            const size_t width = floating_point ? sizeof(float) : sizeof(short);
+            DSD_SNPRINTF(label, sizeof(label), "%s frame %d plays one 20 ms frame", tag, f);
+            rc |= expect_eq_int(label, (int)g_mono_mix_bytes, (int)(160U * (size_t)channels * width));
+        }
+    }
+    dsd_udp_audio_hooks_set((dsd_udp_audio_hooks){0});
+    rc |= expect_eq_int("x2 sequence fixture decodes audible voice", nonzero, 1);
+
+    sf_close(wav[0]);
+    opts->wav_out_f = NULL;
+    if (wav[1] != NULL) {
+        sf_close(wav[1]);
+        opts->wav_out_fR = NULL;
+    }
+
+    if (per_call) {
+        // Each timeslot's frames, and only those, in its own per-call file, in order.
+        for (int slot = 0; slot < 2; slot++) {
+            int ch = 0;
+            const long frames = read_wav_back(path[slot], got, sizeof(got) / sizeof(got[0]), &ch);
+            int want_frames = 0;
+            int same = 1;
+            for (int f = 0; f < X2_SEQ_FRAMES; f++) {
+                if (slots[f] != slot) {
+                    continue;
+                }
+                for (int i = 0; i < 160 && frames >= (long)(want_frames + 1) * 160; i++) {
+                    same &= got[(want_frames * 160) + i] == expected[f][i];
+                }
+                want_frames++;
+            }
+            DSD_SNPRINTF(label, sizeof(label), "%s slot %d per-call frames", tag, slot + 1);
+            rc |= expect_eq_int(label, (int)frames, want_frames * 160);
+            DSD_SNPRINTF(label, sizeof(label), "%s slot %d per-call holds its own voice", tag, slot + 1);
+            rc |= expect_eq_int(label, same, 1);
+            (void)remove(path[slot]);
+        }
+    } else {
+        int ch = 0;
+        const long frames = read_wav_back(path[0], got, sizeof(got) / sizeof(got[0]), &ch);
+        DSD_SNPRINTF(label, sizeof(label), "%s static wav stays stereo", tag);
+        rc |= expect_eq_int(label, ch, 2);
+        int want_frames = 0;
+        int same = 1;
+        {
+            // Every played frame once in either sink format: no mono block, no switched-off slot.
+            for (int f = 0; f < X2_SEQ_FRAMES; f++) {
+                if (!played[f]) {
+                    continue;
+                }
+                for (int i = 0; i < 160 && frames >= (long)(want_frames + 1) * 160; i++) {
+                    same &= got[(want_frames * 320) + (i * 2)] == expected[f][i];
+                    same &= got[(want_frames * 320) + (i * 2) + 1] == expected[f][i];
+                }
+                want_frames++;
+            }
+        }
+        DSD_SNPRINTF(label, sizeof(label), "%s static wav frames", tag);
+        rc |= expect_eq_int(label, (int)frames, want_frames * 160);
+        DSD_SNPRINTF(label, sizeof(label), "%s static wav holds the played frames", tag);
+        rc |= expect_eq_int(label, same, 1);
+        (void)remove(path[0]);
+    }
+    freeState(state);
+    free(state);
+    free(opts);
+    return rc;
+}
+
+/* Issue #654: X2-TDMA plays both timeslots through the mono mixers. Under -w the static WAV holds only the stereo
+ * blocks the mixer played, one per decoded frame; under -P each timeslot's frames go to that timeslot's per-call file;
+ * and -V switches each timeslot by its own switch, in playback and the static WAV alike. */
+static int
+test_x2_sequence_records_and_switches_each_timeslot(void) {
+    int rc = 0;
+    for (int floating_point = 0; floating_point <= 1; floating_point++) {
+        for (int channels = 1; channels <= 2; channels++) {
+            rc |= x2_sequence_check(floating_point, channels, 1, 1, 1);
+            rc |= x2_sequence_check(floating_point, channels, 0, 1, 1);
+            rc |= x2_sequence_check(floating_point, channels, 0, 1, 0);
+            rc |= x2_sequence_check(floating_point, channels, 0, 0, 1);
+        }
+    }
+    return rc;
+}
+
+/* Issue #654: the short mono mixer (-fn, -fi, -fm, dPMR, ProVoice) plays exactly the frame the vocoder staged. An
+ * encrypted NXDN frame without its key stages no short samples, so it neither plays nor grows the static WAV, even
+ * when an earlier frame (a DMR burst whose pair never reached its mixer) left samples counted; a clear frame then
+ * plays and records exactly 20 ms. */
+static int
+check_mono_mixer_plays_only_the_frame_the_vocoder_staged(int floating) {
+    dsd_opts* opts = dmr_mix_new_opts(floating, 0);
+    dsd_state* state = calloc(1, sizeof(*state));
+    if (!opts || !state) {
+        free(opts);
+        free(state);
+        return 1;
+    }
+    initState(state);
+    opts->pulse_digi_out_channels = 1;
+    opts->pulse_digi_rate_out = 8000;
+    opts->dmr_stereo = 0;
+    opts->dmr_mute_encL = 1;
+    char path[1024];
+    SNDFILE* wav = create_wav_temp_channels(path, sizeof(path), "mono_staged_static", 2);
+    if (wav == NULL) {
+        freeState(state);
+        free(state);
+        free(opts);
+        return 1;
+    }
+    opts->wav_out_f = wav;
+    opts->static_wav_file = 1;
+    state->synctype = DSD_SYNC_NXDN_POS;
+    state->lastsynctype = DSD_SYNC_NXDN_POS;
+    dsd_udp_audio_hooks hooks = {0};
+    hooks.blast = mono_mix_count_blast;
+    dsd_udp_audio_hooks_set(hooks);
+
+    char ambe_fr[4][24] = {{0}};
+    ambe_fr[0][2] = 1;
+    ambe_fr[2][15] = 1;
+    int rc = 0;
+    g_mono_mix_blocks = 0;
+    for (int f = 0; f < 3; f++) {
+        // Stale short samples and a stale count, as an unmixed DMR pair leaves them.
+        for (int i = 0; i < 160; i++) {
+            state->s_l[i] = 1234;
+        }
+        state->audio_out_idx = 160 * (f + 1);
+        state->nxdn_cipher_type = 1; // encrypted, no key
+        processMbeFrame(opts, state, owner_of(state->synctype), NULL, ambe_fr, NULL);
+        playSynthesizedVoiceMS(opts, state);
+    }
+    rc |= expect_eq_int("encrypted nxdn without key plays nothing", g_mono_mix_blocks, 0);
+
+    state->nxdn_cipher_type = 0;
+    state->audio_out_idx = 480;
+    g_mono_mix_bytes = 0;
+    processMbeFrame(opts, state, owner_of(state->synctype), NULL, ambe_fr, NULL);
+    playSynthesizedVoiceMS(opts, state);
+    rc |= expect_eq_int("clear nxdn plays one frame", g_mono_mix_blocks, 1);
+    const size_t width = floating ? sizeof(float) : sizeof(short);
+    rc |= expect_eq_int("clear nxdn plays 20 ms", (int)g_mono_mix_bytes, (int)(160U * width));
+    dsd_udp_audio_hooks_set((dsd_udp_audio_hooks){0});
+
+    sf_close(wav);
+    opts->wav_out_f = NULL;
+    static short got[4 * 320];
+    int ch = 0;
+    const long frames = read_wav_back(path, got, sizeof(got) / sizeof(got[0]), &ch);
+    rc |= expect_eq_int("static wav grows only by the clear frame", (int)frames, 160);
+    (void)remove(path);
+    freeState(state);
+    free(state);
+    free(opts);
+    return rc;
+}
+
+static int
+test_mono_mixer_plays_only_the_frame_the_vocoder_staged(void) {
+    return check_mono_mixer_plays_only_the_frame_the_vocoder_staged(0)
+           | check_mono_mixer_plays_only_the_frame_the_vocoder_staged(1);
+}
+
+/* The voice chain on the vocoder's paths (issue #653). Each case decodes the same frames under one output setting and
+   returns the per-call WAV and the chained frames. */
+enum { CHAIN_FRAMES = 8 };
+
+typedef struct {
+    const char* tag;
+    int floating;   /* -y */
+    int audio_out;  /* 0: -o null, or muted from the start */
+    int mute_after; /* muted from this frame on (0: never) */
+    int stereo;     /* a stereo-active preset (-fa / -fs) */
+    int hpf;        /* -v 0x8 */
+} chain_output_case;
+
+typedef struct {
+    int protocol;
+    int slot;
+    const char* tag;
+} chain_protocol_case;
+
+static void
+chain_case_frame(int protocol, int frame, char imbe_fr[8][23], char ambe_fr[4][24]) {
+    DSD_MEMSET(imbe_fr, 0, 8 * 23);
+    DSD_MEMSET(ambe_fr, 0, 4 * 24);
+    if (DSD_SYNC_IS_P25P1(protocol)) {
+        load_imbe7200_rows((frame % 3 == 1) ? k_p25p1_clean_silence_rows : k_p25p1_corrected_speech_rows, imbe_fr);
+        return;
+    }
+    if (DSD_SYNC_IS_DSTAR(protocol)) {
+        (void)build_dstar_voice_frame(frame, ambe_fr);
+        return;
+    }
+    char ambe_d[49];
+    int errs = 0;
+    int errs2 = 0;
+    mbe_process_result result;
+    (void)prepare_active_ambe2450_fixture(ambe_fr, ambe_d, &errs, &errs2, &result);
+}
+
+/* What the mono mixer of a chain case emitted to UDP, as int16-scale samples whichever the format. */
+static float g_chain_emitted[CHAIN_FRAMES * 160];
+static int g_chain_emitted_count;
+static int g_chain_emitted_float;
+
+static void
+chain_capture_emitted(const dsd_opts* opts, dsd_state* state, size_t nsam, const void* data) {
+    (void)opts;
+    (void)state;
+    const size_t width = g_chain_emitted_float ? sizeof(float) : sizeof(short);
+    for (size_t i = 0; i < nsam / width && g_chain_emitted_count < CHAIN_FRAMES * 160; i++) {
+        if (g_chain_emitted_float) {
+            float v = 0.0f;
+            DSD_MEMCPY(&v, (const uint8_t*)data + (i * width), sizeof(v));
+            g_chain_emitted[g_chain_emitted_count++] = v * 32768.0f;
+        } else {
+            short v = 0;
+            DSD_MEMCPY(&v, (const uint8_t*)data + (i * width), sizeof(v));
+            g_chain_emitted[g_chain_emitted_count++] = (float)v;
+        }
+    }
+}
+
+/* Decodes CHAIN_FRAMES frames of @p p under @p c. @p wav gets the slot's per-call WAV samples (@p wav_count of them),
+   @p chained each frame's chain output and @p staged the shared short staging. Single-slot protocols then play each
+   frame through the mono mixer into g_chain_emitted in the selected sink format. */
+static int
+run_chain_case(const chain_protocol_case* p, const chain_output_case* c, short* wav, int* wav_count,
+               float chained[CHAIN_FRAMES][160], short staged[CHAIN_FRAMES][160], float* gain_out) {
+    char wav_path[1024];
+    SNDFILE* file = create_wav_temp(wav_path, sizeof(wav_path), "voice_chain_wav");
+    dsd_opts* opts = calloc(1, sizeof(*opts));
+    dsd_state* state = calloc(1, sizeof(*state));
+    if (!file || !opts || !state) {
+        if (file) {
+            sf_close(file);
+            (void)remove(wav_path);
+        }
+        free(opts);
+        free(state);
+        return 1;
+    }
+    initOpts(opts);
+    initState(state);
+    opts->audio_out_type = 8;
+    opts->audio_out = c->audio_out;
+    opts->floating_point = c->floating;
+    opts->use_hpf_d = c->hpf;
+    opts->dmr_stereo = (c->stereo || DSD_SYNC_IS_DMR(p->protocol)) ? 1 : 0;
+    opts->dmr_stereo_wav = 1;
+    opts->static_wav_file = 0;
+    opts->slot1_on = 1;
+    opts->slot2_on = 1;
+    opts->audio_gain = 0.0f;
+    opts->audio_gainR = 0.0f;
+    if (p->slot == 1) {
+        opts->wav_out_fR = file;
+    } else {
+        opts->wav_out_f = file;
+    }
+    state->synctype = p->protocol;
+    state->lastsynctype = p->protocol;
+    state->currentslot = p->slot;
+    state->p25_crypto_state[0] = DSD_P25_CRYPTO_CLEAR;
+    state->aout_gain = 15.0f;
+    state->aout_gainR = 15.0f;
+    opts->pulse_digi_out_channels = 1;
+    g_chain_emitted_count = 0;
+    g_chain_emitted_float = c->floating;
+    dsd_udp_audio_hooks_set((dsd_udp_audio_hooks){.blast = chain_capture_emitted});
+
+    char imbe_fr[8][23];
+    char ambe_fr[4][24];
+    for (int f = 0; f < CHAIN_FRAMES; f++) {
+        if (c->mute_after > 0 && f >= c->mute_after) {
+            opts->audio_out = 0;
+        }
+        chain_case_frame(p->protocol, f, imbe_fr, ambe_fr);
+        mbe_setThreadRngSeed(4100U + (uint32_t)f);
+        processMbeFrame(opts, state, owner_of(state->synctype), imbe_fr, ambe_fr, NULL);
+        const int right = p->slot == 1 && !DSD_SYNC_IS_X2TDMA(p->protocol);
+        DSD_MEMCPY(chained[f], right ? state->audio_out_temp_bufR : state->audio_out_temp_buf, sizeof(chained[f]));
+        DSD_MEMCPY(staged[f], right ? state->s_r : state->s_l, sizeof(staged[f]));
+        if (!DSD_SYNC_IS_DMR(p->protocol)) {
+            playSynthesizedVoiceMS(opts, state);
+        }
+        // Keep the output ring inside its allocation, as the mixers do after each pass.
+        state->audio_out_buf_p = state->audio_out_buf + 100;
+        state->audio_out_float_buf_p = state->audio_out_float_buf + 100;
+        state->audio_out_buf_pR = state->audio_out_bufR + 100;
+        state->audio_out_float_buf_pR = state->audio_out_float_bufR + 100;
+        state->audio_out_idx = state->audio_out_idx2 = state->audio_out_idxR = state->audio_out_idx2R = 0;
+    }
+    dsd_udp_audio_hooks_set((dsd_udp_audio_hooks){0});
+    *gain_out = p->slot == 1 ? state->aout_gainR : state->aout_gain;
+    const float other_gain = p->slot == 1 ? state->aout_gain : state->aout_gainR;
+    sf_close(file);
+    opts->wav_out_f = NULL;
+    opts->wav_out_fR = NULL;
+
+    int rc = expect_eq_int("voice chain: the other slot's gain untouched", fabsf(other_gain - 15.0f) < 1e-6f, 1);
+    SF_INFO info;
+    DSD_MEMSET(&info, 0, sizeof(info));
+    SNDFILE* written = sf_open(wav_path, SFM_READ, &info);
+    *wav_count = 0;
+    if (written) {
+        *wav_count = (int)sf_read_short(written, wav, CHAIN_FRAMES * 160);
+        sf_close(written);
+    }
+    (void)remove(wav_path);
+    freeState(state);
+    free(state);
+    free(opts);
+    return rc;
+}
+
+/* One decoded call gives one per-call WAV whatever the output format, the output type, a mute partway through or the
+   preset, and it holds the filtered, gained samples that play: the float output's frame is exactly the short output's after sink conversion (issue #653). */
+static int
+test_voice_chain_per_call_wav_is_format_independent(void) {
+    static const chain_protocol_case protocols[] = {
+        {DSD_SYNC_P25P1_POS, 0, "p25p1"},
+        {DSD_SYNC_NXDN_POS, 0, "nxdn"},
+        {DSD_SYNC_DMR_BS_VOICE_POS, 1, "dmr slot 2"},
+        {DSD_SYNC_DSTAR_VOICE_POS, 0, "dstar"},
+        {DSD_SYNC_X2TDMA_VOICE_POS, 1, "x2 slot 2"},
+    };
+    static const chain_output_case outputs[] = {
+        {"short", 0, 1, 0, 0, 1},
+        {"float", 1, 1, 0, 0, 1},
+        {"short -o null", 0, 0, 0, 0, 1},
+        {"float -o null", 1, 0, 0, 0, 1},
+        {"short muted partway", 0, 1, 3, 0, 1},
+        {"short stereo preset", 0, 1, 0, 1, 1},
+        {"float stereo preset", 1, 1, 0, 1, 1},
+    };
+    static const chain_output_case unfiltered = {"short high-pass off", 0, 1, 0, 0, 0};
+    static short ref_wav[CHAIN_FRAMES * 160];
+    static short wav[CHAIN_FRAMES * 160];
+    static float ref_chained[CHAIN_FRAMES][160];
+    static float chained[CHAIN_FRAMES][160];
+    static short ref_staged[CHAIN_FRAMES][160];
+    static short staged[CHAIN_FRAMES][160];
+    static float ref_emitted[CHAIN_FRAMES * 160];
+    char label[160];
+    int rc = 0;
+    for (size_t p = 0; p < sizeof(protocols) / sizeof(protocols[0]); p++) {
+        int ref_count = 0;
+        float ref_gain = 0.0f;
+        rc |= run_chain_case(&protocols[p], &outputs[0], ref_wav, &ref_count, ref_chained, ref_staged, &ref_gain);
+        const int ref_emitted_count = g_chain_emitted_count;
+        DSD_MEMCPY(ref_emitted, g_chain_emitted, sizeof(ref_emitted));
+        if (!DSD_SYNC_IS_DMR(protocols[p].protocol)) {
+            // The short mono mixer played the per-call WAV's samples.
+            DSD_SNPRINTF(label, sizeof(label), "voice chain %s: short playback is the per-call WAV", protocols[p].tag);
+            int same = ref_emitted_count == ref_count;
+            for (int i = 0; same && i < ref_count; i++) {
+                same = fabsf(ref_emitted[i] - (float)ref_wav[i]) < 0.5f;
+            }
+            rc |= expect_eq_int(label, same, 1);
+        }
+        DSD_SNPRINTF(label, sizeof(label), "voice chain %s: per-call WAV holds every frame", protocols[p].tag);
+        rc |= expect_eq_int(label, ref_count, CHAIN_FRAMES * 160);
+        int peak = 0;
+        for (int i = 0; i < ref_count; i++) {
+            const int a = ref_wav[i] < 0 ? -ref_wav[i] : ref_wav[i];
+            peak = a > peak ? a : peak;
+        }
+        // The recording is not silent, and the auto gain moved off its starting level: it is the gained frame.
+        DSD_SNPRINTF(label, sizeof(label), "voice chain %s: the auto gain ran on the call", protocols[p].tag);
+        rc |= expect_eq_int(label, peak > 0 && fabsf(ref_gain - 15.0f) > 0.5f, 1);
+        // What the short output staged is the chain output it wrote to the WAV.
+        DSD_SNPRINTF(label, sizeof(label), "voice chain %s: short staging is the per-call WAV", protocols[p].tag);
+        rc |= expect_eq_mem(label, ref_staged, ref_wav, sizeof(ref_staged));
+
+        for (size_t o = 1; o < sizeof(outputs) / sizeof(outputs[0]); o++) {
+            int count = 0;
+            float gain = 0.0f;
+            rc |= run_chain_case(&protocols[p], &outputs[o], wav, &count, chained, staged, &gain);
+            DSD_SNPRINTF(label, sizeof(label), "voice chain %s %s: per-call WAV length", protocols[p].tag,
+                         outputs[o].tag);
+            rc |= expect_eq_int(label, count, ref_count);
+            DSD_SNPRINTF(label, sizeof(label), "voice chain %s %s: per-call WAV samples", protocols[p].tag,
+                         outputs[o].tag);
+            rc |= expect_eq_mem(label, wav, ref_wav, sizeof(short) * (size_t)ref_count);
+            DSD_SNPRINTF(label, sizeof(label), "voice chain %s %s: chained frames", protocols[p].tag, outputs[o].tag);
+            rc |= expect_eq_mem(label, chained, ref_chained, sizeof(chained));
+            DSD_SNPRINTF(label, sizeof(label), "voice chain %s %s: gain level", protocols[p].tag, outputs[o].tag);
+            rc |= expect_eq_int(label, fabsf(gain - ref_gain) < 1e-6f, 1);
+            if (!outputs[o].floating) {
+                continue;
+            }
+            // Both output formats stage the same quantized samples whenever this output path stages a frame.
+            if (outputs[o].audio_out || outputs[o].stereo || DSD_SYNC_IS_DMR(protocols[p].protocol)) {
+                DSD_SNPRINTF(label, sizeof(label), "voice chain %s %s: float staging is the short staging",
+                             protocols[p].tag, outputs[o].tag);
+                rc |= expect_eq_mem(label, staged, ref_staged, sizeof(staged));
+            }
+            if (outputs[o].audio_out && outputs[o].mute_after == 0 && !outputs[o].stereo
+                && !DSD_SYNC_IS_DMR(protocols[p].protocol)) {
+                int same = g_chain_emitted_count == ref_emitted_count;
+                for (int i = 0; same && i < ref_emitted_count; i++) {
+                    same = fabsf(g_chain_emitted[i] - ref_emitted[i]) <= 1.0f;
+                }
+                DSD_SNPRINTF(label, sizeof(label), "voice chain %s %s: float playback is the short playback",
+                             protocols[p].tag, outputs[o].tag);
+                rc |= expect_eq_int(label, same, 1);
+            }
+        }
+        int count = 0;
+        float gain = 0.0f;
+        rc |= run_chain_case(&protocols[p], &unfiltered, wav, &count, chained, staged, &gain);
+        DSD_SNPRINTF(label, sizeof(label), "voice chain %s: the high-pass shapes the recording", protocols[p].tag);
+        rc |= expect_eq_int(label, count == ref_count && memcmp(wav, ref_wav, sizeof(short) * (size_t)count) != 0, 1);
+    }
     return rc;
 }
 
@@ -3195,31 +6515,59 @@ main(void) {
     rc |= test_process_mbe_frame_p25p1_multicrypt_transforms_imbe_payload();
     rc |= test_process_mbe_frame_nxdn_cipher1_transforms_ambe_payload();
     rc |= test_process_mbe_frame_nxdn_cipher2_initializes_and_advances_keystream();
-    rc |= test_process_mbe_frame_nxdn_cipher2_clamps_stale_bit_counter();
+    rc |= test_process_mbe_frame_nxdn_cipher2_mutes_stale_bit_counter();
     rc |= test_process_mbe_frame_nxdn_cipher3_uses_aes_voice_offset();
     rc |= test_process_mbe_frame_hard_dstar_stages_audio();
+    rc |= test_process_mbe_frame_dstar_header_voice_decodes_as_ambe2400();
     rc |= test_process_mbe_frame_x2_dstar_wav_honors_talkgroup_policy();
     rc |= test_process_mbe_frame_mbe_capture_honors_record_policy();
     rc |= test_process_mbe_frame_p25p1_capture_honors_reverse_mute();
+    rc |= test_process_mbe_frame_capture_follows_each_frames_verdict();
+    rc |= test_process_mbe_frame_verdict_by_owning_protocol();
+    rc |= test_process_mbe_frame_capture_files_follow_the_frame();
     rc |= test_process_mbe_frame_hard_dmr_left_stages_audio();
     rc |= test_process_mbe_frame_trunked_mono_bs_fallback_gates_to_granted_slot();
+    rc |= test_process_mbe_frame_p25p2_mono_path_records_slot2_wav();
+    rc |= test_process_mbe_frame_p25p2_short_staging_provenance();
     rc |= test_process_mbe_frame_dmr_rc4_transforms_left_and_right_slots();
     rc |= test_process_mbe_frame_mixed_clear_and_bp();
     rc |= test_process_mbe_frame_dmr_reverse_mute_preserves_p25_override();
     rc |= test_process_mbe_frame_dmr_missing_alg_key_unmutes_slots();
     rc |= test_process_mbe_frame_dmr_post_decode_gates_override_enc_flags();
+    dsd_audio_activity_arm();
+    rc |= test_dmr_stereo_mixes_follow_vocoder_slot_verdict();
+    rc |= test_dmr_decrypted_call_leaves_mute_options();
+    rc |= test_dmr_reverse_mute_with_mute_option_off();
+    rc |= test_dmr_mixes_keep_slot_switches_and_preference();
+    rc |= test_dmr_mixes_stamp_vocoder_media();
+    rc |= test_dmr_muted_slot_stages_silence_not_its_last_frame();
+    rc |= test_dmr_ss3_stamps_the_slot_each_channel_carries();
+    rc |= test_dmr_stereo_mixes_play_a_vertex_keystream_call();
+    rc |= test_dmr_mono_disabled_slot_stages_silence();
+    rc |= test_dmr_straight_keystream_burst_stays_audible_under_reverse_mute();
     rc |= test_process_mbe_frame_dmr_aes_stream_advances_slot_state();
     rc |= test_process_mbe_frame_activation_gate_and_wide_kid();
     rc |= test_process_mbe_frame_hard_p25p2_right_stages_audio();
     rc |= test_play_mbe_files_processes_imbe_ambe_and_dstar_records();
     rc |= test_play_mbe_files_does_not_carry_call_identity_across_files();
+    rc |= test_play_mbe_files_records_the_static_wav_in_either_format();
+    rc |= test_process_mbe_frame_float_output_runs_the_gain_stage();
     rc |= test_process_mbe_frame_p25p1_updates_error_history();
     rc |= test_process_mbe_frame_provoice_updates_debug_errors_without_p25_history();
     rc |= test_process_mbe_frame_hard_provoice_stages_audio();
+    rc |= test_process_mbe_frame_soft_provoice_matches_hard();
+    rc |= test_process_mbe_frame_soft_provoice_erasures_recover_hard_miscorrection();
+    rc |= test_process_mbe_frame_provoice_matches_library_frame_api();
+    rc |= test_process_mbe_frame_soft_dstar_matches_hard();
+    rc |= test_process_mbe_frame_soft_dstar_erasures_recover_hard_miscorrection();
+    rc |= test_process_mbe_frame_dstar_matches_library_frame_api();
     rc |= test_process_mbe_frame_ambe2_routes_slot2_error_state();
     rc |= test_process_mbe_frame_dstar_ignores_stale_stereo_slot_state();
     rc |= test_process_mbe_frame_media_protocol_lifecycle();
     rc |= test_process_mbe_frame_x2_slot2_uses_right_error_state_and_stages_audio();
+    rc |= test_x2_sequence_records_and_switches_each_timeslot();
+    rc |= test_mono_mixer_plays_only_the_frame_the_vocoder_staged();
+    rc |= test_voice_chain_per_call_wav_is_format_independent();
 
     if (rc == 0) {
         printf("CORE_MBE_TRANSFORM_CONTEXT: OK\n");

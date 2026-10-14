@@ -76,8 +76,25 @@ var DECODE_MODES = [
         // the NFM channel filter, whose width the Radio sheet sets (issue #525).
         label: "NFM — analog FM", short: "NFM", flag: "-fA",
         hint: "Analog narrowband FM voice — repeaters, business and public-service radio."
+    },
+    {
+        // -fM is native AM (issue #524): the engine demodulates it from the
+        // radio's I/Q. Audio from a network or file source arrives already
+        // demodulated, so iqOnly chips are offered only for radio sources.
+        label: "AM", short: "AM", flag: "-fM", iqOnly: true,
+        hint: "Analog AM voice — airband and other AM channels. Needs a radio source."
     }
 ]
+
+// Whether a decode flag is a chip only a radio source can run (iqOnly: AM,
+// issue #524). Network and file audio arrives already demodulated.
+function decodeFlagNeedsRadio(flag) {
+    for (var i = 0; i < DECODE_MODES.length; i++) {
+        if (DECODE_MODES[i].iqOnly === true && DECODE_MODES[i].flag === flag)
+            return true
+    }
+    return false
+}
 
 // The NFM channel widths the Radio sheet steps through, in Hz: the full RF
 // passband the channel filter keeps, not the tuner or audio bandwidth. The
@@ -86,27 +103,33 @@ var DECODE_MODES = [
 var NFM_WIDTHS_HZ = [8000, 11250, 12500, 16000, 20000, 25000]
 var NFM_DEFAULT_WIDTH_HZ = 16000
 
+// The AM channel widths the Radio sheet steps through under the AM preset
+// (issue #524), likewise: the engine accepts any whole Hz from 5000 to 20000;
+// these are the common steps. 6000 is the default.
+var AM_WIDTHS_HZ = [5000, 6000, 8000, 10000, 15000, 20000]
+var AM_DEFAULT_WIDTH_HZ = 6000
+
 // A channel width as kHz text with trailing zeros dropped, as the engine prints
 // it (dsd_analog_width_format()): "12.5 kHz", "11.25 kHz", "16 kHz".
 function widthKhzText(hz) {
     return String(hz / 1000) + " kHz"
 }
 
-// The preset after (direction 1) or before (-1) a width, or -1 at the end of the
-// list. A width between presets steps to the nearest one in that direction.
-// @a maxHz, when above 0, is the widest width the DSP rate filters: presets
-// above it are skipped, since the engine would refuse them.
-function nextNfmWidth(hz, direction, maxHz) {
+// The width in @a widths after (direction 1) or before (-1) @a hz, or -1 at
+// the end of the list. A width between steps moves to the nearest one in that
+// direction. @a maxHz, when above 0, is the widest width the DSP rate filters:
+// steps above it are skipped, since the engine would refuse them.
+function nextWidthIn(widths, hz, direction, maxHz) {
     var fits = function (w) { return !(maxHz > 0) || w <= maxHz }
     if (direction > 0) {
-        for (var i = 0; i < NFM_WIDTHS_HZ.length; i++) {
-            if (NFM_WIDTHS_HZ[i] > hz && fits(NFM_WIDTHS_HZ[i]))
-                return NFM_WIDTHS_HZ[i]
+        for (var i = 0; i < widths.length; i++) {
+            if (widths[i] > hz && fits(widths[i]))
+                return widths[i]
         }
     } else {
-        for (var j = NFM_WIDTHS_HZ.length - 1; j >= 0; j--) {
-            if (NFM_WIDTHS_HZ[j] < hz && fits(NFM_WIDTHS_HZ[j]))
-                return NFM_WIDTHS_HZ[j]
+        for (var j = widths.length - 1; j >= 0; j--) {
+            if (widths[j] < hz && fits(widths[j]))
+                return widths[j]
         }
     }
     return -1
@@ -371,10 +394,11 @@ function systemMeta(sys) {
 }
 
 // "Last listened 2 minutes ago" / "Last listened yesterday" / "Not yet listened".
-function heardText(lastHeardSecs) {
+// nowMs is the real clock lastHeard is stamped from (savedSystems.realtimeNowMs()).
+function heardText(lastHeardSecs, nowMs) {
     if (!lastHeardSecs || lastHeardSecs <= 0)
         return qsTr("Not yet listened")
-    var delta = Math.floor(Date.now() / 1000) - lastHeardSecs
+    var delta = Math.floor(nowMs / 1000) - lastHeardSecs
     if (delta < 60)
         return qsTr("Last listened just now")
     if (delta < 3600) {
@@ -390,9 +414,10 @@ function heardText(lastHeardSecs) {
     return qsTr("Last listened %1 days ago").arg(Math.floor(delta / 86400))
 }
 
-// Compact age for a call row's right edge: "1m", "2h", "3d".
-function shortAge(whenSecs) {
-    var delta = Math.floor(Date.now() / 1000) - whenSecs
+// Compact age for a call row's right edge: "1m", "2h", "3d". nowMs is the decode clock the
+// row's when is stamped on (metrics.decodeNowMs), not the viewer's clock.
+function shortAge(whenSecs, nowMs) {
+    var delta = Math.floor(nowMs / 1000) - whenSecs
     if (delta < 60)
         return qsTr("now")
     if (delta < 3600)
@@ -460,18 +485,47 @@ function decryptionProtocol(flags) {
     return "mixed"
 }
 
-// A scan row's or target's own squelch (--squelch-db), for the channel-map review and the
-// target preview. Absent inherits the session's default; 0 is off.
-function squelchSummary(db) {
+// A scan row's or target's own squelch (--squelch-db or --squelch), for the channel-map review
+// and the target preview. Absent inherits the session's default; 0 is off; a margin is the
+// row's own auto squelch, that many dB over the noise floor it learns, or with @a noise its
+// noise squelch, opening at that many dB of FM quieting.
+function squelchSummary(db, marginDb, noise) {
+    if (marginDb !== undefined && marginDb !== null && marginDb > 0)
+        return noise === true ? qsTr("Squelch: noise +%1 dB").arg(marginDb)
+            : qsTr("Squelch: auto +%1 dB").arg(marginDb)
     if (db === undefined || db === null)
         return qsTr("Squelch: inherit")
     return db === 0 ? qsTr("Squelch: off") : qsTr("Squelch: %1 dB").arg(db)
 }
 
-// An nfm row's or target's own channel width (--nfm-bandwidth-hz), for the channel-map review
-// and the target preview. Absent inherits the configured NFM width.
-function nfmBandwidthSummary(hz) {
+// An analog row's or target's own channel width, for the channel-map review and the target
+// preview (issue #526): an am row's --am-bandwidth-hz when @a am, else an nfm row's
+// --nfm-bandwidth-hz. Absent inherits the configured width of that kind.
+function analogBandwidthSummary(am, hz) {
     if (hz === undefined || hz === null)
-        return qsTr("NFM bandwidth: inherit")
-    return qsTr("NFM bandwidth: %1").arg(widthKhzText(hz))
+        return am ? qsTr("AM bandwidth: inherit") : qsTr("NFM bandwidth: inherit")
+    return am ? qsTr("AM bandwidth: %1").arg(widthKhzText(hz)) : qsTr("NFM bandwidth: %1").arg(widthKhzText(hz))
+}
+
+// An nfm row's or target's own CTCSS/DCS tone policy (--tone-allow, --tone-block,
+// --no-tone-filter), for the channel-map review and the target preview (issue #527): @a mode is
+// its dsd_tone_filter_mode (0 off, 1 allow, 2 block) and @a list its displayed list. Absent runs
+// the configured policy.
+function toneFilterSummary(mode, list) {
+    if (mode === undefined || mode === null)
+        return qsTr("Tone filter: inherit")
+    if (mode === 1)
+        return qsTr("Tone filter: allow %1").arg(list)
+    if (mode === 2)
+        return qsTr("Tone filter: block %1").arg(list)
+    return qsTr("Tone filter: off")
+}
+
+// Whether a saved system's decode flags run an analog monitor (-fA NFM, -fM AM), whose scan
+// entries have no digital modulation, keys or talkgroups (issue #526). Exactly one of those
+// flags, as the scan-list generator maps them (scan_list_entry_analog_kind()): any other
+// combination is refused there, so it keeps its digital controls here.
+function decodeFlagIsAnalog(flags) {
+    var flag = String(flags || "").trim().split(/\s+/).join(" ")
+    return flag === "-fA" || flag === "-fM"
 }

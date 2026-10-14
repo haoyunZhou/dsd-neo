@@ -2,7 +2,11 @@
 /* Copyright (C) 2026 by arancormonk <180709949+arancormonk@users.noreply.github.com> */
 
 #include <assert.h>
+#include <dsd-neo/core/analog_tone.h>
+#include <dsd-neo/core/power.h>
 #include <dsd-neo/core/safe_api.h>
+#include <dsd-neo/runtime/analog_channel.h>
+#include <dsd-neo/runtime/analog_tones.h>
 #include <dsd-neo/runtime/scan_mode.h>
 #include <dsd-neo/runtime/scan_options.h>
 #include <stdio.h>
@@ -59,7 +63,67 @@ count_file_spans(void* context, const char* option, const char* path, size_t off
     return 0;
 }
 
-/* The row squelch uses the rtl_sql contract: whole dB from -100 to 0, 0 switches it off, and
+/* --squelch on a row or target (issue #518 follow-up): the squelch grammar, stored as --squelch-db stores it for a level
+ * (whole dB, off as 0) and as a mode and margin for auto, which only an analog row takes, and noise, which only an nfm
+ * row takes. It shares --squelch-db's option: a row names one squelch. The diagnostic names the option and never
+ * echoes the value. */
+static void
+check_squelch_setting_option(void) {
+    dsd_scan_options parsed;
+    char error[128];
+    DSD_MEMSET(&parsed, 0, sizeof(parsed));
+    assert(dsd_scan_options_parse("--squelch auto+6", DSD_SCAN_MODE_NFM, 0, &parsed, error, sizeof(error)) == 0);
+    assert(parsed.values.present == DSD_SCAN_OPT_SQUELCH && parsed.values.squelch_mode == DSD_SQUELCH_MODE_AUTO);
+    assert(parsed.values.squelch_margin_db == 6 && parsed.values.squelch_db == 0);
+    assert(dsd_scan_options_parse("--squelch=auto", DSD_SCAN_MODE_AM, 1, &parsed, error, sizeof(error)) == 0);
+    assert(parsed.values.squelch_mode == DSD_SQUELCH_MODE_AUTO
+           && parsed.values.squelch_margin_db == DSD_SQUELCH_MARGIN_DEFAULT_DB);
+    assert(dsd_scan_options_parse("--squelch -60", DSD_SCAN_MODE_DMR, 1, &parsed, error, sizeof(error)) == 0);
+    assert(parsed.values.squelch_mode == DSD_SQUELCH_MODE_LEVEL && parsed.values.squelch_db == -60);
+    assert(dsd_scan_options_parse("--squelch off", DSD_SCAN_MODE_P25, 0, &parsed, error, sizeof(error)) == 0);
+    assert(parsed.values.present == DSD_SCAN_OPT_SQUELCH && parsed.values.squelch_mode == DSD_SQUELCH_MODE_LEVEL
+           && parsed.values.squelch_db == 0);
+    assert(dsd_scan_options_parse("--squelch -60 --strict-crc", DSD_SCAN_MODE_DMR, 1, &parsed, error, sizeof(error))
+           == 0);
+
+    assert(dsd_scan_options_parse("--squelch noise+14", DSD_SCAN_MODE_NFM, 0, &parsed, error, sizeof(error)) == 0);
+    assert(parsed.values.present == DSD_SCAN_OPT_SQUELCH && parsed.values.squelch_mode == DSD_SQUELCH_MODE_NOISE);
+    assert(parsed.values.squelch_margin_db == 14 && parsed.values.squelch_db == 0);
+    assert(dsd_scan_options_parse("--squelch=noise", DSD_SCAN_MODE_NFM, 1, &parsed, error, sizeof(error)) == 0);
+    assert(parsed.values.squelch_mode == DSD_SQUELCH_MODE_NOISE
+           && parsed.values.squelch_margin_db == DSD_SQUELCH_MARGIN_DEFAULT_DB);
+
+    const char* rejected_everywhere[] = {"--squelch auto+2", "--squelch auto+31", "--squelch noise+2",
+                                         "--squelch -60.5",  "--squelch 5",       "--squelch SENSITIVE",
+                                         "--squelch -101",   "--squelch noisy"};
+    for (size_t i = 0; i < sizeof(rejected_everywhere) / sizeof(rejected_everywhere[0]); i++) {
+        DSD_MEMSET(&parsed, 0, sizeof(parsed));
+        assert(dsd_scan_options_parse(rejected_everywhere[i], DSD_SCAN_MODE_NFM, 0, &parsed, error, sizeof(error)) < 0);
+        assert(parsed.values.present == 0 && strncmp(error, "--squelch: ", 11) == 0);
+        assert(strstr(error, "SENSITIVE") == NULL);
+    }
+    /* auto on a digital row: its channel never shows its noise. */
+    assert(dsd_scan_options_parse("--squelch auto", DSD_SCAN_MODE_DMR, 1, &parsed, error, sizeof(error)) < 0);
+    assert(strstr(error, "auto[+N] (nfm and am rows)") != NULL);
+    /* noise on an am or digital row: no discriminator to quiet. */
+    assert(dsd_scan_options_parse("--squelch noise", DSD_SCAN_MODE_AM, 1, &parsed, error, sizeof(error)) < 0);
+    assert(strstr(error, "noise[+N] (nfm rows)") != NULL);
+    assert(dsd_scan_options_parse("--squelch noise+8", DSD_SCAN_MODE_P25, 0, &parsed, error, sizeof(error)) < 0);
+    assert(
+        dsd_scan_options_parse("--squelch noise --squelch-db -60", DSD_SCAN_MODE_NFM, 0, &parsed, error, sizeof(error))
+        < 0);
+    assert(strstr(error, "duplicate option") != NULL);
+    /* One squelch per row, whichever spellings. */
+    assert(
+        dsd_scan_options_parse("--squelch auto --squelch-db -60", DSD_SCAN_MODE_NFM, 0, &parsed, error, sizeof(error))
+        < 0);
+    assert(strstr(error, "duplicate option") != NULL);
+    assert(
+        dsd_scan_options_parse("--squelch-db -60 --squelch auto+6", DSD_SCAN_MODE_NFM, 0, &parsed, error, sizeof(error))
+        < 0);
+}
+
+/* The row squelch takes whole dB from -100 to 0 (the rtl_sql key's spelling), 0 switches it off, and
  * omitting it inherits. Both the separate-token and the = spellings work, and a negative number
  * is the one exception to "a following token that starts with - is a switch". */
 static void
@@ -223,10 +287,10 @@ check_nfm_row_accepts_analog_options(void) {
 }
 
 /* Keys, forcing, CRC policy, talkgroup groups, data/encrypted-call policy and the voice gate
- * describe digital frames an analog channel never carries: each is refused on an NFM row with
- * the same diagnostic a wrong-mode digital switch gets, and the value is never echoed. */
+ * describe digital frames an analog channel never carries: each is refused on an nfm and an am row
+ * with the same diagnostic a wrong-mode digital switch gets, and the value is never echoed. */
 static void
-check_nfm_row_rejects_digital_options(void) {
+check_analog_rows_reject_digital_options(void) {
     static const char* const refused[] = {"-b 1",
                                           "-H 0123456789",
                                           "-1 0123456789",
@@ -253,23 +317,26 @@ check_nfm_row_rejects_digital_options(void) {
                                           "--no-scan-voice-only",
                                           "--scan-voice-qualify-ms 1000",
                                           "--scan-voice-hold-ms 1000"};
+    static const dsd_scan_mode analog[] = {DSD_SCAN_MODE_NFM, DSD_SCAN_MODE_AM};
     dsd_scan_options parsed = {0};
     char error[192] = {0};
-    for (size_t i = 0; i < sizeof(refused) / sizeof(refused[0]); i++) {
-        for (int conventional = 0; conventional <= 1; conventional++) {
-            DSD_MEMSET(&parsed, 0, sizeof(parsed));
-            DSD_MEMSET(error, 0, sizeof(error));
-            assert(dsd_scan_options_parse(refused[i], DSD_SCAN_MODE_NFM, conventional, &parsed, error, sizeof(error))
-                   < 0);
-            assert(parsed.values.present == 0);
-            char want[64];
-            const size_t name_len = strcspn(refused[i], " =");
-            DSD_SNPRINTF(want, sizeof(want), "%.*s: not supported for this mode/target", (int)name_len, refused[i]);
-            if (strcmp(error, want) != 0) {
-                DSD_FPRINTF(stderr, "'%s' on nfm: got '%s', want '%s'\n", refused[i], error, want);
-                assert(0);
+    for (size_t m = 0; m < sizeof(analog) / sizeof(analog[0]); m++) {
+        for (size_t i = 0; i < sizeof(refused) / sizeof(refused[0]); i++) {
+            for (int conventional = 0; conventional <= 1; conventional++) {
+                DSD_MEMSET(&parsed, 0, sizeof(parsed));
+                DSD_MEMSET(error, 0, sizeof(error));
+                assert(dsd_scan_options_parse(refused[i], analog[m], conventional, &parsed, error, sizeof(error)) < 0);
+                assert(parsed.values.present == 0);
+                char want[64];
+                const size_t name_len = strcspn(refused[i], " =");
+                DSD_SNPRINTF(want, sizeof(want), "%.*s: not supported for this mode/target", (int)name_len, refused[i]);
+                if (strcmp(error, want) != 0) {
+                    DSD_FPRINTF(stderr, "'%s' on %s: got '%s', want '%s'\n", refused[i], dsd_scan_mode_name(analog[m]),
+                                error, want);
+                    assert(0);
+                }
+                assert(strstr(error, "SENSITIVE") == NULL);
             }
-            assert(strstr(error, "SENSITIVE") == NULL);
         }
     }
     DSD_SECURE_ZERO(&parsed, sizeof(parsed));
@@ -353,14 +420,333 @@ check_nfm_bandwidth_rate(void) {
     assert(dsd_scan_option_width_check(DSD_SCAN_MODE_NFM, NULL, 16000, error, sizeof(error)) == 0);
 }
 
+/* --- Issue #526: AM rows --- */
+
+/* An am row takes the analog options: the visit cap, the squelch and its own channel width, spelled for its kind
+ * (--am-bandwidth-hz, whole Hz in the AM range), on -Y rows and am-conventional targets alike. The width records the
+ * demodulator it is for, so an am row's width lands on the AM width and an nfm row's on the NFM one. */
+static void
+check_am_row_accepts_analog_options(void) {
+    dsd_scan_options parsed = {0};
+    char error[192] = {0};
+    for (int conventional = 0; conventional <= 1; conventional++) {
+        DSD_MEMSET(&parsed, 0, sizeof(parsed));
+        assert(dsd_scan_options_parse("--scan-max-visit-ms 5000 --squelch-db -60 --am-bandwidth-hz 8333",
+                                      DSD_SCAN_MODE_AM, conventional, &parsed, error, sizeof(error))
+               == 0);
+        assert(parsed.values.present == (DSD_SCAN_OPT_MAX_VISIT | DSD_SCAN_OPT_SQUELCH | DSD_SCAN_OPT_BANDWIDTH));
+        assert(parsed.values.max_visit_ms == 5000 && parsed.values.squelch_db == -60);
+        assert(parsed.values.channel_bw_hz == 8333 && parsed.values.channel_bw_kind == DSD_ANALOG_DEMOD_AM);
+    }
+
+    const struct {
+        const char* text;
+        int hz;
+    } widths[] = {
+        {"--am-bandwidth-hz=5000", 5000}, {"--am-bandwidth-hz 20000", 20000}, {"--am-bandwidth-hz '6000'", 6000}};
+
+    for (size_t i = 0; i < sizeof(widths) / sizeof(widths[0]); i++) {
+        DSD_MEMSET(&parsed, 0, sizeof(parsed));
+        assert(dsd_scan_options_parse(widths[i].text, DSD_SCAN_MODE_AM, 1, &parsed, error, sizeof(error)) == 0);
+        assert(parsed.values.present == DSD_SCAN_OPT_BANDWIDTH && parsed.values.channel_bw_hz == widths[i].hz);
+        assert(parsed.values.channel_bw_kind == DSD_ANALOG_DEMOD_AM);
+    }
+    DSD_MEMSET(&parsed, 0, sizeof(parsed));
+    parsed.values.channel_bw_kind = DSD_ANALOG_DEMOD_AM;
+    assert(dsd_scan_options_parse("--nfm-bandwidth-hz 12500", DSD_SCAN_MODE_NFM, 1, &parsed, error, sizeof(error))
+           == 0);
+    assert(parsed.values.channel_bw_hz == 12500 && parsed.values.channel_bw_kind == DSD_ANALOG_DEMOD_FM);
+    size_t visited = 0;
+    assert(dsd_scan_options_visit_files("--am-bandwidth-hz 8333 --squelch-db -60", &visited, count_file_spans) == 0);
+    assert(visited == 0);
+    DSD_SECURE_ZERO(&parsed, sizeof(parsed));
+}
+
+/* Each analog kind's width is refused on the other kind's row, as any switch outside a row's class is; a digital or
+ * blank row that names the AM width is told which mode it needs; and the value must be whole Hz in the AM range,
+ * given once. */
+static void
+check_am_bandwidth_option_contract(void) {
+    dsd_scan_options parsed = {0};
+    char error[192] = {0};
+    for (int conventional = 0; conventional <= 1; conventional++) {
+        assert(dsd_scan_options_parse("--nfm-bandwidth-hz 12500", DSD_SCAN_MODE_AM, conventional, &parsed, error,
+                                      sizeof(error))
+               < 0);
+        assert(strcmp(error, "--nfm-bandwidth-hz: not supported for this mode/target") == 0);
+        assert(dsd_scan_options_parse("--am-bandwidth-hz 8000", DSD_SCAN_MODE_NFM, conventional, &parsed, error,
+                                      sizeof(error))
+               < 0);
+        assert(strcmp(error, "--am-bandwidth-hz: not supported for this mode/target") == 0);
+    }
+    for (unsigned int mode = DSD_SCAN_MODE_INHERIT; mode <= DSD_SCAN_MODE_LAST; mode++) {
+        if (dsd_scan_mode_is_analog((dsd_scan_mode)mode)) {
+            continue;
+        }
+        for (int conventional = 0; conventional <= 1; conventional++) {
+            DSD_MEMSET(&parsed, 0, sizeof(parsed));
+            assert(dsd_scan_options_parse("--am-bandwidth-hz 8000", mode, conventional, &parsed, error, sizeof(error))
+                   < 0);
+            assert(strcmp(error, "--am-bandwidth-hz: needs mode am") == 0);
+            assert(parsed.values.present == 0);
+        }
+    }
+    static const char* const invalid[] = {"--am-bandwidth-hz 4999",   "--am-bandwidth-hz 20001",
+                                          "--am-bandwidth-hz=0",      "--am-bandwidth-hz 8.33k",
+                                          "--am-bandwidth-hz 8333Hz", "--am-bandwidth-hz +8333",
+                                          "--am-bandwidth-hz 0x208d", "--am-bandwidth-hz ' 8333'",
+                                          "--am-bandwidth-hz 1e4",    "--am-bandwidth-hz SENSITIVE"};
+    for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+        DSD_MEMSET(&parsed, 0, sizeof(parsed));
+        assert(dsd_scan_options_parse(invalid[i], DSD_SCAN_MODE_AM, 1, &parsed, error, sizeof(error)) < 0);
+        if (strcmp(error, "--am-bandwidth-hz: expects whole Hz from 5000 to 20000") != 0) {
+            DSD_FPRINTF(stderr, "'%s': got '%s'\n", invalid[i], error);
+            assert(0);
+        }
+        assert(parsed.values.present == 0);
+    }
+    const char* missing[] = {"--am-bandwidth-hz", "--am-bandwidth-hz -8000", "--am-bandwidth-hz --squelch-db -60"};
+    for (size_t i = 0; i < sizeof(missing) / sizeof(missing[0]); i++) {
+        assert(dsd_scan_options_parse(missing[i], DSD_SCAN_MODE_AM, 1, &parsed, error, sizeof(error)) < 0);
+        assert(strcmp(error, "--am-bandwidth-hz: requires a valid argument") == 0);
+    }
+    assert(dsd_scan_options_parse("--am-bandwidth-hz 8000 --am-bandwidth-hz=8000", DSD_SCAN_MODE_AM, 1, &parsed, error,
+                                  sizeof(error))
+           < 0);
+    assert(strcmp(error, "--am-bandwidth-hz: duplicate option") == 0);
+    DSD_SECURE_ZERO(&parsed, sizeof(parsed));
+}
+
+/* An am row's width is held to the DSP rate by the AM demodulator's rule, as an nfm row's is by the NFM one. */
+static void
+check_am_bandwidth_rate(void) {
+    dsd_scan_option_values row = {0};
+    row.present = DSD_SCAN_OPT_BANDWIDTH;
+    row.channel_bw_hz = 20000;
+    row.channel_bw_kind = DSD_ANALOG_DEMOD_AM;
+    char error[256] = {0};
+    assert(dsd_scan_option_width_check(DSD_SCAN_MODE_AM, &row, 24000, error, sizeof(error)) == 0);
+    assert(error[0] == '\0');
+    assert(dsd_scan_option_width_check(DSD_SCAN_MODE_AM, &row, 16000, error, sizeof(error)) < 0);
+    assert(strstr(error, "AM") && strstr(error, "20 kHz") && strstr(error, "16 kHz"));
+    row.channel_bw_hz = 12000;
+    assert(dsd_scan_option_width_check(DSD_SCAN_MODE_AM, &row, 16000, error, sizeof(error)) == 0);
+    /* A digital class has no width to hold. */
+    row.channel_bw_hz = 20000;
+    assert(dsd_scan_option_width_check(DSD_SCAN_MODE_DMR, &row, 16000, error, sizeof(error)) == 0);
+}
+
+/* --- Issue #527: the tone policy on nfm rows --- */
+
+/* --tone-allow and --tone-block take a '/'-separated list and --no-tone-filter none; all three are one option, so a
+ * row names one of them once. They are legal on nfm rows and targets only: a digital or blank row is told which mode
+ * they need. A refused list is named by entry number, never echoed. */
+static void
+check_tone_options(void) {
+    dsd_scan_options parsed = {0};
+    char error[192] = {0};
+    char list[DSD_TONE_LIST_TEXT_MAX + 1];
+    for (int conventional = 0; conventional <= 1; conventional++) {
+        DSD_MEMSET(&parsed, 0, sizeof(parsed));
+        assert(dsd_scan_options_parse("--squelch-db -60 --tone-allow 100/D023", DSD_SCAN_MODE_NFM, conventional,
+                                      &parsed, error, sizeof(error))
+               == 0);
+        assert(parsed.values.present == (DSD_SCAN_OPT_SQUELCH | DSD_SCAN_OPT_TONE));
+        assert(parsed.values.tone_filter == DSD_TONE_FILTER_ALLOW);
+        assert(dsd_tone_set_format(&parsed.values.tone_set, list, sizeof(list)) > 0);
+        assert(strcmp(list, "100.0/D023N") == 0);
+    }
+    DSD_MEMSET(&parsed, 0, sizeof(parsed));
+    assert(dsd_scan_options_parse("--tone-block=67.0/D047I", DSD_SCAN_MODE_NFM, 1, &parsed, error, sizeof(error)) == 0);
+    assert(parsed.values.present == DSD_SCAN_OPT_TONE && parsed.values.tone_filter == DSD_TONE_FILTER_BLOCK);
+    assert(dsd_tone_set_contains_dcs(&parsed.values.tone_set, 0023, 0));
+    /* The explicit row disable: a row that turns a configured policy off. */
+    DSD_MEMSET(&parsed, 0, sizeof(parsed));
+    assert(dsd_scan_options_parse("--no-tone-filter", DSD_SCAN_MODE_NFM, 0, &parsed, error, sizeof(error)) == 0);
+    assert(parsed.values.present == DSD_SCAN_OPT_TONE && parsed.values.tone_filter == DSD_TONE_FILTER_OFF);
+    assert(dsd_tone_set_count(&parsed.values.tone_set) == 0);
+    /* The list is a plain value, never a file operand. */
+    size_t visited = 0;
+    assert(dsd_scan_options_visit_files("--tone-allow 100.0/D023N --squelch-db -60", &visited, count_file_spans) == 0);
+    assert(visited == 0);
+
+    /* One option, whichever spelling comes second. */
+    static const char* const twice[] = {"--tone-allow 100.0 --tone-block 67.0", "--tone-allow 100.0 --no-tone-filter",
+                                        "--no-tone-filter --tone-allow=100.0", "--tone-block 67.0 --tone-block 71.9"};
+    for (size_t i = 0; i < sizeof(twice) / sizeof(twice[0]); i++) {
+        assert(dsd_scan_options_parse(twice[i], DSD_SCAN_MODE_NFM, 1, &parsed, error, sizeof(error)) < 0);
+        assert(strstr(error, ": duplicate option") != NULL);
+    }
+
+    /* An am row or am-conventional target runs the AM monitor, which hears no CTCSS or DCS: another analog class's
+       option, refused there as the NFM width is. */
+    static const struct {
+        const char* text;
+        const char* why;
+    } on_am[] = {
+        {"--tone-allow 100.0", "--tone-allow: not supported for this mode/target"},
+        {"--tone-block=D023N", "--tone-block: not supported for this mode/target"},
+        {"--no-tone-filter", "--no-tone-filter: not supported for this mode/target"},
+        {"--am-bandwidth-hz 8333 --tone-allow 100.0", "--tone-allow: not supported for this mode/target"},
+    };
+
+    for (int conventional = 0; conventional <= 1; conventional++) {
+        for (size_t i = 0; i < sizeof(on_am) / sizeof(on_am[0]); i++) {
+            DSD_MEMSET(&parsed, 0, sizeof(parsed));
+            assert(dsd_scan_options_parse(on_am[i].text, DSD_SCAN_MODE_AM, conventional, &parsed, error, sizeof(error))
+                   < 0);
+            if (strcmp(error, on_am[i].why) != 0) {
+                DSD_FPRINTF(stderr, "am row '%s': got '%s', want '%s'\n", on_am[i].text, error, on_am[i].why);
+                assert(0);
+            }
+            assert(parsed.values.present == 0);
+        }
+    }
+
+    /* Digital and blank rows: the mode they need. */
+    for (unsigned int mode = DSD_SCAN_MODE_INHERIT; mode <= DSD_SCAN_MODE_LAST; mode++) {
+        if (dsd_scan_mode_is_analog((dsd_scan_mode)mode)) {
+            continue;
+        }
+        static const char* const names[] = {"--tone-allow 100.0", "--tone-block D023N", "--no-tone-filter"};
+        for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+            DSD_MEMSET(&parsed, 0, sizeof(parsed));
+            assert(dsd_scan_options_parse(names[i], mode, 1, &parsed, error, sizeof(error)) < 0);
+            char want[64];
+            DSD_SNPRINTF(want, sizeof(want), "%.*s: needs mode nfm", (int)strcspn(names[i], " "), names[i]);
+            assert(strcmp(error, want) == 0);
+            assert(parsed.values.present == 0);
+        }
+    }
+
+    /* Refused lists: index-based, the text never echoed. */
+    static const struct {
+        const char* text;
+        const char* why;
+    } refused[] = {
+        {"--tone-allow 100.0,67.0", "--tone-allow: use / between entries, not commas"},
+        {"--tone-allow 67.0/SECRET", "--tone-allow: entry 2 is not a standard CTCSS tone or DCS code"},
+        {"--tone-block D023N/D047I", "--tone-block: entry 2 is the same DCS signal as entry 1 (D023N)"},
+        {"--tone-block=", "--tone-block: the list is empty"},
+        {"--tone-allow", "--tone-allow: requires a valid argument"},
+        {"--tone-allow --squelch-db -60", "--tone-allow: requires a valid argument"},
+        {"--no-tone-filter=100.0", "--no-tone-filter: takes no argument"},
+    };
+
+    for (size_t i = 0; i < sizeof(refused) / sizeof(refused[0]); i++) {
+        DSD_MEMSET(&parsed, 0, sizeof(parsed));
+        assert(dsd_scan_options_parse(refused[i].text, DSD_SCAN_MODE_NFM, 1, &parsed, error, sizeof(error)) < 0);
+        if (strcmp(error, refused[i].why) != 0) {
+            DSD_FPRINTF(stderr, "'%s': got '%s', want '%s'\n", refused[i].text, error, refused[i].why);
+            assert(0);
+        }
+        assert(strstr(error, "SECRET") == NULL && parsed.values.present == 0);
+    }
+    DSD_SECURE_ZERO(&parsed, sizeof(parsed));
+}
+
+/* A tone list a CSV comma cut short (issue #527): the splitter hands the parser the cell up to the comma and leaves the
+ * rest in the field after it. Refused when the cell ends with a --tone-allow/--tone-block list and that field goes on
+ * with it: any text past the header, a standard tone or code in one of the file's columns, alone or followed by the
+ * cell's next option. A cell whose list is not last, a column's own value (an RTL gain, a name), an empty field and a
+ * row with no field after are left alone, and the diagnostic names the switch only. */
+static void
+check_tone_list_split(void) {
+    static const struct {
+        const char* options;
+        const char* next;
+        int past_header;
+        const char* why;
+    } cases[] = {
+        {"--tone-allow 100.0", "67.0", 1, "--tone-allow: use / between entries, not commas"},
+        {"--squelch-db -60 --tone-block=100.0", "SECRET", 1, "--tone-block: use / between entries, not commas"},
+        {"--tone-allow 100.0", " 67.0/D023N", 0, "--tone-allow: use / between entries, not commas"},
+        {"--tone-block \"100.0\"", "d047i", 0, "--tone-block: use / between entries, not commas"},
+        {"--tone-allow 100.0", "", 1, NULL},
+        {"--tone-allow 100.0", "  \r\n", 1, NULL},
+        {"--tone-allow 100.0", NULL, 1, NULL},
+        {"--tone-allow 100.0", "30", 0, NULL},
+        {"--tone-allow 100.0", "Fire", 0, NULL},
+        {"--tone-allow 100.0", "161.0", 0, NULL},
+        /* 150.0 Hz is a tone (issue #518 follow-up): a column that reads as one is the list's rest. */
+        {"--tone-allow 100.0", "150.0", 0, "--tone-allow: use / between entries, not commas"},
+        /* A name that starts with a tone or code but has a space in it is the column's own. */
+        {"--tone-allow 100.0", "100 Main St", 0, NULL},
+        {"--tone-allow 100.0", "67 Fire", 0, NULL},
+        {"--tone-block D023N", "D023 Repeater", 0, NULL},
+        {"--tone-allow 100.0", "67.0/D023N Fire", 0, NULL},
+        {"--tone-allow 100.0", "67 --fire", 0, NULL},
+        {"--tone-allow 100.0", "100 -- Main St", 0, NULL},
+        {"--tone-allow 100.0", "Fire --squelch-db -60", 0, NULL},
+        /* A run of entries that the cell's next option follows is the list's rest and the cell's rest: the comma cut
+           both off, whatever the column. */
+        {"--tone-block 100.0", "67.0 --squelch-db -60", 0, "--tone-block: use / between entries, not commas"},
+        {"--tone-allow 100.0", "67.0/D023N\t--nfm-bandwidth-hz=12500", 0,
+         "--tone-allow: use / between entries, not commas"},
+        {"--tone-allow 100.0", "d047i  --no-tone-filter", 0, "--tone-allow: use / between entries, not commas"},
+        /* One run of entries with no space in it can only be the list's rest, a nonstandard later entry included. */
+        {"--tone-allow 100.0", "67.0/161.0", 0, "--tone-allow: use / between entries, not commas"},
+        {"--tone-allow 100.0", "67.0 \r\n", 0, "--tone-allow: use / between entries, not commas"},
+        {"--tone-allow 100.0 --squelch-db -60", "67.0", 1, NULL},
+        {"--no-tone-filter", "67.0", 1, NULL},
+        {"--squelch-db -60", "67.0", 1, NULL},
+        {"--tone-allow", "67.0", 1, NULL},
+        {"--tone-allow 'unterminated", "67.0", 1, NULL},
+        {"", "67.0", 1, NULL},
+    };
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char error[96] = "";
+        const int refused = dsd_scan_options_tone_list_split(cases[i].options, cases[i].next, cases[i].past_header,
+                                                             error, sizeof(error));
+        if (refused != (cases[i].why != NULL) || (cases[i].why && strcmp(error, cases[i].why) != 0)) {
+            DSD_FPRINTF(stderr, "split case %zu: refused=%d error='%s'\n", i, refused, error);
+            assert(0);
+        }
+        assert(strstr(error, "SECRET") == NULL);
+    }
+    assert(dsd_scan_options_tone_list_split(NULL, "67.0", 1, NULL, 0) == 0);
+    assert(dsd_scan_options_tone_list_split("--tone-allow 100.0", "67.0", 1, NULL, 0) == 1);
+}
+
+/* What the import previews show of a row's own policy: its mode and its list as displayed, or -1 for a row that runs
+ * the configured one. --no-tone-filter shows no list. */
+static void
+check_tone_summary(void) {
+    char list[96];
+    assert(dsd_scan_option_tone_summary(NULL, list, sizeof(list)) == -1 && list[0] == '\0');
+    dsd_scan_options parsed = {0};
+    char error[192] = {0};
+    assert(dsd_scan_options_parse("--squelch-db -60", DSD_SCAN_MODE_NFM, 1, &parsed, error, sizeof(error)) == 0);
+    DSD_SNPRINTF(list, sizeof(list), "%s", "stale");
+    assert(dsd_scan_option_tone_summary(&parsed.values, list, sizeof(list)) == -1 && list[0] == '\0');
+    assert(dsd_scan_options_parse("--tone-allow 100/D023", DSD_SCAN_MODE_NFM, 1, &parsed, error, sizeof(error)) == 0);
+    assert(dsd_scan_option_tone_summary(&parsed.values, list, sizeof(list)) == DSD_TONE_FILTER_ALLOW);
+    assert(strcmp(list, "100.0 Hz/D023N") == 0);
+    assert(dsd_scan_options_parse("--tone-block=67.0", DSD_SCAN_MODE_NFM, 0, &parsed, error, sizeof(error)) == 0);
+    assert(dsd_scan_option_tone_summary(&parsed.values, list, sizeof(list)) == DSD_TONE_FILTER_BLOCK);
+    assert(strcmp(list, "67.0 Hz") == 0);
+    assert(dsd_scan_options_parse("--no-tone-filter", DSD_SCAN_MODE_NFM, 1, &parsed, error, sizeof(error)) == 0);
+    DSD_SNPRINTF(list, sizeof(list), "%s", "stale");
+    assert(dsd_scan_option_tone_summary(&parsed.values, list, sizeof(list)) == DSD_TONE_FILTER_OFF && list[0] == '\0');
+    DSD_SECURE_ZERO(&parsed, sizeof(parsed));
+}
+
 int
 main(void) {
+    check_tone_options();
+    check_tone_summary();
+    check_tone_list_split();
     check_file_spans();
     check_squelch_option();
+    check_squelch_setting_option();
     check_nfm_row_accepts_analog_options();
-    check_nfm_row_rejects_digital_options();
+    check_analog_rows_reject_digital_options();
     check_nfm_bandwidth_option_contract();
     check_nfm_bandwidth_rate();
+    check_am_row_accepts_analog_options();
+    check_am_bandwidth_option_contract();
+    check_am_bandwidth_rate();
     dsd_scan_options parsed = {0};
     char error[192] = {0};
     assert(dsd_scan_options_parse("--dmr-tg-key-csv mapping.csv", DSD_SCAN_MODE_DMR, 1, &parsed, error, sizeof(error))
@@ -401,17 +787,19 @@ main(void) {
     assert(parsed.values.present & DSD_SCAN_OPT_BP);
     assert(parsed.bp == 0 && parsed.values.force == 0 && parsed.values.strict_crc == 1
            && parsed.values.voice_only == 0);
-    /* Every accepted direct switch arms decryption, including explicit zero. */
+    /* Every accepted direct switch arms decryption, including explicit zero: undecodable P25 stays muted, and the
+     * DMR encrypted-audio mute stays the session's, since the vocoder's verdict plays what the key decrypts
+     * (issue #655). */
     assert(parsed.values.present & DSD_SCAN_OPT_MUTE_P25);
-    assert((parsed.values.present & DSD_SCAN_OPT_MUTE_DMR) && parsed.values.mute_dmr == 0);
+    assert(!(parsed.values.present & DSD_SCAN_OPT_MUTE_DMR));
     assert(dsd_scan_options_parse("-b 7", DSD_SCAN_MODE_DMR, 1, &parsed, error, sizeof(error)) == 0);
-    assert((parsed.values.present & DSD_SCAN_OPT_MUTE_DMR) && parsed.values.mute_dmr == 0);
+    assert((parsed.values.present & DSD_SCAN_OPT_MUTE_P25) && !(parsed.values.present & DSD_SCAN_OPT_MUTE_DMR));
     assert(dsd_scan_options_parse("-H 0000000000", DSD_SCAN_MODE_DMR, 1, &parsed, error, sizeof(error)) == 0);
-    assert((parsed.values.present & DSD_SCAN_OPT_MUTE_DMR) && parsed.values.mute_dmr == 0);
+    assert((parsed.values.present & DSD_SCAN_OPT_MUTE_P25) && !(parsed.values.present & DSD_SCAN_OPT_MUTE_DMR));
     assert(dsd_scan_options_parse("-1 0123456789", DSD_SCAN_MODE_DMR, 1, &parsed, error, sizeof(error)) == 0);
-    assert((parsed.values.present & DSD_SCAN_OPT_MUTE_DMR) && parsed.values.mute_dmr == 0);
+    assert((parsed.values.present & DSD_SCAN_OPT_MUTE_P25) && !(parsed.values.present & DSD_SCAN_OPT_MUTE_DMR));
     assert(dsd_scan_options_parse("-R 5", DSD_SCAN_MODE_NXDN48, 1, &parsed, error, sizeof(error)) == 0);
-    assert((parsed.values.present & DSD_SCAN_OPT_MUTE_DMR) && parsed.values.mute_dmr == 0);
+    assert((parsed.values.present & DSD_SCAN_OPT_MUTE_P25) && !(parsed.values.present & DSD_SCAN_OPT_MUTE_DMR));
     /* Key-file paths share the legacy column limit; the group path is bounded by the option
      * it overrides, and an oversized argument never leaves a partial result behind. */
     {

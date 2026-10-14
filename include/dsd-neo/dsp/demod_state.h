@@ -15,6 +15,7 @@
 #define DSD_NEO_INCLUDE_DSD_NEO_DSP_DEMOD_STATE_H_
 
 #include <dsd-neo/platform/platform.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 #include <atomic>
@@ -22,6 +23,8 @@
 #endif
 #include <dsd-neo/dsp/costas.h>
 #include <dsd-neo/dsp/fsk_modem.h>
+#include <dsd-neo/dsp/nfm_noise_squelch.h>
+#include <dsd-neo/dsp/squelch_floor.h>
 #include <dsd-neo/dsp/ted.h>
 #include <dsd-neo/platform/threading.h>
 
@@ -38,6 +41,29 @@
  * device-forced rates up to ~102 kHz get a real design. Static-asserted against
  * DSD_ANALOG_CHANNEL_MAX_TAPS in demod_pipeline.cpp. */
 #define DSD_CHANNEL_LPF_MAX_TAPS 288
+
+/* Channel LPF history, in complex samples: the streaming FIR (simd_fir_complex_apply()) keeps the newest this many
+ * input samples. Its windows reach pending + c samples back, with pending at most the largest c (143, for the
+ * largest odd tap count) and c at most that too, so a tap change without a reset always finds its history. */
+#define DSD_CHANNEL_LPF_HIST_LEN (DSD_CHANNEL_LPF_MAX_TAPS - 1)
+
+/* The channel LPF's output work buffers (hb_workbuf, timing_buf), in floats: a call makes at most N + 143 complex
+ * outputs for N in (N + c_old - c_new on a tap shrink), and N is at most MAXIMUM_BUF_LENGTH / 2 complex. */
+#define DSD_DEMOD_WORKBUF_LENGTH (MAXIMUM_BUF_LENGTH + 2 * DSD_CHANNEL_LPF_HIST_LEN)
+
+/* The alignment of demod_state's aligned work buffers, in bytes: DSD_NEO_ALIGN (runtime/mem.h), which the SIMD kernels
+ * assume of them. */
+#define DSD_DEMOD_BUF_ALIGN      64
+
+/* Floats in one DSD_DEMOD_BUF_ALIGN-byte block, as an int so the capacities below round in the int arithmetic they are
+ * written in. */
+#define DSD_DEMOD_BLOCK_FLOATS   (DSD_DEMOD_BUF_ALIGN / (int)sizeof(float))
+
+/* The floats an aligned buffer of n floats is declared with: n rounded up to whole DSD_DEMOD_BUF_ALIGN-byte blocks, so
+ * the buffer ends where the next one's alignment starts and the struct needs no padding between them. The capacity is
+ * still n; the spare tail past it is never read. */
+#define DSD_DEMOD_ALIGNED_FLOATS(n)                                                                                    \
+    ((((n) + DSD_DEMOD_BLOCK_FLOATS - 1) / DSD_DEMOD_BLOCK_FLOATS) * DSD_DEMOD_BLOCK_FLOATS)
 
 /* Channel LPF profile ids */
 enum DSD_ATTR_PACKED {
@@ -71,23 +97,43 @@ enum DSD_ATTR_PACKED dsd_digital_resample_mode {
  * Radio and DSP implementation units include this definition directly.
  */
 // NOLINTBEGIN(clang-analyzer-optin.performance.Padding)
+/* What a squelch plan is designed for (issue #518 follow-up): the channel rate, the channel filter's plan, the
+   half-band stage ahead of it (0 none, else its tap count) and how many stages the cascade runs. set is 0 until a plan
+   was designed. */
+typedef struct {
+    int rate_hz;
+    int rate_out;
+    int profile;
+    int width_hz;
+    int taps_len;
+    int hb_taps;
+    int passes; /* half-band stages ahead of the channel filter */
+    int set;
+} dsd_demod_squelch_plan_key;
+
 struct demod_state {
 #ifdef __cplusplus
     demod_state() noexcept { DSD_MEMSET(this, 0, sizeof(*this)); }
 #endif
 
-    /* Large aligned buffers first to minimize padding */
-    alignas(64) float hb_i_buf[MAXIMUM_BUF_LENGTH / 2];
-    alignas(64) float hb_q_buf[MAXIMUM_BUF_LENGTH / 2];
-    alignas(64) float hb_i_out[MAXIMUM_BUF_LENGTH / 2];
-    alignas(64) float hb_q_out[MAXIMUM_BUF_LENGTH / 2];
-    alignas(64) float input_cb_buf[MAXIMUM_BUF_LENGTH];
-    alignas(64) float result[MAXIMUM_BUF_LENGTH];
-    alignas(64) float timing_buf[MAXIMUM_BUF_LENGTH];
-    alignas(64) float resamp_outbuf[MAXIMUM_BUF_LENGTH * 4];
-    alignas(64) float channel_lpf_hist_i[DSD_CHANNEL_LPF_MAX_TAPS]; /* symmetric FIR history (taps - 1) */
-    alignas(64) float channel_lpf_hist_q[DSD_CHANNEL_LPF_MAX_TAPS];
-    alignas(64) float channel_lpf_plan_taps[DSD_CHANNEL_LPF_MAX_TAPS];
+    /* Large aligned buffers first to minimize padding. Each is declared as DSD_DEMOD_ALIGNED_FLOATS of its capacity, so
+       none needs padding before the next (static-asserted below the struct). */
+    alignas(DSD_DEMOD_BUF_ALIGN) float hb_i_buf[DSD_DEMOD_ALIGNED_FLOATS(MAXIMUM_BUF_LENGTH / 2)];
+    alignas(DSD_DEMOD_BUF_ALIGN) float hb_q_buf[DSD_DEMOD_ALIGNED_FLOATS(MAXIMUM_BUF_LENGTH / 2)];
+    alignas(DSD_DEMOD_BUF_ALIGN) float hb_i_out[DSD_DEMOD_ALIGNED_FLOATS(MAXIMUM_BUF_LENGTH / 2)];
+    alignas(DSD_DEMOD_BUF_ALIGN) float hb_q_out[DSD_DEMOD_ALIGNED_FLOATS(MAXIMUM_BUF_LENGTH / 2)];
+    alignas(DSD_DEMOD_BUF_ALIGN) float input_cb_buf[DSD_DEMOD_ALIGNED_FLOATS(MAXIMUM_BUF_LENGTH)];
+    alignas(DSD_DEMOD_BUF_ALIGN) float result[DSD_DEMOD_ALIGNED_FLOATS(MAXIMUM_BUF_LENGTH)];
+    alignas(DSD_DEMOD_BUF_ALIGN) float timing_buf[DSD_DEMOD_ALIGNED_FLOATS(DSD_DEMOD_WORKBUF_LENGTH)];
+    alignas(DSD_DEMOD_BUF_ALIGN) float resamp_outbuf[DSD_DEMOD_ALIGNED_FLOATS(MAXIMUM_BUF_LENGTH * 4)];
+    /* Streaming FIR history, DSD_CHANNEL_LPF_HIST_LEN complex samples, newest right-aligned */
+    alignas(DSD_DEMOD_BUF_ALIGN) float channel_lpf_hist_i[DSD_DEMOD_ALIGNED_FLOATS(DSD_CHANNEL_LPF_HIST_LEN)];
+    alignas(DSD_DEMOD_BUF_ALIGN) float channel_lpf_hist_q[DSD_DEMOD_ALIGNED_FLOATS(DSD_CHANNEL_LPF_HIST_LEN)];
+    alignas(DSD_DEMOD_BUF_ALIGN) float channel_lpf_plan_taps[DSD_DEMOD_ALIGNED_FLOATS(DSD_CHANNEL_LPF_MAX_TAPS)];
+    /* The auto squelch's per-sample gate flags (DSD_SQUELCH_FLAG_CLOSED), parallel to result and to resamp_outbuf.
+       Valid only while result_flags_active; otherwise every sample is open. */
+    alignas(DSD_DEMOD_BUF_ALIGN) uint8_t result_flags[MAXIMUM_BUF_LENGTH];
+    alignas(DSD_DEMOD_BUF_ALIGN) uint8_t resamp_outflags[MAXIMUM_BUF_LENGTH * 4];
 
     /* Pointers and 64-bit items next */
     dsd_thread_t thread;
@@ -158,20 +204,31 @@ struct demod_state {
     int dc_block;
     float dc_avg;
     /* Half-band decimator */
-    float hb_workbuf[MAXIMUM_BUF_LENGTH];
+    float hb_workbuf[DSD_DEMOD_WORKBUF_LENGTH];
     float hb_hist_i[10][HB_TAPS_MAX - 1];
     float hb_hist_q[10][HB_TAPS_MAX - 1];
+    /* Per stage: input samples taken but not yet decimated past (simd_hb_decim2_complex()), the look-ahead and the
+       decimation phase in one count. 0 after a reset (dsd_demod_reset_filter_state()), so the stage's next output is
+       centred on its next input. */
+    int hb_pending[10];
+    /* The downsample_passes the half-band state above belongs to: the cascade starts over when the count changes,
+       since writers of the count (rate setup, restore_capture_rate_settings()) do not reset it. */
+    int hb_state_passes;
 
     /* Fixed channel low-pass (post-HB) to bound noise bandwidth at higher Fs.
-     * At 48 kHz with 1200 Hz transition, Blackman needs 135 taps (hist = 134).
+     * At 48 kHz with 1200 Hz transition, Blackman needs 135 taps.
      * Digital profiles cap the design at 144 taps; the analog family may use
-     * the full DSD_CHANNEL_LPF_MAX_TAPS. */
+     * the full DSD_CHANNEL_LPF_MAX_TAPS. The history is DSD_CHANNEL_LPF_HIST_LEN
+     * samples whatever the taps. */
     int channel_lpf_enable; /* gate */
     /* The historical enable rule (DSD_NEO_CHANNEL_LPF, else a 20 kHz rate_in) as decided when the stream was
        configured. The unset analog default and a switch back to digital restore it; an explicit analog width
        overrides it. */
     int channel_lpf_default_enable;
-    int channel_lpf_hist_len;
+    /* Channel FIR outputs held back for look-ahead (simd_fir_complex_apply()). 0 after a reset
+       (dsd_demod_reset_filter_state()), so the first output is centred on the first new sample; above 0 exactly when
+       the filter took samples since. */
+    int channel_lpf_pending;
     int channel_lpf_profile;       /* see DSD_CH_LPF_PROFILE_* */
     int channel_lpf_plan_rate_out; /* cached rate for channel_lpf_plan_taps */
     int channel_lpf_plan_profile;  /* cached profile for channel_lpf_plan_taps */
@@ -180,6 +237,9 @@ struct demod_state {
     /* Analog receive family (the -fA monitor; not the M17 encoder, which shares the analog front end). While set,
        channel_lpf_width_hz > 0 drives the channel filter instead of channel_lpf_profile. */
     int analog_family;
+    /* 1 for the M17 encoder's monitor (issue #625): the FM/WIDE front end the encoder reads, set when the stream
+       opens. Not part of the analog family, but the dynamic squelch runs on it (dsd_demod_encoder_monitor_active()). */
+    int m17_encoder_monitor;
     int analog_demod; /* dsd_analog_demod (runtime/analog_channel.h); 0 = FM */
     /* Full RF channel width in Hz the analog filter protects (cutoff W/2 + 600 Hz, 1200 Hz transition).
        0 keeps the profile design, including the legacy WIDE design for an unset default the rate cannot fit. */
@@ -188,11 +248,68 @@ struct demod_state {
        kept so a later rate change can resolve the channel again: the unset default between 16 kHz and the legacy
        WIDE design, and a requested width against the new rate. */
     int analog_width_request_hz;
+    /* The configured width that request came from (0 = the kind's default, AM's included), as the decoder spells the
+       setting. The AM default and an explicit 6000 Hz make the same request; a stream that refuses a later request
+       reports this as the width it kept (rtl_stream_receive_request_refusal()), so the decoder puts back the setting
+       it had, not the default for an explicit 6000. */
+    int analog_width_setting_hz;
+    /* AM envelope detector (dsd_am_demod(), issue #524): the carrier estimate the envelope is divided by, a one-pole
+       average of |z| with a DSD_AM_CARRIER_TAU_MS time constant. A squelched block leaves it where it was. Every reset
+       of the monitor audio state (stream open, retune, receive-family or FM/AM switch) sets it to 0, and the next
+       unsquelched block warm-starts it from that block's mean magnitude. */
+    float am_carrier;
+    /* Samples the channel squelch has kept closed since the AM detector last ran on audio (saturating); past
+       DSD_AM_CARRIER_HOLD_MS the next unsquelched block warm-starts am_carrier. Cleared with it. */
+    int am_squelched_samples;
     float channel_pwr; /* mean power (RMS^2 proxy) measured after channel LPF */
     /* Squelch threshold (linear power); 0 = disabled. Written from the control thread
      * (config apply, menus) while the demod thread reads it per block. */
     std::atomic<float> channel_squelch_level;
     int channel_squelched; /* 1 if squelched this block, 0 otherwise */
+    /* 1 when full_demod()'s front end made no samples this block (a filter warm-up, or nothing in): the block decided
+       nothing, so channel_squelched and the other per-block decisions still hold the last block's. */
+    int front_end_empty;
+
+    /* The dynamic squelches (issue #518 follow-up). The IO layer copies the setting (squelch_mode, squelch_margin_db)
+       and the context (what sets the channel's noise) in before each full_demod(), on the demod thread; the DSP reads
+       and writes everything here as plain fields. While one runs (an AUTO or NOISE setting on the analog monitor, the
+       M17 encoder's monitor, or the 9600 bit/s FSK path EDACS analog voice reads: dsd_demod_dynamic_squelch_path())
+       the block is never zeroed: the auto squelch's tracker flags each channel sample, or the noise squelch each
+       discriminator output, the flags travel with the samples through the post-decimator and the resampler
+       (result_flags, resamp_outflags) to the output ring, and the decoder mutes at its sink. */
+    int squelch_mode;      /* dsd_squelch_mode */
+    int squelch_margin_db; /* AUTO: the margin over the floor; NOISE: the quieting it opens at */
+    dsd_squelch_floor_key squelch_context;
+    /* 1 when this block's result_flags hold the tracker's flags. */
+    int result_flags_active;
+    /* 1 when the previous block ran the tracker, and the context it ran in. */
+    int squelch_auto_ran;
+    int squelch_context_applied_set;
+    dsd_squelch_floor_key squelch_context_applied;
+    /* The floor cache's clock when the tracker last ran: its floor ages from there while it does not. */
+    double squelch_floor_active_s;
+    /* What the tracker's plan was designed for. */
+    dsd_demod_squelch_plan_key squelch_plan;
+    dsd_squelch_floor squelch_floor;
+    dsd_squelch_floor_cache squelch_cache;
+    /* The NFM noise squelch: a NOISE setting on the FM monitor whose channel plan has a band above voice runs it on
+       the discriminator output (elsewhere the tracker runs the setting as AUTO). squelch_noise_armed marks a block it
+       runs on: decided before the discriminator, run after it. squelch_noise_ran is 1 when the previous block ran it,
+       in noise_context (its own, so the tracker's floor is never stored under a context it did not run in). Its plan
+       follows the same channel plan as the tracker's; designing one calibrates on 2 s of noise. */
+    int squelch_noise_armed;
+    int squelch_noise_ran;
+    int noise_context_set;
+    dsd_squelch_floor_key noise_context;
+    dsd_demod_squelch_plan_key noise_plan;
+    dsd_noise_squelch noise_squelch;
+    /* The flags of the post-decimator's and the resampler's last inputs: each output takes the flag of the input at or
+       just before its filter's centre, half the filter's length back. */
+    uint8_t post_flag_hist[32];
+    int post_flag_head;
+    uint8_t post_fallback_mid_flag; /* the fallback's part-filled group: the flag of its middle sample */
+    uint8_t resamp_flag_hist[32];
+    int resamp_flag_head;
 
     /* Polyphase rational resampler (L/M) */
     int resamp_enabled;
@@ -280,6 +397,18 @@ struct demod_state {
     int post_polydecim_K;         /* taps per phase (phase==1), e.g., 16 */
     int post_polydecim_hist_head; /* head index into circular history [0..K-1] */
     int post_polydecim_phase;     /* sample phase accumulator [0..M-1] */
+    /* Its fallback, run when the polyphase allocation fails: a one-pole low-pass, then the mean of each M samples. Its
+       state carries across blocks as the polyphase decimator's does, so neither depends on where the blocks are cut;
+       dsd_demod_reset_filter_state() clears both. */
+    float post_fallback_lp_y;    /* the one-pole's last output */
+    int post_fallback_lp_valid;  /* 1 once post_fallback_lp_y holds an output; 0 starts it from the next sample */
+    float post_fallback_box_acc; /* sum of the part-filled group */
+    int post_fallback_box_phase; /* samples in the part-filled group [0..M-1] */
+    /* What the decimator state above belongs to: the factor (0 = none yet), the rate_out and the path (1 = the
+       fallback) of the block that last ran it. A block with another of any starts the stage over. */
+    int post_decim_state_M;
+    int post_decim_state_rate_out;
+    int post_decim_state_fallback;
 
     /* Costas diagnostics (updated per block) */
     int costas_err_avg_q14;     /* average smoothed |err| scaled to Q14 for UI/metrics */
@@ -289,6 +418,30 @@ struct demod_state {
 };
 
 // NOLINTEND(clang-analyzer-optin.performance.Padding)
+
+/* The aligned buffers fill whole alignment blocks, so each starts right where the one before it ends: no compiler pads
+ * between them (MSVC warns C4324 when one does). */
+static_assert(sizeof(demod_state::hb_i_buf) % DSD_DEMOD_BUF_ALIGN == 0, "hb_i_buf must fill whole alignment blocks");
+static_assert(sizeof(demod_state::hb_q_buf) % DSD_DEMOD_BUF_ALIGN == 0, "hb_q_buf must fill whole alignment blocks");
+static_assert(sizeof(demod_state::hb_i_out) % DSD_DEMOD_BUF_ALIGN == 0, "hb_i_out must fill whole alignment blocks");
+static_assert(sizeof(demod_state::hb_q_out) % DSD_DEMOD_BUF_ALIGN == 0, "hb_q_out must fill whole alignment blocks");
+static_assert(sizeof(demod_state::input_cb_buf) % DSD_DEMOD_BUF_ALIGN == 0,
+              "input_cb_buf must fill whole alignment blocks");
+static_assert(sizeof(demod_state::result) % DSD_DEMOD_BUF_ALIGN == 0, "result must fill whole alignment blocks");
+static_assert(sizeof(demod_state::timing_buf) % DSD_DEMOD_BUF_ALIGN == 0,
+              "timing_buf must fill whole alignment blocks");
+static_assert(sizeof(demod_state::resamp_outbuf) % DSD_DEMOD_BUF_ALIGN == 0,
+              "resamp_outbuf must fill whole alignment blocks");
+static_assert(sizeof(demod_state::channel_lpf_hist_i) % DSD_DEMOD_BUF_ALIGN == 0,
+              "channel_lpf_hist_i must fill whole alignment blocks");
+static_assert(sizeof(demod_state::channel_lpf_hist_q) % DSD_DEMOD_BUF_ALIGN == 0,
+              "channel_lpf_hist_q must fill whole alignment blocks");
+static_assert(sizeof(demod_state::channel_lpf_plan_taps) % DSD_DEMOD_BUF_ALIGN == 0,
+              "channel_lpf_plan_taps must fill whole alignment blocks");
+static_assert(sizeof(demod_state::result_flags) % DSD_DEMOD_BUF_ALIGN == 0,
+              "result_flags must fill whole alignment blocks");
+static_assert(sizeof(demod_state::resamp_outflags) % DSD_DEMOD_BUF_ALIGN == 0,
+              "resamp_outflags must fill whole alignment blocks");
 
 /*
  * Whether the analog family's monitor audio, on the analog channel, is what the demodulator produces. The width-driven
@@ -301,6 +454,36 @@ static inline int
 dsd_demod_analog_monitor_active(const struct demod_state* d) {
     return (d && d->analog_family && d->output_kind == DSD_DEMOD_OUTPUT_AUDIO_MONITOR && !d->cqpsk_enable
             && d->channel_lpf_profile == DSD_CH_LPF_PROFILE_WIDE)
+               ? 1
+               : 0;
+}
+
+/* Whether the front end is the M17 encoder's monitor (issue #625): FM audio on its WIDE channel, which the encoder's
+   VOX reads. Not the analog family, so no width, detector or tone policy of the family's applies. */
+static inline int
+dsd_demod_encoder_monitor_active(const struct demod_state* d) {
+    return (d && d->m17_encoder_monitor && !d->analog_family && d->output_kind == DSD_DEMOD_OUTPUT_AUDIO_MONITOR
+            && !d->cqpsk_enable && d->channel_lpf_profile == DSD_CH_LPF_PROFILE_WIDE)
+               ? 1
+               : 0;
+}
+
+/* Whether the front end is the FSK discriminator at 9600 bit/s, two levels: EDACS and ProVoice, whose analog voice
+   channel EDACS reads as audio (issue #625). Keyed on the symbol profile, not the channel filter: with the channel LPF
+   off the profile label stays WIDE. */
+static inline int
+dsd_demod_fsk9600_active(const struct demod_state* d) {
+    return (d && !d->analog_family && d->output_kind == DSD_DEMOD_OUTPUT_FSK_DISCRIMINATOR && !d->cqpsk_enable
+            && d->symbol_rate_hz == 9600 && d->symbol_levels == 2)
+               ? 1
+               : 0;
+}
+
+/* Where a dynamic (AUTO or NOISE) squelch runs: the analog monitor, the M17 encoder's monitor and the 9600 bit/s FSK
+   path. A digital channel elsewhere never shows its noise, and CRC/FEC decide its traffic. */
+static inline int
+dsd_demod_dynamic_squelch_path(const struct demod_state* d) {
+    return (dsd_demod_analog_monitor_active(d) || dsd_demod_encoder_monitor_active(d) || dsd_demod_fsk9600_active(d))
                ? 1
                : 0;
 }

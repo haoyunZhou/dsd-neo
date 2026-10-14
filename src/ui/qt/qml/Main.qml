@@ -434,13 +434,13 @@ Window {
             // The frequency field usually still holds focus; the keyboard would
             // cover the session that just appeared.
             Qt.inputMethod.hide();
-            // Reattaching to a session this UI process did not start (service
-            // survived an Activity restart): bound the recent-calls pane to the
-            // last hour rather than the whole persisted log.
-            if (monitorView.minWhen === 0)
-                monitorView.minWhen = Math.floor(Date.now() / 1000) - 3600;
-            if (talkgroups.sinceWhen === 0)
-                talkgroups.sinceWhen = monitorView.minWhen;
+            // The recent-calls pane and the heard talkgroups show the running
+            // session's calls. A start has set this already. A UI reattaching to
+            // a session it did not start (the service survived an Activity
+            // restart) takes the session the history kept, so it sees the calls
+            // its predecessor logged in that session, not the whole persisted log.
+            monitorView.historySession = callHistory.session;
+            talkgroups.historySession = callHistory.session;
         }
     }
 
@@ -550,6 +550,10 @@ Window {
                 mainRoot.startError = qsTr("“%1” has an invalid decryption configuration. Edit the source to correct it.").arg(sys.name);
             } else if (built.error === "unsafe-option") {
                 mainRoot.startError = qsTr("The session contains a prohibited extra option or grouped short options. Remove prohibited options and write each short option separately.");
+            } else if (built.error === "am-needs-radio") {
+                mainRoot.startError = qsTr("“%1” decodes AM, which needs a radio source: network and file audio arrives already demodulated. Edit the source to correct it.").arg(sys.name);
+            } else if (built.error === "am-bandwidth") {
+                mainRoot.startError = qsTr("“%1” decodes AM, whose 6 kHz channel needs a DSP bandwidth of 8 kHz or more. Set the source's bandwidth, or the default bandwidth in Settings, to 8, 12, 16, 24 or 48 kHz.").arg(sys.name);
             } else {
                 mainRoot.startError = qsTr("The session options are invalid. Review them before starting.");
             }
@@ -586,9 +590,14 @@ Window {
         uiController.flushHistory();
         callHistory.sessionLabel = sys.name;
         callHistory.sessionUid = (!scan && sys.uid) ? sys.uid : "";
-        // The monitor's recent-calls pane shows this session, not the whole log.
-        monitorView.minWhen = Math.floor(Date.now() / 1000);
-        talkgroups.sinceWhen = monitorView.minWhen;
+        // A new decode session, begun after its predecessor's tail is logged above.
+        // The monitor's recent-calls pane and the heard talkgroups show this session,
+        // not the whole log. They select the rows the history logs in it, not rows
+        // stamped after a clock reading: a replay's calls carry the capture's time,
+        // and the decode clock may not have moved to it yet.
+        callHistory.beginSession();
+        monitorView.historySession = callHistory.session;
+        talkgroups.historySession = callHistory.session;
     }
 
     /**

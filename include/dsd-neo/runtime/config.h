@@ -15,6 +15,7 @@
 #define DSD_NEO_RUNTIME_CONFIG_H
 
 #include <dsd-neo/core/airspy_config.h>
+#include <dsd-neo/core/analog_tone.h>
 #include <dsd-neo/platform/platform.h>
 
 /* Include schema types first (before extern "C" for C++ compat) */
@@ -165,7 +166,6 @@ typedef struct dsdneoRuntimeConfig {
     double p25_grant_timeout_s;
     double p25_cc_grace_s;
     double p25_vc_grace_s;
-    double p25_ring_hold_s;
     double p25_mac_hold_s;
     double p25_voice_hold_s;
 
@@ -254,7 +254,6 @@ typedef struct dsdneoRuntimeConfig {
     int p25_grant_timeout_is_set;
     int p25_cc_grace_is_set;
     int p25_vc_grace_is_set;
-    int p25_ring_hold_is_set;
     int p25_mac_hold_is_set;
     int p25_voice_hold_is_set;
     int p25_wd_ms_is_set;
@@ -535,7 +534,8 @@ typedef enum DSD_ATTR_PACKED {
     DSDCFG_MODE_TDMA,
     DSDCFG_MODE_ANALOG,
     DSDCFG_MODE_DMR_MONO,
-    DSDCFG_MODE_TETRA
+    DSDCFG_MODE_TETRA,
+    DSDCFG_MODE_AM /* last preset: the analog monitor with the AM envelope detector (IQ radio inputs only; issue #524) */
 } dsdneoUserDecodeMode;
 
 typedef enum DSD_ATTR_PACKED {
@@ -554,10 +554,19 @@ typedef struct dsdneoUserConfig {
     int rtl_device;
     char rtl_freq[64];
     int rtl_gain;
+    int rtl_gain_is_set; /* distinguish explicit 0 (AGC) from omitted; see dsd_user_config_rtl_gain_is_set() */
     int rtl_ppm;
     int rtl_ppm_is_set; /* distinguish explicit 0 from omitted */
     int rtl_bw_khz;
     int rtl_sql;
+    /* rtl_sql_mode (dsd_squelch_mode: 0 level, 1 auto, 2 noise) and rtl_sql_margin_db (the AUTO margin or the NOISE
+       threshold, 3..30; 0 reads as the default 10). rtl_sql keeps the level under every mode. */
+    int rtl_sql_mode;
+    int rtl_sql_margin_db;
+    /* 1 when the config names rtl_sql, rtl_sql_mode or rtl_sql_margin_db; a session's snapshot (radio or audio input)
+       always sets it, so a save always writes them. A PCM source applies the keys a loaded config holds only then
+       (issue #628): a config without them leaves its squelch alone. */
+    int rtl_sql_is_set;
     int rtl_volume;   /* monitor/non-symbol gain; does not scale symbol streams */
     int rtl_auto_ppm; /* bool */
     char rtltcp_host[128];
@@ -674,6 +683,14 @@ typedef struct dsdneoUserConfig {
        and keeps the default. */
     int has_analog;
     int analog_nfm_bandwidth_hz;
+    int analog_am_bandwidth_hz;
+    /* The CTCSS/DCS receive policy (issue #527): tone_filter (dsd_tone_filter_mode, off when left out) and tone_list
+       (the list, empty when left out; off keeps it). A refused list is left empty with analog_tone_list_refused set,
+       and a refused tone_filter keeps the mode already loaded; either way the loader warns, and a list policy without
+       a usable list is applied as off. */
+    int analog_tone_filter;
+    dsd_tone_set analog_tone_set;
+    int analog_tone_list_refused;
 } dsdneoUserConfig;
 
 /**
@@ -730,6 +747,42 @@ int dsd_user_config_load(const char* path, dsdneoUserConfig* cfg);
 int dsd_user_config_save_atomic(const char* path, const dsdneoUserConfig* cfg);
 
 /**
+ * @brief Reset @p cfg to the state the INI loader starts every file from.
+ *
+ * Not all-zero: some keys default to on (group/private/encrypted call tuning,
+ * persisted lockouts, ...), so a config built with dsd_user_config_apply_key()
+ * must start here or an omitted key would read as "off". Safe on NULL.
+ */
+void dsd_user_config_init(dsdneoUserConfig* cfg);
+
+/**
+ * @brief Mark @p section present in @p cfg, as a `[section]` header in a file does.
+ *
+ * Some sections act even with no keys: an empty `[analog]` puts the analog
+ * widths and tone policy back to their defaults. Call it for every section
+ * before applying that section's keys with dsd_user_config_apply_key().
+ *
+ * @return 1 when @p cfg and @p section are valid and the name is shorter than
+ *         64 bytes, 0 otherwise. An unknown section is accepted and ignored.
+ */
+int dsd_user_config_apply_section(dsdneoUserConfig* cfg, const char* section);
+
+/**
+ * @brief Apply a single user-config key/value pair in memory.
+ *
+ * The same `[section] key = value` mapping the INI loader uses, exposed so
+ * embedders (the JSON API) can build a @ref dsdneoUserConfig from structured
+ * input without a file. Start from dsd_user_config_init(). Section and key are
+ * matched case-insensitively; @p value is the text an INI line would carry
+ * after its quotes. An unknown section or key is ignored, as the loader
+ * ignores it.
+ *
+ * @return 1 when @p cfg, @p section and @p key are valid handles and both
+ *         names are shorter than 64 bytes, 0 otherwise.
+ */
+int dsd_user_config_apply_key(dsdneoUserConfig* cfg, const char* section, const char* key, const char* value);
+
+/**
  * @brief Apply config-derived defaults to opts/state before env + CLI precedence.
  *
  * @param cfg User config to apply.
@@ -751,6 +804,15 @@ void dsd_apply_user_config_to_opts(const dsdneoUserConfig* cfg, dsd_opts* opts, 
  *         sets a non-radio input (or on bad arguments).
  */
 int dsd_user_config_radio_input_spec(const dsdneoUserConfig* cfg, const dsd_opts* opts, char* out, size_t out_size);
+
+/**
+ * @brief Whether @p cfg names a tuner gain: an `rtl_gain` key that was read (0 included, which is AGC), or a nonzero
+ * gain set in code. An omitted gain leaves the gain the session runs.
+ */
+static inline int
+dsd_user_config_rtl_gain_is_set(const dsdneoUserConfig* cfg) {
+    return cfg && (cfg->rtl_gain_is_set || cfg->rtl_gain != 0);
+}
 
 /**
  * @brief Apply config defaults before CLI parsing without activating file-rate timing yet.

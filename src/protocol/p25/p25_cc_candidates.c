@@ -9,7 +9,6 @@
  * reused by tests and UI code without pulling in tuning policy.
  */
 
-#include <dsd-neo/core/dsd_time.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/state.h>
 #include <dsd-neo/core/state_ext.h>
@@ -17,7 +16,9 @@
 #include <dsd-neo/protocol/p25/p25_cc_candidates.h>
 #include <dsd-neo/protocol/p25/p25_frequency.h>
 #include <dsd-neo/runtime/config.h>
+#include <dsd-neo/runtime/decode_clock.h>
 #include <dsd-neo/runtime/trunk_cc_candidates.h>
+#include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -68,8 +69,7 @@ p25_cc_next_candidate(dsd_state* state, long* out_freq) {
     if (!state || !out_freq) {
         return 0;
     }
-    return dsd_trunk_cc_candidates_next(state, dsd_time_now_monotonic_s(), DSD_TRUNK_CC_CANDIDATE_CURRENT_SITE,
-                                        out_freq);
+    return dsd_trunk_cc_candidates_next(state, dsd_decode_now_mono_s(), DSD_TRUNK_CC_CANDIDATE_CURRENT_SITE, out_freq);
 }
 
 static int
@@ -131,8 +131,11 @@ p25_cc_parse_cache_line(char* line, long* out_freq_hz) {
         return 0;
     }
 
+    /* strtol() clamps an overflow to LONG_MAX, which on Windows is itself a plausible frequency; reject it, and
+       anything past the trunk ceiling, rather than load a control channel nobody cached. */
+    errno = 0;
     long freq_hz = strtol(p, &end, 10);
-    if (end == p || freq_hz <= 0) {
+    if (end == p || errno != 0 || freq_hz <= 0 || freq_hz > DSD_TRUNK_FREQ_MAX_HZ) {
         return 0;
     }
 
@@ -332,7 +335,7 @@ p25_nb_record_update(dsd_state* state, const p25_neighbor_record_update_t* updat
     }
 
     int has_site_identity = p25_nb_has_site_identity(&update->announcement);
-    time_t now = time(NULL);
+    time_t now = dsd_decode_time();
 
     /* Structured neighbor broadcasts identify sites. Keep those entries keyed
      * by site identity so frequency reuse does not merge distinct neighbors. */
@@ -354,7 +357,7 @@ p25_nb_tick(dsd_state* state) {
     if (!state) {
         return;
     }
-    time_t now = time(NULL);
+    time_t now = dsd_decode_time();
     int w = 0;
     for (int i = 0; i < state->p25_nb_count && i < P25_NB_MAX; i++) {
         long f = state->p25_nb_entries[i].freq;
@@ -603,7 +606,7 @@ p25_secondary_cc_store(dsd_state* state, long freq, uint16_t channel, uint8_t rf
     if (!state || freq <= 0 || !p25_pending_channel_valid(channel)) {
         return 0;
     }
-    time_t now = time(NULL);
+    time_t now = dsd_decode_time();
     int count = state->p25_secondary_cc_count;
     if (count < 0) {
         count = 0;
@@ -725,7 +728,7 @@ p25_pending_store(dsd_state* state, const p25_pending_update_t* update) {
         return;
     }
 
-    time_t now = time(NULL);
+    time_t now = dsd_decode_time();
     p25_pending_announcement_t* entry = p25_pending_find(state, update);
     if (!entry) {
         entry = p25_pending_select_slot(state);

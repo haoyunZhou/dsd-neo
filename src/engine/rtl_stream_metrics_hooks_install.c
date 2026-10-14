@@ -3,6 +3,7 @@
  * Copyright (C) 2026 by arancormonk <180709949+arancormonk@users.noreply.github.com>
  */
 
+#include <dsd-neo/core/power.h>
 #include <dsd-neo/runtime/config.h>
 #include <dsd-neo/runtime/rtl_stream_metrics_hooks.h>
 #include <stddef.h>
@@ -37,6 +38,33 @@ static void
 rtl_stream_metrics_set_channel_squelch(double mean_power) {
     rtl_stream_set_channel_squelch((float)mean_power);
 }
+
+static void
+rtl_stream_metrics_set_channel_squelch_setting(const dsd_squelch_setting* setting) {
+    rtl_stream_set_channel_squelch_setting(setting);
+}
+
+/* The fields DSP reads of the replay batch tag: the labels, the media span its samples run the decode clock on, and the
+ * centre they were captured on (issue #575). The decoder thread calls it while the stream is open, the one thread
+ * rtl_stream_get_replay_batch() may be called on. */
+static int
+rtl_stream_metrics_replay_batch(dsd_rtl_stream_replay_batch* out) {
+    rtl_stream_replay_batch tag;
+    if (!out || rtl_stream_get_replay_batch(&tag) != 0) {
+        return 0;
+    }
+    out->generation = tag.output_generation;
+    out->output_kind = tag.output_kind;
+    out->channel_profile = tag.channel_profile;
+    out->symbol_rate_hz = tag.symbol_rate_hz;
+    out->levels = tag.symbol_levels;
+    out->media_start_ns = tag.media_start_ns;
+    out->media_duration_ns = tag.media_duration_ns;
+    out->output_count = tag.output_count;
+    out->first_index = tag.first_index;
+    out->center_frequency_hz = tag.center_frequency_hz;
+    return 1;
+}
 #endif
 
 void
@@ -49,8 +77,10 @@ dsd_engine_rtl_stream_metrics_hooks_install(void) {
     hooks.stream_generation = rtl_stream_output_generation;
     hooks.apply_demod_profile = rtl_stream_metrics_apply_demod_profile;
     hooks.apply_analog_profile = rtl_stream_request_analog_profile;
+    hooks.request_digital_family_landing = rtl_stream_request_digital_family_landing;
     hooks.analog_profile = rtl_stream_get_analog_profile;
     hooks.analog_family_active = rtl_stream_analog_family_active;
+    hooks.family_landing_after_pending = rtl_stream_family_landing_after_pending;
     hooks.output_rate_for_family = rtl_stream_output_rate_for_family;
     hooks.cqpsk_status = rtl_stream_get_cqpsk_status;
     hooks.request_cqpsk_reacquire = rtl_stream_request_cqpsk_reacquire;
@@ -67,6 +97,8 @@ dsd_engine_rtl_stream_metrics_hooks_install(void) {
     hooks.stream_active = rtl_stream_is_active;
     hooks.input_level = rtl_stream_get_input_level;
     hooks.set_channel_squelch = rtl_stream_metrics_set_channel_squelch;
+    hooks.set_channel_squelch_setting = rtl_stream_metrics_set_channel_squelch_setting;
+    hooks.replay_batch = rtl_stream_metrics_replay_batch;
 #endif
     dsd_rtl_stream_metrics_hooks_set(&hooks);
 }

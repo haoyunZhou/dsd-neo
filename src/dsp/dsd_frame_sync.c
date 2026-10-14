@@ -42,10 +42,12 @@
 #include <dsd-neo/platform/atomic_compat.h>
 #include <dsd-neo/runtime/colors.h>
 #include <dsd-neo/runtime/config.h>
+#include <dsd-neo/runtime/decode_clock.h>
 #include <dsd-neo/runtime/decode_mode.h>
 #include <dsd-neo/runtime/exitflag.h>
 #include <dsd-neo/runtime/frame_sync_hooks.h>
 #include <dsd-neo/runtime/shutdown.h>
+#include <dsd-neo/runtime/squelch.h>
 #include <dsd-neo/runtime/telemetry.h>
 #include <limits.h>
 #include <math.h>
@@ -56,7 +58,6 @@
 #include "dsd-neo/core/opts_fwd.h"
 #include "dsd-neo/core/safe_api.h"
 #include "dsd-neo/core/state_fwd.h"
-#include "dsd-neo/platform/timing.h"
 #include "frame_sync_internal.h"
 #include "frame_sync_level.h"
 #ifdef DSD_NEO_TEST_HOOKS
@@ -210,24 +211,47 @@ static atomic_int g_vote_gfsk = 0;
 static atomic_int g_ham_c4fm_recent = 24;
 static atomic_int g_ham_qpsk_recent = 24;
 static atomic_int g_ham_gfsk_recent = 24;
-static atomic_int g_qpsk_dwell_enter_ms = 0;
+/* The decode-mono ms the current CQPSK dwell began at (qpsk_dwell_arm()), 0 while none is armed. Unsigned and full
+   width: under a replay the decode clock reads capture time, far past INT_MAX ms, and the dwell checks subtract it
+   unsigned (frame_sync_in_qpsk_dwell()). */
+static dsd_atomic_u64 g_qpsk_dwell_enter_ms = {0};
 static dsd_atomic_u64 g_frame_sync_ui_last_publish_ms = {0};
+
+static void
+qpsk_dwell_arm(void) {
+    dsd_atomic_u64_store_release(&g_qpsk_dwell_enter_ms, dsd_decode_now_mono_ms());
+}
+
+static void
+qpsk_dwell_disarm(void) {
+    dsd_atomic_u64_store_release(&g_qpsk_dwell_enter_ms, 0U);
+}
+
+/* Inside the 2 s CQPSK dwell: on CQPSK, armed, and less than 2 s of decode time since it was armed. */
+static int
+frame_sync_in_qpsk_dwell(const dsd_state* state) {
+    const uint64_t dwell_enter_ms = dsd_atomic_u64_load_acquire(&g_qpsk_dwell_enter_ms);
+    return (state->rf_mod == 1 && dwell_enter_ms != 0U && dsd_decode_now_mono_ms() - dwell_enter_ms < 2000U) ? 1 : 0;
+}
 
 enum { DSD_FRAME_SYNC_UI_PUBLISH_INTERVAL_MS = 50 };
 
 static void
-frame_sync_publish_ui_throttled(const dsd_opts* opts, const dsd_state* state) {
+frame_sync_publish_ui_throttled(const dsd_opts* opts, dsd_state* state) {
     if (!dsd_telemetry_is_active()) {
         return;
     }
 
-    const uint64_t now_ms = dsd_time_monotonic_ms();
+    const uint64_t now_ms = dsd_realtime_mono_ms();
     const uint64_t last_ms = dsd_atomic_u64_load_relaxed(&g_frame_sync_ui_last_publish_ms);
     if (last_ms != 0 && (now_ms - last_ms) < DSD_FRAME_SYNC_UI_PUBLISH_INTERVAL_MS) {
         return;
     }
 
     dsd_atomic_u64_store_relaxed(&g_frame_sync_ui_last_publish_ms, now_ms);
+    /* The dynamic squelch's state, as the stream shows it now (issue #518 follow-up), or the PCM noise squelch's
+       (issue #628). */
+    dsd_squelch_publish_status(opts, state);
     dsd_telemetry_publish_both_and_redraw(opts, state);
 }
 
@@ -250,8 +274,8 @@ p25p2_note_sync_activity(dsd_opts* opts, dsd_state* state) {
         return;
     }
 
-    const time_t now = time(NULL);
-    const double nowm = dsd_time_now_monotonic_s();
+    const time_t now = dsd_decode_time();
+    const double nowm = dsd_decode_now_mono_s();
     state->last_cc_sync_time = now;
     state->last_cc_sync_time_m = nowm;
 }
@@ -264,7 +288,7 @@ dsd_frame_sync_reset_mod_state(void) {
     atomic_store(&g_ham_c4fm_recent, 24);
     atomic_store(&g_ham_qpsk_recent, 24);
     atomic_store(&g_ham_gfsk_recent, 24);
-    atomic_store(&g_qpsk_dwell_enter_ms, 0);
+    qpsk_dwell_disarm();
 }
 
 /*
@@ -280,7 +304,7 @@ printFrameSync(const dsd_opts* opts, const dsd_state* state, const char* framety
     UNUSED3(state, offset, modulation);
 
     char timestr[9];
-    (void)dsd_format_local_datetime(time(NULL), DSD_LOCAL_DATETIME_TIME_COLON, timestr, sizeof timestr);
+    (void)dsd_format_local_datetime(dsd_decode_time(), DSD_LOCAL_DATETIME_TIME_COLON, timestr, sizeof timestr);
     if (opts->verbose > 0) {
         DSD_FPRINTF(stderr, "%s ", timestr);
         DSD_FPRINTF(stderr, "Sync: %s ", frametype);
@@ -2169,9 +2193,7 @@ frame_sync_bias_want_mod_with_snr(const dsd_opts* opts, const dsd_state* state, 
 
     const double kQpskOffsetDb = 6.0;
     double normalized_delta = (snr_q - kQpskOffsetDb) - snr_c;
-    uint32_t now_ms = (uint32_t)dsd_time_monotonic_ms();
-    uint32_t dwell_enter_ms = (uint32_t)atomic_load(&g_qpsk_dwell_enter_ms);
-    int in_qpsk_dwell = (state->rf_mod == 1 && dwell_enter_ms != 0 && (uint32_t)(now_ms - dwell_enter_ms) < 2000U);
+    int in_qpsk_dwell = frame_sync_in_qpsk_dwell(state);
     if (normalized_delta >= 2.0) {
         return 1;
     }
@@ -2317,10 +2339,7 @@ frame_sync_update_mod_votes(int want_mod) {
 
 static int
 frame_sync_decide_mod_switch(const dsd_state* state, int want_mod) {
-    uint32_t now_ms = (uint32_t)dsd_time_monotonic_ms();
-    uint32_t dwell_enter_ms = (uint32_t)atomic_load(&g_qpsk_dwell_enter_ms);
-    int in_qpsk_dwell2 = (state->rf_mod == 1 && dwell_enter_ms != 0 && (uint32_t)(now_ms - dwell_enter_ms) < 2000U);
-    int req_c4_votes = (state->rf_mod == 1) ? (in_qpsk_dwell2 ? 5 : 3) : 2;
+    int req_c4_votes = (state->rf_mod == 1) ? (frame_sync_in_qpsk_dwell(state) ? 5 : 3) : 2;
     int vote_qpsk = atomic_load(&g_vote_qpsk);
     int vote_gfsk = atomic_load(&g_vote_gfsk);
     int vote_c4fm = atomic_load(&g_vote_c4fm);
@@ -2342,9 +2361,9 @@ frame_sync_apply_mod_switch(const dsd_opts* opts, dsd_state* state, int do_switc
         return;
     }
     if (do_switch == 1) {
-        atomic_store(&g_qpsk_dwell_enter_ms, (int)(uint32_t)dsd_time_monotonic_ms());
+        qpsk_dwell_arm();
     } else if (state->rf_mod == 1) {
-        atomic_store(&g_qpsk_dwell_enter_ms, 0);
+        qpsk_dwell_disarm();
     }
     state->rf_mod = do_switch;
 #ifdef USE_RADIO
@@ -2396,7 +2415,7 @@ dsd_frame_sync_test_set_recent_hamming(int ham_c4fm, int ham_qpsk, int ham_gfsk)
 
 int
 dsd_frame_sync_test_qpsk_dwell_armed(void) {
-    return atomic_load(&g_qpsk_dwell_enter_ms) != 0;
+    return dsd_atomic_u64_load_acquire(&g_qpsk_dwell_enter_ms) != 0U;
 }
 
 void
@@ -2834,7 +2853,8 @@ frame_sync_should_skip_snr_or_power_gate(const dsd_opts* opts, const dsd_state* 
         }
     }
 #endif
-    if (opts->audio_in_type == AUDIO_IN_RTL && opts->rtl_pwr < opts->rtl_squelch_level && active_modulation == 2) {
+    if (opts->audio_in_type == AUDIO_IN_RTL && opts->rtl_pwr < dsd_squelch_level_in_force(opts)
+        && active_modulation == 2) {
         return 1;
     }
     return 0;
@@ -3353,7 +3373,7 @@ frame_sync_normalize_profile_modulation(dsd_state* state, int normalize, int mod
     }
     dsd_frame_sync_reset_mod_state();
     if (normalize && modulation == 1) {
-        atomic_store(&g_qpsk_dwell_enter_ms, (int)(uint32_t)dsd_time_monotonic_ms());
+        qpsk_dwell_arm();
     }
 }
 
@@ -3564,20 +3584,10 @@ frame_sync_sps_hunt_note_handler_consumption(dsd_state* state) {
     uint32_t consumed = state->symbolcnt - state->sps_hunt_symbolcnt_mark;
     if (consumed > (uint32_t)INT_MAX) {
         /* symbolcnt went backwards, so an unrelated subsystem zeroed it rather than a
-         * handler having consumed 4 billion symbols: nxdn_reset_after_cac_fail(),
-         * initState() on an in-process restart, and print_datascope() on each refresh.
-         * Credit nothing; the mark below re-anchors the measurement on the next call.
-         *
-         * The datascope is the only one of the three that can zero it faster than handlers
-         * consume -- once every opts->ssize symbols after the count passes
-         * 4800/opts->scoperate, so a few hundred symbols apart -- which means an interval
-         * that really did decode a frame can straddle a reset and be credited nothing.
-         * That is accepted here rather than worked around: nothing in the tree ever sets
-         * opts->datascope to 1, so the display is unreachable and the overlap is latent,
-         * and a missed credit costs only the debit, leaving the hunt on the undebited
-         * dwell it had before #390 rather than mis-crediting anything. Wiring the
-         * datascope back to a switch means giving its reset a form this can tell apart
-         * from a rollover. */
+         * handler having consumed 4 billion symbols: nxdn_reset_after_cac_fail(), or
+         * initState() on an in-process restart. Credit nothing; the mark below re-anchors
+         * the measurement on the next call. (The datascope times its refresh from its own
+         * mark and leaves the count running.) */
         consumed = 0;
     }
     if (proven) {
@@ -3688,7 +3698,7 @@ frame_sync_maybe_probe_p25p1_cqpsk(const dsd_opts* opts, dsd_state* state, int p
     state->rf_mod = probe_qpsk;
     state->p25_p1_mod_probe_active = 1;
     if (probe_qpsk) {
-        atomic_store(&g_qpsk_dwell_enter_ms, (int)(uint32_t)dsd_time_monotonic_ms());
+        qpsk_dwell_arm();
     }
 #ifdef USE_RADIO
     rtl_maybe_apply_active_demod_profile(opts, state);
@@ -3777,23 +3787,19 @@ frame_sync_elapsed_seconds(double nowm, time_t now, double mono_stamp, time_t wa
     return 1e9;
 }
 
+// A slot is active while its audio gate is open, until the voice sync is a hangtime old, or while its MAC signalling
+// is fresh. What the output still holds is no activity: the P25 Phase 2 playout drains it in either format (issue
+// #651).
 void
 frame_sync_p25_slot_activity(const dsd_opts* opts, const dsd_state* state, time_t now, double nowm, double mac_hold,
-                             double ring_hold, double dt, int* left_active, int* right_active) {
+                             double dt, int* left_active, int* right_active) {
     double l_dmac =
         frame_sync_elapsed_seconds(nowm, now, state->p25_p2_last_mac_active_m[0], state->p25_p2_last_mac_active[0]);
     double r_dmac =
         frame_sync_elapsed_seconds(nowm, now, state->p25_p2_last_mac_active_m[1], state->p25_p2_last_mac_active[1]);
-    int l_ring = (state->p25_p2_audio_ring_count[0] > 0) && (l_dmac <= ring_hold);
-    int r_ring = (state->p25_p2_audio_ring_count[1] > 0) && (r_dmac <= ring_hold);
-    int left_has_audio = state->p25_p2_audio_allowed[0] || l_ring;
-    int right_has_audio = state->p25_p2_audio_allowed[1] || r_ring;
-    if (dt >= opts->trunk_hangtime) {
-        left_has_audio = l_ring;
-        right_has_audio = r_ring;
-    }
-    *left_active = left_has_audio || (l_dmac <= mac_hold);
-    *right_active = right_has_audio || (r_dmac <= mac_hold);
+    const int gates_count = dt < opts->trunk_hangtime;
+    *left_active = (gates_count && state->p25_p2_audio_allowed[0]) || (l_dmac <= mac_hold);
+    *right_active = (gates_count && state->p25_p2_audio_allowed[1]) || (r_dmac <= mac_hold);
 }
 
 static void
@@ -3801,7 +3807,7 @@ frame_sync_no_sync_try_p25_release(dsd_opts* opts, dsd_state* state, time_t now)
     if (!(opts->trunk_enable == 1 && opts->trunk_is_tuned == 1)) {
         return;
     }
-    double fallback_nowm = dsd_time_now_monotonic_s();
+    double fallback_nowm = dsd_decode_now_mono_s();
     double dt = frame_sync_elapsed_seconds(fallback_nowm, now, state->last_vc_sync_time_m, state->last_vc_sync_time);
     double dt_since_tune =
         frame_sync_elapsed_seconds(fallback_nowm, now, state->p25_last_vc_tune_time_m, state->p25_last_vc_tune_time);
@@ -3813,11 +3819,10 @@ frame_sync_no_sync_try_p25_release(dsd_opts* opts, dsd_state* state, time_t now)
     }
     double vc_grace = cfg_hold ? cfg_hold->p25_vc_grace_s : 0.75;
     int is_p2_vc = (state->p25_p2_active_slot != -1);
-    double ring_hold = cfg_hold ? cfg_hold->p25_ring_hold_s : 0.75;
     double mac_hold = cfg_hold ? cfg_hold->p25_mac_hold_s : 0.75;
     int left_active = 0;
     int right_active = 0;
-    frame_sync_p25_slot_activity(opts, state, now, fallback_nowm, mac_hold, ring_hold, dt, &left_active, &right_active);
+    frame_sync_p25_slot_activity(opts, state, now, fallback_nowm, mac_hold, dt, &left_active, &right_active);
     int both_slots_idle = (!is_p2_vc) ? 1 : !(left_active || right_active);
     if (dt >= opts->trunk_hangtime && both_slots_idle && dt_since_tune >= vc_grace) {
         dsd_frame_sync_hook_p25_sm_release(opts, state);
@@ -3869,7 +3874,7 @@ int
 dsd_frame_sync_test_handle_no_sync_timeout(dsd_opts* opts, dsd_state* state, int synctest_pos) {
     frame_sync_runtime_ctx rt = {0};
     rt.synctest_pos = synctest_pos;
-    return frame_sync_handle_no_sync_timeout(opts, state, &rt, time(NULL));
+    return frame_sync_handle_no_sync_timeout(opts, state, &rt, dsd_decode_time());
 }
 #endif
 
@@ -3913,8 +3918,8 @@ getFrameSync(dsd_opts* opts, dsd_state* state) {
         return -1;
     }
 
-    const time_t now = time(NULL);
-    const double nowm = dsd_time_now_monotonic_s();
+    const time_t now = dsd_decode_time();
+    const double nowm = dsd_decode_now_mono_s();
     frame_sync_maybe_tick_p25_trunk_sm(opts, state, now);
     frame_sync_apply_cli_mod_lock(opts, state);
     frame_sync_sps_hunt_note_handler_consumption(state);
@@ -3934,6 +3939,13 @@ getFrameSync(dsd_opts* opts, dsd_state* state) {
         }
 
         rt.symbol = getSymbol(opts, state, 0);
+        if (state->input_interrupted) {
+            /* The read left a silent input's wait for a queued command, or the input ended (issue #634): no symbol
+               came and no pass ran, so nothing of it is counted. The engine loop applies the command or switches
+               the input, and the next call hunts afresh. */
+            frame_sync_sps_hunt_mark_return(state);
+            return DSD_SYNC_NONE;
+        }
         frame_sync_update_symbol_ring(opts, state, rt.symbol, rt.lbuf, &rt.lidx, &rt.level_count, rt.t_max);
         frame_sync_maybe_auto_switch_modulation(opts, state, rt.t_max, &rt.lastt);
         rt.dibit = frame_sync_process_dibit_and_payload(opts, state, rt.symbol);

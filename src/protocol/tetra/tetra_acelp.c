@@ -12,6 +12,7 @@
 #include <dsd-neo/platform/file_compat.h>
 #include <dsd-neo/runtime/udp_audio_hooks.h>
 #include <dsd-neo/core/dsd_time.h>
+#include <dsd-neo/runtime/decode_clock.h>
 #include <sndfile.h>
 #include <stdlib.h>
 #include <string.h>
@@ -740,7 +741,7 @@ static void tetra_acelp_process_impl(const uint8_t *type2_bits, int type2_len,
      * PCM remains untouched. */
     if (opts->audio_out_type == 0 && opts->audio_out_stream &&
         opts->slot1_on == 1 && opts->pulse_digi_rate_out == 8000) {
-        const double now = dsd_time_now_monotonic_s();
+        const double now = dsd_realtime_mono_s();
         if (last_live_audio_stream != opts->audio_out_stream ||
             last_live_audio_time <= 0.0 || now - last_live_audio_time > 0.25) {
             const int16_t prefill[640] = {0}; /* 80 ms at 8 kHz */

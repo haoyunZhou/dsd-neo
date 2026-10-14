@@ -31,8 +31,13 @@ ctest --preset dev-debug --output-on-failure
 
 `DMR_EVENT_CRC` exercises real header, assembler, application decoder, history and event-file paths:
 strict rejection, marked relaxed recovery, header-chain failures, encrypted notices, UDT text detail
-lines, a BPTC-encoded RAS-shaped header, slot isolation and clean subsequent packets. Its unchanged
-MNIS LRRP vector comes from [DSD-FME issue 283](https://github.com/lwvmobile/dsd-fme/issues/283).
+lines, slot isolation and clean subsequent packets. Its RAS cases build BPTC-encoded bursts with the RAS
+reserved bits (a data header, UDT, a DPF 15 chain, confirmed rate-1/2 blocks, an MBC grant whose header and
+continuation both go through the real burst handler, so its channel-learning notice carries the MBC's
+provenance, and a voice LC header) and pin the exact provenance bits: `[RAS]` at ordinary severity for RAS
+alone, `[CRC ERR]` once any check fails, and no RAS at all under the separate relaxed-CRC configuration,
+which never runs the heuristic. Its unchanged MNIS LRRP vector comes from
+[DSD-FME issue 283](https://github.com/lwvmobile/dsd-fme/issues/283).
 The 46 received octets end in CRC `0FE81D14`; the two extra zero octets in that issue's dump are buffer
 fill. The former CRC span computes `FF38D9C7`, while the corrected span matches the transmitted value.
 A one-bit payload mutation must not publish in strict mode. With `-F` and `-L`, the clean captured MNIS
@@ -43,10 +48,16 @@ packet must append exactly one location row, while the CRC32-failed packet must 
 CRC-failed location rows, with slot isolation and both file date formats; the LIP vectors follow
 TS 102 361-4 Table 6.79 and TS 100 392-18-1 Table 6.1. `DMR_USBD_LIP_LRRP_CRC` runs
 BPTC-encoded USBD LIP bursts through the real burst handler in strict and relaxed/RAS modes, checking
-decoded coordinates, file rows, unchanged state strings and CRC-flag restoration. `DMR_FLCO_MONO_CRC_SCOPE`
-covers the mono-mode CRC carry, and `DMR_LIP_CARRIERS` covers UDT and UDP-carried LIP.
+decoded coordinates, file rows, CRC-flag restoration, and that strict mode decodes no CRC-failed USBD and
+leaves an active call unmarked. `DMR_FLCO_MONO_CRC_SCOPE` covers the mono-mode CRC carry for every
+provenance value, and `DMR_LIP_CARRIERS` covers UDT and UDP-carried LIP. `DMR_EMBEDDED_LC_CHECKSUM` checks,
+under strict CRC, `-F` and the relaxed-CRC configuration, that an embedded talker alias or GPS LC whose 5-bit
+checksum failed applies nothing and marks nothing, abandons the alias being assembled (so old text cannot
+reappear over a later gap), and that an LC which failed its check refreshes no scan hold.
+`DMR_T3_SM_RETURN_TO_CC_MATRIX` carries a RAS grant's provenance to the call it publishes at voice sync, on
+either slot, and clears it on release.
 `DMR_LRRP_EVENT_CRC_GATING` checks LOCN (including the short-data entry point) and UDP ports 4001/49198
-against the event CRC verdict, including the LRRP suppression summary and clean rows.
+against the event CRC verdict, including the LRRP suppression summary (`CRC ERR` or `RAS`) and clean rows.
 `DMR_LRRP_CRC_GATING` remains the token-level counterpart over `dmr_pdu.c`. `FEC_BPTC_RS` and
 `DMR_LC_RS_VERDICT` pin RS(12,9) rejection of root-less, multiple-root and residual-syndrome words.
 
@@ -66,11 +77,17 @@ with a passing packet CRC32. Those domains are distinct in
 §§6.2–6.4, and independently in
 [SDRTrunk's confirmed blocks](https://github.com/DSheirer/sdrtrunk/blob/master/src/main/java/io/github/dsheirer/module/decode/p25/phase1/message/pdu/block/ConfirmedDataBlock.java).
 `CORE_CALL_ALERT_HISTORY` covers marker placement, warning severity, long notices, detail lines and
-delayed/reacquired voice history. Strict suppression is decoder policy, not a specification requirement
-for passive-receiver user interfaces. A failed standard CRC can also be intentional:
+delayed/reacquired voice history, plus the `[RAS]` marker and its escalation: a failure on a RAS call
+swaps the staged row's marker on re-render and a committed row's in place (also at full row capacity),
+a reacquired failure merges into a RAS row as `[CRC ERR]` with a matching `Reacquired:` line, a scan
+channel labelled `[RAS]` is never taken for a marker, and late detail appends nothing to `-J`. `API_SERVER`
+pins the feed's `crc_invalid`/`crc_ras` flags. Strict suppression is decoder policy, not a specification
+requirement for passive-receiver user interfaces. A failed standard CRC can also be intentional:
 [Motorola's private-CRC patent](https://patents.google.com/patent/US8914699B2/en) and
 [independent RAS documentation](https://cwh050.mywikis.wiki/wiki/Restricted_Access_to_System) explain why
-suspected RAS is marked as a failed check rather than asserted to be corrupted or authenticated.
+suspected RAS is marked `[RAS]` -- unverified, neither asserted to be corrupted nor authenticated -- rather
+than as a failed check. On a RAS system every header fails the standard check, so marking them as
+failures would leave the marker no signal (discussion #602).
 
 ### Known-key MBE playback
 
@@ -78,17 +95,92 @@ suspected RAS is marked as a failed check rather than asserted to be corrupted o
 typed live commands and legacy live commands, in both slots. `UI_KEY_CLEANUP` observes production volatile erasure
 while handler and TYT buffers are still alive.
 
-`UI_QT_ANDROID_HOST` runs Android host lifecycle publication with a desktop transport fixture. `ANDROID_LOCATION_JVM`
-runs the production Kotlin location broker and geocoder queue with deterministic platform stubs, without an Android
-build or emulator. It uses `kotlinc` or a cached Gradle Kotlin compiler plus Java; missing tools skip the CTest entry.
-Android CI runs `python3 tests/android/run_location_tests.py --require-tools` after its APK build, when the compiler
-is cached. Qt persistence tests use disposable directories and do not require a writable home on Linux.
+`UI_QT_ANDROID_HOST` runs Android host lifecycle publication with a desktop transport fixture. The `ANDROID_*_JVM` tests
+run production Android Kotlin on the plain JVM, without an Android build or emulator, one suite of
+`tests/android/run_jvm_tests.py` each (`--suite <name>`, repeatable; all suites by default): `ANDROID_LOCATION_JVM` runs
+the location broker and geocoder queue with deterministic platform stubs, `ANDROID_DECODER_STATUS_JVM` runs
+`DecoderStatus.kt`, the notification status record's reader, with no stubs, and `ANDROID_SCREEN_POLICY_JVM` (the
+`screen` suite) runs the screen modes' policy and pure adapters (`ScreenPolicy.kt`, `ScreenController.kt`,
+`ScreenWake.kt`, `StatusFeed.kt`, `ActivitySlot.kt`, with `DecoderStatus.kt`) with no stubs at all, so an `android.*`
+import in any of them fails the compile, then `ScreenLocks.kt` (with `ScreenWake.kt`) on its own against a
+`PowerManager` stub that models reference counting and the screen's interactive state.
+`ScreenPolicyTest.kt` takes the policy through each row of its transition table and through whole histories on an
+injected clock: sleeping in front with either callback order, split screen, an own wake whose screen goes off on time or
+late, an own wake followed by use in front (after an unlock, or with no lock screen) whose next sleep arms afresh, the
+power snooze and the synchronous sample before it (the session's first readable one included, which counts but never
+wakes), a stamp delivered late or with age -1, a call heard after the screen went off in front but before the activity
+stopped, on either side of the first loss callback and of the screen-off broadcast (woken by the last of the stop and
+the broadcast, and never snoozed by an off it followed), Android's verdict asked only for a sample that would wake, and
+the `AudioManager` and Do Not Disturb mapping, and a wake asked for over a screen someone else turned on, whose
+broadcast then disarms; `ScreenControllerTest.kt` the make-before-break order, lease renewal, wake refusal and which
+screen-on is DSD-neo's own wake (none after a refused pulse, nor after a wake that found the screen already on before
+its broadcast, while an own pulse's pending screen-on keeps its claim). The issue #574 follow-up regression repeats
+three lock-screen wake cycles with broadcast delays from 0 to 10 s, including the old 2 s cutoff; it also checks that
+screen-off, unlock, Activity destruction and session changes cancel pending claims, and that screen-off keeps the
+claim of a new pulse it triggers for held audio. `ScreenLocksTest.kt` checks that a screen already on
+is never pulsed; `StatusFeedTest.kt`
+that the verdict is handed on unasked; `ScreenTouchTest.kt` the gesture latch and the TalkBack exception. Each suite
+compiles its own files, each build in a suite its own set, and the CTest entries share a resource lock so two Kotlin
+compiles never run at once. `DecoderStatusTest.kt` parses the same golden v3 record literal that
+`APP_CONTROL_NOTIFICATION_STATUS` makes the C encoder write; the `decoder_status` suite reads both literals before
+compiling (and before looking for the tools) and fails when they differ. The runner uses `kotlinc` or a cached Gradle
+Kotlin compiler plus Java; missing tools skip the CTest entries. Android CI runs
+`python3 tests/android/run_jvm_tests.py --require-tools` after its APK build, when the compiler is cached. Qt
+persistence tests use disposable directories and do not require a writable home on Linux.
+
+The P25 Phase 2 voice playout (issue #651) is tested end to end by `P25_P2_VOICE_OUTPUT`: timeslots run through the real
+DUID dispatch with seeded DUIDs and `p2_scramble_offset`, and a stand-in `processMbeFrameSoft()` tags every frame (each
+short sample holds a per-slot sequence number, which float output writes as f32, the sample / 32768). Each case reads
+every block from the UDP blast hook and checks that both slots play every frame once, in order, side by side, and as
+each timeslot pair completes. It uses only interfaces the decoder had before the playout, so it also runs against the
+earlier mixers, where it fails. A MAC message that has to arrive between two timeslots of a window comes from the
+stand-in vocoder's hook. `CORE_P25P2_PLAYOUT` drives the playout's API directly (the fill rule over every 2V position,
+epochs, verdicts, routing, the static WAV through a real libsndfile file).
+
+Float output (`-y`, issue #652) is the integer output written as f32, so its end-to-end cases compare the two formats
+rather than pin levels: each `DECODE_IQ_FLOAT_OUTPUT_*` case (`tests/iq_float_output_check.cmake`, label `float-output`)
+replays a voice fixture twice, without and with `-y`, each to stdout and a static WAV, and the comparator
+(`tests/core/float_output_compare.c`) requires every float sample to equal the 16-bit sample / 32768 bit for bit, audio
+in the stream, and byte-identical static WAVs; options check a single call in both ears, a call both formats mute, and
+`-o null`. Replays decode identically within one build ("Replay determinism"), so the two runs see the same frames.
+
+The audible-audio stamp (`<dsd-neo/core/audio_activity.h>`, issue #574) is tested where each writer emits, and every
+writer case asserts both the captured output and the stamp, so audio that plays without stamping, or a stamp with
+nothing played, fails. Each writer family also has negative controls for the null output (type 9 with `audio_out` 1,
+as an unmuted `-o null` session runs) and a local stream that is not open. `CORE_AUDIO_ACTIVITY` covers the API: an
+unarmed note reads no clock and stores nothing, arming, the age and its 60 s expiry, reset, a writer, reader and
+resetter racing (run it under the `tsan-debug` preset too), and the shared output rule every writer stamps under.
+`CORE_AUDIO2_HELPERS` drives the mixers with stubbed gates, in both output formats, the DMR fresh-media marks included
+(a repeated mix with nothing new, muted media beside an idle slot, a discard); `CORE_MBE_TRANSFORM_CONTEXT` the real
+vocoder into the real SS3 mix in both output formats (its clear, encrypted, reverse-mute, unmute and forced-clear
+matrix, skipped bursts, decoded all-zero
+samples, a talkgroup hold, a muted burst over a clear one not yet mixed, and a slot SS3's output policy copies over its
+companion, on stereo and mono output); `CORE_AUDIO_GAIN` the legacy short output; `P25_P2_MIXER_GATE` the P25 Phase 2
+playout under the real gates in both formats (a slot with frames heard whichever slot a hold or the last burst would
+have preferred, the release flush, a slot END flush that only closes the stream) and that the beeper never stamps;
+`CORE_P25P2_PLAYOUT` that the vocoder's mute silence never stamps;
+`M17_STATE_DISPATCH` Codec2 voice through the mixers on every output type; `EDACS_GRANT_TUNE_MATRIX` the EDACS emitter on each output
+type and sample format, and whole analog calls under each squelch; `DSP_SYMBOL_REPLAY` the analog monitor (the tone
+policy, the auto squelch's per-sample gate, a retune, the `-8` source monitor, which never stamps, and a block the
+sink's converter mutes, at a rate it cannot take or with no memory, which never stamps either);
+`DMR_BS_SYNC_TIMES` and `ENGINE_NO_CARRIER_RESET` the discards. The stamp runs on the real-time clock, so
+`CORE_AUDIO_ACTIVITY` and `APP_CONTROL_NOTIFICATION_STATUS` hold its time through
+`dsd_audio_activity_set_clock_for_test()` (module-private, built only with `DSD_NEO_TEST_HOOKS`) rather than the decode
+clock's TEST source. `APP_CONTROL_NOTIFICATION_STATUS` also checks the v3 record's stamp and age fields and that only
+`dsd_app_notification_encode()` arms the stamp.
 
 `CORE_MBE_FILE_IO` checks decrypted AMBE payloads, not merely output-file existence. Its NXDN vectors come
 from [NXDN TS 1-D v1.3](https://www.qsl.net/kb9mwr/projects/dv/nxdn/NXDN-TS-1-D_v0103.pdf),
 §§7.2.1.1–7.2.1.3: every EHR frame decrypts to the published 1031 Hz tone. Scrambler repetitions cover the
 16-frame reset; DES/AES cover the 32-frame session. Missing-IV, changed-to-unloaded-key, manual-key versus
 stale-CSV, and skipped-SACCH cases defend against stale crypto context and incorrect positioning.
+
+`CORE_MBE_CRYPTO_SCOPE` also drives live NXDN DES/AES beyond that 32-word session: every word that fits matches its
+reference keystream; missing-IV frames mute without reusing the last word; a fresh IV restores decoding. Its P25
+Phase 2 AES cases include ciphertext matching DMR's default-silence and zero-tail patterns, on both slots and both AES
+key sizes: P25 still decrypts them, while DMR keeps its clear-silence exception. P25 Phase 1 skipped-frame cases
+compare the remaining superframe against reference keystream positions; `P25_P1_LDU_HELPERS` checks that both
+non-standard C0 and ordinary frames held by the crypto gate consume a position without invoking the vocoder.
 
 The DMR AES-128/256 and RC4 excerpts come from the Baofeng DM-32 recordings in
 [known-key-mbe-samples](https://github.com/tylerwatt12/known-key-mbe-samples/tree/2e15b86e305b7a3c71d52873518e2908747f6e09).
@@ -119,16 +211,22 @@ ctest --preset dev-debug -L iq-decode --output-on-failure
 Each decode case asserts on a decoded payload field (NAC, WACN/SYS, colour code,
 RAN, callsign, site ID) rather than a sync count, so a silent framing or protocol
 regression fails the test instead of merely moving a counter. The
-`DECODE_IQ_*_AUTO_HUNT` cases are the documented exception, described below. The
-whole set runs in about 7 seconds because I/Q replay defaults to
-`--iq-replay-rate fast`.
+`DECODE_IQ_*_AUTO_HUNT` cases are the documented exception, described below. I/Q
+replay defaults to `--iq-replay-rate fast`, so run one after another in
+`dev-debug` the 40 digital cases take about 27 seconds and the analog ones (see
+[Analog monitor audio checks](#analog-monitor-audio-checks)) about 22. The five
+`iq-determinism` cases (see [Replay determinism](#replay-determinism-issue-572))
+add 46 seconds, two realtime cases of 15.6 seconds among them; under
+`ctest -j 16` they run beside the suite's longest test, and the full suite
+still takes about 55 seconds.
 
 Covered: P25 Phase 1 C4FM (control and voice), P25 Phase 1 CQPSK/LSM (control and
 voice, plus a two-ray simulcast-impaired control channel), P25 Phase 2, DMR
 voice, DMR Tier III control (including a CSBK-only RAS control channel replayed
 with `-F`, colour code 0 — regression coverage for issue #348), NXDN48, NXDN96,
-dPMR, D-STAR, YSF, EDACS, and M17, plus the received CTCSS tone on synthetic analog NFM
-under `-fA` (see "Received tone (CTCSS) on the analog monitor" below). The analog FM
+dPMR, D-STAR, YSF, EDACS, ProVoice, and M17, plus the received CTCSS tone and DCS code on synthetic
+analog NFM under `-fA` (see "Received tone (CTCSS) on the analog monitor" and "Received code
+(DCS) on the analog monitor" below). The analog FM
 monitor's audio has its own cases, which score the audio rather than a log line; see
 [Analog monitor audio checks](#analog-monitor-audio-checks).
 
@@ -172,6 +270,26 @@ requires at least 15. `tools/tetra/prepare_real_air_fixture.py` verifies the raw
 SCBS, resampled, marginal, and inverted hashes; the adjacent provenance file
 records the source commits, transforms, and parameters.
 
+`provoice` is the sigidwiki ProVoice clip, one 3.5 s transmission (issue #588). Unlike the other audio sources it was
+recorded from a receiver's de-emphasized audio rather than from its discriminator: its 9600 baud clock line is there,
+but the roll-off smears each transition across its neighbours and, as recorded, it gives no frame sync at all. The
+builder undoes a single-pole 225 us de-emphasis (`AUDIO_DEEMPHASIS_US`) before remodulating it; swept over 150-500 us
+with the hard-decision decoder of the time, that value decoded the most frames at under one correction per voice
+frame. Under `-fp` and `-fh` the fixture decodes 40 ProVoice frames, 160 IMBE 7100x4400 voice frames, 86 of them with
+nothing to correct. Nothing in a ProVoice frame can fail a
+check: its header carries no CRC, BCH or parity, and the Golay(23,12) and Hamming(15,11) codes that protect the voice
+are perfect codes, which decode any input to some codeword. So `DECODE_IQ_PROVOICE` and `DECODE_IQ_PROVOICE_EDACS`
+assert on what `-Z` prints: the 64-bit header field after the LID, the same in 30 of the 40 frames (the rest are a bit
+or two off, since nothing protects it). `DECODE_IQ_PROVOICE_IMBE` asserts a voice frame that decoded with no correction. With ±45 counts of added
+noise the header still matches 21-25 times, and no other preset prints a ProVoice line from it.
+
+`dstar` is the sigidwiki D-STAR clip, 4 s of one transmission. Under `-fd` it decodes six superframes, 126 AMBE
+3600x2400 voice frames: first a header matched in the noise before the carrier, whose 21 frames are mostly corrupt,
+then the transmission's own header and four voice superframes, 99 of whose 105 frames need no correction.
+`DECODE_IQ_DSTAR` asserts the source callsign from the slow data, and `DECODE_IQ_DSTAR_AMBE` (issue #599) asserts what
+`-Z` prints for the first frame of the first voice superframe. The hard and soft decoders give the same payload for
+every frame of the transmission; they differ only in the superframe behind the header matched in noise.
+
 `dpmr_synth` is the exception to all of that: it is modulated from the CCH
 reference vectors in `tests/protocol/dpmr/fixtures`, the same vectors
 `DPMR_REFERENCE_VECTORS` decodes, as continuous-phase 4FSK at 2400 baud with
@@ -199,9 +317,18 @@ frame unproductive drops the payload from 23 hits to 13 and steps the hunt to 20
 `DECODE_IQ_P25P1_CQPSK_VOICE_AUTO_HUNT` covers issue #400, the same rule as the YSF case read the other way. A
 handler's credit is bounded by what it read, and P25p1 reads 33 symbols when the NID fails against 134 of a
 ~180-symbol slot when a one-block TSDU decodes, so a channel that was decoding still lost the profile to the failures
-between its frames. The `p25p1_cqpsk_vc` capture is already registered under `-f1`; under `-fa` it steps to 20 sps
-partway through on `main` and finishes in dPMR, so holding the profile is what the negative half of this case pins.
-Both halves were confirmed stable over repeated runs on `dev-debug`, `asan-ubsan-debug` and `tsan-debug`.
+between its frames. The `p25p1_cqpsk_vc` capture is already registered under `-f1 -mq`; under `-fa` it steps to 20
+sps partway through on `main` and finishes in dPMR, so holding the profile is what the negative half of this case pins.
+Both halves were confirmed stable over repeated runs on `dev-debug`, `asan-ubsan-debug` and `tsan-debug`. Under `-fa`
+the modulation vote never picks CQPSK on this capture, so that hunt runs the FSK discriminator path; it is
+`DECODE_IQ_P25P1_CQPSK_VOICE_AUTO_HUNT_UNLOCKED` now, and `DECODE_IQ_P25P1_CQPSK_VOICE_AUTO_HUNT` runs `-fa -mq`, the
+same protocols on the CQPSK chain. The `-mq` lock lets the hunt rotate only among profiles with the same timing, which
+prints no `SPS hunt: trying` line, so there the negative half guards against a timing change.
+
+The P25 CQPSK fixtures run the CQPSK chain only with `-mq` after the preset. `-f1` sets C4FM modulation and the last of
+the two options wins, so `-f1` alone (how `DECODE_IQ_P25P1_CQPSK_CC`, `_VOICE` and `_SIMULCAST_CC` were first
+registered) and `-mq -f1` both demodulate them on the FSK path; the replay jitter host's `REPLAY STREAM` line shows it
+(`cqpsk_symbols=0`). They are registered under `-f1 -mq` now, and the same goes for an A/B of a CQPSK change.
 
 Its payload assertion changed in issue #388, and the reason is worth recording: it had been
 `ALG ID: 0xC0 KEY ID: 0x3900`, which is not in this capture. The `-f1` preset emits no `0xC0` anywhere in it, reading
@@ -209,7 +336,7 @@ three clear-voice headers (`ALG ID: 0x80 KEY ID: 0x0000`) and six `Group Voice C
 produced was a corrupted read of one of those clear headers — the run decoded zero grants, two headers and 127 header
 errors — and the case had been asserting that artifact. Holding the 4800/4 co-tenants off the frame brings the `-fa`
 run in line with the native one (seven grants, four clear headers, irrecoverable header errors 3 → 0), so the
-assertion is now the same real payload `DECODE_IQ_P25P1_CQPSK_VOICE` asserts under `-f1`. The lesson generalizes: an
+assertion is now the same real payload `DECODE_IQ_P25P1_CQPSK_VOICE` asserts. The lesson generalizes: an
 AUTO case should assert a payload the native preset also produces, or it can end up pinning the corruption it was
 meant to catch.
 
@@ -232,11 +359,14 @@ the SPS hunt until PRBS9 locks, which is the price of a frame type that carries 
 
 The other half of #399 — that a capture containing no M17 does not decode any — is pinned in
 `FRAME_SYNC_INTERNAL_HELPERS` (`test_m17_alternating_runs_alone_are_never_a_sync`) rather than as a reject case on
-the `dstar` fixture. A reject case there was tried and removed: how far the hunt gets through a 4 s capture under
-`-fa` depends on front-end and thread scheduling, so the run varies between builds and between presets, and the
-assertion failed under `tsan-debug` while passing repeatedly under `dev-debug`. Only assertions that hold for every
-schedule belong in an `-fa` decode case, which is why the AUTO cases here assert either a payload the capture always
-reaches or a hunt line that always prints.
+the `dstar` fixture. A reject case there was tried and removed: at the time, how far the hunt got through a 4 s
+capture under `-fa` depended on front-end and thread scheduling, so the run varied between builds and between
+presets, and the assertion failed under `tsan-debug` while passing repeatedly under `dev-debug`. Replay no longer
+depends on scheduling (issue #572), but how far the hunt gets still depends on its phase: anything that shifts its
+timeline by a few samples, the front end's latency or an event's offset, can move it, so it still differs between
+builds (see [Replay determinism](#replay-determinism-issue-572)). Only assertions that hold whatever that phase
+belong in an `-fa` decode case, which is why the AUTO cases here assert either a payload the capture always reaches
+or a hunt line that always prints.
 
 Reject cases assert the opposite: that a fixture produces *no* decode. `dsd_neo_add_iq_reject_test` takes a
 `NOT_EXPECTED` regex alongside the usual `EXPECTED` one, so a run that printed nothing at all cannot pass by
@@ -244,14 +374,14 @@ default. `noise_floor` is 10 s of synthetic complex Gaussian receiver noise (see
 `python3 tools/build_iq_fixtures.py --derived-only`) with no signal in it whatsoever. The `DECODE_IQ_NOISE_FLOOR_*`
 cases assert `Total audio errors: 0`, which is the count of vocoder frames the decoder synthesized: before issue
 \#398's confirmation gate this fixture produced 89 of them under `-fn` and 49 under `-fi`, decoded from nothing.
-They deliberately do not cover `-fa`, where how far the hunt gets is schedule-dependent.
+They deliberately do not cover `-fa`, where how far the hunt gets moves with its phase.
 
 There is no `-fa` hunt case on `noise_floor`, and the measurement behind that is worth recording. Issue #391's
 remaining set — DMR, P25 Phase 2 and X2-TDMA, the handlers that report no verdict — is bounded by arithmetic
 rather than by a verdict, so a replay assertion cannot see it. Under `-fa` the fixture completes six rotations in its
 10 s; defeating the verdict gate in `frame_sync_sps_hunt_note_handler_consumption()` gives five, and every individual
 `SPS hunt: trying` line still prints in both. Only the rotation *count* separates them, and how far the hunt gets is
-exactly the schedule-dependent quantity that got the `dstar` reject case removed above. So the property is pinned
+exactly the phase-dependent quantity that keeps a reject case off the `dstar` fixture above. So the property is pinned
 where it can be stated exactly, in `FRAME_SYNC_SPS_HUNT_FALSE_SYNC`
 (`test_no_verdict_handlers_still_rotate_at_the_noise_cadence`): a handler consuming a dPMR FS2 frame's 372 symbols on
 the default productive verdict still reaches its dwell at the cadence that matcher reaches on noise. Both bounds are
@@ -263,8 +393,8 @@ CCH decodes nothing still rotates, and one whose CCH decodes on three frames in 
 There is no `-fa` case on `nxdn48` for issue #445 either, and for the same reason plus one of its own. The guard
 that issue added withholds the NXDN96 and M17 matchers on 4800/4 while a 2400/4 transmission has recently proved
 itself, so seeing it work in a replay needs the hunt to complete a rotation *after* a proof — and the `nxdn48`
-fixture is 6 s, about one full rotation, which is precisely the schedule-dependent regime that got the `dstar`
-reject case removed above. The change also leaves the hunt's own accounting untouched, so an `-fa` case would mostly
+fixture is 6 s, about one full rotation, which is precisely the phase-dependent regime that keeps a reject case off
+the `dstar` fixture above. The change also leaves the hunt's own accounting untouched, so an `-fa` case would mostly
 re-assert rotation behaviour that did not move. The property is pinned exactly instead, in
 `FRAME_SYNC_INTERNAL_HELPERS` (the matchers stand down inside the span and are live again past it, the level blend
 still runs while the sync is withheld, the guard is scoped to its arming protocols and to the profile proved, and it
@@ -279,18 +409,279 @@ against rotation — makes the decoder worse, and no test here would have caught
 hooks that end a call and clear the state the next one is assembled from. On the uncommitted 35 s four-channel
 NXDN48 capture from issue #373, ten rotated replays per build (`tools/replay_ab.sh`) scored 75 NXDN48 syncs and 11
 voice calls per run on `main` against 66 and 9 with the verdict change, every paired repeat worse. Single replays
-cannot see this: the same build scores anywhere from 57 to 94 NXDN48 syncs run to run under `-fa`, which is wider
-than the effect. Decode *volume* under the hunt is not covered by the `iq-decode` suite, which asks only whether a
+could not see this then: the same build scored anywhere from 57 to 94 NXDN48 syncs run to run under `-fa`, which is
+wider than the effect. Replay is repeatable now, so a build scores the same on every replay, but that score is one
+draw of the hunt's phase against the calls, which a change to the hunt's timeline can move by as much;
+[Replay determinism](#replay-determinism-issue-572) says how to judge such a change across captures and their
+realizations instead. Decode *volume* under the hunt is not covered by the `iq-decode` suite, which asks only whether a
 build still decodes.
+
+#### stdout audio (issue #659)
+
+`DECODE_IQ_STDOUT_*` (`tests/audio_stdout_check.cmake`, radio builds on POSIX) run the `-o -` output end to end.
+`_CLOSED_PIPE` pipes D-STAR into `true`, a reader that is gone before the first block, so the case never depends on how
+much the pipe buffers: dsd-neo must exit 0 (not 141, SIGPIPE), log exactly one stdout failure, and write a `-w` WAV
+byte-identical to a full run's, which replay determinism makes exact. `_FM_MONITOR` and `_AM_MONITOR` require the
+analog monitor's audio on stdout under `-fA` and `-fM`, and `_SOURCE_MONITOR` that `-8` during digital decoding warns
+once and leaves stdout byte-identical to the run without it.
+
+#### Replay determinism (issue #572)
+
+Under `--iq-replay` the decoder paces the front end a capture chunk at a time (a chunk is at most one live transfer,
+`dsd_iq_replay_chunk_bytes()`: 5.33 ms of a 48 kHz capture), every event and loop rewind lands on an
+idle pipeline, the front end's filters carry their state across blocks, and the decode clock runs on the capture's time
+(`docs/iq-capture-replay.md` says what that means for a user, and the IO, DSP and Runtime sections of `docs/code_map.md`
+how it works). For one build, configuration and machine, a replay without `-T` or `-Y` therefore prints the same decoder
+output on every run, fast or realtime, idle or loaded, capture-time timestamps included. The cases under the CTest label
+`iq-determinism` (also in `iq-decode`, radio builds only) hold it to that:
+
+```sh
+ctest --preset dev-debug -L iq-determinism --output-on-failure
+```
+
+The host is `dsd-neo_test_replay_jitter` (`tests/engine/replay_jitter.c`). It runs the real engine on the arguments
+`dsd-neo` would get and perturbs only the decoder's side of the replay, through the stream read hook: with
+`--replay-jitter-seed N` it sleeps a seeded U(0, `--replay-jitter-max-ms`) ms (120 by default) after about one read in
+`--replay-jitter-every` (64), within `--replay-jitter-budget-ms` (1.5 s, which cannot be raised); with
+`--replay-short-reads N` it caps each read at a seeded 1 to count samples. Its `REPLAY JITTER:` line counts only what
+perturbed the decoding: `sleeps` are sleeps with a positive delay after a read that returned tagged samples (a sleep
+after the end of the stream or after a failed read perturbs nothing), `last_sleep_media_ms` is the capture time the
+read before the last of them ended at, and `shortened_reads` are reads the cap made return fewer samples than the same
+read asked in full would have, from the read's own batch tag (a cap above what the batch still held cuts nothing). Where GNU ld can replace the audio device
+layer (`--wrap=dsd_audio_*`, the seam `CORE_AUDIO_GAIN` uses; not on Apple or Windows), `--replay-sink free|stalled`
+gives the engine a test sink with the real backends' asynchronous contract (a 1 s ring, writes that never wait, a
+pump thread) whose device takes every chunk or stalls after the first. The host fails a leg whose stalled sink never
+backed up and dropped audio, whose decoder drained a stalled sink, or whose engine opened a synchronous one. At the end
+it prints `REPLAY STREAM: fsk_samples=… cqpsk_symbols=… monitor_samples=… generation_changes=… media_ms=…`, counted
+from the batch tags the decoder read, each output kind in its own unit, and a `REPLAY SINK:` line per stream with an
+FNV-1a of every sample the decoder handed it. A sample read without a tag, or with an unknown kind, fails the host.
+When the engine returns it prints `REPLAY WALL: wall_ms=…`, the real time the engine run took, timed around
+`dsd_engine_run_with_lifecycle()` on the real-time monotonic clock (`dsd_realtime_mono_ns()`).
+
+The runner is `tests/iq_determinism_check.cmake`, registered through
+`dsd_neo_add_iq_determinism_test(name fixture mode runs expected min_fsk min_cqpsk min_total [NOT_EXPECTED regex])`.
+RUNS is a `;` list of at least two legs, each joining parts with `+`: `fast` or `realtime`,
+`jitter:SEED:MAX_MS[:EVERY[:AFTER_MS]]` (EVERY passes `--replay-jitter-every`), `short:SEED`, and `sink:free` or
+`sink:stalled` (which plays to `-o pulse` in place of `-o null`). Each leg is one
+process, held to `iq_decode_check.cmake`'s exit-status and sanitizer checks, to EXPECTED and, when given, to
+NOT_EXPECTED. A leg that prints `Retune ignored during IQ replay` fails as misconfigured: only `-T` and `-Y` print it,
+and they are outside the guarantee. A leg must also show that its perturbation happened: the host's `REPLAY JITTER`
+line has to report `sleeps` above 0 on a leg with a jitter part, `last_sleep_media_ms` at or past AFTER_MS on one that
+names it, and `shortened_reads` above 0 on one with a short part, and a realtime leg has to take at least 90 % of its
+`REPLAY STREAM` `media_ms` in wall time, so an inert option or a replay rate the host ignores fails the case instead
+of comparing two identical fast runs. AFTER_MS keeps a jitter leg honest about where it perturbs: the budget is spent
+in sleeps after reads, so a case whose decoder reads often (the monitor reads one sample at a time) spends it in its
+first tens of milliseconds unless EVERY spreads the sleeps out. Each jitter leg names the capture time of its case's
+transition (a retune group, a capture gap, a squelch edge) as AFTER_MS and an EVERY that reaches past it, and
+`DECODE_IQ_NEG_DETERMINISM_JITTER_AFTER` holds the runner to the check: an AFTER_MS past the end of the capture must
+fail the leg. The wall time is the host's
+`REPLAY WALL` `wall_ms`, never a clock the runner reads: CMake's own timestamps read whole seconds before 3.23 (and
+follow `SOURCE_DATE_EPOCH`), which would time the 16 ms `rf_clip` capture's realtime leg at 0 ms. A leg without exactly
+one `REPLAY WALL` line carrying `wall_ms` fails, whatever its rate. `IQ_DETERMINISM_CHECK_WALL`
+(`tests/cmake/IqDeterminismCheckWall.cmake`) holds the runner to that against a stand-in host: a missing line or one
+without `wall_ms` fails, and so does 899 ms for 1000 ms of air time, while 900 ms passes. Every leg's stdout and stderr
+are then compared with the first leg's, line for line, after a normalization kept as small as the measurement allows:
+
+- ANSI colour sequences are removed.
+- Four kinds of line are dropped: `NOTICE: Runtime:` (the decode loop's real-time duration), `REPLAY JITTER:` (what
+  the host injected), `REPLAY WALL:` (the real time the host's run took) and the audio-sink diagnostics
+  (`PulseAudio output stats:` and the other backends', and the host's `Replay sink output stats:`, the device side a
+  stall changes on purpose). The input-level advisories (`WARNING: …` to raise or lower the RF gain or the source
+  volume) are the decoder's own lines and are compared like the rest: their 10 s cooldown runs on decode time
+  (`dsd_input_level_publish()`), so a replay prints each at the same capture time however fast it runs, even where one
+  lands in the middle of a decoder line.
+- Lines the reader, demod or controller threads print would be compared as a sorted set, since where they fall among
+  the decoder's lines follows thread timing. The pattern list is empty, by measurement: traced per thread
+  (`strace -f -e trace=write`) under every leg kind, everything these legs print comes from the decoder thread.
+- CMake itself drops two differences before any of that: `execute_process` turns CRLF line ends into LF, so a CR just
+  before a line break is never compared (one anywhere else in a line is), and a CMake list keeps no empty element at
+  its front, so blank lines before a stream's first text line are not compared either.
+
+Everything else is compared verbatim and in order: the decoder's lines with their `HH:MM:SS` capture-time stamps, the
+`REPLAY STREAM` and `REPLAY SINK` lines and the end-of-run totals. A mismatch prints both legs' specs and the first
+differing line with context. A new difference is a defect to fix, not a pattern to add to the list.
+
+Every leg's `REPLAY STREAM` line must also count at least MIN_FSK discriminator samples and MIN_CQPSK CQPSK symbols.
+The verbatim comparison already catches one leg reading less than the others; the floors catch every leg doing so,
+and keep the case on the path it was written for. On `nxdn48_after_retune` under `-fa` every leg measures 605,114 and
+5,342: the hunt spends about 0.89 s on the CQPSK path (6000 symbols a second, 8 samples each), so the legs cross output
+kinds and generations, and the two counts cover all but 150 of the capture's 648,000 samples
+(FSK = 648,000 - 150 - 8 x CQPSK). MIN_CQPSK is 5,000, just under one CQPSK dwell, a fixed 3 passes of 1,800 symbols
+(`DSD_FRAME_SYNC_NO_SYNC_PASS_SYMBOLS`), 5,400: the hunt's request to leave the path lands at the next replay block, so
+the count is about one dwell. With 64 KiB blocks (683 ms of this capture) the request landed up to a block late and the
+count was 8,189; the hunt's visit and credit accounting may legitimately move it again. MIN_FSK is 535,000, the
+measured count less one more full dwell (5,400 x 8 = 43,200 samples, leaving 561,914) and room to spare. MIN_TOTAL
+floors the two together, FSK + 8 x CQPSK, which no split of the hunt's time between the paths moves: 647,850 measured,
+so 647,000. The comment beside the
+registration records the measurement; re-derive all three from it when the hunt or the fixture changes.
+
+The fixture, `nxdn48_after_retune` (1.3 MB, `DERIVED_RETUNE` in `tools/build_iq_fixtures.py`), is a call after a scan
+retune: the first 7.5 s of `noise_floor` on one channel, then the four events a real scan retune records, all at byte
+720,000 (a `RETUNE` to 467.75625 MHz, a 154.7 ms `retune_mute` `MUTE`, a `RESET` and a 25 ms `MUTE`, the reasons and
+lengths of the first retunes in a real 1.536 Msps NXDN scan capture divided by its decimation of 32), then all of
+`nxdn48`, byte for byte. Its version 2 sidecar starts the capture at 2026-01-01T00:00:00Z.
+`DECODE_IQ_NXDN48_AFTER_RETUNE` (`-fi`) is the control that the eventful path decodes the call,
+`IQ_INFO_NXDN48_AFTER_RETUNE` reads the event timeline back, and `DECODE_IQ_NXDN48_AFTER_RETUNE_AUTO` decodes the call
+under `-fa`, which needs the hunt to land on 20 sps after the `RESET` by itself. The lead-in was chosen by sweeping it,
+three fast `-fa` replays per point: 1.5-9.5 s in 0.5 s steps, then 6.0-9.0 s in 0.1 s steps (the grid the comment above
+`DERIVED_RETUNE` records), 48 sweep points over 41 distinct lead-ins, since the fine grid repeats seven of the coarse
+ones. The three replays were byte-identical at every point, and `-fi` decoded the call at all of them:
+
+| Lead-in (s) | `-fa` decodes `Src=901` | Hunt steps before the `RESET` (sps) | First hunt step after it | `Src=901` lines / audio errors |
+| --- | --- | --- | --- | --- |
+| 1.5 | yes | 1 (20) | none | 4 / 76 |
+| 2.0, 2.5 | no | 1 (20) | 5 | 0 / 8, 0 / 30 |
+| 3.0-4.0 | yes | 1 (20) | 5 | 1-2 / 19-72 |
+| 4.5 | yes | 2 (20, 5) | 8 | 3 / 30 |
+| 5.0, 5.5 | yes | 3 (20, 5, 8) | 10 | 3 / 45, 3 / 55 |
+| 6.0-6.6 | yes | 4 (20, 5, 8, 10) | 10 | 4 / 76 (6 / 86 at 6.3 and 6.4) |
+| **6.7-8.1** | **yes** | **5 (20, 5, 8, 10, 10)** | **20** | **4 / 76** |
+| 8.2, 8.3 | yes | 6 | none | 4 / 76, 6 / 64 |
+| 8.4-8.8, 9.0 | no | 6 | 5 | 0 / 0 |
+| 8.9 | yes | 6 | none | 6 / 64 |
+| 9.5 | no | 6 | 5 | 0 / 8 |
+
+The lead-in had to put at least a whole hunt rotation (five steps) before the `RESET`, with its neighbours 0.5 s either
+side decoding under `-fa` too. 7.5 s sits mid-plateau: every point from 6.7 to 8.1 s reaches the `RESET` after the same
+five steps and decodes identically, 0.8 s above the four-step edge (which still decodes) and about 0.85 s below the
+cliff at 8.35-8.4 s, where the hunt reaches 20 sps just before the `RESET` and its dwell runs out early in the call. A
+change to the hunt's dwell or to the front end's latency can move those edges. When `DECODE_IQ_NXDN48_AFTER_RETUNE_AUTO`
+fails after one, run the sweep again (`build_retune_fixture()` builds a fixture at any lead-in) before moving the
+lead-in.
+
+That sweep ran with 64 KiB replay blocks, 683 ms of this capture, so a hunt step's request landed up to 683 ms late. Run
+again on the same grid once a replay block became one live transfer (5.33 ms, issue #626), with the same three fast
+`-fa` replays and one `-fi` replay at each of the 41 lead-ins, `-fa` decodes `Src=901` at every one from 1.5 to 9.5 s
+(2 to 6 lines, 22 to 107 audio errors), `-fi` decodes its six `Src=901` lines at every one, and each point's three
+replays are byte-identical. Past 3.0 s the hunt takes the same steps at every lead-in (20, 5, 8, 10 and 10 sps, then
+20 again), so neither edge of the plateau above exists at this block size. 7.5 s still decodes the call (6 `Src=901`
+lines, 74 audio errors), and the case is kept there.
+
+| Case | Legs |
+| --- | --- |
+| `DECODE_IQ_NXDN48_AFTER_RETUNE_AUTO_DETERMINISM` | `fast;fast;jitter:7:120:128:7700;jitter:11:120:128:7700;short:13` |
+| `DECODE_IQ_NXDN48_AFTER_RETUNE_AUTO_DETERMINISM_REALTIME` | `fast;realtime` |
+| `DECODE_IQ_NXDN48_AFTER_RETUNE_AUTO_DETERMINISM_REALTIME_JITTER` | `fast;realtime+jitter:17:120:128:7700` |
+| `DECODE_IQ_NXDN48_AFTER_RETUNE_AUTO_DETERMINISM_STALLED_SINK` | `sink:free;sink:stalled`, only where `--wrap` links |
+| `DECODE_IQ_P25P2_CC_DETERMINISM` (`p25p2_cc`, `-f2`) | `fast;short:19;jitter:23:120:16:1500` |
+| `DECODE_IQ_YSF_GAP_ADVISORY_DETERMINISM` (`ysf_gap`, `-fy`) | `fast;realtime;jitter:29:120:64:16000` |
+| `DECODE_IQ_RF_CLIP_EOF_DETERMINISM` (`rf_clip`, `-f1 -mq`) | `fast;realtime;short:16` |
+| `DECODE_IQ_ANALOG_SQL_{AUTO,NOISE,LEVEL}_*_DETERMINISM` | `sink:free;sink:free+jitter:7:120:1500:550;sink:free+jitter:11:120:1500:550;sink:free+realtime`, only where `--wrap` links |
+| `DECODE_IQ_NEG_DETERMINISM_JITTER_AFTER` (`nfm_burst_synth`, `-fA`) | `fast;jitter:7:120:64:99999`, which must fail on AFTER_MS |
+
+The jitter legs' AFTER_MS is each case's transition: the end of the retune group (7,680 ms of capture time), the end of
+the capture gap (16 s), most of `p25p2_cc`'s 2 s, and the end of the squelch bursts' carrier (550 ms). The analog legs
+read one sample at a time, so they sleep after about one read in 1,500; at one in 64 they spent the budget in the first
+30 ms.
+
+`DECODE_IQ_P25P2_CC_DETERMINISM` holds the CQPSK path decoding real frames to the same rule: under `-f2` the whole
+2 s capture runs the CQPSK chain (`fsk_samples=0 cqpsk_symbols=11992`, 95,936 of its 96,000 samples), and every leg
+must decode its `P25p2 SACCH` lines alike; MIN_CQPSK 11,900 and MIN_TOTAL 95,000 sit just under the measurement.
+
+`DECODE_IQ_YSF_GAP_ADVISORY_DETERMINISM` holds the input-level advisories to it. `ysf_gap` (`DERIVED_GAP` in
+`tools/build_iq_fixtures.py`) is a version 2 sidecar alone: its `data_file` names `ysf.iq` (replay resolves it beside
+the sidecar), and it adds one 12 s `MUTE` (a `driver_overflow` gap) 4 s in, so the capture spans 18 s. `ysf` sits near
+full scale, RF HOT in every block a replay hands the demod (its peak reaches -1 dBFS in all 1,125 of its 512-byte
+blocks): every leg warns as the replay starts and again 16 s in, right after the gap, the cooldown having run out at
+10 s, and decodes the repeater's frames between the two (EXPECTED `RF Level HOT.*Repeater CC.*RF Level HOT`). Each leg
+measured `fsk_samples=287933 cqpsk_symbols=0 media_ms=18000`; MIN_FSK and MIN_TOTAL 287,000 sit just under it. With the
+cooldown on real time, before the fix, the fast and jitter legs finished before it ran out and printed only the first
+warning, and the realtime leg printed both, so the case failed at the second warning's line. The case first ran on
+`nxdn48`, which read HOT throughout only in 64 KiB blocks: in a live transfer's time it reaches -1 dBFS in 6 of its
+1,125 blocks, and the decoder's poll every 64 symbols reads the newest block alone, so it saw none (issue #626).
+
+`DECODE_IQ_RF_CLIP_EOF_DETERMINISM` holds the end of the stream to it. `rf_clip` (`DERIVED_CLIP` in
+`tools/build_iq_fixtures.py`, 1.5 KiB) is two replay chunks of a tone at a quarter of full scale (in range: no warning)
+and one chunk of I/Q pairs on the cu8 rails, 768 pairs (16 ms). The decoder polls the input level every 64 symbols, and
+its poll at symbol 64 of the 70 lands while it decodes the last chunk, after the read that took its last samples; the
+read after that ends the stream. Every leg must print `RF Level CLIP 100.0%`. The replay used to end the stream on the
+read that took the last samples whenever the reader had already reached the capture's end, which cleared the input level
+under that poll. A stream now ends only on the read that finds the ring empty (`rtl_stream_read_replay()`), and putting
+the old rule back makes every leg miss the warning. The short-read leg's seed (16) cuts the last chunk's 26 symbols into
+reads of 7 and 19, and the poll comes after the second. The fixture used to be one 4,096-pair chunk on the rails (8
+KiB), which a replay now hands over in 16 blocks: CLIP would print long before the end. With four reads a jitter leg
+would hardly sleep. Each leg measured `fsk_samples=0 cqpsk_symbols=70 media_ms=16`; MIN_CQPSK 68 and MIN_TOTAL 544 sit
+just under it.
+
+On `main` before issue #572 the cases fail. The host needs the replay batch tag, which `main` lacks, so its own
+`dsd-neo` ran the fast and realtime legs through the runner: `fast;fast` and `fast;realtime` both stop at the first
+differing decoder line. Even with the timestamps stripped as well, three fast replays decoded 9, 9 and 13 voice frames
+of the call and one `Src=901` line each, two distinct outputs in three runs, and a realtime one 50 frames and four
+`Src=901` lines. Every leg on the fixed tree decodes the whole call as that realtime run did, four `Src=901` lines and
+76 audio errors. Two mutations show the cases are live: leaving the decode clock on the system clock under replay
+fails `_REALTIME` on a timestamp alone (`03:15:34` against `03:15:36`), and making replay audio output synchronous
+fails `_STALLED_SINK`.
+
+The fifteen cases under the label take 98 s in `dev-debug` run one after another (measured on a loaded machine): the two
+`nxdn48_after_retune` realtime ones about 16 s each, since a realtime leg takes the capture's 13.7 s of air time,
+`DECODE_IQ_YSF_GAP_ADVISORY_DETERMINISM` 20 s (its realtime leg takes 18 s), the five analog squelch ones 4 to 5 s each,
+`DECODE_IQ_P25P2_CC_DETERMINISM` 2.5 s and `DECODE_IQ_RF_CLIP_EOF_DETERMINISM` 1.3 s. Under `ctest -j 16` they run
+beside the suite's longest tests. Under `tsan-debug` they take up to 77 s each and under `asan-ubsan-debug` up to 35 s.
+
+Repeatable is not the same as representative. Which frames a replay yields depends on where the decoder stands when each
+transmission arrives, the `-fa` hunt's rotation above all but a pinned mode's symbol timing too, and a capture replayed
+as recorded is one fixed draw of that: anything that moves the front end's output against the signal, an event's offset,
+the filters' latency or a dwell, can win or lose a call or a frame, in either direction, with nothing decoding better or
+worse. The sweep above shows it on one fixture. The uncommitted 94 s NXDN48 scan capture behind this issue
+(`faNXDNScan`, 88 retunes at 1.536 Msps) shows it on a real one: the streaming filters, which hold back 1.5 ms of
+look-ahead and drop it at each `RESET`, took its `-fa` replay from 144 voice frames and a caught `Src=102` call to 82
+frames and no `Src=102`, as repeatably as before. Repeating a replay repeats its draw, so two builds paired over
+identical repeats read a precision the capture does not have: six realtime replays of the uncommitted 35 s `fiNXDN`
+capture (30 retunes) under `-fi` put the branch +4.09 +/- 0.04 errors per voice frame from the build before the
+streaming filters.
+
+A draw is a realization of the capture: a copy with every event shifted by k input samples. Over 32 of them,
+k = 20i + (7i mod 20) for i = 0 to 31, spread over one 2400-baud symbol (640 samples at 1.536 Msps), the build before
+the streaming filters and the branch compare as below (fast replays of `dev-release` builds, paired per realization, 95%
+intervals):
+
+- `fiNXDN`, `-fi`: SACCH CRC passes 89.3% against 87.8% (paired -1.6 +/- 3.4 points) and errors per AMBE frame 0.75
+  against 0.86 (+0.12 +/- 0.16). Neither difference is resolved, and the build before the filters alone passes anywhere
+  from 62% to 100% of SACCH across the realizations.
+- `faNXDNScan`, `-fa`: `Src=102` caught at 25 of the 32 realizations against 17 (13 caught only before the change, 5
+  only after it: McNemar p about 0.10, not settled), 123.0 voice frames against 114.7 (paired -8.3 +/- 9.1) and 4.19
+  errors per voice frame against 4.14.
+- `faNXDNScan`, `-fi`: `Src=102` caught at all 32 on both builds, 5.26 errors per voice frame against 4.90
+  (paired -0.36 +/- 0.27, better) and SACCH 61.3% against 61.7%.
+
+A capture of a local P25 Phase 1/2 system (593 s, 36 retunes between the control channel and Phase 2 voice channels),
+replayed with `-f2 -mq -X` and its WACN, system and control channel, without `-T`, over 16 realizations, puts the branch
+at -3.88 +/- 0.18 of 677 Phase 2 syncs, -2.44 +/- 0.75 of 1040 voice frames and +0.19 +/- 0.40 audio errors (equal)
+against the build before the streaming filters. That loss is small and repeatable across the realizations, and all of it
+comes from the channel filter's streaming change. A frame that straddles a dwell's closing `RESET` is no longer made
+from the dropped tail and the new channel's first samples (10 error-type frames against 18), and about one
+call-opening `MAC_ACTIVE` a run is missed at a dwell's start (paired -1.9 +/- 0.2). Against `main`, replayed realtime,
+the branch is level or ahead on every count except audio errors, 25 against 24 (`docs/iq-capture-replay.md`, "Replay
+Pacing And The Decode Clock").
+
+A shift must not be a whole multiple of the front end's total decimation (the capture rate over its `demod_rate_hz`, 32
+at 1.536 Msps). Replay anchors the chunk grid (one live transfer a chunk) and restarts every filter at each event, so a
+shift of m whole decimations hands every dwell the same output samples, m outputs later: it changes nothing inside a
+dwell, and copies shifted that way are not independent draws of the signal. The earlier sweeps of this kind shifted
+mostly by multiples of 32 samples at 1.536 Msps, so their copies were not independent draws either. A capture made at
+its demod rate, decimation 1, has no other kind of shift, so its realizations vary only where each dwell starts against
+the decoder's own timeline.
+
+So judge a hunt, timing or front-end change across captures and across realizations of each, with a pinned mode beside
+`-fa`, never from one replay or from identical repeats of it. `tools/replay_ab.sh` replays each repeat as its own
+realization (see [Decode-Quality A/B on Real Captures](#decode-quality-ab-on-real-captures)). A shifted copy by hand
+needs only a new sidecar: point its `data_file` at the original data and add the same whole number of samples (2 bytes
+each for cu8, 8 for cf32) to every event's `byte_offset`, keeping each within the bytes replay reads. Those are
+`data_bytes`, or the data file's size when that is smaller or `data_bytes` is 0, rounded down to whole samples. The
+number of samples must not be a multiple of the front end's total decimation; spread the copies across one symbol at the
+capture's rate, as `replay_ab.sh` does (copy i of n shifted floor(i P / n) + i samples, P the samples in one 2400-baud
+symbol, and one sample more where that lands on a multiple of the decimation).
 
 #### Received tone (CTCSS) on the analog monitor
 
 `DECODE_IQ_ANALOG_CTCSS_1000`, `_670`, `_DROP` and `_NOTONE` (issue #522) replay synthetic NFM under `-fA -o null`, so
-they also show detection needs neither audio output nor a tone policy. The fixtures (`nfm_ctcss_synth_1000`,
-`nfm_ctcss_synth_670`, `nfm_ctcss_synth_drop`, `nfm_notone_synth`) are built offline by
-`python3 tools/build_iq_fixtures.py --derived-only`: voice-band audio (noise limited to 300-3000 Hz, gated into
-syllables) plus a 600 Hz-deviation sine at the named tone, through the existing `remodulate()`, with receiver noise
-added at baseband. Each asserts the `Received tone:` log line and, as its negative half, that no other tone was ever
+they also show detection needs neither audio output nor a tone policy; `_1506` (issue #643) replays 150.6 Hz, a
+transmitter 0.4 % high on 150.0 Hz, which must read `CTCSS 150.0 Hz` and never `none` or 151.4 Hz. The fixtures
+(`nfm_ctcss_synth_1000`, `nfm_ctcss_synth_670`, `nfm_ctcss_synth_1506`, `nfm_ctcss_synth_drop`, `nfm_notone_synth`) are
+built offline by `python3 tools/build_iq_fixtures.py --derived-only`: voice-band audio (noise limited to 300-3000 Hz,
+gated into syllables) plus a 600 Hz-deviation sine at the named tone, through the existing `remodulate()`, with
+receiver noise added at baseband. Each asserts the `Received tone:` log line and, as its negative half, that no other
+tone was ever
 reported; CMake regexes have no negative lookahead, so "any other tone" is spelled out as every value that is not the
 expected one. The drop fixture stops its tone at 1.2 s under a live carrier and must log `CTCSS 100.0 Hz` then `none`.
 Each case's expected line appears only once the replay has run long enough to reach its verdict, so a replay that
@@ -323,23 +714,41 @@ at 0 dB, and the late acquisition windows (`ctcss_step_late()` in `src/dsp/analo
 the ceiling. The p95 targets, the ceilings and those rates are what the
 user guide states; the per-row pins are tighter and record what these seeds measure:
 
-- Lock: all 50 tones at four input rates, at +10 and 0 dB in-band tone-to-noise, lock within 400 ms of an onset placed
-  anywhere inside a hop. Tones off their table value by transmitter encoder error lock on that value: 0.2 and 0.35 Hz
+- Lock: the 50 tones of the table these rows were pinned on, iterated by their own indices (`analog_tone_synth.h`) so
+  the seeds and pins reproduce, at four input rates, at +10 and 0 dB in-band tone-to-noise, lock within 400 ms of an
+  onset placed anywhere inside a hop. 150.0 Hz, which joined the table later (issue #518 follow-up), has rows of its
+  own: at every rate at +10, +3 and 0 dB it locks within the lock contract on 20 seeds each, and with 151.4 Hz, each on
+  its value and 0.2 or 0.35 Hz either side, it never reads as the other on its seeds. The pair has rows of its own for
+  the third agreeing hop a candidate needs while its estimate leans more than 0.3 Hz toward the other tone (issue #623):
+  on a clean carrier each tone set 0.4 Hz toward the other locks exactly one hop after the same tone set 0.4 Hz away,
+  and 146.2 Hz on the same hop either way; starting in noise anywhere in a hop, on seeds of their own, 200 starts per
+  row, on the value and 0.2 Hz toward the other at 0 dB and 0.35 Hz toward it at +10 dB, each locks only its own tone
+  (p95 347, 389 and 330 ms); 93 starts that named the other tone before the rule, rebuilt from the seeds of the sweep
+  the rule was tuned on (the 73 of its 80 such starts in the contract's conditions that the rule stops, and 20 of the
+  281 it stops set 0.35 Hz toward the other at 0 and +3 dB), now lock only their own (the slowest at 474 ms); the 22
+  slowest starts of the long-run sweep below, the late windows' locks among them, lock within the 700 ms ceiling (the
+  slowest at 664 ms); and a locked tone moved to the other tone of the pair, or between 151.4 and 146.2 Hz, at +10 and 0
+  dB, is dropped within 450 ms of the move (337 ms at the slowest) while the new one reads within 700 ms (560 ms), never
+  a third tone. Tones off their table value by transmitter encoder error lock on that value: 0.2 and 0.35 Hz
   off within 400 ms at +10 dB, and the exact tone at 0 dB on a second seed set within 400 ms too; 0.2 Hz off at 0 dB,
   99% of the starts lock within 400 ms and the slowest at 468 ms (the row asserts at least 95% and 500 ms). The lock
   gate is 0.5 Hz, so encoder error trades against lock time. The 32 slowest of the 2,000,000 long-run starts at 0 dB
   as the 250 ms window alone locked them (8 exact tones and 24 tones 0.2 Hz off, from 701 ms to 1,128 ms), rebuilt from
   the sweep's own seeds, each lock within the 700 ms ceiling (the slowest at 509 ms). Under transmitter-filtered speech 10 dB above the tone
-  every tone locks within 500 ms and holds that one lock to the end of the run; a tone held 15 s at 0 dB, at each rate,
+  every tone, 150.0 Hz included, locks within 500 ms and holds that one lock to the end of the run; a tone held 15 s at 0 dB, at each rate,
   locks once and is never lost.
 - Rejection: 67.0/69.3/71.9 Hz are each identified; off-table tones lock nothing over 3 s runs down to 0 dB in-band
-  (150.0 Hz, and 68.2, 161.0 and 166.7 Hz between two table tones), nor do 100.85 and 100.9 Hz, just outside the snap
+  (152.6 Hz, 1.2 Hz above 151.4, and 68.2, 161.0 and 166.7 Hz between two table tones), nor do 100.85 and 100.9 Hz,
+  just outside the snap
   gate of 100.0, at +10 and +20 dB; a locked tone that moves off the table is dropped within 450 ms (one window plus
-  four failing hops) and nothing locks in its place; no DCS code locks -- every rotation class of the Golay (23,12)
-  code, forward and bit-reversed, which is every periodic DCS waveform in either polarity, plus the nearest words at
-  every rate, clean, at +10 dB and at 0 dB; and a minute each of unfiltered speech, transmitter-filtered speech and
-  noise never locks and reaches the `none` verdict, which the speech runs hold for 87% of their carrier time (the rows
-  assert 80%; each pause that closes the carrier starts the verdict again). Two more minutes of speech, one filtered and
+  four failing hops) and nothing locks in its place; no DCS waveform locks a CTCSS tone, in the publication or in the
+  CTCSS detector's own state, where the DCS lock that outranks it would hide one -- every rotation class of the
+  Golay (23,12) code, forward and bit-reversed, which is every periodic DCS waveform in either polarity (what
+  the DCS detector makes of each is under [Received code (DCS)](#received-code-dcs-on-the-analog-monitor)),
+  plus the words that come nearest a table tone, which lock nothing at all at every rate, clean, at +10 dB
+  and at 0 dB; and a minute each of unfiltered speech, transmitter-filtered speech and noise never locks and
+  reaches the `none` verdict, which the speech runs hold for 87% of their carrier time (the rows assert 80%;
+  each pause that closes the carrier starts the verdict again). Two more minutes of speech, one filtered and
   one not, in which a high voice holds a pitch near 225.7 or 229.1 Hz for most of a late acquisition window and then
   moves on, never lock: the late windows qualify that pitch, and only the check that the newest 250 ms still carry it
   keeps it from locking. The speech model is source-filter speech
@@ -350,7 +759,8 @@ user guide states; the per-row pins are tighter and record what these seeds meas
   multiples wherever they lie below it (2300 Hz at 48 kHz lands on 100.0 Hz, 2333 Hz on 67.0 Hz). The other side of
   that check: a tone at +10 dB beside a voice-band tone 30 dB louder whose residue lands on the tone's own bin locks as
   itself within 400 ms, and when the tone stops the residue alone does not hold the lock (dropped within 350 ms).
-- Loss and verdicts: every tone at every rate is dropped after it stops under a live carrier, at +10 dB 99% of the stops
+- Loss and verdicts (the 50 pinned tones, as for lock; 150.0 Hz has rows of its own, below): every tone at every
+  rate is dropped after it stops under a live carrier, at +10 dB 99% of the stops
   within 350 ms and all within 386 ms, at 0 dB 98% within 350 ms and all within 476 ms (the rows assert 98% and 400 ms,
   97% and 500 ms), and nothing locks again from what the detector still holds of the stopped tone; every tone at every rate is dropped within 150 ms of a reverse burst at +10 dB, a 180 degree one and
   a 120 and a 240 degree one alike, the flip landing anywhere inside a sub-block; at 0 dB, with a 180 degree flip held
@@ -358,8 +768,10 @@ user guide states; the per-row pins are tighter and record what these seeds meas
   contract, and the 4 of 200 that are missed end with the carrier drop, within its 200 ms hangover (the row asserts 89%
   and at most 5 missed); a 120 or 240 degree burst inside the sub-block a tone locks on -- driven through the detector
   alone at +10 dB, every tone on its table value and 0.15 Hz either side, the step at every eighth sample of that
-  sub-block -- ends the lock within 150 ms after every one of the 2,882 steps that still lock the tone on that hop, and
-  after all but 15 of 2,852 when the tone has just moved there from another table tone it was locked on (248 of those
+  sub-block -- ends the lock within 150 ms after every one of the 2,879 steps that still lock the tone on that hop, and
+  after all but 15 of 2,851 when the tone has just moved there from another table tone it was locked on (2,887 and
+  2,859 before 151.4 Hz's leaning candidates waited for a third hop, issue #623, and 2,882 and 2,852 before 150.0 Hz's
+  bin joined the detector; 248 of those
   300 tones lock in place of the old tone's lock, the rest just after losing it); the rows assert at most 2 and 20, and
   measured against the lock hop's own estimate 115 and 143 were missed; a tone that stops under a carrier that keeps
   dropping out (up for 20 ms of every 40 to 180 ms,
@@ -369,12 +781,16 @@ user guide states; the per-row pins are tighter and record what these seeds meas
   `detecting` until 500 ms of it and `none` by the next hop, and a tone that starts after that verdict still locks
   within the lock bound; the verdict, the no-tone one included, is identical at the three input scales and for any
   block size; the front end runs from 2400 Hz up to its 320 kHz limit and reports itself unavailable outside it.
+- 150.0 Hz loss: at every rate, on seeds of its own, it is dropped after it stops under a live carrier, 40 stops each
+  at +10 and 0 dB (p95 312 and 289 ms, all within 318 ms), nothing locks again, and a 180 degree reverse burst at
+  +10 dB ends the lock within 121 ms on all 40.
 
 Fixed seeds say what the detector does on those seeds, not how often it misses in the long run. The long-run figures
 below come from wider seed sweeps run offline over the same generators and the same core (x86-64 at -O0 and -O2 give
 identical results), and they are the numbers the user guide quotes:
 
-- Lock, 10,000 starts each (every tone at every rate, onset anywhere in a hop): at +10 dB, p95 255 ms and none beyond
+- Lock, 10,000 starts each (every tone of the 50-tone table at every rate, onset anywhere in a hop, measured before
+  150.0 Hz joined the table; the 150.0/151.4 Hz pair's own sweeps are below): at +10 dB, p95 255 ms and none beyond
   400 ms (the slowest 331 ms); at 0 dB, p95 341 ms and 0.30% beyond 400 ms (447 ms); 0.2 Hz off at +10 dB, none
   (331 ms); 0.35 Hz off at +10 dB, 1 start (424 ms); 0.2 Hz off at 0 dB, p95 362 ms and 1.55% (553 ms).
 - Loss, 4,000 stops each: 2.0% beyond 350 ms at +10 dB (the slowest 515 ms) and 1.25% at 0 dB (494 ms), and about 2%
@@ -405,9 +821,38 @@ identical results), and they are the numbers the user guide quotes:
   1,314 ms. Twice a voice holding 254.1 Hz locked that tone for 150-250 ms, once before the real tone locked and once
   in its place (the detector hands a lock to a steadier tone). The contract covers tones in noise, so the speech row
   holds only its fixed seeds to it.
-- Off-table tones, two hours of continuous carrier at 0 dB each, at 48 kHz and 8 kHz: 150.0 Hz never locked; 68.2 Hz
-  locked a neighbour 20 and 25 times, 161.0 Hz 5 and 5, 166.7 Hz 6 and 4, each for 200-260 ms; at +3, +6 and +10 dB,
-  68.2 and 161.0 Hz never locked in two hours.
+- Off-table tones, two hours of continuous carrier at 0 dB each, at 48 kHz and 8 kHz: 68.2 Hz locked a neighbour 20
+  and 25 times, 161.0 Hz 5 and 5, 166.7 Hz 6 and 4, each for 200-260 ms; at +3, +6 and +10 dB, 68.2 and 161.0 Hz never
+  locked in two hours. Before 150.0 Hz joined the table it never locked in two hours either; with it, 152.6 Hz (1.2 Hz
+  above 151.4, whose gate is now 0.7 Hz) locked 151.4 Hz 2 and 3 times, each for 200 ms.
+- 150.0 and 151.4 Hz (issue #518 follow-up), 1.4 Hz apart with a 0.7 Hz gate each, and since issue #623 a third agreeing
+  hop for a candidate whose newest estimate leans more than 0.3 Hz toward the other tone, which was chosen on a sweep of
+  seeds of its own and measured on another: 10,000 starts per row (every rate, the onset anywhere in a hop after 300 ms
+  of noise, offsets toward and away from the other tone in rows of their own; figures for 150.0 and 151.4 Hz). On the
+  table value at +10 dB, p95 256 and 262 ms and never the other tone; at +3 dB p95 306 and 309 ms, never the other; at 0
+  dB p95 352 and 351 ms, 0.58% and 0.55% beyond 400 ms, never the other. 0.2 Hz toward the other at 0 dB, p95 390 and
+  393 ms, 3.6% and 4.0% beyond 400 ms, the other tone on 0 and 3 starts; at +3 dB on 0 and 1; at +10 dB never. 0.35 Hz
+  toward the other at +10 dB, p95 325 and 344 ms, never the other; at 0 dB, outside the contract, p95 476 and 484 ms,
+  the other on 5 and 9. Starts set away from the other tone lock about as before (0.2 Hz away at 0 dB, p95 361 and 363
+  ms; 360 and 363 before). 100,000 starts per row at 0 dB: on the value the other tone on 2 and 0 starts (p95 350 and
+  352 ms), 0.2 Hz toward it on 12 and 9 (p95 391 and 394 ms), 0.2 Hz away on 1 and 0, and no start slower than 664 ms.
+  Each named the other for at most 236 ms. The same seeds before the rule: on the value the other tone on 9 and 17 of
+  the 100,000 starts at 0 dB, 0.2 Hz toward it on 78 and 154, and 0.35 Hz toward it on 79 and 128 of 10,000 at 0 dB and
+  0 and 14 at +10 dB (each start watched for 1 s after its onset). In the sweep the rule was tuned on, on 282 of the 309
+  starts whose first lock named the other tone the candidate leaned more than 0.3 Hz toward the true one, as noise that
+  carries an estimate into the other tone's gate leaves it. With the tone from the reception's start (a squelched
+  carrier) a start locks on a hop's end, and set 0.2 Hz toward the other at 0 dB the p95 is the eighth hop for both
+  tones (400 and 402 ms; a hop is 50.2 ms at 44.1 kHz), as it was for 151.4 Hz before the rule (150.0 Hz's was the
+  seventh, 352 ms); from the reception's start the other tone was named on 0 of 10,000 starts each 0.2 Hz toward it (1
+  and 4 before) and 5 and 5 set 0.35 Hz toward it (59 and 78). Two hours of continuous carrier at 0 dB, at 48 and 8 kHz:
+  on their values never the other tone; 0.2 Hz toward each other, never (3, 0, 0 and 2 times before the rule); 0.35 Hz
+  toward each other, the other tone 1 and 2 times (150.35 Hz) and 5 and 1 times (151.05 Hz), each for up to 200 ms (50,
+  37, 57 and 41 before). Under the tone policy with an allow list, a tone starting 300-350 ms after the carrier opened,
+  set 0.2 Hz toward the other at 0 dB, locked after the 800 ms window had run out on 11 and 15 of 5,000 starts (0 and 5
+  before the rule), turning the reception audible at its lock as before (first audible p95 703 ms from the carrier, 700
+  ms before); with the tone from the reception's start, never. The ad-hoc driver links the same generators and core at
+  -O2; every other tone's verdicts are bit-identical with and without the rule (200 starts each at 0 and +10 dB, on the
+  value and 0.2 Hz either side).
 - Holds, 200 runs of 20 s: at 0 and +3 dB a held tone never dropped. Under transmitter-filtered speech 10 dB above the
   tone, 300 runs of 20 s: 4 drops, all on 250.3 and 254.1 Hz, each reading `none` for 340-740 ms before the same tone
   locked again.
@@ -415,6 +860,76 @@ identical results), and they are the numbers the user guide quotes:
   254.1 Hz, where a high voice with weak harmonics holds near a table tone), and the transmitter-filtered model once
   (at 254.1 Hz). The 250 ms window alone locked the 233.6 Hz and the filtered 254.1 Hz voice too; without the check
   that the newest 250 ms still carry the tone, the late windows would lock another five unfiltered and one filtered.
+- Transmitter tone error (issue #643). `DSP_ANALOG_CTCSS_TONE_ERROR` pins, at every rate:
+  - 150.6 Hz (a radio 0.4 % high on 150.0 Hz, as the reporter's were) read as 150.0 Hz at +20 and +30 dB and clean, from
+    a carrier's start before any `none` and after 300 ms of noise, held 3 s and never read as 151.4 Hz, and 150.8 Hz as
+    151.4 Hz; at +10 dB 150.6 Hz never reads 151.4 Hz;
+  - every tone from 127.3 Hz up 0.4 % off its value (below 125 Hz that is within 0.5 Hz, on its value), and the pair
+    0.6 Hz off, at +20 dB, within the off-value lock bounds (`DSD_ANALOG_CTCSS_OFF_VALUE_LOCK_P95_MS`, 500 ms, and
+    `_CEILING_MS`, 650 ms) and never another tone (the long-run sweep below covers every tone from 100 Hz);
+  - 150.70 Hz, the pair's midpoint, and 150.68 and 150.72 Hz, naming neither;
+  - the estimate's precision against what it claims, with white and f^2 noise, at every span the detector uses: |z| > 3
+    on at most 0.5 % of the stationary hops, and the non-stationary ones left at 0.5 Hz;
+  - the review cases, each against what the detector did before: a tone the on-value rules acquire beside a voice line
+    near another tone is confirmed when it was and kept, a tone that moves within its tolerance is kept and hands over
+    to the on-value tone that follows, and a 150.6 Hz onset after noise never names 151.4 Hz;
+  - an off-value lock keeps the DCS candidate published, and five receptions of the sweeps below, where a voice line's
+    off-value lock coming and going delayed or lost the real tone and a hop the wider hold kept dropped a held tone,
+    lock and hold exactly as the on-value rules alone do, as does a tone their late windows were already agreeing on
+    when an off-value lock came first (250.72 Hz beside 242.32 Hz: confirmed on its value at 500 ms, not a hop later),
+    and the loss of an off-value lock under a chattering carrier returns to the NONE they had already reached.
+
+  `test_150_and_151_4_hold_only_their_own_side` in `DSP_ANALOG_CTCSS` was rewritten for nearest-tone naming: a locked
+  tone moved nearer the other tone of the pair is still dropped within the moved-off bound, and the other tone is then
+  named, being nearest and within 0.5 % of it, where nothing was before. `DSP_ANALOG_TONE_POLICY` pins the off-value
+  deferral (pending to the window's end, rejected there, a passing one allowed at once, a fresh window after a pass, the
+  DCS extension under it), and `ENGINE_TRUNK_SCAN` runs the real policy on two scan targets: an unlisted 254.1 Hz named
+  off its value at 300 ms, then the listed 100.0 Hz at 700 ms, keeps the target and ends allowed, and the same 254.1 Hz
+  on its value leaves at the next tick; likewise for a DCS list beside an off-value CTCSS lock.
+
+  The long-run sweeps ran the old and the new detector on the same seeds through an offline driver (the same
+  generators and core, at -O2), every run compared publication by publication, with each rule the change added
+  counted as it fired. Of about 6,300,000 runs, every one in which no added rule fired published exactly what the
+  old detector did; the rest are below.
+  - Lock (1,000,000 starts per condition at 0 dB, on the value and 0.2 Hz off; 100,000 at +10 dB on the value and
+    0.35 Hz off; 100,000 from a carrier's start; the pair's rows of 100,000 at 0 dB and 20,000 at +10 dB on the value,
+    0.2 and 0.35 Hz toward the other): p95 the same or lower on every row, none past 700 ms inside the contract, the
+    other tone of the pair named on the same starts as before.
+  - Loss (400,000 stops at 0 and +10 dB, 24,000 under a flickering carrier): p50, p95 and the slowest the same; at most
+    9 more stops in 100,000 past 350 ms, none past 800 ms.
+  - Off-table carriers, two hours each at 0 dB (68.2, 161.0, 166.7 and 152.6 Hz, at 48 and 8 kHz): identical, and at
+    +30 dB nothing; every tone set just past its gate at +30 dB never named it.
+  - The midpoint, 150.64 to 150.76 Hz in 0.01 Hz steps at +10 to +60 dB, 2,000 starts each: never the far side;
+    150.70 Hz names nothing at any level; at +40 dB and up 150.68-150.72 Hz names neither, where the analog oracle's
+    exclusive 0.5 % rule leaves 150.643-150.75 Hz unlabelled. Two hours of 150.70 Hz at 0 dB read the pair as often
+    as before (about 2,950 times an hour, the old detector's own rate there), at +20 dB never.
+  - Off-value lock: 810,000 starts from a carrier's start at +20 dB and up, every tone from 100 Hz 0.4 % off: p95 402
+    ms (499 ms for the pair), the slowest 553 ms; at +10 dB 150.6 Hz p95 753 ms, all within 1 s, and 250.3 Hz 0.4 %
+    high p95 503 ms; at 0 dB 150.6 Hz p95 1.56 s, 250.3 and 254.1 Hz 0.4 % high p95 1.05 s. Every other-tone read is
+    one the old detector made too (at 0 dB 150.6 Hz still reads 151.4 Hz on about one start in five, on the on-value
+    rules).
+  - Precision, 4.6 million hops at 250, 400, 500 and 600 ms with white and f^2 noise: |z| > 3 on 0.04-0.43 % of the
+    stationary hops of each cell, mean z^2 0.36-0.82; onset windows that pass the stationarity test, 0.38-0.42 % at
+    250 ms (3,400 windows each), 0.42 and 0.44 % over all spans.
+  - Talk-off: 20 hours of each speech model with no tone locked the same tones as often as before (4.45 and 0.80 an
+    hour at this level, with no noise); 150,000 onsets under speech 10 dB above the tone: none later or another tone,
+    78 sooner; 3.4 hours of every tone held under such speech: the same 1,259 relocks. A tone beside a stronger steady
+    line near another tone (250,000 receptions): the real tone confirmed when it was before on every one, and the
+    line's own tone named on 74 % of them (62 % before), 1.3 s of 2.35 (1.2 before).
+  - DCS, 1,000,000 code starts at +10 dB and 200,000 each at +3 dB through 75 and 750 us de-emphasis: no added rule
+    fired, every publication and allow-list verdict the same; the CTCSS detector's own state locked on a code's
+    waveform on 2 of the 1,400,000, as before.
+  - The capture from issue #643, replayed under `-fA --nfm-bandwidth-hz 15000 --squelch noise+3`: `CTCSS 150.0 Hz` 46
+    times, `none` 20 and 151.4 Hz once (before: 3, 40 and 1); the 151.4 Hz is the old detector's too, at a
+    transmitter's end of message, where its tone runs up to 151.3 Hz for 150 ms. Through the core alone, all 28
+    receptions of 0.6 s or more lock 150.0 Hz (p50 380 ms, the slowest 540 ms), never `none` first (before: none).
+
+Detection runs on the FM monitor only (issue #524), DCS (issue #523) as well as CTCSS. `DSP_SYMBOL_REPLAY` feeds the
+same CTCSS-bearing monitor blocks, and the same D023N-bearing ones, through the tap on the FM monitor, where they lock,
+and on the AM monitor, where nothing is published or logged and a live switch to AM forgets the FM lock;
+`APP_COMMAND_QUEUE` checks that the decode-mode switch from Analog to AM clears a received tone or code, and
+`RUNTIME_ANALOG_TONES` pins the predicate every frontend's row asks. The `Received tone:` forbid on
+`DECODE_IQ_ANALOG_AM_REAL` only guards against a false report: that excerpt carries no sub-audible tone or code.
 
 Retune clearing is covered where each path lives: `DSP_SYMBOL_REPLAY` (the tap reads the raw block before the voice
 high-pass removes the tone, leaves the audio byte-identical, clears on an RTL stream-generation or
@@ -437,13 +952,24 @@ connection drops when it reconnects inside the read, whose 300 ms backoff is sho
 Pulse, stdin, UDP and TCP input after a reset or a trunk-tuning generation move, the half second of the old channel's
 100 Hz tone the input had queued -- read with no time passing on the injected clock, as a decoder drains a backlog,
 which heard locked 100.0 Hz again on the new channel -- whether the new channel then arrives in 20 ms reads or in 100 ms
-bursts, also when the reset came in a digital mode before detection started, and on stdin input whose monitor playback
-holds the decoder for each block's 20 ms (the time spent playing is not counted as waiting for input), and its own
-131.8 Hz tone locks within the p95 target plus one read, while a WAV file is heard at once after a reset, a UDP stream
-with nothing queued from the third read after a reset or a generation move, and stdin fed faster than real time again
-after 2 s; restarts the tap at the first sample of the next block when the symbol path drops a part-collected block
-(`dsd_symbol_analog_block_reset()` on a receive-family change, or a family switch landing on an RTL front end), where
-read on from its place in the dropped block it missed the new block's opening samples; and --
+bursts, also when the reset came in a digital mode before detection started, on stdin input whose monitor playback holds
+the decoder for each block's 20 ms, and with a raw WAV whose per-block sync to disk holds it 12 or 15 ms (issue #576; a
+test hook stands in for the sync, so no test waits on the disk), which makes each 20 ms of the backlog take more than 10
+ms to read but is no time spent waiting inside the input read, and while the decoder is descheduled 3 or 9 ms inside
+each backlog read, which is time in the read but leaves the span short of half its length, also with stdin's synchronous
+playback holding it for each block's 20 ms on top, which only leaving the time spent playing out keeps short of half --
+and its own 131.8 Hz tone locks within the p95 target plus one read, while a WAV file is heard at once after a reset, a
+UDP stream with nothing queued from the third read after a reset or a generation move, a new channel arriving live after
+the backlog on a decoder a 15 or 17 ms sync holds, which leaves it only 5 or 3 ms of each 20 ms read to wait, from its
+second read (an 18 ms sync, 2 ms, is below the eighth of a read that shows the input ran dry, and is heard only 2 s
+after the retune), and stdin fed faster than real time again after 2 s; driven through `getSymbol()` on UDP input, where
+the symbol path brackets the live read and a fake producer delivers each sample at its real-time arrival on the injected
+clock, keeps the same skip across a 400 ms hold with a 12 ms sync per block, both after a reset and after a generation
+move: the old tone never returns, nothing is heard until a read has had to wait for the producer, well short of the 2 s
+cap, and 131.8 Hz then locks within the
+p95 target plus one read; restarts the tap at the first sample of the next block when the symbol path drops a
+part-collected block (`dsd_symbol_analog_block_reset()` on a receive-family change, or a family switch landing on an
+RTL front end), where read on from its place in the dropped block it missed the new block's opening samples; and --
 driven through `getSymbol()` on 2500 Hz WAVs, where one 960-sample block is 384 ms -- reads the block as it fills, so a
 tone starting mid-block locks within the 400 ms p95 target of its start and a carrier drop is forgotten within the
 hangover and two 20 ms reads (read only at block ends they took 576 and 544 ms), and sets aside the part of the monitor
@@ -459,7 +985,9 @@ and moves the generation on), `ENGINE_CHANNEL_SCAN`/`ENGINE_TRUNK_SCAN` (row com
 `UI_NCURSES_PRINTER_HELPERS` and `UI_QT_METRICS_MODEL` (a paused stream's publication reads no carrier past its deadline
 on the caller's clock) and `APP_COMMAND_QUEUE` (decode-mode change, `RTL_SET_FREQ`, `MANUAL_TUNE`, a manual channel
 cycle and scan avoid by rigctl on PCM input, accepted, pending or refused; switching to WAV, Pulse, a named Pulse
-source, UDP or symbol-stream input, replay and stop-playback, including a stop whose Pulse open fails; TCP connect and
+source, UDP or symbol-stream input, replay and stop-playback, each opening its input for real (issue #634: files in a
+temporary directory, UDP on a free loopback port, Pulse through the `openAudioInput()` wrap), while a switch that cannot
+open its input, a stop whose Pulse open fails included, keeps the tone; TCP connect and
 reconnect, accepted or refused; and a config apply, which clears the tone when it moves the input or changes the decode
 mode -- out of the analog monitor and straight back with no monitor block read in between, the row returns with no
 carrier, not the old tone -- and keeps it, generation included, when it changes an unrelated setting or restates the
@@ -467,7 +995,9 @@ mode the session is in). The `APP_COMMAND_QUEUE` cases for `RTL_SET_FREQ`, `MANU
 avoid, the TCP connect and the failed Pulse open, and the `ENGINE_NO_CARRIER_RESET` `-Y` step cases (the rigctl step,
 the legacy RTL step and the failed partial hop), stub what they drive through the linker's `--wrap` seam, so they run
 only where that seam exists: GCC or Clang builds off macOS, and for `APP_COMMAND_QUEUE` off Windows too. The RTL cases
-also need a radio build. All of these bounds come from synthetic signals.
+also need a radio build. All of these bounds come from synthetic signals. `--wrap` replaces only calls that reach the
+symbol from another object file, so a call made inside the object that defines it is not wrapped: the input switch lives
+in `dsd_audio_input_switch.c`, apart from `dsd_audio.c`, so the `openAudioInput()` wrap reaches its Pulse open.
 
 The off-air excerpts are pinned against their oracle labels (see [Tone and code labels](#tone-and-code-labels)) by
 cases in the analog block, run through the analog replay host, which reads the received tone from the decoder's
@@ -510,12 +1040,198 @@ with open(os.path.join(out, "nfm_ctcss_real_neighbour.iq.json"), "w", encoding="
     json.dump(meta, handle, indent=2)
 EOF
 tools/replay_ab.sh --metric analog --capture /tmp/neighbour/nfm_ctcss_real_neighbour.iq.json \
-    --mode -fA --reps 12 --out /tmp/ab/neighbour /tmp/ab/analog_replay.main /tmp/ab/analog_replay.branch
+    --mode -fA --reps 3 --out /tmp/ab/neighbour /tmp/ab/analog_replay.main /tmp/ab/analog_replay.branch
 ```
 
-The hosts are set up as under [Analog A/B](#analog-ab). Over those 12 realtime repeats the detector locked 173.8 Hz at
-300 ms on every one, reported no other tone, and dropped and re-locked it once around a similar reversal and gap at
-2.44 s, 90.33% locked in all.
+The hosts are set up as under [Analog A/B](#analog-ab), which says why three repeats are enough. Over the 12 realtime
+repeats measured when this case was added, the detector locked 173.8 Hz at 300 ms on every one, reported no other
+tone, and dropped and re-locked it once around a similar reversal and gap at 2.44 s, 90.33% locked in all.
+
+#### Received code (DCS) on the analog monitor
+
+`DECODE_IQ_ANALOG_DCS_023N`, `_023I`, `_NOISY`, `_DROP` and `_NOCODE` (issue #523) replay synthetic NFM under
+`-fA -o null` like the CTCSS cases. The fixtures (`nfm_dcs_synth_023n`, `nfm_dcs_synth_023i`, `nfm_dcs_synth_noisy`,
+`nfm_dcs_synth_drop`) are built by `python3 tools/build_iq_fixtures.py --derived-only`: the same voice-band audio and
+receiver noise with a DCS word in place of the tone, repeated at 134.4 bit/s, bit 0 first, as NRZ at 600 Hz deviation
+(a one as positive deviation in normal polarity, the complement in inverted polarity), low-passed below 300 Hz. The
+words come from the builder's own Golay encoder, whose layout `RUNTIME_ANALOG_TONES` and `DSP_ANALOG_DCS_GOLAY_XCHECK`
+pin against the published words, so the fixtures are correct by construction. No public off-air DCS recording exists
+(see [Tone and code labels](#tone-and-code-labels)); a real accept fixture waits for a maintainer recording.
+
+- `_023N`: must log `Received tone: DCS D023N / D047I` (both spellings of the signal, canonical first), and never
+  `none`, a tone or another code.
+- `_023I`: D023 sent in inverted polarity is the signal of D047N and must log `Received tone: DCS D047N / D023I`, never
+  `DCS D023N / D047I`, which a detector that ignored polarity would report. Together the two cases pin the polarity
+  convention end to end, through the RTL replay chain; `DSP_FM_DEMOD_REF` pins the discriminator's sign on its own (a
+  carrier above the tuned frequency demodulates positive, and D023N sent as +/-600 Hz NRZ reads back as D023N).
+- `_NOISY`: D023N's word sent two bits wrong, the same two bits in every repetition, which is no code (two bits from
+  D023N and, the code words being at least 7 bits apart, at least 5 from every other); it must log `none` and never a
+  code or a tone.
+- `_DROP`: the code stops at 1.2 s with no turn-off tone while the carrier and voice carry on: `DCS D023N / D047I`, then
+  `none`.
+- `_NOCODE`: `nfm_notone_synth` through the narrowest NFM channel (`--nfm-bandwidth-hz 8000`), voice with no code:
+  `none`, never a code. `DECODE_IQ_ANALOG_CTCSS_NOTONE`, which fails on a code too, replays the same voice at the
+  default width.
+
+The CTCSS cases and the off-air cases fail on any DCS code too, so none of the tone fixtures, the squelch captures'
+150 bit/s data or AM airband voice reads as a code. `DECODE_IQ_ANALOG_DCS_023N_HOST` and `_023I_HOST` replay the two
+accept fixtures through the analog replay host and match its `tone=` field, which reads the publication's code as both
+spellings of its signal, canonical first: `tone=D023N/D047I` and `tone=D047N/D023I` (never `D023N/D047I` for the
+inverted word), locked within the 520 ms bound (360 ms measured, 83% of each run locked). Over 12 realtime
+`replay_ab.sh --metric analog` repeats against `main` (see [Analog A/B](#analog-ab)), this build read `D023N/D047I`,
+`D047N/D023I` and `D023N/D047I` on `_023n`, `_023i` and `_drop` on every repeat (first lock 360 ms on each; 83, 83 and
+57% locked), where `main`, which has no DCS detector, reads `NA`; `_noisy`, both squelch captures and `nfm_ctcss_real`
+(151.4 Hz at 300 ms, 88.67% locked) read the same in both builds, with every audio column unchanged.
+
+The detector's own bounds are pinned in sample time by `DSP_ANALOG_DCS`, through the pure receive core. Its signals are
+built the way a receiver hears them: the transmitter's NRZ word through the receiver's de-emphasis (75 us, or the
+750 us land-mobile option) and the demodulator's DC block (`dc += (x - dc) / 2^11`, as `demod_pipeline.cpp` runs it),
+plus white noise at an in-band (0-290 Hz) signal-to-noise ratio against the NRZ's power, all from seeded generators.
+Its pins are stronger than the per-event ceilings in `<dsd-neo/dsp/analog_rx.h>`: every stop meets the loss p95
+target on its own, and at 3 dB every row through the demodulator's DC block meets the lock p95 target and every
+fixed-seed start there locks within 700 ms.
+
+- Lock: every code in both polarities at 48 kHz, with both de-emphasis settings, within 520 ms of its onset at 10 dB and
+  700 ms at 3 dB (p50 347-356 ms; the slowest 400 ms at 10 dB and 529 ms at 3 dB), each 3 dB row within the 450 ms p95
+  target; at 8, 44.1, 48 and 78.125 kHz, every eighth code in both polarities within 520 ms at 10 dB and every second
+  code, 104 starts a row, within 700 ms at 3 dB, each 3 dB row within the p95 target (p95 370, 379, 393 and 415 ms;
+  worst 529 ms at 78.125 kHz); PCM input through a 10 Hz sound card coupling in place of the demodulator's DC block, at
+  48 kHz with 75 us, every second code in both polarities within 520 ms at 10 dB (worst 376 ms), and at 3 dB, which the
+  timing contract does not cover through a coupling, every code in both polarities within the row's own pins, p95 550 ms
+  and 1,000 ms a start (p95 436 ms, worst 683 ms); a DC step at the onset, as a carrier off frequency puts under the
+  code: through a DC-coupled PCM input at 48 kHz, every second code in both polarities with a step of 1, 2 and 4 times
+  its level, up or down, within 520 ms at 10 dB (worst 413 ms), and every code in both polarities with a 4x step within
+  700 ms at 3 dB and the 450 ms p95 target (p95 390 ms, worst 473 ms); through the demodulator's DC block at 8 kHz,
+  where it removes a step slowest, every second code with a 4x step within 520 ms at 10 dB (worst 422 ms) -- the
+  detector without its balance slicer fails the first row (some starts not locked within 670 ms, p95 639 ms); a code
+  under transmitter-filtered speech 10 dB above it within 700 ms, and held from then on for 20 s; a transmitter at 134.3
+  or 134.5 bit/s locks and holds for 8 s; the alias pins (D023I is published as D047N, D047I as D023N, D754I as D116N
+  and others) through the detector.
+- Acquisition: a code whose every other word is damaged, so that no two windows 23 bits apart match, started at the top
+  of a clean word once random bits have settled the receiver, at 8 kHz: one bit off, the bit spread over the word, locks
+  every code in both polarities within 520 ms of its start, and bits 3 and 12 off lock none. A rule asking for both
+  windows exactly fails the first, and one allowing two bits the second.
+- Hold and loss: one wrong bit in every word, in the same bit or moving through the word, holds for 20 s; two wrong bits
+  in every word lose the lock within 522 ms of the damage (a window holds both errors only once it lies wholly after the
+  damage started, up to a word later), and nothing locks in its place; a code that stops under a live carrier is lost
+  within 350 ms (p50 293 ms), and the 134.4 Hz turn-off tone within 150 ms (p50 76 ms, worst 99 ms); a steady 130, 134.4
+  or 140 Hz component at the code's power or 3 dB above it, starting under a held code, never ends the lock (the
+  turn-off rule waits for the code to go too); a carrier drop is forgotten within the 200 ms hangover, and a 150 ms
+  dropout inside a transmission keeps the lock; that hangover running out, and the core's reset under a running code,
+  unlock the detector at once: a carrier back with no code never locks, one back with another code never shows the old
+  one, and the same code shows again only once read twice from scratch, not within 330 ms of the reset; a code that
+  stops under a carrier up for 20 ms of every 40-180 ms is lost within the 64-bit span and a word of the stop (649 ms;
+  worst 577 ms over 100 cases at every rate, 1 and 20 ms blocks), with the carrier open throughout; the same code
+  starting over 1 to 22 bits and a share of a bit further on in its word, on a continuous carrier and after 120 and
+  190 ms gaps, keeps one lock and never reads `none`.
+- Publication: a code outranks a tone. A CTCSS tone that locks under a held code never shows while the code holds, and a
+  code that locks under a held tone replaces it at once, within the 10 dB bound of the code's start; both detectors are
+  locked meanwhile, so the rule, not a missed detection, decides the display. The two long-run starts at 10 dB in which
+  a code's own waveform read as a CTCSS tone before the code locked (D274N as 67.0 Hz at 8 kHz, D122N as 77.0 Hz at
+  78.125 kHz), replayed exactly, show the code 346 and 357 ms after its onset; a rule that let the first lock keep the
+  publication showed D122N only after 535 ms, when the tone was lost.
+- Rejection: ten minutes of random bits at 134.4 bit/s; the 74 rotation classes of the Golay (23,12) code that carry
+  no standard code, in both polarities; every standard word sent bit-reversed that is more than one bit from every
+  standard word; every CTCSS tone at 8 and 48 kHz, clean and at 10 dB, never locking even for a moment; and two
+  minutes each of unfiltered and transmitter-filtered speech: none locks. A carrier with no code reads `detecting`
+  until 500 ms, then `none`, and a code that starts later still locks within its bound. A rate beyond the detector's
+  sample ring (none the front end delivers) leaves it inert, reporting no code.
+- Invariance: the RTL live, replay and int16 PCM scales lock in the same block, and block size never moves the lock.
+
+`DSP_ANALOG_CTCSS` also checks that every supported code's waveform locks once as DCS, under its canonical name, and
+never as a CTCSS tone, reading the CTCSS detector's own state, where the code's lock would hide one from the
+publication; that every other periodic waveform locks nothing, not even for a moment, unless it is one bit from a
+supported word, when it locks once as that code; and that the words that come nearest to a table tone, at least three
+bits from every supported word, lock nothing at every rate and SNR. `DSP_SYMBOL_REPLAY` runs D023N and the inverted word
+through the real tap and checks the `Received tone: DCS` line, and the resets that clear a tone are shown to clear a
+code as well: a trunk-tuning or RTL stream generation move and an announced reset in `DSP_SYMBOL_REPLAY`,
+`RTL_SET_FREQ`, `MANUAL_TUNE` and a decode-mode change in `APP_COMMAND_QUEUE` (each named for the tone and the code
+pass), a `-Y` row commit in `ENGINE_CHANNEL_SCAN`, and an `nfm-conventional` target switch in `ENGINE_TRUNK_SCAN` (the
+visit cap moving on under the carrier that carries a code, then an operator advance back). The two scan tests clear the
+code through their own stub of the acquisition reset each switch calls, so they show that the switch calls it and that
+no parked state brings the code back; `FRAME_SYNC_INTERNAL_HELPERS` checks that the real reset clears a code, called as
+a trunk-scan target switch calls it. That a reset clears the detector itself, not only the publication, is shown twice:
+in `DSP_SYMBOL_REPLAY` the same code running on through a generation move is neither shown nor logged for 300 ms after
+it, less than the 342 ms a lock read from scratch needs, and after the announced reset the inverted word locks as D047N
+with D023N never shown again; `DSP_ANALOG_DCS` runs the core's own reset (the carrier hangover running out, and
+`dsd_analog_rx_core_reset()` under a running code) and checks the detector is unlocked at once and the old code never
+shows again. A reset that kept a held lock fails both. `APP_CONTROL_RX_TONE_VIEW`, `UI_NCURSES_PRINTER_HELPERS`,
+`UI_QT_METRICS_MODEL` and `UI_QT_QML_CALL_LISTS` pin the `DCS D023N / D047I` text (both spellings of the signal,
+canonical first, with the second one's code and polarity beside the first's), the names the view refuses (an unsupported
+code, a rotation alias, a non-canonical polarity), and the received code kept apart from a configured policy value.
+`RUNTIME_ANALOG_TONES` pins that every standard signal has exactly two standard spellings, the canonical normal code and
+one inverted code, against the golden alias table, and the label that names both; and that every supported code's word
+carries 11 or 12 ones in either polarity (000's carries 7), which the balance slicer relies on. `RUNTIME_ANALOG_TONES`
+and `DSP_ANALOG_DCS_GOLAY_XCHECK` pin the published words of 023, the inverted 023, 047, 020 and 000 (onfreq's DPL/DCS
+page), 047 a standard code of its own and 020 a word of another rotation class, so check bits that do not follow from
+023's, before and after the mapping onto `Golay24.hpp`.
+
+Long-run sweeps (offline, the `DSP_ANALOG_DCS` signal model through the pure receive core, a random code and polarity
+per start with the onset anywhere in a word; `<dsd-neo/dsp/analog_rx.h>` sets its ceilings above the slowest event):
+
+- Lock at 10 dB, 7,000,000 starts: 500,000 each with 75 and 750 us at 48 kHz, p95 369 and 370 ms, the slowest 429 and
+  422 ms; 1,000,000 each with 75 and 750 us at 8, 44.1 and 78.125 kHz, p95 367-370 ms, p99.99 398-412 ms, the slowest
+  437 and 445 ms at 8 kHz, 428 and 434 ms at 44.1 kHz and 428 and 424 ms at 78.125 kHz (75, then 750 us). No code's own
+  waveform read as a CTCSS tone first. An earlier 7,000,000-start sweep, on other seeds and before the balance slicer,
+  found it twice (D274N as 67.0 Hz at 8 kHz, D122N as 77.0 Hz at 78.125 kHz, both 75 us), shown for 161 and 71 ms
+  until the code outranked it; `DSP_ANALOG_DCS` replays both on this detector. Under a rule that let the first lock
+  keep the publication, D122N showed only after 535 ms, when the tone was lost.
+- Lock at 3 dB, 8,500,000 starts: with 75 us, p95 376, 382, 385 and 399 ms at 8, 44.1, 48 and 78.125 kHz (500,000,
+  500,000, 1,000,000 and 1,000,000 starts), the slowest 868, 830, 861 and 1,022 ms; with 750 us, p95 385, 392, 396
+  and 415 ms (500,000, 500,000, 2,000,000 and 2,500,000 starts), p99.9 at most 690 ms, the slowest 781, 910, 992 and
+  1,224 ms. 23 starts took longer than a second, all at 78.125 kHz and 21 of them with 750 us, where the demodulator's
+  DC block sags the most and the de-emphasis smears a code's isolated bits. None read a tone first.
+- The acquisition rule, 100,000 starts per rate (8, 44.1, 48 and 78.125 kHz) and de-emphasis at 3 and 10 dB, against the
+  same detector asking for both windows exactly: at 3 dB p95 377-416 ms against 436-666 ms (past the 450 ms target in
+  7 rows of 8), at most 0.1% of starts past 700 ms against 0.3-3.5%, and none past the 1,500 ms ceiling against 8 (the
+  slowest 1,662 ms); at 10 dB the slowest 422 ms against 553 ms, 2 of 800,000 past 520 ms.
+- A DC step at the code's onset, from a carrier off frequency, of 1, 2 and 4 times the code's deviation up or down,
+  50,000 starts per rate (8, 44.1, 48 and 78.125 kHz) and condition, 75 us (and 750 us for the 4x step through the
+  demodulator's DC block and a DC-coupled input): through the demodulator's DC block, a DC-coupled PCM input and a 1 Hz
+  coupling, every one of the 1,200,000 starts at 10 dB with a 1 or 2x step within 520 ms (the slowest 473 ms,
+  DC-coupled) and p95 at most 421 ms at 3 dB (the slowest 882 ms); with a 4x step 1 of 1,000,000 at 10 dB past 520 ms
+  (526 ms, DC-coupled at 48 kHz with 750 us, the next 496 ms) and at 3 dB p95 up to 474 ms (a 1 Hz coupling; 473 ms
+  through the demodulator's DC block at 8 kHz with 750 us), the slowest 1,020 ms. Through a 10 Hz coupling every start
+  at 10 dB within 520 ms (the slowest 511 ms), and at 3 dB p95 482-544 ms (475-483 ms without a step). A DC-coupled
+  input with no step: p95 367 ms at 10 dB and 377 ms at 3 dB. Once a code's own waveform read as a CTCSS tone first
+  (D225I as 77.0 Hz for 50 ms, a 2x step through a 10 Hz coupling at 44.1 kHz and 10 dB). The detector before the
+  balance slicer, through a DC-coupled input with a 2x step at 48 kHz and 10 dB: p50 617 ms, 19,990 of 20,000 starts
+  past 520 ms; with a 4x step p50 837 ms, every one past it.
+- PCM input through a sound card's coupling in place of the demodulator's DC block (a one-pole high-pass, 75 and 750 us,
+  75 then 750 us in each pair below): with a 10 Hz corner at 10 dB, 200,000 starts each at 44.1 and 48 kHz, p95
+  371-372 ms, the slowest 441 and 451 ms at 44.1 kHz and 477 and 465 ms at 48 kHz; at 3 dB, 200,000 each at 44.1 kHz and
+  500,000 each at 48 kHz, p95 475 and 525 ms at 44.1 kHz and 483 and 535 ms at 48 kHz, p99.9 837-930 ms, the slowest
+  1,372 and 1,605 ms at 44.1 kHz and 1,463 and 1,702 ms at 48 kHz. With a 15 Hz corner at 48 kHz and 75 us, 100,000
+  starts each: 5 past 520 ms at 10 dB (the slowest 649 ms), and at 3 dB p95 716 ms, the slowest 2,284 ms. A droop
+  slicer that matched the 10 Hz coupling (0.63 a bit in place of 0.55) was slower there (p95 518 against 485 ms at
+  48 kHz, 75 us, 3 dB, the same 100,000 starts).
+- Loss when the code stops under a live carrier, 1,000,000 stops at 3 and 10 dB over the same rates and de-emphasis:
+  p95 at most 328 ms, p99.9 at most 377 ms, the slowest 591 ms. About 9 stops in 100,000 take longer than 450 ms: the
+  noise that follows reads as the code once more (within one bit of the word expected next, or exactly at another
+  place in it), which starts the 32 bits over. The balance slicer holds only on an exact read: allowed a bit of slack,
+  it read noise as the code about twice as often (25 against 14 of 200,000 stops past 450 ms at 48 kHz, 75 us, 3 dB).
+- Loss on the turn-off tone, 1,000,000 at 3 and 10 dB: p95 at most 134 ms (750 us at 3 dB; 97-109 ms otherwise), p99.9
+  at most 224 ms, the slowest 353 ms (78.125 kHz, 750 us, 3 dB, a turn-off the detector before the balance slicer reads
+  the same, which is why the ceiling is 400 ms and not 350).
+- Loss under a flickering carrier (openings of 1-60 ms between dropouts of 10-199 ms from the stop), 16,000 stops at 8,
+  44.1, 48 and 78.125 kHz, 3 and 10 dB: p95 at most 548 ms, the slowest 619 ms (a loss that counted only bits read with
+  the carrier open, with no span, took p95 1,270 ms and the slowest 1,755 ms at 48 kHz). After a single 120 ms dropout
+  with the code gone, 16,000 returns: lost p95 368 ms after the carrier came back, the slowest 591 ms (twice in 16,000
+  the noise read as the code once more).
+- The same code at another place in its word, a shift of 1-22 bits and a random share of a bit, half on a continuous
+  carrier and half after a 120 or 190 ms gap: at 10 and 20 dB, of 7,040 restarts at 8, 44.1, 48 and 78.125 kHz one
+  showed `none` briefly (48 kHz, 10 dB, after a 190 ms gap, as the detector before the balance slicer does too) and none
+  another code (a hold that followed only the expected place dropped 396 of 440 to `none` at 48 kHz, 20 dB); at 3 dB,
+  0-19 of 440 per condition dropped and locked again.
+- Holds (random codes, 60 s each): at 3 dB with nothing else in the band, a held code dropped once in 200 minutes with
+  750 us at 78.125 kHz and once in 200 minutes with 75 us at 48 kHz, never in 200 minutes with 750 us at 48 kHz, each
+  time locking again, and never in 20 minutes at 10 dB; with a steady 130 Hz component 3 dB above the code or 134.4 Hz
+  at its power, about once or twice a minute at 3 dB and never at 10 dB; under transmitter-filtered speech 10 and 20 dB
+  above the code never in 12 minutes each; under unfiltered speech 10 dB above it, outside the contract, about 7 times
+  a minute (the code shown 96% of the time; before the balance slicer 9 times a minute and 94%); at 0 dB in-band,
+  outside the contract, about twice a minute. A DC-coupled input with a 4x step at the onset of each 10 s hold, at 3 and
+  10 dB, and the demodulator's DC block with the same step at 8 kHz and at 48 kHz with 750 us, 3 dB: 200 holds each, no
+  loss.
 
 Known gaps and caveats:
 
@@ -757,41 +1473,93 @@ Known gaps and caveats:
   appearing as received data; valid status is shown with its Table 16.92 label
   in the terminal channel summary.
 - **ProVoice** and **X2-TDMA** have no usable public sample and are untested here.
+- **X2-TDMA** has no usable public sample and is untested here.
 - **dPMR** decodes only what its CCH CRC-7 verifies (issue #407), so the `dpmr` off-air capture publishes nothing:
   it carries no recoverable CCH, which is why the CRC was thought to be broken. `DECODE_IQ_DPMR_MARGINAL` pins that
   it still syncs and still publishes no identity; `DECODE_IQ_DPMR_SYNTH` is the accept case.
 - **P25 Phase 2** asserts SACCH framing only. Full payload decode needs the
   system WACN/SYSID/CC via `-X`, which the public sample does not identify.
-- Fixtures are timing-insensitive by construction. Do not add assertions that
-  depend on wall-clock call-state timers, because `fast` replay compresses them;
-  use `--iq-replay-rate realtime` for that.
-- **AM** has a fixture (`am_airband_real`) but no AM case until native AM reception (#524) adds `-fM`. Under `-fA`
-  the FM monitor demodulates it, which measures an FM discriminator on an AM signal, so `-fA` cannot stand in for an
-  AM case (`DECODE_IQ_ANALOG_REAL_CTCSS_NOFALSE_AM` uses it under `-fA` only as no-false-lock material for the tone
-  detector). The excerpt serves `-fA` for another reason: its carrier sits within a few hertz of 0 Hz, where the
+- Call-state timers run on the capture's clock under replay (issue #572), so an
+  assertion that depends on one holds in `fast` and `realtime` replay alike.
+  `-T` and `-Y` replays are outside that guarantee (see
+  [Replay determinism](#replay-determinism-issue-572)): under `-T` the P25
+  trunking watchdog checks its timers at a real-time cadence, and under `-Y`
+  replay refuses the scanner's retunes, so its hangtime and visit timers cannot
+  follow the scan they time.
+- **AM** cases run `-fM`, native AM reception (issue #524): `DECODE_IQ_ANALOG_AM_*` in the table below. Under `-fA` the
+  FM monitor demodulates `am_airband_real`, which measures an FM discriminator on an AM signal, so `-fA` cannot stand in
+  for an AM case (`DECODE_IQ_ANALOG_REAL_CTCSS_NOFALSE_AM` uses it under `-fA` only as no-false-lock material for the
+  tone detector). The excerpt serves `-fA` for another reason: its carrier sits within a few hertz of 0 Hz, where the
   modulation auto-switch (`frame_sync_maybe_auto_switch_modulation()` in `src/dsp/dsd_frame_sync.c`) votes for CQPSK.
-  The switch used to run in analog-only mode too, because `-fA` does not set `opts->mod_cli_lock`: it applied the
-  P25 CQPSK demod profile to the RTL front end, which then delivered CQPSK symbols instead of monitor audio, after 0
-  or 20 ms of monitor audio in `fast` replay and 680 ms in `realtime` (the switch's dwell is timed by the wall clock).
-  The analog family (`dsd_opts_is_analog_family()`) now stands the switch down, so the front end stays on the monitor
-  path whatever the carrier offset, and replay of the excerpt is sample-deterministic. Two tests pin it:
+  The switch used to run in analog-only mode too, because `-fA` does not set `opts->mod_cli_lock`: it applied the P25
+  CQPSK demod profile to the RTL front end, which then delivered CQPSK symbols instead of monitor audio, after 0 or 20
+  ms of monitor audio in `fast` replay and 680 ms in `realtime` (the switch's dwell was then timed by the wall
+  clock). The analog family (`dsd_opts_is_analog_family()`) now stands the switch down, so the front end stays on the
+  monitor path whatever the carrier offset, and replay of the excerpt is sample-deterministic. Two tests pin it:
   `FRAME_SYNC_INTERNAL_HELPERS` feeds the switch CQPSK-favouring metrics under the analog preset and requires no vote
   and no demod profile, with no clock involved, and `DECODE_IQ_ANALOG_NO_MOD_AUTO_SWITCH` replays the excerpt under
   `-fA` and requires all 8000 ms on the monitor path. The vote is not the hunt's only request: every symbol profile the
   sync hunt asks for goes through `rtl_maybe_apply_demod_profile()`, which sends the RTL front end nothing in
   analog-only mode, so a two-level profile the hunt re-normalises when its dwell runs out (a live switch to `-fA` from
   D-STAR leaves the hunt on 4800/2) cannot narrow the monitor to a digital channel either; `FRAME_SYNC_INTERNAL_HELPERS`
-  pins that guard on both paths. The analog replay host still warns whenever the front end
-  delivers CQPSK symbols, since symbols are not samples at the output rate and its stream clock then does not measure
-  stream time, and every registered `-fA` case fails on that warning (`NOT_EXPECTED`); `tools/replay_ab.sh` leaves
-  such repeats out (its `off_path` column). An AM case on this excerpt (`-fM`) carries the same guard.
+  pins that guard on both paths. The analog replay host still warns whenever the front end delivers CQPSK symbols, since
+  symbols are not samples at the output rate and its stream clock then does not measure stream time, and every
+  registered `-fA` case fails on that warning (`NOT_EXPECTED`); `tools/replay_ab.sh` leaves such repeats out (its
+  `off_path` column). An AM case on this excerpt (`-fM`) carries the same guard.
+
+
+### MBE capture checks (issue #661)
+
+`DECODE_IQ_MBE_CAPTURE_*` (CTest labels `iq-decode` and `mbe-capture`) replay a voice fixture with
+`-d <dir>/caps`, given without a trailing separator, through `tests/iq_mbe_capture_check.cmake`. Like the decode
+runner it requires exit code 0, the decode regex and no sanitizer report first, so a run that never decoded cannot
+pass a check for missing files. Then every file in `caps/` must carry its extension's 4-byte header and hold whole
+records, at least one (a capture is created by its first frame), nothing named `caps*` may sit beside the folder,
+and each case pins a file count or minimum frame count. Frame counts are lower bounds, because what a replay
+captures is fixed for one build, not across builds. The AUTO cases (`-fa`) assert only what holds whatever the hunt's
+phase: every file is well formed, and YSF is captured at all. The runner removes its work folder, failing or not.
+
+Name collisions are pinned with GNU ld `--wrap` in `CORE_MBE_OUT_COLLISION`: `dsd_nonce_u16()` and
+`dsd_decode_time()` return fixed values, so the test knows in advance the capture name and the per-call WAV final
+name the code will try, creates a file there, and checks that it keeps its bytes while the recording lands under the
+next number. `YSF_MBE_CAPTURE` compiles `test_ysf_dch_decode.c` again with `DSD_YSF_TEST_REAL_VOCODER`, linking the
+real vocoder in place of the `processMbeFrame` stub, so the V/D1 and full-rate frames YSF hands the borrowed NXDN and
+P25 Phase 1 decoders reach the capture writer.
+
+### Digital voice chain checks (issue #653)
+
+Every decoded voice frame runs once through its slot's voice chain (high-pass, then gain) before anything consumes it,
+so one call gives the same audio in every output. `CORE_VOICE_CHAIN` holds the high-pass to the closed-form bilinear
+Butterworth response (-3 dB at 300 Hz, unity at Nyquist, flat within 0.05 dB from 1 kHz up) and runs a sine sweep
+through the live filter; it checks that each slot filters on its own state, that the state starts over at a new call or
+protocol family (and not when a call becomes known mid-stream, after a boundary reset included, nor for a borrowed
+decoder's synctype), the gain laws (fixed `-g` a plain multiplier, unity below 0, the auto gain's attack, a legitimate
+gain below unity kept, a zeroed level recovering), and that the alert tone is a clean sine with the same samples in
+both formats after sink conversion, its phase running across blocks (ID 41 ends a block partway through a cycle).
+`CORE_MBE_TRANSFORM_CONTEXT`'s voice-chain case decodes P25 Phase 1, NXDN, DMR slot 2, D-STAR and X2-TDMA slot 2
+frames through the real vocoder under integer and float output, the null output, a mute partway, and stereo presets,
+and requires byte-identical per-call WAVs, chained frames and gain levels, shared short staging equal to the WAV in
+both formats, the mono mixer's playback equal to the WAV and to the converted float output within one LSB, and a
+recording the high-pass changes. `CORE_MBE_FILE_IO` checks that SDRTrunk JSON
+playback chains the frames it withholds (encrypted, no key). Its other cases set a fixed
+unity gain with the high-pass off (`pass_through_voice_chain()`), which leaves the chain a pass-through, so they still
+compare synthesis against mbelib's own output.
+
+`DECODE_IQ_VOICE_CHAIN_*` (CTest labels `iq-decode` and `voice-chain`) replay a voice fixture with `-P` through
+`tests/iq_voice_chain_check.cmake` under integer output to stdout, float output (`-y`) to stdout and `-o null`, and
+require byte-identical per-call WAVs from all three (compared as sorted content hashes, since their names carry a
+nonce), as many float samples as integer ones, a float output that `-v 0x1` (high-pass off) changes, and, for a mono
+preset's single call (`PLAYBACK_MATCH`), the integer stdout equal to the WAV's samples. The runner removes its work
+folder, failing or not.
 
 ### Analog monitor audio checks
 
 The `DECODE_IQ_ANALOG_*` audio cases (CTest labels `iq-decode` and `analog`, radio builds only) check what the analog
-FM monitor lets a listener hear; the received-tone cases `DECODE_IQ_ANALOG_CTCSS_*` carry the same labels but match a
-log line, and `DECODE_IQ_ANALOG_REAL_CTCSS_*` read the received tone through this host (see
-[Received tone (CTCSS) on the analog monitor](#received-tone-ctcss-on-the-analog-monitor)).
+FM monitor lets a listener hear; the received-tone cases `DECODE_IQ_ANALOG_CTCSS_*` and `DECODE_IQ_ANALOG_DCS_*` carry
+the same labels and match a log line, and `DECODE_IQ_ANALOG_REAL_CTCSS_*`, `DECODE_IQ_ANALOG_DCS_023N_HOST` and
+`DECODE_IQ_ANALOG_DCS_023I_HOST` also read the received tone or code through this host (see
+[Received tone (CTCSS) on the analog monitor](#received-tone-ctcss-on-the-analog-monitor) and
+[Received code (DCS) on the analog monitor](#received-code-dcs-on-the-analog-monitor)).
 `iq_decode_check.cmake` can only match log lines, and the `-6` WAV is taken before the monitor's filters, gain stage
 and squelch gate, so neither can say whether the monitor produced the right audio. The
 cases therefore run `dsd-neo_test_analog_replay` (`tests/engine/analog_replay.c`) as `DSD_BIN` through the unchanged
@@ -810,8 +1578,14 @@ build/dev-debug/tests/dsd-neo_test_analog_replay --frontend none -fA --iq-replay
 
 The host removes its own `--analog-*` options (either `--opt VALUE` or `--opt=VALUE`) before the rest reach the CLI
 parser; any other `--analog-*` argument goes to `dsd-neo` unchanged, so the prefix stays free for real options. Each
-audio block is scored as delivered, 20 ms at the monitor's rate, with one gain for the whole block: the default
-fixed gain, or with `-n 0` the per-block AGC.
+audio block is scored as delivered, after the voice band-pass and the gain stage (the AGC by default, or a fixed gain
+with `-n N`). A block is 20 ms of an RTL stream or I/Q replay at its output rate, or 960 samples of audio input at its
+rate (20 ms at 48 kHz); either reaches the sink at 48 kHz (issue #633). The host scores the audio at the sink rate and
+keeps stream time at the monitor's rate. A block
+at another rate arrives in writes of at most 960 samples, all at one stream position; the host takes them as one block
+and scores it whole, so the spectral windows and stream times do not depend on how it was cut
+(`dsd-neo_test_analog_replay --analog-selftest`, CTest `ANALOG_REPLAY_SELFTEST`, checks a block scores the same in one
+write or two).
 
 | Option | Measures |
 | --- | --- |
@@ -821,6 +1595,7 @@ fixed gain, or with `-n 0` the per-block AGC.
 | `--analog-min-captured-ms MS` | Audio the monitor delivered at all, i.e. with the gate open. A stalled or shortened replay fails it. |
 | `--analog-min-audible-ms MS`, `--analog-max-audible-ms MS` | Blocks whose RMS is at or above the audible level (`--analog-audible-dbfs`, default -50 dBFS). |
 | `--analog-min-first-audible-ms MS`, `--analog-max-first-audible-ms MS` | Stream time where the first audible block starts. Fails when nothing is audible. |
+| `--analog-min-last-audible-ms MS`, `--analog-max-last-audible-ms MS` | Stream time where the last audible block ends (`last_audible_ms`). Fails when nothing is audible. With first-audible and audible-ms bounds that pin exact blocks, it pins a gate's closing edge and that no block between the edges is missing. |
 | `--analog-min-inband-db DB` | 300-3000 Hz energy over 3400-6000 Hz energy, Hann-windowed per block. |
 | `--analog-min-rms-dbfs DB`, `--analog-max-rms-dbfs DB` | RMS level of all delivered audio (`rms_dbfs`). |
 | `--analog-max-peak-dbfs DB` | Largest delivered sample (`peak_dbfs`). |
@@ -828,7 +1603,10 @@ fixed gain, or with `-n 0` the per-block AGC.
 | `--analog-probe-hz HZ` | Level at `HZ` (Hann-windowed Goertzel), repeatable up to 8 frequencies: `dbfs`, and `dbc` against the expected tone. |
 | `--analog-probe-{min,max}-{dbc,dbfs} HZ:DB` | Bounds on a probe's level; each also adds the probe. |
 | `--analog-max-tone-lock-ms MS` | Upper bound on `tone_lock_ms`, the stream time of the first received-tone lock. Fails as not measured when no tone locked. |
-| `--analog-scan-row ROW` | Enter row `ROW` of the `-C` channel map before the replay, the way the conventional scanner commits it (its class, then its own options), and print `Scan row applied: ROW <class>; width <W>` with `(row)` when the row sets the width. I/Q replay cannot retune, so one row is all a run visits (issue #526). |
+| `--analog-max-delivery-error-pct PCT` | How far the length of the delivered audio strays from the input its blocks span, at the sink rate (issue #633). Measured on audio input, where each block spans 960 samples at the monitor's rate; fails as not measured otherwise. |
+| `--analog-raw-wav-min-rms-dbfs DB` | Lower bound on the RMS level of the run's `-6` raw WAV (issue #643), which this option has the host record: it adds `-6 FILE` for a private temporary file, reads the WAV back when live processing ends (closing it first, which the engine would only do after the stop hook), prints `ANALOG RAW WAV: frames=N rate_hz=R rms_dbfs=X peak_dbfs=Y clip=C` after the `ANALOG METRIC:` line, and removes the file at exit. Fails as not measured when the WAV holds no frames. |
+| `--analog-scan-row ROW` | Enter row `ROW` of the `-C` channel map before the replay, the way the conventional scanner commits it (its class, then its own options), and print `Scan row applied: ROW <class>; width <W>; squelch <S>`, each with `(row)` when the row sets it. I/Q replay cannot retune, so one row is all a run visits (issue #526). |
+| `--analog-iq-gain-db DB` | Replay a copy of the capture with every sample scaled by `DB` about the cu8 midpoint: the same air, noise included, as a receiver with that much more (or less) gain records it. It works on the committed fixtures only (`tests/fixtures/iq`, opened by their directory entries there, never by a path from the command line or a sidecar). The copy goes to a private temporary directory the host removes at exit, and the host prints `capture scaled by +10.0 dB, N of M bytes clipped`; it stops (exit 2) when more than one byte in a thousand would clip, or when the capture is not a committed fixture. The auto squelch's `_HOT` cases use it, so a hotter receiver costs no committed fixture. |
 
 A case that expects silence (a muted or rejected transmission) pairs `--analog-max-audible-ms 0` with
 `--analog-min-total-ms`: silence alone is also what a replay that stalled or never started produces.
@@ -845,31 +1623,73 @@ it. Sub-audible tones 20-30 Hz apart need a longer, phase-continuous window than
 When live processing ends the host prints `ANALOG METRIC:` (`rate_hz`, `total_ms`, `captured_ms`, `audible_ms`,
 `first_audible_ms`, `rms_dbfs`, `peak_dbfs`, `clip`, `inband_db`, `tone_hz`, `tone_dbfs`, `tone_snr_db`, and the
 received-tone fields `tone`, `tone_lock_ms` and `tone_lock_pct` described under [Analog A/B](#analog-ab); `NA` where
-a value was not measured), one `ANALOG PROBE:` line per probe, and then `ANALOG AUDIO OK`, or one
-`ANALOG AUDIO FAIL:` line per missed bound and exit status 1. Without bounds it only reports, which is how
-`tools/replay_ab.sh --metric analog` uses it. Every bound is absolute and per case, so "narrower is cleaner" becomes
-two cases with their own limits, not a comparison between runs. Measured on the commit that added them:
+a value was not measured), the `ANALOG RAW WAV:` line when the run recorded one, one `ANALOG PROBE:` line per probe,
+and then `ANALOG AUDIO OK`, or one `ANALOG AUDIO FAIL:` line per missed bound and exit status 1. Without bounds it
+only reports, which is how `tools/replay_ab.sh --metric analog` uses it. Every bound is absolute and per case, so
+"narrower is cleaner" becomes two cases with their own limits, not a comparison between runs. Measured on the commit
+that added them:
 
 | Case | Fixture | Measured (default monitor filters) | Bounds |
 | --- | --- | --- | --- |
-| `DECODE_IQ_ANALOG_NFM_TONE` | `nfm_tone_synth` | tone SNR 25.9 dB, in-band 30.5 dB, RMS -36.1 dBFS, audible 1500 of 1500 ms from 0 ms, no clipping; a 1 kHz probe reads 0.00 dBc | SNR ≥ 20, captured and audible ≥ 1400 ms, first audible ≤ 100 ms, in-band ≥ 24, RMS -42 to -30 dBFS, clip 0, 1 kHz probe within ±1 dBc |
-| `DECODE_IQ_ANALOG_NFM_ADJACENT` | `nfm_adjacent_synth` | tone SNR 25.8 dB; 12.5 kHz probe -64.9 dBc | SNR ≥ 20, captured ≥ 1400 ms, 12.5 kHz ≤ -40 dBc |
-| `DECODE_IQ_ANALOG_NFM_TONE_8K` | `nfm_tone_synth`, `--nfm-bandwidth-hz 8000` | tone SNR 17.0 dB (the 8 kHz channel trims the 3 kHz-deviation sidebands), in-band 28.5 dB, RMS -36.1 dBFS, 1 kHz tone -36.1 dBFS; 12.5 kHz probe -80.4 dBc | `NFM_TONE`'s bounds with SNR ≥ 12, the 1 kHz tone at -37.5 to -34.5 dBFS, and 12.5 kHz ≤ -72 dBc (the default width reads -66.7) |
-| `DECODE_IQ_ANALOG_NFM_TONE_16K` | `nfm_tone_synth`, `--nfm-bandwidth-hz 16000` | measures the same as the default: tone SNR 25.9 dB, in-band 30.5 dB, 1 kHz tone -36.1 dBFS | `NFM_TONE`'s bounds with SNR ≥ 25 and in-band ≥ 30, which neither other width meets together, and the 1 kHz tone at -37.5 to -34.5 dBFS |
-| `DECODE_IQ_ANALOG_NFM_TONE_25K` | `nfm_tone_synth`, `--nfm-bandwidth-hz=25000` | tone SNR 23.6 dB (more receiver noise in the wider channel), in-band 30.4 dB, RMS -36.1 dBFS, 1 kHz tone -36.1 dBFS; 12.5 kHz probe -48.9 dBc | `NFM_TONE`'s bounds with SNR ≥ 18, the 1 kHz tone at -37.5 to -34.5 dBFS, and 12.5 kHz ≥ -58 dBc (the default width reads -66.7) |
-| `DECODE_IQ_ANALOG_NFM_BW_8K` | `nfm_adjacent_synth`, `--nfm-bandwidth-hz 8000` | tone SNR 17.0 dB; 12.5 kHz probe -79.5 dBc | SNR ≥ 12, captured ≥ 1400 ms, 12.5 kHz ≤ -72 dBc (the default width reads -64.9) |
-| `DECODE_IQ_ANALOG_NFM_BW_25K` | `nfm_adjacent_synth`, `--nfm-bandwidth-hz 25000` | the neighbour is in the passband: 12.5 kHz probe -8.2 dBc, tone SNR -3.5 dB (the beat counts as noise), tone level -36.1 dBFS | captured ≥ 1400 ms, 12.5 kHz ≥ -20 dBc, 1 kHz level -38 to -34 dBFS |
-| `DECODE_IQ_SCAN_NFM_TONE` | `nfm_adjacent_synth` through an `nfm` map row with `--nfm-bandwidth-hz 12500` on a `-fa` session (`--analog-scan-row 0`) | tone SNR 27.2 dB; 12.5 kHz probe -81.3 dBc (the same row without a width: 25.8 dB, -64.9 dBc) | row banner with `width 12.5 kHz (row)`, SNR ≥ 20, captured ≥ 1400 ms, 12.5 kHz ≤ -72 dBc |
+| `DECODE_IQ_ANALOG_NFM_TONE` | `nfm_tone_synth` | tone SNR 37.5 dB, in-band 52.3 dB, RMS -13.2 dBFS at the AGC's -10 dBFS peak, audible 1500 of 1500 ms from 0 ms, no clipping; a 1 kHz probe reads 0.00 dBc | SNR ≥ 30, captured and audible ≥ 1400 ms, first audible ≤ 100 ms, in-band ≥ 45, RMS -14.5 to -12 dBFS and peak ≤ -9.5 dBFS (the window `AM_TONE` shares), clip 0, 1 kHz probe within ±1 dBc |
+| `DECODE_IQ_ANALOG_NFM_TONE_FIXED50` | `nfm_tone_synth`, `-n 50` | RMS -15.9 dBFS, peak -12.4 dBFS: the fixed gain's calibration (the reference signal at -12 dBFS peak, -15 dBFS RMS) | RMS -16.9 to -14.9 dBFS, captured ≥ 1400 ms, clip 0 |
+| `DECODE_IQ_ANALOG_NFM_ADJACENT` | `nfm_adjacent_synth`, `-v 0 -n 50` | tone SNR 36.6 dB; 12.5 kHz probe -76.6 dBc | SNR ≥ 30, captured ≥ 1400 ms, 12.5 kHz ≤ -40 dBc |
+| `DECODE_IQ_ANALOG_NFM_TONE_8K` | `nfm_tone_synth`, `-v 0 -n 50 --nfm-bandwidth-hz 8000` | tone SNR 28.0 dB (the 8 kHz channel trims the 3 kHz-deviation sidebands), in-band 40.8 dB, RMS -15.9 dBFS, 1 kHz tone -15.9 dBFS; 12.5 kHz probe -92.8 dBc | SNR ≥ 22, in-band ≥ 36, captured and audible ≥ 1400 ms, first audible ≤ 100 ms, RMS -22 to -10 dBFS, clip 0, the 1 kHz tone at -17.5 to -14.5 dBFS, and 12.5 kHz ≤ -86 dBc (the default width reads -78.4) |
+| `DECODE_IQ_ANALOG_NFM_TONE_16K` | `nfm_tone_synth`, `-v 0 -n 50 --nfm-bandwidth-hz 16000` | measures the same as the default: tone SNR 36.8 dB, in-band 42.7 dB, 1 kHz tone -15.9 dBFS | `NFM_TONE_8K`'s level bounds with SNR ≥ 36, which neither other width meets, and in-band ≥ 40 |
+| `DECODE_IQ_ANALOG_NFM_TONE_25K` | `nfm_tone_synth`, `-v 0 -n 50 --nfm-bandwidth-hz=25000` | tone SNR 35.0 dB (more receiver noise in the wider channel), in-band 42.6 dB, RMS -15.9 dBFS, 1 kHz tone -15.9 dBFS; 12.5 kHz probe -60.6 dBc | `NFM_TONE_8K`'s level bounds with SNR ≥ 30, in-band ≥ 36, and 12.5 kHz ≥ -70 dBc (the default width reads -78.4) |
+| `DECODE_IQ_ANALOG_NFM_BW_8K` | `nfm_adjacent_synth`, `-v 0 -n 50 --nfm-bandwidth-hz 8000` | tone SNR 28.0 dB; 12.5 kHz probe -92.6 dBc | SNR ≥ 22, captured ≥ 1400 ms, 12.5 kHz ≤ -86 dBc (the default width reads -76.6) |
+| `DECODE_IQ_ANALOG_NFM_BW_25K` | `nfm_adjacent_synth`, `-v 0 -n 50 --nfm-bandwidth-hz 25000` | the neighbour is in the passband: 12.5 kHz probe -19.9 dBc, tone SNR 8.2 dB (the beat counts as noise), tone level -15.9 dBFS | captured ≥ 1400 ms, 12.5 kHz ≥ -30 dBc, 1 kHz level -18 to -14 dBFS |
+| `DECODE_IQ_SCAN_NFM_TONE` | `nfm_adjacent_synth` through an `nfm` map row with `--nfm-bandwidth-hz 12500` on a `-fa -v 0 -n 50` session (`--analog-scan-row 0`) | tone SNR 37.4 dB; 12.5 kHz probe -97.3 dBc (the same row without a width: 36.6 dB, -76.6 dBc) | row banner with `width 12.5 kHz (row)`, SNR ≥ 30, captured ≥ 1400 ms, 12.5 kHz ≤ -86 dBc |
+| `DECODE_IQ_SCAN_AM_TONE` | `am_tone_synth` through an `am` map row with `--am-bandwidth-hz 8333` on a `-fa` session (`--analog-scan-row 0`) | tone SNR 31.6 dB, in-band 43.0 dB, RMS -13.5 dBFS, audible 1500 of 1500 ms from 0 ms, no clipping (the wider channel lets in more noise than `-fM`'s 6 kHz default, 31.7 dB and 50.4 dB); the FM monitor finds no tone there, so the tone is the AM detector's | row banner with `width 8.333 kHz (row)`, SNR ≥ 25, captured and audible ≥ 1400 ms, in-band ≥ 36, `NFM_TONE`'s level window, clip 0 |
+| `DECODE_IQ_SCAN_AM_WIDTH` | `am_adjacent_synth` through an `am` map row with `--am-bandwidth-hz 20000` (`--analog-scan-row 1`), `-v 0 -n 50` | 8333 Hz probe +0.3 dBc (row 0's 8.333 kHz: -93.2 dBc; `-fM`'s 6 kHz default: -103.5 dBc) | row banner with `width 20 kHz (row)`, captured ≥ 1400 ms, 8333 Hz ≥ -10 dBc, which fails if the row's width does not apply |
+| `DECODE_IQ_SCAN_AM_SQUELCH_STEADY_CARRIER` | `am_airband_real` through an `am` map row with `--squelch-db -20` (the carrier reads about -13 dB) | captured 7980 of 8000 ms: the carrier, measured whole, holds the gate open throughout (the pooled-mean measurement, which reads an 0 Hz carrier as A²(1 - sin 2φ)/4, let 5940 ms through, chopped; at -18 dB 4580 ms, at -16 dB 2720 ms) | captured ≥ 7800 ms |
 | `DECODE_IQ_ANALOG_SILENT_STREAM_TIME` | `nfm_tone_synth` under `-fi` (monitor off) | total 1500 ms, no audio at all | audible 0 ms, total 1400 to 1600 ms |
-| `DECODE_IQ_ANALOG_NFM_REAL_CTCSS_SMOKE` | `nfm_ctcss_real` | captured and audible 6000 ms, in-band -1.0 dB, RMS -44.6 dBFS | captured ≥ 5800, audible ≥ 4500, in-band ≥ -4, RMS ≤ -34 dBFS |
-| `DECODE_IQ_ANALOG_NFM_REAL_SQUELCH_A_SMOKE` | `nfm_squelch_real_a` | captured 4000 ms, audible 1460 ms from 460 ms, in-band 8.0 dB | captured ≥ 3900, audible ≥ 900, first audible 250 to 1000 ms, in-band ≥ 4 |
-| `DECODE_IQ_ANALOG_NFM_REAL_SQUELCH_B_SMOKE` | `nfm_squelch_real_b` | captured 4000 ms, audible 2980 ms, in-band 9.6 dB | captured ≥ 3900, audible ≥ 2000, in-band ≥ 5 |
+| `DECODE_IQ_ANALOG_NFM_REAL_CTCSS_SMOKE` | `nfm_ctcss_real`, `-n 50`, audible from -40 dBFS | captured 6000 ms, audible 4200 ms, in-band 18.4 dB, RMS -32.8 dBFS | captured ≥ 5800, audible ≥ 3500, in-band ≥ 14, RMS ≤ -25 dBFS |
+| `DECODE_IQ_ANALOG_NFM_REAL_SQUELCH_A_SMOKE` | `nfm_squelch_real_a`, `-n 50`, audible from -40 dBFS | captured 4000 ms, audible 1700 ms from 460 ms, in-band 23.7 dB | captured ≥ 3900, audible ≥ 1200, first audible 250 to 1000 ms, in-band ≥ 18 |
+| `DECODE_IQ_ANALOG_NFM_REAL_SQUELCH_B_SMOKE` | `nfm_squelch_real_b`, `-n 50`, audible from -40 dBFS | captured 4000 ms, audible 3100 ms, in-band 25.5 dB | captured ≥ 3900, audible ≥ 2500, in-band ≥ 20 |
+| `DECODE_IQ_ANALOG_PARITY_NFM_REAL` | `nfm_ctcss_real` under `-fA` (default chain) | RMS -23.9 dBFS, no clipping: the level `dmr_voice` decodes to (-24.9 dBFS RMS) within 1 dB | captured ≥ 5800, RMS -27.9 to -21.9 dBFS (DMR voice ±3 dB), clip 0 |
+| `DECODE_IQ_ANALOG_PARITY_AM_REAL` | `am_airband_real` under `-fM` (default chain) | RMS -23.9 dBFS, no clipping | captured ≥ 7800, `PARITY_NFM_REAL`'s window, clip 0 |
+| `DECODE_IQ_ANALOG_RAW_WAV_NFM_REAL` | `nfm_ctcss_real` under `-fA`, the `-6` raw WAV (issue #643) | raw WAV RMS -28.9 dBFS, peak -13.9 dBFS, no clipping: the monitor's 1/pi-scale samples at the level a PCM input at the reference has (before the fix: every sample 0) | raw WAV RMS ≥ -32 dBFS |
+| `DECODE_IQ_ANALOG_RAW_WAV_AM_REAL` | `am_airband_real` under `-fM`, the `-6` raw WAV | raw WAV RMS -18.3 dBFS, peak -4.5 dBFS, no clipping (before the fix: -117.8 dBFS, samples of -1, 0 and 1) | raw WAV RMS ≥ -21.5 dBFS |
+| `DECODE_IQ_ANALOG_SOURCE_MONITOR_FIXED` | `p25p1_c4fm_vc` under `-fs -8 -n 50` (the source monitor during digital decoding) | captured 3000 ms, peak -9.9 dBFS, no clipping (main: 141440 clipped samples, -0.03 dBFS RMS) | captured ≥ 2900, peak ≤ -6 dBFS, clip 0 |
 | `DECODE_IQ_ANALOG_NO_MOD_AUTO_SWITCH` | `am_airband_real` under `-fA` (monitor path only, not AM reception) | total and captured 8000 ms, no CQPSK symbols (before the fix: total 751 ms, captured 0 to 20 ms, CQPSK warning) | captured ≥ 7800 ms, total 7800 to 8200 ms |
 | `DECODE_IQ_ANALOG_REAL_CTCSS_1514` | `nfm_ctcss_real` | tone 151.4, first lock at 300 ms, locked 88.67% | tone lock ≤ 400 ms; tone 151.4 and no other tone logged |
 | `DECODE_IQ_ANALOG_REAL_CTCSS_NOFALSE_SQUELCH_A`, `_B`, `_AM` | `nfm_squelch_real_a`, `nfm_squelch_real_b`, `am_airband_real` | `none` verdict, no tone, locked 0.00% | `none` logged, `tone=NA`, 0.00% locked, no tone logged |
+| `DECODE_IQ_ANALOG_AM_TONE` | `am_tone_synth` under `-fM` | tone SNR 31.7 dB, in-band 50.4 dB, RMS -13.5 dBFS at the AGC's -10 dBFS peak, audible 1500 of 1500 ms from 0 ms, no clipping; a 1 kHz probe reads 0.00 dBc | SNR ≥ 25, captured and audible ≥ 1400 ms, first audible ≤ 100 ms, in-band ≥ 40, `NFM_TONE`'s level window, clip 0, 1 kHz probe within ±1 dBc |
+| `DECODE_IQ_ANALOG_AM_TONE_FIXED50` | `am_tone_synth` under `-fM -n 50` | RMS -15.0 dBFS, peak -11.5 dBFS | RMS -16 to -14 dBFS, captured ≥ 1400 ms, clip 0 |
+| `DECODE_IQ_ANALOG_AM_ADJ_6K` | `am_adjacent_synth` under `-fM -v 0 -n 50` (6 kHz default) | tone SNR 31.9 dB; 8333 Hz probe -103.5 dBc | SNR ≥ 25, captured ≥ 1400 ms, 8333 Hz ≤ -40 dBc |
+| `DECODE_IQ_ANALOG_AM_ADJ_20K` | `am_adjacent_synth` under `-fM -v 0 -n 50 --am-bandwidth-hz 20000` | 8333 Hz probe +0.3 dBc (tone SNR -0.4 dB: the beat dominates) | captured ≥ 1400 ms, 8333 Hz ≥ -10 dBc |
+| `DECODE_IQ_ANALOG_AM_REAL` | `am_airband_real` under `-fM -n 50`, audible from -40 dBFS | captured 8000 ms, audible 5720 ms, in-band 34.4 dB, RMS -18.6 dBFS, no clipping | captured ≥ 7800, audible ≥ 4500, in-band ≥ 28, RMS -24 to -13 dBFS, clip 0; no `Received tone:` logged |
+| `DECODE_IQ_ANALOG_POLICY_ALLOW_MATCH` | `nfm_ctcss_synth_1000`, `--tone-allow 100.0` | first audible 280 ms (the tone locks at 300 ms, within the read that crosses it), audible 1720 of 2000 ms; `Tone filter: allowed (CTCSS 100.0 Hz)` | first audible 100 to 400 ms, audible ≥ 1600, total ≥ 1900; no `rejected` or `pending` line |
+| `DECODE_IQ_ANALOG_POLICY_ALLOW_NOTONE` | `nfm_notone_synth`, `--tone-allow 100.0` | audible 0 of 2000 ms; `Tone filter: rejected (no tone)` | audible 0, total 1900 to 2100 ms; no `allowed` line |
+| `DECODE_IQ_ANALOG_POLICY_BLOCK_NOTONE` | `nfm_notone_synth`, `--tone-block 100.0` | first audible 800 ms (the window's end), audible 1200 ms; `Tone filter: allowed (no tone)` | first audible 780 to 860 ms, audible ≥ 1100, total ≥ 1900; no `rejected` line |
+| `DECODE_IQ_ANALOG_POLICY_BLOCK_DCS` | `nfm_dcs_synth_023n`, `--tone-block D023N` | audible 0 of 2000 ms; `Tone filter: rejected (DCS D023N / D047I)` | audible 0, total 1900 to 2100 ms; no `allowed` line |
+| `DECODE_IQ_ANALOG_POLICY_ALLOW_DCS_ALIAS` | `nfm_dcs_synth_023i`, `--tone-allow D023I` | first audible 340 ms, audible 1660 ms; `Tone filter: allowed (DCS D047N / D023I)`: the listed spelling matches the signal the detector names D047N | first audible ≤ 600 ms, audible ≥ 1300, total ≥ 1900; no `rejected` line |
+| `DECODE_IQ_ANALOG_REAL_CTCSS_POLICY` | `nfm_ctcss_real`, `--tone-allow 151.4` | first audible 280 ms, audible 5320 of 6000 ms: muted again over the reverse burst and tone gap at 3.7-4.0 s (`Tone filter: pending (tone lost)`) until the tone locks again | first audible 100 to 400 ms, audible ≥ 4500, total ≥ 5800; no `rejected` line |
 
 Every `-fA` case in the table also fails if the host warns that the front end delivered CQPSK symbols instead of
 monitor audio (see the `am_airband_real` note above).
+
+The tone filter cases (`DECODE_IQ_ANALOG_POLICY_*` and `DECODE_IQ_ANALOG_REAL_CTCSS_POLICY`, issue #527) read the
+filter's mute through the first-audible and audible-time metrics, and every never-audible case pairs its 0 ms bound with
+stream time, so a replay that delivered nothing could not pass. Two unit tests sit under them. `DSP_ANALOG_TONE_POLICY`
+drives the verdict state machine (`src/dsp/analog_tone_policy.c`) with no audio and no clock: each read is a
+publication built as the tap would publish it (carrier, detector state, locked tone or code, the DCS candidate) plus the
+samples and rate it covered, so the 800 ms window, its DCS extension and every transition are pinned in sample time,
+the window's end to the read that crosses it at several rates and read sizes. `DSP_SYMBOL_REPLAY` covers the sink the
+verdict gates: both live outputs muted together while a check runs or after a rejection, the `-6` raw WAV ungated, the
+output with the filter off byte-identical to a session without one, the AM and `-8` monitors judging nothing, the
+`Tone filter:` log lines, a changed policy's fresh check included, and the -Y hangtime stamp, which only traffic the
+policy passes leaves (no-tone bursts shorter than the window stamp nothing). What the scanners do with a check is
+engine-side. `ENGINE_NO_CARRIER_RESET` cannot run the monitor block (the DSP test seam is not linked into the engine
+test), so it feeds such bursts through the real tap and sets the `-Y` hangtime anchor itself, to where the monitor's
+stamp leaves it, and checks the step rule against it on the decode clock's TEST source, held at each whole second it
+checks (see [Decode time in unit tests](#decode-time-in-unit-tests)): with a burst in every second of `-t`, the pass at
+`-t` after the row's landing holds and the pass a second later steps, and allowed traffic holds the row through `-t`
+after its last block and steps a second later. A check, or traffic whose verdict turned ALLOWED part-way through a
+monitor block (at 22050 Hz, before the block's end stamps it), holds the row with `-t` run out. `ENGINE_TRUNK_SCAN`
+shows the bursts, on its injected clock, restart neither the activity hold nor the idle dwell, and a check that spans
+the end of an activity or operator hold arm the dwell as a quiet tick would.
 
 The cases above can only show that bounds hold. The `DECODE_IQ_ANALOG_NEG_*` negative controls show that a missed
 bound fails: they run the host through `tests/analog_replay_fail_check.cmake`, which requires its exit status (1 for
@@ -878,33 +1698,37 @@ a missed bound), the named `ANALOG AUDIO FAIL:` line, an `ANALOG METRIC:` line (
 
 | Case | Run | Must fail on |
 | --- | --- | --- |
-| `DECODE_IQ_ANALOG_NEG_ADJACENT_UNFILTERED` | `DECODE_IQ_ANALOG_NFM_ADJACENT`'s 12.5 kHz bound with `DSD_NEO_CHANNEL_LPF=0`, options spelled `--opt=VALUE` | the probe's measured level: about -8 dBc against -40 (-64.9 with the channel filter); "not measured" does not count |
+| `DECODE_IQ_ANALOG_NEG_ADJACENT_UNFILTERED` | `DECODE_IQ_ANALOG_NFM_ADJACENT`'s 12.5 kHz bound with `DSD_NEO_CHANNEL_LPF=0`, options spelled `--opt=VALUE` | the probe's measured level: about -20 dBc against -40 (-76.6 with the channel filter); "not measured" does not count |
 | `DECODE_IQ_ANALOG_NEG_AUDIBLE_NOT_SILENT` | the silence pattern (`--analog-max-audible-ms 0`, `--analog-min-total-ms 1400`) on `nfm_tone_synth` | audible ms, while the stream-time bound holds |
-| `DECODE_IQ_ANALOG_NEG_TONE_SNR` | a 60 dB tone SNR floor on `nfm_tone_synth` (25.9 dB) | tone SNR |
+| `DECODE_IQ_ANALOG_NEG_TONE_SNR` | a 60 dB tone SNR floor on `nfm_tone_synth` (37.5 dB) | tone SNR |
 | `DECODE_IQ_ANALOG_NEG_TONE_NOT_MEASURED` | an SNR bound without `--analog-expect-tone-hz` | tone SNR "not measured" |
 | `DECODE_IQ_ANALOG_NEG_BAD_BOUND` | a malformed bound value | exit status 2 before the replay starts |
 | `DECODE_IQ_ANALOG_NEG_MISSING_VALUE` | a host option as the last argument, with no value | exit status 2 and "needs a value" before the replay starts |
 | `DECODE_IQ_ANALOG_NEG_TONE_LOCK_MS` | a 50 ms tone-lock bound on `nfm_ctcss_synth_1000` (300 ms) | tone lock ms, on the measured value |
 | `DECODE_IQ_ANALOG_NEG_TONE_LOCK_NOT_MEASURED` | a 400 ms tone-lock bound on `nfm_notone_synth`, where no tone locks | tone lock ms "not measured" |
+| `DECODE_IQ_ANALOG_NEG_AM_TONE_THROUGH_FM` | `DECODE_IQ_ANALOG_AM_TONE`'s 25 dB tone SNR floor on `am_tone_synth` under `-fA` (the FM monitor) | tone SNR, measured at -21.4 dB: the AM case's tone is the AM detector's |
+| `DECODE_IQ_ANALOG_NEG_PARITY_FIXED` | `DECODE_IQ_ANALOG_PARITY_NFM_REAL`'s window on `nfm_ctcss_real` at `-n 50` | RMS, measured at -32.8 dBFS: the parity holds only with the AGC |
+| `DECODE_IQ_ANALOG_NEG_RAW_WAV_RMS` | a -20 dBFS raw WAV floor on `nfm_ctcss_real` under `-fA` (-28.9 dBFS) | raw WAV RMS dBFS, read back from a WAV that holds frames |
+| `DECODE_IQ_ANALOG_NEG_LAST_AUDIBLE` | the level burst (`nfm_burst_synth`, `--squelch -28`) with a 520 ms last-audible bound | last audible ms, measured at 540, while the first-audible bound holds |
 
 When a later change adds a bound or a new kind of check to the host, add a negative control beside it.
 
-A few things about these numbers. The default monitor chain puts a first-order 8 kHz high-pass (`pbf_f`) and a
-960 Hz high-pass after the discriminator, then a fixed gain: at the default `-n 50`, `analog_gain_f()` multiplies by
-12000 (4800 x 50/100 x 5). The per-block AGC (`agsm_f()`, which aims each block's peak at 4800 and caps its gain at
-6000x) runs only with `-n 0`. The default chain's audio therefore sits near -36 dBFS; with `-n 0` the same tone comes
-out at -42.1 dBFS, 6 dB lower, because the cap is reached. The fixed gain is also why clipping can happen at all, and
-why FM quieting shows as level: receiver noise (`noise_floor` under `-fA`) measures -23.3 dBFS RMS against -44.6 dBFS
-for `nfm_ctcss_real`. The high-passes bring 1 kHz out about 18 dB lower, relative to 8 kHz and up, than it went in,
-so the default chain's in-band ratio says more about those filters than about the demodulator: receiver noise
-measures -0.6 dB, no better than `nfm_ctcss_real`, whose speech deviation is small (0.2-0.6 kHz RMS) against a
-channel CNR of roughly 20 dB. That is why its smoke case bounds the level instead. With the filters off (`-v 0`) the
-same fixtures measure a tone SNR of 36.8 dB and an in-band ratio of 42.7 dB on `nfm_tone_synth`, 8.7, 15.8 and
-17.8 dB in-band on the three real excerpts, and 6.9 dB on receiver noise. Use `-v 0` when the question is what the
-demodulator did.
+A few things about these numbers. Since issue #518 the default monitor chain is the voice band-pass (300-3400 Hz,
+`-v 0x9`; its FM high-pass takes every CTCSS tone 40 dB down and a DCS signal about 32 dB) and the analog AGC (`-n 0`), which takes a
+steady tone's peaks to -10 dBFS and real speech to about the level digital voice decodes to: `dmr_voice` plays at
+-24.9 dBFS RMS, `nfm_ctcss_real` and `am_airband_real` at -23.9 dBFS each, where the old chain played them at -44.6
+and -53.7 dBFS. Its gain depends on the signal, so a case that measures the excerpt rather than the AGC pins the fixed
+reference gain, `-n 50`, which takes 1 kHz at 3 kHz deviation, or AM at 50%, to -12 dBFS peak (-15 dBFS RMS) live and
+in replay alike; the smoke cases count audible blocks from -40 dBFS there, where the speech stands clear of the quiet
+carrier between words. At the fixed gain FM quieting shows as level: receiver noise (`noise_floor` under `-fA`)
+measures -12.8 dBFS RMS against -32.8 dBFS for `nfm_ctcss_real`, whose speech deviation is small (0.2-0.6 kHz RMS)
+against a channel CNR of roughly 20 dB; under the AGC both sit near the target (-21.1 and -23.9 dBFS). The band-pass's
+3.4 kHz low-pass takes 12.5 kHz 54 dB down, so the cases that measure the channel filter (its width, a neighbour) run
+with the voice filters off and the fixed gain (`-v 0 -n 50`). Use `-v 0` when the question is what the demodulator did:
+it measures a tone SNR of 36.8 dB and an in-band ratio of 42.7 dB on `nfm_tone_synth` at the default width.
 
-The 12.5 kHz probe on `nfm_adjacent_synth` reads -64.9 dBc, against -66.7 dBc on `nfm_tone_synth`, which has no
-interferer: at the default channel width it measures the floor, so its bound catches a channel filter that lets the
+The 12.5 kHz probe on `nfm_adjacent_synth` reads -76.6 dBc (`-v 0 -n 50`), against -78.4 dBc on `nfm_tone_synth`,
+which has no interferer: at the default channel width it measures the floor, so its bound catches a channel filter that lets the
 neighbour through, not finer changes. The probe itself reads a real line at its true level: in
 `DECODE_IQ_ANALOG_NFM_TONE` a probe on the 1 kHz tone agrees with the least-squares tone fit to 0.00 dB, and a -6 dB
 carrier inside the passband (5 kHz up, a variant fixture that is not committed) measured -5.9 dBc at 5 kHz.
@@ -919,10 +1743,19 @@ carrier inside the passband (5 kHz up, a variant fixture that is not committed) 
 | `nfm_squelch_real_a` | sigidwiki `Unknown_NFM_squelch_IQ.zip`, `855111kHz_IQ.wav` (s16, 39.0625 kHz) | 4 s from 0.3 s: speech, then carrier only; 150 bit/s sub-audible data, not CTCSS or DCS |
 | `nfm_squelch_real_b` | the same zip, `855361kHz_IQ.wav` | 4 s from 0.5 s: speech, then carrier only; the same data signalling |
 | `am_airband_real` | sigidwiki `AM_IQ.zip` (u8, 64 kHz) | 8 s from 22 s: AM airband voice on a continuous carrier |
+| `am_tone_synth` | synthetic, seed 5241 | 1.5 s: 1 kHz at 50% AM depth on a 0 Hz carrier, complex noise 30 dB under the carrier across 48 kHz (#524) |
+| `am_adjacent_synth` | synthetic, seed 5242 | the same plus an unmodulated carrier 8.333 kHz up at -6 dB (the next 8.33 kHz airband channel) |
 | `nfm_ctcss_synth_1000` | synthetic, seed 5221000 | 2 s: voice-band audio at up to 4 kHz deviation plus CTCSS 100.0 Hz at 600 Hz deviation, receiver noise at baseband (#522) |
 | `nfm_ctcss_synth_670` | synthetic, seed 5220670 | the same with CTCSS 67.0 Hz |
+| `nfm_ctcss_synth_1506` | synthetic, seed 5221506 | the same with 150.6 Hz: a transmitter 0.4 % high on CTCSS 150.0 Hz, within its encoder's 0.5 % (#643) |
 | `nfm_ctcss_synth_drop` | synthetic, seed 5221001 | 2.5 s: CTCSS 100.0 Hz that stops at 1.2 s while the carrier and voice carry on |
 | `nfm_notone_synth` | synthetic, seed 5220000 | 2 s: the same voice and noise with no tone |
+| `nfm_dcs_synth_023n` | synthetic, seed 5230023 | 2 s: the same voice and noise plus DCS D023N at 600 Hz deviation, NRZ low-passed below 300 Hz (#523) |
+| `nfm_dcs_synth_023i` | synthetic, seed 5231023 | the same with D023 in inverted polarity, the signal of D047N |
+| `nfm_dcs_synth_noisy` | synthetic, seed 5232023 | the same with D023N's word two bits wrong in every repetition: no code |
+| `nfm_dcs_synth_drop` | synthetic, seed 5233023 | 2 s: D023N that stops at 1.2 s, with no turn-off tone, while the carrier and voice carry on |
+| `nfm_burst_synth` | synthetic, seed 5311 | 0.75 s: complex noise at 3 LSB a component, the 1 kHz test tone at 3 kHz deviation keyed from 0.30 to 0.55 s (2 ms ramps) 16 dB over the noise across 48 kHz, unnormalised so a +10 dB copy stays within the cu8 rails (auto squelch) |
+| `am_burst_synth` | synthetic, seed 5312 | the same with 1 kHz at 50% AM depth on a carrier 12 dB over the noise |
 
 `tools/build_iq_fixtures.py` pins each zip's SHA-256, reads the WAV members sample-exact (u8 centred on 127.5),
 shifts each wanted carrier to 0 Hz by an offset measured over the excerpt (`ANALOG_EXCERPTS` documents each), and
@@ -934,8 +1767,512 @@ The whole analog effort (issue #518) stays within 5 MB of new fixture bytes. The
 `nxdn48_attenuated` replay that #521 committed 0.58 MB and the four received-tone synthetics of #522 0.82 MB
 (`nfm_ctcss_synth_drop` runs 2.5 s: after its tone stops at 1.2 s it still has to lose the tone and reach the no-tone
 verdict), 3.8 MB in all, which leaves about 1.2 MB. A 48 kHz cu8 fixture takes 96 kB a second, so keep each later
-synthetic fixture to 2 s (192 kB) or less: the ones still reserved (three for #523, two for #524) then take at most
-0.96 MB. A pull request that adds analog fixtures states the running total.
+synthetic fixture to 2 s (192 kB) or less. The two AM synthetics of #524 (1.5 s each) take 0.29 MB and the four DCS
+synthetics of #523 0.77 MB (the no-code case reuses `nfm_notone_synth`), 4.86 MB in all, which leaves 0.14 MB. The
+auto squelch's two burst synthetics (0.75 s each) take 0.14 MB (4,992,000 bytes in all), which spends the budget: its
+hotter-receiver twins add nothing, since the analog replay host scales a copy at run time (`--analog-iq-gain-db`), and
+its noise and real-carrier cases reuse `noise_floor` and the excerpts. The noise squelch's replay cases add none either:
+they reuse the same bursts, copies and excerpts. A pull request that adds analog fixtures states the running total.
+
+#### Auto squelch classifier (design gate)
+
+The floor-relative squelch (`--squelch auto[+N]`, issue #518) learns a channel's noise floor from windows it classes as
+noise, so it needs a classifier that tells "noise only" from "carrier present" on the channel-filtered complex baseband
+the demodulator sees, at every channel plan the analog monitor runs. `tools/squelch_model.py` (numpy/scipy, offline;
+CI does not run it) decided its design before any C was written. It builds the plans from the repository itself:
+`tools/squelch_model_taps.cpp`, compiled against a configured build tree's static libraries, prints the taps
+`full_demod()` designs and the half-band taps, and a numpy port of `dsd_firdes_low_pass()` cross-checks every designed
+plan. 420 combinations of NFM 8-25 kHz, unset NFM (with `DSD_NEO_CHANNEL_LPF` unset, `=1` and `=0`) and AM 5-20 kHz
+over 30 rate chains (the RTL DSP bandwidths, the rates Airspy, Airspy Mini and SDDC devices force, and I/Q replay with
+and without post-decimation) leave 253 that run and 196 distinct filters. Signals: channel-filtered complex Gaussian
+noise, FM (dead carrier, tones, real speech from the NFM excerpts) at half and full rated deviation, AM (dead carrier,
+tones, real airband speech) at 30, 60 and 100% depth, each at 0, +/-1 and +/-2.5 kHz offset, at 0 to 20 dB CNR. The
+targets per window are: noise read as carrier at most 1e-4, a 6 dB carrier missed at most 1%, a carrier of 6 dB or more
+read as noise (it would raise the floor) at most 1e-4, noise left undecided at most 25%.
+
+The planned classifier (20 ms windows; envelope CV^2 and phase coherence C at a lag from the taps' autocorrelation;
+fixed thresholds) met every target on 162 of the 196 filters: narrow plans (under about 400 effective samples per
+window) missed 1-5% of 6 dB carriers, among them the fading real capture and AM with full-depth tones, and the
+unfiltered NFM default at the 4 kHz RTL rate read noise as carrier 3.4-3.9 times in 10,000. The scheme the auto
+squelch uses passes 195: 40 ms windows; coherence measured against its expected value on noise, beta = (pi/4)
+rho_n(L) 2F1(1/2, 1/2; 2; rho_n(L)^2), with rho_n the noise autocorrelation through the channel taps and the last
+half-band stage; and both features normalised by the window's effective sample count N_eff = N / sum rho_n(m)^2,
+X = (CV^2 - 1) sqrt(N_eff) and Y = |mean(u_k conj(u_{k-L})) - beta| sqrt(N_eff). A window is a carrier when X <= -7.0
+or Y >= 3.3, and noise when X >= -3.8 and Y <= 2.1. Worst cases over the 195: noise read as carrier 1.0e-4 per window
+(about 10 events, so about +/-32%), a 6 dB carrier missed 1.1%, no carrier of 6 dB or more read as noise (0.4% at
+3 dB), noise left undecided at most 3.7%. The one plan that misses its target, unset NFM with `DSD_NEO_CHANNEL_LPF=1`
+forcing the legacy filter on at the 8 kHz RTL rate, misses 1.1% of 6 dB carriers; it is accepted as marginal. The
+model does not cover spurs or adjacent channels: a steady tone inside the channel is a carrier to the coherence test,
+and with these thresholds a birdie from -12 dB (widest plans) to -3.6 dB (narrowest) against the noise reads as one.
+`python3 tools/squelch_model.py` reproduces the report (`build/squelch_model/report.md`) in about 25 minutes on 8
+workers; `--quick` takes about a minute.
+
+#### Auto squelch on EDACS analog voice and the M17 encoder (design gate)
+
+Issue #625 runs the same tracker, thresholds unchanged, on two more paths: the 9600 bit/s two-level FSK path EDACS
+analog voice reads, and the M17 encoder's monitor. Neither path's channel plans were in the run above.
+`tools/squelch_paths_model.py` (numpy/scipy, offline; CI does not run it) checks them before any C reads the gate. It
+imports `tools/squelch_model.py`'s chains, noise and carriers, and takes each plan's taps and classifier constants
+from C: `tools/squelch_model_taps.cpp` designs a profile's plan off the analog family and prints
+`dsd_squelch_floor_plan_design()`'s lag, beta and N_eff. It classifies exactly as `src/dsp/squelch_floor.c` does,
+with the same 40 ms windows, thresholds and 3 dB halves rule.
+
+The plans and signals:
+- **EDACS:** every plan its FSK path runs at post-decimation 1 and a channel rate of 12 kHz or more (under it a symbol
+  gets fewer than 1.25 samples and EDACS never decodes its control channel):
+  - PROVOICE, designed within the 144-tap cap, or on the 63-tap fallback at the device-forced rates;
+  - no channel filter (`rate_in` under 20 kHz, or `DSD_NEO_CHANNEL_LPF=0`);
+  - WIDE, where a live switch leaves that label in force.
+- **EDACS signals:**
+  - FM tones and real speech at 2.5, 4, 4.5 and 5 kHz peak deviation (NPSPAC to 25 kHz EDACS), counted as wanted
+    within 1 kHz of the channel centre, past the PROVOICE filter's 6.25 kHz edge too;
+  - speech plus a 150 bit/s sub-audible LSD at 750 Hz deviation, and a dead carrier with it;
+  - 9600 bit/s data and dotting at 2.5-4.5 kHz, held to the floor-pollution target only.
+
+  The LSD and data deviations are assumptions. Like the run above, this does not cover adjacent channels.
+- **Encoder:** the legacy WIDE profile plan, or no filter, on every chain, with the monitor's NFM carriers.
+
+The four per-window targets are #627's. Three timing checks run the C tracker itself (`squelch_model_taps track`):
+- the longest closed run in a call, from its first sample: the closed window the tracker's first decision takes is
+  included. It is measured while learning (landing mid-carrier at 6, 10 and 20 dB CNR) and with a known floor at
+  margins 3, 10 and 30 (the carrier 3 dB over the opening level);
+- a carrier under the opening level, which must stay closed;
+- the delay from a carrier drop to the first closed flag, at 40 phases across a window.
+
+Each closed run is held to the path's hold. For EDACS that is four triplets less 85 ms at 48 kHz, about 155 ms at every
+channel rate: EDACS converts what it reads to 48 kHz (issue #633). For the encoder it is the VOX's 440 ms.
+
+| Path | Plans | Noise read as carrier | 6 dB carrier missed | Carrier read as noise | Noise undecided | Longest closed run in a call (learning / known) | Closing delay (learning / known) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| EDACS | 51 of 51 pass | 8e-5 at worst | 0.02 % | none | 3.8 % | 40 / 60 ms | 78 / 39 ms |
+| M17 encoder | 60 of 60, one accepted | 8e-5 | 1.26 % (the accepted plan) | none | 3.8 % | 40 / 60 ms | 78 / 39 ms |
+
+- **Accepted plan:** the encoder's legacy WIDE filter forced on by `DSD_NEO_CHANNEL_LPF=1` at an SDDC's 7.8 kHz channel
+  misses 1.26 % of 6 dB carriers. The run above accepted the analog monitor's forced 8 kHz plan at 1.1 %, and this
+  plan's longest closed run is one window, far under the VOX's 440 ms hang. The tool (`ACCEPTED_MISS`) relaxes only
+  that target for that plan, up to 1.5 %; any other failure there still fails the run.
+- **The bound:** the 78 ms worst closing delay is what EDACS budgets as `DSD_SQUELCH_CLOSE_DELAY_MS` (85 ms) in its
+  release hold. While the floor is learned, a window holding the drop can still read CARRIER, so the next one closes it.
+- **The floor:** the 40 ms a call's first decision takes and the 60 ms of a carrier's onset over a known floor are what
+  EDACS's 80 ms minimum hold (`EDACS_ANALOG_GATE_MIN_HOLD_MS`, two windows) stays clear of. At 48 kHz, which EDACS runs
+  at whatever rate it reads, four triplets less the bound (155 ms) stay above it.
+- **The noise squelch:** NOISE on the encoder's monitor runs the noise squelch where its plan has a band.
+  `tools/noise_squelch_model.py --encoder-only` runs the three encoder plans no NFM plan shares, the 63-tap fallbacks
+  at 62.5, 78.1 and 93.75 kHz. All three pass the chosen design: worst wanted-modulation 1st percentile 62.4 dB against
+  the gate's 36, and no false open on noise. EDACS runs NOISE as auto, so its plans need no noise-model run.
+- **Reproducing:** `python3 tools/squelch_paths_model.py` writes `build/squelch_paths_model/report.md` in about 20
+  minutes on 14 workers; `--quick` takes under a minute.
+
+#### Auto squelch on EDACS analog voice and the M17 encoder (regression cases)
+
+| Case | What it pins |
+| --- | --- |
+| `EDACS_GRANT_TUNE_MATRIX` analog-call release cases | An analog group grant plays a call on a fake RTL stream. Under AUTO and NOISE it ends on the gate at or before the level squelch's twin. That holds at drop phases 0, 0.25, 0.5 and 0.99 of a triplet, closing delays of 0, half and all of the bound, and 24 and 48 kHz. A 24 kHz stream runs at 48 kHz too (issue #633): a triplet reads 1440 samples, and the gate's flags follow the converted samples. The tail after the gate closed is silence. On main the call ran to the read cap. |
+| `EDACS_GRANT_TUNE_MATRIX` disturbance cases | A 20 or 40 ms open burst in the tail restarts the hold; a 20 or 40 ms closed blip inside the call never ends it. A stream whose status says no gate runs ends nothing on its flags (the watchdog's case). |
+| `EDACS_GRANT_TUNE_MATRIX` real-tracker case | Flags the C tracker made on a carrier dropping at every 2 ms phase of its windows, while learning, end the call within the time of the same call under the level squelch, at 48 kHz and on an unresampled 125 kHz replay, which EDACS converts to 48 kHz (issue #633). The call's first, closed window does not end it. |
+| `M17_STATE_DISPATCH` VOX cases | `encodeM17STR()` on a fake RTL stream with both reader hooks and positive power: open flags for 3 reads, then closed. VOX unkeys at read 19 under AUTO and NOISE (11 closed reads, then the LICH boundary). The RF, decoded from the symbol capture, carries the EOS bit on the 19th and last stream frame only, then the EOT marker, with no dead air after it; IP sends its EOTX. Codec2 hears silence once the gate closed. Open flags hold it keyed; a level twin unkeys at 19 too. A manual unkey while VOX still hears a carrier ends that stream with its dead air, and VOX keys a second, well-formed transmission with its own LSF and its own monitored call (two EOS frames and two EOTX on IP). |
+| `M17_STATE_DISPATCH` end-of-stream cases | A keyed exit, a keyed input end, and a manual unkey followed by the input ending each end the stream once, with the EOS frame, the EOT marker and 25 frames of dead air in the decoded RF. On a local output (the audio writes and drains recorded through linker wraps, GNU and Clang off Apple) the end drains after the marker and again after the dead air, and the packet encoder's end does too; a VOX unkey drains nothing then, but the input ending right after it drains once before the output closes. An encoder that never keyed sends no end. |
+| `M17_STATE_DISPATCH` reader case | Closed samples fade to exact silence, and a read is heard while any sample is. LEVEL ignores the flags; with no gate running the flags are not read. |
+| `IO_RTL_DEMOD_CONFIG`, `IO_RTL_ANALOG_OPEN` | A real `-fZ` session (default frame flags, `-mq`, `DSD_NEO_CQPSK=1`) opens FM with de-emphasis on the WIDE channel and runs the tracker there. A CQPSK toggle each way and a published DMR profile change neither. |
+| `DSP_SQUELCH_AUTO_DEMOD` | The 9600/2 FSK path runs the tracker: PROVOICE at 24 and 48 kHz, no filter at 12 and 16 kHz. Its flags match a reference tracker, NOISE gives the same flags, and the FSK output is unchanged. Other FSK profiles run none. The encoder's monitor runs it; the gate closes within `DSD_SQUELCH_CLOSE_DELAY_MS` at every window phase (72 ms at worst there). |
+| `DECODE_IQ_M17_ENCODER_VOX_SQL_{AUTO,NOISE}_NOISE_FLOOR`, `_LEVEL_KEYS` | Ten seconds of receiver noise never key `-fZ` VOX under auto or noise (each keyed on the first frame before); a level the noise clears keys it. |
+| `APP_CONTROL_SQUELCH_VIEW`, `RUNTIME_SQUELCH`, `ENGINE_RUN_SETUP` | The readouts (`EDACS analog calls`, the encoder's tracker reading, `off: no radio input` on audio input), the policy helpers, and the startup notices. |
+
+#### M17 voice output (issue #658, regression cases)
+
+| Case | What it pins |
+| --- | --- |
+| `M17_STATE_DISPATCH` output-format case | Both payloads (two 160-sample codec frames at 3200, one 320-sample frame at 1600) play as two 160-frame blocks in each format: s16 or f32, mono or stereo, on UDP and, through the `dsd_audio_write` wrap (GNU and Clang off Apple), on a local stream. The wrap copies frames x channels samples as a backend reads them, so under ASan a short buffer is a report; on a two-channel stream both channels carry the decoded frame at full level. Every f32 sample equals the chained s16 sample / 32768, and the device receives those same s16 samples under `-y`. `-g 3` triples the samples `-g 1` passes through in both formats. The existing UDP, mute and stamp cases now count 1600's two blocks and stage into initialised output buffers. |
+| `CORE_AUDIO2_HELPERS` decoded-PCM case | `dsd_audio_play_decoded_pcm16()` against gates stubbed to mute: a forced talkgroup mute, a blocked record policy and a stale NXDN cipher with no key never mute a settled frame in any format, channel count or sink; a stale X2 slot cannot select slot 2 for M17; a 330-sample buffer runs the slot 0 chain and short staging exactly twice; the slot 1 switch and the mute still apply; the static WAV records what slot 1 plays in both formats and the per-call WAV every frame; a state with no output history plays nothing; the public mixers keep the policy verdict. |
+| `RUNTIME_CLI_PARSE` encoder-rate cases | `-fZ` opens the digital output at 8 kHz mono; `-fB` and `-fP` keep 48 kHz. Explicit `-8` survives every supported manual selector in either argument order, including after an analog preset. |
+| `M17_STATE_DISPATCH` IP bounds cases | Every truncated stream/control prefix uses an exact-sized allocation and leaves state untouched; a valid MPKT shorter than a stream frame reads only its own header. A sender-shaped 52-byte text-metadata packet retains its final nonzero application byte, with only the two CRC bytes excluded from the payload. ASan checks those bounds. |
+| `DECODE_IQ_M17_VOICE_OUTPUT` (Codec2 builds) | The M17 fixture on stdout: `-fz` whole s16 frames, `-fz -y` twice its bytes, `-fa` twice, `-fa -y` four times; `-g 1` and `-g 50` differ. |
+
+#### Auto squelch replay cases
+
+The `DECODE_IQ_ANALOG_SQL_AUTO_*` cases replay `nfm_burst_synth` and `am_burst_synth` (noise, a carrier from 0.30 to
+0.55 s, noise) under `--squelch auto` and hold each to one set of bounds: first audible block at 300-360 ms, 240-320
+ms audible at -40 dBFS, stream time 700-800 ms, no clipping. Both measure 320 ms and 280 ms through FM and AM: the
+floor is learned from the opening windows, the gate opens 20 ms into the carrier and closes within a window of its end.
+
+| Case | What it pins |
+| --- | --- |
+| `_NFM_BURST`, `_AM_BURST` | The gate's edges on a burst after learned noise. |
+| `_NFM_BURST_HOT`, `_AM_BURST_HOT` | The same capture 10 dB hotter (`--analog-iq-gain-db 10`, 0 bytes clipped), the same bounds and measurements: the setting follows the floor, not the receiver. |
+| `_NFM_MARGIN`, `_AM_MARGIN_HOT` | Each carrier stands about 20 dB over its channel's noise (it still opens at `auto+20` and not at `auto+21`, `+22` on AM); under `auto+30` nothing is audible at either level. |
+| `_NOISE_FLOOR`, `_AM_NOISE_FLOOR` | Ten seconds of receiver noise (`noise_floor`) never open it. Its 16 LSB noise cannot be scaled 10 dB without clipping, so it has no hot twin. |
+| `_NFM_REAL_CARRIER`, `_AM_REAL_CARRIER` | A carrier is never learned as floor: `nfm_ctcss_real` and `am_airband_real` hold their carrier throughout and play whole after the first 40 ms window (5940 of 6000 ms, 7940 of 8000), within 60 ms of their audible time with the squelch off. |
+| `DECODE_IQ_SCAN_SQL_AUTO_ROW` | A `-Y` row's own `--squelch auto` on a digital (`-fa`) session gates the burst as `-fA` does. |
+| `DECODE_IQ_ANALOG_NEG_SQL_LEVEL_HOT` | The burst bounds under a fixed `-35 dB` on the hot copy fail: that level sits 2.5 dB over the burst's noise at its own level and 7.5 dB under the hot copy's, which opens on noise from the first block (740 ms audible). |
+| `DECODE_IQ_ANALOG_NEG_IQ_GAIN_CLIPS` | A gain that would clip the copy stops the host (exit 2). |
+| `DECODE_IQ_ANALOG_SQL_AUTO_{NFM,AM}_DETERMINISM` | Fast, jittered and realtime replays hand the sink the same gated audio (the replay sink's hash, 14 writes of 960). GNU `--wrap` builds only, like the other sink cases; the monitor reads one sample at a time, so there is no short-read leg, and 280 ms of audio cannot back up a stalled sink. |
+
+What each case can catch was checked by mutation. A tracker that never learns a floor passes the burst cases (while
+learning, the gate opens on carrier windows only, which is what lets a scan land mid-transmission) and fails both
+margin cases. A sink that ignores the per-sample flags fails every FM case and both determinism cases; the AM cases
+still pass, because the AM detector writes silence for a closed sample itself (`am_demod_flagged()`: its output,
+the envelope over the held carrier, means nothing without a carrier), so on AM they pin the detector's handling of
+the flags instead.
+
+#### Level squelch replay cases
+
+The level squelch (`--squelch <dB>`, a row's `--squelch-db`) gates each demod block whole on its channel power, and a
+replay's demod block is one capture chunk. With a fixed 64 KiB chunk that was 683 ms of a 48 kHz capture: both chunks of
+the 0.75 s burst started on noise, so a level that kept that noise out never played the carrier, and on a 2 s version a
+fixed `-20 dB` played from 683 ms to the end (issue #626). A chunk is now at most one live transfer, 256 samples
+(5.33 ms) here, the block a live default chain hands the demod, so the level gate opens and closes within one such block
+of the carrier's edges, as on air. The monitor then keeps or drops each 20 ms block by the power at its last sample,
+live and in a replay alike, so the sink's edges fall on its blocks; the cases pin those blocks exactly.
+
+| Case | What it pins |
+| --- | --- |
+| `IO_RTL_REPLAY_CHUNKING` | The gate itself: on `nfm_burst_synth` under -28 dB exactly one run of blocks opens, the first starting 131 samples before the carrier's key plus the channel filter's 67-sample delay and the last ending 157 samples after its unkey plus that delay, both within one 256-sample block. Noise blocks read -37.8 to -36.4 dB, carrier blocks -16.8 to -16.6 dB. On 64 KiB chunks no block opens. |
+| `DECODE_IQ_ANALOG_SQL_LEVEL_NFM_BURST`, `_AM_BURST` | `-fA --squelch -28` and `-fM --squelch -30` (AM noise opens at about -40 dB, its carrier blocks read about -20): first audible 280 ms (the first open block starts 1.3 ms before the carrier as the channel filter sees it), last audible 540 ms (the 540-560 ms block ends closed and is dropped), 260 ms audible, the whole span, so no block between is missing. On 64 KiB chunks nothing is audible. |
+| `DECODE_IQ_SCAN_SQL_LEVEL_ROW` | The issue's case: a `-Y` row's own `--squelch-db -28` on a `-fa` session gates the burst the same way. |
+| `DECODE_IQ_ANALOG_SQL_LEVEL_{NFM,AM}_DETERMINISM` | Fast, jittered and realtime replays hand the sink the same gated audio (13 writes of 960). |
+| `DECODE_IQ_ANALOG_NEG_LAST_AUDIBLE` | The last-audible bound fails on its measured value: 540 ms against a 520 ms limit. |
+
+`DECODE_IQ_ANALOG_NEG_SQL_LEVEL_HOT` still fails as before: on the hot copy every block's noise sits over -35 dB, so the
+gate opens from the first block and plays the whole replay (740 ms).
+
+#### Noise squelch design gate
+
+The NFM noise squelch (`--squelch noise[+N]`, issue #518) opens when the FM discriminator's output above the voice band
+quiets by N dB. The question before any C was written: does a quieting statistic read about 0 dB on noise at any level,
+follow the carrier-to-noise ratio, and stay well above the highest threshold while a strong carrier carries wanted
+modulation, at every plan the FM monitor runs? `tools/noise_squelch_model.py` (numpy/scipy, offline; CI does not run it)
+answers it on `tools/squelch_model.py`'s tap harness and rate chains, with `dsd_fm_demod()`'s discriminator modelled
+exactly. It covers 365 distinct plans:
+
+- 119 plans from the 171 NFM combinations the harness runs: every width, the unset default and every rate chain.
+- 246 plans at custom widths: 11.0-12.4 kHz in 100 Hz steps and 13-25 kHz in 1 kHz steps, on every chain at 24 kHz or
+  above.
+
+Each chain's decimation runs ahead of its channel filter: a cascade of half-band stages, the 31-tap one first and
+15-tap ones after, and the 15-tap stage droops inside the band. The model runs everything through the cascade as the
+chain does: the noise, the calibration and every wanted signal, made at twice the channel rate. The stages before the
+last are one 63-tap FIR sampled from their composite response, then the last stage runs as it is; the C core calibrates
+the same way. For each plan the model runs:
+
+- 600 s of noise.
+- A tone sweep at the width's rated deviation, centred and at every offset the tone's own Carson bandwidth leaves in the
+  channel (its edge and half way, either side). Tones run from 300 Hz in 5 Hz steps up to 800 Hz, where a tone's
+  harmonics crowd the band, then in 25 Hz steps to 3000 Hz.
+- Real NFM speech: the three excerpts' audio at rated deviation.
+- CNR sweeps, and the real excerpts as recorded.
+- Stress cases outside the gate: a carrier 1 kHz off centre past its Carson bandwidth, and 1.5 times rated deviation.
+
+The gate: wanted modulation keeps its 1st-percentile Q at least 6 dB above N = 30, and noise reaches N = 3 in at most
+1e-4 of the 20 ms evaluations.
+
+A single band above voice fails the gate. The channel filter truncates a strong tone's FM sidebands, so its 2nd and 3rd
+harmonics land in the band as lines, and they cap Q at 11-26 dB:
+
+- `single`, worst 11.2 dB.
+- A single band at the top of B, [hi - 1200 Hz, hi], `high1200`: 14.6 dB.
+
+Cutting the band ([3.8 kHz, the taps' -1 dB point less 800 Hz], under 0.45 fs) into sub-bands and taking the
+best-quieted one finds a sub-band clear of the lines. But the best of many noisy readings sits above 0 dB on noise: the
+`sW-max` candidates let noise reach N = 3 in 1-30% of evaluations. So every guarded candidate takes
+Q = max(Q_sum, Q_max - G dB), Q_sum from the sub-bands' summed powers (the whole band, as tight on noise as one
+band-pass). How the band is cut decides the wanted side:
+
+| Candidate | Plans passing (of 289 with a band) | Worst wanted p1 | Why |
+| --- | --- | --- | --- |
+| 500 Hz sub-bands, at most 9 (`s500-guard4`) | 40 | 26.1 dB | too few on narrow channels: at 11.2 kHz two sub-bands, and a harmonic on their boundary leaves neither clear (27.3 dB there) |
+| 300 Hz, at most 15 (`s300-guard4`) | 250 | 33.3 dB | a tone whose harmonics fall near the boundaries leaves no sub-band clear: 39 plans fail, at 11.7-13 kHz and 23 kHz |
+| 250 Hz, at most 18 (`s250-guard5`) | 288 | 35.9 dB | a 585 Hz tone on an 11.8 kHz channel; with a 4 dB guard noise reaches N = 3 in 1.3e-4 of evaluations |
+| 300 Hz and a set staggered half a sub-band between them (`s300x-guard4`) | 289 | 37.0 dB | the design |
+
+The staggered set puts a line that sits on a boundary of one set inside a band-pass of the other. Q_max takes the best
+of all 2K - 1 band-passes; Q_sum stays on the K sub-bands. Its 4 dB guard leaves the most wanted margin: 5 dB also
+passes every plan (36.1 dB at worst) and 6 dB fails two, and both only lower noise's loudest window, at the same
+false-open rate. With `s300x-guard4`:
+
+- All 289 plans with a band pass. Wanted modulation keeps 37.0 dB at worst (a 590 Hz tone at its Carson edge on
+  11.8 kHz at 39062 Hz), and speech keeps 38.6 dB.
+- Noise reaches N = 3 in at most two 20 ms evaluations in 29,970 (6.7e-5) and never N = 4. Its loudest window over
+  600 s is 3.85 dB.
+- The 76 plans with no band run the auto squelch:
+  - every 8 and 10 kHz NFM width;
+  - every chain at a DSP rate under 12 kHz;
+  - the legacy WIDE filters (`DSD_NEO_CHANNEL_LPF=1`) at 11.7 and 12 kHz;
+  - no channel filter behind a half-band cascade at a channel rate (before any post-decimation) of 16 kHz or less (the
+    width unset on rtl-12k, rtl-16k, an Airspy Mini at 11718 Hz and an SDDC at 15625 Hz, or `DSD_NEO_CHANNEL_LPF=0`):
+    the cascade's roll-off is then the channel's only edge and truncates a wide signal into the band (27-34 dB before
+    the rule; the unfiltered plans above, from 19.5 kHz, pass, and a replay with no cascade keeps its band);
+  - the custom widths 11.0 and 11.1 kHz;
+  - 11.2 kHz on the chains whose taps reach their -1 dB point at 5790 Hz, 10 Hz short of the 5.8 kHz that 1200 Hz of
+    band needs.
+
+| Figure (289 plans) | Result |
+| --- | --- |
+| Calibration, 2 s through the cascade, channel taps and discriminator | within 0.65 dB of the 600 s reference in every band-pass (1.97 dB skipping the cascade) |
+| Noise holding an open gate (Q at or over the close threshold) | 2.3e-2 of evaluations at N = 3 (close under 1.5 dB), 6.7e-5 at N = 6, none at N = 10 |
+| A receiver's slope (one pole at the channel edge) | noise's median Q -4.82..+1.08 dB |
+| Median Q at 0, 10, 20 and 30 dB CNR (1 kHz tone) | 0.9-3.8, 8.2-24.8, 19.1-35.2 and 28.0-45.0 dB: wider channels read more quieting at the same in-channel CNR |
+| The real excerpts as recorded (receiver noise and neighbours included) | the two squelch captures keep 21 dB at the 1st percentile through every plan of 12.5 kHz or wider. `nfm_ctcss_real` reads 20.0-23.9 dB (median) through 12.5-23 kHz plans, 12.5-21.0 dB through 24 kHz ones and 1.4-21.0 dB through 25 kHz and wider: its neighbour 12.5 kHz away falls inside those channels, as it falls in their audio |
+| Stress cases (outside the gate) | a carrier 1 kHz past its Carson edge, or at 1.5 times rated deviation, can close the gate (1st percentile down to 3.2 dB): its own sidebands fall in the band as noise does |
+
+`python3 tools/noise_squelch_model.py` reproduces the report (`build/noise_squelch_model/noise_squelch_report.md`, and
+`noise_squelch_results.json` beside it) in about an hour on 6 workers; `--quick` (30 s of noise per plan, shorter
+tones) is a smoke run. The C core is held to the model's design by two suites:
+
+- `DSP_NFM_NOISE_SQUELCH`:
+  - The band rule, the unfiltered-cascade rule included.
+  - The band-passes' response against the closed-form Butterworth band-pass.
+  - The calibration against 60 s of noise, and against noise through the six real stages of an rtl-16k chain (0.25 dB
+    per band-pass; a plan of the last stage alone is 1.0 dB off).
+  - Noise never opening at N = 3 on six plans, quieting independent of the input level, the hysteresis, and block-cut
+    bit identity.
+- `DSP_NFM_NOISE_SQUELCH_SWEEP` (the same binary with `--sweep`, 600 s timeout): full-deviation tones on the model's
+  grid, centred and at their Carson edges, never closing the gate at N = 30. It runs 11.2 kHz at 48 kHz, the gate's
+  weakest plan (11.8 kHz at 39062 Hz), 12.4 kHz at 39062 Hz and 13 kHz at 46875 Hz behind their chains' cascades,
+  and 25 kHz. Its lowest Q is 37.1 dB, and it fails without the staggered set.
+
+#### Noise squelch replay cases
+
+The `DECODE_IQ_ANALOG_SQL_NOISE_*` cases replay the same burst under `--squelch noise`, held to bounds of their own:
+first audible block at 330-380 ms, 200-270 ms audible. The burst measures 340 ms and 240 ms at both levels: the gate
+opens on the first full 40 ms window of carrier and closes within a window of its end. Auto's 320 and 280 ms miss
+those bounds, so a noise setting run as auto fails them.
+
+| Case | What it pins |
+| --- | --- |
+| `_NFM_BURST`, `_NFM_BURST_HOT` | The gate's edges, and the same measurements 10 dB hotter: quieting does not follow the level. |
+| `_NFM_MARGIN`, `_NFM_MARGIN_HOT` | The burst quiets the band by about 22 dB (it opens at `noise+20`, not at `+25`); under `noise+30` nothing is audible at either level. |
+| `_NOISE_FLOOR` | Ten seconds of `noise_floor` never open it at the lowest N (`noise+3`). |
+| `_NFM_REAL_CARRIER` | `nfm_ctcss_real` plays whole after the first window (4160 of the 4200 ms audible with the squelch off). |
+| `_NARROW_AS_AUTO` | An 8 kHz channel has no band above voice: the auto squelch runs the setting, and the burst measures as under `--squelch auto`. |
+| `_AM_REFUSED` | `-fM --squelch noise` stops at startup with its message, before any replay. |
+| `DECODE_IQ_SCAN_SQL_NOISE_ROW` | A `-Y` nfm row's own `--squelch noise` gates the burst as `-fA` does. |
+| `DECODE_IQ_ANALOG_SQL_NOISE_NFM_DETERMINISM` | Fast, jittered and realtime replays hand the sink the same gated audio (GNU `--wrap` builds). |
+
+#### PCM noise squelch design gate
+
+On audio input (issue #628) the FM discriminator ran outside DSD-neo, so the noise squelch has no channel taps to
+calibrate against and must learn what noise alone puts above the voice band from the input. The questions before any C
+was written: can a learned reference gate as the radio squelch does on every source chain such audio comes through, and
+can the squelch tell a source that low-passed its audio (nothing above voice) from one that did not?
+`tools/pcm_noise_squelch_model.py` (numpy/scipy, offline; CI does not run it) answers them on top of
+`tools/noise_squelch_model.py`'s discriminator and `tools/squelch_model.py`'s noise and filters. Its file comment states
+the learner in full. Two facts make a learned reference work:
+
+- The discriminator sees phase only, so the noise above voice does not depend on the RF noise level: it belongs to the
+  source chain (gain, filters, channel width), the same on every channel. Going from a 12.5 to a 25 kHz channel raises it
+  4 dB.
+- A carrier can only quiet that band, so noise is the loudest it reads on a fixed chain. A reference learned from a
+  carrier is too low and only mutes. The one dangerous error is a reference above the true noise, and the stale rule
+  (ruling 4) bounds how long one can hold the gate open. Kurtosis does not separate noise from a carrier (both read
+  about 3), so no single window classifies.
+
+Source chains (28): SDR-program taps (12.5, 16 and 25 kHz channel FIRs, de-emphasis none, 50, 75 and 750 us, at 48,
+44.1, 24, 16, 12, 96 and 8-9.6 kHz), `rtl_fm` (boxcar decimation, with and without `-E deemp`, at 48, 24 and 12 kHz), a
+hardware discriminator tap (a +/-7.5 kHz IF, AC coupling, a sound card), floors and above-band tones (5 and 6.1 kHz)
+added after the source's filters, and sources that low-passed their audio (steep FIRs at 3.0, 3.4 and 4.0 kHz, one
+amplified until it clips, and a gentle Butterworth whose verdict may go either way). Rates under 48 kHz that divide it
+reach the monitor through the production staging interpolator (`src/dsp/pcm_input_staging.c`), modelled tap for tap.
+Each source runs 600 s of noise, the radio gate's tone grid at the source's rated deviation (centred and at its Carson
+edges), remodulated NFM speech, CNR sweeps, and scenarios: keyed transmissions, starting mid-carrier and on dead air, a
+continuous carrier, volume steps of +/-6, 12 and 20 dB in noise and under a carrier, of 12 and 30 dB across a pause and
+in a carrier's last 60 ms, and of 3 dB at N = 3, a 200 Hz-deviation tone fading through 30, 20 and 12 dB CNR, a carrier
+relaying noise and then speech, an AGC and slow drift, clipping, impulses, a neighbour inside a wide source filter,
+stream pauses, zero padding, and the passband moving between 12.5 and 25 kHz.
+
+The gate: a reference within 0.3 s of noise; noise reaching N = 3 in at most 1e-4 of evaluations once learned; wanted
+modulation keeping its 1st-percentile Q at least 6 dB over N = 30 where the source's floor leaves that much room;
+quieting rising with CNR and level-independent within 0.2 dB unclipped; every false open on noise at most 1 s, and
+none while learning; the low-passed sources reading no band and never reporting quieting.
+
+The band: 3.8 kHz to the lower of 6.5 kHz and 0.45 times the input's native rate, in 200 Hz sub-bands with two
+staggered sets between them, Q = max(Q_sum, Q_max - 6 dB). The radio squelch ends its band at the channel edge, but
+noise alone shows no edge here: through every source chain the noise is flat to within about 1 dB a sub-band across the
+band, so the top is fixed. 300 Hz sub-bands pass 14 of 26 sources (harmonics on the boundaries again), 250 Hz 23, and
+200 Hz with a 5 dB guard 24 and with a 6 dB guard and two staggered sets 25. Over the learner grid on that band
+(steady window count, transition step, gain tolerance, no-band ratio, no-band time; a quick run on ten representative
+sources) all 162 combinations pass every source, so the chosen one, in the middle of the grid, has room on every side.
+
+| Figure (full run, 28 sources, about 52 minutes on 7 workers) | Result |
+| --- | --- |
+| Sources with a band | 26; the 8 and 9.6 kHz inputs have no room (`no room above voice`) |
+| Reference learned | 0.14-0.16 s into noise on every source with a band |
+| Noise reaching N = 3 | at most 3.3e-5 of evaluations (the 750 us chain and the 5 kHz tone chain), never on the rest |
+| Wanted modulation, 1st percentile | 33.5-78.9 dB on the sources with a band (33.5 dB: the hardware tap at 48 kHz, ruling 6); `rtl_fm` 61-79 dB |
+| Worst false open on noise, every scenario | 0.44-0.68 s on the unfiltered sources, the 0.4 s that noise turned down holds before it lowers the reference (ruling 8; 0.68 s: `rtl_fm` at 24 kHz turned down 30 dB in a carrier's last 60 ms); 1.00 s on the gentle 3 kHz Butterworth source, whose verdict may go either way; the clipping 3.4 kHz source's 5.08 s is the stale bound (ruling 4) |
+| Carrier relaying noise, then speech | the speech loses at most 3.2% (`relay-speech`, ruling 10) |
+| Low-passed sources | the 3.0 kHz FIR, and the 3.4 kHz FIR with de-emphasis and at 16 kHz, read no band and report no quieting; of the three that may go either way, the 4.0 kHz FIR reads no band, and the gentle Butterworth and the clipping 3.4 kHz source keep a band (clipping puts harmonics there) and pass |
+
+Rulings on the cases the gate left open:
+
+1. The band's top is fixed at 6.5 kHz, as above.
+2. The 10 kHz channel source is exempt from the check that a dead and a modulated carrier read alike: its channel edge
+   sits inside the band, where a carrier quiets the noise past the edge to nothing.
+3. No-band evidence is spectral, never a timeout: a steady stretch whose voice band is steady too and more than 30 dB a
+   Hz over the band, for 1 s. A session that starts on a steady tone carrier can read no band and play it until the
+   first noise.
+4. A clipping source flattens the band as a carrier does. The stale rule (a gate held open 5 s on one steady stretch
+   with 90% of its windows voice-steady is learned again) replaces any clip detection: it bounds a too-high reference to
+   5 s, and so mutes a dead or steady-tone carrier after 5 s. It takes the stretch as a held step (ruling 10), so that
+   carrier's later speech brings the reference back, and the noise after speech that refuted a rightly taken stretch
+   (a source turned down out of clipping, its audio low-pass switched on) takes the stretch back. The hot 3.4 kHz
+   source's 5.08 s worst false open is that bound.
+5. An AGC and impulse dropouts are diagnostic, not gated: they cost quieting, not false opens.
+6. The hardware tap at 48 kHz passes at 33.5 dB, 2.5 dB short of 36: its sound card's floor leaves no more room.
+7. An input rate with no room is logged by the squelch at first use; the engine adds no note of its own.
+8. A louder steady stretch replaces the reference only when it comes up within 4 dB of it: a live weather broadcast
+   (below), whose synthesized speech steps its energy above voice up under the carrier, played half of each segment
+   while any louder stretch replaced the reference. Noise at a lower gain (the source turned down in noise, during a
+   transmission or across a pause) reads under the reference but keeps noise's spectrum against it: the voice band
+   within 1.5 dB and each of its four parts (400-800, 800-1300, 1300-1900 and 1900-2600 Hz) within 2.5 dB moved as far
+   as the band, the band's move being its sub-bands' median, and the sub-bands tilted by at most 2.5 dB end to end, the
+   tilt a least-squares line across the sub-bands within 3 dB of the move (a spur added after the volume stands out of
+   one or two). A stretch's runs more than 1.5 dB under the reference gather that evidence at their level; once 0.4 s of
+   them hold it in three runs of four with the voice band steady, moved 1.5 dB or more on average, the reference steps
+   by their mean move. A gain step straight out of noise needs the same evidence through its 0.2 s hold. Measured over
+   nine chains, noise 6 to 30 dB down keeps that spectrum in 93-100% of its runs; a carrier's own noise leaves the
+   400-800 Hz part 14-20 dB under the band's move, and a tone or speech fills some parts and not others, so of 363 dead,
+   tone and speech carriers under the reference (3 to 30 dB CNR, at the rated deviation and at 100-800 Hz) none kept it
+   in more than 6.3% of its runs. Rules tried on the way failed elsewhere: the voice-to-band ratio alone, and with the
+   sub-bands' shape, let a lightly modulated carrier that weakens pull the reference down (350 Hz deviation at 48 kHz;
+   200 Hz on `rtl_fm`'s 12 kHz band, 23 dB, muting the rest of the carrier); keeping out a pause in speech by asking the
+   stretch to rise from the one before it left noise turned down across a pause, or in a carrier's last 60 ms, open
+   until the stale rule (5.1 s, `pause-volume` and `unkey-volume`); a gain step judged on the whole voice band took a
+   speech carrier on 48 kHz `rtl_fm` for one (76% muted); a limit on the sub-bands' spread, and a tilt fitted to all of
+   them or to their pairwise slopes, kept noise 30 dB down from passing on the sources with a 5 or 6.1 kHz line added
+   after their volume (2.94 s open); fixed 0.4 s trials, tried afresh after each failure, let a carrier that matched
+   noise in 70% of its runs through within a second; and steps of 4 dB or more left noise turned down 3 dB open at N = 3
+   until the stale rule (5.1 s).
+9. A window of exact zeros ends the stretch, as a restart does: bursts separated by padding no longer add their open
+   time up to a stale reading.
+10. A carrier that relays noise (a repeater passing a weak user's hiss: 300-3000 Hz noise on the carrier) at just the
+    level where it matches the source's own noise in every part of the spectrum is noise to every measure the squelch
+    has, and can step the reference down, muting that noise. The step is held, not trusted: the user's speech on the
+    same carrier, wherever it sits under the gate's threshold against the stepped reference (less than N dB under it, so
+    a carrier that strengthens a little is caught too), shows a carrier there (eight of ten runs with the voice band
+    louder than noise's by twice the tolerances, or more than 1.5 dB above the reference without noise's spectrum, two
+    of them at least with the voice band moving against the band above it), and the reference from before the first held
+    step comes back, through a pause and a passband switch (the cache keeps the held step) too. That threshold is read
+    on band power, not the gate's state: under a source AGC a carrier fades toward the reference, and counting only
+    while the gate is shut (its hysteresis included) refuted too late and muted up to 0.44 s more of its speech. The
+    stretch steps down again only after 0.6 s of clean evidence, doubled at each refutation. Weak traffic on noise
+    genuinely turned down (6 dB CNR at `noise+10` after a 20 dB step) shows the same: nothing tells a weak carrier over
+    lower noise from a stronger one over relayed noise taken for noise, and refuting only at the stepped reference
+    itself muted the whole of a carrier 2 dB stronger than the relay before it. So the refuted step is kept as well, and
+    noise that comes back with its spectrum takes it back: 0.8 s of runs since the last modulation against it, whatever
+    stretch they fall in, three in four with its spectrum and the voice band steady against the band above it; it comes
+    back at their recent step, so a source whose volume also moved meanwhile, or keeps moving, is no exception (a 2 dB
+    drop had left that noise open the stale rule's 5 s, and a volume pumping 2 dB at 1 or 2 Hz, starting a stretch at
+    every swing, all 12 s; it closes in 1.0-1.2 s now), and a take-back ends the stretch's refutations. Weak traffic
+    plays, and the noise after it steps the reference down again in about 0.5 s, as noise turned down always does. Where
+    nothing steps down again the take-back closes the noise: after the stale rule took a switched-on audio low-pass, the
+    noise after each transmission had stayed open until that rule took it again 5 s later, and now closes after 0.9 s. A
+    carrier's own shorter pauses (a relay's noise between its speech, a dead carrier between its bursts) take nothing
+    back. A 0.2 s take-back muted the first 160 ms burst on a dead carrier the stale rule took; a longer one only in the
+    stretch whose carrier refuted the step was lost when the bursts faded 6 dB into stretches of their own, muting the
+    rest; and forbidding a take-back in that stretch left the noise after carriers 2 dB over noise, which shares their
+    stretch (under the 4 dB a new one needs), open 2.5 and 4.8 s after the third and fourth. With 0.8 s everywhere that
+    noise is open 0.64-0.86 s, and every burst plays, faded or not, while the pauses are shorter than that; a pause of
+    0.8 s or more takes the step back as noise would, and the speech after it loses the 0.2 s a refutation needs (all of
+    a 160 ms burst). The relay's later pauses step down again only after 0.6 s of them. Its next speech may be lighter
+    (500 Hz deviation after 1 kHz), and against the relay's own noise in the voice band such speech reads clearly louder
+    in only some of its runs, too few to refute the step again: a whole transmission was muted (none of 3 s, 6.9 of 12
+    s). So a reference a refutation brought back is proven, and a step held over it, stepped down again or taken back,
+    is contested: eight of ten runs under the threshold whose voice band is louder than noise's by more than the shape
+    tolerances alone (not twice them), and moves against the band above it, refute it, and that speech plays (2.8 of 3
+    s, 11.8 of 12 s, and 2.8 s after a gap). Counting every run without noise's spectrum instead let noise whose own
+    spectrum changed (an 800 Hz high-pass switched on) refute a contested step and play 4.8 s; counting a voice band
+    only louder let 25 us de-emphasis switched on do the same (5.0 s); and counting a voice band that moves on its own
+    let that de-emphasized noise under a volume pumping 2 dB at 10 Hz play 12.3 of 16 s. A filter changes the spectrum
+    steadily, and a moving volume moves the voice band and the band above it alike: against the band above it, all three
+    stay shut, as does a dead carrier. A filter that quiets the band by N dB on its own (75 us de-emphasis, a 3 kHz
+    low-pass, switched on) opens for the stale rule's 5 s, contested or not (ruling 4). A weak carrier with no louder
+    voice (dead, or speech at 0 dB CNR) refutes nothing, and neither does a steady tone carrier or a steady line in the
+    voice band: a 1 kHz line at -50 dBFS added to noise after a genuine step read clearly louder in one voice part run
+    after run, and played 4.8 s, until refutation asked for the voice band to move against the band above it in two runs
+    of ten (asking it of every run instead cost the hardware tap's AGC scenario 11.6% of its speech). Modulation against
+    a refuted step starts the take-back's evidence over in any run, one the learner otherwise passes over (a level still
+    being confirmed) included: light, faded bursts that never continue a stretch had let the pauses between them add up
+    to a take-back and muted the bursts after it. Known limits, which no measure of the audio removes: audio added after
+    the discriminator reads as the modulation of a carrier relaying noise. A steady line a little louder (-48 dBFS)
+    moves the voice band just enough, now and then, to refute a genuine step and plays the stale rule's 5 s; a tone
+    keyed on and off in the voice band moves it as speech does and keeps the gate open on noise as long as it keeps
+    switching. And light speech (250 Hz deviation) after the stale rule took a dead carrier moves the voice band too
+    little at first to refute that, and loses its first 2.9 s. The gate bounds the speech after relayed noise to 15%
+    dropout (`relay-speech`), and the harder cases in `DSP_PCM_NOISE_SQUELCH` lose 0.2-0.6 s of it. No spectral test
+    told the two apart: the band under voice (100-350 Hz) reads -6.4 to +2.9 dB against noise's move for a relay without
+    CTCSS, depending on the CNR, a CTCSS tone fills it, and hum after the volume lifts it; the window-to-window
+    correlation of the voice and above-band powers reads about the same for both (-0.2 for noise, 0 for a relay).
+
+Live check (an RTL-SDR running `rtl_fm -M fm` with no squelch, de-emphasis or low-pass, recorded at 48, 24 and
+12 kHz): 8 s of an empty channel, 8 s of a NOAA weather radio broadcast and 8 s of the empty channel again, fed to
+`dsd-neo -i - -fA --squelch noise+10`, play 7.98-8.00 s at every rate and nothing of the noise; 40 s of the broadcast
+after 3 s of noise play whole; 30 s of the empty channel piped live never open at `noise+3`. Started on the broadcast
+with no noise first, the gate opens only in snatches (6 of 40 s in the model), the documented cost of starting on a
+carrier.
+
+`python3 tools/pcm_noise_squelch_model.py` reproduces the report (`build/pcm_noise_squelch_model/
+pcm_noise_squelch_report.md`, and `pcm_noise_squelch_results.json` beside it); `--quick` is a smoke run, `--only`
+narrows the sources and `--grid` runs the learner grid on one band. `TOOLS_PCM_NOISE_SQUELCH_MODEL_REPORT` checks the
+report on canned results, an all-no-room run included. The C core (`src/dsp/pcm_noise_squelch.c`) is held to the
+model by two suites:
+
+- `DSP_PCM_NOISE_SQUELCH`: the band rule, the band-passes' response, the threshold clamp, no room, noise learning and
+  never opening at N = 3, a carrier opening and confirming the reference, quieting following CNR, level independence, a
+  volume step in noise, under a steady carrier, during speech (a tone with a 3 Hz syllabic envelope), across a pause, in
+  a carrier's last 60 ms, with a spur added after the volume at 3.9, 5, 6.1 and 6.4 kHz, and of 2-4 dB at N = 3; a
+  carrier that weakens (30, 20 and 12 dB CNR, dead and modulated at 100-1200 Hz and the rated deviation, on a 48 kHz
+  source and on `rtl_fm`'s 12 kHz band, two seeds each); a light tone keyed straight out of noise, which is no gain
+  step; a carrier relaying noise on both sources, whose speech refutes the step it caused, after two held steps, across
+  a passband switched away and back, across a gap, and on a carrier that strengthens; a dead carrier the stale rule
+  took, whose speech brings the reference back; weak carriers that refute no genuine step; weak traffic that refutes one
+  (after a 20 dB volume step, across volume changes both ways, and speech after a switched-on 3 kHz Butterworth low-pass
+  the stale rule took, with the volume 2 dB lower meanwhile or not), whose noise after takes the step back; lighter
+  speech after a relay stepped down again (3 and 12 s, and across a gap), and 160 ms bursts on a dead carrier the stale
+  rule took, which refute a contested step, faded 6 dB or not; carriers 2 dB over noise turned down, whose noise after
+  takes the step back within 1 s, and an 800 Hz high-pass or 25 us de-emphasis switched on after a contested step, under
+  a pumping volume or not, and a steady 1 kHz line after a genuine or a contested step, which refute nothing; a volume
+  pumping at 1 and 2 Hz after the low-pass case's refutation, whose noise is taken back within 1.5 s; light, faded
+  bursts between a stale dead carrier's pauses, whose modulation guards the refuted step though no stretch reads it;
+  modulation that steps up under a carrier (a 4.5 kHz line after each pause), bursts separated by exact zeros, starting
+  on a carrier, a low-passed source reading no band, exact zeros, the per-passband cache (its eight entries, the oldest
+  evicted, as in the model) and the stale rule, and block-cut bit identity. The pause, unkey, edge-spur, small-step,
+  relayed-noise, held-step, weak-carrier, take-back, contested-step, voice-band-line and gain-step cases, and the
+  weakening carrier at 100 Hz deviation, each fail on the learner as it stood before the rule they pin.
+- `DSP_PCM_NOISE_SQUELCH_SWEEP` (`--sweep`): full-deviation tones on 12.5 and 25 kHz sources, centred and at their
+  Carson edges, never closing the gate at N = 30 (lowest Q 42.8 dB).
+
+`DSP_SYMBOL_REPLAY` holds the decoder integration: every monitor sample gated by its own flag on WAV and UDP input; the
+squelch held closed, learning nothing, while the tap skips a UDP backlog; the rigctl peer's passband, its first known
+value and a live change of it, as a boundary that re-keys the reference, while a busy read changes nothing and one the
+client no longer knows (a lost reply) learns afresh without storing what it learns; and a
+no-band decision inside a monitor block, at three offsets, leaving the samples before it shut and ramping in the rest.
+`APP_CONTROL_SCAN_ROW_EDIT` refuses a scan row's own auto squelch on audio input.
+
+#### PCM noise squelch replay cases
+
+The `DECODE_PCM_*` cases run the noise squelch on audio input end to end, in every build (they need no radio support).
+`dsd-neo_test_analog_replay --analog-pcm-tap RATE` turns the case's committed capture into the audio a scanner's
+discriminator tap, or an SDR program with its audio filtering off, would send: a 16 kHz channel filter and a polar
+discriminator, resampled to RATE (decimated for a divisor of the capture's 48 kHz, interpolated with the host's own
+windowed sinc for any other rate), written as a 16-bit mono WAV into the host's private temporary directory and run as
+`-i` in place of `--iq-replay` (`--analog-pcm-gain-db` scales it, `--analog-pcm-lowpass-hz` low-passes it first, as an
+SDR program's audio filter would). Stream time is the WAV's read position, so the bounds read as on a replay. No
+fixture is committed for them.
+
+| Case | What it pins |
+| --- | --- |
+| `_TAP_BURST`, `_TAP_BURST_HOT` | `nfm_burst_synth` gates as on a radio input: first audible block at 330-380 ms (340 measured), 200-290 ms audible (260), at the tap's level and 10 dB louder. |
+| `_TAP_BURST_16K`, `_TAP_BURST_12K` | The same through the staged rates; 12 kHz keeps 3.8-5.4 kHz of band. `_TAP_BURST` and `_16K` also hold the delivered audio within 0.5% of the input it spans. |
+| `_TAP_BURST_44K`, `DECODE_PCM_ANALOG_TAP_44K` | A rate that does not divide 48 kHz (issue #633): the monitor runs at 44.1 kHz and its audio reaches the 48 kHz sink converted, within 0.5% of the input it spans (8.1% short before the fix). The squelch measures the same (261 ms audible); its first audible block starts at 326.5 ms, since a 44.1 kHz block lasts 21.8 ms, so its floor is 315 ms. `DECODE_PCM_ANALOG_NEG_DELIVERY_EXACT` (radio builds) shows the bound fires. |
+| `_TAP_MARGIN` | The burst quiets the band by about 22 dB: under `noise+30` nothing plays. |
+| `_TAP_FLOOR` | Ten seconds of `noise_floor` never open it at `noise+3`. |
+| `_TAP_LOWPASSED` | The same noise low-passed at 3 kHz has no band: the notice comes, the gate stays closed for about a second (1080 ms to the first audible block), then plays as with the squelch off. |
+| `_TAP_NO_ROOM` | An 8 kHz input has no room above voice: the notice comes and it plays from the start. |
+| `_TAP_STARTS_ON_CARRIER` | `nfm_ctcss_real` is carrier throughout: the reference learned from it is too low and nothing plays (the documented cost of starting on a carrier). |
+| `DECODE_PCM_ANALOG_SQL_AUTO_OFF` | `--squelch auto` on audio input warns at startup and plays. |
+| `DECODE_PCM_SCAN_SQL_NOISE_ROW`, `_AM_ROW_OFF` | A `-Y` nfm row's own `--squelch noise` gates as `-fA` does; an am row that inherits a noise default plays (off on AM audio). |
+
+With the PCM noise squelch disabled, every case but the two where it is meant to be off fails.
 
 #### Tone and code labels
 
@@ -959,14 +2296,20 @@ because they hold no DCS, and the corpus has no real DCS recording yet (`build_i
 names with the new ones and refuses any name it does not build). A real DCS accept case needs another source.
 
 Every DCS waveform has two spellings, because inverting a DCS word gives another valid word: the oracle prints both
-(`D023N = D047I`, and `D023I = D047N` for the inverted waveform). A detector reports one canonical label per waveform,
-and the DCS detector (#523) defines which; compare an oracle label with a detector's by waveform, not by spelling. The wiki's CTCSS page, which links the I/Q recording, carries audio samples at
-151.4, 173.8 and 186.2 Hz without saying which tones the recording holds; the oracle finds the first two. A
-maintainer has confirmed the CTCSS labels in the table, "none" for both squelch captures included, and the received-tone
+(`D023N = D047I`, and `D023I = D047N` for the inverted waveform). The DCS detector (#523) publishes the normal-polarity
+spelling (`dsd_dcs_canonical()`) and shows and logs both, normal first (`DCS D023N / D047I`; the alias table is
+in the [CLI guide](cli.md#received-code-dcs-on-the-analog-monitor)), so an oracle label and the detector's name
+the same two spellings. The wiki's CTCSS page, which links the I/Q recording, carries audio samples at 151.4,
+173.8 and 186.2 Hz without saying which tones the recording holds; the oracle finds the first two. A maintainer
+has confirmed the CTCSS labels in the table, "none" for both squelch captures included, and the received-tone
 cases pin them: `DECODE_IQ_ANALOG_REAL_CTCSS_1514` the 151.4 Hz of `nfm_ctcss_real`, and the
 `DECODE_IQ_ANALOG_REAL_CTCSS_NOFALSE_*` cases the absence of any tone on both squelch captures (see
 [Received tone (CTCSS) on the analog monitor](#received-tone-ctcss-on-the-analog-monitor), which also says why the
-neighbour's 173.8 Hz has no case). The DCS labels stay unpinned until a DCS detector exists.
+neighbour's 173.8 Hz has no case). No committed excerpt carries DCS, so no DCS label is pinned; the DCS detector
+(#523) is held to the "none" labels instead, by the same `DECODE_IQ_ANALOG_REAL_CTCSS_NOFALSE_*` cases and by
+`DECODE_IQ_ANALOG_REAL_CTCSS_1514`, all of which fail on any `Received tone: DCS` line. A real DCS accept fixture is a
+maintainer follow-up: record a transmitter with a known code in both polarities (and its turn-off tone), add it under
+`LOCAL_SOURCES`, and pin it here.
 
 ### Qt frontend and QML screen tests
 
@@ -993,6 +2336,15 @@ unknown network scheme. The Qt 6.10.3 MSVC validation built the complete
 `dsd-neo_ui_qt` target and passed all 12 registered `UI_QT_*` tests, including
 the real QML screen test. When Qt is not deployed beside the test executables,
 prepend the selected Qt kit's `bin` directory to `PATH` before invoking CTest.
+
+The QML suites, and the C++ cases that load a production screen (`UI_QT_CONTROLLER`,
+`UI_QT_RADIO_REFERENCE`), run the QML collector to completion, as the app does: each calls
+`dsd_qt::applyQmlGcPolicy()` (`src/ui/qt/qml_gc_policy.h`) before its first engine exists.
+`UI_QT_QML_GC_POLICY` pins the rule. With Qt's incremental collector, Qt 6.11.2 crashed the suites in
+`QQmlConnections::connectSignalsToMethods()` whenever the host was busy, for example under a parallel
+`ctest` with other builds running. A test that builds its own `QQmlEngine` calls the policy first. To
+watch the incremental collector again, set `QV4_GC_TIMELIMIT` to a slice length in milliseconds
+(Qt's default is 5): the policy keeps any integer it finds.
 
 #### Build-time constants that gate a branch
 
@@ -1061,6 +2413,110 @@ Clear the `DSD_REQUIRE_*` flags alongside the `DSD_ENABLE_*` ones. Against a
 cached build tree, configure otherwise stops with
 `DSD_REQUIRE_RTLSDR=ON requires DSD_ENABLE_RTLSDR=ON.`
 
+### Decode time in unit tests
+
+Decode decisions and decoded-output stamps read the decode clock (`<dsd-neo/runtime/decode_clock.h>`), never the
+platform clock (`docs/code-quality-guardrails.md` has the rule). So a test that steps a decode window, an expiry or a
+stamp drives the clock's TEST source, rather than sleeping through the window or wrapping `time()` at link time:
+
+```c
+static const uint64_t k_t0_ns = 1000000000000000000ULL; /* far from any platform clock reading */
+dsd_decode_clock_use_test(k_t0_ns); /* before anything stamps, init included */
+/* ... set up and run the code under test ... */
+dsd_decode_clock_test_set_ns(k_t0_ns + 1250000000ULL); /* 1.25 s later */
+/* ... check the window, reading now back through dsd_decode_now_*() ... */
+dsd_decode_clock_use_system(); /* on every return path */
+```
+
+- Select TEST before anything stamps. Init seeds stamps from the clock (`initState()`, `p25_sm_init_ctx()`), and a
+  stamp taken on the system clock read against a TEST value compares two origins.
+- TEST holds one value for the monotonic and the wall reads alike (`dsd_decode_time()` is its whole seconds), so a rule
+  that compares wall seconds, such as the `-Y` hangtime step in `ENGINE_NO_CARRIER_RESET`, is stepped a second at a
+  time.
+- Time moves only when the test moves it. A loop that waits for decode time to pass steps the clock itself, as the P25
+  call-skip case in `P25_P2_FRAME_LOCKOUT_SM` does, 100 ms a voice burst. Unstepped, it never ends on TEST, and on
+  SYSTEM it sits out the whole window in real time.
+- A case that orders two stamps, such as a stop and the start that follows it, runs on TEST and steps between the two
+  events. On SYSTEM, two events sent back to back can land in one reading of a coarse clock (a virtualised CI runner),
+  so a strict comparison fails now and then: `P25_SM_UNIFIED_CORE` runs such cases through
+  `run_on_test_decode_clock()` and steps with `decode_clock_step()` (issue #619).
+- The source is process-wide, so put it back with `dsd_decode_clock_use_system()` on every return path, failures
+  included, or the next case in the binary inherits it. Leaving TEST carries no value into SYSTEM. Leaving REPLAY does:
+  SYSTEM's monotonic reads then go on from the replay's capture time for the rest of the process, so a case that runs
+  a replay leave (`dsd_engine_decode_clock_leave_replay()`) leaves later cases reading SYSTEM there; they use TEST or
+  run before it.
+- Real-time reads (`dsd_realtime_*()`: sleeps, condvar deadlines, ring, device and socket timeouts) do not move with
+  TEST. A case that needs both steps the decode clock and lets the real one run.
+- `dsd_decode_clock_use_replay(anchor_s)` and `dsd_decode_clock_set_media_ns()` (monotone: a smaller value is ignored)
+  stand in for a replay's capture time the same way, as `ENGINE_NO_CARRIER_RESET` and `APP_COMMAND_QUEUE` do to test a
+  replay leave.
+- A test that compiles protocol, core, app-control or terminal sources directly instead of linking `dsd-neo_runtime`
+  gets the clock from `dsd-neo_test_decode_clock`: add its target to `_DSD_NEO_DECODE_CLOCK_TEST_TARGETS` in
+  `tests/CMakeLists.txt`.
+
+### Temporary files and directories
+
+A test must remove every temporary file and directory it creates, on its failure
+paths as well as when it passes. `dsd_test_mkstemp()`, `dsd_test_mkdtemp()` and
+`dsd_test_capture_stderr_begin()` in `tests/test_support/test_support.h` create
+them under `dsd_test_tmpdir()`: `DSD_NEO_TEST_TMPDIR`, else `TMPDIR` (`TEMP` or
+`TMP` on Windows), else the working directory. Create them with these helpers,
+not at a fixed path such as `/tmp`, which the check below does not look at. The
+temp directory's own path can contain a dot, so when the code under test reads
+meaning from a path's text, such as an extension, open the file by a bare name
+from a `dsd_test_temp_cwd_enter()` directory instead. Remove each file with
+`remove()`, including any the code under test wrote there, such as a P25
+control-channel cache file or an I/Q capture's sidecar, then remove the
+directory with `dsd_test_rmdir()`. `dsd_test_remove_temp_dir()` does both from a
+list of file names. Never remove a directory with `remove()`: the native Windows
+CRT does not remove directories, so it would stay behind there. Check the result
+of the directory removal and fail the test if it fails. The removal succeeds
+only on an empty directory, so the check also catches a file the test forgot to
+list or a new file the code under test starts writing.
+`dsd_test_capture_stderr_read()` deletes the capture file it reads. A test that
+does not read its capture removes `cap.path` itself after
+`dsd_test_capture_stderr_end()`.
+
+A failed `assert()` aborts the test before its cleanup runs. Once a temporary
+file or directory exists, check with a counted failure instead: print what
+failed, remove the file or directory, then return the failure. A write that
+fails while the test sets up its file counts the same way. An open that fails
+can still have created the file, so remove it on that path too. Close every
+handle on a file before removing it, including one the code under test hands
+back from an open the test expects it to refuse: the native Windows CRT cannot
+remove an open file.
+
+Keep large objects off the stack. A Windows main thread gets a 1 MiB stack where
+Linux gives 8 MiB, so a test that declares a `dsd_state`, an `Event_History_I`
+(3.7 MB) or another multi-megabyte object as a local crashes only on Windows,
+which CTest reports as a segfault. Make such a local `static` and clear it before
+use. GCC and Clang build every test with `-Wframe-larger-than=786432`, so a frame
+over 768 KiB fails the Linux build instead.
+
+Production writes CSV, INI and group files in text mode, so on Windows their
+lines end in CRLF. Compare such a file's contents after reading it in text mode
+(`"r"`), and binary output, such as an MBE recording, byte for byte (`"rb"`).
+
+To check the whole suite, run it against an empty directory, which must still
+be empty afterwards. That does not catch a file a test creates by a relative
+path, which lands in its working directory: `build/dev-debug/tests` for most
+tests, the source tree for the `TOOLS_*` scripts. So compare both before and
+after the run too:
+
+```sh
+T=$(mktemp -d)
+find build/dev-debug/tests | sort > "$T.build"
+git status --porcelain --ignored > "$T.src"
+DSD_NEO_TEST_TMPDIR=$T TMPDIR=$T ctest --preset dev-debug --output-on-failure
+ls -A "$T"   # prints nothing
+find build/dev-debug/tests | sort | diff "$T.build" -   # prints nothing
+git status --porcelain --ignored | diff "$T.src" -   # prints nothing
+rmdir "$T"; rm "$T.build" "$T.src"
+```
+
+Repeat this in a `-DDSD_ENABLE_QT_UI=ON` build with `-R '^UI_QT'` and
+`QT_QPA_PLATFORM=offscreen` when a change touches the Qt tests.
+
 ## Continuous Integration
 
 GitHub Actions runs tests and quality checks on pull requests, primary-branch
@@ -1070,18 +2526,71 @@ secret scanning, OSV scanning, repository guardrails for secret redaction and
 workflow source/download pinning, fuzz smoke tests, and install/package
 validation run where their workflows declare those events. Dependency review is
 PR-only, release tag validation is tag-only, and extended fuzzing is scheduled
-or manually dispatched. The backend matrix builds and tests all four
-SDR-backend combinations — `both`, `rtl_only`, `soapy_only` and `neither` — on
-pull requests as well as pushes, so the radio-off build is proven before a merge
-rather than after one.
+or manually dispatched. The backend matrix builds and tests all five
+SDR-backend combinations — `both`, `rtl_only`, `soapy_only`, `airspy_only` and
+`neither` — on pull requests as well as pushes, so the radio-off build is proven
+before a merge rather than after one.
+
+The full ctest suite also runs, as a required check on every pull request, on
+each platform a release ships for:
+
+| Check | Configuration | Covers |
+|---|---|---|
+| `backend-matrix (both, arm64)` | `dev-debug`, native arm64 runner | the aarch64 AppImage; unsigned `char`; the NEON SIMD paths |
+| `android shape (arm64, headless, forced radio pipeline)` | the Android option set on arm64 | the Android ABI's instruction set (not Bionic) |
+| `Linux • RelWithDebInfo • ctest (x86-64-v3, fast-math)` | `perf-bench` with `-march=x86-64-v3`, GCC | optimized, fast-math code generation like the shipped builds, with AVX2/FMA |
+| `Linux • RelWithDebInfo • ctest (x86-64-v3, fast-math, clang)` | the same with Clang | the macOS release toolchain's fast-math code generation; with `-Werror`, `-Wnan-infinity-disabled` rejects `isnan()`/`isinf()` builtins and NaN/infinity constants in fast-math code. Clang can silently fold hand-written bit tests; only runtime tests fed NaN or infinity catch those dead guards (see "Fast-math and non-finite values" in `docs/code_map.md`) |
+| `macOS • Debug • ctest (arm64)` | `dev-debug`, AppleClang | the DMG; libc++, ld64 and BSD libc |
+| `Windows • Debug • ctest (MSVC x64)` | `win-msvc-debug` with Ninja | the ZIP; MSVC, the debug CRT and 32-bit `long` |
+
+Tests that need GNU ld `--wrap` seams register only on Linux, and the `TOOLS_*`
+script tests only where bash is (not Windows), so the macOS and Windows suites
+are smaller than the Linux one; each job prints its registered test count before
+running.
+
+Some tests drive an external tool: two `TOOLS_*` tests need ripgrep,
+`TOOLS_GCC_FANALYZER` needs GNU GCC's analyzer under the name `gcc`,
+`TOOLS_IWYU` needs git and Python, and the `ANDROID_*_JVM` tests need Java and
+the Kotlin compiler. Without its tool such a test skips, and passes, on a
+developer machine. Every CI job that runs the suite sets
+`DSD_NEO_REQUIRE_TEST_TOOLS=1`, which turns that skip into a failure, and
+installs what its runner image lacks: ripgrep everywhere, Homebrew's GCC as
+`gcc` for the macOS test step, Java and Kotlin in the Clang container, and the
+pinned Kotlin compiler (`KOTLIN_COMPILER_VERSION` and `KOTLIN_COMPILER_SHA256`
+in `tools/ci-dependency-pins.env`) on the arm64 legs.
+
+A job skipped by an `if:` still reports its check, as a success. A required job
+that only runs on pull requests therefore lives in a workflow that only pull
+requests start (`windows-pr`, `macos-pr`, `guardrails-pr`), with no event
+condition. In a workflow that a push or a dispatch can also start, a skipped run
+on a pull request's head commit could stand in for the real one.
+
+The Windows Debug job's vcpkg dependencies come from a binary cache that pull
+requests only read. A change to the dependency set (`vcpkg.json`, the overlay
+ports or the baseline) builds them from source on every pull-request run until
+the push-side twin has run once: `Windows • Debug • ctest (MSVC x64, cache
+seed)` in `windows-ctest-seed`. Dispatch `windows-ctest-seed` on the branch to
+seed it.
+
+To run the Windows suite locally, configure and build the `win-msvc-debug`
+preset and run `ctest --preset win-msvc-debug`; the test preset puts the vcpkg
+debug DLLs on `PATH`. A Debug-CRT assertion or `abort()` in a test is reported on
+stderr rather than in a dialog (`tests/test_support/win_crt_report.c`).
 
 ## Decode-Quality A/B on Real Captures
 
 The `iq-decode` suite answers whether a change still decodes; it does not answer
 whether it decodes *as well*. Symbol-timing, slicer and demodulator changes need
-the second question answered, and one replay cannot answer it: decoding runs on a
-threaded pipeline, so how much of a capture gets decoded varies run to run by more
-than the effect being looked for.
+the second question answered, and one replay cannot answer it. Replay is
+repeatable (issue #572, see
+[Replay determinism](#replay-determinism-issue-572)), so a capture replayed
+again decodes exactly as before, but that is one draw: which frames a capture
+yields depends on where the decoder's state stands when each transmission
+arrives, the sync hunt's above all, and a change that moves the front end's
+timing by a few samples can move that draw by more than the effect being looked
+for. Measure on real captures, more than one where you can, and on several
+realizations of each: copies with every event shifted by a fraction of a
+symbol, which `tools/replay_ab.sh` makes, one per repeat.
 
 `tools/replay_ab.sh` replays one I/Q capture through two or more builds and
 `tools/replay_ab_report.py` reports the result:
@@ -1090,7 +2599,7 @@ than the effect being looked for.
 cmake --build --preset dev-debug -j --target dsd-neo
 cp build/dev-debug/apps/dsd-cli/dsd-neo /tmp/dsd-neo.after   # and one for 'before'
 
-tools/replay_ab.sh --capture ~/captures/nxdn.json --mode -fi --reps 12 \
+tools/replay_ab.sh --capture ~/captures/nxdn.json --mode -fi \
     --out /tmp/ab /tmp/dsd-neo.before /tmp/dsd-neo.after
 tools/replay_ab_report.py /tmp/ab/summary.tsv
 ```
@@ -1107,16 +2616,97 @@ Reading it:
 - **Errors per decoded voice frame**, never the raw error total. A build that
   loses sync decodes fewer frames and accrues fewer errors without being better,
   so watch the `voice` column alongside the error rate.
+- **What `voice` counts.** Lines that label a frame `Voice`, and ProVoice frames,
+  which print `VOICE` after their sync (trunked `PV`, or conventional `PV_C` with
+  its addresses in between) and carry four IMBE voice frames each.
+  Startup `NOTICE:` lines are left out: the ProVoice and EDACS presets print two
+  that mention voice, and before issue #588 they were the whole count for a
+  ProVoice run, so its errors were divided by 2 rather than by its frames.
+  D-STAR prints nothing labelled `Voice`, so its unit is the superframe: each
+  `Sync: ±DSTAR VOICE` or `Sync: ±DSTAR HEADER` line opens one of 21 AMBE voice
+  frames. Before issue #599 a D-STAR run counted none, and the report dropped it.
+  The log is read as text whatever bytes it holds: a D-STAR header decoded from
+  noise prints its callsigns raw, and a UTF-8 `grep` then takes the log for a
+  binary file and stops printing lines at the first of them.
+- **Soft-decision error counts are not a quality score on their own.** mbelib's
+  soft Golay reports how many data bits of the codeword it chose differ from the
+  hard decisions, so a soft decode that lands on the right codeword where the
+  hard one did not can report as many corrections, or more. For a change between
+  hard and soft decoding (issues #588 and #599), compare the builds' `-Z` IMBE or
+  AMBE payloads against a reference decode as well.
 - **Paired per repeat.** Builds run round-robin with the order rotated each
-  repeat, because a fixed order credits the better slot to whichever build holds
-  it. The report compares within a repeat for the same reason.
+  repeat, every build replays the same realization of the capture in a repeat,
+  and the report compares within a repeat. Before issue #572 a fixed order
+  credited the better slot to whichever build held it; with repeatable replay
+  the order changes nothing unless determinism has regressed.
+- **Each repeat is its own realization.** Replay is deterministic, so repeats of
+  a capture as recorded are all one draw of it, and an interval paired over them
+  claims a precision the capture does not have
+  ([Replay determinism](#replay-determinism-issue-572) measures how much).
+  Repeat r therefore replays `<out>/realizations/r<r>.json`, a copy of the
+  sidecar whose `data_file` is the original data's path, made absolute the way
+  replay resolves it (the sidecar's directory as given, with no `..`
+  collapsed), and whose every event `byte_offset` is
+  s_r = floor((r-1) P / reps) + (r-1) input samples later, held to the bytes
+  replay reads, where P = round(sample rate / 2400) is one 2400-baud symbol:
+  640 samples at 1.536 Msps, 20 at 48 kHz. Those bytes are `data_bytes`, or
+  the data file's size when that is smaller or `data_bytes` is 0, rounded down
+  to whole samples, as replay computes them. Repeat 1 is the capture as
+  recorded; a sidecar with an event past those bytes, which replay refuses,
+  stops the run before it replays anything.
+  A later shift that lands on a whole multiple of the front end's total
+  decimation D (`sample_rate_hz` over `demod_rate_hz`, else `base_decimation`
+  x `post_downsample`) moves up one sample, so no repeat after the first hands
+  every dwell the recorded output samples, only later; at 1.536 Msps,
+  `--reps 24` would otherwise shift its 23rd repeat by 608 samples, 19 x 32.
+  With `--reps 1` only repeat 1 runs, unshifted, and the header says so. Only
+  cu8 and cf32 captures (2 and 8 bytes a sample) can be shifted; any other
+  `sample_format` stops the run before it replays anything. Each progress line
+  prints its repeat's `shift=`, `summary.tsv` records it in its last column,
+  `shift`, and the report's first line counts the realizations. More repeats
+  buy more realizations again: the default `--reps 12` is a floor for a result,
+  and the measurements in [Replay determinism](#replay-determinism-issue-572)
+  took 16 and 32.
+- **A capture with no events** has nothing to shift. `replay_ab.sh` warns once
+  (`the capture has no events: every repeat replays the same realization;
+  compare it across captures`), replays every repeat as recorded and says so in
+  its header, and the report notes that every repeat replayed one realization.
+  Such a capture is one draw however many repeats it gets, so compare builds
+  across captures.
+- **Repeats that share an event schedule.** Events held at the end of the
+  bytes replay reads stop moving, and two shifts can coincide, so two repeats
+  can put every event in the same place. A repeat whose events land where an
+  earlier repeat's did replays the same realization: its progress lines say
+  `(same realization as rN)`, and `summary.tsv` records repeat N's shift, so
+  the report counts the realization once. When every event sits at the end,
+  every repeat is one realization, and the run warns once as for a capture with
+  no events (`every event sits at the end of the bytes replay reads, where no
+  shift moves it: every repeat replays the same realization; compare it across
+  captures`). When only some repeats collapse, it prints one notice
+  (`N of M repeats replay the same event schedule as an earlier repeat ..., so
+  the run has K distinct realizations`), and the report notes that a
+  realization several repeats replayed counts more than once in its interval.
+- **`--no-realizations`** replays every repeat as recorded on purpose: the
+  determinism control, in which each build's repeats must decode alike (an `sd`
+  of 0) as well as pair to `+0.00 +/- 0.00`.
 - **Run the baseline against itself first**, as a copy under another name
-  (replay_ab.sh refuses two builds with the same basename). That control
-  establishes the noise floor for the machine and the capture; a difference
-  smaller than it has not been measured. On the captures behind issue #444 the
-  floor was about 0.1 errors per voice frame over 12 repeats.
-- Keep the machine otherwise idle: `--rate realtime` is wall-clock paced, so a
-  build competing with a compile is measured under different conditions.
+  (replay_ab.sh refuses two builds with the same basename). Replay is
+  deterministic and both copies replay the same realization in a repeat, so
+  that control must read `+0.00 +/- 0.00` in every column, with no differing
+  repeat; any spread is a determinism regression to fix before anything is
+  measured. Before issue #572 the control measured a noise floor instead, about
+  0.1 errors per voice frame over 12 repeats on the captures behind issue #444.
+- Leave `-T` and `-Y` out of `--mode`: those replays are outside the
+  determinism guarantee. Otherwise load on the machine no longer changes what a
+  replay decodes, and `--rate realtime`, the default, decodes what `fast` does,
+  in the capture's own time.
+- **Judge an acquisition change across draws.** Under `-fa`, which calls a
+  capture yields depends on the hunt's phase when each arrives, so a change that
+  moves the hunt's timeline or the front end's latency by a few samples can win
+  or lose a call on one capture with nothing decoding better or worse. The
+  realizations are such draws; replay several captures as well, and compare a
+  pinned mode (`-fi`, `-f1`) beside `-fa`.
+  [Replay determinism](#replay-determinism-issue-572) has a worked case.
 
 - **When the frame count moves, match payloads before calling it quality.**
   Paying off the matched filter's group delay at every switch took errors per
@@ -1153,24 +2743,29 @@ Analog DSP changes (channel width, AM demodulation, de-emphasis, tone detection)
 excerpts in `tests/fixtures/iq` and on any longer real capture, with `--metric analog`. The builds are analog replay
 hosts rather than `dsd-neo`, and `summary.tsv` gains the analog columns: `tone_snr_db`, `inband_db`, `clip`,
 `audible_ms`, `first_audible_ms`, `rms_dbfs`, the first probe given as `probe_hz`, `probe_dbfs` and `probe_dbc`, `tone`,
-`tone_lock_ms` and `tone_lock_pct`, and last the run's exit status `rc` and `off_path`, 1 when the host warned that the
-front end delivered CQPSK symbols instead of monitor samples. `probe_dbc` needs `--analog-expect-tone-hz`, so on a real
-capture, which has no test tone, it is `NA` and `probe_dbfs` is the probe's level. The report pairs each column per
-repeat, pairs probe levels only between builds that probed the same frequency (a wrapper that puts its own
-`--analog-probe-hz` first changes which probe comes first), and gives the tone label each build settled on. A repeat
-that exited non-zero or ran off the monitor path is left out of every column and counted in a per-build warning, even
-though the host prints its metrics before it exits: it measured a crash, a timeout or the modulation auto-switch, not
-the build. So give the host no `--analog-*` bounds in `--mode`, since a missed bound exits 1. Its `n` column counts the
-repeats in which a build measured that column. The paired interval needs at least two paired repeats and reads `n/a`
-with one (`--reps 1`, or every other repeat left out), in the digital report too, since one pair says nothing about the
-spread. A build missing a column that another build measured gets an explicit `NA` row, and a build with no usable
-repeat (it crashed, timed out, left the monitor path, or is not an analog replay host) makes the report warn and exit 1,
-rather than leave the other builds' rows looking like a clean result. `tests/tools/test_replay_ab_report.py` (stdlib
-only) covers the per-repeat pairing, the A-vs-A control, probe frequency keying, the coverage reporting, crashed and
-off-path repeats, the single-pair interval, the received-tone columns and the duplicate-name refusal. CTest runs it as
-two tests: `TOOLS_REPLAY_AB_REPORT` scores canned summaries and runs wherever Python does, and
-`TOOLS_REPLAY_AB_ANALOG_METRIC` drives the real `replay_ab.sh` with a fake host, so it is registered only outside
-Windows where bash and coreutils `timeout` are found.
+`tone_lock_ms` and `tone_lock_pct`, then the run's exit status `rc` and `off_path`, 1 when the host warned that the
+front end delivered CQPSK symbols instead of monitor samples, and last the repeat's `shift`, as in a digital run.
+`probe_dbc` needs `--analog-expect-tone-hz`, so on a real capture, which has no test tone, it is `NA` and `probe_dbfs`
+is the probe's level. The report pairs each column per repeat, pairs probe levels only between builds that probed the
+same frequency (a wrapper that puts its own `--analog-probe-hz` first changes which probe comes first), and gives the
+tone label each build settled on. A repeat that exited non-zero or ran off the monitor path is left out of every column
+and counted in a per-build warning, even though the host prints its metrics before it exits: it measured a crash, a
+timeout or the modulation auto-switch, not the build. So give the host no `--analog-*` bounds in `--mode`, since a
+missed bound exits 1. Its `n` column counts the repeats in which a build measured that column. The paired interval needs
+at least two paired repeats and reads `n/a` with one (`--reps 1`, or every other repeat left out), in the digital report
+too, since one pair says nothing about the spread. A build missing a column that another build measured gets an explicit
+`NA` row, and a build with no usable repeat (it crashed, timed out, left the monitor path, or is not an analog replay
+host) makes the report warn and exit 1, rather than leave the other builds' rows looking like a clean result.
+`tests/tools/test_replay_ab_report.py` (stdlib only) covers the per-repeat pairing, the A-vs-A control, probe frequency
+keying, the coverage reporting, crashed and off-path repeats, the single-pair interval, the received-tone columns, the
+duplicate-name refusal and the realizations: the shifted copies, their hold at the bytes replay reads (with `data_bytes`
+0 or past the data file too), the cf32 stride, the shift moved off a multiple of the decimation, `data_file` made
+absolute as replay resolves it (also under a symlinked directory) or kept when already absolute, paths with spaces,
+`--reps 1`, the no-events warning, repeats whose events collapse onto one schedule (all of them or some),
+`--no-realizations`, an unknown `sample_format` and the report's reading of `shift`. CTest runs it as four tests:
+`TOOLS_REPLAY_AB_REPORT` scores canned summaries and runs wherever Python does, and `TOOLS_REPLAY_AB_ANALOG_METRIC`,
+`TOOLS_REPLAY_AB_DIGITAL_METRIC` and `TOOLS_REPLAY_AB_REALIZATIONS` drive the real `replay_ab.sh` with fake hosts, so
+they are registered only outside Windows where bash and coreutils `timeout` are found.
 
 `tone`, `tone_lock_ms` and `tone_lock_pct` come from the host's `ANALOG METRIC:` line, which reads them from the
 decoder's received-tone publication (`dsd_state::analog_rx`) after every block the monitor delivers; a host built
@@ -1179,9 +2774,11 @@ CTCSS detector (#522) fills them for CTCSS, the DCS detector (#523) adds its lab
 statistic adds its own field and column. The contract (also in the file comment of `tests/engine/analog_replay.c`),
 which matters because replay_ab.sh splits the line on spaces:
 
-- `tone=<label>`: the received tone or code with no whitespace, `151.4` (Hz, one decimal) for CTCSS and the DCS
-  detector's canonical label, such as `D023N`, for DCS (see [Tone and code labels](#tone-and-code-labels)); `NA` when
-  none was confirmed. When the label changes during a run, the last one confirmed.
+- `tone=<label>`: the received tone or code with no whitespace, `151.4` (Hz, one decimal) for CTCSS, and for DCS both
+  spellings of the code's signal, canonical first, joined by a slash, such as `D023N/D047I`: the log's
+  `DCS D023N / D047I` as one token, since a receiver cannot tell the two apart (see
+  [Tone and code labels](#tone-and-code-labels)); `NA` when none was confirmed. When the label changes during a run, the
+  last one confirmed.
 - `tone_lock_ms=<ms>`: stream time of the first confirmed lock, on the same clock as `first_audible_ms`: the end of
   the block after which the publication first read locked, with two decimals; `NA` when nothing locked.
 - `tone_lock_pct=<pct>`: the share of the delivered audio (`captured_ms`) in blocks after which the publication read
@@ -1193,8 +2790,14 @@ replay_ab.sh names each build by its basename and refuses two with the same one,
 name. Per-variant flags or settings within one build go in a wrapper script per variant; its name is the variant's
 name. The example compares main with a branch and, on the branch, the land-mobile de-emphasis (`DSD_NEO_DEEMPH=nfm`)
 with the default. A channel-width variant is the same kind of wrapper passing `--nfm-bandwidth-hz`
-(`printf '#!/bin/sh\nexec /tmp/ab/analog_replay.branch --nfm-bandwidth-hz 12500 "$@"\n' > /tmp/ab/nfm_12k5`); an AGC
-variant passes `-n 0`, since the default gain is fixed.
+(`printf '#!/bin/sh\nexec /tmp/ab/analog_replay.branch --nfm-bandwidth-hz 12500 "$@"\n' > /tmp/ab/nfm_12k5`), or
+`--am-bandwidth-hz` under `-fM`; a fixed-gain variant passes `-n 50`, since the default gain is the AGC (issue #518),
+which brings every block's peaks to the same level and so hides level differences between builds. AM has no main-branch
+baseline before #524: its variants are paired against the branch's default width, and the FM monitor cases (`-fA` on
+the NFM excerpts and on `am_airband_real`) are paired against main to show them unchanged. A design constant with no
+runtime setting, such as the AM carrier time constant (`DSD_AM_CARRIER_TAU_MS`), is varied with temporary builds that
+change only that constant, paired against the default build; revert the constant afterwards and check the rebuilt
+default host is byte-identical to the one measured.
 
 ```sh
 mkdir -p /tmp/ab
@@ -1204,23 +2807,28 @@ printf '#!/bin/sh\nDSD_NEO_DEEMPH=nfm exec /tmp/ab/analog_replay.branch "$@"\n' 
 chmod +x /tmp/ab/deemph_nfm
 
 tools/replay_ab.sh --metric analog --capture tests/fixtures/iq/nfm_ctcss_real.iq.json \
-    --mode "-fA -v 0 --analog-probe-hz 12500" --reps 12 --out /tmp/ab/ctcss \
+    --mode "-fA -v 0 --analog-probe-hz 12500" --reps 3 --out /tmp/ab/ctcss \
     /tmp/ab/analog_replay.main /tmp/ab/analog_replay.branch /tmp/ab/deemph_nfm
 tools/replay_ab_report.py /tmp/ab/ctcss/summary.tsv --baseline analog_replay.main
 ```
 
-`-v 0` takes the monitor's fixed voice filters out of the measurement (see
+`-v 0` takes the monitor's voice filters out of the measurement (see
 [Analog monitor audio checks](#analog-monitor-audio-checks)); leave it out when the question is what a listener gets.
 The 12.5 kHz probe there reads the neighbour channel's leakage as `probe_dbfs`, over about 75 Hz around 12.5 kHz in
 each 20 ms block, no finer.
-Run the control first, one host against a copy of itself. While the front end stays on the monitor path, I/Q replay
-is sample-deterministic, so the control must read `+0.00 +/- 0.00` with no differing repeats: 12 realtime repeats on
-`nfm_ctcss_real` and on `nfm_tone_synth` did, for every column. A run whose log carries the host's CQPSK-symbols
-warning left the monitor path and is not deterministic: a build from before the analog family stood the modulation
-auto-switch down does that on `am_airband_real` (see the `am_airband_real` note under
-[Full-chain modulation decode tests](#full-chain-modulation-decode-tests)), and such a run measures the auto-switch,
-not the change; the report leaves it out as `off_path` and warns, and a build with no other repeats fails the report. A
-difference that shows up in a monitor-path control is the harness's, not the change's. Attach the report to the pull request with the capture, flags and repeat count.
+Run the control first, one host against a copy of itself. I/Q replay is deterministic (issue #572), so the control must
+read `+0.00 +/- 0.00` with no differing repeats, as the digital one must: 12 realtime repeats on `nfm_ctcss_real` and on
+`nfm_tone_synth` did, for every column. The analog excerpts in `tests/fixtures/iq` have no events, so `replay_ab.sh`
+warns and replays each as recorded in every repeat: there two or three repeats show the control (hence `--reps 3` above)
+and more add nothing, and a difference between builds is one draw of each excerpt, to be compared across the excerpts. A
+longer capture with events gets a realization per repeat, as a digital one does. A run whose log carries the host's
+CQPSK-symbols warning left the monitor path: a build from before the analog family stood the modulation auto-switch down
+does that on `am_airband_real` (see the `am_airband_real` note under
+[Full-chain modulation decode tests](#full-chain-modulation-decode-tests)), and such a run measures the auto-switch, not
+the change, and on a build from before issue #572 is not deterministic either; the report leaves it out as `off_path`
+and warns, and a build with no other repeats fails the report. A difference that shows up in a control is a determinism
+regression in the build or the harness, not the change's. Attach the report to the pull request with the capture, flags
+and repeat count.
 
 ### Analog listen-test sign-off
 
@@ -1233,8 +2841,15 @@ request:
   `nfm_ctcss_real` audible only at the widest setting (#525).
 - [ ] AM on `am_airband_real` at several widths and with the AGC: speech intelligible, level steady across the
   excerpt, no pumping or clipping (#524).
+- [ ] DCS on the air (#523), against a radio or repeater with a published DPL: a radio set to D023N reads
+  `DCS D023N / D047I`, one set to D023I reads `DCS D047N / D023I`, and the turn-off code ends the lock (the N polarity
+  and the bit order, which the synthetic fixtures cannot check).
 - [ ] Tone filtering: allowed traffic opens within the detection window, rejected and untoned traffic stays silent,
   and nothing leaks at the start of a rejected transmission (#527).
+- [ ] Level and AGC (#518), with the defaults (`-n 0`, `-v 0x9`): NFM, AM and digital voice at matching loudness in a
+  mixed scan; no pumping in pauses (hiss does not swell between words); a squelch tail or key-up noise does not leave
+  the next transmission quiet; AM static does not duck the speech after it for seconds; a 151.4 Hz CTCSS tone is
+  inaudible; and the `-8` source monitor under digital decoding plays without clipping.
 - [ ] The A/B report agrees with what was heard; where it does not, say which one the pull request relies on.
 
 ## Regression Test Requirement

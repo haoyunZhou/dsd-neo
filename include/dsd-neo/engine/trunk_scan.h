@@ -16,6 +16,7 @@
 #include <dsd-neo/core/state_fwd.h>
 #include <dsd-neo/runtime/scan_mode.h>
 #include <dsd-neo/runtime/scan_options.h>
+#include <dsd-neo/runtime/scan_row_edit.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -59,6 +60,8 @@ typedef enum {
     DSD_TRUNK_SCAN_TARGET_P25_CONVENTIONAL = 7,
     /** One analog NFM channel (issue #526): carrier activity, no frames, keys or symbol clock. */
     DSD_TRUNK_SCAN_TARGET_NFM_CONVENTIONAL = 8,
+    /** One analog AM channel (issue #526): the AM monitor (-fM), otherwise as an nfm-conventional target. */
+    DSD_TRUNK_SCAN_TARGET_AM_CONVENTIONAL = 9,
 } dsd_trunk_scan_target_type;
 
 typedef enum {
@@ -189,7 +192,49 @@ size_t dsd_engine_trunk_scan_target_count(const dsd_state* state);
  * edit made while another row was on air. Read-only; 0 when @p opts or @p state is NULL.
  */
 int dsd_engine_scan_runs_configured_nfm_width(const dsd_opts* opts, const dsd_state* state);
+/**
+ * @brief dsd_engine_scan_runs_configured_nfm_width() for the configured AM width: whether the scan running now visits
+ * an am row or am-conventional target that sets no --am-bandwidth-hz of its own, and so runs the configured AM width
+ * (its 6 kHz default when none is set, which a DSP rate holds too) whenever it is on air, on any session (issue #526).
+ */
+int dsd_engine_scan_runs_configured_am_width(const dsd_opts* opts, const dsd_state* state);
+/**
+ * @brief Whether anything in the session runs received-tone detection, so the configured tone policy can act (#527).
+ *
+ * Under the trunk-scan coordinator, an nfm-conventional target: every target runs its own type's mode, never the
+ * configured one. Otherwise dsd_channel_modes_conventional_hear_tones(): on the conventional -Y scanner with a channel
+ * map, a row that runs the FM monitor (dsd_channel_modes_hear_tones()); without rows, the configured decode mode is the
+ * analog FM monitor (dsd_scan_mode_configured_fm_monitor()). A --trunk-scan session whose coordinator has not started
+ * counts as hearing them: its targets are judged when the scan starts. Read-only; 0 when @p opts or @p state is NULL.
+ */
+int dsd_engine_scan_hears_tones(const dsd_opts* opts, const dsd_state* state);
+/**
+ * @brief The tuner autogain a target without its own manual gain runs: the session's at scan start, or the latest
+ * live edit (dsd_engine_trunk_scan_set_configured_autogain()). Returns 1 with @p out_on set, 0 when no trunk scan runs
+ * or the value was never known (@p out_on 0).
+ */
 int dsd_engine_trunk_scan_saved_tuner_autogain(const dsd_state* state, int* out_on);
+/**
+ * @brief Make @p gain the tuner gain the trunk scan restores at every target switch and at shutdown (issue #518
+ * follow-up: a live gain edit used to be put back to the scan-start value at the next switch).
+ *
+ * The configured gain is what targets without an rtl_gain column run; a target with its own keeps it while it is on
+ * air, as a row's --squelch-db overrides the configured squelch. Publishes the result for the frontends. Decoder
+ * thread, with the P25 SM tick guard held: the watchdog's control-channel returns read the configured gain and
+ * autogain through the retune gain profile under it.
+ *
+ * @return 1 when the gain is in force now (written to opts->rtl_gain_value), 0 when the parked target's own rtl_gain
+ *         overrides it (@p opts unchanged), -1 when no trunk scan runs (nothing changed).
+ */
+int dsd_engine_trunk_scan_set_configured_gain(dsd_opts* opts, dsd_state* state, int gain);
+/**
+ * @brief Make @p on the tuner autogain the trunk scan restores at every retune (the same rule as the configured gain).
+ * Decoder thread, with the P25 SM tick guard held.
+ *
+ * @return 1 when it is in force now (the gain in force is AGC; the caller applies it to the stream), 0 when a manual
+ *         gain suspends it (every trunk-scan retune forces the supervisor off then), -1 when no trunk scan runs.
+ */
+int dsd_engine_trunk_scan_set_configured_autogain(const dsd_opts* opts, dsd_state* state, int on);
 int dsd_engine_trunk_scan_active_p25_cqpsk_request(const dsd_state* state, int* out_enable);
 /**
  * @brief Symbol rate of the parked four-level GFSK scan target, or 0 when there is none.
@@ -230,6 +275,51 @@ int dsd_engine_trunk_scan_active_is_p25_class(const dsd_state* state);
  * @return The new row count.
  */
 int dsd_engine_trunk_scan_append_p25_idens(const dsd_state* state, struct p25_bandplan_row* rows, int count, int cap);
+
+/**
+ * @brief Edit one field of a target's own settings for the rest of the session ("this channel", issue #518).
+ *
+ * @p session and @p target_id name the target as the frontends saw it (dsd_state::scan_row_session and
+ * trunk_scan_active_id): an edit opened on one coordinator never lands on the next, and one that outlives the visit
+ * still reaches the target it named. @p field is one DSD_SCAN_ROW_FIELD_*, which the target's type must take
+ * (dsd_scan_row_edit_fields(): the gain only on an RTL-family input other than an Airspy); @p action a
+ * dsd_scan_row_edit_action, with @p value for SET. A width the published DSP rate cannot filter is refused, as it would
+ * skip the target at every visit.
+ *
+ * A parked target runs the edit at once: its scope takes the merged options again (the squelch reaches the demod), and
+ * @p out says whether the caller must hand the front end the new width (publish_width) or reopen the stream for the
+ * new gain (restart_gain), and holds the edit before this one for dsd_engine_trunk_scan_restore_target_edit() should
+ * that fail. Any other target runs it from its next visit. Nothing is written to the list or saved.
+ *
+ * Takes the P25 SM tick guard (try-enter) around the change, so the caller must not hold it; decoder thread only. A
+ * width or gain edit of the parked target waits for its retune to land: only the request the caller makes after this
+ * call can be put back should the front end refuse it.
+ *
+ * @return a dsd_scan_row_edit_status: APPLIED, STORED, REFUSED (with @p out->err), STALE, UNAVAILABLE (no trunk scan)
+ * or BUSY (the guard was held, or the parked target is still retuning; nothing changed).
+ */
+int dsd_engine_trunk_scan_edit_target(dsd_opts* opts, dsd_state* state, uint32_t session, const char* target_id,
+                                      uint32_t field, int action, const dsd_scan_row_edit_value* value,
+                                      dsd_scan_row_edit_result* out);
+
+/**
+ * @brief Put the @p fields (DSD_SCAN_ROW_FIELD_*) of a target's session edit back to those of @p edit (the previous
+ * one dsd_engine_trunk_scan_edit_target() returned), keeping its other fields as they are now, and apply it as that
+ * call does. For a caller whose follow-up -- the width request, the stream restart -- failed: an edit of another field
+ * made since stays. Same session and thread rules, no checks of the values beyond those, but the P25 SM tick guard is
+ * waited for (entered, not tried): the rollback must not be left undone because a watchdog tick held it.
+ */
+int dsd_engine_trunk_scan_restore_target_edit(dsd_opts* opts, dsd_state* state, uint32_t session, const char* target_id,
+                                              uint32_t fields, const dsd_scan_row_edit* edit,
+                                              dsd_scan_row_edit_result* out);
+
+/**
+ * @brief dsd_engine_trunk_scan_restore_target_edit() for a caller that holds the P25 SM tick guard already: the
+ * rollback of a gain inside the one hold that covers a failed stream reopen and the recovery start after it.
+ */
+int dsd_engine_trunk_scan_restore_target_edit_locked(dsd_opts* opts, dsd_state* state, uint32_t session,
+                                                     const char* target_id, uint32_t fields,
+                                                     const dsd_scan_row_edit* edit, dsd_scan_row_edit_result* out);
 
 #ifdef __cplusplus
 }

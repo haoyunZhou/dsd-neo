@@ -14,6 +14,9 @@ Item {
             keySheet.visible = false;
             siteSheet.visible = false;
             networkSheet.visible = false;
+            toneFilterSheet.visible = false;
+            squelchSheet.visible = false;
+            passbandSheet.visible = false;
             historyDetail.visible = false;
             otherSlotMenu.visible = false;
         }
@@ -79,9 +82,9 @@ Item {
     }
 
     // Ticks the recent-calls age labels ("now", "1m", "2h") once a minute:
-    // Util.shortAge reads the clock, which is not a binding dependency, so
-    // without this a row's age freezes at whatever it said when its delegate
-    // was created. Same device as HomeScreen's heardTick.
+    // metrics.decodeNowMs is read live but only announces a change while the
+    // decoder publishes, so without this a row's age freezes at whatever it said
+    // when the decoder last spoke. Same device as HomeScreen's heardTick.
     property int ageTick: 0
 
     Timer {
@@ -750,9 +753,37 @@ Item {
             // next line and never splits a label from its value. Whitespace groups
             // them, as in the design — separator glyphs would strand at a line head.
             Flow {
+                objectName: "signalStrip"
                 width: parent.width
                 visible: metrics.radioInput
                 spacing: 10
+
+                // Where the receiver is tuned: the frequency a plain session sits
+                // on, a scan target's park frequency, or the voice channel while a
+                // trunked target follows a call (issue #575). First, because it
+                // is what the rest of the strip is a reading of. Here and not in
+                // the header, which on a phone would elide the target's name to
+                // make room for it.
+                Row {
+                    objectName: "monitorFreq"
+                    spacing: 5
+                    visible: metrics.centerFreqHz > 0
+
+                    Text {
+                        text: qsTr("FREQ")
+                        font.family: Theme.mono
+                        font.pixelSize: Theme.fontSize(11)
+                        color: Theme.textSubdued
+                    }
+
+                    Text {
+                        objectName: "monitorFreqValue"
+                        text: Util.fmtMhz(metrics.centerFreqHz)
+                        font.family: Theme.mono
+                        font.pixelSize: Theme.fontSize(11)
+                        color: Theme.textSecondary
+                    }
+                }
 
                 Row {
                     spacing: 5
@@ -980,20 +1011,30 @@ Item {
                 }
             }
 
-            // The sub-audible tone the analog FM monitor hears (#522): "CTCSS 100.0 Hz"
-            // once locked, "detecting" while a carrier is being evaluated, "none" when
-            // it carries no supported tone, an em dash with no carrier. Shown only while
-            // the FM monitor runs, which app-control decides for this row and the
-            // terminal alike. Cyan once locked (rxToneStatus 3 is
+            // The sub-audible tone or code the analog FM monitor hears (#522, #523):
+            // "CTCSS 100.0 Hz" or "DCS D023N / D047I" (both spellings of the code's
+            // signal) once locked, "detecting" while a carrier is being evaluated, "none"
+            // when it carries no supported tone or code, an em dash with no carrier.
+            // Shown only while the FM monitor runs, which app-control decides for this
+            // row and the terminal alike. Cyan once locked (rxToneStatus 3 is
             // DSD_APP_RX_TONE_LOCKED), like the other signal readings.
-            Row {
+            //
+            // Flow, not Row: on a narrow phone with larger text the label and a code's
+            // two spellings do not fit on one line, and an unconstrained Row ran the
+            // second spelling off the clipped body with no way to reach it. The value
+            // then moves under the label whole; it wraps between its words only if
+            // even it alone is wider than the body.
+            Flow {
                 // Named so UI_QT_QML_CALL_LISTS can reach it with findChild().
                 objectName: "monitorRxTone"
 
+                width: parent.width
                 spacing: 5
                 visible: metrics.rxToneVisible
 
                 Text {
+                    objectName: "monitorRxToneLabel"
+
                     text: qsTr("RECEIVED TONE")
                     font.family: Theme.mono
                     font.pixelSize: Theme.fontSize(11)
@@ -1003,25 +1044,39 @@ Item {
                 Text {
                     objectName: "monitorRxToneValue"
 
+                    width: Math.min(implicitWidth, parent.width)
                     text: metrics.rxToneText
                     textFormat: Text.PlainText
+                    wrapMode: Text.Wrap
                     font.family: Theme.mono
                     font.pixelSize: Theme.fontSize(11)
                     color: metrics.rxToneStatus === 3 ? Theme.cyan : Theme.textSubdued
                 }
             }
 
-            // The configured tone policy, beside the received tone but never fed by
-            // it: its own reading, which says "off" until tone filtering exists (#527).
-            // Reserved and hidden until then.
-            Row {
+            // The CTCSS/DCS receive policy in force (#527), beside the received tone
+            // but never fed by it: "allow 100.0 Hz/D023N", marked "(row; default X)",
+            // naming the configured policy X it shadows, while a scan row's own policy
+            // runs, and while a carrier is heard what the policy does
+            // with it: "passing" in cyan (toneFilterGate 2 is
+            // DSD_ANALOG_TONE_GATE_ALLOWED), "muted: checking tone", "muted: not
+            // allowed" or "muted: no tone" in magenta. Shown while a policy is in force
+            // where detection runs, which app-control decides for this row and the
+            // terminal alike, and with no policy too wherever detection runs, reading
+            // "off", so its Edit button can open the live editor. A Flow for the received
+            // row's reason: a long list, its verdict and the button move under the label
+            // on a narrow phone rather than run off it.
+            Flow {
                 // Named so UI_QT_QML_CALL_LISTS can reach it with findChild().
                 objectName: "monitorToneFilter"
 
+                width: parent.width
                 spacing: 5
-                visible: false
+                visible: metrics.toneFilterVisible || metrics.toneFilterEditable
 
                 Text {
+                    objectName: "monitorToneFilterLabel"
+
                     text: qsTr("TONE FILTER")
                     font.family: Theme.mono
                     font.pixelSize: Theme.fontSize(11)
@@ -1031,11 +1086,131 @@ Item {
                 Text {
                     objectName: "monitorToneFilterValue"
 
+                    width: Math.min(implicitWidth, parent.width)
                     text: metrics.rxToneConfiguredText
                     textFormat: Text.PlainText
+                    wrapMode: Text.Wrap
                     font.family: Theme.mono
                     font.pixelSize: Theme.fontSize(11)
                     color: Theme.textSubdued
+                }
+
+                Text {
+                    objectName: "monitorToneFilterStatus"
+
+                    width: Math.min(implicitWidth, parent.width)
+                    visible: text.length > 0
+                    text: metrics.toneFilterStatusText
+                    textFormat: Text.PlainText
+                    wrapMode: Text.Wrap
+                    font.family: Theme.mono
+                    font.pixelSize: Theme.fontSize(11)
+                    color: metrics.toneFilterGate === 2 ? Theme.cyan : Theme.magenta
+                }
+
+                // The live editor (#527): it edits the configured policy, which a scan
+                // row with its own keeps in force while on air. Its own size, a full
+                // touch target that grows with the text: the Flow moves it under the
+                // row's text when it does not fit beside it.
+                OutlineButton {
+                    objectName: "monitorToneFilterEdit"
+
+                    text: qsTr("Edit")
+                    accessibleName: qsTr("Edit tone filter")
+                    enabled: decoderHost.running
+                    onClicked: toneFilterSheet.openEditor()
+                }
+            }
+
+            // The squelch on audio input (#628): a level, or the noise squelch it
+            // learns from the input, read as the terminal's SQL field spells it
+            // ("noise +10 dB (learning)", "-50.0 dB", "(off: no band above
+            // voice)"). On a radio input the Radio sheet has the squelch; here,
+            // with no tuner, the monitor is where it is set. A Flow, as the
+            // tone filter row is, so the button moves under a long reading.
+            Flow {
+                // Named so UI_QT_QML_CALL_LISTS can reach it with findChild().
+                objectName: "monitorSquelch"
+
+                width: parent.width
+                spacing: 5
+                visible: metrics.squelchAudioInput === true
+
+                Text {
+                    objectName: "monitorSquelchLabel"
+
+                    text: qsTr("SQUELCH")
+                    font.family: Theme.mono
+                    font.pixelSize: Theme.fontSize(11)
+                    color: Theme.textSubdued
+                }
+
+                Text {
+                    objectName: "monitorSquelchValue"
+
+                    width: Math.min(implicitWidth, parent.width)
+                    text: metrics.squelchReadout
+                    textFormat: Text.PlainText
+                    wrapMode: Text.Wrap
+                    font.family: Theme.mono
+                    font.pixelSize: Theme.fontSize(11)
+                    color: Theme.textSubdued
+                }
+
+                OutlineButton {
+                    objectName: "monitorSquelchEdit"
+
+                    text: qsTr("Edit")
+                    accessibleName: qsTr("Edit squelch")
+                    enabled: decoderHost.running
+                    onClicked: squelchSheet.openEditor()
+                }
+            }
+
+            // The passband on audio input with a rigctl peer (#621): the peer
+            // demodulates the audio, so the analog width is the passband it is
+            // asked for, read as the terminal's Passband field spells it ("NFM
+            // 12.5 kHz (-B)", "NFM peer's own"). On a radio input the Radio
+            // sheet has the width; here, with no tuner, the monitor is where it
+            // is set. A Flow, as the squelch row is, so the button moves under a
+            // long reading.
+            Flow {
+                // Named so UI_QT_QML_CALL_LISTS can reach it with findChild().
+                objectName: "monitorPassband"
+
+                width: parent.width
+                spacing: 5
+                visible: metrics.peerPassband === true
+                    && (metrics.nfmBandwidthOffered === true || metrics.amBandwidthOffered === true)
+
+                Text {
+                    objectName: "monitorPassbandLabel"
+
+                    text: qsTr("PASSBAND")
+                    font.family: Theme.mono
+                    font.pixelSize: Theme.fontSize(11)
+                    color: Theme.textSubdued
+                }
+
+                Text {
+                    objectName: "monitorPassbandValue"
+
+                    width: Math.min(implicitWidth, parent.width)
+                    text: passbandSheet.summary
+                    textFormat: Text.PlainText
+                    wrapMode: Text.Wrap
+                    font.family: Theme.mono
+                    font.pixelSize: Theme.fontSize(11)
+                    color: Theme.textSubdued
+                }
+
+                OutlineButton {
+                    objectName: "monitorPassbandEdit"
+
+                    text: qsTr("Edit")
+                    accessibleName: qsTr("Edit passband")
+                    enabled: decoderHost.running
+                    onClicked: passbandSheet.openEditor()
                 }
             }
 
@@ -1122,32 +1297,50 @@ Item {
                             emergency: model.emergency,
                             enc: model.enc,
                             durationSecs: model.durationSecs,
-                            detail: model.detail
+                            detail: model.detail,
+                            freqHz: model.freqHz,
+                            accessCode: model.accessCode,
+                            accessCodeText: model.accessCodeText
                         })
                         width: ListView.view.width
                         name: model.name
                         metaText: {
-                            if (model.kind === 1)
-                                return model.detail.length > 0 ? model.detail : qsTr("data message");
+                            // A notice keeps its payload first, the pane being too
+                            // narrow for its ids, then names what every row names: the
+                            // access code, and the frequency last (issue #575).
+                            if (model.kind === 1) {
+                                var parts = [model.detail.length > 0 ? model.detail : qsTr("data message")];
+                                if (model.accessCode.length > 0)
+                                    parts.push(model.accessCode);
+                                if (model.freqHz > 0)
+                                    parts.push(Util.fmtMhz(model.freqHz));
+                                return parts.join(" · ");
+                            }
                             // Same meta rules as the history row: a zero talkgroup is
-                            // not printed, the channel closes the line unless it is
-                            // already the name.
+                            // not printed, the access code follows the ids, the channel
+                            // follows the duration unless it is already the name, and
+                            // the frequency closes the line, the first thing a narrow
+                            // phone elides.
                             var meta = [];
                             if (model.tg > 0)
                                 meta.push("TG " + model.tg);
                             if (model.src > 0 || model.srcName)
                                 meta.push("SRC " + Util.sourceText(model.src, model.srcName));
+                            if (model.accessCode.length > 0)
+                                meta.push(model.accessCode);
                             if (model.enc)
                                 meta.push(qsTr("encrypted"));
                             if (model.durationSecs >= 0)
                                 meta.push(Util.fmtDuration(model.durationSecs));
                             if (model.channel.length > 0 && model.channel !== model.name)
                                 meta.push(model.channel);
+                            if (model.freqHz > 0)
+                                meta.push(Util.fmtMhz(model.freqHz));
                             return meta.join(" · ");
                         }
-                        // ageTick forces the minute-by-minute refresh; shortAge reads
-                        // the clock, which is not a binding dependency by itself.
-                        rightText: (screen.ageTick, Util.shortAge(model.when))
+                        // Aged on the decode clock the row's when is stamped on. ageTick
+                        // forces the minute-by-minute refresh while the decoder is quiet.
+                        rightText: (screen.ageTick, Util.shortAge(model.when, metrics.decodeNowMs))
                         enc: model.enc
                         emergency: model.emergency
                     }
@@ -1232,6 +1425,24 @@ Item {
             else if (index === 1)
                 commands.lockoutSlot(menuSlot === 2 ? 1 : 0);
         }
+    }
+
+    // #527: the live tone-filter editor, over the monitor like the key sheet.
+    ToneFilterSheet {
+        id: toneFilterSheet
+        z: 10
+    }
+
+    // #628: the squelch on audio input, over the monitor like the tone-filter editor.
+    SquelchSheet {
+        id: squelchSheet
+        z: 10
+    }
+
+    // #621: the passband a rigctl peer is asked for on audio input, over the monitor like the squelch editor.
+    PassbandSheet {
+        id: passbandSheet
+        z: 10
     }
 
     // WP-D2: the modal consumes input above every monitor control.

@@ -3,11 +3,13 @@
  * Copyright (C) 2026 by arancormonk <180709949+arancormonk@users.noreply.github.com>
  */
 
+#include <dsd-neo/core/analog_tone.h>
 #include <dsd-neo/core/audio.h>
 #include <dsd-neo/core/call_state.h>
 #include <dsd-neo/core/file_io.h>
 #include <dsd-neo/core/init.h>
 #include <dsd-neo/core/opts.h>
+#include <dsd-neo/core/power.h>
 #include <dsd-neo/core/source_alias.h>
 #include <dsd-neo/core/state.h>
 #include <dsd-neo/crypto/dmr_keystream.h>
@@ -16,15 +18,21 @@
 #include <dsd-neo/io/iq_types.h>
 #include <dsd-neo/platform/file_compat.h>
 #include <dsd-neo/platform/posix_compat.h>
+#include <dsd-neo/runtime/analog_channel.h>
+#include <dsd-neo/runtime/analog_tones.h>
 #include <dsd-neo/runtime/bootstrap.h>
 #include <dsd-neo/runtime/call_alert.h>
 #include <dsd-neo/runtime/cli.h>
+#include <dsd-neo/runtime/config.h>
+#include <dsd-neo/runtime/decode_mode.h>
 #include <dsd-neo/runtime/rdio_export.h>
 #include <inttypes.h>
+#include <math.h>
 #include <sndfile.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "dsd-neo/core/frontend_types.h"
 #include "dsd-neo/core/opts_fwd.h"
@@ -160,6 +168,58 @@ test_help_returns_one_shot_and_does_not_exit(void) {
     return 0;
 }
 
+/* Issue #661: a -d or -7 folder that does not fit its buffer is refused, before anything is created, never cut to the
+   name of some other folder. One that fits exactly is taken as given. */
+static int
+test_folder_options_refuse_paths_that_do_not_fit(void) {
+    int rc = 0;
+    static const char opt_d[] = "-d";
+    static const char opt_7[] = "-7";
+    const char* options[] = {opt_d, opt_7};
+    for (size_t i = 0; i < 2U; i++) {
+        dsd_opts* opts = (dsd_opts*)calloc(1, sizeof(dsd_opts));
+        dsd_state* state = (dsd_state*)calloc(1, sizeof(dsd_state));
+        if (!opts || !state) {
+            free(opts);
+            free(state);
+            return 1;
+        }
+        initOpts(opts);
+        initState(state);
+        const size_t limit = i == 0U ? sizeof opts->mbe_out_dir : sizeof opts->wav_out_dir;
+        /* A path one byte too long, under a folder that does not exist, so a cut copy would be created if taken. */
+        char* path = (char*)malloc(limit + 1U);
+        if (!path) {
+            freeState(state);
+            free(opts);
+            free(state);
+            return 1;
+        }
+        DSD_MEMSET(path, 'a', limit);
+        DSD_MEMCPY(path, "dsdneo_no_such_dir/", 19U);
+        path[limit] = '\0';
+
+        char arg0[] = "dsd-neo";
+        char arg1[3];
+        DSD_SNPRINTF(arg1, sizeof arg1, "%s", options[i]);
+        char* argv[] = {arg0, arg1, path, NULL};
+        int argc_effective = 0;
+        int exit_rc = 0;
+        char err[512];
+        const int parsed = parse_args_capture_stderr(3, argv, opts, state, &argc_effective, &exit_rc, err, sizeof err);
+        if (parsed != DSD_PARSE_ERROR || exit_rc != 1 || strstr(err, "folder path is longer") == NULL) {
+            DSD_FPRINTF(stderr, "%s with a %zu-byte path: rc=%d exit=%d\n%s\n", options[i], limit, parsed, exit_rc,
+                        err);
+            rc = 1;
+        }
+        free(path);
+        freeState(state);
+        free(opts);
+        free(state);
+    }
+    return rc;
+}
+
 static int
 test_invalid_option_returns_error_and_does_not_exit(void) {
     dsd_opts* opts = (dsd_opts*)calloc(1, sizeof(dsd_opts));
@@ -279,6 +339,66 @@ test_frontend_terminal_option_sets_terminal_kind(void) {
     freeState(state);
     free(opts);
     free(state);
+    return test_rc;
+}
+
+/* Issue #518: the analog monitor defaults to the AGC (-n 0) and the voice band-pass plus the digital high-pass
+   (-v 0x9); -n takes 1..100 as a fixed gain and anything under 1 as auto. */
+static int
+parse_analog_gain(const char* value, float* out) {
+    dsd_opts* opts = (dsd_opts*)calloc(1, sizeof(dsd_opts));
+    dsd_state* state = (dsd_state*)calloc(1, sizeof(dsd_state));
+    if (!opts || !state) {
+        free(opts);
+        free(state);
+        return -1;
+    }
+    initOpts(opts);
+    initState(state);
+    char arg0[] = "dsd-neo";
+    char arg1[] = "-n";
+    char arg2[32];
+    DSD_SNPRINTF(arg2, sizeof arg2, "%s", value);
+    char* argv[] = {arg0, arg1, arg2, NULL};
+    int argc_effective = 0;
+    int exit_rc = 0;
+    const int rc = dsd_parse_args(3, argv, opts, state, &argc_effective, &exit_rc);
+    *out = opts->audio_gainA;
+    freeState(state);
+    free(opts);
+    free(state);
+    return rc == DSD_PARSE_CONTINUE ? 0 : -1;
+}
+
+static int
+test_analog_monitor_defaults_and_gain(void) {
+    dsd_opts* opts = (dsd_opts*)calloc(1, sizeof(dsd_opts));
+    if (!opts) {
+        return 1;
+    }
+    initOpts(opts);
+    int test_rc = 0;
+    if (!(fabsf(opts->audio_gainA) < 1e-6f) || opts->use_pbf != 1 || opts->use_lpf != 0 || opts->use_hpf != 0
+        || opts->use_hpf_d != 1) {
+        DSD_FPRINTF(stderr, "analog defaults: gain=%.1f pbf=%d lpf=%d hpf=%d hpfd=%d, want auto and -v 0x9\n",
+                    (double)opts->audio_gainA, opts->use_pbf, opts->use_lpf, opts->use_hpf, opts->use_hpf_d);
+        test_rc = 1;
+    }
+    free(opts);
+
+    const struct {
+        const char* value;
+        float want;
+    } cases[] = {{"0", 0.0f},     {"0.5", 0.0f}, {"-4", 0.0f},   {"1", 1.0f},
+                 {"37.5", 37.5f}, {"50", 50.0f}, {"150", 100.0f}};
+
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        float got = -1.0f;
+        if (parse_analog_gain(cases[i].value, &got) != 0 || !(fabsf(got - cases[i].want) < 1e-6f)) {
+            DSD_FPRINTF(stderr, "-n %s: gain %.2f, want %.2f\n", cases[i].value, (double)got, (double)cases[i].want);
+            test_rc = 1;
+        }
+    }
     return test_rc;
 }
 
@@ -663,8 +783,9 @@ test_H_loads_aes256_key_for_both_slots(void) {
         return 1;
     }
 
-    if (opts->dmr_mute_encL != 0 || opts->dmr_mute_encR != 0) {
-        DSD_FPRINTF(stderr, "expected -H to unmute encrypted DMR audio, got L/R=%d/%d\n", opts->dmr_mute_encL,
+    // A key load leaves the DMR encrypted-audio mute as the user set it (issue #655).
+    if (opts->dmr_mute_encL != 1 || opts->dmr_mute_encR != 1) {
+        DSD_FPRINTF(stderr, "expected -H to leave encrypted DMR audio muted, got L/R=%d/%d\n", opts->dmr_mute_encL,
                     opts->dmr_mute_encR);
         freeState(state);
         free(opts);
@@ -730,8 +851,8 @@ test_H_zero_key_arms_dmr_decryption(void) {
         return 1;
     }
 
-    if (opts->dmr_mute_encL != 0 || opts->dmr_mute_encR != 0) {
-        DSD_FPRINTF(stderr, "expected zero -H key to arm DMR decryption, got L/R=%d/%d\n", opts->dmr_mute_encL,
+    if (opts->dmr_mute_encL != 1 || opts->dmr_mute_encR != 1) {
+        DSD_FPRINTF(stderr, "expected zero -H key to leave the DMR mute alone, got L/R=%d/%d\n", opts->dmr_mute_encL,
                     opts->dmr_mute_encR);
         freeState(state);
         free(opts);
@@ -846,8 +967,8 @@ test_b_loads_basic_privacy_key_and_unmutes_dmr(void) {
         return 1;
     }
 
-    if (state->K != 42ULL || opts->dmr_mute_encL != 0 || opts->dmr_mute_encR != 0) {
-        DSD_FPRINTF(stderr, "expected -b 42 to set K=42 and unmute DMR, got K=%llu L/R=%d/%d\n", state->K,
+    if (state->K != 42ULL || opts->dmr_mute_encL != 1 || opts->dmr_mute_encR != 1) {
+        DSD_FPRINTF(stderr, "expected -b 42 to set K=42 and leave the DMR mute, got K=%llu L/R=%d/%d\n", state->K,
                     opts->dmr_mute_encL, opts->dmr_mute_encR);
         freeState(state);
         free(opts);
@@ -892,8 +1013,8 @@ test_b_zero_key_arms_dmr_decryption(void) {
         return 1;
     }
 
-    if (state->K != 0ULL || opts->dmr_mute_encL != 0 || opts->dmr_mute_encR != 0) {
-        DSD_FPRINTF(stderr, "expected -b 0 to set K=0 and arm DMR decryption, got K=%llu L/R=%d/%d\n", state->K,
+    if (state->K != 0ULL || opts->dmr_mute_encL != 1 || opts->dmr_mute_encR != 1) {
+        DSD_FPRINTF(stderr, "expected -b 0 to set K=0 and leave the DMR mute, got K=%llu L/R=%d/%d\n", state->K,
                     opts->dmr_mute_encL, opts->dmr_mute_encR);
         freeState(state);
         free(opts);
@@ -936,8 +1057,8 @@ test_b_accepts_basic_privacy_table_max(void) {
         return 1;
     }
 
-    if (state->K != 255ULL || opts->dmr_mute_encL != 0 || opts->dmr_mute_encR != 0) {
-        DSD_FPRINTF(stderr, "expected -b 255 to set K=255 and unmute DMR, got K=%llu L/R=%d/%d\n", state->K,
+    if (state->K != 255ULL || opts->dmr_mute_encL != 1 || opts->dmr_mute_encR != 1) {
+        DSD_FPRINTF(stderr, "expected -b 255 to set K=255 and leave the DMR mute, got K=%llu L/R=%d/%d\n", state->K,
                     opts->dmr_mute_encL, opts->dmr_mute_encR);
         freeState(state);
         free(opts);
@@ -2501,6 +2622,73 @@ test_bootstrap_inherited_trunk_scan_preserves_ui_only_short_options(void) {
     if (opts->use_pbf != 1 || opts->use_lpf != 1 || opts->use_hpf != 0 || opts->use_hpf_d != 0) {
         DSD_FPRINTF(stderr, "expected -v 3 to apply PBF/LPF only, got pbf=%d lpf=%d hpf=%d hpfd=%d\n", opts->use_pbf,
                     opts->use_lpf, opts->use_hpf, opts->use_hpf_d);
+        test_rc = 1;
+    }
+
+    (void)remove(cfg_path);
+    freeState(state);
+    free(opts);
+    free(state);
+    return test_rc;
+}
+
+/* An API token is any text: one that reads "--iq-replay" is not an input override, so the trunk scan the INI enables
+   stays on. */
+static int
+test_bootstrap_inherited_trunk_scan_ignores_api_token_text(void) {
+    dsd_opts* opts = (dsd_opts*)calloc(1, sizeof(dsd_opts));
+    dsd_state* state = (dsd_state*)calloc(1, sizeof(dsd_state));
+    if (!opts || !state) {
+        free(opts);
+        free(state);
+        DSD_FPRINTF(stderr, "out of memory\n");
+        return 1;
+    }
+
+    initOpts(opts);
+    initState(state);
+
+    (void)dsd_unsetenv("DSD_NEO_CONFIG");
+    (void)dsd_setenv("DSD_NEO_NO_BOOTSTRAP", "1", 1);
+
+    static const char* ini = "[trunk_scan]\n"
+                             "enabled = true\n"
+                             "targets_csv = \"targets.csv\"\n"
+                             "idle_dwell_ms = 500\n";
+
+    char cfg_path[1024];
+    if (test_create_temp_ini_with_contents(ini, cfg_path, sizeof cfg_path) != 0) {
+        DSD_FPRINTF(stderr, "failed to create temp trunk scan ini\n");
+        freeState(state);
+        free(opts);
+        free(state);
+        return 1;
+    }
+
+    char arg0[] = "dsd-neo";
+    char arg1[] = "--config";
+    char arg2[1024];
+    char arg3[] = "--api-token";
+    char arg4[] = "--iq-replay";
+    DSD_SNPRINTF(arg2, sizeof arg2, "%s", cfg_path);
+    char* argv[] = {arg0, arg1, arg2, arg3, arg4, NULL};
+
+    int argc_effective = 0;
+    int exit_rc = -1;
+    int rc = dsd_runtime_bootstrap(5, argv, opts, state, &argc_effective, &exit_rc);
+
+    int test_rc = 0;
+    if (rc != DSD_BOOTSTRAP_CONTINUE || exit_rc != 0) {
+        DSD_FPRINTF(stderr, "expected a token option to continue, got rc=%d exit_rc=%d\n", rc, exit_rc);
+        test_rc = 1;
+    }
+    if (opts->trunk_scan_enabled != 1) {
+        DSD_FPRINTF(stderr, "expected inherited trunk scan to stay enabled past a token, got %d\n",
+                    opts->trunk_scan_enabled);
+        test_rc = 1;
+    }
+    if (strcmp(opts->api_token, "--iq-replay") != 0) {
+        DSD_FPRINTF(stderr, "expected the token text to be kept\n");
         test_rc = 1;
     }
 
@@ -4569,6 +4757,276 @@ test_lrrp_extra_port_missing_value_returns_error(void) {
     return test_missing_required_long_option_value_returns_error("--lrrp-extra-port");
 }
 
+/* The control API options: parse argv into fresh opts and report what landed there. */
+typedef struct {
+    int rc;
+    int exit_rc;
+    int port;
+    char bind[64];
+    char token[256];
+} api_parse_result;
+
+static api_parse_result
+api_parse(int argc, char** argv) {
+    api_parse_result r;
+    DSD_MEMSET(&r, 0, sizeof r);
+    r.rc = -1;
+    dsd_opts* opts = (dsd_opts*)calloc(1, sizeof(dsd_opts));
+    dsd_state* state = (dsd_state*)calloc(1, sizeof(dsd_state));
+    if (!opts || !state) {
+        free(opts);
+        free(state);
+        return r;
+    }
+    initOpts(opts);
+    initState(state);
+    int argc_effective = 0;
+    r.exit_rc = -1;
+    r.rc = dsd_parse_args(argc, argv, opts, state, &argc_effective, &r.exit_rc);
+    r.port = opts->api_port;
+    DSD_SNPRINTF(r.bind, sizeof r.bind, "%s", opts->api_bindaddr);
+    DSD_SNPRINTF(r.token, sizeof r.token, "%s", opts->api_token);
+    close_parse_outputs(opts);
+    freeState(state);
+    free(opts);
+    free(state);
+    return r;
+}
+
+static void
+api_env_clear(void) {
+    (void)dsd_unsetenv("DSD_NEO_API_PORT");
+    (void)dsd_unsetenv("DSD_NEO_API_BIND");
+    (void)dsd_unsetenv("DSD_NEO_API_TOKEN");
+    (void)dsd_unsetenv("DSD_NEO_API_TOKEN_FILE");
+}
+
+/* Write @p contents to a fresh temp file; returns 0 with its path in @p path. */
+static int
+api_token_file(char* path, size_t cap, const char* contents, size_t len) {
+    const int fd = dsd_test_mkstemp(path, cap, "dsd_api_token");
+    if (fd < 0) {
+        return -1;
+    }
+    FILE* fp = dsd_test_fdopen(fd, "wb");
+    if (!fp) {
+        return -1;
+    }
+    const int ok = fwrite(contents, 1U, len, fp) == len;
+    return (fclose(fp) == 0 && ok) ? 0 : -1;
+}
+
+static int
+api_expect(const char* what, const api_parse_result* r, int rc, int port, const char* bind, const char* token) {
+    if (r->rc != rc || (rc == DSD_PARSE_ERROR && r->exit_rc != 1)
+        || (rc == DSD_PARSE_CONTINUE
+            && (r->port != port || strcmp(r->bind, bind) != 0 || strcmp(r->token, token) != 0))) {
+        DSD_FPRINTF(stderr, "%s: rc=%d exit_rc=%d port=%d bind='%s' token-set=%d\n", what, r->rc, r->exit_rc, r->port,
+                    r->bind, r->token[0] != '\0');
+        return 1;
+    }
+    return 0;
+}
+
+static int
+test_api_options(void) {
+    int test_rc = 0;
+    api_env_clear();
+    char a0[] = "dsd-neo";
+    char api[] = "--api";
+    char port9911[] = "9911";
+    char port0[] = "0";
+    char bad_port[] = "65536";
+    char bind_opt[] = "--api-bind";
+    char any[] = "0.0.0.0";
+    char host[] = "localhost";
+    char token_opt[] = "--api-token";
+    char token_eq[] = "--api-token=s3cret";
+    char file_opt[] = "--api-token-file";
+    char missing[] = "/nonexistent/dsd-neo-api-token";
+
+    {
+        char* argv[] = {a0, api, port9911, NULL};
+        api_parse_result r = api_parse(3, argv);
+        test_rc |= api_expect("--api 9911", &r, DSD_PARSE_CONTINUE, 9911, "", "");
+    }
+    {
+        char eq[] = "--api=9911";
+        char* argv[] = {a0, eq, NULL};
+        api_parse_result r = api_parse(2, argv);
+        test_rc |= api_expect("--api=9911", &r, DSD_PARSE_CONTINUE, 9911, "", "");
+    }
+    {
+        char* argv[] = {a0, api, bad_port, NULL};
+        api_parse_result r = api_parse(3, argv);
+        test_rc |= api_expect("--api 65536", &r, DSD_PARSE_ERROR, 0, "", "");
+    }
+    /* The environment fills in only what the CLI left out, and an explicit --api 0 wins over it. */
+    (void)dsd_setenv("DSD_NEO_API_PORT", "7000", 1);
+    {
+        char* argv[] = {a0, NULL};
+        api_parse_result r = api_parse(1, argv);
+        test_rc |= api_expect("DSD_NEO_API_PORT", &r, DSD_PARSE_CONTINUE, 7000, "", "");
+    }
+    {
+        char* argv[] = {a0, api, port0, NULL};
+        api_parse_result r = api_parse(3, argv);
+        test_rc |= api_expect("--api 0 over DSD_NEO_API_PORT", &r, DSD_PARSE_CONTINUE, 0, "", "");
+    }
+    (void)dsd_setenv("DSD_NEO_API_PORT", "70000", 1);
+    {
+        char* argv[] = {a0, NULL};
+        api_parse_result r = api_parse(1, argv);
+        test_rc |= api_expect("invalid DSD_NEO_API_PORT", &r, DSD_PARSE_ERROR, 0, "", "");
+    }
+    api_env_clear();
+
+    /* Off loopback, a token is required. */
+    {
+        char* argv[] = {a0, api, port9911, bind_opt, any, NULL};
+        api_parse_result r = api_parse(5, argv);
+        test_rc |= api_expect("non-loopback bind without token", &r, DSD_PARSE_ERROR, 0, "", "");
+    }
+    {
+        char* argv[] = {a0, api, port9911, bind_opt, any, token_eq, NULL};
+        api_parse_result r = api_parse(6, argv);
+        test_rc |= api_expect("non-loopback bind with token", &r, DSD_PARSE_CONTINUE, 9911, "0.0.0.0", "s3cret");
+    }
+    {
+        char* argv[] = {a0, api, port9911, bind_opt, host, NULL};
+        api_parse_result r = api_parse(5, argv);
+        test_rc |= api_expect("non-numeric bind", &r, DSD_PARSE_ERROR, 0, "", "");
+    }
+    (void)dsd_setenv("DSD_NEO_API_BIND", "10.0.0.1", 1);
+    {
+        char* argv[] = {a0, api, port9911, NULL};
+        api_parse_result r = api_parse(3, argv);
+        test_rc |= api_expect("DSD_NEO_API_BIND without token", &r, DSD_PARSE_ERROR, 0, "", "");
+    }
+    (void)dsd_setenv("DSD_NEO_API_TOKEN", "envtoken", 1);
+    {
+        char* argv[] = {a0, api, port9911, NULL};
+        api_parse_result r = api_parse(3, argv);
+        test_rc |=
+            api_expect("DSD_NEO_API_BIND with DSD_NEO_API_TOKEN", &r, DSD_PARSE_CONTINUE, 9911, "10.0.0.1", "envtoken");
+    }
+    {
+        char* argv[] = {a0, api, port9911, token_opt, port9911, NULL};
+        api_parse_result r = api_parse(5, argv);
+        test_rc |= api_expect("--api-token over DSD_NEO_API_TOKEN", &r, DSD_PARSE_CONTINUE, 9911, "10.0.0.1", "9911");
+    }
+    api_env_clear();
+    /* A token may start with '-': it is the option's value, never an option of its own (here, not -h for help). */
+    {
+        char dash_token[] = "-h";
+        char* argv[] = {a0, api, port9911, token_opt, dash_token, NULL};
+        api_parse_result r = api_parse(5, argv);
+        test_rc |= api_expect("--api-token -h", &r, DSD_PARSE_CONTINUE, 9911, "", "-h");
+    }
+    api_env_clear();
+
+    /* A token file that cannot give a token is an error, never a server without one. */
+    {
+        char* argv[] = {a0, api, port9911, file_opt, missing, NULL};
+        api_parse_result r = api_parse(5, argv);
+        test_rc |= api_expect("missing token file", &r, DSD_PARSE_ERROR, 0, "", "");
+    }
+    char path[1024];
+    if (api_token_file(path, sizeof path, "file-token\r\n", 12U) != 0) {
+        DSD_FPRINTF(stderr, "cannot create a token file\n");
+        return 1;
+    }
+    {
+        char* argv[] = {a0, api, port9911, file_opt, path, NULL};
+        api_parse_result r = api_parse(5, argv);
+        test_rc |= api_expect("token file", &r, DSD_PARSE_CONTINUE, 9911, "", "file-token");
+    }
+    (void)remove(path);
+
+    static const struct {
+        const char* what;
+        const char* contents;
+        size_t len;
+    } k_bad_files[] = {
+        {"empty token file", "", 0U},
+        {"whitespace token file", " \n", 2U},
+        {"two-line token file", "a\nb\n", 4U},
+        {"token file with NUL", "ab\0cd", 5U},
+    };
+
+    for (size_t i = 0; i < sizeof k_bad_files / sizeof k_bad_files[0]; i++) {
+        if (api_token_file(path, sizeof path, k_bad_files[i].contents, k_bad_files[i].len) != 0) {
+            return 1;
+        }
+        char* argv[] = {a0, api, port9911, file_opt, path, NULL};
+        api_parse_result r = api_parse(5, argv);
+        test_rc |= api_expect(k_bad_files[i].what, &r, DSD_PARSE_ERROR, 0, "", "");
+        (void)remove(path);
+    }
+    char long_token[300];
+    DSD_MEMSET(long_token, 'x', sizeof long_token);
+    if (api_token_file(path, sizeof path, long_token, 256U) != 0) {
+        return 1;
+    }
+    {
+        char* argv[] = {a0, api, port9911, file_opt, path, NULL};
+        api_parse_result r = api_parse(5, argv);
+        test_rc |= api_expect("256-byte token file", &r, DSD_PARSE_ERROR, 0, "", "");
+    }
+    (void)remove(path);
+    long_token[256] = '\0';
+    {
+        char* argv[] = {a0, api, port9911, token_opt, long_token, NULL};
+        api_parse_result r = api_parse(5, argv);
+        test_rc |= api_expect("256-byte --api-token", &r, DSD_PARSE_ERROR, 0, "", "");
+    }
+
+    /* The bootstrap pre-scan steps over a token too: "--print-config" as a token is not the option. */
+    {
+        dsd_opts* bopts = (dsd_opts*)calloc(1, sizeof(dsd_opts));
+        dsd_state* bstate = (dsd_state*)calloc(1, sizeof(dsd_state));
+        if (!bopts || !bstate) {
+            free(bopts);
+            free(bstate);
+            return 1;
+        }
+        initOpts(bopts);
+        initState(bstate);
+        (void)dsd_unsetenv("DSD_NEO_CONFIG");
+        (void)dsd_setenv("DSD_NEO_NO_BOOTSTRAP", "1", 1);
+        char print_config[] = "--print-config";
+        char* argv[] = {a0, api, port9911, token_opt, print_config, NULL};
+        int argc_effective = 0;
+        int exit_rc = -1;
+        const int brc = dsd_runtime_bootstrap(5, argv, bopts, bstate, &argc_effective, &exit_rc);
+        if (brc != DSD_BOOTSTRAP_CONTINUE || bopts->api_port != 9911
+            || strcmp(bopts->api_token, "--print-config") != 0) {
+            DSD_FPRINTF(stderr, "bootstrap with --api-token --print-config: rc=%d exit_rc=%d port=%d\n", brc, exit_rc,
+                        bopts->api_port);
+            test_rc = 1;
+        }
+        close_parse_outputs(bopts);
+        freeState(bstate);
+        free(bopts);
+        free(bstate);
+    }
+
+    /* The fallbacks are read only when the API is on: a stale token file in the environment does not stop a run. */
+    (void)dsd_setenv("DSD_NEO_API_TOKEN_FILE", missing, 1);
+    {
+        char* argv[] = {a0, NULL};
+        api_parse_result r = api_parse(1, argv);
+        test_rc |= api_expect("DSD_NEO_API_TOKEN_FILE with the API off", &r, DSD_PARSE_CONTINUE, 0, "", "");
+    }
+    {
+        char* argv[] = {a0, api, port9911, NULL};
+        api_parse_result r = api_parse(3, argv);
+        test_rc |= api_expect("DSD_NEO_API_TOKEN_FILE missing", &r, DSD_PARSE_ERROR, 0, "", "");
+    }
+    api_env_clear();
+    return test_rc;
+}
+
 static int
 test_rtl_udp_control_long_option_parse(void) {
     dsd_opts* opts = (dsd_opts*)calloc(1, sizeof(dsd_opts));
@@ -5802,6 +6260,226 @@ test_f_manual_selectors_leave_analog_monitor(void) {
     return test_rc;
 }
 
+/* AM (issue #524): parse @p args (NULL-terminated, program name first) into freshly initialised options, with the
+ * options first put on the AM preset when @p config_am says a loaded config chose it. */
+typedef struct {
+    dsd_opts* opts;
+    dsd_state* state;
+    int rc;
+    int exit_rc;
+    char err[4096];
+} am_cli_run;
+
+static int
+am_cli_parse(const char* const* args, int config_am, am_cli_run* run) {
+    DSD_MEMSET(run, 0, sizeof(*run));
+    run->opts = (dsd_opts*)calloc(1, sizeof(dsd_opts));
+    run->state = (dsd_state*)calloc(1, sizeof(dsd_state));
+    if (!run->opts || !run->state) {
+        free(run->opts);
+        free(run->state);
+        return -1;
+    }
+    initOpts(run->opts);
+    initState(run->state);
+    if (config_am) {
+        (void)dsd_apply_decode_mode_preset(DSDCFG_MODE_AM, DSD_DECODE_PRESET_PROFILE_CONFIG, run->opts, run->state);
+        run->state->config_autosave_enabled = 1;
+    }
+    static char storage[8][96];
+    char* argv[9] = {NULL};
+    int argc = 0;
+    for (; argc < 8 && args[argc] != NULL; argc++) {
+        DSD_SNPRINTF(storage[argc], sizeof storage[argc], "%s", args[argc]);
+        argv[argc] = storage[argc];
+    }
+    int argc_effective = 0;
+    run->exit_rc = -1;
+    run->rc = parse_args_capture_stderr(argc, argv, run->opts, run->state, &argc_effective, &run->exit_rc, run->err,
+                                        sizeof run->err);
+    return 0;
+}
+
+static void
+am_cli_free(am_cli_run* run) {
+    freeState(run->state);
+    free(run->opts);
+    free(run->state);
+}
+
+/* -fM is the AM preset on every IQ radio input: the analog monitor with the AM detector. */
+static int
+test_f_am_preset_on_iq_inputs(void) {
+    static const char* const inputs[] = {"rtl:0:851.375M", "rtltcp:127.0.0.1:1234", "soapy:driver=rtlsdr", "rtl"};
+    int test_rc = 0;
+    for (size_t i = 0; i < sizeof inputs / sizeof inputs[0]; i++) {
+        const char* const args[] = {"dsd-neo", "-fM", "-i", inputs[i], NULL};
+        am_cli_run run;
+        if (am_cli_parse(args, 0, &run) != 0) {
+            return 1;
+        }
+        if (run.rc != DSD_PARSE_CONTINUE || run.opts->analog_only != 1 || run.opts->monitor_input_audio != 1
+            || run.opts->analog_demod != DSD_ANALOG_DEMOD_AM
+            || dsd_infer_decode_mode_preset(run.opts) != DSDCFG_MODE_AM) {
+            DSD_FPRINTF(stderr, "-fM -i %s: rc=%d analog_only=%d kind=%d\n%s\n", inputs[i], run.rc,
+                        run.opts->analog_only, run.opts->analog_demod, run.err);
+            test_rc = 1;
+        }
+        am_cli_free(&run);
+    }
+    return test_rc;
+}
+
+/* PCM inputs arrive already demodulated: -fM on one stops with the reason and the -fA alternative. */
+static int
+test_f_am_refused_on_pcm_input(void) {
+    static const char* const inputs[] = {NULL, "pulse", "tcp:127.0.0.1:7355", "udp:127.0.0.1:7355", "capture.wav", "-"};
+    int test_rc = 0;
+    for (size_t i = 0; i < sizeof inputs / sizeof inputs[0]; i++) {
+        const char* const with_input[] = {"dsd-neo", "-fM", "-i", inputs[i], NULL};
+        const char* const default_input[] = {"dsd-neo", "-fM", NULL};
+        am_cli_run run;
+        if (am_cli_parse(inputs[i] ? with_input : default_input, 0, &run) != 0) {
+            return 1;
+        }
+        if (run.rc != DSD_PARSE_ERROR || run.exit_rc != 1
+            || !strstr(run.err, "AM demodulation needs an IQ radio input; monitor externally demodulated AM audio "
+                                "with -fA")) {
+            DSD_FPRINTF(stderr, "-fM on %s: rc=%d exit_rc=%d\n%s\n", inputs[i] ? inputs[i] : "(default input)", run.rc,
+                        run.exit_rc, run.err);
+            test_rc = 1;
+        }
+        am_cli_free(&run);
+    }
+    return test_rc;
+}
+
+/* The selectors the -f case handles itself leave AM for FM as they leave the analog monitor: the M17 encoder shares
+ * the analog front end and must not run the AM detector. */
+static int
+test_f_manual_selectors_leave_am(void) {
+    static const char* const selectors[] = {"-fp", "-fZ"};
+    int test_rc = 0;
+    for (size_t i = 0; i < sizeof selectors / sizeof selectors[0]; i++) {
+        const char* const args[] = {"dsd-neo", "-fM", selectors[i], "-i", "rtl", NULL};
+        am_cli_run run;
+        if (am_cli_parse(args, 0, &run) != 0) {
+            return 1;
+        }
+        if (run.rc != DSD_PARSE_CONTINUE || run.opts->analog_only != 0
+            || run.opts->analog_demod != DSD_ANALOG_DEMOD_FM) {
+            DSD_FPRINTF(stderr, "-fM %s: rc=%d analog_only=%d kind=%d\n", selectors[i], run.rc, run.opts->analog_only,
+                        run.opts->analog_demod);
+            test_rc = 1;
+        }
+        am_cli_free(&run);
+    }
+    return test_rc;
+}
+
+/* --am-bandwidth-hz takes whole Hz from 5000 to 20000 in both spellings and refuses anything else, never clamping. */
+static int
+test_am_bandwidth_option(void) {
+    static const struct {
+        const char* a;
+        const char* b;
+        int want_rc;
+        int want_hz;
+        const char* want_text;
+    } cases[] = {
+        {"--am-bandwidth-hz", "8000", DSD_PARSE_CONTINUE, 8000, NULL},
+        {"--am-bandwidth-hz=20000", NULL, DSD_PARSE_CONTINUE, 20000, NULL},
+        {"--am-bandwidth-hz", "5000", DSD_PARSE_CONTINUE, 5000, NULL},
+        {"--am-bandwidth-hz", "25000", DSD_PARSE_ERROR, 0,
+         "--am-bandwidth-hz: AM bandwidth 25000 Hz is outside the supported range of 5000 to 20000 Hz"},
+        {"--am-bandwidth-hz=4999", NULL, DSD_PARSE_ERROR, 0,
+         "AM bandwidth 4999 Hz is outside the supported range of 5000 to 20000 Hz"},
+        {"--am-bandwidth-hz", "6k", DSD_PARSE_ERROR, 0,
+         "--am-bandwidth-hz: AM bandwidth must be a whole number of Hz from 5000 to 20000"},
+        {"--am-bandwidth-hz", NULL, DSD_PARSE_ERROR, 0, "--am-bandwidth-hz requires a width in Hz (5000 to 20000)"},
+    };
+
+    int test_rc = 0;
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        const char* const two[] = {"dsd-neo", "-fM", "-i", "rtl", cases[i].a, cases[i].b, NULL};
+        am_cli_run run;
+        if (am_cli_parse(two, 0, &run) != 0) {
+            return 1;
+        }
+        const int width_ok =
+            cases[i].want_rc != DSD_PARSE_CONTINUE || run.opts->analog_am_bandwidth_hz == cases[i].want_hz;
+        const int text_ok = !cases[i].want_text || strstr(run.err, cases[i].want_text) != NULL;
+        if (run.rc != cases[i].want_rc || !width_ok || !text_ok
+            || (cases[i].want_rc == DSD_PARSE_ERROR && run.exit_rc != 1)) {
+            DSD_FPRINTF(stderr, "%s %s: rc=%d width=%d exit_rc=%d\n%s\n", cases[i].a, cases[i].b ? cases[i].b : "",
+                        run.rc, run.opts->analog_am_bandwidth_hz, run.exit_rc, run.err);
+            test_rc = 1;
+        }
+        am_cli_free(&run);
+    }
+    /* On a PCM input the width parses but has nothing to act on: said once, not an error. */
+    const char* const pcm[] = {"dsd-neo", "-fA", "--am-bandwidth-hz", "8000", "-i", "pulse", NULL};
+    am_cli_run run;
+    if (am_cli_parse(pcm, 0, &run) != 0) {
+        return 1;
+    }
+    if (run.rc != DSD_PARSE_CONTINUE || run.opts->analog_am_bandwidth_hz != 8000
+        || !strstr(run.err, "--am-bandwidth-hz has no effect on PCM input")) {
+        DSD_FPRINTF(stderr, "--am-bandwidth-hz on PCM input: rc=%d\n%s\n", run.rc, run.err);
+        test_rc = 1;
+    }
+    am_cli_free(&run);
+    /* Issue #526: with a rigctl peer the AM width is the passband an am scan row without a width of its own asks the
+       peer for, so it is said as that, not as having no effect. */
+    const char* const rigctl[] = {"dsd-neo", "-fA", "--am-bandwidth-hz", "8000", "-i", "pulse", "-U", "4532", NULL};
+    if (am_cli_parse(rigctl, 0, &run) != 0) {
+        return 1;
+    }
+    if (run.rc != DSD_PARSE_CONTINUE || run.opts->analog_am_bandwidth_hz != 8000 || run.opts->use_rigctl != 1
+        || strstr(run.err, "has no effect") || !strstr(run.err, "it is the AM passband the peer is asked for")) {
+        DSD_FPRINTF(stderr, "--am-bandwidth-hz on PCM input with rigctl: rc=%d\n%s\n", run.rc, run.err);
+        test_rc = 1;
+    }
+    am_cli_free(&run);
+    return test_rc;
+}
+
+/* [mode] decode = am from a loaded config on a PCM input: the same reason, logged, and the session monitors with the
+ * Analog preset instead. Autosave is off for the session, so the saved decode = am stays as it was, and a toast says
+ * so. On an IQ input the config's AM stands. */
+static int
+test_config_am_on_pcm_input_falls_back(void) {
+    int test_rc = 0;
+    const char* const pcm[] = {"dsd-neo", "-i", "pulse", NULL};
+    am_cli_run run;
+    if (am_cli_parse(pcm, 1, &run) != 0) {
+        return 1;
+    }
+    /* Autosave off stops every other change the session makes from being saved, so the frontends are told too. */
+    if (run.rc != DSD_PARSE_CONTINUE || dsd_infer_decode_mode_preset(run.opts) != DSDCFG_MODE_ANALOG
+        || run.opts->analog_demod != DSD_ANALOG_DEMOD_FM || run.state->config_autosave_enabled != 0
+        || !strstr(run.err, "AM demodulation needs an IQ radio input")
+        || !strstr(run.state->ui_msg, "Autosave is off this session to keep decode = am")
+        || run.state->ui_msg_expire <= time(NULL)) {
+        DSD_FPRINTF(stderr, "config AM on PCM: rc=%d mode=%d autosave=%d\n%s\n", run.rc,
+                    (int)dsd_infer_decode_mode_preset(run.opts), run.state->config_autosave_enabled, run.err);
+        test_rc = 1;
+    }
+    am_cli_free(&run);
+    const char* const iq[] = {"dsd-neo", "-i", "rtl:0:118.1M", NULL};
+    if (am_cli_parse(iq, 1, &run) != 0) {
+        return 1;
+    }
+    if (run.rc != DSD_PARSE_CONTINUE || dsd_infer_decode_mode_preset(run.opts) != DSDCFG_MODE_AM
+        || run.state->config_autosave_enabled != 1 || strstr(run.err, "AM demodulation needs")) {
+        DSD_FPRINTF(stderr, "config AM on RTL: rc=%d mode=%d\n%s\n", run.rc,
+                    (int)dsd_infer_decode_mode_preset(run.opts), run.err);
+        test_rc = 1;
+    }
+    am_cli_free(&run);
+    return test_rc;
+}
+
 static int
 test_f_fr_restores_single_slot_mono_preset(void) {
     static const struct {
@@ -6374,6 +7052,46 @@ test_trunk_scan_long_options_parse(void) {
         DSD_FPRINTF(stderr, "trunk scan long option parse mismatch rc=%d enabled=%d targets=%s dwell=%d hold=%d\n", rc,
                     opts->trunk_scan_enabled, opts->trunk_scan_targets_csv, opts->trunk_scan_idle_dwell_ms,
                     opts->trunk_scan_activity_hold_ms);
+        test_rc = 1;
+    }
+
+    freeState(state);
+    free(opts);
+    free(state);
+    return test_rc;
+}
+
+/* A token that reads like a one-shot option is still a token: the run is not taken for --print-config, so an explicit
+   --trunk-scan still disowns the channel map and P25 band plan a config file would otherwise hand down. */
+static int
+test_trunk_scan_api_token_is_not_a_one_shot(void) {
+    dsd_opts* opts = (dsd_opts*)calloc(1, sizeof(dsd_opts));
+    dsd_state* state = (dsd_state*)calloc(1, sizeof(dsd_state));
+    if (!opts || !state) {
+        free(opts);
+        free(state);
+        return 1;
+    }
+    initOpts(opts);
+    initState(state);
+    DSD_SNPRINTF(opts->chan_in_file, sizeof opts->chan_in_file, "%s", "inherited_channels.csv");
+    DSD_SNPRINTF(opts->p25_bandplan_in_file, sizeof opts->p25_bandplan_in_file, "%s", "inherited_bandplan.csv");
+
+    char arg0[] = "dsd-neo";
+    char arg1[] = "--trunk-scan";
+    char arg2[] = "targets.csv";
+    char arg3[] = "--api-token";
+    char arg4[] = "--print-config";
+    char* argv[] = {arg0, arg1, arg2, arg3, arg4, NULL};
+    int argc_effective = 0;
+    int exit_rc = -1;
+    const int rc = dsd_parse_args(5, argv, opts, state, &argc_effective, &exit_rc);
+
+    int test_rc = 0;
+    if (rc != DSD_PARSE_CONTINUE || opts->trunk_scan_enabled != 1 || opts->chan_in_file[0] != '\0'
+        || opts->p25_bandplan_in_file[0] != '\0' || strcmp(opts->api_token, "--print-config") != 0) {
+        DSD_FPRINTF(stderr, "token reading as --print-config: rc=%d trunk_scan=%d chan=%s bandplan=%s\n", rc,
+                    opts->trunk_scan_enabled, opts->chan_in_file, opts->p25_bandplan_in_file);
         test_rc = 1;
     }
 
@@ -7602,6 +8320,263 @@ test_bootstrap_inherited_trunk_scan_preserves_max_visit_override(void) {
     return test_rc;
 }
 
+/* Issue #527: one tone-switch parse. @p args are the arguments after the program name (at most 8); the parse's rc,
+ * exit code and stderr come back, and the caller frees @p opts / @p state with free_tone_parse(). A non-NULL
+ * @p config_map is a channel map a loaded config names ([trunking] chan_csv), which the engine imports, not the
+ * parse. */
+typedef struct {
+    dsd_opts* opts;
+    dsd_state* state;
+    int rc;
+    int exit_rc;
+    char output[4096];
+} tone_parse;
+
+static int
+run_tone_parse_with_config_map(tone_parse* out, const char* const* args, int count, const char* config_map) {
+    DSD_MEMSET(out, 0, sizeof(*out));
+    out->opts = (dsd_opts*)calloc(1, sizeof(dsd_opts));
+    out->state = (dsd_state*)calloc(1, sizeof(dsd_state));
+    if (!out->opts || !out->state || count > 8) {
+        return -1;
+    }
+    initOpts(out->opts);
+    initState(out->state);
+    if (config_map) {
+        DSD_SNPRINTF(out->opts->chan_in_file, sizeof out->opts->chan_in_file, "%s", config_map);
+    }
+    char storage[9][256];
+    char* argv[10] = {0};
+    DSD_SNPRINTF(storage[0], sizeof storage[0], "%s", "dsd-neo");
+    argv[0] = storage[0];
+    for (int i = 0; i < count; i++) {
+        DSD_SNPRINTF(storage[i + 1], sizeof storage[i + 1], "%s", args[i]);
+        argv[i + 1] = storage[i + 1];
+    }
+    int argc_effective = 0;
+    out->rc = parse_args_capture_stderr(count + 1, argv, out->opts, out->state, &argc_effective, &out->exit_rc,
+                                        out->output, sizeof out->output);
+    return 0;
+}
+
+static int
+run_tone_parse(tone_parse* out, const char* const* args, int count) {
+    return run_tone_parse_with_config_map(out, args, count, NULL);
+}
+
+static void
+free_tone_parse(tone_parse* p) {
+    if (p->state) {
+        freeState(p->state);
+    }
+    free(p->opts);
+    free(p->state);
+}
+
+/* Issue #527: --tone-allow and --tone-block take a '/'-separated list in both long-option spellings, --no-tone-filter
+ * none; a list is stored as written (a bare code as N), and the switches share one setting, so a second one is an
+ * error, as on a scan row. */
+static int
+test_tone_filter_options_parse(void) {
+    static const struct {
+        const char* args[4];
+        int count;
+        int mode;
+        const char* list;
+    } cases[] = {
+        {{"--tone-allow", "D023/100/67.0", "-fA"}, 3, DSD_TONE_FILTER_ALLOW, "67.0/100.0/D023N"},
+        {{"--tone-block=d023i", "-fA"}, 2, DSD_TONE_FILTER_BLOCK, "D023I"},
+        {{"-fA", "--tone-allow=254.1"}, 2, DSD_TONE_FILTER_ALLOW, "254.1"},
+        {{"--no-tone-filter", "-fA"}, 2, DSD_TONE_FILTER_OFF, ""},
+    };
+
+    int test_rc = 0;
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        tone_parse p;
+        if (run_tone_parse(&p, cases[i].args, cases[i].count) != 0) {
+            free_tone_parse(&p);
+            return 1;
+        }
+        char list[DSD_TONE_LIST_TEXT_MAX + 1] = "";
+        (void)dsd_tone_set_format(&p.opts->analog_tone_set, list, sizeof list);
+        if (p.rc != DSD_PARSE_CONTINUE || p.exit_rc != 0 || p.opts->analog_tone_filter != cases[i].mode
+            || strcmp(list, cases[i].list) != 0 || p.opts->analog_only != 1 || strstr(p.output, "tone filter")) {
+            DSD_FPRINTF(stderr, "tone case %zu: rc=%d exit_rc=%d mode=%d list=\"%s\" stderr=\"%s\"\n", i, p.rc,
+                        p.exit_rc, p.opts->analog_tone_filter, list, p.output);
+            test_rc = 1;
+        }
+        free_tone_parse(&p);
+    }
+    return test_rc;
+}
+
+/* A refused list is an error naming the switch and the entry by number, never the text given; the policy stays off. */
+static int
+test_tone_filter_options_refused(void) {
+    static const struct {
+        const char* args[3];
+        int count;
+        const char* why;
+    } cases[] = {
+        {{"--tone-allow", "100.0,67.0"}, 2, "--tone-allow: use / between entries, not commas"},
+        {{"--tone-block", "67.0/161.0"}, 2, "--tone-block: entry 2 is not a standard CTCSS tone or DCS code"},
+        {{"--tone-allow=D023N/D047I"}, 1, "--tone-allow: entry 2 is the same DCS signal as entry 1 (D023N)"},
+        {{"--tone-allow="}, 1, "--tone-allow: the list is empty"},
+        {{"--tone-block"}, 1, "--tone-block requires a '/'-separated list"},
+        {{"--tone-allow", "100.0", "--tone-block=67.0"}, 3, "may be given only once"},
+        {{"--no-tone-filter", "--no-tone-filter"},
+         2,
+         "--no-tone-filter: --tone-allow, --tone-block and --no-tone-filter"},
+    };
+
+    int test_rc = 0;
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        tone_parse p;
+        if (run_tone_parse(&p, cases[i].args, cases[i].count) != 0) {
+            free_tone_parse(&p);
+            return 1;
+        }
+        if (p.rc != DSD_PARSE_ERROR || p.exit_rc != 1 || !strstr(p.output, cases[i].why) || strstr(p.output, "161.0")
+            || strstr(p.output, "D047I")) {
+            DSD_FPRINTF(stderr, "tone refusal %zu: rc=%d exit_rc=%d stderr=\"%s\", want \"%s\"\n", i, p.rc, p.exit_rc,
+                        p.output, cases[i].why);
+            test_rc = 1;
+        }
+        if (i < 5 && p.opts->analog_tone_filter != DSD_TONE_FILTER_OFF) {
+            DSD_FPRINTF(stderr, "tone refusal %zu left the policy on\n", i);
+            test_rc = 1;
+        }
+        free_tone_parse(&p);
+    }
+    return test_rc;
+}
+
+/* The policy judges only the analog FM monitor and nfm scan rows: set for a session with neither (a digital mode, the
+ * AM monitor), it parses and says once that it has no effect. */
+static int
+test_tone_filter_warns_outside_the_fm_monitor(void) {
+    static const struct {
+        const char* args[5];
+        int count;
+        int warn;
+    } cases[] = {
+        {{"--tone-allow", "100.0"}, 2, 1},
+        {{"--tone-block", "D023N", "-fs"}, 3, 1},
+        {{"--tone-allow", "100.0", "-fM", "-i", "rtl"}, 5, 1},
+        {{"--tone-allow", "100.0", "-fA"}, 3, 0},
+        {{"--no-tone-filter"}, 1, 0},
+    };
+
+    static const char* const expected =
+        "the tone filter (--tone-allow/--tone-block, [analog] tone_filter) has no effect";
+    int test_rc = 0;
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        tone_parse p;
+        if (run_tone_parse(&p, cases[i].args, cases[i].count) != 0) {
+            free_tone_parse(&p);
+            return 1;
+        }
+        const char* first = strstr(p.output, expected);
+        const int warned = first != NULL ? 1 : 0;
+        if (p.rc != DSD_PARSE_CONTINUE || warned != cases[i].warn || (first && strstr(first + 1, expected))) {
+            DSD_FPRINTF(stderr, "tone warning %zu: rc=%d warned=%d want %d stderr=\"%s\"\n", i, p.rc, warned,
+                        cases[i].warn, p.output);
+            test_rc = 1;
+        }
+        free_tone_parse(&p);
+    }
+    return test_rc;
+}
+
+/* A -Y scan runs the policy on its nfm rows as well as under the FM monitor, so the warning weighs the list imported
+ * with the command line: an untyped list under the AM monitor, or a typed one with no nfm row under a digital mode,
+ * cannot use it; an nfm row can, and so can the FM monitor on a row that runs it -- every row of an untyped list, a row
+ * without a mode of its own on a typed one -- but not on a typed list whose rows all declare a digital mode or am,
+ * which each run their own (an am row the AM monitor, which hears no tone). A -Y scan with no list to come stays on the
+ * configured decode mode and is weighed by it, as on a session without a scan. A list the engine still imports (a
+ * config file's, or a -C map the command line read no row from) and --trunk-scan targets are weighed when the engine
+ * loads them, so parsing says nothing for them. */
+static int
+test_tone_filter_warns_on_scan_lists(void) {
+    char untyped[256];
+    char digital[256];
+    char with_nfm[256];
+    char with_blank[256];
+    char with_am[256];
+    char header_only[256];
+
+    const struct {
+        char* path;
+        const char* contents;
+    } lists[] = {
+        {untyped, "channel,frequency_hz\n1,154430000\n2,155475000\n"},
+        {digital, "channel,frequency_hz,mode\n1,461000000,dmr\n2,851012500,p25\n"},
+        {with_nfm, "channel,frequency_hz,mode\n1,461000000,dmr\n2,154430000,nfm\n"},
+        {with_blank, "channel,frequency_hz,mode\n1,461000000,dmr\n2,154430000,\n"},
+        {with_am, "channel,frequency_hz,mode\n1,461000000,dmr\n2,118300000,am\n"},
+        {header_only, "channel,frequency_hz,mode\n"},
+    };
+
+    for (size_t i = 0; i < sizeof lists / sizeof lists[0]; i++) {
+        if (test_create_temp_ini_with_contents(lists[i].contents, lists[i].path, sizeof untyped) != 0) {
+            /* Remove the lists already made, so later tests do not trip over them. */
+            DSD_FPRINTF(stderr, "failed to create temp scan list %zu\n", i);
+            for (size_t made = 0; made < i; made++) {
+                (void)remove(lists[made].path);
+            }
+            return 1;
+        }
+    }
+
+    const struct {
+        const char* args[8];
+        int count;
+        int warn;
+        const char* config_map;
+    } cases[] = {
+        {{"--tone-allow", "100.0", "-fM", "-i", "rtl", "-Y", "-C", untyped}, 8, 1, NULL},
+        {{"--tone-allow", "100.0", "-fs", "-Y", "-C", digital}, 6, 1, NULL},
+        {{"--tone-block", "D023N", "-fs", "-Y", "-C", with_nfm}, 6, 0, NULL},
+        {{"--tone-allow", "100.0", "-fA", "-Y", "-C", untyped}, 6, 0, NULL},
+        {{"--tone-allow", "100.0", "-fA", "-Y", "-C", digital}, 6, 1, NULL},
+        {{"--tone-allow", "100.0", "-fA", "-Y", "-C", with_blank}, 6, 0, NULL},
+        {{"--tone-allow", "100.0", "-fs", "-Y", "-C", with_blank}, 6, 1, NULL},
+        {{"--tone-allow", "100.0", "-fA", "-Y", "-C", with_nfm}, 6, 0, NULL},
+        {{"--tone-allow", "100.0", "-fA", "-Y", "-C", with_am}, 6, 1, NULL},
+        {{"--tone-allow", "100.0", "-fs", "-Y", "-C", with_am}, 6, 1, NULL},
+        {{"--tone-allow", "100.0", "-fs", "-Y"}, 4, 1, NULL},
+        {{"--tone-allow", "100.0", "-fM", "-i", "rtl", "-Y"}, 6, 1, NULL},
+        {{"--tone-allow", "100.0", "-fA", "-Y"}, 4, 0, NULL},
+        {{"--tone-allow", "100.0", "-fs", "-Y"}, 4, 0, digital},
+        {{"--tone-allow", "100.0", "-fs", "-Y", "-C", header_only}, 6, 0, NULL},
+        {{"--no-tone-filter", "-fs", "-Y", "-C", digital}, 5, 0, NULL},
+    };
+
+    static const char* const expected =
+        "the tone filter (--tone-allow/--tone-block, [analog] tone_filter) has no effect";
+    int test_rc = 0;
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        tone_parse p;
+        if (run_tone_parse_with_config_map(&p, cases[i].args, cases[i].count, cases[i].config_map) != 0) {
+            free_tone_parse(&p);
+            test_rc = 1;
+            break;
+        }
+        const char* first = strstr(p.output, expected);
+        const int warned = first != NULL ? 1 : 0;
+        if (p.rc != DSD_PARSE_CONTINUE || warned != cases[i].warn || (first && strstr(first + 1, expected))) {
+            DSD_FPRINTF(stderr, "scan tone warning %zu: rc=%d warned=%d want %d stderr=\"%s\"\n", i, p.rc, warned,
+                        cases[i].warn, p.output);
+            test_rc = 1;
+        }
+        free_tone_parse(&p);
+    }
+    for (size_t i = 0; i < sizeof lists / sizeof lists[0]; i++) {
+        (void)remove(lists[i].path);
+    }
+    return test_rc;
+}
+
 /* Issue #525: --nfm-bandwidth-hz takes whole Hz in both long-option spellings and lands in the
  * configured NFM width. The value token must be consumed before getopt runs, or it would read
  * as a positional input and the -fA after it would not be seen. */
@@ -7754,6 +8729,110 @@ test_nfm_bandwidth_rejects_invalid_values(void) {
     return test_rc;
 }
 
+/* --squelch <setting> (issue #518 follow-up): the squelch grammar in both long-option spellings, marking the squelch as
+ * the command line's so an input spec's sql field leaves it; a refusal names the grammar and never repeats the text. */
+static int
+run_squelch_option(const char* argv1, const char* argv2, dsd_opts* opts, int* rc, int* exit_rc, char* output,
+                   size_t output_size) {
+    dsd_state* state = (dsd_state*)calloc(1, sizeof(dsd_state));
+    if (!state) {
+        return -1;
+    }
+    DSD_MEMSET(opts, 0, sizeof(*opts));
+    initOpts(opts);
+    initState(state);
+    char arg0[] = "dsd-neo";
+    char arg1[64];
+    char arg2[32];
+    DSD_SNPRINTF(arg1, sizeof arg1, "%s", argv1);
+    if (argv2) {
+        DSD_SNPRINTF(arg2, sizeof arg2, "%s", argv2);
+    }
+    char* argv[] = {arg0, arg1, argv2 ? arg2 : NULL, NULL};
+    int argc_effective = 0;
+    *exit_rc = 0;
+    *rc = parse_args_capture_stderr(argv2 ? 3 : 2, argv, opts, state, &argc_effective, exit_rc, output, output_size);
+    freeState(state);
+    free(state);
+    return 0;
+}
+
+static int
+test_squelch_option(void) {
+    static const struct {
+        const char* argv1;
+        const char* argv2;
+        double db; /* LEVEL: the threshold in dB, 0 = off */
+        int mode;
+        int margin;
+    } good[] = {
+        {"--squelch", "auto", 0.0, DSD_SQUELCH_MODE_AUTO, 10},
+        {"--squelch", "auto+6", 0.0, DSD_SQUELCH_MODE_AUTO, 6},
+        {"--squelch=AUTO+30", NULL, 0.0, DSD_SQUELCH_MODE_AUTO, 30},
+        {"--squelch", "noise", 0.0, DSD_SQUELCH_MODE_NOISE, 10},
+        {"--squelch=noise+14", NULL, 0.0, DSD_SQUELCH_MODE_NOISE, 14},
+        {"--squelch=-60", NULL, -60.0, DSD_SQUELCH_MODE_LEVEL, 0},
+        {"--squelch", "-47.5", -47.5, DSD_SQUELCH_MODE_LEVEL, 0},
+        {"--squelch", "off", 0.0, DSD_SQUELCH_MODE_LEVEL, 0},
+    };
+
+    static const struct {
+        const char* argv1;
+        const char* argv2;
+        const char* why;
+    } bad[] = {
+        {"--squelch", "noise+31", "3 to 30"},   {"--squelch", "noise+SECRET", "noise+N"},
+        {"--squelch", "auto+2", "3 to 30"},     {"--squelch=SECRET", NULL, "expected off"},
+        {"--squelch", "auto+SECRET", "auto+N"}, {"--squelch", NULL, "--squelch requires a setting"},
+    };
+
+    int test_rc = 0;
+    dsd_opts* opts = (dsd_opts*)calloc(1, sizeof(dsd_opts));
+    if (!opts) {
+        return 1;
+    }
+    char output[4096];
+    for (size_t i = 0; i < sizeof good / sizeof good[0]; i++) {
+        int rc = 0;
+        int exit_rc = 0;
+        if (run_squelch_option(good[i].argv1, good[i].argv2, opts, &rc, &exit_rc, output, sizeof output) != 0) {
+            free(opts);
+            return 1;
+        }
+        int ok = rc == DSD_PARSE_CONTINUE && opts->rtl_squelch_cli_set == 1 && opts->rtl_squelch_mode == good[i].mode;
+        if (dsd_squelch_mode_is_dynamic(good[i].mode)) {
+            ok = ok && opts->rtl_squelch_margin_db == good[i].margin;
+        } else if (good[i].db < 0.0) {
+            const double want = dsd_squelch_level_from_sql(good[i].db);
+            ok = ok && fabs(opts->rtl_squelch_level - want) <= 1e-9 * want;
+        } else {
+            ok = ok && dsd_squelch_is_off(opts->rtl_squelch_level);
+        }
+        if (!ok) {
+            DSD_FPRINTF(stderr, "%s %s: rc=%d mode=%d level=%g margin=%d cli=%d\n", good[i].argv1,
+                        good[i].argv2 ? good[i].argv2 : "", rc, opts->rtl_squelch_mode, opts->rtl_squelch_level,
+                        opts->rtl_squelch_margin_db, opts->rtl_squelch_cli_set);
+            test_rc = 1;
+        }
+    }
+    for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+        int rc = 0;
+        int exit_rc = 0;
+        if (run_squelch_option(bad[i].argv1, bad[i].argv2, opts, &rc, &exit_rc, output, sizeof output) != 0) {
+            free(opts);
+            return 1;
+        }
+        if (rc != DSD_PARSE_ERROR || exit_rc != 1 || opts->rtl_squelch_cli_set || !strstr(output, bad[i].why)
+            || strstr(output, "SECRET")) {
+            DSD_FPRINTF(stderr, "%s %s: expected a refusal naming \"%s\", got rc=%d exit_rc=%d \"%s\"\n", bad[i].argv1,
+                        bad[i].argv2 ? bad[i].argv2 : "", bad[i].why, rc, exit_rc, output);
+            test_rc = 1;
+        }
+    }
+    free(opts);
+    return test_rc;
+}
+
 /* The NFM width is the radio front end's channel filter: on PCM input (the default Pulse source,
  * a file, UDP or TCP audio) it cannot act, so the flag parses and says so. Radio inputs do not
  * warn; I/Q replay has its own case below, in the radio builds where --iq-replay parses. */
@@ -7815,6 +8894,40 @@ test_nfm_bandwidth_warns_on_pcm_input(void) {
         free(opts);
         free(state);
     }
+
+    /* Issue #621: with a rigctl peer the NFM width is the FM passband the peer is asked for, in place of -B, while the
+       FM monitor runs, so it is said as that, not as having no effect. */
+    dsd_opts* opts = (dsd_opts*)calloc(1, sizeof(dsd_opts));
+    dsd_state* state = (dsd_state*)calloc(1, sizeof(dsd_state));
+    if (!opts || !state) {
+        free(opts);
+        free(state);
+        return 1;
+    }
+    initOpts(opts);
+    initState(state);
+    char arg0[] = "dsd-neo";
+    char arg_flag[] = "--nfm-bandwidth-hz=12500";
+    char arg_mode[] = "-fA";
+    char arg_in[] = "-i";
+    char arg_spec[] = "tcp:127.0.0.1:7355";
+    char arg_rigctl[] = "-U";
+    char arg_port[] = "4532";
+    char* argv[] = {arg0, arg_flag, arg_mode, arg_in, arg_spec, arg_rigctl, arg_port, NULL};
+    char output[4096];
+    int argc_effective = 0;
+    int exit_rc = 0;
+    const int rc = parse_args_capture_stderr(7, argv, opts, state, &argc_effective, &exit_rc, output, sizeof output);
+    if (rc != DSD_PARSE_CONTINUE || exit_rc != 0 || opts->analog_nfm_bandwidth_hz != 12500 || opts->use_rigctl != 1
+        || strstr(output, "has no effect")
+        || !strstr(output, "NOTICE: --nfm-bandwidth-hz filters nothing on PCM input; with rigctl (-U) it is the FM "
+                           "passband the peer is asked for, in place of -B, while the FM monitor runs.")) {
+        DSD_FPRINTF(stderr, "--nfm-bandwidth-hz on PCM input with rigctl: rc=%d exit_rc=%d\n%s\n", rc, exit_rc, output);
+        test_rc = 1;
+    }
+    freeState(state);
+    free(opts);
+    free(state);
     return test_rc;
 }
 
@@ -8517,14 +9630,99 @@ test_tg_lockout_persistence_flags(void) {
     return rc;
 }
 
+/* Issue #658: the stream encoder's digital output plays its decoded 8 kHz Codec2 monitor, so -fZ opens it at 8 kHz, mono;
+   -8's 48 kHz baseband goes to the raw stream. The BERT and packet encoders decode no voice and keep 48 kHz. */
+static int
+test_m17_encoder_digital_output_rates(void) {
+    static const struct {
+        const char* selector;
+        int rate;
+    } cases[] = {{"-fZ", 8000}, {"-fB", 48000}, {"-fP", 48000}};
+
+    int rc = 0;
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; ++i) {
+        dsd_opts* opts = calloc(1, sizeof(*opts));
+        dsd_state* state = calloc(1, sizeof(*state));
+        if (!opts || !state) {
+            free(opts);
+            free(state);
+            return 1;
+        }
+        initOpts(opts);
+        initState(state);
+        char name[] = "dsd-neo";
+        char selector[8] = {0};
+        DSD_SNPRINTF(selector, sizeof selector, "%s", cases[i].selector);
+        char* argv[] = {name, selector, NULL};
+        int effective = 0;
+        int exit_rc = -1;
+        const int parsed = dsd_parse_args(2, argv, opts, state, &effective, &exit_rc);
+        if (parsed != DSD_PARSE_CONTINUE || opts->pulse_digi_rate_out != cases[i].rate
+            || opts->pulse_digi_out_channels != 1) {
+            DSD_FPRINTF(stderr, "%s digital output: rc=%d rate=%d channels=%d, want rate %d mono\n", cases[i].selector,
+                        parsed, opts->pulse_digi_rate_out, opts->pulse_digi_out_channels, cases[i].rate);
+            rc = 1;
+        }
+        close_parse_outputs(opts);
+        freeState(state);
+        free(state);
+        free(opts);
+    }
+    return rc;
+}
+
+/* Explicit source monitoring chooses the encoder's baseband even when a later preset replaces analog mode. */
+static int
+test_explicit_source_monitor_survives_mode_selectors(void) {
+    static const char* const selectors[] = {"-fZ", "-fB", "-fP", "-fU", "-fp", "-fz", "-fd"};
+    int rc = 0;
+    for (size_t i = 0; i < sizeof selectors / sizeof selectors[0]; ++i) {
+        for (int monitor_first = 0; monitor_first <= 1; ++monitor_first) {
+            dsd_opts* opts = calloc(1, sizeof(*opts));
+            dsd_state* state = calloc(1, sizeof(*state));
+            if (!opts || !state) {
+                free(opts);
+                free(state);
+                return 1;
+            }
+            initOpts(opts);
+            initState(state);
+            char name[] = "dsd-neo";
+            char analog[] = "-fA";
+            char monitor[] = "-8";
+            char selector[8] = {0};
+            DSD_SNPRINTF(selector, sizeof selector, "%s", selectors[i]);
+            char* argv[] = {name, analog, monitor_first ? monitor : selector, monitor_first ? selector : monitor, NULL};
+            int effective = 0;
+            int exit_rc = -1;
+            const int parsed = dsd_parse_args(4, argv, opts, state, &effective, &exit_rc);
+            if (parsed != DSD_PARSE_CONTINUE || opts->analog_only != 0 || opts->monitor_input_audio != 1) {
+                DSD_FPRINTF(stderr, "explicit -8 lost for %s (first=%d): rc=%d analog=%d monitor=%d\n", selectors[i],
+                            monitor_first, parsed, opts->analog_only, opts->monitor_input_audio);
+                rc = 1;
+            }
+            close_parse_outputs(opts);
+            freeState(state);
+            free(state);
+            free(opts);
+        }
+    }
+    return rc;
+}
+
 int
 main(void) {
     int rc = 0;
+    rc |= test_api_options();
+    rc |= test_m17_encoder_digital_output_rates();
+    rc |= test_explicit_source_monitor_survives_mode_selectors();
     rc |= test_force_conflicts_and_explicit_off_options();
     rc |= test_help_returns_one_shot_and_does_not_exit();
     rc |= test_invalid_option_returns_error_and_does_not_exit();
+    rc |= test_folder_options_refuse_paths_that_do_not_fit();
     rc |= test_unknown_option_returns_error_and_does_not_exit();
     rc |= test_frontend_terminal_option_sets_terminal_kind();
+    rc |= test_analog_monitor_defaults_and_gain();
     rc |= test_N_short_option_enables_terminal_frontend();
     rc |= test_frontend_native_alias_selects_equivalent_headless_frontend();
     rc |= test_compatibility_short_options_use_current_facilities();
@@ -8556,6 +9754,7 @@ main(void) {
     rc |= test_bootstrap_print_config_normalizes_soapy_shorthand();
     rc |= test_bootstrap_profile_preserves_trunking_with_ncurses_cli();
     rc |= test_bootstrap_inherited_trunk_scan_preserves_ui_only_short_options();
+    rc |= test_bootstrap_inherited_trunk_scan_ignores_api_token_text();
     rc |= test_bootstrap_inherited_trunk_scan_allows_cli_channel_map();
     rc |= test_bootstrap_inherited_trunk_scan_allows_cli_p25_bandplan();
     rc |= test_bootstrap_inherited_trunk_scan_disables_for_positional_input();
@@ -8586,8 +9785,13 @@ main(void) {
     rc |= test_scan_max_visit_boundary_and_off_values_parse();
     rc |= test_scan_max_visit_warns_without_scan_mode();
     rc |= test_bootstrap_inherited_trunk_scan_preserves_max_visit_override();
+    rc |= test_squelch_option();
     rc |= test_nfm_bandwidth_long_option_parses();
     rc |= test_nfm_bandwidth_rejects_invalid_values();
+    rc |= test_tone_filter_options_parse();
+    rc |= test_tone_filter_options_refused();
+    rc |= test_tone_filter_warns_outside_the_fm_monitor();
+    rc |= test_tone_filter_warns_on_scan_lists();
     rc |= test_nfm_bandwidth_warns_on_pcm_input();
 #ifdef USE_RADIO
     rc |= test_nfm_bandwidth_quiet_on_iq_replay();
@@ -8596,6 +9800,7 @@ main(void) {
     rc |= test_input_source_tcp_ipv4_roundtrip();
     rc |= test_trunk_scan_long_options_parse();
     rc |= test_trunk_scanner_option_order();
+    rc |= test_trunk_scan_api_token_is_not_a_one_shot();
     rc |= test_trunk_scan_still_refuses_scanner_after_trunk();
     rc |= test_trunk_scan_conflicts_with_scanner_mode();
     rc |= test_trunk_scan_rejects_global_channel_map();
@@ -8661,6 +9866,11 @@ main(void) {
     rc |= test_f_dpmr_and_m17_presets_match_documented_letters();
     rc |= test_f_edacs_presets_match_reference_modes();
     rc |= test_f_manual_selectors_leave_analog_monitor();
+    rc |= test_f_am_preset_on_iq_inputs();
+    rc |= test_f_am_refused_on_pcm_input();
+    rc |= test_f_manual_selectors_leave_am();
+    rc |= test_am_bandwidth_option();
+    rc |= test_config_am_on_pcm_input_falls_back();
     rc |= test_f_fr_restores_single_slot_mono_preset();
     rc |= test_f_dmr_preset_selects_gfsk();
     rc |= test_mg_before_f_dmr_keeps_gfsk_lock();

@@ -7,6 +7,7 @@
 #include <dsd-neo/core/keyring.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/opts_fwd.h>
+#include <dsd-neo/core/power.h>
 #include <dsd-neo/core/safe_api.h>
 #include <dsd-neo/core/scan_profile.h>
 #include <dsd-neo/core/secret_redaction.h>
@@ -476,20 +477,18 @@ csvGroupImport(const dsd_opts* opts, dsd_state* state) {
  * doc's own example row `2,70` became a channel at 70 Hz, which the trunking SM
  * would then try to tune.
  *
- * The range is what the front ends can actually reach, generously bounded: the
- * low end sits under any HF-capable SoapySDR device, the high end above the
- * 6 GHz ceiling of the widest-tuning ones (LimeSDR, B210, HackRF). It is not a
- * band plan -- it only rejects numbers that cannot be radio frequencies at all,
- * including the 0 a blank column parses to. Long is 32-bit on the MSVC presets,
- * so the comparison is done in long long or the upper bound would not fit.
+ * The low end sits under any HF-capable SoapySDR device; the high end is
+ * DSD_TRUNK_FREQ_MAX_HZ, the highest frequency a trunk channel is stored and
+ * tuned at on every platform, far above any trunking band. It is not a band
+ * plan -- it only rejects numbers that cannot be trunk channel frequencies,
+ * including the 0 a blank column parses to. A row past the ceiling is refused
+ * here rather than stored, so it can never reach a tuner that would wrap it.
  */
-#define CSV_CHAN_FREQ_MIN_HZ 100000LL
-#define CSV_CHAN_FREQ_MAX_HZ 6000000000LL
+#define CSV_CHAN_FREQ_MIN_HZ 100000L
 
 static int
 csv_chan_freq_plausible(long int freq) {
-    const long long hz = (long long)freq;
-    return hz >= CSV_CHAN_FREQ_MIN_HZ && hz <= CSV_CHAN_FREQ_MAX_HZ;
+    return freq >= CSV_CHAN_FREQ_MIN_HZ && freq <= DSD_TRUNK_FREQ_MAX_HZ;
 }
 
 /*
@@ -659,16 +658,19 @@ enum {
 
 typedef struct {
     int index[CHAN_FIELD_COUNT];
+    int count; /**< columns the header names, notes included */
 } chan_header_cols;
 
-/* Walk every field, retaining only the named columns. No field-count truncation. */
+/* Walk every field, retaining only the named columns, and the field right after the options cell in @p after_options
+   (NULL when there is none), which a comma inside the cell would have cut off. No field-count truncation. */
 static size_t
-chan_select_fields(char* line, const chan_header_cols* cols, char** fields) {
+chan_select_fields(char* line, const chan_header_cols* cols, char** fields, char** after_options) {
     size_t count = 0;
     char* cell = line;
     for (int i = 0; i < CHAN_FIELD_COUNT; i++) {
         fields[i] = NULL;
     }
+    *after_options = NULL;
     while (cell) {
         char* next = strchr(cell, ',');
         if (next) {
@@ -678,6 +680,9 @@ chan_select_fields(char* line, const chan_header_cols* cols, char** fields) {
             if (cols->index[i] >= 0 && (size_t)cols->index[i] == count) {
                 fields[i] = cell;
             }
+        }
+        if (cols->index[CHAN_OPTIONS] >= 0 && (size_t)cols->index[CHAN_OPTIONS] + 1U == count) {
+            *after_options = cell;
         }
         count++;
         cell = next;
@@ -747,6 +752,7 @@ chan_parse_header(char* header_line, chan_header_cols* out) {
         index++;
         cell = next;
     }
+    out->count = index;
     return 0;
 }
 
@@ -941,6 +947,28 @@ chan_import_row_mode(char** fields, const char* base_path, int row_number, dsd_s
     return 0;
 }
 
+/*
+ * A tone list written with commas (issue #527): the splitter ends the options cell at the first one, so the entries
+ * after it would be dropped without a word, past the header, or read as the next column's value. The row is refused
+ * with the hint instead, before that column's own check (the mode, a key column) can blame something else; neither the
+ * cell nor the field is echoed.
+ */
+static int
+chan_import_options_split(char** fields, const chan_header_cols* cols, const char* after_options, const char* base_path,
+                          int row_number) {
+    const char* options = fields[CHAN_OPTIONS];
+    if (!options || !after_options) {
+        return 0;
+    }
+    char error[96] = "";
+    const int past_header = cols->index[CHAN_OPTIONS] + 1 >= cols->count;
+    if (!dsd_scan_options_tone_list_split(options, after_options, past_header, error, sizeof(error))) {
+        return 0;
+    }
+    LOG_ERROR("channel map file '%s' row %d: %s\n", base_path, row_number, error);
+    return -1;
+}
+
 /**
  * @brief Parse one channel row into @p state.
  *
@@ -963,9 +991,11 @@ chan_import_row(dsd_state* state, char* buffer, const chan_header_cols* cols, co
     int freq_parsed = 0;
     long int chan_number = -1;
     const int lcn_before = state->lcn_freq_count;
-    const size_t field_count = chan_select_fields(buffer, cols, fields);
+    char* after_options = NULL;
+    const size_t field_count = chan_select_fields(buffer, cols, fields, &after_options);
     dsd_scan_mode mode = DSD_SCAN_MODE_INHERIT;
-    if (chan_import_row_mode(fields, base_path, row_number, &mode) != 0) {
+    if (chan_import_options_split(fields, cols, after_options, base_path, row_number) != 0
+        || chan_import_row_mode(fields, base_path, row_number, &mode) != 0) {
         return -1;
     }
     for (int i = 0; i < 2 && fields[i]; i++) {
@@ -1560,8 +1590,13 @@ csv_describe_channel_profile(const dsd_state* state, int index, dsd_csv_channel_
     out->dmr_mapping_count = profile && (profile->values.present & DSD_SCAN_OPT_DMR_MAP) ? profile->dmr_map.count : -1;
     out->squelch_db_set = profile && (profile->values.present & DSD_SCAN_OPT_SQUELCH) ? 1 : 0;
     out->squelch_db = out->squelch_db_set ? profile->values.squelch_db : 0;
+    out->squelch_mode =
+        out->squelch_db_set ? dsd_squelch_mode_or_level(profile->values.squelch_mode) : DSD_SQUELCH_MODE_LEVEL;
+    out->squelch_margin_db = dsd_squelch_mode_is_dynamic(out->squelch_mode) ? profile->values.squelch_margin_db : 0;
     out->bandwidth_hz =
         profile && (profile->values.present & DSD_SCAN_OPT_BANDWIDTH) ? profile->values.channel_bw_hz : -1;
+    out->tone_filter =
+        dsd_scan_option_tone_summary(profile ? &profile->values : NULL, out->tone_list, sizeof(out->tone_list));
 }
 
 int

@@ -10,7 +10,6 @@
 
 #include <QByteArray>
 #include <QChar>
-#include <QDateTime>
 #include <QDir>
 #include <QFile>
 #include <QFileDevice> // IWYU pragma: keep
@@ -26,6 +25,7 @@
 
 #include <dsd-neo/app_control/trunk_scan_validate.h>
 #include <dsd-neo/core/csv_validate.h>
+#include <dsd-neo/core/power.h>
 #include <dsd-neo/core/safe_api.h>
 
 #include <QSaveFile>
@@ -34,6 +34,7 @@
 #include "csv_bundle_import.h"
 #include "decoder_host.h"
 #include "json_store.h"
+#include "realtime_clock.h"
 
 namespace dsd_qt {
 
@@ -178,7 +179,7 @@ ImportedFilesModel::registerTalkgroupList(const QString& path) {
     row.path = path;
     row.name = file.fileName();
     row.type = QStringLiteral("group");
-    row.importedAt = QDateTime::currentSecsSinceEpoch();
+    row.importedAt = realtimeSecsSinceEpoch();
     // Unlike a staged import, failure must never delete the engine's active file.
     if (!validate(path, row.type, &row.accepted, &row.skipped)) {
         return false;
@@ -377,7 +378,7 @@ ImportedFilesModel::replaceBundle(int replaceRow, const CsvBundleImport& bundle,
     next[replaceRow].accepted = accepted;
     next[replaceRow].skipped = skipped;
     next[replaceRow].bundleRoot = bundle.root.isEmpty() ? previous.bundleRoot : bundle.root;
-    next[replaceRow].importedAt = QDateTime::currentSecsSinceEpoch();
+    next[replaceRow].importedAt = realtimeSecsSinceEpoch();
     next[replaceRow].origin.clear();
     if (!saveRows(next)) {
         if (writePrivateCsv(previous.path, backup)) {
@@ -420,7 +421,7 @@ ImportedFilesModel::adoptStoredFile(const QString& path, const QString& type, co
         row.name = origin.value("name").toString();
     }
     row.type = type;
-    row.importedAt = QDateTime::currentSecsSinceEpoch();
+    row.importedAt = realtimeSecsSinceEpoch();
     row.accepted = accepted;
     row.skipped = skipped;
     row.origin = origin.value(QStringLiteral("origin")).toString();
@@ -495,7 +496,7 @@ QVariantMap
 ImportedFilesModel::commitReplacedRow(int row, int accepted, int skipped, bool keepProvenance) {
     auto next = m_rows;
     Row& stored = next[row];
-    stored.importedAt = QDateTime::currentSecsSinceEpoch();
+    stored.importedAt = realtimeSecsSinceEpoch();
     stored.accepted = accepted;
     stored.skipped = skipped;
     if (!keepProvenance) {
@@ -655,19 +656,28 @@ ImportedFilesModel::refreshGeneratedFile(int row, const QString& sourcePath) {
 static void
 appendChannelProfile(const dsd_csv_channel_profile* row, void* context) {
     auto* rows = static_cast<QVariantList*>(context);
-    rows->append(QVariantMap{{"index", static_cast<int>(row->index)},
-                             {"name", QString::fromUtf8(row->name)},
-                             {"frequency", QString::number(row->frequency_hz / 1e6, 'f', 6)},
-                             {"mode", QString::fromUtf8(row->mode)},
-                             {"keySource", row->key_source},
-                             {"force", row->force},
-                             {"mappings", row->dmr_mapping_count},
-                             /* #521: invalid (not 0 or -1) when the row inherits the squelch. */
-                             {"squelchDb", row->squelch_db_set ? QVariant(row->squelch_db) : QVariant()},
-                             /* #526: an nfm row's own channel width in Hz; invalid when it inherits the configured
-                                one. */
-                             {"bandwidthHz", row->bandwidth_hz >= 0 ? QVariant(row->bandwidth_hz) : QVariant()},
-                             {"profileRef", QString::fromUtf8(row->profile_ref)}});
+    rows->append(
+        QVariantMap{{"index", static_cast<int>(row->index)},
+                    {"name", QString::fromUtf8(row->name)},
+                    {"frequency", QString::number(row->frequency_hz / 1e6, 'f', 6)},
+                    {"mode", QString::fromUtf8(row->mode)},
+                    {"keySource", row->key_source},
+                    {"force", row->force},
+                    {"mappings", row->dmr_mapping_count},
+                    /* #521: invalid (not 0 or -1) when the row inherits the squelch. */
+                    {"squelchDb", row->squelch_db_set ? QVariant(row->squelch_db) : QVariant()},
+                    /* Issue #518 follow-up: the row's own auto or noise squelch margin, invalid for a level, and
+                       whether it is the noise squelch's. */
+                    {"squelchMarginDb", row->squelch_margin_db > 0 ? QVariant(row->squelch_margin_db) : QVariant()},
+                    {"squelchNoise", row->squelch_mode == DSD_SQUELCH_MODE_NOISE},
+                    /* #526: an analog (nfm or am) row's own channel width in Hz; invalid when it inherits
+                                the configured width of its kind. */
+                    {"bandwidthHz", row->bandwidth_hz >= 0 ? QVariant(row->bandwidth_hz) : QVariant()},
+                    /* #527: an nfm row's own tone policy (dsd_tone_filter_mode) and its displayed list;
+                                invalid when it runs the configured policy. */
+                    {"toneFilter", row->tone_filter >= 0 ? QVariant(row->tone_filter) : QVariant()},
+                    {"toneList", QString::fromUtf8(row->tone_list)},
+                    {"profileRef", QString::fromUtf8(row->profile_ref)}});
 }
 
 QVariantMap
@@ -716,18 +726,25 @@ ImportedFilesModel::remove(int row) {
 namespace {
 void
 appendTargetPreview(const dsd_app_scan_csv_target* target, void* context) {
-    static_cast<QVariantList*>(context)->append(
-        QVariantMap{{"id", QString::fromUtf8(target->id)},
-                    {"type", QString::fromUtf8(target->type)},
-                    {"frequency", QString::number(target->frequency_hz / 1e6, 'f', 6)},
-                    {"dwellMs", target->dwell_ms},
-                    {"holdMs", target->hold_ms},
-                    {"gainDb", target->gain_db},
-                    /* #521: invalid (not 0 or -1) when the target inherits the squelch. */
-                    {"squelchDb", target->squelch_db_set ? QVariant(target->squelch_db) : QVariant()},
-                    /* #526: an nfm-conventional target's own channel width in Hz; invalid when it inherits. */
-                    {"bandwidthHz", target->bandwidth_hz >= 0 ? QVariant(target->bandwidth_hz) : QVariant()},
-                    {"modulation", QString::fromUtf8(target->modulation)}});
+    static_cast<QVariantList*>(context)->append(QVariantMap{
+        {"id", QString::fromUtf8(target->id)},
+        {"type", QString::fromUtf8(target->type)},
+        {"frequency", QString::number(target->frequency_hz / 1e6, 'f', 6)},
+        {"dwellMs", target->dwell_ms},
+        {"holdMs", target->hold_ms},
+        {"gainDb", target->gain_db},
+        /* #521: invalid (not 0 or -1) when the target inherits the squelch. */
+        {"squelchDb", target->squelch_db_set ? QVariant(target->squelch_db) : QVariant()},
+        {"squelchMarginDb", target->squelch_margin_db > 0 ? QVariant(target->squelch_margin_db) : QVariant()},
+        {"squelchNoise", target->squelch_mode == DSD_SQUELCH_MODE_NOISE},
+        /* #526: an analog (nfm- or am-conventional) target's own channel width in Hz; invalid when
+                       it inherits the configured width of its kind. */
+        {"bandwidthHz", target->bandwidth_hz >= 0 ? QVariant(target->bandwidth_hz) : QVariant()},
+        /* #527: an nfm-conventional target's own tone policy (dsd_tone_filter_mode) and its displayed
+                       list; invalid when it runs the configured policy. */
+        {"toneFilter", target->tone_filter >= 0 ? QVariant(target->tone_filter) : QVariant()},
+        {"toneList", QString::fromUtf8(target->tone_list)},
+        {"modulation", QString::fromUtf8(target->modulation)}});
 }
 } // namespace
 
@@ -838,7 +855,7 @@ ImportedFilesModel::load() {
     }
     const bool pruned = rows.size() != array.size();
     beginResetModel();
-    m_rows = rows;
+    m_rows = std::move(rows);
     endResetModel();
     Q_EMIT countChanged();
     if (pruned) {

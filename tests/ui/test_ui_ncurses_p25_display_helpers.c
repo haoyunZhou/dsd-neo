@@ -12,14 +12,15 @@
 #include <dsd-neo/core/state.h>
 #include <dsd-neo/core/state_ext.h>
 #include <dsd-neo/core/synctype_ids.h>
-#include <dsd-neo/platform/timing.h>
 #include <dsd-neo/protocol/p25/p25_cc_candidates.h>
 #include <dsd-neo/protocol/p25/p25_frequency.h>
 #include <dsd-neo/protocol/p25/p25_sm_watchdog.h>
 #include <dsd-neo/runtime/config.h>
+#include <dsd-neo/runtime/decode_clock.h>
 #include <dsd-neo/runtime/trunk_cc_candidates.h>
 #include <dsd-neo/ui/ncurses_internal.h>
 #include <dsd-neo/ui/ui_prims.h>
+#include <limits.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -37,7 +38,6 @@ static char g_printw_capture[4096];
 static size_t g_printw_capture_len;
 static int g_test_rows = 24;
 static int g_test_cols = 80;
-static uint64_t g_monotonic_ns;
 static int g_percentile_fixture;
 static int g_percentile_len;
 
@@ -108,16 +108,6 @@ assert_capture_lines_fit(int max_cols) {
         col++;
     }
     assert(col <= max_cols);
-}
-
-uint64_t
-dsd_time_monotonic_ns(void) { // NOLINT(misc-use-internal-linkage)
-    return g_monotonic_ns;
-}
-
-uint64_t
-dsd_time_monotonic_ms(void) { // NOLINT(misc-use-internal-linkage)
-    return 0;
 }
 
 const dsdneoRuntimeConfig*
@@ -334,6 +324,9 @@ WINDOW* stdscr;
         (x) = g_test_cols;                                                                                             \
     } while (0)
 
+#if defined(DSD_USE_PDCURSES)
+#include "pdcurses_macro_stubs.h"
+#endif
 #include "../../src/ui/terminal/ncurses_p25_display.c"
 #include "dsd-neo/core/opts.h"
 #include "dsd-neo/core/opts_fwd.h"
@@ -391,6 +384,34 @@ run_iden_match_cases(void) {
     assert(ui_is_iden_channel(&state, tdma_ch, tdma_freq) == 0);
     assert(ui_is_iden_channel(NULL, tdma_ch, tdma_freq) == 0);
 
+    /* The display computes a channel as process_channel_to_freq() does: in 64 bits, since base * 5 overflows a 32-bit
+     * long past about 2.147 GHz, and only inside 1..2147483647 Hz (DSD_TRUNK_FREQ_MAX_HZ). An IDEN whose channel lands
+     * past the ceiling names no channel, so it never claims one; the last 5 Hz step under it still does. */
+    DSD_MEMSET(&state, 0, sizeof(state));
+    state.synctype = DSD_SYNC_P25P1_POS;
+    set_fdma_iden(&state, 5, 436207616, 100, 1); /* * 5 = 2181038080 Hz */
+    const int past_ch = 5 << 12;
+    /* Every frequency a long holds on every platform, the ceiling included, misses the past-ceiling channel. */
+    assert(ui_is_iden_channel(&state, past_ch, DSD_TRUNK_FREQ_MAX_HZ) == 0);
+    iden = -1;
+    assert(ui_match_iden_channel(&state, past_ch, DSD_TRUNK_FREQ_MAX_HZ, &iden) == 0);
+    assert(iden == -1);
+#if LONG_MAX > 2147483647L
+    /* Where long is 64-bit, the frequency the IDEN would have computed misses it too. */
+    assert(ui_is_iden_channel(&state, past_ch, 2181038080L) == 0);
+    iden = -1;
+    assert(ui_match_iden_channel(&state, past_ch, 2181038080L, &iden) == 0);
+    assert(iden == -1);
+#endif
+    set_fdma_iden(&state, 6, 429496729, 100, 1); /* * 5 = 2147483645 Hz */
+    assert(ui_is_iden_channel(&state, 6 << 12, 2147483645L) == 1);
+
+    /* A channel the display cannot compute is no channel either, so an unknown (0) frequency never matches it. A
+     * negative stored base is one (where long is 32-bit, a raw base of 2^31 or more arrives that way), even when its
+     * channel offset would bring the sum to 0 Hz or above. */
+    set_fdma_iden(&state, 7, -25, 1, 1); /* -125 Hz + 1 step * 125 Hz = 0 Hz */
+    assert(ui_is_iden_channel(&state, (7 << 12) | 1, 0L) == 0);
+
     return 0;
 }
 
@@ -418,8 +439,9 @@ run_active_vc_cases(void) {
         .channel = 0x123AU,
         .frequency_hz = 853012500L,
     };
-    g_monotonic_ns = UINT64_C(10000000000);
-    const uint64_t now_ms = dsd_time_monotonic_ns() / UINT64_C(1000000);
+    // The recent-activity TTL is judged on the decode clock the entries are stamped on.
+    dsd_decode_clock_use_test(UINT64_C(10000000000));
+    const uint64_t now_ms = dsd_decode_now_mono_ms();
     assert(dsd_recent_activity_publish(&state, 2U, &recent, "TG 123 Ch: 123A slot 1", now_ms) == 1);
     assert(ui_guess_active_vc_freq(&state) == 853012500L);
     assert(dsd_recent_activity_publish(&state, 2U, &recent, "TG 123 Ch: 123A slot 1",
@@ -427,7 +449,7 @@ run_active_vc_cases(void) {
            == 1);
     assert(ui_guess_active_vc_freq(&state) == 0);
     dsd_state_ext_free_all(&state);
-    g_monotonic_ns = 0U;
+    dsd_decode_clock_use_system();
 
     dsd_state* canonical = (dsd_state*)calloc(1U, sizeof(*canonical));
     assert(canonical != NULL);
@@ -811,23 +833,9 @@ run_service_metric_display_cases(void) {
 static int
 run_p2_gate_helper_cases(void) {
     DSD_MEMSET(&g_runtime_config, 0, sizeof(g_runtime_config));
-    g_runtime_config.p25_ring_hold_s = 1.25;
     g_runtime_config.p25_mac_hold_s = 4.5;
-
-    double ring_hold = 0.0;
-    double mac_hold = 0.0;
-    ui_get_p2_hold_windows(&ring_hold, &mac_hold);
-    assert(ring_hold == 1.25);
-    assert(mac_hold == 4.5);
-
-    assert(ui_clamp_p2_ring_fill(-2) == 0);
-    assert(ui_clamp_p2_ring_fill(2) == 2);
-    assert(ui_clamp_p2_ring_fill(99) == DSD_P25_P2_AUDIO_RING_DEPTH);
-
-    assert(ui_p2_ring_recent(0, 0.2, 0.75) == 0);
-    assert(ui_p2_ring_recent(1, -0.1, 0.75) == 0);
-    assert(ui_p2_ring_recent(1, 0.8, 0.75) == 0);
-    assert(ui_p2_ring_recent(1, 0.75, 0.75) == 1);
+    const double mac_hold = ui_get_p2_mac_hold();
+    assert(mac_hold > 4.4999 && mac_hold < 4.5001);
 
     static dsd_opts opts;
     static dsd_state state;
@@ -835,15 +843,14 @@ run_p2_gate_helper_cases(void) {
     DSD_MEMSET(&state, 0, sizeof(state));
     opts.trunk_hangtime = 2.0;
 
-    assert(ui_p2_slot_active(&opts, &state, 0, 5.0, 0.0, 0.75, 3.0) == 0);
+    assert(ui_p2_slot_active(&opts, &state, 0, 5.0, 0.0, 3.0) == 0);
     state.p25_p2_audio_allowed[0] = 1;
-    assert(ui_p2_slot_active(&opts, &state, 0, 5.0, 0.0, 0.75, 3.0) == 1);
-    assert(ui_p2_slot_active(&opts, &state, 0, 5.0, 3.0, 0.75, 3.0) == 0);
-    state.p25_p2_audio_ring_count[0] = 1;
-    assert(ui_p2_slot_active(&opts, &state, 0, 0.5, 3.0, 0.75, 3.0) == 1);
+    assert(ui_p2_slot_active(&opts, &state, 0, 5.0, 0.0, 3.0) == 1);
+    assert(ui_p2_slot_active(&opts, &state, 0, 5.0, 3.0, 3.0) == 0);
+    assert(ui_p2_slot_active(&opts, &state, 0, 0.5, 3.0, 3.0) == 1);
     state.p25_p2_audio_allowed[0] = 0;
-    state.p25_p2_audio_ring_count[0] = 0;
-    assert(ui_p2_slot_active(&opts, &state, 0, 2.5, 9.0, 0.75, 3.0) == 1);
+    assert(ui_p2_slot_active(&opts, &state, 0, 2.5, 9.0, 3.0) == 1);
+    assert(ui_p2_slot_active(&opts, &state, 0, -1.0, 0.0, 3.0) == 0);
 
     return 0;
 }

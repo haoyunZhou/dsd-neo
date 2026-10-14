@@ -122,7 +122,7 @@ _Static_assert(UI_SNAPSHOT_FIELD_END(trunk_lcn_freq_ext_capacity) <= offsetof(ds
                "trunk_lcn_freq_ext must sit before the audio_out_idx..lastsample copy range");
 /* ui_snapshot_copy_trunk_lcn_freq_ext() writes lcn_freq_count/lcn_freq_roll on its clamp
  * paths, so the range that carries them has to be copied first or the clamp is undone. */
-_Static_assert(offsetof(dsd_state, lcn_freq_count) >= offsetof(dsd_state, p25_p2_audio_ring_count)
+_Static_assert(offsetof(dsd_state, lcn_freq_count) >= offsetof(dsd_state, p25_p2_active_slot)
                    && UI_SNAPSHOT_FIELD_END(lcn_freq_roll) <= UI_SNAPSHOT_FIELD_END(dstar_gps),
                "lcn_freq_count/roll must ride the range copied before the scan-list tail");
 /* The per-row name store is a second heap allocation with the same hazard, and it sits
@@ -146,8 +146,8 @@ _Static_assert(UI_SNAPSHOT_FIELD_END(scan_keys_active_set) <= offsetof(dsd_state
  * unlike the stores above they want to be inside a copy range -- left out of one they
  * would silently never reach the UI. */
 _Static_assert(offsetof(dsd_state, trunk_scan_active_id) >= offsetof(dsd_state, vertex_ks_count)
-                   && UI_SNAPSHOT_FIELD_END(trunk_scan_avoided_count) <= UI_SNAPSHOT_FIELD_END(ui_msg),
-               "trunk_scan_active_id..trunk_scan_avoided_count must ride the vertex_ks_count..ui_msg range");
+                   && UI_SNAPSHOT_FIELD_END(scan_row_scope_seq) <= UI_SNAPSHOT_FIELD_END(ui_msg),
+               "trunk_scan_active_id..scan_row_scope_seq must ride the vertex_ks_count..ui_msg range");
 /* Voice-gated scan memory and the per-visit cap bookkeeping beside it ride the same range so the
  * status line sees the phase and the Scan Timing row sees the cap. */
 _Static_assert(offsetof(dsd_state, scan_voice_gate_arrive_m) >= offsetof(dsd_state, vertex_ks_count)
@@ -164,6 +164,11 @@ _Static_assert(offsetof(dsd_state, scan_timing) >= offsetof(dsd_state, vertex_ks
 _Static_assert(offsetof(dsd_state, analog_rx) >= offsetof(dsd_state, vertex_ks_count)
                    && UI_SNAPSHOT_FIELD_END(analog_rx) <= UI_SNAPSHOT_FIELD_END(ui_msg),
                "analog_rx must ride the vertex_ks_count..ui_msg range");
+/* The dynamic squelch's status (issue #518 follow-up), the PCM noise squelch's state among it (issue #628) and the EDACS
+ * analog call bit (issue #625), reaches the frontends' readouts the same way. */
+_Static_assert(offsetof(dsd_state, squelch_auto_active) >= offsetof(dsd_state, vertex_ks_count)
+                   && UI_SNAPSHOT_FIELD_END(squelch_edacs_call) <= UI_SNAPSHOT_FIELD_END(ui_msg),
+               "the squelch_* status must ride the vertex_ks_count..ui_msg range");
 
 /* The embedded trunk_lcn_freq[] is a plain array copied by the byte ranges
  * above; the scan-list heap tail past it needs an explicit deep copy.
@@ -259,7 +264,7 @@ ui_snapshot_copy_render_state(dsd_state* dst, const dsd_state* src) {
     UI_SNAPSHOT_COPY_RANGE(dst, src, input_sample_buffer, directmode);
     UI_SNAPSHOT_COPY_RANGE(dst, src, dmr_alias_format, DMRvcR);
     UI_SNAPSHOT_COPY_RANGE(dst, src, octet_counter, p25_p2_audio_allowed);
-    UI_SNAPSHOT_COPY_RANGE(dst, src, p25_p2_audio_ring_count, dstar_gps);
+    UI_SNAPSHOT_COPY_RANGE(dst, src, p25_p2_active_slot, dstar_gps);
     ui_snapshot_copy_trunk_lcn_freq_ext(dst, src);
     ui_snapshot_copy_trunk_lcn_name(dst, src);
     ui_snapshot_copy_trunk_lcn_avoid(dst, src);
@@ -344,6 +349,7 @@ dsd_app_telemetry_publish_snapshot(const dsd_state* state) {
        and nesting the two would put a lock-order edge between the snapshot path and a
        JNI poll. */
     dsd_app_notification_publish_state(state);
+    dsd_app_telemetry_notify_state(state);
 }
 
 const dsd_state*

@@ -6,6 +6,7 @@
 #include <dsd-neo/app_control/analog_width_view.h>
 #include <dsd-neo/core/airspy_config.h>
 #include <dsd-neo/core/audio.h>
+#include <dsd-neo/core/audio_input_switch.h>
 #include <dsd-neo/core/channel_mode.h>
 #include <dsd-neo/core/constants.h>
 #include <dsd-neo/core/csv_import.h>
@@ -21,10 +22,11 @@
 #include <dsd-neo/core/string_utils.h>
 #include <dsd-neo/core/talkgroup_policy.h>
 #include <dsd-neo/engine/channel_scan.h>
+#include <dsd-neo/engine/engine.h>
+#include <dsd-neo/engine/frame_processing.h>
 #include <dsd-neo/engine/p25_bandplan_export.h>
 #include <dsd-neo/engine/trunk_scan.h>
 #include <dsd-neo/io/control.h>
-#include <dsd-neo/io/rigctl_client.h>
 #include <dsd-neo/io/rtl_stream_c.h>
 #include <dsd-neo/io/udp_socket_connect.h>
 #include <dsd-neo/platform/file_compat.h>
@@ -35,22 +37,27 @@
 #include <dsd-neo/runtime/airspy_config.h>
 #include <dsd-neo/runtime/analog_channel.h>
 #include <dsd-neo/runtime/config.h>
+#include <dsd-neo/runtime/decode_clock.h>
+#include <dsd-neo/runtime/input_failure.h>
 #include <dsd-neo/runtime/log.h>
 #include <dsd-neo/runtime/scan_mode.h>
 #include <dsd-neo/runtime/scan_options.h>
+#include <dsd-neo/runtime/squelch.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "dsd-neo/core/dibit.h"
 #include "dsd-neo/core/key_set.h"
 #include "dsd-neo/core/opts_fwd.h"
 #include "dsd-neo/core/safe_api.h"
 #include "dsd-neo/core/state_fwd.h"
 #include "dsd-neo/platform/sockets.h"
 #include "services.h"
+
+/* Radio streams svc_rtl_restart_locked() started (svc_rtl_start_count()). Decoder thread only, as every restart is. */
+static unsigned int g_svc_rtl_starts;
 
 #ifdef USE_RADIO
 
@@ -63,6 +70,11 @@ svc_radio_source_is_soapy(const dsd_opts* opts) {
     return (strcmp(dev, "soapy") == 0) || (strncmp(dev, "soapy:", 6) == 0);
 }
 #endif
+
+unsigned int
+svc_rtl_start_count(void) {
+    return g_svc_rtl_starts;
+}
 
 int
 svc_toggle_all_mutes(dsd_opts* opts) {
@@ -95,6 +107,9 @@ svc_enable_per_call_wav(dsd_opts* opts, dsd_state* state) {
     DSD_FPRINTF(stderr, "\n Per Call Wav File Enabled to Directory: %s;.\n", opts->wav_out_dir);
     opts->wav_out_f = open_wav_file(opts->wav_out_dir, opts->wav_out_file, sizeof opts->wav_out_file, 8000, 0);
     opts->wav_out_fR = open_wav_file(opts->wav_out_dir, opts->wav_out_fileR, sizeof opts->wav_out_fileR, 8000, 0);
+    // Switched on mid-call, the recordings hold only what follows: their sidecars start now, not at the call's start.
+    opts->wav_out_open_time = dsd_decode_time();
+    opts->wav_out_open_timeR = opts->wav_out_open_time;
     opts->dmr_stereo_wav = 1;
     return (opts->wav_out_f && opts->wav_out_fR) ? 0 : -1;
 }
@@ -109,54 +124,84 @@ svc_open_symbol_out(dsd_opts* opts, dsd_state* state, const char* filename) {
     return (opts->symbol_out_f != NULL) ? 0 : -1;
 }
 
-int
-svc_open_symbol_in(dsd_opts* opts, dsd_state* state, const char* filename) {
-    (void)state;
-    if (!opts || !filename || !*filename) {
-        return -1;
+/* Run an input switch (issue #634) for a menu service. */
+static int
+svc_switch_input(dsd_opts* opts, dsd_state* state, dsd_audio_input_kind kind, const char* path, const char* host,
+                 int port) {
+    if (!opts || !state) {
+        return DSD_AUDIO_INPUT_KEPT;
     }
-    opts->symbolfile = dsd_fopen_existing_regular_file(filename, "rb");
-    if (!opts->symbolfile) {
-        LOG_ERROR("Error, couldn't open %s\n", filename);
-        return -1;
+    dsd_audio_input_request request;
+    DSD_MEMSET(&request, 0, sizeof request);
+    request.kind = kind;
+    request.path = path;
+    request.host = host;
+    request.port = port;
+    request.tcp_sockfd = DSD_INVALID_SOCKET;
+    return dsd_audio_switch_input(opts, state, &request);
+}
+
+const char*
+svc_input_switch_unsupported(const dsd_opts* opts) {
+    if (!opts) {
+        return "no session";
     }
-    dsd_stat_t sb;
-    if (dsd_fstat(dsd_fileno(opts->symbolfile), &sb) != 0) {
-        LOG_ERROR("Error, couldn't stat %s\n", filename);
-        fclose(opts->symbolfile);
-        opts->symbolfile = NULL;
-        return -1;
+    if (opts->playfiles == 1) {
+        return "MBE playback reads no audio input";
     }
-    if (!dsd_stat_is_regular(&sb)) {
-        LOG_ERROR("Error, %s is not a regular file\n", filename);
-        fclose(opts->symbolfile);
-        opts->symbolfile = NULL;
-        return -1;
+    if (opts->m17decoderip == 1) {
+        return "the M17 IP frame receiver reads no audio input";
     }
-    DSD_SNPRINTF(opts->audio_in_dev, sizeof opts->audio_in_dev, "%s", filename);
-    opts->audio_in_type = AUDIO_IN_SYMBOL_BIN; // symbol capture bin
-    if (state) {
-        state->symbol_replay_format = DSD_SYMBOL_REPLAY_FORMAT_UNKNOWN;
-        state->symbol_replay_header_checked = 0;
-        state->symbol_replay_has_soft = 0;
+    if (opts->m17encoderbrt == 1 || opts->m17encoderpkt == 1) {
+        return "the M17 encoder reads no audio input";
     }
-    return 0;
+    if (opts->m17encoder == 1) {
+        /* Its decimation and filter are set from the input rate it started on (m17_encoder_input_init()). */
+        return "the M17 stream encoder keeps the input it started on";
+    }
+    return NULL;
 }
 
 int
-svc_rigctl_connect(dsd_opts* opts, const char* host, int port) {
-    if (!opts || !host || port <= 0) {
-        return -1;
+svc_playback_running(const dsd_opts* opts) {
+    return opts
+           && (opts->audio_in_type == AUDIO_IN_WAV || opts->audio_in_type == AUDIO_IN_SYMBOL_BIN
+               || opts->audio_in_type == AUDIO_IN_SYMBOL_FLT);
+}
+
+int
+svc_open_audio_file_in(dsd_opts* opts, dsd_state* state, const char* path) {
+    if (!path || !*path) {
+        return DSD_AUDIO_INPUT_KEPT;
     }
-    DSD_SNPRINTF(opts->rigctlhostname, sizeof opts->rigctlhostname, "%s", host);
-    opts->rigctlportno = port;
-    opts->rigctl_sockfd = Connect(opts->rigctlhostname, opts->rigctlportno);
-    if (opts->rigctl_sockfd != DSD_INVALID_SOCKET) {
-        opts->use_rigctl = 1;
-        return 0;
+    return svc_switch_input(opts, state, dsd_audio_path_input_kind(path), path, NULL, 0);
+}
+
+int
+svc_open_symbol_stream_in(dsd_opts* opts, dsd_state* state, const char* path) {
+    if (!path || !*path) {
+        return DSD_AUDIO_INPUT_KEPT;
     }
-    opts->use_rigctl = 0;
-    return -1;
+    return svc_switch_input(opts, state, DSD_AUDIO_INPUT_SYMBOL_FLT, path, NULL, 0);
+}
+
+int
+svc_open_symbol_in(dsd_opts* opts, dsd_state* state, const char* filename) {
+    if (!filename || !*filename) {
+        return DSD_AUDIO_INPUT_KEPT;
+    }
+    return svc_switch_input(opts, state, DSD_AUDIO_INPUT_SYMBOL_BIN, filename, NULL, 0);
+}
+
+int
+svc_udp_input_config(dsd_opts* opts, dsd_state* state, const char* bindaddr, int port) {
+    return svc_switch_input(opts, state, DSD_AUDIO_INPUT_UDP, NULL, bindaddr, port);
+}
+
+int
+svc_stop_playback(dsd_opts* opts, dsd_state* state) {
+    /* The configured Pulse device (NULL): the one the session runs Pulse on. */
+    return svc_switch_input(opts, state, DSD_AUDIO_INPUT_PULSE, NULL, NULL, 0);
 }
 
 int
@@ -215,6 +260,7 @@ svc_set_p2_params(dsd_state* state, unsigned long long wacn, unsigned long long 
     state->p2_wacn = (wacn > 0xFFFFF) ? 0xFFFFF : wacn;
     state->p2_sysid = (sysid > 0xFFF) ? 0xFFF : sysid;
     state->p2_cc = (cc > 0xFFF) ? 0xFFF : cc;
+    state->p2_cc_verified = 0U; // a seed set by hand proves nothing until a burst decodes with it (issue #575)
     state->p2_hardset = (state->p2_wacn != 0 && state->p2_sysid != 0 && state->p2_cc != 0) ? 1 : 0;
 }
 
@@ -293,16 +339,11 @@ svc_set_pulse_output(dsd_opts* opts, const char* index) {
 }
 
 int
-svc_set_pulse_input(dsd_opts* opts, const char* index) {
-    if (!opts || !index) {
-        return -1;
+svc_set_pulse_input(dsd_opts* opts, dsd_state* state, const char* device) {
+    if (!device) {
+        return DSD_AUDIO_INPUT_KEPT;
     }
-    DSD_SNPRINTF(opts->audio_in_dev, sizeof opts->audio_in_dev, "%s", "pulse");
-    opts->audio_in_type = AUDIO_IN_PULSE;
-    char tmp[128];
-    DSD_SNPRINTF(tmp, sizeof tmp, "%s", index);
-    parse_audio_input_string(opts, tmp);
-    return 0;
+    return svc_switch_input(opts, state, DSD_AUDIO_INPUT_PULSE, device, NULL, 0);
 }
 
 int
@@ -386,7 +427,7 @@ chan_map_adopt(dsd_opts* opts, dsd_state* dst, dsd_state* src) {
         LOG_ERROR("channel map adopt out of memory\n");
         return -1;
     }
-    dsd_engine_channel_scan_leave(opts, dst);
+    (void)svc_leave_channel_scan(opts, dst);
     dsd_scan_keys_leave(dst);
     DSD_MEMCPY(dst->trunk_chan_map, src->trunk_chan_map, sizeof dst->trunk_chan_map);
     DSD_MEMCPY(dst->trunk_chan_map_used, src->trunk_chan_map_used, sizeof dst->trunk_chan_map_used);
@@ -526,7 +567,7 @@ svc_clear_channel_map(dsd_opts* opts, dsd_state* state) {
     DSD_MEMSET(state->trunk_lcn_freq, 0, sizeof state->trunk_lcn_freq);
     // Releases the per-row name, avoid and key stores along with the scan-list heap tail.
     // Clearing the map leaves -Y: hand the foreground keyring back to the globals first.
-    dsd_engine_channel_scan_leave(opts, state);
+    (void)svc_leave_channel_scan(opts, state);
     dsd_scan_keys_leave(state);
     dsd_state_trunk_lcn_free(state);
     state->lcn_freq_count = 0;
@@ -837,6 +878,17 @@ svc_analog_width_in_range(int kind, int width_hz, char* why, size_t why_size) {
     return 0;
 }
 
+/* The width a DSP rate holds for analog @p kind configured at @p width_hz (0 = the kind's default): an explicit width
+   as it is, and the unset AM default as its 6 kHz, since AM always runs its channel filter (issue #524). 0 for the
+   unset NFM default, which keeps its legacy filter rule and which no rate refuses. */
+static int
+svc_analog_held_width_hz(int kind, int width_hz) {
+    if (width_hz > 0) {
+        return width_hz;
+    }
+    return kind == DSD_ANALOG_DEMOD_AM ? dsd_analog_width_default_hz(DSD_ANALOG_DEMOD_AM) : 0;
+}
+
 /* "NFM 25 kHz does not fit the 24 kHz DSP rate (max 20.4 kHz); use a 48 kHz DSP bandwidth": short enough for a
    toast, with both values, the limit and the fix. @p source (dsd_analog_rate_source) says what sets the rate: an
    RTL-SDR or rtl_tcp input's DSP bandwidth, whose fix names the bandwidths that fit; a SoapySDR or Airspy device, whose
@@ -867,24 +919,37 @@ svc_analog_rate_refusal(int kind, int width_hz, int rate_hz, int source, char* w
     }
 }
 
-/* DSD_NEO_CHANNEL_LPF=0 turns off the channel filter every explicit width needs (dsd_analog_channel_lpf_off_check()),
-   whatever the rate. A change that commits to a stream start (a reopen, an input switch, the next start) is held to it
-   first, so the running input is not torn down for a start that refuses the width. The toast is short; the full text,
-   with the fix, goes to the log. */
+/* DSD_NEO_CHANNEL_LPF=0 turns off the channel filter every explicit width, and the unset AM default, need
+   (dsd_analog_channel_lpf_off_check()), whatever the rate. A change that commits to a stream start (a reopen, an input
+   switch, the next start) is held to it first, so the running input is not torn down for a start that refuses the
+   width. @p width_hz is the configured width (0 = the kind's default). The toast is short; the full text, with the
+   fix, goes to the log unless @p log_refusal is 0 (a start that refused the width has logged it already). */
 static int
-svc_analog_width_env_allows(int kind, int width_hz, char* why, size_t why_size) {
+svc_analog_width_env_rule(int kind, int width_hz, int log_refusal, char* why, size_t why_size) {
     const dsdneoRuntimeConfig* env = dsd_neo_get_config();
     const int lpf_off = (env && env->channel_lpf_is_set && env->channel_lpf_enable == 0) ? 1 : 0;
     char err[DSD_ANALOG_ERROR_TEXT_MAX];
-    if (width_hz <= 0 || dsd_analog_channel_lpf_off_check(kind, width_hz, lpf_off, err, sizeof err) == 0) {
+    if (svc_analog_held_width_hz(kind, width_hz) <= 0
+        || dsd_analog_channel_lpf_off_check(kind, width_hz, lpf_off, err, sizeof err) == 0) {
         return 1;
     }
     char width[DSD_ANALOG_WIDTH_TEXT_MAX];
-    (void)dsd_analog_width_format(width_hz, width, sizeof width);
-    svc_why(why, why_size, "%s %s needs the channel filter, which DSD_NEO_CHANNEL_LPF=0 turns off",
-            dsd_analog_demod_label(kind), width);
-    LOG_WARN("%s.\n", err);
+    if (width_hz > 0 && dsd_analog_width_format(width_hz, width, sizeof width) == 0) {
+        svc_why(why, why_size, "%s %s needs the channel filter, which DSD_NEO_CHANNEL_LPF=0 turns off",
+                dsd_analog_demod_label(kind), width);
+    } else {
+        svc_why(why, why_size, "%s needs the channel filter, which DSD_NEO_CHANNEL_LPF=0 turns off",
+                dsd_analog_demod_label(kind));
+    }
+    if (log_refusal) {
+        LOG_WARN("%s.\n", err);
+    }
     return 0;
+}
+
+static int
+svc_analog_width_env_allows(int kind, int width_hz, char* why, size_t why_size) {
+    return svc_analog_width_env_rule(kind, width_hz, 1, why, why_size);
 }
 
 /* An explicit analog width held to an RTL-SDR or rtl_tcp input's DSP bandwidth @p rate_hz (0: no rate to hold it to).
@@ -951,99 +1016,176 @@ svc_channel_map_refused_rows(const dsd_opts* opts, const dsd_state* state, char*
     return refused;
 }
 
+int
+svc_store_analog_width_setting(dsd_opts* opts, const dsd_state* state, int kind, int width_hz) {
+    return dsd_scan_mode_set_configured_analog_width(opts, state, kind, width_hz) == 1 ? 1 : 0;
+}
+
 void
-svc_describe_nfm_refusal(const dsd_opts* opts, int width_hz, char* why, size_t why_size) {
+svc_describe_analog_refusal(const dsd_opts* opts, int kind, int width_hz, char* why, size_t why_size) {
+    /* The unset AM default is the 6 kHz filter AM runs; the unset NFM default refuses for no rate, so its text is the
+       default's own width. */
+    const int held_hz = svc_analog_held_width_hz(kind, width_hz);
+    const int shown_hz = held_hz > 0 ? held_hz : dsd_analog_width_default_hz(kind);
+    const char* label = dsd_analog_demod_label(kind);
     char width[DSD_ANALOG_WIDTH_TEXT_MAX];
-    (void)dsd_analog_width_format(width_hz, width, sizeof width);
+    (void)dsd_analog_width_format(shown_hz, width, sizeof width);
     if (!opts) {
-        svc_why(why, why_size, "the RTL front end refused NFM %s (see log)", width);
+        svc_why(why, why_size, "the RTL front end refused %s %s (see log)", label, width);
         return;
     }
 #ifdef USE_RADIO
     const int rtl_rate_hz = svc_rtl_bw_dsp_rate_hz(opts, opts->rtl_dsp_bw_khz);
     const int rate_hz = rtl_rate_hz > 0 ? rtl_rate_hz : rtl_stream_get_demod_rate_hz();
-    if (rate_hz > 0 && !dsd_analog_width_realizable(width_hz, rate_hz)) {
-        svc_analog_rate_refusal(DSD_ANALOG_DEMOD_FM, width_hz, rate_hz,
+    if (rate_hz > 0 && held_hz > 0 && !dsd_analog_width_realizable(held_hz, rate_hz)) {
+        svc_analog_rate_refusal(kind, held_hz, rate_hz,
                                 rtl_rate_hz > 0 ? DSD_ANALOG_RATE_RTL_BW : dsd_opts_analog_rate_source(opts), why,
                                 why_size);
         return;
     }
 #endif
-    svc_why(why, why_size, "the RTL front end refused NFM %s (see log)", width);
+    svc_why(why, why_size, "the RTL front end refused %s %s (see log)", label, width);
 }
 
-/* Whether the scan row on air sets its own NFM width (--nfm-bandwidth-hz, issue #526), which is in force over the
-   configured one until the row leaves. */
-static int
-svc_row_sets_nfm_width(const dsd_state* state) {
-    const dsd_scan_option_values* row = dsd_scan_mode_row_options(state);
-    return row && (row->present & DSD_SCAN_OPT_BANDWIDTH) != 0U;
-}
-
-/* The NFM width is in use while the configured -fA preset runs FM (the scan scope's configured view: a typed digital
-   row on an analog session returns to the monitor when it ends), and on any session while the scan has an nfm row or
-   target that sets no width of its own (issue #526), which runs it whenever it is on air: an edit made while another
-   row is on air is held to the rate as well, rather than accepted and the row skipped at every visit. Only a scanner
-   puts such a row on air, from the map or list it visits, and it leaves the row before that map or list changes, so
-   the scanner's answer covers the row on air too (dsd_engine_scan_runs_configured_nfm_width()). The M17 encoder's
-   monitor path never uses it. */
-static int
-svc_nfm_width_in_use(const dsd_opts* opts, const dsd_state* state) {
-    const dsd_scan_settings* configured = dsd_scan_mode_configured_view(state);
-    const int analog_only = configured ? configured->analog_only : opts->analog_only;
-    const int kind = configured ? configured->analog_demod : opts->analog_demod;
-    if (analog_only == 1 && opts->m17encoder != 1 && kind == DSD_ANALOG_DEMOD_FM) {
-        return 1;
+/* What the monitor runs after a refused return to it (@p runs_hz, svc_describe_monitor_return_refusal()), for the end
+   of its toast: the width it kept, the kind's default, or, when the default was refused too, @p default_refused (said
+   only when the refused width, @p width_hz, was not that default). */
+static void
+svc_monitor_return_runs(const char* label, int width_hz, int runs_hz, const char* default_refused, char* runs,
+                        size_t runs_size) {
+    runs[0] = '\0';
+    if (runs_hz > 0) {
+        char kept[DSD_ANALOG_WIDTH_TEXT_MAX];
+        (void)dsd_analog_width_format(runs_hz, kept, sizeof kept);
+        DSD_SNPRINTF(runs, runs_size, "; the monitor keeps %s %s", label, kept);
+    } else if (runs_hz == 0) {
+        DSD_SNPRINTF(runs, runs_size, "; the monitor is back on the %s default", label);
+    } else if (width_hz > 0) {
+        DSD_SNPRINTF(runs, runs_size, "; the %s default %s", label, default_refused);
     }
-    return dsd_engine_scan_runs_configured_nfm_width(opts, state);
 }
 
 void
-svc_restore_nfm_width(dsd_opts* opts, const dsd_state* state, int kept_hz, int configured_before_hz) {
-    if (!opts) {
+svc_describe_monitor_return_refusal(const dsd_opts* opts, int kind, int width_hz, int runs_hz, char* why,
+                                    size_t why_size) {
+    const int held_hz = svc_analog_held_width_hz(kind, width_hz);
+    const char* label = dsd_analog_demod_label(kind);
+    char width[DSD_ANALOG_WIDTH_TEXT_MAX];
+    (void)dsd_analog_width_format(held_hz > 0 ? held_hz : dsd_analog_width_default_hz(kind), width, sizeof width);
+    char runs[DSD_ANALOG_WIDTH_TEXT_MAX + 48];
+#ifdef USE_RADIO
+    /* The rate the scan left the front end on, which a row's retune can have moved off the DSP bandwidth: the one the
+       stream holds requests to from the moment a retune or start settles it (rtl_stream_get_request_rate_hz()), not
+       the one rtl_dsp_bw_khz gives (svc_describe_analog_refusal()), nor the metrics rate, which follows only with the
+       next I/Q block. */
+    const int rate_hz = (opts && opts->audio_in_type == AUDIO_IN_RTL) ? rtl_stream_get_request_rate_hz() : 0;
+    if (rate_hz > 0 && held_hz > 0 && !dsd_analog_width_realizable(held_hz, rate_hz)) {
+        char rate[DSD_ANALOG_WIDTH_TEXT_MAX];
+        (void)dsd_analog_width_format(rate_hz, rate, sizeof rate);
+        svc_monitor_return_runs(label, width_hz, runs_hz, "does not fit it either", runs, sizeof runs);
+        svc_why(why, why_size, "%s %s does not fit the %s DSP rate%s", label, width, rate, runs);
+        return;
+    }
+#else
+    (void)opts;
+#endif
+    /* A refusal the rate does not explain (no rate published, or one the width fits) points at the log. */
+    svc_monitor_return_runs(label, width_hz, runs_hz, "is refused too", runs, sizeof runs);
+    svc_why(why, why_size, "the RTL front end refused %s %s (see log)%s", label, width, runs);
+}
+
+/* Whether the scan row on air sets its own width of analog @p kind (--nfm-bandwidth-hz on an nfm row, --am-bandwidth-hz
+   on an am row, issue #526), which is in force over the configured one until the row leaves. */
+static int
+svc_row_sets_width(const dsd_state* state, int kind) {
+    const dsd_scan_option_values* row = dsd_scan_mode_row_options(state);
+    return row && (row->present & DSD_SCAN_OPT_BANDWIDTH) != 0U
+           && (row->channel_bw_kind == DSD_ANALOG_DEMOD_AM) == (kind == DSD_ANALOG_DEMOD_AM);
+}
+
+/* Whether the scan has an analog row or target of @p kind that sets no width of its own, and so runs the configured
+   width of that kind whenever it is on air (issue #526): dsd_engine_scan_runs_configured_nfm_width() or _am_width(). */
+static int
+svc_scan_runs_configured_width(const dsd_opts* opts, const dsd_state* state, int kind) {
+    return kind == DSD_ANALOG_DEMOD_AM ? dsd_engine_scan_runs_configured_am_width(opts, state)
+                                       : dsd_engine_scan_runs_configured_nfm_width(opts, state);
+}
+
+/* The width of analog @p kind is in use while the configured analog preset runs that kind (the scan scope's configured
+   view: a typed digital row on an analog session returns to the monitor when it ends), and on any session while the
+   scan has an nfm or am row or target of that kind that sets no width of its own (issue #526), which runs it whenever
+   it is on air: an edit made while another row is on air is held to the rate as well, rather than accepted and the row
+   skipped at every visit. Only a scanner puts such a row on air, from the map or list it visits, and it leaves the row
+   before that map or list changes, so the scanner's answer covers the row on air too
+   (svc_scan_runs_configured_width()). The M17 encoder's monitor path never uses it. */
+static int
+svc_analog_width_in_use(const dsd_opts* opts, const dsd_state* state, int kind) {
+    const dsd_scan_settings* configured = dsd_scan_mode_configured_view(state);
+    const int analog_only = configured ? configured->analog_only : opts->analog_only;
+    const int configured_kind = configured ? configured->analog_demod : opts->analog_demod;
+    if (analog_only == 1 && opts->m17encoder != 1 && configured_kind == kind) {
+        return 1;
+    }
+    return svc_scan_runs_configured_width(opts, state, kind);
+}
+
+void
+svc_restore_analog_width(dsd_opts* opts, const dsd_state* state, int kind, int kept_hz, int configured_before_hz) {
+    if (!opts || !dsd_analog_demod_is_valid(kind)) {
         return;
     }
     if (!dsd_scan_mode_configured_view(state)) {
-        (void)dsd_scan_mode_set_configured_nfm_bandwidth(opts, state, kept_hz);
+        (void)svc_store_analog_width_setting(opts, state, kind, kept_hz);
         return;
     }
     /* Under a scan row the width the front end kept can be a row's own (the row on air's, or the one a retune in flight
        had not moved it off yet): the configured width only goes back to its own value from before the change. */
     if (configured_before_hz >= 0) {
-        (void)dsd_scan_mode_set_configured_nfm_bandwidth(opts, state, configured_before_hz);
+        (void)svc_store_analog_width_setting(opts, state, kind, configured_before_hz);
     }
-    if (svc_row_sets_nfm_width(state)) {
+    if (svc_row_sets_width(state, kind)) {
         /* The row's own width was the one refused: the configured one never reached the front end. */
-        opts->analog_nfm_bandwidth_hz = kept_hz;
+        if (kind == DSD_ANALOG_DEMOD_AM) {
+            opts->analog_am_bandwidth_hz = kept_hz;
+        } else {
+            opts->analog_nfm_bandwidth_hz = kept_hz;
+        }
     }
 }
 
 int
-svc_check_nfm_bandwidth(const dsd_opts* opts, const dsd_state* state, int width_hz, char* why, size_t why_size) {
+svc_check_analog_bandwidth(const dsd_opts* opts, const dsd_state* state, int kind, int width_hz, char* why,
+                           size_t why_size) {
     svc_why(why, why_size, "%s", "");
-    if (!opts || !svc_analog_width_in_range(DSD_ANALOG_DEMOD_FM, width_hz, why, why_size)) {
+    if (!opts || !dsd_analog_demod_is_valid(kind) || !svc_analog_width_in_range(kind, width_hz, why, why_size)) {
         return -1;
     }
-    if (width_hz == 0) {
-        return 0; /* the unset default keeps the historical filter rule and is never refused for its rate */
+    const int held_hz = svc_analog_held_width_hz(kind, width_hz);
+    if (held_hz == 0) {
+        return 0; /* the unset NFM default keeps the historical filter rule and is never refused for its rate */
     }
     /* No channel filter runs on PCM input, which takes the width as stored and unused (as a PCM start does): only a
-       radio input needs the filter DSD_NEO_CHANNEL_LPF=0 turns off, and a switch onto one holds the width to it
-       (svc_check_rtl_input_analog_width()). */
-    if (dsd_opts_input_is_radio(opts) && !svc_analog_width_env_allows(DSD_ANALOG_DEMOD_FM, width_hz, why, why_size)) {
+       radio input needs the filter DSD_NEO_CHANNEL_LPF=0 turns off and runs at a DSP rate, and a switch onto one holds
+       the width to both (svc_check_rtl_input_analog_width(); an Airspy, which sets its own rate, to the environment
+       first, svc_check_airspy_input_analog_width()). A PCM input a live switch put an RTL session on keeps
+       the RTL device string, whose DSP bandwidth is no rate that input runs at. */
+    if (!dsd_opts_input_is_radio(opts)) {
+        return 0;
+    }
+    if (!svc_analog_width_env_allows(kind, width_hz, why, why_size)) {
         return -1;
     }
 #ifdef USE_RADIO
     if (svc_rtl_stream_running(opts, state)) {
         /* The front end logs a refusal with the validator's text itself. */
-        if (rtl_stream_check_analog_profile(DSD_RX_FAMILY_ANALOG, DSD_ANALOG_DEMOD_FM, width_hz) == 0) {
+        if (rtl_stream_check_analog_profile(DSD_RX_FAMILY_ANALOG, kind, width_hz) == 0) {
             return 0;
         }
-        svc_describe_nfm_refusal(opts, width_hz, why, why_size);
+        svc_describe_analog_refusal(opts, kind, width_hz, why, why_size);
         return -1;
     }
-    if (!svc_analog_width_fits_rtl_rate(DSD_ANALOG_DEMOD_FM, width_hz,
-                                        svc_rtl_bw_dsp_rate_hz(opts, opts->rtl_dsp_bw_khz), why, why_size)) {
+    if (!svc_analog_width_fits_rtl_rate(kind, held_hz, svc_rtl_bw_dsp_rate_hz(opts, opts->rtl_dsp_bw_khz), why,
+                                        why_size)) {
         return -1;
     }
 #else
@@ -1053,23 +1195,24 @@ svc_check_nfm_bandwidth(const dsd_opts* opts, const dsd_state* state, int width_
 }
 
 int
-svc_check_nfm_bandwidth_at_device_rate(int width_hz, char* why, size_t why_size) {
+svc_check_analog_bandwidth_at_device_rate(int kind, int width_hz, char* why, size_t why_size) {
     svc_why(why, why_size, "%s", "");
-    return (svc_analog_width_in_range(DSD_ANALOG_DEMOD_FM, width_hz, why, why_size)
-            && svc_analog_width_env_allows(DSD_ANALOG_DEMOD_FM, width_hz, why, why_size))
+    return (dsd_analog_demod_is_valid(kind) && svc_analog_width_in_range(kind, width_hz, why, why_size)
+            && svc_analog_width_env_allows(kind, width_hz, why, why_size))
                ? 0
                : -1;
 }
 
 int
-svc_check_nfm_bandwidth_for_rtl_bw(int width_hz, int rtl_bw_khz, char* why, size_t why_size) {
-    if (svc_check_nfm_bandwidth_at_device_rate(width_hz, why, why_size) != 0) {
+svc_check_analog_bandwidth_for_rtl_bw(int kind, int width_hz, int rtl_bw_khz, char* why, size_t why_size) {
+    if (svc_check_analog_bandwidth_at_device_rate(kind, width_hz, why, why_size) != 0) {
         return -1;
     }
     /* The reopened device is an RTL-SDR or rtl_tcp one, whose rate is its DSP bandwidth: saturated, never overflowed,
        for a loaded config's out-of-range rtl_bw_khz, which no width then fits. */
     const int rate_hz = dsd_app_analog_rtl_bw_rate_hz("rtl", AUDIO_IN_RTL, rtl_bw_khz);
-    if (width_hz == 0 || rate_hz <= 0 || dsd_analog_width_realizable(width_hz, rate_hz)) {
+    const int held_hz = svc_analog_held_width_hz(kind, width_hz);
+    if (held_hz == 0 || rate_hz <= 0 || dsd_analog_width_realizable(held_hz, rate_hz)) {
         return 0;
     }
     if (rtl_bw_khz > DSD_ANALOG_RTL_DSP_BW_MAX_KHZ) {
@@ -1077,67 +1220,173 @@ svc_check_nfm_bandwidth_for_rtl_bw(int width_hz, int rtl_bw_khz, char* why, size
            rate to name: the setting is what is wrong. */
         char fits[32];
         char text[128];
-        (void)dsd_analog_width_fitting_rtl_bandwidths(width_hz, fits, sizeof fits);
+        (void)dsd_analog_width_fitting_rtl_bandwidths(held_hz, fits, sizeof fits);
         DSD_SNPRINTF(text, sizeof text, "rtl_bw_khz %d is not a DSP bandwidth; use a %s kHz DSP bandwidth", rtl_bw_khz,
                      fits);
         svc_why(why, why_size, "%s", text);
         LOG_WARN("%s.\n", text);
         return -1;
     }
-    return svc_analog_width_fits_rtl_rate(DSD_ANALOG_DEMOD_FM, width_hz, rate_hz, why, why_size) ? 0 : -1;
+    return svc_analog_width_fits_rtl_rate(kind, held_hz, rate_hz, why, why_size) ? 0 : -1;
 }
 
 int
-svc_set_nfm_bandwidth(dsd_opts* opts, const dsd_state* state, int width_hz, char* why, size_t why_size) {
+svc_set_analog_bandwidth(dsd_opts* opts, const dsd_state* state, int kind, int width_hz, int guarded, char* why,
+                         size_t why_size) {
     svc_why(why, why_size, "%s", "");
-    if (!opts || !state || !svc_analog_width_in_range(DSD_ANALOG_DEMOD_FM, width_hz, why, why_size)) {
+    if (!opts || !state || !dsd_analog_demod_is_valid(kind)
+        || !svc_analog_width_in_range(kind, width_hz, why, why_size)) {
         return -1;
     }
-    if (svc_nfm_width_in_use(opts, state) && svc_check_nfm_bandwidth(opts, state, width_hz, why, why_size) != 0) {
+    if (svc_analog_width_in_use(opts, state, kind)
+        && svc_check_analog_bandwidth(opts, state, kind, width_hz, why, why_size) != 0) {
         return -1;
     }
-    const int previous_hz = dsd_scan_mode_configured_analog_width(opts, state, DSD_ANALOG_DEMOD_FM);
+    const svc_rigctl_session before = svc_rigctl_session_now(opts, state);
+    const int previous_hz = dsd_scan_mode_configured_analog_width(opts, state, kind);
     /* The configured width, without suspending a scan row (issue #526): a row that sets its own width keeps it in force
        until it leaves, and nothing reaches the front end until then. */
-    if (dsd_scan_mode_set_configured_nfm_bandwidth(opts, state, width_hz) == 1
-        && svc_publish_nfm_bandwidth(opts, state, previous_hz) != 0) {
+    if (svc_store_analog_width_setting(opts, state, kind, width_hz) == 1
+        && svc_publish_analog_bandwidth(opts, state, kind, previous_hz) != 0) {
         /* The front end refused the request after all: the rate moved since the check (a retune). */
-        (void)dsd_scan_mode_set_configured_nfm_bandwidth(opts, state, previous_hz);
-        svc_describe_nfm_refusal(opts, width_hz, why, why_size);
+        (void)svc_store_analog_width_setting(opts, state, kind, previous_hz);
+        svc_describe_analog_refusal(opts, kind, width_hz, why, why_size);
         return -1;
     }
-    return 0;
+    /* On audio input a rigctl peer demodulates, and the width is the passband it is asked for while the monitor of
+       that kind runs (issue #621): asked at once, as the front end is, rather than at the next retune, and asked again
+       when resubmitted unchanged, since a refused transition can have left the peer off it. */
+    if (svc_rigctl_follow_edit(opts, state, &before, kind, guarded) >= 0) {
+        return 0;
+    }
+    /* Refused, or the reply lost: the width goes back, and the peer, which may run either passband, is asked for the
+       one the session runs again. Asked as the edit was, whether or not the request changed: a retry of the width in
+       force goes back to the very same request, and only the peer record knows whether the peer runs it (it does not
+       after a lost reply). */
+    const svc_rigctl_session refused = svc_rigctl_session_now(opts, state);
+    (void)svc_store_analog_width_setting(opts, state, kind, previous_hz);
+    (void)svc_rigctl_follow_edit(opts, state, &refused, kind, guarded);
+    char setting[DSD_APP_ANALOG_WIDTH_TEXT_MAX];
+    (void)dsd_app_analog_width_setting_format(width_hz, setting, sizeof setting);
+    svc_why(why, why_size, "%s bandwidth -> %s: the rigctl peer refused the passband", dsd_analog_demod_label(kind),
+            setting);
+    return -1;
+}
+
+int
+svc_apply_rigctl_setmod_bw(dsd_opts* opts, const dsd_state* state, int hz, int guarded, char* why, size_t why_size) {
+    svc_why(why, why_size, "%s", "");
+    if (!opts) {
+        svc_why(why, why_size, "%s", "Rigctl setmod BW: no decoder options to set it in");
+        return -1;
+    }
+    const svc_rigctl_session before = svc_rigctl_session_now(opts, state);
+    const int previous_hz = opts->setmod_bw;
+    svc_set_rigctl_setmod_bw(opts, hz);
+    /* -B is what the FM monitor asks a rigctl peer for while no NFM width is in force (issue #621), asked whenever it
+       is edited there; elsewhere -B waits for the next tune. */
+    if (svc_rigctl_follow_edit(opts, state, &before, SVC_RIGCTL_EDIT_SETMOD_BW, guarded) >= 0) {
+        return 0;
+    }
+    /* As for a width: -B goes back, and the peer is asked again as the edit was, a retry of the -B in force
+       included. */
+    const int refused_hz = opts->setmod_bw;
+    const svc_rigctl_session refused = svc_rigctl_session_now(opts, state);
+    opts->setmod_bw = previous_hz;
+    (void)svc_rigctl_follow_edit(opts, state, &refused, SVC_RIGCTL_EDIT_SETMOD_BW, guarded);
+    svc_why(why, why_size, "Rigctl setmod BW -> %d Hz: the rigctl peer refused the passband", refused_hz);
+    return -1;
 }
 
 #ifdef USE_RADIO
 
-/* The explicit analog width a DSP rate is held to, 0 for none: the configured analog preset's own kind and width
-   (app_control's analog width view shows the preset), so a scan row on an analog session, whose leave returns to the
-   monitor, still holds it: a typed digital row, or an nfm row (issue #526) on a session whose preset runs another
+/* Whether an analog width is held to a DSP rate: 1 with its kind and configured width (0 = the kind's default), which
+   svc_analog_held_width_hz() turns into the width a DSP rate is held to. The configured analog preset's own kind and
+   width (app_control's analog width view shows the preset), so a scan row on an analog session, whose leave returns to
+   the monitor, still holds it: a typed digital row, or an nfm row (issue #526) on a session whose preset runs another
    demodulator (AM), which runs FM at a width of its own meanwhile and is held to the rate apart. On any other session,
    the configured NFM width while the scan has an nfm row or target without a width of its own, which runs it when it
-   comes on air. */
+   comes on air. 0 otherwise, with the unset NFM default, which holds nothing. The configured AM width the scan's am
+   rows or targets run is held beside whichever this returns (svc_scan_width_beside_preset(), issue #526). */
 static int
-svc_configured_analog_width(const dsd_opts* opts, const dsd_state* state, int* kind) {
+svc_configured_analog_width(const dsd_opts* opts, const dsd_state* state, int* kind, int* configured_hz) {
     dsd_app_analog_width_view view;
     (void)dsd_app_analog_width_view_get(opts, state, NULL, &view);
     if (view.shown) {
         const dsd_scan_settings* configured = dsd_scan_mode_configured_view(state);
         *kind = configured ? configured->analog_demod : opts->analog_demod;
-        return dsd_scan_mode_configured_analog_width(opts, state, *kind);
+        *configured_hz = dsd_scan_mode_configured_analog_width(opts, state, *kind);
+        return 1;
     }
     *kind = DSD_ANALOG_DEMOD_FM;
-    return dsd_engine_scan_runs_configured_nfm_width(opts, state)
-               ? dsd_scan_mode_configured_analog_width(opts, state, DSD_ANALOG_DEMOD_FM)
-               : 0;
+    *configured_hz = 0;
+    if (!dsd_engine_scan_runs_configured_nfm_width(opts, state)) {
+        return 0;
+    }
+    *configured_hz = dsd_scan_mode_configured_analog_width(opts, state, DSD_ANALOG_DEMOD_FM);
+    return 1;
 }
 
-/* Whether an explicit analog width @p width_hz of @p kind (0: none) can open at @p rate_hz (0: no rate to hold it to). */
+/* Whether a DSP rate holds the configured width of analog @p row_kind beside the configured preset's own width
+   (@p preset_kind, which holds its own): on a session whose preset runs another kind (AM, issue #524) or none, the
+   scan's nfm or am rows or targets without a width of their own run the configured width of their kind whenever they
+   come on air (svc_scan_runs_configured_width()), the AM default included, which AM holds as its 6 kHz. */
 static int
-svc_rtl_input_width_fits(int kind, int width_hz, int rate_hz, char* why, size_t why_size) {
-    return width_hz <= 0
-           || (svc_analog_width_env_allows(kind, width_hz, why, why_size)
-               && svc_analog_width_fits_rtl_rate(kind, width_hz, rate_hz, why, why_size));
+svc_scan_width_beside_preset(const dsd_opts* opts, const dsd_state* state, int preset_kind, int row_kind) {
+    return row_kind != preset_kind && svc_scan_runs_configured_width(opts, state, row_kind);
+}
+
+/* Whether analog width @p configured_hz of @p kind (0 = the kind's default) can open at @p rate_hz (0: no rate to hold
+   it to, only the rules every rate shares). The unset NFM default always can. */
+static int
+svc_input_width_fits(int kind, int configured_hz, int rate_hz, char* why, size_t why_size) {
+    const int held_hz = svc_analog_held_width_hz(kind, configured_hz);
+    return held_hz <= 0
+           || (svc_analog_width_env_allows(kind, configured_hz, why, why_size)
+               && svc_analog_width_fits_rtl_rate(kind, held_hz, rate_hz, why, why_size));
+}
+
+/* The analog widths an input switch opens a stream with, held to @p rate_hz, the rate the RTL DSP bandwidth gives the
+   device it opens (0: a device that sets its own rate, against which its start checks the width in force; only the
+   rules every rate shares). */
+static int
+svc_check_input_analog_width_at(const dsd_opts* opts, const dsd_state* state, int rate_hz, char* why, size_t why_size) {
+    int kind = DSD_ANALOG_DEMOD_FM;
+    int configured_hz = 0;
+    (void)svc_configured_analog_width(opts, state, &kind, &configured_hz);
+    if (!svc_input_width_fits(kind, configured_hz, rate_hz, why, why_size)) {
+        return -1;
+    }
+    for (int row_kind = DSD_ANALOG_DEMOD_FM; row_kind <= DSD_ANALOG_DEMOD_AM; row_kind++) {
+        if (svc_scan_width_beside_preset(opts, state, kind, row_kind)
+            && !svc_input_width_fits(row_kind, dsd_scan_mode_configured_analog_width(opts, state, row_kind), rate_hz,
+                                     why, why_size)) {
+            return -1;
+        }
+    }
+    /* The switch is unscoped, so the stream it opens starts on the settings in force: while a scan row runs the analog
+       family with another width (an nfm or am row's own, issue #526), that width is held as well. */
+    const int in_force_hz = dsd_opts_analog_width_hz(opts);
+    if (!dsd_opts_is_analog_family(opts) || (in_force_hz == configured_hz && opts->analog_demod == kind)) {
+        return 0;
+    }
+    return svc_input_width_fits(opts->analog_demod, in_force_hz, rate_hz, why, why_size) ? 0 : -1;
+}
+
+void
+svc_rtl_row_destination(const dsd_opts* opts, char* out, size_t out_size) {
+    if (!out || out_size == 0U) {
+        return;
+    }
+    const char* dev = "rtl";
+    if (opts && dsd_opts_audio_in_dev_is_radio_spec(opts->audio_in_dev)
+        && !dsd_opts_audio_in_dev_is_airspy_spec(opts->audio_in_dev)) {
+        dev = opts->audio_in_dev;
+    } else if (opts && dsd_opts_audio_in_dev_is_radio_spec(opts->radio_in_dev)
+               && !dsd_opts_audio_in_dev_is_airspy_spec(opts->radio_in_dev)) {
+        dev = opts->radio_in_dev;
+    }
+    DSD_SNPRINTF(out, out_size, "%s", dev);
 }
 
 int
@@ -1146,33 +1395,107 @@ svc_check_rtl_input_analog_width(const dsd_opts* opts, const dsd_state* state, c
     if (!opts) {
         return -1;
     }
-    int kind = DSD_ANALOG_DEMOD_FM;
-    const int width_hz = svc_configured_analog_width(opts, state, &kind);
-    /* Input > Switch source > RTL-SDR turns an Airspy spec into "rtl" and reopens every other device string but a
-       SoapySDR or I/Q replay one as an RTL-SDR or rtl_tcp device, at its DSP bandwidth. A SoapySDR device may force its
-       own rate and a replay runs at its capture's: their start checks those. */
-    const char* dev = dsd_opts_audio_in_dev_is_airspy_spec(opts->audio_in_dev) ? "rtl" : opts->audio_in_dev;
-    const int rate_hz = dsd_app_analog_rtl_bw_rate_hz(dev, AUDIO_IN_RTL, opts->rtl_dsp_bw_khz);
-    if (!svc_rtl_input_width_fits(kind, width_hz, rate_hz, why, why_size)) {
-        return -1;
-    }
-    /* The switch is unscoped, so the stream it opens starts on the settings in force: while a scan row runs the analog
-       family with another width (an nfm row's own, issue #526), that width is held to the rate as well. */
-    const int in_force_hz = dsd_opts_analog_width_hz(opts);
-    if (!dsd_opts_is_analog_family(opts) || (in_force_hz == width_hz && opts->analog_demod == kind)) {
-        return 0;
-    }
-    return svc_rtl_input_width_fits(opts->analog_demod, in_force_hz, rate_hz, why, why_size) ? 0 : -1;
+    /* Input > Switch source > RTL-SDR opens the device svc_rtl_row_destination() names, as an RTL-SDR or rtl_tcp
+       device at its DSP bandwidth unless it is a SoapySDR or I/Q replay one. A SoapySDR device may force its own rate
+       and a replay runs at its capture's: their start checks those. */
+    char dev[sizeof opts->audio_in_dev];
+    svc_rtl_row_destination(opts, dev, sizeof dev);
+    return svc_check_input_analog_width_at(
+        opts, state, dsd_app_analog_rtl_bw_rate_hz(dev, AUDIO_IN_RTL, opts->rtl_dsp_bw_khz), why, why_size);
 }
 
 int
-svc_rtl_enable_input(dsd_opts* opts, dsd_state* state) {
+svc_check_airspy_input_analog_width(const dsd_opts* opts, const dsd_state* state, char* why, size_t why_size) {
+    svc_why(why, why_size, "%s", "");
+    if (!opts) {
+        return -1;
+    }
+    /* The Airspy delivers its own rate, which its start holds the width in force to. */
+    return svc_check_input_analog_width_at(opts, state, 0, why, why_size);
+}
+
+/* The input a start opens, as the stream classifies its device string (detect_radio_source()). */
+static const char*
+svc_radio_input_label(const dsd_opts* opts) {
+    const char* dev = opts->audio_in_dev;
+    if (dsd_opts_audio_in_dev_is_airspy_spec(dev)) {
+        return "Airspy";
+    }
+    if (dsd_opts_audio_in_dev_is_soapy_spec(dev)) {
+        return "SoapySDR";
+    }
+    if (dsd_opts_audio_in_dev_is_rtltcp_spec(dev)) {
+        return "rtl_tcp";
+    }
+    if (dsd_opts_audio_in_dev_is_iqreplay_spec(dev)) {
+        return "I/Q replay";
+    }
+    return "RTL-SDR";
+}
+
+/* Why the input @p opts describes refused analog @p kind at @p width_hz (0 = the kind's default) at @p rate_hz, the DSP
+   rate it delivers (0: none known), which its stream logged in full: the width's range, the environment rule, or the
+   width against that rate with the fix for what sets it; a width the rate fits, refused for a reason the log gives (a
+   replay that decimates after the demodulator), points at the log. */
+static void
+svc_describe_input_width_refusal(const dsd_opts* opts, int kind, int width_hz, int rate_hz, char* why,
+                                 size_t why_size) {
+    if (!svc_analog_width_in_range(kind, width_hz, why, why_size)
+        || !svc_analog_width_env_rule(kind, width_hz, 0, why, why_size)) {
+        return;
+    }
+    const int held_hz = svc_analog_held_width_hz(kind, width_hz);
+    if (held_hz > 0 && rate_hz > 0 && !dsd_analog_width_realizable(held_hz, rate_hz)) {
+        svc_analog_rate_refusal(kind, held_hz, rate_hz, dsd_opts_analog_rate_source(opts), why, why_size);
+        return;
+    }
+    char width[DSD_ANALOG_WIDTH_TEXT_MAX];
+    (void)dsd_analog_width_format(held_hz > 0 ? held_hz : dsd_analog_width_default_hz(kind), width, sizeof width);
+    svc_why(why, why_size, "the %s input refused %s %s (see log)", svc_radio_input_label(opts),
+            dsd_analog_demod_label(kind), width);
+}
+
+int
+svc_describe_start_failure(const dsd_opts* opts, char* why, size_t why_size) {
+    svc_why(why, why_size, "%s", "");
+    if (!opts) {
+        return 0;
+    }
+    int kind = DSD_ANALOG_DEMOD_FM;
+    int width_hz = 0;
+    int rate_hz = 0;
+    if (rtl_stream_start_analog_refusal(&kind, &width_hz, &rate_hz) != 1) {
+        svc_why(why, why_size, "the %s input did not start (see log)", svc_radio_input_label(opts));
+        return 0;
+    }
+    svc_describe_input_width_refusal(opts, kind, width_hz, rate_hz, why, why_size);
+    return 1;
+}
+
+int
+svc_check_started_stream_analog(const dsd_opts* opts, int kind, int width_hz, char* why, size_t why_size) {
+    svc_why(why, why_size, "%s", "");
+    if (!opts || !dsd_analog_demod_is_valid(kind)) {
+        return -1;
+    }
+    /* The stream logs a refusal with the validator's text itself. */
+    if (rtl_stream_check_analog_profile(DSD_RX_FAMILY_ANALOG, kind, width_hz) == 0) {
+        return 0;
+    }
+    /* The rate the new stream published when it started: the demod thread's metrics rate can still be the stream's
+       before it until its first block. */
+    svc_describe_input_width_refusal(opts, kind, width_hz, rtl_stream_get_request_rate_hz(), why, why_size);
+    return -1;
+}
+
+int
+svc_rtl_enable_input_locked(dsd_opts* opts, dsd_state* state) {
     if (!opts || !state) {
         return -1;
     }
     opts->audio_in_type = AUDIO_IN_RTL;
     /* Ensure an RTL stream is ready immediately when switching inputs. */
-    return svc_rtl_restart(opts, state);
+    return svc_rtl_restart_locked(opts, state);
 }
 
 int
@@ -1189,14 +1512,13 @@ svc_rtl_restart(dsd_opts* opts, dsd_state* state) {
     return result;
 }
 
-int
-svc_rtl_restart_locked(dsd_opts* opts, dsd_state* state) {
-    if (!opts || !state) {
-        return -1;
-    }
-    int result = 0;
-
-    /* Stop and destroy any existing stream context. */
+/* Stop and destroy any existing stream context. An I/Q replay stopped here restarts from the capture's first sample, if
+   at all, so its decode time can no longer follow the capture: the decode clock goes back to the system clock with the
+   stream stopped (issue #572). When the input is still that replay, the restart replays it on the system clock, which
+   is logged once, at the leave. The replay centre the decoder last read goes with the stream (issue #575): every stop,
+   restart, input switch and rollback comes here, so a live radio that replaces the replay reads its own centre. */
+static void
+svc_rtl_stop_locked(dsd_opts* opts, dsd_state* state) {
     if (state->rtl_ctx) {
         rtl_stream_stop(state->rtl_ctx);
         rtl_stream_destroy(state->rtl_ctx);
@@ -1204,26 +1526,155 @@ svc_rtl_restart_locked(dsd_opts* opts, dsd_state* state) {
     }
     opts->rtl_started = 0;
     opts->rtl_needs_restart = 0;
-
-    /* If the radio pipeline is the active input, immediately recreate and start the stream
-       so changes take effect as soon as the user confirms the setting. */
-    if (opts->audio_in_type == AUDIO_IN_RTL) {
-        if (rtl_stream_create(opts, &state->rtl_ctx) < 0) {
-            result = -1;
-            goto done;
-        }
-        if (rtl_stream_start(state->rtl_ctx) < 0) {
-            rtl_stream_destroy(state->rtl_ctx);
-            state->rtl_ctx = NULL;
-            result = -1;
-            goto done;
-        }
-        opts->rtl_started = 1;
-        opts->rtl_needs_restart = 0;
+    dsd_opts_forget_iq_replay_center(opts);
+    const int leaves_replay = dsd_decode_clock_source() == DSD_DECODE_CLOCK_REPLAY;
+    dsd_engine_decode_clock_leave_replay(opts, state);
+    if (leaves_replay && opts->audio_in_type == AUDIO_IN_RTL && opts->iq_replay_requested
+        && dsd_opts_audio_in_dev_is_iqreplay_spec(opts->audio_in_dev)) {
+        LOG_INFO("IQ replay restarted mid-run; decode timestamps now follow the system clock.\n");
     }
+}
 
-done:
-    return result;
+/* A stream opens with the operator's last tuner autogain setting or the environment default. Under --trunk-scan the
+   scan's configured setting rules instead, as every retune's gain profile applies it: off under a manual gain, the
+   configured one under AGC (issue #518 follow-up), so a restart leaves the supervisor as the gain readout says. It is
+   enforced for the scan only (rtl_stream_enforce_tuner_autogain()), never recorded as the operator's setting. Airspy
+   runs no supervisor. */
+static void
+svc_apply_scan_autogain(const dsd_opts* opts, const dsd_state* state) {
+    int configured = 0;
+    if (dsd_opts_audio_in_dev_is_airspy_spec(opts->audio_in_dev)
+        || !dsd_engine_trunk_scan_saved_tuner_autogain(state, &configured)) {
+        return;
+    }
+    rtl_stream_enforce_tuner_autogain(opts->rtl_gain_value > 0 ? 0 : configured);
+}
+
+/* If the radio pipeline is the active input, create and start the stream so changes take effect as soon as the user
+   confirms the setting; nothing to start otherwise. Returns 0 then, or when the stream started. */
+static int
+svc_rtl_start_locked(dsd_opts* opts, dsd_state* state) {
+    if (opts->audio_in_type != AUDIO_IN_RTL) {
+        return 0;
+    }
+    if (rtl_stream_create(opts, &state->rtl_ctx) < 0) {
+        return -1;
+    }
+    if (rtl_stream_start(state->rtl_ctx) < 0) {
+        rtl_stream_destroy(state->rtl_ctx);
+        state->rtl_ctx = NULL;
+        return -1;
+    }
+    opts->rtl_started = 1;
+    opts->rtl_needs_restart = 0;
+    ++g_svc_rtl_starts;
+    svc_apply_scan_autogain(opts, state);
+    /* A stream on another source than the one before it is another carrier (issue #575): every start comes here, so a
+       command that changes the source and restarts needs no boundary of its own. Callers hold the P25 SM tick guard. */
+    dsd_engine_note_stream_source(opts, state, 1);
+    return 0;
+}
+
+int
+svc_rtl_restart_locked(dsd_opts* opts, dsd_state* state) {
+    if (!opts || !state) {
+        return -1;
+    }
+    svc_rtl_stop_locked(opts, state);
+    return svc_rtl_start_locked(opts, state);
+}
+
+/* Turn the I/Q capture off for the rest of the session before a rollback restart (svc_rtl_restart_recovery_locked()),
+   and log it naming the file, when a stream start would write over what the stream the failed change stopped
+   recorded: the restart of a radio input that ran, or, with a PCM input put back (@p stream_stopped: a radio stream ran
+   behind it, which a switch to PCM leaves running), the next radio start of the session. The start the change made
+   may have written over it already: it opens the capture once its device runs, before its workers and the device's
+   streaming, which can still fail (rtl_stream_start_opened_capture()). Returns 1 when it turned the capture off. */
+static int
+svc_recovery_stop_capture(dsd_opts* opts, int stream_stopped) {
+    const int restarts_radio = opts->audio_in_type == AUDIO_IN_RTL;
+    if (!opts->iq_capture_requested || (!restarts_radio && !stream_stopped)) {
+        return 0;
+    }
+    opts->iq_capture_requested = 0;
+    if (rtl_stream_start_opened_capture()) {
+        LOG_WARN("I/Q capture stopped: the start the change made had already reopened %s, writing over what %s "
+                 "recorded. %s\n",
+                 opts->iq_capture_path,
+                 restarts_radio ? "the input that ran" : "the radio stream running behind the input that ran",
+                 restarts_radio ? "That input restarts without the capture, which stays off for the rest of this "
+                                  "session."
+                                : "The capture stays off for the rest of this session.");
+    } else if (restarts_radio) {
+        LOG_WARN("I/Q capture stopped: restarting the input that ran would reopen %s and write over what it "
+                 "recorded, which is kept. The capture stays off for the rest of this session.\n",
+                 opts->iq_capture_path);
+    } else {
+        LOG_WARN("I/Q capture stopped: the change stopped the radio stream running behind the input that ran, closing "
+                 "%s with what it recorded, which is kept; the next radio start would write over it. The capture "
+                 "stays off for the rest of this session.\n",
+                 opts->iq_capture_path);
+    }
+    return 1;
+}
+
+/* Start the input the options describe on the receive profile the stream the failed change stopped ran (issue #578).
+   Outside a scan row's suspended scope that is the options in force. A config apply runs with the scope suspended, so
+   the options hold the configured settings, while the stream ran the row's constraint over them
+   (dsd_scan_mode_suspended_effective()): a typed digital row's profile, or an analog row's own width, at a rate that
+   need not run the configured analog width (a DSP bandwidth lowered while a digital row ran). The start opens on that
+   constraint, and the configured settings go back once it has, for the resume to put the row back over. */
+static int
+svc_rtl_start_on_the_profile_that_ran_locked(dsd_opts* opts, dsd_state* state) {
+    const dsd_scan_settings* ran = dsd_scan_mode_suspended_effective(state);
+    if (!ran) {
+        return svc_rtl_start_locked(opts, state);
+    }
+    dsd_scan_settings configured;
+    dsd_scan_settings_capture(opts, state, &configured);
+    dsd_scan_settings_restore(ran, opts, state);
+    const int rc = svc_rtl_start_locked(opts, state);
+    dsd_scan_settings_restore(&configured, opts, state);
+    return rc;
+}
+
+int
+svc_rtl_restart_recovery_locked(dsd_opts* opts, dsd_state* state, int stream_stopped,
+                                const dsd_input_failure* failure_before, int* out_capture_stopped) {
+    if (out_capture_stopped) {
+        *out_capture_stopped = 0;
+    }
+    if (!opts || !state) {
+        return -1;
+    }
+    if (svc_recovery_stop_capture(opts, stream_stopped) && out_capture_stopped) {
+        *out_capture_stopped = 1;
+    }
+    /* The input that ran runs again, so a failure the failed change latched is not the session's: the latch goes back
+       to the one from before the change once the stream the change left is gone and before the restart starts
+       anything, so a failure the restarted stream latches stands, even one its threads latch before its start returns
+       (an Airspy whose device stops at once). A restart that fails and leaves no failure of its own latched gets the
+       change's back, with no input running: one that wrote nothing to the latch since the put-back, or whose writes
+       left it clear (an Airspy that opened, then failed). The latch's write count tells what the restart wrote, not
+       its value, which reads as the one put back when the restart latches that failure again (an Airspy that again
+       does not open); it is read right after the put-back, while no stream runs to write the latch. */
+    svc_rtl_stop_locked(opts, state);
+    dsd_input_failure failed;
+    dsd_input_failure_get(&failed);
+    unsigned int put_back_generation = 0U;
+    if (failure_before) {
+        dsd_input_failure_report((dsd_input_failure_kind)failure_before->kind, failure_before->native_code);
+        put_back_generation = dsd_input_failure_generation();
+    }
+    const int rc = svc_rtl_start_on_the_profile_that_ran_locked(opts, state);
+    if (rc != 0 && failure_before) {
+        dsd_input_failure now;
+        dsd_input_failure_get(&now);
+        if (dsd_input_failure_generation() == put_back_generation || now.kind == DSD_INPUT_FAILURE_NONE) {
+            dsd_input_failure_report((dsd_input_failure_kind)failed.kind, failed.native_code);
+        }
+    }
+    return rc;
 }
 
 static void
@@ -1231,36 +1682,72 @@ svc_airspy_restore_tuning(dsd_opts* opts, const svc_airspy_tuning* tuning) {
     opts->rtlsdr_center_freq = tuning->frequency;
     opts->rtl_dsp_bw_khz = tuning->bandwidth;
     opts->rtl_squelch_level = tuning->squelch;
+    opts->rtl_squelch_mode = tuning->squelch_mode;
+    opts->rtl_squelch_margin_db = tuning->squelch_margin_db;
     opts->rtl_volume_multiplier = tuning->volume;
 }
 
-static int
-svc_airspy_reopen_impl(dsd_opts* opts, dsd_state* state, const dsd_airspy_config* config,
-                       const dsd_airspy_config* previous, const svc_airspy_tuning* previous_tuning, int guard_held) {
+/* The Airspy @p config names, as the input the next start opens. */
+static void
+svc_airspy_select(dsd_opts* opts, const dsd_airspy_config* config) {
     opts->airspy = *config;
     DSD_SNPRINTF(opts->audio_in_dev, sizeof opts->audio_in_dev, "airspy%s%s", config->serial[0] ? ":serial=" : "",
                  config->serial);
-    int rc = guard_held ? svc_rtl_restart_locked(opts, state) : svc_rtl_restart(opts, state);
+}
+
+/* Reopen the Airspy with @p config, and on a failed start put back @p previous and @p previous_tuning and start that
+   again, without the I/Q capture that would write over the recording, and with the input failure the session had
+   latched before the reopen (svc_rtl_restart_recovery_locked(), which sets @p out_capture_stopped when it turned the
+   capture off; may be NULL). The watchdog reads the input under the P25 SM tick guard, so the whole of it runs inside
+   one hold (issue #578): the caller's (@p guard_held), or one taken here. */
+static int
+svc_airspy_reopen_impl(dsd_opts* opts, dsd_state* state, const dsd_airspy_config* config,
+                       const dsd_airspy_config* previous, const svc_airspy_tuning* previous_tuning, int guard_held,
+                       int* out_capture_stopped) {
+    if (!guard_held) {
+        p25_sm_tick_guard_enter();
+    }
+    dsd_input_failure failure_before;
+    dsd_input_failure_get(&failure_before);
+    const int stream_stopped = state->rtl_ctx != NULL;
+    svc_airspy_select(opts, config);
+    const int rc = svc_rtl_restart_locked(opts, state);
     if (rc != 0) {
-        opts->airspy = *previous;
+        svc_airspy_select(opts, previous);
         svc_airspy_restore_tuning(opts, previous_tuning);
-        DSD_SNPRINTF(opts->audio_in_dev, sizeof opts->audio_in_dev, "airspy%s%s", previous->serial[0] ? ":serial=" : "",
-                     previous->serial);
-        (void)(guard_held ? svc_rtl_restart_locked(opts, state) : svc_rtl_restart(opts, state));
+        (void)svc_rtl_restart_recovery_locked(opts, state, stream_stopped, &failure_before, out_capture_stopped);
+    }
+    if (!guard_held) {
+        p25_sm_tick_guard_leave();
     }
     return rc;
 }
 
-/* Squelch is a linear power level; differences below this are the same threshold. */
+int
+svc_airspy_reopen_locked(dsd_opts* opts, dsd_state* state, const dsd_airspy_config* config) {
+    if (!opts || !state || !dsd_airspy_config_valid(config)) {
+        return -1;
+    }
+    svc_airspy_select(opts, config);
+    const int rc = svc_rtl_restart_locked(opts, state);
+    (void)rtl_stream_airspy_info(&opts->airspy_info);
+    return rc;
+}
+
+/* Squelch is a linear power level; differences below this are the same threshold. The mode and the dynamic margin are
+   part of the setting too. */
 static int
-svc_airspy_squelch_changed(double previous, double current) {
-    return fabs(previous - current) > 1e-12;
+svc_airspy_squelch_changed(const svc_airspy_tuning* previous, const dsd_opts* current) {
+    return fabs(previous->squelch - current->rtl_squelch_level) > 1e-12
+           || previous->squelch_mode != current->rtl_squelch_mode
+           || (dsd_squelch_mode_is_dynamic(current->rtl_squelch_mode)
+               && previous->squelch_margin_db != current->rtl_squelch_margin_db);
 }
 
 /* In-place path: native controls first, then the shared tuning the stream did not reopen for. */
 static int
 svc_airspy_apply_live(dsd_opts* opts, dsd_state* state, const dsd_airspy_config* config,
-                      const svc_airspy_tuning* previous_tuning) {
+                      const svc_airspy_tuning* previous_tuning, int guard_held) {
     int rc = rtl_stream_airspy_controls(config);
     if (rc != 0) {
         svc_airspy_restore_tuning(opts, previous_tuning);
@@ -1270,7 +1757,7 @@ svc_airspy_apply_live(dsd_opts* opts, dsd_state* state, const dsd_airspy_config*
     if (previous_tuning->frequency != opts->rtlsdr_center_freq) {
         uint32_t frequency = opts->rtlsdr_center_freq;
         opts->rtlsdr_center_freq = previous_tuning->frequency;
-        rc = svc_rtl_set_freq(opts, state, frequency);
+        rc = guard_held ? svc_rtl_set_freq_locked(opts, state, frequency) : svc_rtl_set_freq(opts, state, frequency);
         if (rc == RTL_STREAM_TUNE_TIMEOUT) {
             /* Accepted-but-pending requests remain owned by the controller. DEFERRED
              * means the request was never queued (replay, PPM training, or a
@@ -1283,15 +1770,20 @@ svc_airspy_apply_live(dsd_opts* opts, dsd_state* state, const dsd_airspy_config*
             return rc;
         }
     }
-    if (svc_airspy_squelch_changed(previous_tuning->squelch, opts->rtl_squelch_level)) {
-        rtl_stream_set_channel_squelch((float)opts->rtl_squelch_level);
+    if (svc_airspy_squelch_changed(previous_tuning, opts)) {
+        svc_rtl_push_squelch(opts);
     }
     return 0;
 }
 
+/* svc_airspy_apply_config(), holding the guard when @p guard_held is 0, and setting @p out_capture_stopped (may be
+   NULL; 0 on entry) when the restart of the settings a failed reopen replaced turned the I/Q capture off. */
 static int
 svc_airspy_apply_config_impl(dsd_opts* opts, dsd_state* state, const dsd_airspy_config* config,
-                             const svc_airspy_tuning* previous_tuning, int guard_held) {
+                             const svc_airspy_tuning* previous_tuning, int guard_held, int* out_capture_stopped) {
+    if (out_capture_stopped) {
+        *out_capture_stopped = 0;
+    }
     if (!opts || !state || !previous_tuning || !dsd_airspy_config_valid(config)) {
         return -1;
     }
@@ -1301,9 +1793,9 @@ svc_airspy_apply_config_impl(dsd_opts* opts, dsd_state* state, const dsd_airspy_
     dsd_airspy_config previous = opts->airspy;
     int reopen = svc_airspy_settings_reopen(&previous, config, previous_tuning->bandwidth, opts->rtl_dsp_bw_khz,
                                             previous_tuning->volume, opts->rtl_volume_multiplier);
-    int rc = (reopen || !state->rtl_ctx)
-                 ? svc_airspy_reopen_impl(opts, state, config, &previous, previous_tuning, guard_held)
-                 : svc_airspy_apply_live(opts, state, config, previous_tuning);
+    int rc = (reopen || !state->rtl_ctx) ? svc_airspy_reopen_impl(opts, state, config, &previous, previous_tuning,
+                                                                  guard_held, out_capture_stopped)
+                                         : svc_airspy_apply_live(opts, state, config, previous_tuning, guard_held);
     (void)rtl_stream_airspy_info(&opts->airspy_info);
     return rc;
 }
@@ -1311,23 +1803,26 @@ svc_airspy_apply_config_impl(dsd_opts* opts, dsd_state* state, const dsd_airspy_
 int
 svc_airspy_apply_config(dsd_opts* opts, dsd_state* state, const dsd_airspy_config* config,
                         const svc_airspy_tuning* previous_tuning) {
-    return svc_airspy_apply_config_impl(opts, state, config, previous_tuning, 0);
+    return svc_airspy_apply_config_impl(opts, state, config, previous_tuning, 0, NULL);
 }
 
 int
 svc_airspy_apply_config_locked(dsd_opts* opts, dsd_state* state, const dsd_airspy_config* config,
                                const svc_airspy_tuning* previous_tuning) {
-    return svc_airspy_apply_config_impl(opts, state, config, previous_tuning, 1);
+    return svc_airspy_apply_config_impl(opts, state, config, previous_tuning, 1, NULL);
 }
 
 int
-svc_airspy_apply(dsd_opts* opts, dsd_state* state, const dsd_airspy_config* config) {
+svc_airspy_apply(dsd_opts* opts, dsd_state* state, const dsd_airspy_config* config, int* out_capture_stopped) {
+    if (out_capture_stopped) {
+        *out_capture_stopped = 0;
+    }
     if (!opts) {
         return -1;
     }
-    const svc_airspy_tuning tuning = {opts->rtlsdr_center_freq, opts->rtl_dsp_bw_khz, opts->rtl_squelch_level,
-                                      opts->rtl_volume_multiplier};
-    return svc_airspy_apply_config(opts, state, config, &tuning);
+    const svc_airspy_tuning tuning = {opts->rtlsdr_center_freq,    opts->rtl_dsp_bw_khz,   opts->rtl_squelch_level,
+                                      opts->rtl_volume_multiplier, opts->rtl_squelch_mode, opts->rtl_squelch_margin_db};
+    return svc_airspy_apply_config_impl(opts, state, config, &tuning, 0, out_capture_stopped);
 }
 
 int
@@ -1350,13 +1845,30 @@ svc_rtl_set_dev_index(dsd_opts* opts, dsd_state* state, int index) {
     return 0;
 }
 
-int
-svc_rtl_set_freq(dsd_opts* opts, dsd_state* state, uint32_t hz) {
+/* A tune the user asked for, through the centralized io/control tuning API for both RTL and rigctl. An accepted one
+   (applied or pending) puts the receiver on another carrier, which can sync before any no-carrier pass: the carrier
+   boundary runs at this success point (issue #575). @p guard_held says whether the caller holds the P25 SM tick
+   guard. */
+static int
+svc_rtl_tune(dsd_opts* opts, dsd_state* state, uint32_t hz, int guard_held) {
     if (!opts) {
         return -1;
     }
-    // Use centralized io/control tuning API for both RTL and rigctl
-    return io_control_set_freq(opts, state, (long int)hz);
+    const int rc = io_control_set_freq(opts, state, (long int)hz);
+    if (state && (rc == RTL_STREAM_TUNE_OK || rc == RTL_STREAM_TUNE_TIMEOUT)) {
+        dsd_engine_carrier_boundary(opts, state, DSD_CARRIER_BOUNDARY_TUNE, guard_held);
+    }
+    return rc;
+}
+
+int
+svc_rtl_set_freq(dsd_opts* opts, dsd_state* state, uint32_t hz) {
+    return svc_rtl_tune(opts, state, hz, 0);
+}
+
+int
+svc_rtl_set_freq_locked(dsd_opts* opts, dsd_state* state, uint32_t hz) {
+    return svc_rtl_tune(opts, state, hz, 1);
 }
 
 int
@@ -1373,7 +1885,19 @@ svc_rtl_set_gain(dsd_opts* opts, dsd_state* state, int value) {
     if (value > 49) {
         value = 49;
     }
-    opts->rtl_gain_value = value;
+    /* Under --trunk-scan the edit is the configured gain every target without its own rtl_gain runs and the scan puts
+       back at each switch; while the parked target's own rtl_gain is on air nothing on the device changes. The P25
+       watchdog's control-channel returns read that gain through the retune profile under the P25 SM tick guard, so it
+       changes under the guard; the restart below takes the guard itself. */
+    p25_sm_tick_guard_enter();
+    const int scan = dsd_engine_trunk_scan_set_configured_gain(opts, state, value);
+    if (scan < 0) {
+        opts->rtl_gain_value = value;
+    }
+    p25_sm_tick_guard_leave();
+    if (scan == 0) {
+        return 0;
+    }
     /* Manual gain change requires reopen to apply */
     opts->rtl_needs_restart = 1;
     if (opts->audio_in_type == AUDIO_IN_RTL) {
@@ -1406,14 +1930,16 @@ svc_rtl_bw_width_fix(int kind, int max_hz, int row, char* fix, size_t fix_size) 
     return 0;
 }
 
-/* Whether a stream reopened at an RTL DSP bandwidth of @p khz can filter the explicit analog width @p width_hz of
-   @p kind (0: none, never refused). A refusal gives the toast text and logs the validator's full message. @p row says
-   the width is a scan row's own (--nfm-bandwidth-hz), which the width controls do not edit: the toast names the row,
-   and the only fix is the bandwidth. */
+/* Whether a stream reopened at an RTL DSP bandwidth of @p khz can filter analog width @p configured_hz of @p kind (0 =
+   the kind's default: the AM default is held as its 6 kHz, since AM always runs its channel filter, and the unset NFM
+   default is never refused). A refusal gives the toast text and logs the validator's full message. @p row says the
+   width is a scan row's own (--nfm-bandwidth-hz or --am-bandwidth-hz), which the width controls do not edit: the toast
+   names the row, and the only fix is the bandwidth. */
 static int
-svc_rtl_bandwidth_fits_width(const dsd_opts* opts, int kind, int width_hz, int row, int khz, char* why,
+svc_rtl_bandwidth_fits_width(const dsd_opts* opts, int kind, int configured_hz, int row, int khz, char* why,
                              size_t why_size) {
-    if (width_hz > 0 && !svc_analog_width_env_allows(kind, width_hz, why, why_size)) {
+    const int width_hz = svc_analog_held_width_hz(kind, configured_hz);
+    if (width_hz > 0 && !svc_analog_width_env_allows(kind, configured_hz, why, why_size)) {
         return 0; /* the reopen's start would refuse the width at any rate */
     }
     const int rate_hz = svc_rtl_bw_dsp_rate_hz(opts, khz);
@@ -1441,31 +1967,39 @@ svc_rtl_bandwidth_fits_width(const dsd_opts* opts, int kind, int width_hz, int r
     return 0;
 }
 
-/* The DSP rate an explicit analog width runs at: a bandwidth that cannot filter it is refused rather than leaving the
-   next start to fail, or the width to be clamped. The configured preset decides: a typed digital scan row on an analog
-   session still returns to the analog monitor, at this rate. RTL_SET_BW is unscoped, so the stream it reopens starts
-   on the settings in force: while a scan row runs the analog family with its own width (issue #526), that width is
-   held to the rate as well, since a start that refuses it would leave the session with no radio input. */
+/* The DSP rate an explicit analog width, or the AM default, runs at: a bandwidth that cannot filter it is refused rather
+   than leaving the next start to fail, or the width to be clamped. The configured preset decides: a typed digital scan
+   row on an analog session still returns to the analog monitor, at this rate. RTL_SET_BW is unscoped, so the stream it
+   reopens starts on the settings in force: while a scan row runs the analog family with its own width (issue #526),
+   that width is held to the rate as well, since a start that refuses it would leave the session with no radio input. */
 static int
 svc_rtl_bandwidth_fits_analog_width(const dsd_opts* opts, const dsd_state* state, int khz, char* why, size_t why_size) {
     int kind = DSD_ANALOG_DEMOD_FM;
-    const int width_hz = svc_configured_analog_width(opts, state, &kind);
-    if (!svc_rtl_bandwidth_fits_width(opts, kind, width_hz, 0, khz, why, why_size)) {
+    int configured_hz = 0;
+    (void)svc_configured_analog_width(opts, state, &kind, &configured_hz);
+    if (!svc_rtl_bandwidth_fits_width(opts, kind, configured_hz, 0, khz, why, why_size)) {
         return 0;
     }
+    for (int row_kind = DSD_ANALOG_DEMOD_FM; row_kind <= DSD_ANALOG_DEMOD_AM; row_kind++) {
+        if (svc_scan_width_beside_preset(opts, state, kind, row_kind)
+            && !svc_rtl_bandwidth_fits_width(
+                opts, row_kind, dsd_scan_mode_configured_analog_width(opts, state, row_kind), 0, khz, why, why_size)) {
+            return 0;
+        }
+    }
     const int in_force_hz = dsd_opts_analog_width_hz(opts);
-    if (!dsd_opts_is_analog_family(opts) || in_force_hz <= 0
-        || (in_force_hz == width_hz && opts->analog_demod == kind)) {
+    if (!dsd_opts_is_analog_family(opts) || svc_analog_held_width_hz(opts->analog_demod, in_force_hz) <= 0
+        || (in_force_hz == configured_hz && opts->analog_demod == kind)) {
         return 1;
     }
     /* A row without a width of its own runs the configured one (on a digital session, where the configured preset holds
        none): the width's own fix applies to it. */
-    return svc_rtl_bandwidth_fits_width(opts, opts->analog_demod, in_force_hz, svc_row_sets_nfm_width(state), khz, why,
-                                        why_size);
+    return svc_rtl_bandwidth_fits_width(opts, opts->analog_demod, in_force_hz,
+                                        svc_row_sets_width(state, opts->analog_demod), khz, why, why_size);
 }
 
 int
-svc_rtl_set_bandwidth(dsd_opts* opts, dsd_state* state, int khz, char* why, size_t why_size) {
+svc_rtl_set_bandwidth_locked(dsd_opts* opts, dsd_state* state, int khz, char* why, size_t why_size) {
     svc_why(why, why_size, "%s", "");
     if (!opts || !state) {
         return -1;
@@ -1480,29 +2014,18 @@ svc_rtl_set_bandwidth(dsd_opts* opts, dsd_state* state, int khz, char* why, size
     /* Tuner bandwidth change requires reopen */
     opts->rtl_needs_restart = 1;
     if (opts->audio_in_type == AUDIO_IN_RTL) {
-        return svc_rtl_restart(opts, state);
+        return svc_rtl_restart_locked(opts, state);
     }
     return 0;
 }
 
 int
-svc_rtl_set_sql_db(dsd_opts* opts, const dsd_state* state, double dB) {
-    if (!opts) {
-        return -1;
-    }
-    /* 0 dB is full scale, so as a threshold it would close the gate on every
-     * signal there is. Spending that value on "off" instead gives both UIs a way
-     * to switch the squelch off, and matches what 0 already means in the `sql`
-     * CLI field and the rtl_sql config key. */
-    const double level = (dB >= 0.0) ? 0.0 : dsd_squelch_level_from_sql(dB);
-    /* The operator edits the configured default. A scan row or target that overrides the
-     * squelch (--squelch-db) keeps its own threshold, in dsd_opts and in the demod, until the
-     * scanner leaves it. */
-    if (dsd_scan_mode_set_configured_squelch(opts, state, level) == 1) {
-        /* Sync the demod state for channel-based squelching */
-        rtl_stream_set_channel_squelch((float)opts->rtl_squelch_level);
-    }
-    return 0;
+svc_rtl_set_bandwidth(dsd_opts* opts, dsd_state* state, int khz, char* why, size_t why_size) {
+    /* The watchdog reads the input under this guard: the new bandwidth and the reopen it takes run inside one hold. */
+    p25_sm_tick_guard_enter();
+    const int rc = svc_rtl_set_bandwidth_locked(opts, state, khz, why, why_size);
+    p25_sm_tick_guard_leave();
+    return rc;
 }
 
 int
@@ -1563,3 +2086,70 @@ svc_rtl_set_auto_ppm(dsd_opts* opts, const dsd_state* state, int on) {
     return 0;
 }
 #endif
+
+/* The squelch services run on every input: audio input takes a level or the noise squelch (issue #628). */
+int
+svc_rtl_set_sql_db(dsd_opts* opts, const dsd_state* state, double dB) {
+    if (!opts) {
+        return -1;
+    }
+    /* 0 dB is full scale, so as a threshold it would close the gate on every
+     * signal there is. Spending that value on "off" instead gives both UIs a way
+     * to switch the squelch off, and matches what 0 already means in the `sql`
+     * CLI field and the rtl_sql config key. */
+    const double level = (dB >= 0.0) ? 0.0 : dsd_squelch_level_from_sql(dB);
+    /* The operator edits the configured default. A scan row or target that overrides the
+     * squelch (--squelch-db) keeps its own threshold, in dsd_opts and in the demod, until the
+     * scanner leaves it. */
+    if (dsd_scan_mode_set_configured_squelch(opts, state, level) == 1) {
+        /* Sync the demod state for channel-based squelching: a level, in place of an auto squelch too. */
+        svc_rtl_push_squelch(opts);
+    }
+    return 0;
+}
+
+int
+svc_rtl_set_sql_setting(dsd_opts* opts, const dsd_state* state, const dsd_squelch_setting* setting) {
+    if (!opts || !setting) {
+        return -1;
+    }
+    if (dsd_squelch_mode_is_dynamic(setting->mode)
+        && (setting->margin_db < DSD_SQUELCH_MARGIN_MIN_DB || setting->margin_db > DSD_SQUELCH_MARGIN_MAX_DB)) {
+        return -1;
+    }
+    if (!dsd_squelch_setting_level_finite(setting)) {
+        return -1;
+    }
+    if (setting->mode == DSD_SQUELCH_MODE_NOISE && dsd_squelch_noise_has_no_fm(opts)) {
+        return SVC_SQL_NOISE_NEEDS_FM;
+    }
+    /* The auto squelch learns a floor from the channel power DSD-neo's own receiver measures; audio input has none, so
+       it would resolve to off there. */
+    if (setting->mode == DSD_SQUELCH_MODE_AUTO && dsd_squelch_input_kind(opts) == DSD_SQUELCH_INPUT_AUDIO) {
+        return SVC_SQL_AUTO_NEEDS_RADIO;
+    }
+    const dsd_squelch_setting stored = dsd_squelch_mode_is_dynamic(setting->mode)
+                                           ? dsd_squelch_setting_dynamic(setting->mode, setting->margin_db)
+                                           : dsd_squelch_setting_of_level(setting->level);
+    if (dsd_scan_mode_set_configured_squelch_setting(opts, state, &stored) == 1) {
+        svc_rtl_push_squelch(opts);
+    }
+    return 0;
+}
+
+void
+svc_rtl_push_squelch(const dsd_opts* opts) {
+#ifdef USE_RADIO
+    if (!opts) {
+        return;
+    }
+    if (dsd_squelch_mode_is_dynamic(opts->rtl_squelch_mode)) {
+        const dsd_squelch_setting squelch = dsd_squelch_setting_of_opts(opts);
+        rtl_stream_set_channel_squelch_setting(&squelch);
+        return;
+    }
+    rtl_stream_set_channel_squelch((float)opts->rtl_squelch_level);
+#else
+    (void)opts;
+#endif
+}

@@ -24,15 +24,21 @@ enum {
     PROVOICE_EXPECTED_BF_PREFIX_BITS = 2 + 16,
     PROVOICE_EXPECTED_TRAILER_BITS = 2,
     PROVOICE_EXPECTED_TOTAL_DIBITS = PROVOICE_EXPECTED_HEADER_BITS + (2 * DSD_PROVOICE_FRAME_PAIR_DIBITS)
-                                     + PROVOICE_EXPECTED_BF_PREFIX_BITS + PROVOICE_EXPECTED_TRAILER_BITS,
+        + PROVOICE_EXPECTED_BF_PREFIX_BITS + PROVOICE_EXPECTED_TRAILER_BITS,
 };
 
 static int dibit_calls;
 static int mbe_calls;
 static int play_ms_calls;
-static int play_fm_calls;
 static uint8_t expected_bits[PROVOICE_EXPECTED_TOTAL_DIBITS];
-static char captured_first_frame[DSD_PROVOICE_IMBE_ROWS][DSD_PROVOICE_IMBE_COLS];
+static dsd_provoice_imbe_frame captured_first_frame;
+
+/* The stub reader hands out a symbol per bit whose value is the reliability the stub helper below reports for it,
+ * so each frame cell shows which symbol's confidence it received. */
+static uint8_t
+expected_reliability(int stream_idx) {
+    return (uint8_t)(1 + ((stream_idx * 37) % 254));
+}
 
 static void
 fill_expected_bits(void) {
@@ -52,24 +58,35 @@ reset_counters(void) {
     dibit_calls = 0;
     mbe_calls = 0;
     play_ms_calls = 0;
-    play_fm_calls = 0;
     fill_expected_bits();
     DSD_MEMSET(captured_first_frame, 0, sizeof(captured_first_frame));
 }
 
 int
-get_dibit_and_analog_signal(dsd_opts* opts, dsd_state* state, int* out_analog_signal) {
+getDibitAndSoftSymbol(dsd_opts* opts, dsd_state* state, float* out_soft_symbol) {
     (void)opts;
     (void)state;
-    (void)out_analog_signal;
     assert(dibit_calls < PROVOICE_EXPECTED_TOTAL_DIBITS);
+    assert(out_soft_symbol != NULL);
+    *out_soft_symbol = (float)expected_reliability(dibit_calls);
     int value = expected_bits[dibit_calls];
     dibit_calls++;
     return value;
 }
 
+uint8_t
+dsd_two_level_symbol_reliability(const dsd_opts* opts, const dsd_state* state, float symbol) {
+    assert(opts != NULL);
+    assert(state != NULL);
+    return (uint8_t)(int)symbol;
+}
+
+/* The soft path is ProVoice's only way into the vocoder: no processMbeFrame stub exists, so a hard call fails to
+ * link. */
 void
-processMbeFrame(dsd_opts* opts, dsd_state* state, char imbe_fr[8][23], char ambe_fr[4][24], char imbe7100_fr[7][24]) {
+processMbeFrameSoft(dsd_opts* opts, dsd_state* state, dsd_voice_protocol protocol, dsd_vocoder_soft_bit imbe_fr[8][23],
+                    dsd_vocoder_soft_bit ambe_fr[4][24], dsd_vocoder_soft_bit imbe7100_fr[7][24]) {
+    assert(protocol == DSD_VOICE_PROTOCOL_PROVOICE);
     (void)opts;
     (void)state;
     assert(imbe_fr == NULL);
@@ -88,22 +105,15 @@ playSynthesizedVoiceMS(dsd_opts* opts, dsd_state* state) {
     play_ms_calls++;
 }
 
-void
-playSynthesizedVoiceFM(dsd_opts* opts, dsd_state* state) {
-    (void)opts;
-    (void)state;
-    play_fm_calls++;
-}
-
+/* The first frame's first segment takes the six symbols after the header, bit and reliability both. */
 static void
 assert_first_imbe_frame_uses_interleave_schedule(void) {
     int first_pair_start = PROVOICE_EXPECTED_HEADER_BITS;
-    assert(captured_first_frame[provoice_interleave_w[0]][provoice_interleave_x[0]]
-           == (char)expected_bits[first_pair_start]);
-    assert(captured_first_frame[provoice_interleave_w[1]][provoice_interleave_x[1]]
-           == (char)expected_bits[first_pair_start + 1]);
-    assert(captured_first_frame[provoice_interleave_w[5]][provoice_interleave_x[5]]
-           == (char)expected_bits[first_pair_start + 5]);
+    for (int i = 0; i < 6; i++) {
+        const dsd_vocoder_soft_bit* cell = &captured_first_frame[provoice_interleave_w[i]][provoice_interleave_x[i]];
+        assert(cell->bit == expected_bits[first_pair_start + i]);
+        assert(cell->reliability == expected_reliability(first_pair_start + i));
+    }
 }
 
 static void
@@ -127,10 +137,10 @@ test_process_voice_integer_playback(void) {
     assert(dibit_calls == PROVOICE_EXPECTED_TOTAL_DIBITS);
     assert(mbe_calls == 4);
     assert(play_ms_calls == 4);
-    assert(play_fm_calls == 0);
     assert_first_imbe_frame_uses_interleave_schedule();
 }
 
+/* Float output (-y) plays through the same mono mixer: it only changes how the output writes the samples (#652). */
 static void
 test_process_voice_float_playback(void) {
     static dsd_opts opts;
@@ -149,8 +159,7 @@ test_process_voice_float_playback(void) {
 
     assert(dibit_calls == PROVOICE_EXPECTED_TOTAL_DIBITS);
     assert(mbe_calls == 4);
-    assert(play_ms_calls == 0);
-    assert(play_fm_calls == 4);
+    assert(play_ms_calls == 4);
 }
 
 /* #421: nothing inside the 736 dibits can fail a check, so a lone frame buys the 9600/2

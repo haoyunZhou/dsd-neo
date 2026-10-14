@@ -8,6 +8,7 @@
 
 #include <assert.h>
 #include <dsd-neo/core/input_level.h>
+#include <dsd-neo/core/power.h>
 #include <dsd-neo/io/rtl_stream_c.h>
 #include <dsd-neo/runtime/config.h>
 #include <dsd-neo/runtime/rtl_stream_metrics_hooks.h>
@@ -41,6 +42,8 @@ static int g_stream_active_calls;
 static int g_input_level_calls;
 static int g_channel_squelch_calls;
 static float g_last_channel_squelch;
+static int g_channel_squelch_setting_calls;
+static dsd_squelch_setting g_last_channel_squelch_setting;
 static dsdneoRuntimeConfig g_runtime_config;
 
 static int g_last_symbol_rate;
@@ -124,6 +127,16 @@ rtl_stream_request_analog_profile(int family, int kind, int width_hz) {
     return -22;
 }
 
+static int g_digital_landing_calls;
+static int g_last_landing_explicit;
+
+int
+rtl_stream_request_digital_family_landing(int cqpsk_explicit) {
+    ++g_digital_landing_calls;
+    g_last_landing_explicit = cqpsk_explicit;
+    return -23;
+}
+
 int
 rtl_stream_get_analog_profile(int* out_kind, int* out_width_hz, int* out_lpf_on) {
     ++g_analog_profile_calls;
@@ -144,6 +157,7 @@ static int g_output_rate_for_family_calls;
 static int g_last_rate_family;
 static int g_last_rate_cqpsk;
 static int g_last_rate_symbol_rate;
+static int g_last_rate_explicit;
 
 int
 rtl_stream_analog_family_active(void) {
@@ -151,12 +165,22 @@ rtl_stream_analog_family_active(void) {
     return 1;
 }
 
+static int g_family_landing_after_pending_calls;
+
+/* Answers unlike rtl_stream_analog_family_active() above, so the wrapper is seen to reach this one. */
+int
+rtl_stream_family_landing_after_pending(void) {
+    ++g_family_landing_after_pending_calls;
+    return 0;
+}
+
 unsigned int
-rtl_stream_output_rate_for_family(int family, int cqpsk_enable, int symbol_rate_hz) {
+rtl_stream_output_rate_for_family(int family, int cqpsk_enable, int symbol_rate_hz, int cqpsk_explicit) {
     ++g_output_rate_for_family_calls;
     g_last_rate_family = family;
     g_last_rate_cqpsk = cqpsk_enable;
     g_last_rate_symbol_rate = symbol_rate_hz;
+    g_last_rate_explicit = cqpsk_explicit;
     return 24000U;
 }
 
@@ -269,6 +293,64 @@ rtl_stream_set_channel_squelch(float level) {
     g_last_channel_squelch = level;
 }
 
+void
+rtl_stream_set_channel_squelch_setting(const dsd_squelch_setting* setting) {
+    ++g_channel_squelch_setting_calls;
+    g_last_channel_squelch_setting = *setting;
+}
+
+static int g_replay_batch_calls;
+static int g_replay_batch_result;
+
+/* A tag whose fields all differ, so each is seen to reach its own field of the runtime batch. */
+int
+rtl_stream_get_replay_batch(rtl_stream_replay_batch* out) {
+    ++g_replay_batch_calls;
+    assert(out != NULL);
+    *out = (rtl_stream_replay_batch){0};
+    out->chunk_sequence = 7U;
+    out->output_generation = 654321U;
+    out->output_kind = 2;
+    out->channel_profile = 5;
+    out->symbol_rate_hz = 6000;
+    out->symbol_levels = 2;
+    out->output_rate_hz = 24000;
+    out->media_start_ns = 1234567890123ULL;
+    out->media_duration_ns = 21333333ULL;
+    out->output_count = 99U;
+    out->first_index = 17U;
+    out->center_frequency_hz = 851012500U;
+    return g_replay_batch_result;
+}
+
+/* The replay batch the decoder's last read took its samples from reaches DSP with the fields it labels a symbol cache
+ * with, the media span it runs the decode clock on and the centre it was captured on (issue #575); no replay batch is
+ * none. Called with the engine's table installed. */
+static void
+test_replay_batch_hook(void) {
+    dsd_rtl_stream_replay_batch batch = {0};
+    g_replay_batch_result = 0;
+    assert(dsd_rtl_stream_metrics_hook_replay_batch(&batch) == 1);
+    assert(g_replay_batch_calls == 1);
+    assert(batch.generation == 654321U);
+    assert(batch.output_kind == 2);
+    assert(batch.channel_profile == 5);
+    assert(batch.symbol_rate_hz == 6000);
+    assert(batch.levels == 2);
+    assert(batch.media_start_ns == 1234567890123ULL);
+    assert(batch.media_duration_ns == 21333333ULL);
+    assert(batch.output_count == 99U);
+    assert(batch.first_index == 17U);
+    assert(batch.center_frequency_hz == 851012500U);
+    g_replay_batch_result = -1;
+    assert(dsd_rtl_stream_metrics_hook_replay_batch(&batch) == 0);
+    assert(g_replay_batch_calls == 2);
+    assert(batch.generation == 0U && batch.output_kind == 0 && batch.channel_profile == 0);
+    assert(batch.symbol_rate_hz == 0 && batch.levels == 0);
+    assert(batch.media_start_ns == 0U && batch.media_duration_ns == 0U && batch.output_count == 0U);
+    assert(batch.first_index == 0U && batch.center_frequency_hz == 0U);
+}
+
 int
 main(void) {
     dsd_rtl_stream_metrics_hooks_set(NULL);
@@ -327,6 +409,10 @@ main(void) {
     assert(g_last_analog_family == 1);
     assert(g_last_analog_kind == 0);
     assert(g_last_analog_width_hz == 12500);
+    /* So does the digital family request that lands the digital family's landing (issue #583), not the plain one. */
+    assert(dsd_rtl_stream_metrics_hook_request_digital_family_landing(1) == -23);
+    assert(g_digital_landing_calls == 1 && g_last_landing_explicit == 1);
+    assert(g_request_analog_calls == 1);
     int analog_kind = -1;
     int analog_width = -1;
     int analog_lpf_on = -1;
@@ -338,9 +424,15 @@ main(void) {
     /* So do the family readback and the output rate a family switch lands on. */
     assert(dsd_rtl_stream_metrics_hook_analog_family_active() == 1);
     assert(g_analog_family_active_calls == 1);
-    assert(dsd_rtl_stream_metrics_hook_output_rate_for_family(0, 1, 6000) == 24000U);
+    /* Whether outstanding work lands a family is the stream's own query, not the live family (issue #583). */
+    assert(dsd_rtl_stream_metrics_hook_family_landing_after_pending() == 0);
+    assert(g_family_landing_after_pending_calls == 1);
+    assert(g_analog_family_active_calls == 1);
+    /* The target's own CQPSK choice reaches the stream with it (issue #583). */
+    assert(dsd_rtl_stream_metrics_hook_output_rate_for_family(0, 1, 6000, 1) == 24000U);
     assert(g_output_rate_for_family_calls == 1);
     assert(g_last_rate_family == 0 && g_last_rate_cqpsk == 1 && g_last_rate_symbol_rate == 6000);
+    assert(g_last_rate_explicit == 1);
 
     int cqpsk_enable = -1;
     int cqpsk_timing = -1;
@@ -395,6 +487,15 @@ main(void) {
     assert(dsd_rtl_stream_metrics_hook_set_channel_squelch(1e-6) == 0);
     assert(g_channel_squelch_calls == 1);
     assert(fabsf(g_last_channel_squelch - 1e-6f) < 1e-12f);
+    /* A whole setting, the auto squelch's margin included, reaches its own setter (issue #518 follow-up). */
+    const dsd_squelch_setting auto6 = {DSD_SQUELCH_MODE_AUTO, 0.0, 6};
+    assert(dsd_rtl_stream_metrics_hook_set_channel_squelch_setting(&auto6) == 0);
+    assert(g_channel_squelch_setting_calls == 1 && g_channel_squelch_calls == 1);
+    assert(g_last_channel_squelch_setting.mode == DSD_SQUELCH_MODE_AUTO
+           && g_last_channel_squelch_setting.margin_db == 6);
+    assert(dsd_rtl_stream_metrics_hook_set_channel_squelch_setting(NULL) == -1);
+
+    test_replay_batch_hook();
 
     dsd_rtl_stream_metrics_hooks_set(NULL);
     return 0;

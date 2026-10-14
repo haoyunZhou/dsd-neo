@@ -257,6 +257,12 @@ If the default file does not exist, it will be created when settings are saved
 Autosave is disabled when an explicit `--profile NAME` is loaded successfully, because saving the effective config would
 flatten the profile overlay back into the base file and remove profile sections.
 
+An input switch in the terminal UI (Input > Switch source, Replay last, Stop replay, a TCP connect) names the input it
+opened the way `-i` and `[input]` spell it (`udp:127.0.0.1:7355`, `tcp:host:port`, `pulse:<device>`, a file path), so
+autosave records the input that runs. A switch to an audio input keeps the radio spec it replaced only for the session's
+own `RTL-SDR` row; it is not saved. A file the switch opened by its `-i` extension rule (`.raw`/`.sym` as symbol
+streams, `.bin` as a capture) is saved by its path, so startup opens it the same way.
+
 ---
 
 ## Precedence Rules
@@ -284,10 +290,12 @@ small subset is exposed as config keys for convenience (for example
 | `pulse_input` | STRING | Deprecated read alias for `pulse_source` | (empty) |
 | `rtl_device` | INT (0-255) | RTL-SDR device index | `0` |
 | `rtl_freq` | FREQ | RTL-SDR frequency; saving during trunking or scanning records the accepted tune target, not the startup frequency | `851.375M` |
-| `rtl_gain` | INT (0-49) | RTL-SDR gain in dB | `0` |
+| `rtl_gain` | INT (0-49) | RTL-SDR gain in dB; `0` is AGC, which a save writes and a load applies like any other gain (an omitted key keeps the gain running). Loading a config applies its gain even when its `[input]` is otherwise the input that runs: the input restarts on the new gain at the frequency and DSP bandwidth it runs (a SoapySDR `[input]` too, whose spec names no gain; its own frequency and bandwidth wait for an `[input]` that reopens the device) | `0` |
 | `rtl_ppm` | INT (-1000-1000) | Frequency correction | `0` |
 | `rtl_bw_khz` | INT (4-48) | DSP bandwidth | `48` |
-| `rtl_sql` | INT (-100-0) | Squelch threshold in dB; `0` switches squelch off (a disabled squelch is saved as `0`). The default a scan row's `--squelch-db` overrides and every row without one inherits; a save during a row override writes this default, not the row's value | `0` |
+| `rtl_sql` | INT (-120-0) | Squelch threshold in dB; `0` switches squelch off (a disabled squelch is saved as `0`; the unset default is -110 dB, saved as `-110`). The default a scan row's `--squelch-db` overrides and every row without one inherits; a save during a row override writes this default, not the row's value. Under `rtl_sql_mode = auto` or `noise` it is kept as the level a switch back to `level` returns to. The three squelch keys are read and written under the audio sources too (`pulse`, `file`, `tcp`, `udp`): a save writes them (off as `rtl_sql = 0`), and a load applies them only when the section sets one, so a config saved before audio input had a squelch leaves the running one alone, and an `rtl_sql` left in such a section by hand now applies | `0` |
+| `rtl_sql_mode` | ENUM (`level`, `auto`, `noise`) | `level` gates on `rtl_sql`; `auto` is the [auto squelch](cli.md#auto-squelch---squelch-auto), which opens `rtl_sql_margin_db` over the noise floor the demodulator learns on each analog channel; `noise` is the [noise squelch](cli.md#noise-squelch---squelch-noise), which opens an FM channel at `rtl_sql_margin_db` of quieting (as auto on AM). Auto runs on radio inputs; noise runs on radio inputs and, from a reference it learns, on audio input ([noise squelch on audio input](cli.md#noise-squelch-on-audio-input)). Both are off on digital channels. Written only when it is not `level`; `--squelch` and a spec's `sql` field win over it | `level` |
+| `rtl_sql_margin_db` | INT (3-30) | The auto squelch's margin over the learned noise floor, or the noise squelch's quieting, in dB; written with `rtl_sql_mode = auto` or `noise` | `10` |
 | `rtl_volume` | INT (1-3) | RTL monitor/non-symbol gain multiplier | `2` |
 | `auto_ppm` | BOOL | Enable carrier/error-based RTL auto-PPM correction | `false` |
 | `rtl_auto_ppm` | BOOL | Deprecated read alias for `auto_ppm` | `false` |
@@ -404,7 +412,7 @@ is lost, since the call may still resume; a terminator alerts immediately.
 | `per_call_wav` | BOOL | Enable per-call decoded voice WAV output | `false` |
 | `per_call_wav_dir` | PATH | Per-call WAV output directory | `./WAV` |
 | `static_wav` | PATH | Static decoded voice WAV output file | (empty) |
-| `raw_wav` | PATH | Raw (48 kHz) audio WAV output file | (empty) |
+| `raw_wav` | PATH | Raw (48 kHz) audio WAV output file; input at another rate is converted to 48 kHz | (empty) |
 | `rdio_mode` | ENUM | rdio export mode: off/dirwatch/api/both | `off` |
 | `rdio_system_id` | INT | rdio-scanner numeric system ID | `0` |
 | `rdio_api_url` | STRING | rdio API base URL | `http://127.0.0.1:3000` |
@@ -421,42 +429,72 @@ Rdio API uploads do not follow HTTP redirects. Configure `rdio_api_url` as the f
 **[dsp] section:**
 | Key | Type | Description | Default |
 |-----|------|-------------|---------|
-| `iq_balance` | BOOL | Enable RTL IQ balance (image suppression) | `false` |
-| `iq_dc_block` | BOOL | Enable RTL I/Q DC blocker | `false` |
+| `iq_balance` | BOOL | Enable RTL IQ balance (image suppression; kept off while AM runs: it would cancel a carrier at 0 Hz) | `false` |
+| `iq_dc_block` | BOOL | Enable RTL I/Q DC blocker (kept off while AM runs: it would remove a carrier at 0 Hz) | `false` |
 
 **[analog] section:**
 | Key | Type | Description | Default |
 |-----|------|-------------|---------|
-| `nfm_bandwidth_hz` | INT (8000-25000) | NFM channel-filter width in whole Hz: the full RF passband the analog monitor (`decode = "analog"`) keeps, not the tuner, DSP or audio bandwidth. Same as `--nfm-bandwidth-hz` | (unset: `16000`) |
+| `nfm_bandwidth_hz` | INT (8000-25000) | NFM channel-filter width in whole Hz: the full RF passband the analog monitor (`decode = "analog"`) keeps, not the tuner, DSP or audio bandwidth. On audio input with a rigctl peer (`-U`), which demodulates it, the FM passband the peer is asked for, in place of `-B`, while the FM monitor runs. Same as `--nfm-bandwidth-hz` | (unset: `16000`; on audio input with a rigctl peer, `-B`, or the peer's own passband with `-B` 0) |
+| `am_bandwidth_hz` | INT (5000-20000) | AM channel-filter width in whole Hz, likewise, for native AM (`decode = "am"`); on audio input with a rigctl peer, the AM passband an `am` row or `am-conventional` target without its own width asks the peer for. Same as `--am-bandwidth-hz` | (unset: `6000`, with a rigctl peer too) |
+| `tone_filter` | ENUM (`off`, `allow`, `block`) | CTCSS/DCS receive policy on the analog FM monitor and `nfm` scan rows: `allow` hears only traffic carrying a `tone_list` tone or code, `block` mutes it. Same as `--tone-allow`/`--tone-block`/`--no-tone-filter` | `off` |
+| `tone_list` | STRING (`/`-separated, at most 1023 bytes) | The tones and codes `tone_filter` uses: standard CTCSS tones and DCS codes, e.g. `"67.0/100.0/D023N"` (a bare `D023` is `D023N`) | (empty) |
 
 The `[analog]` keys are written only when set explicitly: a save leaves `nfm_bandwidth_hz` out while the default is in
 force, so within the section the key left out and the default are the same thing, and a later default reaches the
-config. An explicit `16000` is saved, because it differs from the default in one way: an explicit width always runs the
-channel filter, while the unset default keeps the historical rule and runs it only at DSP rates of 20 kHz or more. The
-generated template's `# nfm_bandwidth_hz = 16000` shows the width the default resolves to; uncommenting it makes the
-width explicit. A section that is present sets every key it owns, so a save always writes the `[analog]` header, even
-with no key under it: loading a config saved at the default puts the default back over an explicit width the session
-had, from the Config menu's load and a profile switch alike. An `[analog]` section whose width the loader refused leaves
-the default too. A hand-written config with no `[analog]` section leaves the width as it was. A save during a scan
-writes the configured width, never the one an `nfm` channel-map row or `nfm-conventional` target sets for itself with
-`--nfm-bandwidth-hz` (see [csv-formats.md](csv-formats.md#analog-rows)).
+config. An explicit `16000` is saved, because it differs from the default: an explicit width always runs the channel
+filter, while the unset default keeps the historical rule and runs it only at DSP rates of 20 kHz or more. The generated
+template's `# nfm_bandwidth_hz = 16000` shows the width the default resolves to on a radio input; uncommenting it makes
+the width explicit. On audio input with a rigctl peer (`-U`) the unset NFM width is not 16 kHz: the peer is asked for
+`-B` in its place, or keeps its own passband when `-B` is 0, so leaving the key out there asks for `-B` rather than
+16 kHz, while an explicit `16000` asks for 16 kHz; an unset AM width there is the 6 kHz default, as on a radio.
+`am_bandwidth_hz` is saved the same way, an explicit `6000` included, though AM always runs its channel filter, so its
+unset default is held to the DSP rate like an explicit width. A section that is present sets every key it owns, so a
+save always writes the `[analog]` header, even with no key under it: loading a config saved at the default puts the
+default back over an explicit width the session had, from the Config menu's load and a profile switch alike. An
+`[analog]` section whose width the loader refused leaves the default too. A hand-written config with no `[analog]`
+section leaves both widths as they were. A save during a scan writes the configured widths, never the one an `nfm`
+channel-map row or `nfm-conventional` target sets for itself with `--nfm-bandwidth-hz`, nor the one an `am` row or
+`am-conventional` target sets with `--am-bandwidth-hz`, and an `am` row never saves `[mode] decode = "am"` (see
+[csv-formats.md](csv-formats.md#analog-rows)).
 
-A value outside 8000-25000, or anything but whole Hz (`12.5k`, `12500Hz`), is refused, never clamped: startup logs a
+A value outside its range, or anything but whole Hz (`12.5k`, `12500Hz`), is refused, never clamped: startup logs a
 warning and keeps the default, and `--validate-config` reports an error with the same text the CLI prints. With
-`[input] source = "rtl"` or `"rtltcp"` (with `rtl_freq`, which is what builds the input with `rtl_bw_khz`) and
-`[mode] decode = "analog"`, `--validate-config` also reports an error when the width does not fit the DSP rate
-`rtl_bw_khz` gives (for example `25000` needs `rtl_bw_khz = 48`; see the DSP-rate table in `docs/cli.md`, Analog
-reception).
+`[input] source = "rtl"` or `"rtltcp"` (with `rtl_freq`, which is what builds the input with `rtl_bw_khz`),
+`--validate-config` also reports an error when the width the decode preset runs does not fit the DSP rate `rtl_bw_khz`
+gives: an explicit `nfm_bandwidth_hz` under `[mode] decode = "analog"` (for example `25000` needs `rtl_bw_khz = 48`),
+and `am_bandwidth_hz`, the 6000 default included, under `decode = "am"` (`AM bandwidth 20 kHz does not fit the 16 kHz
+DSP rate ...`); see the DSP-rate table in `docs/cli.md`, Analog reception. A SoapySDR or Airspy device, which can force
+another rate, is checked when its stream starts.
+
+`tone_filter` and `tone_list` (issue #527) set the configured receive policy, a setting the frontends show apart from
+the tone or code the monitor receives (see "Tone filter" in `docs/cli.md`). `off` keeps the list, so switching between
+`allow`, `block` and `off` never loses it. A save writes `tone_filter` when it is not `off` and `tone_list` whenever the
+list is not empty, each list entry as it was written (an inverted code stays inverted; tones with one decimal); a key
+left out of a present `[analog]` section is `off` and an empty list. A save during a scan writes the configured policy,
+never the one an `nfm` channel-map row or `nfm-conventional` target sets for itself with `--tone-allow`, `--tone-block`
+or `--no-tone-filter` (see [csv-formats.md](csv-formats.md#analog-rows)). A list with a comma, an empty entry, a value
+that is not a standard CTCSS tone or DCS code, or one signal twice (`D023N/D047I` included) is refused by entry number:
+startup logs a warning and the filter stays off, and `--validate-config` reports an error. So does `tone_filter = allow`
+or `block` with no list. The filter applies only where the monitor detects tones (the analog FM monitor and `nfm` scan
+rows); set for AM or a digital mode without a scan list (a `-Y` scan with no channel map included), or with a scan list
+that has no `nfm` row or `nfm-conventional` target, the session warns once that it has no effect. A config loaded into a
+running session applies the policy from the next read of the monitor's audio; while an `nfm` row with its own policy is
+on air, the loaded policy becomes the configured default and applies when the row leaves. The live tone-filter editor
+(the terminal's Audio > Tone filter... row and the Qt/Android monitor's `TONE FILTER` row) edits the same configured
+policy, checked by the same list parser, so what it sets is what the next save writes.
 
 When `[analog]` changes apply (the full table, with the terminal and Qt controls, is in `docs/cli.md`, Analog
 reception, "When changes apply"):
 
 | Change | When it applies |
 | --- | --- |
-| `nfm_bandwidth_hz` at startup | When the stream opens. An RTL-SDR or rtl_tcp input whose DSP bandwidth cannot filter the width stops startup before the device opens; other radio inputs are held to the rate they deliver when the stream starts. |
-| `nfm_bandwidth_hz` in a config loaded into a running session | Live, on the next DSP block of the analog monitor; no reopen. A width the DSP rate it will run at cannot filter, or any explicit width while `DSD_NEO_CHANNEL_LPF=0`, leaves the whole config unapplied, with a message naming the width, the rate and the fix. A width the front end refuses where it lands (a retune moved its rate after the check) is put back, with the same message. While an `nfm` scan row that sets its own `--nfm-bandwidth-hz` is on air, the loaded width becomes the configured default and takes effect when the row leaves (or with the next row that has no width of its own). On a digital session the width is held to the DSP rate the same way while the scan has an `nfm` row or `nfm-conventional` target without a width of its own, which runs it when it comes on air. |
-| `[input] rtl_bw_khz` in a config loaded into a running session | Reopens the device at that DSP bandwidth, as given, when the `[input]` builds an RTL-SDR or rtl_tcp input other than the running one (another bandwidth, frequency or device, or an RTL spec over a running SoapySDR or Airspy input). A bandwidth the explicit NFM width in use cannot run at leaves the whole config unapplied: the config's or the session's on an analog session, the configured one on a digital session while the scan has an `nfm` row or target without a width of its own, and the own width of an `nfm` scan row on air. The width is checked at the bandwidth the reopen runs at, not the running one. An `[input]` that builds the input already running reopens nothing and changes no rate. An `[input]` that reopens a SoapySDR or Airspy device (an `airspy` source over a running Airspy reopens it for a new sample rate, serial, `rtl_bw_khz` or volume) is held to neither rate: the reopened stream's start checks the width at the rate that device delivers. |
-| `[mode] decode = "analog"` in a config loaded into a digital session | Live receive-family switch. With an explicit NFM width the DSP rate cannot filter, the whole config is left unapplied. A `[mode]` section without a `decode` key keeps the session's mode, and an analog session's width is held as above. |
+| `nfm_bandwidth_hz`, `am_bandwidth_hz` at startup | When the stream opens. An RTL-SDR or rtl_tcp input whose DSP bandwidth cannot filter the width in use stops startup before the device opens; other radio inputs are held to the rate they deliver when the stream starts. |
+| `nfm_bandwidth_hz`, `am_bandwidth_hz` in a config loaded into a running session | Live, on the next DSP block of the analog monitor of that kind; no reopen. A width the DSP rate it will run at cannot filter, or any explicit width (or AM at all) while `DSD_NEO_CHANNEL_LPF=0`, leaves the whole config unapplied, with a message naming the width, the rate and the fix. A width the front end refuses where it lands (a retune moved its rate after the check) is put back, with the same message. While an analog scan row that sets its own width of the loaded kind is on air (an `nfm` row's `--nfm-bandwidth-hz`, an `am` row's `--am-bandwidth-hz`), the loaded width becomes the configured default and takes effect when the row leaves (or with the next row of that kind that has no width of its own). On a session whose preset does not run that kind (a digital one, or the other analog kind) the width is held to the DSP rate the same way while the scan has an analog row or target of that kind without a width of its own, which runs it when it comes on air: the NFM width for an `nfm` row or `nfm-conventional` target, the AM width, its 6 kHz default included, for an `am` row or `am-conventional` target. The width of the kind not in use is stored for the next switch to it. On audio input with a rigctl peer no DSP rate holds the width: once the config is applied, a width that changes the passband in force is asked of the peer, and one the peer refuses, or whose reply is lost, is put back, the peer is asked again for the passband the session then runs, and the load fails with the rest of the config applied (`Config applied; the rigctl peer refused AM 10 kHz: the AM width stays 8 kHz`); a config that changed what runs rather than the width (a `[mode]` onto the monitor) stays applied and fails the same way (`Config applied; the rigctl peer refused NFM 12.5 kHz (see log)`). A `[mode]` that leaves the monitor for a digital mode puts the peer back on `-B`, or on its own passband with `-B` 0, where the monitor ran a passband this client set (a width, or `-B` standing in), best-effort as a tune's `-B` is: a refusal there is a warning (`Rigctl peer refused NFM 12.5 kHz (see log)`), and the config applies without failing. |
+| `[input] rtl_bw_khz` in a config loaded into a running session | Reopens the device at that DSP bandwidth, as given, when the `[input]` builds an RTL-SDR or rtl_tcp input other than the running one (another bandwidth, frequency or device, or an RTL spec over a running SoapySDR or Airspy input). A bandwidth the explicit NFM width, or the AM width (its default included), in use cannot run at leaves the whole config unapplied: the config's or the session's on an analog session, the configured width of a kind the preset does not run while the scan has an analog row or target of that kind without a width of its own (the NFM width for `nfm`, the AM width, its default included, for `am`), and the own width of an `nfm` or `am` scan row on air. The width is checked at the bandwidth the reopen runs at, not the running one. An `[input]` that builds the input already running reopens nothing and changes no rate. An `[input]` that reopens a SoapySDR or Airspy device (an `airspy` source over a running Airspy reopens it for a new sample rate, serial or `rtl_bw_khz`) is held to neither rate: the reopened stream's start checks the width at the rate that device delivers. An `airspy` source that changes only `rtl_volume` reopens the running Airspy at the rate it runs now, so the running front end checks the width first, the configured one even when the config leaves it unchanged, since the reopened stream opens on it (also while a digital scan row that leaves it unused is on air). A reopened stream that does not start, or that cannot run the analog scan row on air once it resumes (a row's own width, or the configured width a row without one runs, at the rate a SoapySDR or Airspy device delivers; a config that turns the scanner off leaves the row, so it is not checked), puts the running input back, with the `[mode]`, `[demod]` and `[analog]` settings it ran (the tone filter, the EDACS variant and the extra LRRP ports included), started again on what its stream ran (the scan row's profile while a row is on air), and the config is not applied to the receive side (see "When changes apply" in `docs/cli.md`). |
+| `tone_filter`, `tone_list` in a config loaded into a running session | From the next read of the monitor's audio: a policy that differs from the one in force starts the transmission on air over, muted for a fresh check. A present `[analog]` section without either key turns the filter off. While an `nfm` scan row with its own policy is on air, the loaded policy becomes the configured default (what a save writes) and applies when the row leaves. |
+| Tone filter from the live editor (terminal or Qt/Android) | As for a loaded config. A refused list, or `allow` or `block` without one, changes nothing. The edit is the configured policy, which the next save writes as `tone_filter` and `tone_list`; a scan row's own policy is never saved. |
+| `[mode] decode = "analog"` or `"am"` in a config loaded into a running session | Live receive-family switch, or a switch between FM and AM on the monitor. With an explicit NFM width, or an AM width (its default included), the DSP rate cannot filter, the whole config is left unapplied. A `[mode]` section without a `decode` key keeps the session's mode, and an analog session's width is held as above. `decode = "am"` on a PCM input applies, and the session runs the Analog monitor instead, saying why (see `[mode]` below). |
 
 Note: The defaults shown match the generated template (`--dump-config-template`).
 Missing keys generally mean “leave the engine default unchanged”; some input
@@ -470,7 +508,8 @@ Notes on Input Sources).
 The config system validates files and reports issues with line numbers:
 
 - **Error**: Invalid enum value, type mismatch, parse failure, an `[analog]` width outside its range or one the
-  configured RTL DSP bandwidth cannot filter (for an `rtl`/`rtltcp` input with `rtl_freq` under `decode = "analog"`)
+  configured RTL DSP bandwidth cannot filter (for an `rtl`/`rtltcp` input with `rtl_freq` under `decode = "analog"` or
+  `"am"`), a refused `[analog] tone_list`, or `tone_filter = allow` or `block` without a list
 - **Warning**: Unknown key or section, integer out of range
 
 ```bash
@@ -583,7 +622,20 @@ Output format:
 The `decode` key in `[mode]` configures the frame types and modulation.
 Supported values: `auto`, `p25p1`, `p25p2`, `dmr`, `dmr_mono`, `nxdn48`,
 `nxdn96`, `x2tdma`, `ysf`, `dstar`, `edacs_pv`, `dpmr`, `m17`, `tdma`,
-`analog`. `dmr_mono` selects the same single-slot decoder as CLI `-fr`.
+`analog`, `am`. `dmr_mono` selects the same single-slot decoder as CLI `-fr`.
+`am` is native AM (CLI `-fM`), which needs an I/Q radio input: RTL-SDR,
+rtl_tcp, SoapySDR, Airspy or an I/Q replay. On a PCM input the session logs
+`AM demodulation needs an IQ radio input; monitor externally demodulated AM
+audio with -fA`, runs the Analog monitor instead, and turns autosave off so
+the saved `decode = "am"` is kept; a toast says so in the terminal and the
+Qt/Android app, since no other change the session makes is saved either. A
+runtime config apply with `am` on a PCM session (terminal Config > Load)
+applies the rest of the config and runs the Analog monitor with the same
+reason and autosave off, as a start does, so the loaded file keeps its
+`decode = "am"`. An explicit save still writes what the session runs
+(`analog`). A live switch of a running AM session's input to a PCM one falls
+back to the Analog monitor too, with autosave left on: it saves the new input
+with the mode the session runs there.
 Persisted compatibility values `p25p1_only`, `p25p2_only`, `edacs`,
 `provoice`, and `analog_monitor` are translated to their canonical modes when
 read. Generated configurations always use the canonical values above.
@@ -616,8 +668,8 @@ Autosave records the decoder set only when a preset reproduces it exactly: an
 while a session whose decoder set matches no preset saves no `decode` key at
 all and reloads with the initialization defaults left alone. Independent keys
 such as `dmr_mono` are still saved either way.
-Passive analog monitoring and already-framed M17 UDP input are outside this
-frame-sync hunt.
+Passive analog monitoring, native AM and already-framed M17 UDP input are
+outside this frame-sync hunt.
 
 The optional `demod` key selects a demodulator path (`auto`, `c4fm`, `gfsk`,
 `qpsk`). When set, it locks demodulator selection similarly to the `-m*`
@@ -748,8 +800,10 @@ Config/CLI interaction:
 3. One-shot commands (`--dump-config-template`, `--validate-config`,
    `--list-profiles`, `--print-config`) execute and exit immediately.
    Before `--print-config` renders, Soapy shorthand input specs are normalized
-   into `soapy_args` plus shared `rtl_*` tuning keys. Explicit `soapy_settings`
-   values are rendered under their normalized key.
+   into `soapy_args` plus shared `rtl_*` tuning keys, and an `rtl:`/`rtltcp:`
+   spec's tuning is read into the `rtl_*` keys as the engine reads it when the
+   input opens. Explicit `soapy_settings` values are rendered under their
+   normalized key.
 4. If no CLI args and no config is loaded, the interactive bootstrap wizard runs.
 5. When a config is loaded: interactive bootstrap is skipped unless
    `--interactive-setup` is specified.
@@ -766,7 +820,9 @@ When using `source = "file"` with a non-48 kHz sample rate:
 ## Interactive Bootstrap
 
 The interactive bootstrap wizard (`--interactive-setup`) guides you
-through selecting input, mode, trunking, and UI options.
+through selecting input, mode, trunking, and UI options. Its AM receiver entry
+(15) needs an RTL-SDR or rtl_tcp source; on any other source it is refused with
+the reason and the mode question is asked again.
 
 ### Auto-Saving
 
@@ -879,8 +935,9 @@ The following can be changed without restarting:
 
 - PulseAudio input/output device
 - RTL-SDR, RTL-TCP, and Soapy tuning parameters (frequency, gain, PPM, etc.)
-- The NFM channel width (`[analog] nfm_bandwidth_hz`), applied to a running analog monitor without a reopen (see
-  "When `[analog]` changes apply" above)
+- The NFM and AM channel widths (`[analog] nfm_bandwidth_hz`, `am_bandwidth_hz`), applied to a running analog monitor
+  of that kind without a reopen (see "When `[analog]` changes apply" above)
+- The tone filter (`[analog] tone_filter`, `tone_list`), from the monitor's next read of audio
 - TCP/UDP connection parameters
 - File input path
 

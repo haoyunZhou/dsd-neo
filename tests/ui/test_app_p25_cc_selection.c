@@ -5,9 +5,9 @@
 #include <dsd-neo/app_control/commands.h>
 #include <dsd-neo/app_control/frontend_runtime.h>
 #include <dsd-neo/core/call_state.h>
-#include <dsd-neo/core/dsd_time.h>
 #include <dsd-neo/core/init.h>
 #include <dsd-neo/core/opts.h>
+#include <dsd-neo/core/p25p2_playout.h>
 #include <dsd-neo/core/safe_api.h>
 #include <dsd-neo/core/state.h>
 #include <dsd-neo/core/synctype_ids.h>
@@ -17,12 +17,15 @@
 #include <dsd-neo/platform/file_compat.h>
 #include <dsd-neo/protocol/p25/p25_cc_candidates.h>
 #include <dsd-neo/protocol/p25/p25_frequency.h>
+#include <dsd-neo/protocol/p25/p25_sm_watchdog.h>
 #include <dsd-neo/protocol/p25/p25_trunk_sm.h>
 #include <dsd-neo/protocol/p25/p25_vpdu.h>
 #include <dsd-neo/runtime/config.h>
+#include <dsd-neo/runtime/decode_clock.h>
 #include <dsd-neo/runtime/decode_mode.h>
 #include <dsd-neo/runtime/trunk_cc_candidates.h>
 #include <dsd-neo/runtime/trunk_tuning_hooks.h>
+#include <dsd-neo/runtime/udp_audio_hooks.h>
 #include <limits.h>
 #include <math.h>
 #include <stdint.h>
@@ -39,6 +42,8 @@
 
 static dsd_trunk_tune_result tune_result;
 static int early_completion;
+/* Decode time cc_tune() lets pass after it publishes an early completion, 0 for none. */
+static uint64_t early_completion_delay_ns;
 static uint64_t last_request;
 static long last_freq;
 static int last_sps;
@@ -58,6 +63,9 @@ cc_tune(dsd_opts* opts, dsd_state* state, long hz, int sps, uint64_t request_id)
         dsd_trunk_tuning_request_publish(request_id, early_completion > 0 ? DSD_TRUNK_TUNE_RESULT_OK
                                                                           : DSD_TRUNK_TUNE_RESULT_FAILED);
         assert(!dsd_trunk_tuning_frame_is_current(dsd_trunk_tuning_generation()));
+        if (early_completion_delay_ns != 0U) {
+            dsd_decode_clock_test_set_ns(dsd_decode_now_mono_ns() + early_completion_delay_ns);
+        }
     }
     return tune_result;
 }
@@ -83,14 +91,19 @@ return_cc(dsd_opts* opts, dsd_state* state, uint64_t request_id) {
     return DSD_TRUNK_TUNE_RESULT_OK;
 }
 
-static void
-setup(dsd_opts* opts, dsd_state* state) {
+/* Returns 0, or -1 when the decode-mode preset does not apply. The state is initialized either way, so the caller
+ * frees it. */
+static int
+try_setup(dsd_opts* opts, dsd_state* state) {
     initOpts(opts);
     initState(state);
     dsd_app_frontend_runtime_start(opts, state);
     state->cli_argc_effective = 0;
     state->cli_argv = NULL;
-    assert(dsd_apply_decode_mode_preset(DSDCFG_MODE_TDMA, DSD_DECODE_PRESET_PROFILE_CLI, opts, state) == 0);
+    if (dsd_apply_decode_mode_preset(DSDCFG_MODE_TDMA, DSD_DECODE_PRESET_PROFILE_CLI, opts, state) != 0) {
+        DSD_FPRINTF(stderr, "setup: the TDMA decode-mode preset did not apply\n");
+        return -1;
+    }
     opts->verbose = 0;
     opts->audio_in_type = AUDIO_IN_RTL;
     opts->rtlsdr_center_freq = CC_A;
@@ -122,20 +135,41 @@ setup(dsd_opts* opts, dsd_state* state) {
     p25_sm_get_ctx()->config.cc_grace_s = 30.0;
     tune_result = DSD_TRUNK_TUNE_RESULT_OK;
     early_completion = 0;
+    early_completion_delay_ns = 0U;
     cc_calls = vc_calls = return_calls = 0;
     dsd_trunk_tuning_requests_reset();
     const dsd_trunk_tuning_hooks hooks = {vc_tune, cc_tune, return_cc};
     dsd_trunk_tuning_hooks_set(hooks);
+    return 0;
+}
+
+static void
+setup(dsd_opts* opts, dsd_state* state) {
+    assert(try_setup(opts, state) == 0);
+}
+
+/* Select @p hz as the control channel the way a frontend does. Returns 0, or -1 when the command is not queued or
+ * not drained. */
+static int
+try_select_cc(dsd_opts* opts, dsd_state* state, uint32_t hz) {
+#ifdef USE_RADIO
+    if (dsd_app_command_set_u32(DSD_APP_CMD_RTL_SET_FREQ, hz) != DSD_APP_COMMAND_SUBMIT_QUEUED) {
+        DSD_FPRINTF(stderr, "select_cc: the RTL frequency command for %u Hz was not queued\n", (unsigned)hz);
+        return -1;
+    }
+    if (dsd_app_drain_cmds(opts, state) != 1) {
+        DSD_FPRINTF(stderr, "select_cc: the RTL frequency command for %u Hz was not drained\n", (unsigned)hz);
+        return -1;
+    }
+#else
+    (void)p25_sm_select_control_channel(p25_sm_get_ctx(), opts, state, (long)hz);
+#endif
+    return 0;
 }
 
 static void
 select_cc(dsd_opts* opts, dsd_state* state, uint32_t hz) {
-#ifdef USE_RADIO
-    assert(dsd_app_command_set_u32(DSD_APP_CMD_RTL_SET_FREQ, hz) == DSD_APP_COMMAND_SUBMIT_QUEUED);
-    assert(dsd_app_drain_cmds(opts, state) == 1);
-#else
-    (void)p25_sm_select_control_channel(p25_sm_get_ctx(), opts, state, (long)hz);
-#endif
+    assert(try_select_cc(opts, state, hz) == 0);
 }
 
 static void
@@ -165,12 +199,32 @@ acquire_cc(dsd_opts* opts, dsd_state* state) {
     state->p2_rfssid = 2;
     state->p2_siteid = 3;
     state->synctype = state->lastsynctype = DSD_SYNC_P25P1_POS;
-    state->p25_last_cc_msg_time_m = dsd_time_now_monotonic_s() + 0.001;
+    state->p25_last_cc_msg_time_m = dsd_decode_now_mono_s() + 0.001;
     p25_sm_event_t sync = {0};
     sync.type = P25_SM_EV_CC_SYNC;
     p25_sm_event(p25_sm_get_ctx(), opts, state, &sync);
     assert(!p25_sm_get_ctx()->cc_sync_pending);
     assert(p25_sm_get_ctx()->expected_cc_nac == 0x456);
+}
+
+/* Issue #575: the codes the carrier on air decoded. A control channel the user picks (a frequency entry under P25
+ * trunking) is the system's own, so the pick keeps them, accepted or refused, as automatic trunk following does. The
+ * Phase 2 seed's proof goes only with the seed: an accepted pick resets the site's identity (p2_cc), a refused one
+ * leaves it. */
+static void
+seed_carrier_codes(dsd_state* state) {
+    state->dmr_color_code = 5U;
+    state->nxdn_last_ran = 9U;
+    state->nxdn_last_ran_stand_in = 1U;
+    state->dpmr_color_code = 33;
+    state->p2_cc_verified = 1U;
+}
+
+static void
+expect_carrier_codes_kept(const dsd_state* state) {
+    assert(state->dmr_color_code == 5U && state->nxdn_last_ran == 9U && state->nxdn_last_ran_stand_in == 1U);
+    assert(state->dpmr_color_code == 33);
+    assert(state->p2_cc_verified == (state->p2_cc != 0U ? 1U : 0U));
 }
 
 static void
@@ -189,7 +243,9 @@ test_selection(dsd_opts* opts, dsd_state* state, int voice, int cc_type) {
     const uint32_t grants = p25_sm_get_ctx()->grant_count;
     const uint32_t releases = p25_sm_get_ctx()->release_count;
     const uint64_t generation = dsd_trunk_tuning_generation();
+    seed_carrier_codes(state);
     select_cc(opts, state, CC_B);
+    expect_carrier_codes_kept(state);
     assert(cc_calls == 1 && last_freq == CC_B && return_calls == 0);
     assert(last_sps
            == dsd_opts_compute_sps_rate(opts, cc_type == 1 ? 6000 : 4800, dsd_opts_current_input_timing_rate(opts)));
@@ -225,13 +281,173 @@ test_selection(dsd_opts* opts, dsd_state* state, int voice, int cc_type) {
     freeState(state);
 }
 
+static int blasts;
+
+static void
+count_blast(const dsd_opts* opts, dsd_state* state, size_t bytes, const void* data) {
+    (void)opts;
+    (void)state;
+    (void)bytes;
+    (void)data;
+    blasts++;
+}
+
+/* Frames the P25 Phase 2 playout queued for both slots' calls, one per slot, playable on the UDP output. */
+static void
+queue_voice(dsd_opts* opts, dsd_state* state) {
+    opts->audio_out = 1;
+    opts->audio_out_type = 8;
+    opts->floating_point = 0;
+    opts->pulse_digi_rate_out = 8000;
+    opts->slot1_on = opts->slot2_on = 1;
+    for (int slot = 0; slot < 2; slot++) {
+        state->p25_crypto_state[slot] = DSD_P25_CRYPTO_CLEAR;
+        state->p25_p2_audio_allowed[slot] = 1;
+        state->mbe_short_silenced[slot] = 0;
+    }
+    for (int i = 0; i < 160; i++) {
+        state->s_l[i] = 1000;
+        state->s_r[i] = 2000;
+    }
+    dsd_p25p2_playout_reset(state, -1);
+    dsd_p25p2_playout_stage(opts, state, 0, 0, 1U, NULL);
+    dsd_p25p2_playout_stage(opts, state, 1, 0, 1U, NULL);
+    assert(dsd_p25p2_playout_level(state, 0) == 1 && dsd_p25p2_playout_level(state, 1) == 1);
+    blasts = 0;
+    dsd_udp_audio_hooks_set((dsd_udp_audio_hooks){.blast = count_blast});
+}
+
+/* A manual control-channel selection abandons the voice channel with what the P25 Phase 2 playout holds: the queued
+ * frames are discarded, not played after the move, and a no-carrier that follows before any other Phase 2 window finds
+ * nothing to play either (issue #651). */
+static void
+test_selection_discards_queued_voice(dsd_opts* opts, dsd_state* state) {
+    setup(opts, state);
+    start_voice(opts, state);
+    queue_voice(opts, state);
+    select_cc(opts, state, CC_B);
+    assert(state->p25_cc_freq == CC_B);
+    assert(dsd_p25p2_playout_level(state, 0) == 0 && dsd_p25p2_playout_level(state, 1) == 0);
+    assert(blasts == 0);
+    noCarrier(opts, state);
+    assert(blasts == 0);
+    dsd_udp_audio_hooks_set((dsd_udp_audio_hooks){0});
+    freeState(state);
+}
+
+/* A talkgroup hold set while the P25 Phase 2 playout holds frames of calls on other talkgroups, then the carrier drops
+ * before another emission: the no-carrier pass ends the calls before it drains, and the frames play under the hold,
+ * so they stay silent (issue #651). */
+static void
+test_no_carrier_honours_a_new_hold(dsd_opts* opts, dsd_state* state) {
+    setup(opts, state);
+    start_voice(opts, state);
+    queue_voice(opts, state);
+    const uint32_t held = 4321U;
+    assert(dsd_app_command_submit(DSD_APP_CMD_TG_HOLD_SET, &held, sizeof held) == DSD_APP_COMMAND_SUBMIT_QUEUED);
+    assert(dsd_app_drain_cmds(opts, state) == 1);
+    assert(state->tg_hold == held);
+    noCarrier(opts, state);
+    assert(blasts == 0);
+    assert(dsd_p25p2_playout_level(state, 0) == 0 && dsd_p25p2_playout_level(state, 1) == 0);
+    dsd_udp_audio_hooks_set((dsd_udp_audio_hooks){0});
+    freeState(state);
+
+    /* A hold no command set: the no-carrier pass takes the verdict before it ends the calls. */
+    setup(opts, state);
+    start_voice(opts, state);
+    queue_voice(opts, state);
+    state->tg_hold = held;
+    noCarrier(opts, state);
+    assert(blasts == 0);
+    dsd_udp_audio_hooks_set((dsd_udp_audio_hooks){0});
+    freeState(state);
+
+    /* The watchdog holds the tick guard as the carrier drops: that pass ends the calls without draining, and the next
+       one drains under the verdict the hold command left. */
+    setup(opts, state);
+    start_voice(opts, state);
+    queue_voice(opts, state);
+    assert(dsd_app_command_submit(DSD_APP_CMD_TG_HOLD_SET, &held, sizeof held) == DSD_APP_COMMAND_SUBMIT_QUEUED);
+    assert(dsd_app_drain_cmds(opts, state) == 1);
+    assert(p25_sm_tick_guard_try_enter());
+    noCarrier(opts, state);
+    p25_sm_tick_guard_leave();
+    assert(dsd_p25p2_playout_level(state, 0) == 1);
+    noCarrier(opts, state);
+    assert(blasts == 0);
+    assert(dsd_p25p2_playout_level(state, 0) == 0);
+    dsd_udp_audio_hooks_set((dsd_udp_audio_hooks){0});
+    freeState(state);
+}
+
+/* Return to CC leaves the voice channel with what the P25 Phase 2 playout holds: the queued frames are discarded, not
+ * played on the control channel, and a no-carrier that follows before any other Phase 2 window finds nothing to play
+ * (issue #651). */
+static void
+test_return_to_cc_discards_queued_voice(dsd_opts* opts, dsd_state* state) {
+    setup(opts, state);
+    start_voice(opts, state);
+    queue_voice(opts, state);
+    assert(dsd_app_command_submit(DSD_APP_CMD_RETURN_CC, NULL, 0) == DSD_APP_COMMAND_SUBMIT_QUEUED);
+    assert(dsd_app_drain_cmds(opts, state) == 1);
+    assert(p25_sm_get_ctx()->state != P25_SM_TUNED);
+    assert(dsd_p25p2_playout_level(state, 0) == 0 && dsd_p25p2_playout_level(state, 1) == 0);
+    assert(blasts == 0);
+    noCarrier(opts, state);
+    assert(blasts == 0);
+    dsd_udp_audio_hooks_set((dsd_udp_audio_hooks){0});
+    freeState(state);
+}
+
+/* The allow list turned on while the P25 Phase 2 playout holds frames of calls on unlisted talkgroups, then the calls
+ * end before another emission (the no-carrier pass, with the watchdog holding the tick guard, ends them without
+ * draining): the next pass drains them under the allow list the command left, so they stay silent (issue #651). */
+static void
+test_allow_list_mutes_queued_voice(dsd_opts* opts, dsd_state* state) {
+    setup(opts, state);
+    start_voice(opts, state);
+    queue_voice(opts, state);
+    assert(opts->trunk_use_allow_list == 0);
+    assert(dsd_app_command_submit(DSD_APP_CMD_TRUNK_WLIST_TOGGLE, NULL, 0) == DSD_APP_COMMAND_SUBMIT_QUEUED);
+    assert(dsd_app_drain_cmds(opts, state) == 1);
+    assert(opts->trunk_use_allow_list == 1);
+    assert(p25_sm_tick_guard_try_enter());
+    noCarrier(opts, state);
+    p25_sm_tick_guard_leave();
+    dsd_call_snapshot call;
+    assert(dsd_call_state_get(state, 0, &call) == 1 && call.phase != DSD_CALL_PHASE_ACTIVE);
+    assert(dsd_p25p2_playout_level(state, 0) == 1);
+    noCarrier(opts, state);
+    assert(blasts == 0);
+    assert(dsd_p25p2_playout_level(state, 0) == 0 && dsd_p25p2_playout_level(state, 1) == 0);
+    dsd_udp_audio_hooks_set((dsd_udp_audio_hooks){0});
+    freeState(state);
+}
+
+/* The carrier drops while the P25 Phase 2 playout holds the calls' last frames: they play, both slots side by side,
+ * before the no-carrier reset empties the queues (issue #651). */
+static void
+test_no_carrier_plays_queued_voice(dsd_opts* opts, dsd_state* state) {
+    setup(opts, state);
+    start_voice(opts, state);
+    queue_voice(opts, state);
+    noCarrier(opts, state);
+    assert(blasts == 1);
+    assert(dsd_p25p2_playout_level(state, 0) == 0 && dsd_p25p2_playout_level(state, 1) == 0);
+    dsd_udp_audio_hooks_set((dsd_udp_audio_hooks){0});
+    freeState(state);
+}
+
 static void
 test_rejected(dsd_opts* opts, dsd_state* state, dsd_trunk_tune_result result) {
     setup(opts, state);
     start_voice(opts, state);
     tune_result = result;
     const p25_sm_ctx_t before = *p25_sm_get_ctx();
+    seed_carrier_codes(state);
     select_cc(opts, state, CC_B);
+    expect_carrier_codes_kept(state);
     const p25_sm_ctx_t* after = p25_sm_get_ctx();
     assert(after->state == before.state && after->vc_freq_hz == before.vc_freq_hz);
     assert(after->cc_tune_request_id == before.cc_tune_request_id && after->cc_sync_pending == before.cc_sync_pending);
@@ -250,14 +466,23 @@ test_rejected(dsd_opts* opts, dsd_state* state, dsd_trunk_tune_result result) {
     freeState(state);
 }
 
+/* test_pending() runs on the TEST decode clock. Its retunes complete at PENDING_T0_NS, and the decoder thread reaches
+ * the state machine PENDING_DELAY_NS later, the way a busy or preempted decoder thread does. */
+#define PENDING_T0_NS    1234500000000ULL
+#define PENDING_DELAY_NS 1000000000ULL
+
+/* A retune the backend completes inside the tune call (@p early) or later. The decode clock steps between the
+ * completion and the state machine seeing it, and the control channel acquisition still starts at the completion. */
 static void
 test_pending(dsd_opts* opts, dsd_state* state, int early, int fail) {
+    dsd_decode_clock_use_test(PENDING_T0_NS);
     setup(opts, state);
     start_voice(opts, state);
     tune_result = DSD_TRUNK_TUNE_RESULT_PENDING;
     early_completion = 0;
     if (early) {
         early_completion = fail ? -1 : 1;
+        early_completion_delay_ns = PENDING_DELAY_NS;
     }
     select_cc(opts, state, CC_B);
     p25_sm_ctx_t* ctx = p25_sm_get_ctx();
@@ -270,11 +495,13 @@ test_pending(dsd_opts* opts, dsd_state* state, int early, int fail) {
     }
     if (!early) {
         assert(!dsd_trunk_tuning_frame_is_current(dsd_trunk_tuning_generation()));
-        ctx->t_cc_sync_m = dsd_time_now_monotonic_s() - 100.0;
+        ctx->t_cc_sync_m = dsd_decode_now_mono_s() - 100.0;
         p25_sm_tick_ctx(ctx, opts, state);
         assert(ctx->cc_tune_pending && cc_calls == 1);
         dsd_trunk_tuning_request_publish(request, fail ? DSD_TRUNK_TUNE_RESULT_FAILED : DSD_TRUNK_TUNE_RESULT_OK);
+        dsd_decode_clock_test_set_ns(PENDING_T0_NS + PENDING_DELAY_NS);
     }
+    assert(dsd_decode_now_mono_ns() == PENDING_T0_NS + PENDING_DELAY_NS);
     if (fail) {
         tune_result = DSD_TRUNK_TUNE_RESULT_FAILED;
     }
@@ -291,15 +518,26 @@ test_pending(dsd_opts* opts, dsd_state* state, int early, int fail) {
     } else {
         double completed_m = 0.0;
         assert(dsd_trunk_tuning_request_status(request, &completed_m) == DSD_TRUNK_TUNE_RESULT_OK);
-        assert(fabs(ctx->t_cc_tune_m - completed_m) < 0.01);
+        assert(fabs(completed_m - (double)PENDING_T0_NS / 1e9) < 1e-9);
+        assert(fabs(ctx->t_cc_tune_m - completed_m) < 1e-9);
         assert(ctx->state == P25_SM_ON_CC && ctx->cc_sync_pending);
         p25_sm_tick_ctx(ctx, opts, state);
         assert(cc_calls == 1);
+        // The acquisition grace runs out a full grace after the completion, not after the state machine saw it.
+        const uint64_t grace_ns = (uint64_t)(ctx->config.cc_grace_s * 1e9);
+        dsd_decode_clock_test_set_ns(PENDING_T0_NS + grace_ns - (PENDING_DELAY_NS / 2U));
+        p25_sm_tick_ctx(ctx, opts, state);
+        assert(ctx->state == P25_SM_ON_CC && ctx->cc_sync_pending && cc_calls == 1);
+        dsd_decode_clock_test_set_ns(PENDING_T0_NS + grace_ns + (PENDING_DELAY_NS / 2U));
+        p25_sm_tick_ctx(ctx, opts, state);
+        assert(cc_calls == 2 && last_freq == CC_B);
+        assert(ctx->cc_acquisition_origin == P25_SM_CC_ACQUISITION_HUNT_PROBE);
     }
     const uint64_t generation = dsd_trunk_tuning_generation();
     dsd_trunk_tuning_request_publish(request, DSD_TRUNK_TUNE_RESULT_FAILED);
     assert(dsd_trunk_tuning_generation() == generation);
     freeState(state);
+    dsd_decode_clock_use_system();
 }
 
 static void
@@ -363,41 +601,83 @@ test_overrides(dsd_opts* opts, dsd_state* state) {
     freeState(state);
 }
 
+/* Reports a failed cache check. The cache checks are counted rather than asserted so that test_cache() removes its
+ * cache files and their directory before a failure ends the test. */
+static int
+cache_check(int ok, const char* what) {
+    if (!ok) {
+        DSD_FPRINTF(stderr, "FAIL: manual CC cache: %s\n", what);
+        return 1;
+    }
+    return 0;
+}
+
+/* Write a P25 CC cache file naming @p freq at @p path, the file @p name in @p dir. @p path is empty on a failure to
+ * build it. Returns 0 on success. */
+static int
+write_cc_cache_file(char* path, size_t path_size, const char* dir, const char* name, long freq) {
+    if (dsd_test_path_join(path, path_size, dir, name) != 0) {
+        path[0] = '\0';
+        return cache_check(0, "build a cache file path");
+    }
+    FILE* fp = dsd_fopen_private(path, "w");
+    if (!fp) {
+        return cache_check(0, "open a cache file");
+    }
+    DSD_FPRINTF(fp, "cc %ld\n", freq);
+    return cache_check(fclose(fp) == 0, "write a cache file");
+}
+
+/* With the cache in @p dir, a manual selection loads no disk candidates until its site is known, and then only that
+ * site's. Returns the number of failed checks. */
+static int
+check_cache_loads_selected_site(dsd_opts* opts, dsd_state* state, const char* dir) {
+    if (cache_check(dsd_test_setenv("DSD_NEO_CACHE_DIR", dir, 1) == 0, "set DSD_NEO_CACHE_DIR")
+        || cache_check(dsd_test_setenv("DSD_NEO_CC_CACHE", "1", 1) == 0, "set DSD_NEO_CC_CACHE")) {
+        return 1;
+    }
+    dsd_neo_config_init();
+    if (cache_check(try_setup(opts, state) == 0, "set up the P25 trunk state")
+        || cache_check(try_select_cc(opts, state, CC_B) == 0, "select the manual control channel")) {
+        freeState(state);
+        return 1;
+    }
+    const long no_neighbor = 0;
+    p25_cc_record_neighbor_frequencies(opts, state, &no_neighbor, 1);
+    int failed = cache_check(state->p25_cc_cache_loaded == 0, "no load before the site is known");
+    noCarrier(opts, state);
+    p25_cc_record_neighbor_frequencies(opts, state, &no_neighbor, 1);
+    failed += cache_check(state->p25_cc_cache_loaded == 0, "no load after the carrier is lost");
+    const dsd_trunk_cc_candidates* none = dsd_trunk_cc_candidates_peek(state);
+    failed += cache_check(none && none->count == 0, "no candidates from the system-wide file");
+    state->p2_rfssid = 2;
+    state->p2_siteid = 3;
+    p25_cc_record_neighbor_frequencies(opts, state, &no_neighbor, 1);
+    const dsd_trunk_cc_candidates* cc = dsd_trunk_cc_candidates_peek(state);
+    failed += cache_check(state->p25_cc_cache_loaded && cc && cc->count == 1 && cc->candidates[0] == CC_B + 25000,
+                          "the selected site's file loads its candidate");
+    freeState(state);
+    return failed;
+}
+
 static void
 test_cache(dsd_opts* opts, dsd_state* state) {
     char dir[DSD_TEST_PATH_MAX];
     char legacy[DSD_TEST_PATH_MAX];
     char site[DSD_TEST_PATH_MAX];
     assert(dsd_test_mkdtemp(dir, sizeof(dir), "dsdneo_manual_cc"));
-    assert(dsd_test_path_join(legacy, sizeof(legacy), dir, "p25_cc_BEE00_37D.txt") == 0);
-    assert(dsd_test_path_join(site, sizeof(site), dir, "p25_cc_BEE00_37D_R002_S003.txt") == 0);
-    FILE* fp = dsd_fopen_private(legacy, "w");
-    assert(fp);
-    DSD_FPRINTF(fp, "cc %ld\n", CC_A);
-    assert(fclose(fp) == 0);
-    fp = dsd_fopen_private(site, "w");
-    assert(fp);
-    DSD_FPRINTF(fp, "cc %ld\n", CC_B + 25000);
-    assert(fclose(fp) == 0);
-    assert(dsd_test_setenv("DSD_NEO_CACHE_DIR", dir, 1) == 0);
-    assert(dsd_test_setenv("DSD_NEO_CC_CACHE", "1", 1) == 0);
-    dsd_neo_config_init();
-    setup(opts, state);
-    select_cc(opts, state, CC_B);
-    const long no_neighbor = 0;
-    p25_cc_record_neighbor_frequencies(opts, state, &no_neighbor, 1);
-    assert(state->p25_cc_cache_loaded == 0);
-    noCarrier(opts, state);
-    p25_cc_record_neighbor_frequencies(opts, state, &no_neighbor, 1);
-    assert(state->p25_cc_cache_loaded == 0);
-    assert(dsd_trunk_cc_candidates_peek(state)->count == 0);
-    state->p2_rfssid = 2;
-    state->p2_siteid = 3;
-    p25_cc_record_neighbor_frequencies(opts, state, &no_neighbor, 1);
-    const dsd_trunk_cc_candidates* cc = dsd_trunk_cc_candidates_peek(state);
-    assert(state->p25_cc_cache_loaded && cc && cc->count == 1 && cc->candidates[0] == CC_B + 25000);
-    freeState(state);
-    assert(remove(legacy) == 0 && remove(site) == 0);
+    int failed = write_cc_cache_file(legacy, sizeof(legacy), dir, "p25_cc_BEE00_37D.txt", CC_A);
+    failed += write_cc_cache_file(site, sizeof(site), dir, "p25_cc_BEE00_37D_R002_S003.txt", CC_B + 25000);
+    if (failed == 0) {
+        failed = check_cache_loads_selected_site(opts, state, dir);
+    }
+    /* Loading leaves both files in place. */
+    const int legacy_removed = remove(legacy) == 0;
+    const int site_removed = remove(site) == 0;
+    const int dir_removed = dsd_test_rmdir(dir) == 0;
+    assert(failed == 0);
+    assert(legacy_removed && site_removed);
+    assert(dir_removed);
 }
 
 static void
@@ -509,6 +789,11 @@ main(void) {
             test_selection(opts, state, voice, type);
         }
     }
+    test_selection_discards_queued_voice(opts, state);
+    test_no_carrier_plays_queued_voice(opts, state);
+    test_no_carrier_honours_a_new_hold(opts, state);
+    test_allow_list_mutes_queued_voice(opts, state);
+    test_return_to_cc_discards_queued_voice(opts, state);
     test_rejected(opts, state, DSD_TRUNK_TUNE_RESULT_FAILED);
     test_rejected(opts, state, DSD_TRUNK_TUNE_RESULT_DEFERRED);
     test_pending(opts, state, 0, 0);

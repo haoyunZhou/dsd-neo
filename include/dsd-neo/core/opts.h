@@ -15,6 +15,7 @@
 #define DSD_NEO_INCLUDE_DSD_NEO_CORE_OPTS_H_H
 
 #include <dsd-neo/core/airspy_config.h>
+#include <dsd-neo/core/analog_tone.h>
 #include <dsd-neo/core/frontend_types.h>
 #include <dsd-neo/core/opts_fwd.h>
 #include <dsd-neo/platform/platform.h>
@@ -66,12 +67,28 @@ struct dsd_opts {
     SF_INFO* audio_out_file_info;
     FILE* mbe_out_f;
     FILE* mbe_out_fR; //second slot on a TDMA system
+    /* MBE capture runtime state beside the handles it describes (issue #661), never a user setting: the realtime
+       monotonic second before which a failed creation is not retried, the open capture's owner (dsd_mbe_out_owner_of();
+       0 for a handle the capture writer did not create) and record format (dsd_mbe_out_format), and whether the current
+       run of failed creations has been reported. */
+    double mbe_out_retry_at;
+    double mbe_out_retry_atR;
+    int mbe_out_owner;
+    int mbe_out_ownerR;
+    int mbe_out_format;
+    int mbe_out_formatR;
+    int mbe_out_fail_logged;
+    int mbe_out_fail_loggedR;
     FILE* symbol_out_f;
     FILE* frame_log_f;                    // optional frame-trace sink
     FILE* p25_sm_log_f;                   // optional P25 state-machine diagnostic sink
     time_t symbol_out_file_creation_time; //time the symbol out file was created
     SNDFILE* wav_out_f;
     SNDFILE* wav_out_fR;
+    // Decode time the per-call WAV in wav_out_f / wav_out_fR was opened, 0 before the first open. A recording switched
+    // on after its call began holds only what followed, so its rdio-scanner sidecar starts here, not at the call's start.
+    time_t wav_out_open_time;
+    time_t wav_out_open_timeR;
     SNDFILE* wav_out_raw;
     double rtl_pwr;
     dsd_audio_stream* audio_in_stream;   /* Primary audio input stream */
@@ -85,8 +102,15 @@ struct dsd_opts {
     unsigned long long udp_in_drops;   // dropped samples due to ring overflow
     tcp_input_ctx* tcp_in_ctx;         ///< TCP audio input context (cross-platform)
     double rtl_squelch_level;
+    /* The squelch's mode (dsd_squelch_mode, core/power.h) and, under AUTO, its margin over the floor the demodulator
+       learns, in whole dB. LEVEL gates at rtl_squelch_level; under AUTO rtl_squelch_level keeps the last level for a
+       switch back. Gate through the runtime/squelch.h helpers, never by comparing rtl_pwr to rtl_squelch_level. */
+    int rtl_squelch_mode;
+    int rtl_squelch_margin_db;
+    /* 1 once --squelch set the squelch: an input spec's sql field then leaves it (dsd_squelch_spec_field_apply()). */
+    int rtl_squelch_cli_set;
     double input_warn_db;
-    time_t last_input_warn_time;
+    time_t last_input_warn_time; // decode time of the last input-level warning
     // P25 SM unified follower configuration (CLI values override environment defaults)
     // Values <= 0 mean "unset" and will defer to environment or defaults.
     double p25_vc_grace_s;             // seconds after tune before eligible for VC->CC return
@@ -171,7 +195,17 @@ struct dsd_opts {
     int rtl_volume_multiplier;
     /* Generic input volume multiplier for non-RTL inputs (Pulse/WAV/TCP/UDP). */
     int input_volume_multiplier;
+    /* Bumped each time a PCM input stream (re)opens (dsd_opts_note_pcm_stream(): openAudioInput(), a TCP reconnect,
+       and dsd_opts_reset_pcm_input_state(), which every input switch runs): what the PCM noise squelch learned belongs
+       to one stream (issues #628, #634). */
+    uint32_t pcm_input_generation;
+    /* Bumped each time dsd_opts_apply_input_sample_rate() changes the PCM input rate, provisional changes a transaction
+       later restores included: a monitor block that collects samples on both sides of one is mixed-rate, and neither
+       plays nor goes to the -6 WAV (issue #633). */
+    uint32_t input_rate_generation;
     int rtl_udp_port;
+    /* Control/telemetry API (docs/api.md) listening port; 0 disables the server. */
+    int api_port;
     /* Base DSP bandwidth for RTL path in kHz (4,6,8,12,16,24,48). Influences capture rate planning.
        Not the hardware tuner IF bandwidth. */
     int rtl_dsp_bw_khz;
@@ -200,6 +234,11 @@ struct dsd_opts {
        the unset NFM default keeps the historical enable rule. */
     int analog_nfm_bandwidth_hz;
     int analog_am_bandwidth_hz;
+    /* The CTCSS/DCS receive policy (issue #527): dsd_tone_filter_mode (0 off, 1 allow, 2 block) and its list, both in
+       <dsd-neo/core/analog_tone.h>. Off keeps the list. Only the analog FM monitor applies it; a scan row's own policy
+       runs over these while the row is on air, so a save reads them from the configured view. */
+    int analog_tone_filter;
+    dsd_tone_set analog_tone_set;
     int pulse_raw_rate_in;
     int pulse_raw_rate_out;
     int pulse_digi_rate_in;
@@ -254,6 +293,9 @@ struct dsd_opts {
     int rtltcp_autotune; // 1 to enable rtl_tcp network auto-tuning (adaptive buffering)
     int wav_sample_rate;
     int staged_file_sample_rate;
+    /* The raw PCM rate (from -s or a config's file rate) that a running WAV's header rate replaced in wav_sample_rate,
+       or 0. A switch away from that WAV opens the next PCM input at it again (dsd_audio_switch_input(), issue #634). */
+    int wav_header_replaced_rate;
     int wav_interpolator;
     int wav_decimator;
     float input_upsample_prev;
@@ -266,6 +308,10 @@ struct dsd_opts {
     float trunk_hangtime; //hangtime in seconds before tuning back to CC
     int scanner_mode;     //experimental -- use the channel map as a conventional scanner, quicker tuning, but no CC
     int trunk_scan_enabled;
+    /* Issue #518: the scan row scope these options last took a row's options under (dsd_scan_mode_options());
+       dsd_state::scan_row_scope_seq carries the same number, so a frontend reading both snapshots can tell they are
+       of one row's visit. Runtime only, never saved. */
+    uint32_t scan_row_scope_seq;
     int trunk_scan_idle_dwell_ms;
     int trunk_scan_activity_hold_ms;
     int scan_voice_only;
@@ -325,6 +371,11 @@ struct dsd_opts {
     uint8_t iq_replay_active;     /* 1 while replay stream is active */
     uint8_t iq_replay_rate_mode;  /* DSD_IQ_REPLAY_RATE_* */
     uint8_t iq_capture_format;    /* DSD_IQ_FORMAT_* */
+    /* During an I/Q replay, the channel centre in Hz the samples being decoded were captured on: the replay batch tag's,
+       which a recorded RETUNE moves (issue #575). 0 when none. The decoder thread writes it from the read path, as it
+       does rtl_pwr, a live read never does, and every stop of the RTL stream clears it. rtlsdr_center_freq keeps the
+       capture's opening centre meanwhile; read the tuned frequency through dsd_opts_tuned_freq_hz(). */
+    uint32_t iq_replay_center_freq;
 
     // Strings and paths (large trailing arrays)
     char pa_input_idx[100];
@@ -342,6 +393,8 @@ struct dsd_opts {
     char wav_out_fileR[1024];
     char wav_out_file_raw[1024];
     char symbol_out_file[1024];
+    char symbol_out_open_path[1024]; /* the capture file symbol_out_f writes, named when it opened */
+    char symbol_capture_last[1024];  /* the last capture closed this session: what Replay last replays (issue #634) */
     char lrrp_out_file[1024];
     uint16_t lrrp_extra_ports[DSD_LRRP_EXTRA_PORT_MAX]; //site-mapped UDP ports decoded as LRRP
     char event_out_file[1024];
@@ -353,6 +406,11 @@ struct dsd_opts {
     char rigctlhostname[1024];
     char rdio_api_url[1024];
     char rtl_udp_bindaddr[64];
+    /* Control/telemetry API bind address (numeric IPv4, "" = 127.0.0.1) and shared-secret token. The token is
+       resolved from --api-token, DSD_NEO_API_TOKEN or a token file at parse time, handed to the server at start
+       and then wiped from here; published opts snapshots never carry it. */
+    char api_bindaddr[64];
+    char api_token[256];
     char udp_hostname[1024];
     char udp_in_bindaddr[1024];
     char m17_hostname[1024];
@@ -376,6 +434,9 @@ struct dsd_opts {
     char soapy_settings[1024];
     char soapy_gains[512];
     char audio_in_dev[2048]; //increase size for super long directory/file names
+    /* The radio input spec a switch to a PCM input replaced in audio_in_dev, so Input > Switch source > RTL-SDR goes back
+       to that backend (runtime only, never saved; issue #634). */
+    char radio_in_dev[2048];
     char iq_capture_path[2048];
     char iq_replay_path[2048];
     char mbe_out_path[2048]; //1024
@@ -447,11 +508,23 @@ dsd_opts_uses_wide_4800_profile(const dsd_opts* opts) {
  * @brief Return 1 for the analog receive family (the `-fA` monitor).
  *
  * The M17 encoder shares the analog front end but is not part of the family: its channel filter, demodulator and
- * de-emphasis stay on the fixed WIDE/FM path whatever the analog settings say.
+ * de-emphasis stay on the fixed WIDE/FM path whatever the analog settings say (dsd_opts_runs_m17_encoder()).
  */
 static inline int
 dsd_opts_is_analog_family(const dsd_opts* opts) {
     return (opts && opts->analog_only == 1 && opts->m17encoder != 1) ? 1 : 0;
+}
+
+/**
+ * @brief Return 1 for the M17 stream encoder (`-fZ`), whose RTL front end is the fixed FM/WIDE monitor with de-emphasis
+ * and no CQPSK, at open and through every live change (issue #625).
+ *
+ * `-fZ` clears analog_only and leaves the digital frame flags at their defaults, so neither says it is the encoder: the
+ * front end, the symbol profile and the squelch key on this instead.
+ */
+static inline int
+dsd_opts_runs_m17_encoder(const dsd_opts* opts) {
+    return (opts && opts->m17encoder == 1) ? 1 : 0;
 }
 
 /** @brief Explicit channel width configured for the active analog demodulator in Hz; 0 selects its default. */
@@ -487,6 +560,19 @@ dsd_opts_reset_input_upsample_state(dsd_opts* opts) {
 }
 
 /**
+ * @brief Note that a new PCM input stream began: a reopen, a reconnect, another device. The PCM noise squelch keys its
+ * references on dsd_opts::pcm_input_generation, so it forgets what it learned from the old stream.
+ *
+ * @param opts Decoder options.
+ */
+static inline void
+dsd_opts_note_pcm_stream(dsd_opts* opts) {
+    if (opts) {
+        opts->pcm_input_generation++;
+    }
+}
+
+/**
  * @brief Reset low-rate PCM input processing state at a stream boundary.
  *
  * Clears both the staged upsample bookkeeping and the reusable FIR state so the next socket/file block cannot blend
@@ -501,6 +587,7 @@ dsd_opts_reset_pcm_input_state(dsd_opts* opts) {
     }
     dsd_resampler_reset(&opts->input_resampler);
     dsd_opts_reset_input_upsample_state(opts);
+    dsd_opts_note_pcm_stream(opts);
 }
 
 /**
@@ -522,6 +609,9 @@ dsd_opts_apply_input_sample_rate(dsd_opts* opts, int sample_rate_hz) {
         sample_rate_hz = 48000;
     }
 
+    if (opts->wav_sample_rate != sample_rate_hz) {
+        opts->input_rate_generation++;
+    }
     opts->wav_sample_rate = sample_rate_hz;
     opts->wav_interpolator = (opts->wav_decimator > 0 && opts->wav_sample_rate >= opts->wav_decimator)
                                  ? (opts->wav_sample_rate / opts->wav_decimator)
@@ -624,6 +714,14 @@ dsd_opts_audio_in_dev_is_m17udp_spec(const char* dev) {
     return dsd_opts_audio_dev_is_exact_or_prefixed(dev, "m17udp", "m17udp:");
 }
 
+/** Whether @p dev names a radio input: an RTL-SDR, rtl_tcp, Airspy, SoapySDR or I/Q replay spec. */
+static inline int
+dsd_opts_audio_in_dev_is_radio_spec(const char* dev) {
+    return dsd_opts_audio_in_dev_is_rtl_spec(dev) || dsd_opts_audio_in_dev_is_rtltcp_spec(dev)
+           || dsd_opts_audio_in_dev_is_airspy_spec(dev) || dsd_opts_audio_in_dev_is_soapy_spec(dev)
+           || dsd_opts_audio_in_dev_is_iqreplay_spec(dev);
+}
+
 /**
  * @brief What sets the DSP rate of this radio input (dsd_analog_rate_source), as the stream start classifies the input
  * (detect_radio_source()): an I/Q replay's capture, a SoapySDR or Airspy device, or else the RTL DSP bandwidth. It
@@ -721,6 +819,155 @@ dsd_opts_input_is_radio(const dsd_opts* opts) {
 }
 
 /**
+ * @brief Return the frequency in Hz the receiver is tuned to, as every frontend reads it; 0 when there is none to show.
+ *
+ * During an I/Q replay it is the centre the samples being decoded were captured on (`iq_replay_center_freq`), which
+ * follows the capture's recorded RETUNEs (issue #575). `rtlsdr_center_freq` keeps the capture's opening centre then:
+ * the replay defers every live retune before the field is written, and the trunking paths read it as the control or
+ * current channel, so moving it would change how a replay decodes. Otherwise it is `rtlsdr_center_freq`, the centre
+ * DSD-neo tuned the radio to.
+ *
+ * Off a radio input it is 0, rigctl on an audio input included: `rtlsdr_center_freq` holds a made-up 850 MHz default
+ * until DSD-neo tunes the peer (initOpts()), the legacy rigctl `-Y` scan never writes it, and a frequency changed on the
+ * peer itself is invisible here.
+ *
+ * @param opts Decoder options (may be NULL).
+ * @return The tuned frequency in Hz; 0 off a radio input and for NULL.
+ */
+static inline uint32_t
+dsd_opts_tuned_freq_hz(const dsd_opts* opts) {
+    if (!dsd_opts_input_is_radio(opts)) {
+        return 0U;
+    }
+    return opts->iq_replay_center_freq != 0U ? opts->iq_replay_center_freq : opts->rtlsdr_center_freq;
+}
+
+/**
+ * @brief Note the centre the I/Q replay sample the decoder just read was captured on, for dsd_opts_tuned_freq_hz().
+ *
+ * Every read path that runs the decode clock on a replay sample calls it, on the decoder thread (issue #575): the
+ * symbol cache's readers with the cached batch's centre, the one-sample readers with the centre
+ * dsd_rtl_stream_metrics_hook_replay_advance_decode_clock() reported. A centre of 0 (a live read, or no batch) leaves
+ * the reading as it was. Read paths call it through dsd_frame_sync_note_replay_center(), which ends the reception
+ * across a centre this adopts (a retune the capture recorded) before the sample is returned.
+ *
+ * @param opts Decoder options (may be NULL).
+ * @param center_hz Capture centre in Hz of the sample just read; 0 for none.
+ * @return 1 when the decoder adopted a new centre over another one (a recorded retune), 0 otherwise: no centre, the
+ *         same one, or the stream's first.
+ */
+static inline int
+dsd_opts_note_iq_replay_center(dsd_opts* opts, uint32_t center_hz) {
+    if (opts == NULL || center_hz == 0U || opts->iq_replay_center_freq == center_hz) {
+        return 0;
+    }
+    const int moved = opts->iq_replay_center_freq != 0U;
+    opts->iq_replay_center_freq = center_hz;
+    return moved;
+}
+
+/**
+ * @brief Forget the I/Q replay centre when the stream that set it stops (issue #575).
+ *
+ * @param opts Decoder options (may be NULL).
+ */
+static inline void
+dsd_opts_forget_iq_replay_center(dsd_opts* opts) {
+    if (opts != NULL) {
+        opts->iq_replay_center_freq = 0U;
+    }
+}
+
+/**
+ * @brief Return 1 while the input in force is an I/Q replay (`--iq-replay`), 0 otherwise.
+ *
+ * A replay plays the tuning its capture recorded and defers every other retune unseen, so app-control refuses manual
+ * tunes and the tuner release during one (issue #575). It reads the input type and device string the session runs,
+ * never `iq_replay_active`, which an input switch does not clear and the RTL stream sets in its own copy of the
+ * options.
+ *
+ * @param opts Decoder options (may be NULL).
+ * @return 1 for an RTL-family input whose device is an `iqreplay` spec; 0 otherwise and for NULL.
+ */
+static inline int
+dsd_opts_input_is_iq_replay(const dsd_opts* opts) {
+    return (dsd_opts_input_is_radio(opts) && dsd_opts_audio_in_dev_is_iqreplay_spec(opts->audio_in_dev)) ? 1 : 0;
+}
+
+/**
+ * @brief Return 1 while the receiver is on a voice channel a trunking grant sent it to, 0 otherwise.
+ *
+ * A trunking receiver's tune of a grant sets `trunk_is_tuned` together with the voice-channel frequencies
+ * `trunk_vc_freq[]` and `p25_vc_freq[]` (dsd_engine_update_vc_tune_state(), the P25 SM's own commit), and the return to
+ * the control channel clears it. Without trunking nothing is followed: every DMR grant writes `trunk_vc_freq[]` for
+ * display while the receiver stays put, and Hytera XPT site status raises `trunk_is_tuned` on the rest channel. So a
+ * call observation whose message carries no frequency of its own (a DMR voice LC, an NXDN VCALL, a P25 Phase 1 ESS)
+ * may stamp `trunk_vc_freq[]` only while this returns 1; otherwise it names another channel, not the carrier the call
+ * is decoded on (issue #575). P25's own `p25_vc_freq[]` differs: without trunking only a grant naming a call active on
+ * this carrier writes it, so P25 reads it either way.
+ *
+ * @param opts Decoder options (may be NULL).
+ * @return 1 with trunking on and a voice channel tuned; 0 otherwise and for NULL.
+ */
+static inline int
+dsd_opts_trunk_vc_followed(const dsd_opts* opts) {
+    return (opts != NULL && opts->trunk_enable == 1 && opts->trunk_is_tuned == 1) ? 1 : 0;
+}
+
+/**
+ * @brief Return 1 when the session's input carries PCM audio, 0 otherwise.
+ *
+ * Pulse, stdin, WAV/file, UDP and TCP inputs deliver audio something else already demodulated (a rigctl peer such as
+ * SDR++ or GQRX, issue #621); dsd_squelch_input_kind() calls exactly these audio. An RTL-family input delivers I/Q
+ * DSD-neo demodulates itself, and symbol-file and null inputs carry no audio at all.
+ *
+ * @param opts Decoder options containing the configured input source.
+ * @return 1 for a PCM audio input, 0 for everything else and for NULL.
+ */
+static inline int
+dsd_opts_input_is_pcm_audio(const dsd_opts* opts) {
+    if (opts == NULL) {
+        return 0;
+    }
+    switch (opts->audio_in_type) {
+        case AUDIO_IN_PULSE:
+        case AUDIO_IN_STDIN:
+        case AUDIO_IN_WAV:
+        case AUDIO_IN_UDP:
+        case AUDIO_IN_TCP: return 1;
+        default: return 0;
+    }
+}
+
+/**
+ * @brief Return 1 while a rigctl peer is connected (-U), 0 otherwise.
+ *
+ * The test every rigctl request path makes before it sends: rigctl in use with a socket. Socket 0 is a socket.
+ *
+ * @param opts Decoder options containing the rigctl connection.
+ * @return 1 with rigctl on and its socket open, 0 otherwise and for NULL.
+ */
+static inline int
+dsd_opts_rigctl_live(const dsd_opts* opts) {
+    return (opts != NULL && opts->use_rigctl == 1 && opts->rigctl_sockfd != DSD_INVALID_SOCKET) ? 1 : 0;
+}
+
+/**
+ * @brief Return 1 when a connected rigctl peer demodulates what DSD-neo hears, 0 otherwise.
+ *
+ * On PCM audio input (dsd_opts_input_is_pcm_audio()) the audio arrives from the peer's demodulator, so the analog
+ * monitor's demodulator and passband are the peer's to set (issue #526, #621). On any other input the peer, if any,
+ * only follows the frequency.
+ *
+ * @param opts Decoder options.
+ * @return 1 with a live rigctl peer on PCM audio input, 0 otherwise and for NULL.
+ */
+static inline int
+dsd_opts_rigctl_peer_demodulates(const dsd_opts* opts) {
+    return (dsd_opts_rigctl_live(opts) && dsd_opts_input_is_pcm_audio(opts)) ? 1 : 0;
+}
+
+/**
  * @brief Return the effective PCM rate seen by non-RTL PCM decode paths.
  *
  * @param opts Decoder options containing the configured PCM input sample rate.
@@ -813,6 +1060,18 @@ dsd_opts_current_input_timing_rate(const dsd_opts* opts) {
         return dsd_opts_effective_input_rate(opts);
     }
     return 0;
+}
+
+/**
+ * @brief The rate every analog sink runs at: the local raw stream, the UDP analog socket and the -6 raw WAV (issue
+ * #633). The monitor's blocks are converted to it from whatever rate they run at.
+ *
+ * @param opts Decoder options (may be NULL).
+ * @return `pulse_raw_rate_out` when set, otherwise 48000.
+ */
+static inline int
+dsd_opts_analog_sink_rate_hz(const dsd_opts* opts) {
+    return (opts && opts->pulse_raw_rate_out > 0) ? opts->pulse_raw_rate_out : 48000;
 }
 
 /**

@@ -20,101 +20,6 @@ permissions:
   contents: read
 
 jobs:
-  build-native-msvc:
-    runs-on: windows-latest
-    if: github.event_name == 'pull_request'
-    permissions:
-      actions: read
-      contents: read
-      packages: read
-    env:
-      # Use a release-only triplet to avoid building debug variants of vcpkg deps.
-      VCPKG_DEFAULT_TRIPLET: x64-windows-dynamic-release
-      VCPKG_TARGET_TRIPLET: x64-windows-dynamic-release
-      VCPKG_OVERLAY_TRIPLETS: ${{ github.workspace }}\vcpkg-triplets
-      # Pull requests may restore existing vcpkg binaries but must not write new cache entries.
-      VCPKG_EXE: ${{ github.workspace }}/vcpkg/vcpkg.exe
-      VCPKG_NUGET_FEED: https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json
-      VCPKG_NUGET_USER: ${{ github.repository_owner }}
-      VCPKG_BINARY_SOURCES: "clear;nuget,https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json,read"
-      # Enable sccache GitHub Actions backend.
-      SCCACHE_GHA_ENABLED: "true"
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-      - name: Run sccache-cache
-        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba
-
-      - name: Initialize sccache
-        shell: pwsh
-        run: |
-          & $env:SCCACHE_PATH --version
-          & $env:SCCACHE_PATH --zero-stats
-
-      - name: Setup MSVC environment
-        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756
-
-      - name: Setup vcpkg
-        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2
-        with:
-          # run-vcpkg v11.6 requires a full 40-char SHA1.
-          # Keep this in sync with vcpkg.json's builtin-baseline.
-          vcpkgGitCommitId: "9e593bb18ea69cc5095e012465dcd675a822ed0d"
-
-      - name: Configure vcpkg binary cache
-        shell: pwsh
-        env:
-          VCPKG_NUGET_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          $nuget = (& $env:VCPKG_EXE fetch nuget | Select-Object -Last 1)
-          if (-not $nuget) { throw "vcpkg fetch nuget did not return a path" }
-
-          & $nuget sources add `
-            -Source "$env:VCPKG_NUGET_FEED" `
-            -StorePasswordInClearText `
-            -Name GitHubPackages `
-            -UserName "$env:VCPKG_NUGET_USER" `
-            -Password "$env:VCPKG_NUGET_TOKEN" `
-            -NonInteractive
-
-      - name: Install vcpkg dependencies (MSVC)
-        shell: pwsh
-        run: >-
-          vcpkg install
-          --triplet $env:VCPKG_DEFAULT_TRIPLET
-          --overlay-triplets "$env:GITHUB_WORKSPACE\\vcpkg-triplets"
-          --x-manifest-root "$env:GITHUB_WORKSPACE"
-
-      - name: Configure (MSVC Release)
-        shell: pwsh
-        # Use Ninja generator (override preset) so CMAKE_*_COMPILER_LAUNCHER works with sccache
-        run: |
-          cmake --preset win-msvc-release -G Ninja `
-            -DCMAKE_C_COMPILER_LAUNCHER=sccache `
-            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache `
-            -DDSD_REQUIRE_RTLSDR=ON `
-            -DDSD_REQUIRE_AIRSPY=ON `
-            -DDSD_REQUIRE_SOAPYSDR=ON
-
-      - name: Build (MSVC Release)
-        shell: pwsh
-        run: cmake --build --preset win-msvc-release
-
-      - name: Verify release hardening (MSVC)
-        shell: pwsh
-        run: |
-          $exe = Get-ChildItem -Path 'build/win-msvc-release/apps/dsd-cli' -Recurse -Filter 'dsd-neo.exe' |
-            Select-Object -First 1
-          if ($null -eq $exe) { throw "dsd-neo.exe not found under build/win-msvc-release/apps/dsd-cli" }
-          ./tools/check_release_hardening.ps1 $exe.FullName
-
-      - name: Show sccache stats
-        shell: pwsh
-        run: |
-          & $env:SCCACHE_PATH --show-stats
-
   package-native-msvc:
     name: Package native MSVC ZIP
     runs-on: windows-latest
@@ -250,9 +155,9 @@ jobs:
 
           Copy-Item -Force LICENSE,COPYRIGHT,THIRD_PARTY.md $docDir -ErrorAction SilentlyContinue
           Copy-Item -Force 'src/third_party/ezpwd/lesser.txt' (Join-Path $licenseDir 'ezpwd-LGPL-2.1-or-later.txt') -ErrorAction SilentlyContinue
-          Copy-Item -Force 'src/third_party/pffft/COPYING' (Join-Path $licenseDir 'pffft-FFTPACK.txt') -ErrorAction SilentlyContinue
+          Copy-Item -Force 'build/win-msvc-release/pffft-licenses/pffft-LICENSE.txt','build/win-msvc-release/pffft-licenses/pffft-NOTICES.txt' $licenseDir -ErrorAction Stop
           Copy-Item -Force 'android/third_party/libairspy/LICENSE' (Join-Path $licenseDir 'libairspy-LICENSE.txt') -ErrorAction Stop
-          $required = @('LICENSE','COPYRIGHT','THIRD_PARTY.md','licenses/ezpwd-LGPL-2.1-or-later.txt','licenses/pffft-FFTPACK.txt','licenses/libairspy-LICENSE.txt')
+          $required = @('LICENSE','COPYRIGHT','THIRD_PARTY.md','licenses/ezpwd-LGPL-2.1-or-later.txt','licenses/pffft-LICENSE.txt','licenses/pffft-NOTICES.txt','licenses/libairspy-LICENSE.txt')
           foreach ($f in $required) {
             $p = Join-Path $docDir $f
             if (!(Test-Path $p)) { throw "Missing required license file in staged docs: $p" }
@@ -328,14 +233,32 @@ jobs:
           retention-days: 7
 
       - name: Generate native MSVC SBOM
-        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
           file: ${{ steps.zip.outputs.ZIP_PATH }}
           format: spdx-json
           output-file: ${{ steps.zip.outputs.ZIP_PATH }}.spdx.json
           artifact-name: ${{ steps.zip.outputs.ART_NAME }}.spdx.json
-          upload-artifact: true
+          upload-artifact: false
           upload-release-assets: false
+
+      - name: Record pinned PFFFT in SBOM
+        shell: bash
+        env:
+          SBOM_PATH: ${{ steps.zip.outputs.ZIP_PATH }}.spdx.json
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            python tools/pffft_metadata.py --spdx "$SBOM_PATH"
+          else
+            python3 tools/pffft_metadata.py --spdx "$SBOM_PATH"
+          fi
+
+      - name: Upload enriched SBOM
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.zip.outputs.ART_NAME }}.spdx.json
+          path: ${{ steps.zip.outputs.ZIP_PATH }}.spdx.json
+          retention-days: 7
 
       - name: Attest native MSVC provenance
         if: startsWith(github.ref, 'refs/tags/')
@@ -403,11 +326,7 @@ jobs:
         with:
           name: ${{ steps.names.outputs.ART_NAME }}.spdx.json
           path: dist
-      - name: Normalize downloaded SBOM filename
-        shell: bash
-        run: |
-          set -euo pipefail
-          mv -f "dist/${{ steps.names.outputs.ART_NAME }}.spdx.json" "${{ steps.names.outputs.ZIP_PATH }}.spdx.json"
+      # upload-artifact preserves the SBOM basename, including the package extension.
       - name: Verify downloaded release files
         shell: bash
         run: |

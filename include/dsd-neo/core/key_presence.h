@@ -29,6 +29,14 @@ dsd_key_hytera_present(const dsd_state* state) {
     return state && (state->hytera_key_segments != 0U || state->K1 != 0ULL);
 }
 
+// DMR forced clear: Baofeng AP, CSI EE and the Kenwood scrambler are static keys forced onto every voice frame, so
+// the vocoder's verdict counts a frame under them as decrypted (issue #655): an encrypted one plays, and reverse mute
+// (-q) mutes only one that is clear.
+static inline int
+dsd_key_dmr_forced_clear(const dsd_state* state) {
+    return state && (state->baofeng_ap == 1 || state->csi_ee == 1 || state->ken_sc == 1);
+}
+
 #ifdef __cplusplus
 }
 #endif

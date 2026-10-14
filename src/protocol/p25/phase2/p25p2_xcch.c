@@ -12,10 +12,10 @@
 
 #include <dsd-neo/core/audio.h>
 #include <dsd-neo/core/call_state.h>
-#include <dsd-neo/core/dsd_time.h>
 #include <dsd-neo/core/file_io.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/state.h>
+#include <dsd-neo/core/synctype_ids.h>
 #include <dsd-neo/protocol/p25/p25_cc_activity.h>
 #include <dsd-neo/protocol/p25/p25_crc.h>
 #include <dsd-neo/protocol/p25/p25_crypto.h>
@@ -25,16 +25,16 @@
 #include <dsd-neo/protocol/p25/p25_xcch.h>
 #include <dsd-neo/protocol/p25/p25p2_mac_parse.h>
 #include <dsd-neo/runtime/colors.h>
-#include <dsd-neo/runtime/p25_p2_audio_ring.h>
+#include <dsd-neo/runtime/decode_clock.h>
 #include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
-#include <time.h>
 #include "../p25_trunk_sm_internal.h"
 #include "dsd-neo/core/opts_fwd.h"
 #include "dsd-neo/core/safe_api.h"
 #include "dsd-neo/core/secret_redaction.h"
 #include "dsd-neo/core/state_fwd.h"
+#include "p25p2_frame_internal.h"
 
 static int
 p25p2_xcch_slot_valid(int slot) {
@@ -204,55 +204,14 @@ p25p2_xcch_set_slot_burst(dsd_state* state, int slot, int value) {
 }
 
 static void
-p25p2_xcch_reset_slot_gain(const dsd_opts* opts, dsd_state* state, int slot) {
-    if (opts->floating_point != 1) {
-        return;
-    }
-
-    if (slot == 0) {
-        state->aout_gain = opts->audio_gain;
-    } else {
-        state->aout_gainR = opts->audio_gain;
-    }
-}
-
-static void
 p25p2_xcch_close_slot_mbe_out(dsd_opts* opts, dsd_state* state, int slot) {
-    if (slot == 0) {
-        if (opts->mbe_out_f != NULL) {
-            closeMbeOutFile(opts, state);
-        }
-    } else {
-        if (opts->mbe_out_fR != NULL) {
-            closeMbeOutFileR(opts, state);
-        }
-    }
-}
-
-static void
-p25p2_xcch_flush_partial_audio_on_hangtime(dsd_opts* opts, dsd_state* state, int slot) {
-    int audio_allowed[2];
-
-    if (!opts || !state) {
-        return;
-    }
-
-    audio_allowed[0] = state->p25_p2_audio_allowed[0];
-    audio_allowed[1] = state->p25_p2_audio_allowed[1];
-
-    // Flush before MAC_HANGTIME changes burst 21 to 22, so the flushed
-    // superframe is still attributed to the active transmission. Unlike release,
-    // hangtime stays on the VC, so restore the existing audio gates after the
-    // flush -- the flush helper repoints them at the slot it is draining.
-    dsd_p25p2_flush_partial_audio_slot(opts, state, slot);
-
-    state->p25_p2_audio_allowed[0] = audio_allowed[0];
-    state->p25_p2_audio_allowed[1] = audio_allowed[1];
+    dsd_mbe_out_close_protocol(opts, state, slot == 0 ? DSD_MBE_OUT_SLOT1 : DSD_MBE_OUT_SLOT2, DSD_SYNC_P25P2_POS);
 }
 
 static void
 p25p2_xcch_handle_mac_hangtime_slot(dsd_opts* opts, dsd_state* state, int slot) {
-    p25p2_xcch_flush_partial_audio_on_hangtime(opts, state, slot);
+    // The transmission is over: its playout stream closes and what it queued still plays (issue #651).
+    dsd_p25p2_flush_partial_audio_slot(opts, state, slot);
     p25p2_xcch_set_slot_burst(state, slot, 22);
     p25p2_xcch_close_slot_mbe_out(opts, state, slot);
 }
@@ -293,8 +252,16 @@ p25p2_xcch_clear_idle_metadata_if_stale(dsd_state* state, uint8_t slot, double i
 
 static void
 p25p2_xcch_clear_slot_gps(dsd_state* state, int slot) {
-    state->dmr_embedded_gps[slot][0] = '\0';
-    state->dmr_lrrp_gps[slot][0] = '\0';
+    if (!state) {
+        return;
+    }
+    if (slot == 0) {
+        state->dmr_embedded_gps[0][0] = '\0';
+        state->dmr_lrrp_gps[0][0] = '\0';
+    } else if (slot == 1) {
+        state->dmr_embedded_gps[1][0] = '\0';
+        state->dmr_lrrp_gps[1][0] = '\0';
+    }
 }
 
 static void
@@ -349,7 +316,6 @@ p25p2_xcch_log_slot_encryption(const dsd_opts* opts, dsd_state* state, int slot)
 static void
 p25p2_xcch_reset_ptt_slot_state(dsd_state* state, int slot) {
     state->fourv_counter[slot] = 0;
-    state->voice_counter[slot] = 0;
     p25p2_xcch_set_slot_drop(state, slot, 256);
 }
 
@@ -375,7 +341,6 @@ p25p2_xcch_handle_ptt_slot(dsd_opts* opts, dsd_state* state, const unsigned long
 
     p25p2_xcch_set_slot_crypto_from_mac(opts, state, slot, mac);
     p25p2_xcch_log_slot_encryption(opts, state, slot);
-    p25p2_xcch_reset_slot_gain(opts, state, slot);
 
     allow_audio = p25p2_xcch_slot_audio_allowed(opts, state, slot);
     p25p2_xcch_set_slot_audio_allowed(opts, state, slot, allow_audio);
@@ -389,7 +354,6 @@ p25p2_xcch_handle_end_slot(dsd_opts* opts, dsd_state* state, int slot, int clear
     }
     dsd_p25p2_flush_partial_audio_slot(opts, state, slot);
     state->fourv_counter[slot] = 0;
-    state->voice_counter[slot] = 0;
     p25p2_xcch_set_slot_drop(state, slot, 256);
     p25p2_xcch_set_slot_burst(state, slot, 23);
 
@@ -404,7 +368,6 @@ p25p2_xcch_handle_end_slot(dsd_opts* opts, dsd_state* state, int slot, int clear
     }
 
     p25p2_xcch_set_slot_audio_allowed(opts, state, slot, 0);
-    p25p2_xcch_reset_slot_gain(opts, state, slot);
     p25p2_xcch_clear_slot_gps(state, slot);
     p25_crypto_reset_slot(state, slot);
 }
@@ -440,11 +403,10 @@ p25p2_xcch_reset_idle_slot_facch(dsd_state* state, uint8_t slot) {
     p25_crypto_reset_slot(state, slot);
     p25p2_xcch_set_slot_burst(state, slot, 24);
     state->fourv_counter[slot] = 0;
-    state->voice_counter[slot] = 0;
 }
 
 static int
-p25p2_xcch_validate_sacch_crc(const dsd_opts* opts, dsd_state* state, const int payload[180],
+p25p2_xcch_validate_sacch_crc(dsd_opts* opts, dsd_state* state, const int payload[180],
                               const unsigned long long int smac[24], int opcode, uint8_t slot, int* abort_processing) {
     int err = -2;
 
@@ -468,7 +430,7 @@ p25p2_xcch_validate_sacch_crc(const dsd_opts* opts, dsd_state* state, const int 
             DSD_FPRINTF(stderr, " CRC16 ERR L");
             if (opcode == 0x0) {
                 p25p2_xcch_set_slot_audio_allowed(opts, state, slot, 0);
-                p25_p2_audio_ring_reset(state, slot);
+                dsd_p25p2_flush_partial_audio_slot(opts, state, slot);
             }
             state->p2_is_lcch = 0;
             *abort_processing = 1;
@@ -507,21 +469,21 @@ p25p2_xcch_handle_sacch_mac_signal(dsd_opts* opts, dsd_state* state, unsigned lo
         DSD_FPRINTF(stderr, "CRC16 ERR ");
     }
     DSD_FPRINTF(stderr, "%s", KYEL);
-    process_MAC_VPDU(opts, state, 1, P25_MAC_PDU_SIGNAL, smac);
+    process_MAC_VPDU_crc(opts, state, 1, P25_MAC_PDU_SIGNAL, smac, err == 0);
     DSD_FPRINTF(stderr, "%s", KNRM);
 }
 
 static void
 p25p2_xcch_handle_sacch_mac_ptt(dsd_opts* opts, dsd_state* state, uint8_t slot, int mac_offset, int res,
                                 const unsigned long long int smac[24]) {
-    const double ptt_observed_m = dsd_time_now_monotonic_s();
+    const double ptt_observed_m = dsd_decode_now_mono_s();
     uint8_t signature[P25_SM_PTT_SIGNATURE_BYTES];
     p25p2_xcch_ptt_signature(smac, signature);
 
     DSD_FPRINTF(stderr, " MAC_PTT ");
     DSD_FPRINTF(stderr, "%s", KGRN);
 
-    state->p25_p2_last_mac_active[slot] = time(NULL);
+    state->p25_p2_last_mac_active[slot] = dsd_decode_time();
     state->p25_p2_last_mac_active_m[slot] = ptt_observed_m;
 
     if (!p25_sm_emit_ptt_call_metadata(opts, state, slot, p25p2_xcch_tg_from_mac(smac), 0,
@@ -545,7 +507,7 @@ p25p2_xcch_handle_sacch_mac_ptt(dsd_opts* opts, dsd_state* state, uint8_t slot, 
 
 static void
 p25p2_xcch_handle_sacch_mac_end(dsd_opts* opts, dsd_state* state, uint8_t slot, const unsigned long long int smac[24]) {
-    const double end_observed_m = dsd_time_now_monotonic_s();
+    const double end_observed_m = dsd_decode_now_mono_s();
     const int tg = p25p2_xcch_tg_from_mac(smac);
     const int src = (int)p25p2_xcch_src_from_mac(smac);
 
@@ -557,7 +519,7 @@ p25p2_xcch_handle_sacch_mac_end(dsd_opts* opts, dsd_state* state, uint8_t slot, 
         DSD_FPRINTF(stderr, "%s", KNRM);
         return;
     }
-    state->p25_p2_last_end_ptt[slot] = time(NULL);
+    state->p25_p2_last_end_ptt[slot] = dsd_decode_time();
     p25p2_xcch_handle_end_slot(opts, state, slot, 1);
     p25p2_xcch_set_slot_audio_allowed(opts, state, slot, 0);
 
@@ -566,15 +528,20 @@ p25p2_xcch_handle_sacch_mac_end(dsd_opts* opts, dsd_state* state, uint8_t slot, 
 
 static void
 p25p2_xcch_handle_sacch_mac_idle(dsd_opts* opts, dsd_state* state, uint8_t slot, unsigned long long int smac[24]) {
-    double idle_observed_m = dsd_time_now_monotonic_s();
+    double idle_observed_m = dsd_decode_now_mono_s();
 
     dsd_p25p2_flush_partial_audio_slot(opts, state, slot);
     p25p2_xcch_set_slot_burst(state, slot, 24);
 
     DSD_FPRINTF(stderr, " MAC_IDLE ");
     DSD_FPRINTF(stderr, "%s", KYEL);
+    const p25p2_retune_token token = p25p2_retune_token_now();
     process_MAC_VPDU(opts, state, 1, P25_MAC_PDU_IDLE, smac);
     DSD_FPRINTF(stderr, "%s", KNRM);
+    // A retune the PDU accepted left this channel: nothing below may act on the assignment it moved to (issue #651).
+    if (p25p2_retune_token_changed(&token)) {
+        return;
+    }
 
     p25_sm_emit_idle_at(opts, state, slot, idle_observed_m);
     p25p2_xcch_clear_idle_metadata_if_stale(state, slot, idle_observed_m, 0);
@@ -597,10 +564,15 @@ p25p2_xcch_handle_sacch_mac_active(dsd_opts* opts, dsd_state* state, uint8_t slo
 
     DSD_FPRINTF(stderr, " MAC_ACTIVE ");
     DSD_FPRINTF(stderr, "%s", KYEL);
+    const p25p2_retune_token token = p25p2_retune_token_now();
     process_MAC_VPDU(opts, state, 1, P25_MAC_PDU_ACTIVE, smac);
+    if (p25p2_retune_token_changed(&token)) {
+        DSD_FPRINTF(stderr, "%s", KNRM);
+        return;
+    }
 
-    state->p25_p2_last_mac_active[slot] = time(NULL);
-    state->p25_p2_last_mac_active_m[slot] = dsd_time_now_monotonic_s();
+    state->p25_p2_last_mac_active[slot] = dsd_decode_time();
+    state->p25_p2_last_mac_active_m[slot] = dsd_decode_now_mono_s();
 
     DSD_FPRINTF(stderr, "%s", KNRM);
 
@@ -631,14 +603,14 @@ p25p2_xcch_handle_sacch_mac_hangtime(dsd_opts* opts, dsd_state* state, unsigned 
 static void
 p25p2_xcch_handle_facch_mac_ptt(dsd_opts* opts, dsd_state* state, uint8_t slot, int mac_offset, int res,
                                 const unsigned long long int fmac[24]) {
-    const double ptt_observed_m = dsd_time_now_monotonic_s();
+    const double ptt_observed_m = dsd_decode_now_mono_s();
     uint8_t signature[P25_SM_PTT_SIGNATURE_BYTES];
     p25p2_xcch_ptt_signature(fmac, signature);
 
     DSD_FPRINTF(stderr, " MAC_PTT  ");
     DSD_FPRINTF(stderr, "%s", KGRN);
 
-    state->p25_p2_last_mac_active[slot] = time(NULL);
+    state->p25_p2_last_mac_active[slot] = dsd_decode_time();
     state->p25_p2_last_mac_active_m[slot] = ptt_observed_m;
 
     if (!p25_sm_emit_ptt_call_metadata(opts, state, slot, p25p2_xcch_tg_from_mac(fmac), 0,
@@ -662,7 +634,7 @@ p25p2_xcch_handle_facch_mac_end(dsd_opts* opts, dsd_state* state, uint8_t slot, 
     if (!p25p2_xcch_slot_valid(slot)) {
         return;
     }
-    const double end_observed_m = dsd_time_now_monotonic_s();
+    const double end_observed_m = dsd_decode_now_mono_s();
     const int tg = p25p2_xcch_tg_from_mac(fmac);
     const int src = (int)p25p2_xcch_src_from_mac(fmac);
 
@@ -692,20 +664,23 @@ p25p2_xcch_handle_facch_mac_idle(dsd_opts* opts, dsd_state* state, uint8_t slot,
         return;
     }
 
-    double idle_observed_m = dsd_time_now_monotonic_s();
+    double idle_observed_m = dsd_decode_now_mono_s();
 
     dsd_p25p2_flush_partial_audio_slot(opts, state, slot);
     p25p2_xcch_reset_idle_slot_facch(state, slot);
 
     DSD_FPRINTF(stderr, " MAC_IDLE ");
     DSD_FPRINTF(stderr, "%s", KYEL);
+    const p25p2_retune_token token = p25p2_retune_token_now();
     process_MAC_VPDU(opts, state, 0, P25_MAC_PDU_IDLE, fmac);
     DSD_FPRINTF(stderr, "%s", KNRM);
+    if (p25p2_retune_token_changed(&token)) {
+        return;
+    }
 
     p25_sm_emit_idle_at(opts, state, slot, idle_observed_m);
     p25p2_xcch_clear_idle_metadata_if_stale(state, slot, idle_observed_m, 1);
     p25p2_xcch_set_slot_audio_allowed(opts, state, slot, 0);
-    p25_p2_audio_ring_reset(state, slot);
 }
 
 static void
@@ -720,8 +695,12 @@ p25p2_xcch_handle_facch_mac_active(dsd_opts* opts, dsd_state* state, uint8_t slo
 
     DSD_FPRINTF(stderr, " MAC_ACTIVE ");
     DSD_FPRINTF(stderr, "%s", KYEL);
+    const p25p2_retune_token token = p25p2_retune_token_now();
     process_MAC_VPDU(opts, state, 0, P25_MAC_PDU_ACTIVE, fmac);
     DSD_FPRINTF(stderr, "%s", KNRM);
+    if (p25p2_retune_token_changed(&token)) {
+        return;
+    }
 
     if (!p25p2_xcch_emit_active(opts, state, 0, slot, fmac)) {
         return;

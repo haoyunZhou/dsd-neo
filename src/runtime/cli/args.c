@@ -4,6 +4,8 @@
  */
 
 #include <ctype.h>
+#include <dsd-neo/core/analog_tone.h>
+#include <dsd-neo/core/channel_mode.h>
 #include <dsd-neo/core/csv_import.h>
 #include <dsd-neo/core/file_io.h>
 #include <dsd-neo/core/frontend_types.h>
@@ -13,6 +15,7 @@
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/opts_fwd.h>
 #include <dsd-neo/core/parse.h>
+#include <dsd-neo/core/power.h>
 #include <dsd-neo/core/safe_api.h>
 #include <dsd-neo/core/secret_redaction.h>
 #include <dsd-neo/core/state.h>
@@ -32,14 +35,18 @@
 #include <dsd-neo/platform/posix_compat.h>
 #include <dsd-neo/runtime/airspy_config.h>
 #include <dsd-neo/runtime/analog_channel.h>
+#include <dsd-neo/runtime/analog_tones.h>
 #include <dsd-neo/runtime/call_alert.h>
 #include <dsd-neo/runtime/cli.h>
 #include <dsd-neo/runtime/colors.h>
 #include <dsd-neo/runtime/config.h>
+#include <dsd-neo/runtime/decode_clock.h>
 #include <dsd-neo/runtime/decode_mode.h>
 #include <dsd-neo/runtime/log.h>
 #include <dsd-neo/runtime/path_policy.h>
 #include <dsd-neo/runtime/rdio_export.h>
+#include <dsd-neo/runtime/scan_mode.h>
+#include <dsd-neo/runtime/squelch.h>
 #include <errno.h>
 #include <inttypes.h>
 #include <stdio.h>
@@ -169,6 +176,132 @@ cli_is_numeric_ipv4_address(const char* in) {
     return octets == 4;
 }
 
+/* The network-control options (--rtl-udp-control*, --api*) the long-option pre-scan collects and applies after it. */
+typedef struct {
+    int rtl_udp_seen;
+    unsigned long rtl_udp_port;
+    const char* rtl_udp_bindaddr;
+    const char* api_port;
+    const char* api_bind;
+    const char* api_token;
+    const char* api_token_file;
+} cli_net_args;
+
+/* First octet of an address cli_is_numeric_ipv4_address() accepted is 127. */
+static int
+cli_ipv4_is_loopback(const char* in) {
+    return in && in[0] == '1' && in[1] == '2' && in[2] == '7' && in[3] == '.';
+}
+
+/* One line of 1..cap-1 bytes, trailing whitespace dropped; anything else is not a token. */
+static int
+cli_read_api_token_file(const char* path, char* out, size_t cap) {
+    char opened[2048];
+    FILE* fp = dsd_path_fopen_user_read_file(path, opened, sizeof opened);
+    if (!fp) {
+        return -1;
+    }
+    char buf[512];
+    size_t n = fread(buf, 1U, sizeof buf - 1U, fp);
+    const int failed = ferror(fp) || !feof(fp);
+    (void)fclose(fp);
+    buf[n] = '\0';
+    while (n > 0U && (buf[n - 1U] == '\n' || buf[n - 1U] == '\r' || buf[n - 1U] == ' ' || buf[n - 1U] == '\t')) {
+        buf[--n] = '\0';
+    }
+    const int ok = !failed && n > 0U && n < cap && strlen(buf) == n && strpbrk(buf, "\r\n") == NULL;
+    if (ok) {
+        DSD_MEMCPY(out, buf, n + 1U);
+    }
+    DSD_SECURE_ZERO(buf, sizeof buf);
+    return ok ? 0 : -1;
+}
+
+/* An option's CLI value, else (when @p use_env) its non-empty environment fallback; *src names the one used. */
+static const char*
+cli_api_value(const char* cli, const char* cli_name, const char* env_name, int use_env, const char** src) {
+    *src = cli_name;
+    if (cli || !use_env) {
+        return cli;
+    }
+    const char* env = dsd_neo_env_get(env_name);
+    *src = env_name;
+    return (env && env[0] != '\0') ? env : NULL;
+}
+
+static int
+cli_resolve_api_port(dsd_opts* opts, const char* cli) {
+    const char* src = NULL;
+    const char* port = cli_api_value(cli, "--api", "DSD_NEO_API_PORT", 1, &src);
+    unsigned long parsed = 0;
+    if (!port) {
+        return 0;
+    }
+    if (!cli_parse_decimal_u32(port, &parsed) || parsed > 65535UL) {
+        LOG_ERROR("Invalid %s value \"%s\" (expected port 0..65535)\n", src, port);
+        return -1;
+    }
+    opts->api_port = (int)parsed;
+    return 0;
+}
+
+static int
+cli_resolve_api_bind(dsd_opts* opts, const char* cli, int enabled) {
+    const char* src = NULL;
+    const char* bind = cli_api_value(cli, "--api-bind", "DSD_NEO_API_BIND", enabled, &src);
+    if (!bind) {
+        return 0;
+    }
+    if (!cli_is_numeric_ipv4_address(bind) || strlen(bind) >= sizeof opts->api_bindaddr) {
+        LOG_ERROR("Invalid %s value \"%s\" (expected numeric IPv4 address)\n", src, bind);
+        return -1;
+    }
+    DSD_SNPRINTF(opts->api_bindaddr, sizeof opts->api_bindaddr, "%s", bind);
+    return 0;
+}
+
+/* Token precedence: --api-token, DSD_NEO_API_TOKEN, --api-token-file, DSD_NEO_API_TOKEN_FILE. */
+static int
+cli_resolve_api_token(dsd_opts* opts, const cli_net_args* net, int enabled) {
+    const unsigned max_len = (unsigned)(sizeof opts->api_token - 1U);
+    const char* src = NULL;
+    const char* token = cli_api_value(net->api_token, "--api-token", "DSD_NEO_API_TOKEN", enabled, &src);
+    if (token) {
+        if (token[0] == '\0' || strlen(token) > max_len) {
+            LOG_ERROR("%s must be 1 to %u bytes\n", src, max_len);
+            return -1;
+        }
+        DSD_SNPRINTF(opts->api_token, sizeof opts->api_token, "%s", token);
+        return 0;
+    }
+    const char* file = cli_api_value(net->api_token_file, "--api-token-file", "DSD_NEO_API_TOKEN_FILE", enabled, &src);
+    if (file && cli_read_api_token_file(file, opts->api_token, sizeof opts->api_token) != 0) {
+        LOG_ERROR("Cannot read an API token from %s \"%s\" (expected one line of 1 to %u bytes)\n", src, file, max_len);
+        return -1;
+    }
+    return 0;
+}
+
+/* The control/telemetry API options (docs/api.md). Each CLI value wins over its DSD_NEO_API_* fallback, and the
+   fallbacks are read only when the API is enabled. The token file is read here, so a missing or unreadable one is an
+   argument error rather than a server running without the token that was asked for. */
+static int
+cli_resolve_api_options(dsd_opts* opts, const cli_net_args* net) {
+    if (cli_resolve_api_port(opts, net->api_port) != 0) {
+        return -1;
+    }
+    const int enabled = opts->api_port > 0;
+    if (cli_resolve_api_bind(opts, net->api_bind, enabled) != 0 || cli_resolve_api_token(opts, net, enabled) != 0) {
+        return -1;
+    }
+    if (enabled && opts->api_bindaddr[0] != '\0' && !cli_ipv4_is_loopback(opts->api_bindaddr)
+        && opts->api_token[0] == '\0') {
+        LOG_ERROR("API bind address %s is not loopback; set --api-token or --api-token-file\n", opts->api_bindaddr);
+        return -1;
+    }
+    return 0;
+}
+
 static int
 cli_parse_decimal_u64(const char* in, uint64_t* out) {
     if (!in || !out || in[0] == '\0') {
@@ -229,13 +362,18 @@ cli_has_config_one_shot_arg(int argc, char** argv) {
     if (argc <= 1 || !argv) {
         return 0;
     }
-    for (int i = 1; i < argc; i++) {
+    for (int i = 1, advance = 1; i < argc; i += advance) {
+        advance = 1;
         const char* arg = argv[i];
         if (!arg) {
             break;
         }
         if (strcmp(arg, "--") == 0) {
             break;
+        }
+        if (dsd_cli_option_takes_free_value(arg)) {
+            advance = 2; /* a token is any text, a one-shot option's name included */
+            continue;
         }
         if (strcmp(arg, "--validate-config") == 0 || strncmp(arg, "--validate-config=", 18) == 0
             || strcmp(arg, "--print-config") == 0 || strcmp(arg, "--list-profiles") == 0
@@ -490,19 +628,139 @@ cli_parse_analog_width_option(const char* option_name, int kind, const char* in,
     return 1;
 }
 
-/* The analog channel width is the radio front end's filter. PCM inputs (Pulse, files, UDP and TCP audio) arrive
- * already demodulated, so a width given for one of them parses but cannot act. */
+/* --squelch <setting> (issue #518 follow-up): the squelch grammar (off, a level in dB or as a linear power, auto[+N],
+ * noise[+N]). It wins over an input spec's sql field, which is read later (dsd_squelch_spec_field_apply()). The refusal
+ * names the grammar, never the text. */
+static int
+cli_parse_squelch_option(const char* in, dsd_opts* opts, int* out_exit_rc) {
+    if (!in) {
+        LOG_ERROR("--squelch requires a setting: off, a level in dB, auto[+N] or noise[+N]\n");
+        cli_set_exit_rc(out_exit_rc, 1);
+        return 0;
+    }
+    dsd_squelch_setting setting;
+    char err[96];
+    if (dsd_squelch_setting_parse(in, &setting, err, sizeof err) != 0) {
+        LOG_ERROR("--squelch: %s\n", err);
+        cli_set_exit_rc(out_exit_rc, 1);
+        return 0;
+    }
+    dsd_squelch_setting_store(opts, &setting);
+    opts->rtl_squelch_cli_set = 1;
+    return 1;
+}
+
+/* The bit of dsd_parse_args()' analog_cli_seen set once a tone switch was given; the bits below it are the analog width
+   options, 1 << dsd_analog_demod. */
+enum { CLI_TONE_FILTER_SEEN = 1 << 8 };
+
+/* A tone-policy switch (issue #527): --tone-allow and --tone-block take a '/'-separated tone list, --no-tone-filter
+ * turns the policy off and keeps the list. One of the three per command line, as on a scan row, where the three share
+ * one option. A refused list is named by entry number, never echoed. */
+static int
+cli_parse_tone_filter_option(const char* option_name, int mode, const char* list, dsd_opts* opts, int* analog_cli_seen,
+                             int* out_exit_rc) {
+    if (*analog_cli_seen & CLI_TONE_FILTER_SEEN) {
+        LOG_ERROR("%s: --tone-allow, --tone-block and --no-tone-filter may be given only once\n", option_name);
+        cli_set_exit_rc(out_exit_rc, 1);
+        return 0;
+    }
+    *analog_cli_seen |= CLI_TONE_FILTER_SEEN;
+    if (mode == DSD_TONE_FILTER_OFF) {
+        opts->analog_tone_filter = DSD_TONE_FILTER_OFF;
+        return 1;
+    }
+    char err[DSD_TONE_LIST_ERROR_SIZE];
+    dsd_tone_set set;
+    if (!list) {
+        LOG_ERROR("%s requires a '/'-separated list of CTCSS tones and DCS codes (e.g. 67.0/100.0/D023N)\n",
+                  option_name);
+        cli_set_exit_rc(out_exit_rc, 1);
+        return 0;
+    }
+    if (dsd_tone_set_parse(list, &set, err, sizeof err) != 0) {
+        LOG_ERROR("%s: %s\n", option_name, err);
+        cli_set_exit_rc(out_exit_rc, 1);
+        return 0;
+    }
+    opts->analog_tone_filter = mode;
+    opts->analog_tone_set = set;
+    return 1;
+}
+
+/* The tone policy judges only what received-tone detection hears: the analog FM monitor, and an nfm row of a scan,
+ * whose own policy or the configured one applies while it is on air. Configured for a session that has neither (the
+ * AM monitor or a digital mode without a scan, or a -Y list none of whose rows runs the FM monitor), it can do nothing,
+ * which is said once (issue #527). On a -Y list only the rows count: a typed row runs its own mode, so under -fA a
+ * list whose rows all declare a digital mode hears no tone either (dsd_channel_modes_conventional_hear_tones()). A -Y
+ * scan with no list to come stays on the configured decode mode, and is weighed by it. A -Y list the engine still
+ * imports (a config file's, or one the command line read no row from) is checked when the engine imports it, and
+ * --trunk-scan targets when that scan starts. */
 static void
-cli_warn_analog_width_without_radio(const dsd_opts* opts, const char* option_name) {
+cli_warn_tone_filter_without_fm_monitor(const dsd_opts* opts, const dsd_state* state) {
+    const int list_to_come = opts->scanner_mode == 1 && state->lcn_freq_count <= 0 && opts->chan_in_file[0] != '\0';
+    if (opts->trunk_scan_enabled == 1 || list_to_come) {
+        return;
+    }
+    (void)dsd_scan_mode_warn_tone_filter_unused(opts, state, dsd_channel_modes_conventional_hear_tones(opts, state));
+}
+
+/* The analog channel width is the radio front end's filter. PCM inputs (Pulse, files, UDP and TCP audio) arrive
+ * already demodulated, so a width given for one of them parses but cannot act as a filter. Either width still reaches
+ * a rigctl peer (-U) there, which demodulates what DSD-neo hears, so with one it is said as what it does: the AM width
+ * is the AM passband an am scan row or am-conventional target without a width of its own asks the peer for (issue
+ * #526), and the NFM width is the FM passband the peer is asked for, in place of -B, wherever the FM monitor runs
+ * without a row width of its own (issue #621). */
+static void
+cli_warn_analog_width_without_radio(const dsd_opts* opts, int kind, const char* option_name) {
     const char* dev = opts->audio_in_dev;
     if (opts->iq_replay_requested || dsd_opts_audio_in_dev_is_rtl_spec(dev) || dsd_opts_audio_in_dev_is_rtltcp_spec(dev)
         || dsd_opts_audio_in_dev_is_soapy_spec(dev) || dsd_opts_audio_in_dev_is_airspy_spec(dev)
         || dsd_opts_audio_in_dev_is_iqreplay_spec(dev)) {
         return;
     }
+    if (kind == DSD_ANALOG_DEMOD_AM && opts->use_rigctl == 1) {
+        LOG_INFO("NOTICE: %s filters nothing on PCM input; with rigctl (-U) it is the AM passband the peer is asked "
+                 "for on am scan rows and am-conventional targets that set no width of their own.\n",
+                 option_name);
+        return;
+    }
+    if (opts->use_rigctl == 1) {
+        LOG_INFO("NOTICE: %s filters nothing on PCM input; with rigctl (-U) it is the FM passband the peer is asked "
+                 "for, in place of -B, while the FM monitor runs.\n",
+                 option_name);
+        return;
+    }
     LOG_WARN("WARNING: %s has no effect on PCM input; it sets the channel filter of a radio input (RTL-SDR, rtl_tcp, "
              "SoapySDR, Airspy or --iq-replay).\n",
              option_name);
+}
+
+/* AM needs an IQ radio input (issue #524). -fM on a PCM input is an error. [mode] decode = am from a loaded config (the
+ * only other way a parse ends on AM) falls back to the Analog monitor for the session instead, and autosave is turned
+ * off for it so the saved decode = am is not replaced by the fallback (dsd_decode_mode_keep_saved_am(), which a runtime
+ * config apply of such a config calls too). That turns off saving every other change the session makes too, so it is
+ * said where the operator looks, not only in the log: a toast the frontends show once they are up. (Keeping autosave
+ * and writing decode = am back would need the session to remember the preset it fell back from, a state field this
+ * change does not add.) */
+static int
+cli_check_am_input(dsd_opts* opts, dsd_state* state, int cli_chose_am, int* out_exit_rc) {
+    /* The input is not open yet: its spec (or --iq-replay) says whether it will deliver I/Q. */
+    if (dsd_infer_decode_mode_preset_exact(opts) != DSDCFG_MODE_AM || dsd_decode_mode_input_spec_is_iq(opts)) {
+        return 0;
+    }
+    if (cli_chose_am) {
+        LOG_ERROR("-fM: %s\n", DSD_DECODE_MODE_AM_NEEDS_IQ_TEXT);
+        cli_set_exit_rc(out_exit_rc, 1);
+        return -1;
+    }
+    LOG_WARN("WARNING: [mode] decode = am: %s. Using the Analog monitor for this session.\n",
+             DSD_DECODE_MODE_AM_NEEDS_IQ_TEXT);
+    (void)dsd_apply_decode_mode_preset(DSDCFG_MODE_ANALOG, DSD_DECODE_PRESET_PROFILE_CONFIG, opts, state);
+    if (dsd_decode_mode_keep_saved_am(state)) {
+        LOG_INFO("NOTICE: %s.\n", DSD_DECODE_MODE_KEEP_SAVED_AM_NOTICE);
+    }
+    return 0;
 }
 
 static int
@@ -667,8 +925,8 @@ cli_parse_airspy_option(int argc, char** argv, int i, dsd_opts* opts) {
                 cli_set_exit_rc(out_exit_rc, 1);                                                                       \
                 return DSD_PARSE_ERROR;                                                                                \
             }                                                                                                          \
-            rtl_udp_control_cli_seen = 1;                                                                              \
-            rtl_udp_control_cli_port = parsed_port;                                                                    \
+            net_cli.rtl_udp_seen = 1;                                                                                  \
+            net_cli.rtl_udp_port = parsed_port;                                                                        \
             arg_advance = 2;                                                                                           \
             continue;                                                                                                  \
         }                                                                                                              \
@@ -685,8 +943,8 @@ cli_parse_airspy_option(int argc, char** argv, int i, dsd_opts* opts) {
                 cli_set_exit_rc(out_exit_rc, 1);                                                                       \
                 return DSD_PARSE_ERROR;                                                                                \
             }                                                                                                          \
-            rtl_udp_control_cli_seen = 1;                                                                              \
-            rtl_udp_control_cli_port = parsed_port;                                                                    \
+            net_cli.rtl_udp_seen = 1;                                                                                  \
+            net_cli.rtl_udp_port = parsed_port;                                                                        \
             continue;                                                                                                  \
         }                                                                                                              \
         if (strcmp(argv[i], "--rtl-udp-control-bind") == 0) {                                                          \
@@ -701,7 +959,7 @@ cli_parse_airspy_option(int argc, char** argv, int i, dsd_opts* opts) {
                 cli_set_exit_rc(out_exit_rc, 1);                                                                       \
                 return DSD_PARSE_ERROR;                                                                                \
             }                                                                                                          \
-            rtl_udp_control_cli_bindaddr = bind_arg;                                                                   \
+            net_cli.rtl_udp_bindaddr = bind_arg;                                                                       \
             arg_advance = 2;                                                                                           \
             continue;                                                                                                  \
         }                                                                                                              \
@@ -712,7 +970,75 @@ cli_parse_airspy_option(int argc, char** argv, int i, dsd_opts* opts) {
                 cli_set_exit_rc(out_exit_rc, 1);                                                                       \
                 return DSD_PARSE_ERROR;                                                                                \
             }                                                                                                          \
-            rtl_udp_control_cli_bindaddr = bind_arg;                                                                   \
+            net_cli.rtl_udp_bindaddr = bind_arg;                                                                       \
+            continue;                                                                                                  \
+        }                                                                                                              \
+        if (strcmp(argv[i], "--api") == 0) {                                                                           \
+            if (i + 1 >= argc) {                                                                                       \
+                LOG_ERROR("--api requires a port value\n");                                                            \
+                cli_set_exit_rc(out_exit_rc, 1);                                                                       \
+                return DSD_PARSE_ERROR;                                                                                \
+            }                                                                                                          \
+            net_cli.api_port = DSD_PARSE_ARGS_NEXT_ARG();                                                              \
+            arg_advance = 2;                                                                                           \
+            continue;                                                                                                  \
+        }                                                                                                              \
+        if (strncmp(argv[i], "--api=", 6) == 0) {                                                                      \
+            net_cli.api_port = argv[i] + 6;                                                                            \
+            continue;                                                                                                  \
+        }                                                                                                              \
+        if (strcmp(argv[i], "--api-bind") == 0) {                                                                      \
+            if (i + 1 >= argc) {                                                                                       \
+                LOG_ERROR("--api-bind requires a numeric IPv4 address\n");                                             \
+                cli_set_exit_rc(out_exit_rc, 1);                                                                       \
+                return DSD_PARSE_ERROR;                                                                                \
+            }                                                                                                          \
+            const char* bind_arg = DSD_PARSE_ARGS_NEXT_ARG();                                                          \
+            if (!cli_is_numeric_ipv4_address(bind_arg)) {                                                              \
+                LOG_ERROR("Invalid --api-bind value \"%s\" (expected numeric IPv4 address)\n", bind_arg);              \
+                cli_set_exit_rc(out_exit_rc, 1);                                                                       \
+                return DSD_PARSE_ERROR;                                                                                \
+            }                                                                                                          \
+            net_cli.api_bind = bind_arg;                                                                               \
+            arg_advance = 2;                                                                                           \
+            continue;                                                                                                  \
+        }                                                                                                              \
+        if (strncmp(argv[i], "--api-bind=", 11) == 0) {                                                                \
+            const char* bind_arg = argv[i] + 11;                                                                       \
+            if (!cli_is_numeric_ipv4_address(bind_arg)) {                                                              \
+                LOG_ERROR("Invalid --api-bind value \"%s\" (expected numeric IPv4 address)\n", bind_arg);              \
+                cli_set_exit_rc(out_exit_rc, 1);                                                                       \
+                return DSD_PARSE_ERROR;                                                                                \
+            }                                                                                                          \
+            net_cli.api_bind = bind_arg;                                                                               \
+            continue;                                                                                                  \
+        }                                                                                                              \
+        if (strcmp(argv[i], "--api-token") == 0) {                                                                     \
+            if (i + 1 >= argc) {                                                                                       \
+                LOG_ERROR("--api-token requires a value\n");                                                           \
+                cli_set_exit_rc(out_exit_rc, 1);                                                                       \
+                return DSD_PARSE_ERROR;                                                                                \
+            }                                                                                                          \
+            net_cli.api_token = DSD_PARSE_ARGS_NEXT_ARG();                                                             \
+            arg_advance = 2;                                                                                           \
+            continue;                                                                                                  \
+        }                                                                                                              \
+        if (strncmp(argv[i], "--api-token=", 12) == 0) {                                                               \
+            net_cli.api_token = argv[i] + 12;                                                                          \
+            continue;                                                                                                  \
+        }                                                                                                              \
+        if (strcmp(argv[i], "--api-token-file") == 0) {                                                                \
+            if (i + 1 >= argc) {                                                                                       \
+                LOG_ERROR("--api-token-file requires a path\n");                                                       \
+                cli_set_exit_rc(out_exit_rc, 1);                                                                       \
+                return DSD_PARSE_ERROR;                                                                                \
+            }                                                                                                          \
+            net_cli.api_token_file = DSD_PARSE_ARGS_NEXT_ARG();                                                        \
+            arg_advance = 2;                                                                                           \
+            continue;                                                                                                  \
+        }                                                                                                              \
+        if (strncmp(argv[i], "--api-token-file=", 17) == 0) {                                                          \
+            net_cli.api_token_file = argv[i] + 17;                                                                     \
             continue;                                                                                                  \
         }                                                                                                              \
         if (strcmp(argv[i], "--iq-capture") == 0) {                                                                    \
@@ -916,15 +1242,6 @@ cli_parse_airspy_option(int argc, char** argv, int i, dsd_opts* opts) {
             DSD_SNPRINTF(buf, sizeof buf, "%.3f", v);                                                                  \
             dsd_setenv("DSD_NEO_P25_MAC_HOLD", buf, 1);                                                                \
             LOG_INFO("NOTICE: P25: MAC hold set to %.2fs (CLI).\n", v);                                                \
-            continue;                                                                                                  \
-        }                                                                                                              \
-        if (strcmp(argv[i], "--p25-ring-hold") == 0 && i + 1 < argc) {                                                 \
-            double v = 0.0;                                                                                            \
-            DSD_CLI_PARSE_DOUBLE_OR_RETURN("--p25-ring-hold", DSD_PARSE_ARGS_NEXT_ARG(), v);                           \
-            char buf[32];                                                                                              \
-            DSD_SNPRINTF(buf, sizeof buf, "%.3f", v);                                                                  \
-            dsd_setenv("DSD_NEO_P25_RING_HOLD", buf, 1);                                                               \
-            LOG_INFO("NOTICE: P25: Ring hold set to %.2fs (CLI).\n", v);                                               \
             continue;                                                                                                  \
         }                                                                                                              \
         if (strcmp(argv[i], "--p25-cc-grace") == 0 && i + 1 < argc) {                                                  \
@@ -1137,7 +1454,46 @@ cli_parse_airspy_option(int argc, char** argv, int i, dsd_opts* opts) {
                                                &opts->analog_nfm_bandwidth_hz, out_exit_rc)) {                         \
                 return DSD_PARSE_ERROR;                                                                                \
             }                                                                                                          \
-            nfm_bandwidth_cli_seen = 1;                                                                                \
+            analog_cli_seen |= 1 << DSD_ANALOG_DEMOD_FM;                                                               \
+            continue;                                                                                                  \
+        }                                                                                                              \
+        if (strcmp(argv[i], "--am-bandwidth-hz") == 0 || strncmp(argv[i], "--am-bandwidth-hz=", 18) == 0) {            \
+            const char* value = argv[i][17] == '=' ? argv[i] + 18 : (i + 1 < argc ? DSD_PARSE_ARGS_NEXT_ARG() : NULL); \
+            if (!cli_parse_analog_width_option("--am-bandwidth-hz", DSD_ANALOG_DEMOD_AM, value,                        \
+                                               &opts->analog_am_bandwidth_hz, out_exit_rc)) {                          \
+                return DSD_PARSE_ERROR;                                                                                \
+            }                                                                                                          \
+            analog_cli_seen |= 1 << DSD_ANALOG_DEMOD_AM;                                                               \
+            continue;                                                                                                  \
+        }                                                                                                              \
+        if (strcmp(argv[i], "--squelch") == 0 || strncmp(argv[i], "--squelch=", 10) == 0) {                            \
+            const char* value = argv[i][9] == '=' ? argv[i] + 10 : (i + 1 < argc ? DSD_PARSE_ARGS_NEXT_ARG() : NULL);  \
+            if (!cli_parse_squelch_option(value, opts, out_exit_rc)) {                                                 \
+                return DSD_PARSE_ERROR;                                                                                \
+            }                                                                                                          \
+            continue;                                                                                                  \
+        }                                                                                                              \
+        if (strcmp(argv[i], "--tone-allow") == 0 || strncmp(argv[i], "--tone-allow=", 13) == 0) {                      \
+            const char* value = argv[i][12] == '=' ? argv[i] + 13 : (i + 1 < argc ? DSD_PARSE_ARGS_NEXT_ARG() : NULL); \
+            if (!cli_parse_tone_filter_option("--tone-allow", DSD_TONE_FILTER_ALLOW, value, opts, &analog_cli_seen,    \
+                                              out_exit_rc)) {                                                          \
+                return DSD_PARSE_ERROR;                                                                                \
+            }                                                                                                          \
+            continue;                                                                                                  \
+        }                                                                                                              \
+        if (strcmp(argv[i], "--tone-block") == 0 || strncmp(argv[i], "--tone-block=", 13) == 0) {                      \
+            const char* value = argv[i][12] == '=' ? argv[i] + 13 : (i + 1 < argc ? DSD_PARSE_ARGS_NEXT_ARG() : NULL); \
+            if (!cli_parse_tone_filter_option("--tone-block", DSD_TONE_FILTER_BLOCK, value, opts, &analog_cli_seen,    \
+                                              out_exit_rc)) {                                                          \
+                return DSD_PARSE_ERROR;                                                                                \
+            }                                                                                                          \
+            continue;                                                                                                  \
+        }                                                                                                              \
+        if (strcmp(argv[i], "--no-tone-filter") == 0) {                                                                \
+            if (!cli_parse_tone_filter_option("--no-tone-filter", DSD_TONE_FILTER_OFF, NULL, opts, &analog_cli_seen,   \
+                                              out_exit_rc)) {                                                          \
+                return DSD_PARSE_ERROR;                                                                                \
+            }                                                                                                          \
             continue;                                                                                                  \
         }                                                                                                              \
         if (strcmp(argv[i], "--auto-ppm") == 0) {                                                                      \
@@ -1627,11 +1983,11 @@ cli_parse_airspy_option(int argc, char** argv, int i, dsd_opts* opts) {
         return DSD_PARSE_ONE_SHOT;                                                                                     \
     }                                                                                                                  \
                                                                                                                        \
-    if (rtl_udp_control_cli_seen) {                                                                                    \
-        int p = (int)rtl_udp_control_cli_port;                                                                         \
+    if (net_cli.rtl_udp_seen) {                                                                                        \
+        int p = (int)net_cli.rtl_udp_port;                                                                             \
         opts->rtl_udp_port = p;                                                                                        \
-        if (rtl_udp_control_cli_bindaddr) {                                                                            \
-            DSD_SNPRINTF(opts->rtl_udp_bindaddr, sizeof opts->rtl_udp_bindaddr, "%s", rtl_udp_control_cli_bindaddr);   \
+        if (net_cli.rtl_udp_bindaddr) {                                                                                \
+            DSD_SNPRINTF(opts->rtl_udp_bindaddr, sizeof opts->rtl_udp_bindaddr, "%s", net_cli.rtl_udp_bindaddr);       \
             opts->rtl_udp_bindaddr[sizeof opts->rtl_udp_bindaddr - 1] = '\0';                                          \
         }                                                                                                              \
         if (p > 0) {                                                                                                   \
@@ -1639,9 +1995,14 @@ cli_parse_airspy_option(int argc, char** argv, int i, dsd_opts* opts) {
         } else {                                                                                                       \
             LOG_INFO("NOTICE: RTL: external UDP retune control disabled\n");                                           \
         }                                                                                                              \
-    } else if (rtl_udp_control_cli_bindaddr) {                                                                         \
-        DSD_SNPRINTF(opts->rtl_udp_bindaddr, sizeof opts->rtl_udp_bindaddr, "%s", rtl_udp_control_cli_bindaddr);       \
+    } else if (net_cli.rtl_udp_bindaddr) {                                                                             \
+        DSD_SNPRINTF(opts->rtl_udp_bindaddr, sizeof opts->rtl_udp_bindaddr, "%s", net_cli.rtl_udp_bindaddr);           \
         opts->rtl_udp_bindaddr[sizeof opts->rtl_udp_bindaddr - 1] = '\0';                                              \
+    }                                                                                                                  \
+                                                                                                                       \
+    if (cli_resolve_api_options(opts, &net_cli) != 0) {                                                                \
+        cli_set_exit_rc(out_exit_rc, 1);                                                                               \
+        return DSD_PARSE_ERROR;                                                                                        \
     }                                                                                                                  \
                                                                                                                        \
     if (frontend_cli) {                                                                                                \
@@ -1968,12 +2329,19 @@ cli_finish_airspy_input(dsd_opts* opts, int parse_rc, int* out_exit_rc) {
     return parse_rc;
 }
 
-/* What runs once every option has been read, whatever order they came in. */
+/* What runs once every option has been read, whatever order they came in. @p analog_cli_seen has bit
+   1 << dsd_analog_demod set for each analog width option given (and CLI_TONE_FILTER_SEEN for a tone switch). */
 static int
-cli_finish_parse(dsd_opts* opts, int parse_rc, int nfm_bandwidth_cli_seen, int* out_exit_rc) {
+cli_finish_parse(dsd_opts* opts, const dsd_state* state, int parse_rc, int analog_cli_seen, int* out_exit_rc) {
     parse_rc = cli_finish_airspy_input(opts, parse_rc, out_exit_rc);
-    if (parse_rc == DSD_PARSE_CONTINUE && nfm_bandwidth_cli_seen) {
-        cli_warn_analog_width_without_radio(opts, "--nfm-bandwidth-hz");
+    if (parse_rc == DSD_PARSE_CONTINUE && (analog_cli_seen & (1 << DSD_ANALOG_DEMOD_FM))) {
+        cli_warn_analog_width_without_radio(opts, DSD_ANALOG_DEMOD_FM, "--nfm-bandwidth-hz");
+    }
+    if (parse_rc == DSD_PARSE_CONTINUE && (analog_cli_seen & (1 << DSD_ANALOG_DEMOD_AM))) {
+        cli_warn_analog_width_without_radio(opts, DSD_ANALOG_DEMOD_AM, "--am-bandwidth-hz");
+    }
+    if (parse_rc == DSD_PARSE_CONTINUE) {
+        cli_warn_tone_filter_without_fm_monitor(opts, state);
     }
     return parse_rc;
 }
@@ -2023,14 +2391,12 @@ dsd_parse_args(int argc, char** argv, dsd_opts* opts, dsd_state* state, int* out
     const char* iq_replay_rate_cli = NULL;
     const char* iq_info_cli = NULL;
     int iq_loop_cli = 0;
-    int rtl_udp_control_cli_seen = 0;
     int lrrp_extra_ports_cli_seen = 0;
-    unsigned long rtl_udp_control_cli_port = 0;
-    const char* rtl_udp_control_cli_bindaddr = NULL;
+    cli_net_args net_cli = {0, 0UL, NULL, NULL, NULL, NULL, NULL};
     int trunk_scan_cli_seen = 0;
     int chan_csv_cli_seen = 0;
     int p25_bandplan_cli_seen = 0;
-    int nfm_bandwidth_cli_seen = 0;
+    int analog_cli_seen = 0; /* bit 1 << dsd_analog_demod per analog width option given, CLI_TONE_FILTER_SEEN too */
     int config_one_shot_cli_seen = cli_has_config_one_shot_arg(argc, argv);
     DSD_PARSE_ARGS_PRESCAN_BLOCK();
     DSD_PARSE_ARGS_IQ_PRE_BLOCK();
@@ -2073,11 +2439,36 @@ dsd_parse_args(int argc, char** argv, dsd_opts* opts, dsd_state* state, int* out
             return DSD_PARSE_ERROR;
         }
     }
-    parse_rc = cli_finish_parse(opts, parse_rc, nfm_bandwidth_cli_seen, out_exit_rc);
+    parse_rc = cli_finish_parse(opts, state, parse_rc, analog_cli_seen, out_exit_rc);
     if (out_argc) {
         *out_argc = new_argc;
     }
     return parse_rc;
+}
+
+/*
+ * getopt's own diagnostics depend on the C library -- glibc says "invalid option", musl "unrecognized option", the
+ * BSDs "illegal option" -- and the Windows getopt prints none, so the option string starts with ':' to silence them
+ * and this reports the error the same way everywhere. That ':' also makes getopt return ':' rather than '?' for an
+ * option whose argument is missing.
+ */
+static void
+cli_report_short_opt_error(int c, int argc, char** argv) {
+    if (c == ':') {
+        LOG_ERROR("Option -%c requires an argument\n", optopt);
+        return;
+    }
+    /* A token the long-option pass did not recognize reaches getopt as "--name", which it reads as option '-'.
+     * getopt has not finished that element, so it is still argv[optind]. */
+    if (optopt == '-' && optind > 0 && optind < argc && argv[optind] != NULL && strncmp(argv[optind], "--", 2) == 0) {
+        LOG_ERROR("Unrecognized option '%s'\n", argv[optind]);
+        return;
+    }
+    if (optopt > ' ' && optopt < 0x7f) {
+        LOG_ERROR("Unrecognized option '-%c'\n", optopt);
+        return;
+    }
+    LOG_ERROR("Unrecognized option\n");
 }
 
 // Short-option getopt loop migrated to runtime
@@ -2109,8 +2500,9 @@ dsd_parse_args(int argc, char** argv, dsd_opts* opts, dsd_state* state, int* out
             LOG_INFO("NOTICE: TG Hold set to %u \n", state->tg_hold);                                                  \
             break;                                                                                                     \
         case '8':                                                                                                      \
+            cli_source_monitor_seen = 1;                                                                               \
             opts->monitor_input_audio = 1;                                                                             \
-            LOG_INFO("NOTICE: Experimental Raw Analog Source Monitoring Enabled (Pulse Audio Only!)\n");               \
+            LOG_INFO("NOTICE: Raw Source Audio Monitoring Enabled\n");                                               \
             break;                                                                                                     \
         case 'j':                                                                                                      \
             /* Compatibility spelling for the current default/on policy. */                                            \
@@ -2168,7 +2560,7 @@ dsd_parse_args(int argc, char** argv, dsd_opts* opts, dsd_state* state, int* out
             break;                                                                                                     \
         case 'y':                                                                                                      \
             opts->floating_point = 1;                                                                                  \
-            LOG_INFO("NOTICE: Enabling Experimental Floating Point Audio Output\n");                                   \
+            LOG_INFO("NOTICE: Digital voice to stdout and UDP as 32-bit float samples\n");                             \
             break;                                                                                                     \
         case 'Y':                                                                                                      \
             if (opts->trunk_scan_enabled) {                                                                            \
@@ -2316,10 +2708,17 @@ dsd_parse_args(int argc, char** argv, dsd_opts* opts, dsd_state* state, int* out
                 open_wav_file(opts->wav_out_dir, opts->wav_out_file, sizeof opts->wav_out_file, 8000, 0);              \
             opts->wav_out_fR =                                                                                         \
                 open_wav_file(opts->wav_out_dir, opts->wav_out_fileR, sizeof opts->wav_out_fileR, 8000, 0);            \
+            opts->wav_out_open_time = dsd_decode_time();                                                               \
+            opts->wav_out_open_timeR = opts->wav_out_open_time;                                                        \
             opts->dmr_stereo_wav = 1;                                                                                  \
             break;                                                                                                     \
         case '7':                                                                                                      \
-            /* Set custom directory for per-call WAV saving */                                                         \
+            /* Set custom directory for per-call WAV saving; one that does not fit is refused, never cut short. */     \
+            if (strlen(optarg) >= sizeof opts->wav_out_dir) {                                                          \
+                LOG_ERROR("-7: the folder path is longer than %d bytes\n", (int)(sizeof opts->wav_out_dir - 1U));      \
+                cli_set_exit_rc(out_exit_rc, 1);                                                                       \
+                return DSD_PARSE_ERROR;                                                                                \
+            }                                                                                                          \
             DSD_STRNCPY(opts->wav_out_dir, optarg, 511);                                                               \
             opts->wav_out_dir[511] = '\0';                                                                             \
             LOG_INFO("NOTICE: Per-call WAV directory set to: %s\n", opts->wav_out_dir);                                \
@@ -2366,6 +2765,12 @@ dsd_parse_args(int argc, char** argv, dsd_opts* opts, dsd_state* state, int* out
             opts->audio_out_dev[1023] = '\0';                                                                          \
             break;                                                                                                     \
         case 'd':                                                                                                      \
+            /* A folder that does not fit is refused, never silently cut to another folder (issue #661). */            \
+            if (strlen(optarg) >= sizeof opts->mbe_out_dir) {                                                          \
+                LOG_ERROR("-d: the folder path is longer than %d bytes\n", (int)(sizeof opts->mbe_out_dir - 1U));      \
+                cli_set_exit_rc(out_exit_rc, 1);                                                                       \
+                return DSD_PARSE_ERROR;                                                                                \
+            }                                                                                                          \
             DSD_STRNCPY(opts->mbe_out_dir, optarg, 1023);                                                              \
             opts->mbe_out_dir[1023] = '\0';                                                                            \
             if (dsd_stat_path(opts->mbe_out_dir, &st) == -1) {                                                         \
@@ -2429,14 +2834,18 @@ dsd_parse_args(int argc, char** argv, dsd_opts* opts, dsd_state* state, int* out
                 return DSD_PARSE_ERROR;                                                                                \
             }                                                                                                          \
             float ga = (float)parsed_ga;                                                                               \
-            if (ga < 0.0f) {                                                                                           \
+            /* 0 (anything under 1) is auto, the analog AGC; 1..100 is a fixed gain, 50 the reference level. */        \
+            if (!(ga >= 1.0f)) {                                                                                       \
                 ga = 0.0f;                                                                                             \
             } else if (ga > 100.0f) {                                                                                  \
                 ga = 100.0f;                                                                                           \
             }                                                                                                          \
             opts->audio_gainA = ga;                                                                                    \
-            LOG_INFO("NOTICE: Analog Audio Out Gain set to %.1f;\n", ga);                                              \
-            /* 0.0 means auto; analog_gain/agsm will derive the effective coefficient. */                              \
+            if (ga > 0.0f) {                                                                                           \
+                LOG_INFO("NOTICE: Analog Audio Out Gain set to %.1f;\n", ga);                                          \
+            } else {                                                                                                   \
+                LOG_INFO("NOTICE: Analog Audio Out Gain set to auto;\n");                                              \
+            }                                                                                                          \
             break;                                                                                                     \
         }                                                                                                              \
         case 'w':                                                                                                      \
@@ -2495,7 +2904,7 @@ dsd_parse_args(int argc, char** argv, dsd_opts* opts, dsd_state* state, int* out
             dsd_key_apply_mute_policy(opts, state);                                                                    \
             break;                                                                                                     \
         case 'v': {                                                                                                    \
-            /* Filtering bitmap (PBF/LPF/HPF/HPFD) -- accepts hex or dec */                                            \
+            /* Filtering bitmap: 1 voice band-pass, 2 LPF 960 Hz, 4 HPF 960 Hz, 8 digital HPF -- hex or dec */         \
             unsigned long bm = 0;                                                                                      \
             if (!cli_parse_ulong_option("-v", optarg, 0, &bm, out_exit_rc)) {                                          \
                 return DSD_PARSE_ERROR;                                                                                \
@@ -2504,8 +2913,8 @@ dsd_parse_args(int argc, char** argv, dsd_opts* opts, dsd_state* state, int* out
             opts->use_lpf = (bm & 0x2) ? 1 : 0;                                                                        \
             opts->use_hpf = (bm & 0x4) ? 1 : 0;                                                                        \
             opts->use_hpf_d = (bm & 0x8) ? 1 : 0;                                                                      \
-            LOG_INFO("NOTICE: Filters: PBF=%d LPF=%d HPF=%d HPFD=%d\n", opts->use_pbf, opts->use_lpf, opts->use_hpf,   \
-                     opts->use_hpf_d);                                                                                 \
+            LOG_INFO("NOTICE: Filters: voice band-pass=%d LPF 960 Hz=%d HPF 960 Hz=%d digital HPF=%d\n",               \
+                     opts->use_pbf, opts->use_lpf, opts->use_hpf, opts->use_hpf_d);                                    \
             break;                                                                                                     \
         }                                                                                                              \
         case 'f': {                                                                                                    \
@@ -2522,6 +2931,8 @@ dsd_parse_args(int argc, char** argv, dsd_opts* opts, dsd_state* state, int* out
                 || f_selector == 'U') {                                                                                \
                 opts->analog_only = 0;                                                                                 \
                 opts->monitor_input_audio = 0;                                                                         \
+                /* ... and the AM detector -fM chose: the M17 encoder shares the analog front end. */                  \
+                opts->analog_demod = DSD_ANALOG_DEMOD_FM;                                                              \
             }                                                                                                          \
             const char decode_preset = optarg[0] == 'r' ? 's' : optarg[0];                                             \
             dsdneoUserDecodeMode core_mode = DSDCFG_MODE_UNSET;                                                        \
@@ -2534,6 +2945,7 @@ dsd_parse_args(int argc, char** argv, dsd_opts* opts, dsd_state* state, int* out
                     case 'a': LOG_INFO("NOTICE: Decoding AUTO: all digital modes with multi-rate SPS hunting\n");      \
                         break;                                                                                         \
                     case 'A': LOG_INFO("NOTICE: Only Monitoring Passive Analog Signal\n"); break;                      \
+                    case 'M': LOG_INFO("NOTICE: AM receiver (IQ radio inputs)\n"); break;                              \
                     case 'd': LOG_INFO("NOTICE: Decoding only DSTAR frames.\n"); break;                                \
                     case 'x': LOG_INFO("NOTICE: Decoding only X2-TDMA frames.\n"); break;                              \
                     case '1': LOG_INFO("NOTICE: Decoding only P25 Phase 1 frames.\n"); break;                          \
@@ -2772,7 +3184,8 @@ dsd_parse_args(int argc, char** argv, dsd_opts* opts, dsd_state* state, int* out
                 cli_decode_timing_source = CLI_TIMING_SOURCE_PRESET;                                                   \
             } else if (optarg[0] == 'Z') {                                                                             \
                 opts->m17encoder = 1;                                                                                  \
-                opts->pulse_digi_rate_out = 48000;                                                                     \
+                /* The digital stream plays the decoded 8 kHz voice monitor; -8's baseband goes to the raw stream. */  \
+                opts->pulse_digi_rate_out = 8000;                                                                      \
                 opts->pulse_digi_out_channels = 1;                                                                     \
                 opts->use_lpf = 0;                                                                                     \
                 opts->use_hpf = 0;                                                                                     \
@@ -3016,6 +3429,7 @@ dsd_parse_args(int argc, char** argv, dsd_opts* opts, dsd_state* state, int* out
             LOG_INFO("NOTICE: Force Privacy Key priority enabled\n");                                                  \
             break;                                                                                                     \
         default:                                                                                                       \
+            cli_report_short_opt_error(c, argc, argv);                                                                 \
             dsd_cli_usage();                                                                                           \
             cli_set_exit_rc(out_exit_rc, 1);                                                                           \
             return DSD_PARSE_ERROR;                                                                                    \
@@ -3066,14 +3480,20 @@ dsd_parse_short_opts(int argc, char** argv, dsd_opts* opts, dsd_state* state, in
     int cli_manual_timing_sps = 0;
     int cli_manual_timing_center = 0;
     int cli_dmr_mono_override_seen = 0;
+    int cli_source_monitor_seen = 0;
     while ((c = getopt(argc, argv,
-                       "~yhaepPqs:t:v:z:i:o:d:c:g:n:w:B:C:R:f:m:x:A:S:M:G:D:L:V:U:YK:b:H:X:Q:WrlZTF@:!:01:2:345:6:7:_:"
+                       ":~yhaepPqs:t:v:z:i:o:d:c:g:n:w:B:C:R:f:m:x:A:S:M:G:D:L:V:U:YK:b:H:X:Q:WrlZTF@:!:01:2:345:6:7:_:"
                        "89:Ek:I:J:O^Nj"))
            != -1) {
         DSD_PARSE_SHORT_OPTS_SWITCH_BLOCK();
     }
     if (cli_dmr_mono_override_seen) {
         opts->dmr_mono = 1;
+    }
+    /* Leaving an analog preset clears its implicit monitor. An explicit -8 is the user's separate choice and must
+       survive later selectors too, notably -fZ where it selects 48 kHz baseband instead of decoded voice. */
+    if (cli_source_monitor_seen) {
+        opts->monitor_input_audio = 1;
     }
     if (cli_decode_timing_seen && dsd_opts_source_uses_effective_input_rate(opts)) {
         int timing_rate_hz = dsd_opts_effective_input_rate(opts);
@@ -3087,6 +3507,10 @@ dsd_parse_short_opts(int argc, char** argv, dsd_opts* opts, dsd_state* state, in
                 dsd_state_rescale_symbol_timing(state, 48000, timing_rate_hz);
             }
         }
+    }
+    if (cli_check_am_input(opts, state, cli_decode_timing_seen && cli_decode_timing_mode == DSDCFG_MODE_AM, out_exit_rc)
+        != 0) {
+        return DSD_PARSE_ERROR;
     }
     dsd_warn_ineffective_short_opts(opts, state);
     // Set after getopt completes so -r file ordering is independent of later options.

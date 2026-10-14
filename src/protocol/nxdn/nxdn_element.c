@@ -18,7 +18,6 @@
 #include <dsd-neo/core/bit_packing.h>
 #include <dsd-neo/core/call_state.h>
 #include <dsd-neo/core/constants.h>
-#include <dsd-neo/core/dsd_time.h>
 #include <dsd-neo/core/enc_lockout.h>
 #include <dsd-neo/core/events.h>
 #include <dsd-neo/core/gps.h>
@@ -38,6 +37,7 @@
 #include <dsd-neo/protocol/nxdn/nxdn_lfsr.h>
 #include <dsd-neo/protocol/nxdn/nxdn_trunk_diag.h>
 #include <dsd-neo/protocol/p25/p25_frequency.h>
+#include <dsd-neo/runtime/decode_clock.h>
 
 #include <dsd-neo/core/opts_fwd.h>
 #include <dsd-neo/core/safe_api.h>
@@ -371,7 +371,7 @@ nxdn_element_handle_dst_info(dsd_opts* opts, dsd_state* state, const uint8_t* el
 
 static void
 nxdn_element_mark_control_sync(const dsd_opts* opts, dsd_state* state) {
-    state->last_cc_sync_time_m = dsd_time_now_monotonic_s();
+    state->last_cc_sync_time_m = dsd_decode_now_mono_s();
     nxdn_anchor_control_channel_from_current_tuner(opts, state, 1);
 }
 
@@ -1202,6 +1202,7 @@ nxdn_location_id_handler(dsd_state* state, uint32_t location_id, uint8_t type) {
     //type 0 is for current site, type 1 is for adjacent sites
     if (type == 0) {
         state->nxdn_last_ran = site_code % 64; //Table 6.3-4 RAN for Trunked Radio Systems
+        state->nxdn_last_ran_stand_in = 0U;
         if (site_code != 0) {
             state->nxdn_location_site_code = site_code;
         }
@@ -1622,7 +1623,7 @@ nxdn_vcall_assgn_apply_tune(dsd_opts* opts, dsd_state* state, const struct nxdn_
 
 void
 NXDN_decode_VCALL_ASSGN(dsd_opts* opts, dsd_state* state, const uint8_t* Message) {
-    const time_t now = time(NULL);
+    const time_t now = dsd_decode_time();
     struct nxdn_vcall_assgn_info info;
     nxdn_vcall_assgn_parse(state, Message, &info);
     nxdn_vcall_assgn_print(state, &info);
@@ -2286,6 +2287,14 @@ nxdn_vcall_publish(dsd_opts* opts, dsd_state* state, const struct nxdn_vcall_inf
     if (!DSD_SYNC_IS_NXDN(protocol)) {
         protocol = DSD_SYNC_NXDN_POS;
     }
+    /* A VCALL carries no channel or frequency of its own (issue #575). The call may name only the voice channel the
+     * receiver followed a grant to: trunk_vc_freq[] while that holds, and the last grant's channel only when that
+     * grant is the one followed. Without trunking no grant is followed, and trunk_vc_freq[] holds whatever a DMR grant
+     * decoded with trunking off wrote for display; a grant decoded while tuned (a duplicate assignment for another
+     * call) moves nxdn_grant_chan without moving the receiver. */
+    const long int followed_freq = dsd_opts_trunk_vc_followed(opts) ? state->trunk_vc_freq[0] : 0;
+    const uint16_t followed_chan =
+        (followed_freq != 0 && state->nxdn_grant_freq == followed_freq) ? state->nxdn_grant_chan : 0U;
     const dsd_call_observation observation = {
         .protocol = protocol,
         .slot = 0U,
@@ -2293,8 +2302,8 @@ nxdn_vcall_publish(dsd_opts* opts, dsd_state* state, const struct nxdn_vcall_inf
         .ota_target_id = info->destination_id,
         .policy_target_id = info->destination_id,
         .ota_source_id = (info->voice_call_option & 0x0FU) < 4U ? info->source_unit_id : 0U,
-        .channel = state->nxdn_grant_chan,
-        .frequency_hz = state->trunk_vc_freq[0],
+        .channel = followed_chan,
+        .frequency_hz = followed_freq,
         .service_options = info->cc_option,
         .emergency = (uint8_t)((info->cc_option & 0x80U) != 0U),
         .has_service_metadata = 1U,
@@ -2357,14 +2366,10 @@ nxdn_vcall_run_enc_lockout(dsd_opts* opts, dsd_state* state, const struct nxdn_v
 
     if (dsd_enc_lockout_note(state, info->destination_id, is_group, (int)state->nxdn_cipher_type,
                              (int)state->nxdn_key)) {
-        dsd_event_history_transaction transaction;
-        dsd_event_history_transaction_begin(state, &transaction);
-        DSD_SNPRINTF(state->event_history_s[0].Event_History_Items[0].internal_str,
-                     sizeof(state->event_history_s[0].Event_History_Items[0].internal_str),
-                     "Target: %d; has been locked out; Encryption Lock Out Enabled.", info->destination_id);
-        dsd_event_history_mark_dirty(&state->event_history_s[0]);
-        dsd_event_history_transaction_end(&transaction);
-        watchdog_event_current(opts, state, 0);
+        char note[128];
+        DSD_SNPRINTF(note, sizeof note, "Target: %d; has been locked out; Encryption Lock Out Enabled.",
+                     info->destination_id);
+        dsd_event_note_current_call(opts, state, 0U, note);
     }
 
     // Deliberately unconditional (the event above fires once per lock, the
@@ -2565,9 +2570,11 @@ nxdn_scch_prepare_type_d(dsd_state* state, const struct nxdn_scch_info* info) {
          * hold cannot rest on one (issue #398). */
         return;
     }
+    /* The area bit, which the terminal shows as "IDAS - Area" where the RAN goes; not a RAN (issue #575). */
     state->nxdn_last_ran = info->area;
+    state->nxdn_last_ran_stand_in = 1U;
     state->last_cc_sync_time = info->now;
-    state->last_cc_sync_time_m = dsd_time_now_monotonic_s();
+    state->last_cc_sync_time_m = dsd_decode_now_mono_s();
 }
 
 static void
@@ -2597,7 +2604,9 @@ nxdn_scch_handle_site_id(dsd_state* state, const struct nxdn_scch_info* info) {
     }
     state->nxdn_location_site_code = info->sitet;
     state->nxdn_location_sys_code = info->sitet;
+    /* Likewise shown where the RAN goes, and likewise not one (issue #575). */
     state->nxdn_last_ran = info->sitet;
+    state->nxdn_last_ran_stand_in = 1U;
 }
 
 static int
@@ -2857,7 +2866,7 @@ nxdn_scch_handle_info1(dsd_opts* opts, dsd_state* state, const struct nxdn_scch_
 //can also (mostly) be decoded seperately, except an enc IV
 void
 NXDN_decode_scch(dsd_opts* opts, dsd_state* state, const uint8_t* Message, uint8_t direction) {
-    const time_t now = time(NULL);
+    const time_t now = dsd_decode_time();
     struct nxdn_scch_info info;
     nxdn_scch_parse(Message, direction, now, &info);
 

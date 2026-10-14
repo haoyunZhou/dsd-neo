@@ -15,11 +15,13 @@
 #include <dsd-neo/app_control/rr_import_apply.h>
 #include <dsd-neo/app_control/snapshot.h>
 #include <dsd-neo/core/opts.h>
+#include <dsd-neo/core/power.h>
 #include <dsd-neo/core/safe_api.h>
 #include <dsd-neo/core/state.h>
 #include <dsd-neo/platform/platform.h>
 #include <dsd-neo/platform/posix_compat.h>
 #include <dsd-neo/runtime/config.h>
+#include <math.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -63,10 +65,8 @@ static int g_env_set_calls;
 static int g_env_unset_calls;
 static char g_env_int_name[128];
 static int g_env_int_value;
-static int g_env_int_calls;
 static char g_env_double_name[128];
 static double g_env_double_value;
-static int g_env_double_calls;
 static int g_reparse_calls;
 static const char* g_env_get_value;
 static int g_config_load_rc;
@@ -119,6 +119,11 @@ dsd_app_command_set_u64(int cmd_id, uint64_t value) {
 int
 dsd_app_command_set_double(int cmd_id, double value) {
     return capture_command(cmd_id, &value, sizeof value);
+}
+
+int
+dsd_app_command_submit(int cmd_id, const void* payload, size_t payload_sz) {
+    return capture_command(cmd_id, payload, payload_sz);
 }
 
 int
@@ -225,14 +230,12 @@ void
 env_set_int(const char* name, int v) {
     DSD_SNPRINTF(g_env_int_name, sizeof g_env_int_name, "%s", name ? name : "");
     g_env_int_value = v;
-    g_env_int_calls++;
 }
 
 void
 env_set_double(const char* name, double v) {
     DSD_SNPRINTF(g_env_double_name, sizeof g_env_double_name, "%s", name ? name : "");
     g_env_double_value = v;
-    g_env_double_calls++;
 }
 
 int
@@ -335,10 +338,8 @@ reset_capture(void) {
     g_env_unset_calls = 0;
     DSD_MEMSET(g_env_int_name, 0, sizeof g_env_int_name);
     g_env_int_value = 0;
-    g_env_int_calls = 0;
     DSD_MEMSET(g_env_double_name, 0, sizeof g_env_double_name);
     g_env_double_value = 0.0;
-    g_env_double_calls = 0;
     g_reparse_calls = 0;
     g_env_get_value = NULL;
     g_config_load_rc = 0;
@@ -963,6 +964,33 @@ test_gain_rtl_and_env_callbacks(void) {
     rc |= expect_int("rtl sql command", g_cmd.id, DSD_APP_CMD_RTL_SET_SQL_DB);
     rc |= expect_int("rtl sql value", cmd_double() == -42.5, 1);
 
+    /* The setting as typed (issue #518 follow-up): the grammar, whole; a refusal says why on the status line and never
+       repeats the text. */
+    {
+        dsd_app_squelch_setting_payload sql;
+        reset_capture();
+        cb_rtl_sql_text(&ctx, "auto+6");
+        rc |= expect_int("rtl sql setting command", g_cmd.id, DSD_APP_CMD_RTL_SET_SQL_SETTING);
+        rc |= expect_int("rtl sql setting size", (int)g_cmd.n, (int)sizeof sql);
+        DSD_MEMCPY(&sql, g_cmd.data, sizeof sql);
+        rc |= expect_int("rtl sql setting auto", sql.mode == DSD_SQUELCH_MODE_AUTO && sql.margin_db == 6, 1);
+        reset_capture();
+        cb_rtl_sql_text(&ctx, "-60");
+        DSD_MEMCPY(&sql, g_cmd.data, sizeof sql);
+        rc |= expect_int("rtl sql setting level",
+                         g_cmd.id == DSD_APP_CMD_RTL_SET_SQL_SETTING && sql.mode == DSD_SQUELCH_MODE_LEVEL
+                             && fabs(sql.level - 1e-6) < 1e-15,
+                         1);
+        reset_capture();
+        cb_rtl_sql_text(&ctx, "SECRET");
+        rc |= expect_int("rtl sql setting refused", g_cmd.calls, 0);
+        rc |= expect_int("rtl sql setting says why", strstr(g_status, "Squelch: ") != NULL, 1);
+        rc |= expect_int("rtl sql setting never repeats the text", strstr(g_status, "SECRET") == NULL, 1);
+        reset_capture();
+        cb_rtl_sql_text(&ctx, NULL);
+        rc |= expect_int("rtl sql setting cancelled", g_cmd.calls, 0);
+    }
+
     reset_capture();
     cb_rtl_vol(&ctx, 1, 9);
     rc |= expect_int("rtl vol command", g_cmd.id, DSD_APP_CMD_RTL_SET_VOL_MULT);
@@ -1063,6 +1091,7 @@ test_env_editor_and_protocol_callbacks(void) {
     g_prompt.str_cb(g_prompt.user, "new");
     rc |= expect_str("env set name", g_env_name, "DSD_NEO_TEST_VALUE");
     rc |= expect_str("env set value", g_env_value, "new");
+    rc |= expect_int("env set sets once", g_env_set_calls, 1);
     rc |= expect_int("env set reparse", g_reparse_calls, 1);
 
     reset_capture();
@@ -1073,6 +1102,7 @@ test_env_editor_and_protocol_callbacks(void) {
     cb_env_edit_value(clear, "");
     rc |= expect_str("env clear name", g_env_name, "DSD_NEO_CLEAR_ME");
     rc |= expect_int("env clear calls unset", g_env_unset_calls, 1);
+    rc |= expect_int("env clear does not set an empty value", g_env_set_calls, 0);
     rc |= expect_int("env clear reparses", g_reparse_calls, 1);
 
     reset_capture();

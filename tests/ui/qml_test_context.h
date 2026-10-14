@@ -35,6 +35,7 @@
 #define DSD_NEO_TESTS_UI_QML_TEST_CONTEXT_H_
 
 #include <QAbstractListModel>
+#include <QByteArray>
 #include <QCoreApplication>
 #include <QDateTime>
 #include <QDir>
@@ -56,11 +57,15 @@
 #include <QVariantMap>
 #include <QXmlStreamReader>
 #include <QtQuickTest>
+#include <dsd-neo/core/analog_tone.h>
 #include <dsd-neo/core/opts.h>
+#include <dsd-neo/core/power.h>
 #include <dsd-neo/core/safe_api.h>
 #include <dsd-neo/core/state.h>
 #include <dsd-neo/core/state_ext.h>
 #include <dsd-neo/core/talkgroup_policy.h>
+#include <dsd-neo/runtime/analog_tones.h>
+#include <dsd-neo/runtime/scan_row_edit.h>
 #include <memory>
 #include "../test_support/qt_test_paths.h"
 #include "decryption_profiles_model.h"
@@ -74,6 +79,7 @@
 #include "diagnostics_log.h"
 #include "imported_files_model.h"
 #include "p25_network_model.h" // WP-F2
+#include "qml_gc_policy.h"
 #include "qml_spectrum_stub.h"
 #include "saved_systems_model.h"
 #include "scan_list_starter.h"
@@ -224,6 +230,14 @@ class ImportOnlyHost : public dsd_qt::DecoderHost {
     bool usbReady = false;
     int usbRequests = 0;
 
+    // Issue #574: the Settings screen's Screen rows gate on this capability.
+    bool
+    screenPolicySupported() const override {
+        return screenPolicy;
+    }
+
+    bool screenPolicy = false;
+
     bool acceptStart = false;
     bool startRunning = false;
 
@@ -315,11 +329,119 @@ class TestUiController : public QObject {
  */
 class CommandRecorder : public QObject {
     Q_OBJECT
+    /* Issue #518: the session-edit fields and actions, as CommandBridge publishes them. */
+    Q_PROPERTY(int scanRowFieldSquelch READ scanRowFieldSquelch CONSTANT)
+    Q_PROPERTY(int scanRowFieldWidth READ scanRowFieldWidth CONSTANT)
+    Q_PROPERTY(int scanRowFieldTone READ scanRowFieldTone CONSTANT)
+    Q_PROPERTY(int scanRowFieldGain READ scanRowFieldGain CONSTANT)
+    Q_PROPERTY(int scanRowEditSet READ scanRowEditSet CONSTANT)
+    Q_PROPERTY(int scanRowEditInherit READ scanRowEditInherit CONSTANT)
+    Q_PROPERTY(int scanRowEditReset READ scanRowEditReset CONSTANT)
+    /* The squelch modes and the auto squelch's margin range, as CommandBridge publishes them. */
+    Q_PROPERTY(int squelchModeLevel READ squelchModeLevel CONSTANT)
+    Q_PROPERTY(int squelchModeAuto READ squelchModeAuto CONSTANT)
+    Q_PROPERTY(int squelchModeNoise READ squelchModeNoise CONSTANT)
+    Q_PROPERTY(int squelchMarginMinDb READ squelchMarginMinDb CONSTANT)
+    Q_PROPERTY(int squelchMarginMaxDb READ squelchMarginMaxDb CONSTANT)
+    Q_PROPERTY(int squelchMarginDefaultDb READ squelchMarginDefaultDb CONSTANT)
     quint64 m_next_key_request = 1;
     QString m_last_key_request;
     QVariantList m_last_selection;
 
   public:
+    static int
+    scanRowFieldSquelch() {
+        return DSD_SCAN_ROW_FIELD_SQUELCH;
+    }
+
+    static int
+    scanRowFieldWidth() {
+        return DSD_SCAN_ROW_FIELD_WIDTH;
+    }
+
+    static int
+    scanRowFieldTone() {
+        return DSD_SCAN_ROW_FIELD_TONE;
+    }
+
+    static int
+    scanRowFieldGain() {
+        return DSD_SCAN_ROW_FIELD_GAIN;
+    }
+
+    static int
+    scanRowEditSet() {
+        return DSD_SCAN_ROW_EDIT_SET;
+    }
+
+    static int
+    scanRowEditInherit() {
+        return DSD_SCAN_ROW_EDIT_INHERIT;
+    }
+
+    static int
+    scanRowEditReset() {
+        return DSD_SCAN_ROW_EDIT_RESET;
+    }
+
+    static int
+    squelchModeLevel() {
+        return DSD_SQUELCH_MODE_LEVEL;
+    }
+
+    static int
+    squelchModeAuto() {
+        return DSD_SQUELCH_MODE_AUTO;
+    }
+
+    static int
+    squelchModeNoise() {
+        return DSD_SQUELCH_MODE_NOISE;
+    }
+
+    static int
+    squelchMarginMinDb() {
+        return DSD_SQUELCH_MARGIN_MIN_DB;
+    }
+
+    static int
+    squelchMarginMaxDb() {
+        return DSD_SQUELCH_MARGIN_MAX_DB;
+    }
+
+    static int
+    squelchMarginDefaultDb() {
+        return DSD_SQUELCH_MARGIN_DEFAULT_DB;
+    }
+
+    /* The row on air an editor captures (setScanRowContext()), and the session edits it then sends. */
+    Q_INVOKABLE QVariantMap
+    scanRowContext() const {
+        return m_scan_row_context;
+    }
+
+    void
+    setScanRowContext(const QVariantMap& context) {
+        m_scan_row_context = context;
+    }
+
+    Q_INVOKABLE bool
+    editScanRow(const QVariantMap& context, int field, int action, const QVariantMap& value) {
+        m_last_scan_row_edit = {{"context", context}, {"field", field}, {"action", action}, {"value", value}};
+        m_scan_row_edit_calls++;
+        return true;
+    }
+
+    int
+    scanRowEditCalls() const {
+        return m_scan_row_edit_calls;
+    }
+
+    QVariantMap
+    lastScanRowEdit() const {
+        return m_last_scan_row_edit;
+    }
+
     Q_INVOKABLE QVariantMap
     decryptionContext(const QString& target, const QString& epoch) const {
         return {{"session", "1"}, {"tuning", "1"}, {"target", target}, {"keyEpoch", epoch}};
@@ -608,9 +730,45 @@ class CommandRecorder : public QObject {
     }
 
     Q_INVOKABLE bool
+    setAirspy(const QString& key, const QString& value) {
+        (void)key;
+        (void)value;
+        m_airspy_calls++;
+        return true;
+    }
+
+    Q_INVOKABLE bool
     setSquelchDb(double db) {
         m_last_squelch_db = db;
         m_squelch_calls++;
+        return true;
+    }
+
+    /* Refuses a margin out of range, as CommandBridge does. */
+    Q_INVOKABLE bool
+    setSquelchAuto(int marginDb) {
+        if (marginDb < DSD_SQUELCH_MARGIN_MIN_DB || marginDb > DSD_SQUELCH_MARGIN_MAX_DB) {
+            return false;
+        }
+        m_last_squelch_margin_db = marginDb;
+        m_squelch_auto_calls++;
+        return true;
+    }
+
+    /* Refuses a margin out of range, as CommandBridge does. */
+    Q_INVOKABLE bool
+    setSquelchNoise(int marginDb) {
+        if (marginDb < DSD_SQUELCH_MARGIN_MIN_DB || marginDb > DSD_SQUELCH_MARGIN_MAX_DB) {
+            return false;
+        }
+        m_last_squelch_margin_db = marginDb;
+        m_squelch_noise_calls++;
+        return true;
+    }
+
+    Q_INVOKABLE bool
+    restoreSquelchLevel() {
+        m_restore_squelch_calls++;
         return true;
     }
 
@@ -628,9 +786,36 @@ class CommandRecorder : public QObject {
     }
 
     Q_INVOKABLE bool
+    setAmBandwidthHz(int hz) {
+        m_last_am_bandwidth_hz = hz;
+        m_am_bandwidth_calls++;
+        return true;
+    }
+
+    Q_INVOKABLE bool
     setModulation(int modulation) {
         m_last_modulation = modulation;
         return true;
+    }
+
+    /* The live tone-filter editor (#527): what it sends, and the production validator's answer for its inline check,
+     * so a case sees the message the decoder would refuse with. */
+    Q_INVOKABLE bool
+    setToneFilter(int mode, const QString& list) {
+        m_last_tone_filter_mode = mode;
+        m_last_tone_filter_list = list;
+        m_tone_filter_calls++;
+        return true;
+    }
+
+    Q_INVOKABLE QString
+    // cppcheck-suppress functionStatic // Qt meta-object entry point must remain an instance method.
+    toneFilterError(int mode, const QString& list) const {
+        const QByteArray utf8 = list.toUtf8();
+        dsd_tone_set set;
+        char err[DSD_TONE_LIST_ERROR_SIZE] = "";
+        return dsd_tone_filter_check(mode, utf8.constData(), &set, err, sizeof err) == 0 ? QString()
+                                                                                         : QString::fromUtf8(err);
     }
 
     Q_INVOKABLE bool
@@ -676,14 +861,27 @@ class CommandRecorder : public QObject {
         m_set_trunking_calls = 0;
         m_last_set_trunking = false;
         m_gain_calls = 0;
+        m_airspy_calls = 0;
         m_last_gain_db = -1;
         m_last_squelch_db = 0.0;
         m_squelch_calls = 0;
+        m_last_squelch_margin_db = 0;
+        m_squelch_auto_calls = 0;
+        m_squelch_noise_calls = 0;
+        m_restore_squelch_calls = 0;
         m_last_nfm_bandwidth_hz = -1;
         m_nfm_bandwidth_calls = 0;
         m_last_modulation = -1;
         m_last_decode_mode = -1;
         m_last_ppm = 9999;
+        m_last_am_bandwidth_hz = -1;
+        m_am_bandwidth_calls = 0;
+        m_last_tone_filter_mode = -1;
+        m_last_tone_filter_list.clear();
+        m_tone_filter_calls = 0;
+        m_scan_row_context = {{"active", false}};
+        m_last_scan_row_edit.clear();
+        m_scan_row_edit_calls = 0;
         m_lockout_accepted = true;
         m_lockout_requests.clear();
         m_avoid_clear_requests.clear();
@@ -727,6 +925,11 @@ class CommandRecorder : public QObject {
     }
 
     int
+    airspyCalls() const {
+        return m_airspy_calls;
+    }
+
+    int
     lastGainDb() const {
         return m_last_gain_db;
     }
@@ -740,6 +943,26 @@ class CommandRecorder : public QObject {
     Q_INVOKABLE int
     squelchCalls() const {
         return m_squelch_calls;
+    }
+
+    int
+    lastSquelchMarginDb() const {
+        return m_last_squelch_margin_db;
+    }
+
+    int
+    squelchAutoCalls() const {
+        return m_squelch_auto_calls;
+    }
+
+    int
+    squelchNoiseCalls() const {
+        return m_squelch_noise_calls;
+    }
+
+    int
+    restoreSquelchCalls() const {
+        return m_restore_squelch_calls;
     }
 
     int
@@ -765,6 +988,31 @@ class CommandRecorder : public QObject {
     int
     lastPpm() const {
         return m_last_ppm;
+    }
+
+    int
+    lastAmBandwidthHz() const {
+        return m_last_am_bandwidth_hz;
+    }
+
+    int
+    amBandwidthCalls() const {
+        return m_am_bandwidth_calls;
+    }
+
+    int
+    lastToneFilterMode() const {
+        return m_last_tone_filter_mode;
+    }
+
+    QString
+    lastToneFilterList() const {
+        return m_last_tone_filter_list;
+    }
+
+    int
+    toneFilterCalls() const {
+        return m_tone_filter_calls;
     }
 
     int
@@ -878,6 +1126,10 @@ class CommandRecorder : public QObject {
     int m_set_trunking_calls = 0;
     bool m_last_set_trunking = false;
     int m_gain_calls = 0;
+    int m_airspy_calls = 0;
+    QVariantMap m_scan_row_context{{"active", false}};
+    QVariantMap m_last_scan_row_edit;
+    int m_scan_row_edit_calls = 0;
     bool m_lockout_accepted = true;
     QVariantList m_lockout_requests;
     QStringList m_avoid_clear_requests;
@@ -888,11 +1140,20 @@ class CommandRecorder : public QObject {
     int m_last_gain_db = -1;
     double m_last_squelch_db = 0.0;
     int m_squelch_calls = 0;
+    int m_last_squelch_margin_db = 0;
+    int m_squelch_noise_calls = 0;
+    int m_squelch_auto_calls = 0;
+    int m_restore_squelch_calls = 0;
     int m_last_nfm_bandwidth_hz = -1;
     int m_nfm_bandwidth_calls = 0;
     int m_last_modulation = -1;
     int m_last_decode_mode = -1;
     int m_last_ppm = 9999;
+    int m_last_am_bandwidth_hz = -1;
+    int m_am_bandwidth_calls = 0;
+    int m_last_tone_filter_mode = -1;
+    QString m_last_tone_filter_list;
+    int m_tone_filter_calls = 0;
     QVariantList m_talkgroupEdit;
     int m_talkgroup_listen_calls = 0;
     double m_last_talkgroup_id_start = 0.0;
@@ -908,13 +1169,16 @@ class CommandRecorder : public QObject {
  *
  * Same roles and the same newest-first prepend as CallHistoryModel, with
  * granular insert/reset signals — the screens' scroll behaviour is a reaction to
- * those signals, so a reset-everything stand-in would test nothing.
+ * those signals, so a reset-everything stand-in would test nothing. Rows carry the
+ * decode session they were logged in, as CallHistoryModel's do, and beginSession()
+ * moves it on the way a start does.
  */
 class CallLogStore : public QAbstractListModel {
     Q_OBJECT
     Q_PROPERTY(int count READ count NOTIFY countChanged)
     Q_PROPERTY(QString sessionLabel READ sessionLabel WRITE setSessionLabel NOTIFY sessionLabelChanged)
     Q_PROPERTY(QString sessionUid READ sessionUid WRITE setSessionUid NOTIFY sessionUidChanged)
+    Q_PROPERTY(qlonglong session READ session NOTIFY sessionChanged)
     Q_PROPERTY(QStringList systemLabels READ systemLabels NOTIFY countChanged)
 
   public:
@@ -935,6 +1199,10 @@ class CallLogStore : public QAbstractListModel {
         QString detail;
         QString channel;
         QString sourceName;
+        qint64 session = 0;
+        qint64 freqHz = 0;
+        QString accessCode;
+        QString accessCodeText;
     };
 
     int
@@ -975,6 +1243,18 @@ class CallLogStore : public QAbstractListModel {
         Q_EMIT sessionUidChanged();
     }
 
+    qlonglong
+    session() const {
+        return m_session;
+    }
+
+    /** @brief A start: the rows pushed from here on are the new session's. */
+    Q_INVOKABLE void
+    beginSession() {
+        m_session++;
+        Q_EMIT sessionChanged();
+    }
+
     QStringList
     systemLabels() const {
         return m_rows.isEmpty() ? QStringList() : QStringList{m_systemName};
@@ -1002,6 +1282,10 @@ class CallLogStore : public QAbstractListModel {
             case CallHistoryModel::KindRole: return row.kind;
             case CallHistoryModel::DetailRole: return row.detail;
             case CallHistoryModel::ChannelRole: return row.channel;
+            case CallHistoryModel::SessionRole: return row.session;
+            case CallHistoryModel::FreqHzRole: return row.freqHz;
+            case CallHistoryModel::AccessCodeRole: return row.accessCode;
+            case CallHistoryModel::AccessCodeTextRole: return row.accessCodeText;
             default: return {};
         }
     }
@@ -1022,7 +1306,11 @@ class CallLogStore : public QAbstractListModel {
                 {CallHistoryModel::TimeTextRole, "timeText"},
                 {CallHistoryModel::KindRole, "kind"},
                 {CallHistoryModel::DetailRole, "detail"},
-                {CallHistoryModel::ChannelRole, "channel"}};
+                {CallHistoryModel::ChannelRole, "channel"},
+                {CallHistoryModel::SessionRole, "session"},
+                {CallHistoryModel::FreqHzRole, "freqHz"},
+                {CallHistoryModel::AccessCodeRole, "accessCode"},
+                {CallHistoryModel::AccessCodeTextRole, "accessCodeText"}};
     }
 
     /**
@@ -1039,6 +1327,7 @@ class CallLogStore : public QAbstractListModel {
         row.when = m_clock++;
         row.systemName = m_systemName;
         row.systemUid = m_sessionUid;
+        row.session = m_session;
         row.dayLabel = dayLabel.isEmpty() ? QStringLiteral("TODAY") : dayLabel;
         row.timeText = QStringLiteral("12:%1").arg(m_seq % 60, 2, 10, QLatin1Char('0'));
         beginInsertRows(QModelIndex(), 0, 0);
@@ -1090,6 +1379,34 @@ class CallLogStore : public QAbstractListModel {
     }
 
     /**
+     * @brief Prepend one call with ids @p tg / @p src heard on @p channel, at @p freqHz under access code
+     * @p accessCode (long form @p accessCodeText), as the model's rows carry them (issue #575).
+     * @return The row's name, so a test can find that one row.
+     */
+    Q_INVOKABLE QString
+    pushTuned(qulonglong tg, qulonglong src, const QString& channel, qint64 freqHz, const QString& accessCode,
+              const QString& accessCodeText) {
+        const QString name = push(QStringLiteral("TODAY"));
+        tuneNewest(tg, src, channel, freqHz, accessCode, accessCodeText);
+        return name;
+    }
+
+    /**
+     * @brief The same, as a data/control notice carrying @p detail: notice rows keep their own meta rules.
+     * @return The row's name.
+     */
+    Q_INVOKABLE QString
+    pushTunedNotice(qulonglong tg, qulonglong src, const QString& detail, const QString& channel, qint64 freqHz,
+                    const QString& accessCode, const QString& accessCodeText) {
+        const QString name = push(QStringLiteral("TODAY"));
+        m_rows[0].kind = CallHistoryModel::KindNotice;
+        m_rows[0].detail = detail;
+        m_rows[0].durationSecs = -1;
+        tuneNewest(tg, src, channel, freqHz, accessCode, accessCodeText);
+        return name;
+    }
+
+    /**
      * @brief Prepend a call that decoded no talkgroup, named by the scan channel it
      * was heard on — encrypted traffic on a conventional list looks like this.
      * @return The row's name (the channel).
@@ -1104,6 +1421,26 @@ class CallLogStore : public QAbstractListModel {
         Q_EMIT dataChanged(idx, idx,
                            {CallHistoryModel::TgRole, CallHistoryModel::NameRole, CallHistoryModel::ChannelRole});
         return channel;
+    }
+
+    /**
+     * @brief Prepend one clear voice call stamped @p when, as a replay's calls are
+     * stamped with the capture's time.
+     * @return The row's name.
+     */
+    Q_INVOKABLE QString
+    pushAt(qint64 when) {
+        const QString name = push(QStringLiteral("TODAY"));
+        m_rows[0].when = when;
+        const QModelIndex idx = index(0);
+        Q_EMIT dataChanged(idx, idx, {CallHistoryModel::WhenRole});
+        return name;
+    }
+
+    /** @brief The newest row's `when`, 0 with no rows: the stamps are fixed, so a case ages rows against it. */
+    Q_INVOKABLE qint64
+    newestWhen() const {
+        return m_rows.isEmpty() ? 0 : m_rows.first().when;
     }
 
     /** @brief Prepend @p n calls, oldest first, so the list reads newest-first. */
@@ -1141,12 +1478,33 @@ class CallLogStore : public QAbstractListModel {
     void countChanged();
     void sessionLabelChanged();
     void sessionUidChanged();
+    void sessionChanged();
 
   private:
+    /* Stamps the newest row with its ids, channel, frequency and access code, and announces every role it set. */
+    void
+    tuneNewest(qulonglong tg, qulonglong src, const QString& channel, qint64 freqHz, const QString& accessCode,
+               const QString& accessCodeText) {
+        StoreRow& row = m_rows[0];
+        row.tg = tg;
+        row.src = src;
+        row.channel = channel;
+        row.freqHz = freqHz;
+        row.accessCode = accessCode;
+        row.accessCodeText = accessCodeText;
+        const QModelIndex idx = index(0);
+        Q_EMIT dataChanged(idx, idx,
+                           {CallHistoryModel::KindRole, CallHistoryModel::DetailRole,
+                            CallHistoryModel::DurationSecsRole, CallHistoryModel::TgRole, CallHistoryModel::SrcRole,
+                            CallHistoryModel::ChannelRole, CallHistoryModel::FreqHzRole,
+                            CallHistoryModel::AccessCodeRole, CallHistoryModel::AccessCodeTextRole});
+    }
+
     QList<StoreRow> m_rows;
     QString m_systemName = QStringLiteral("Test Site");
     QString m_sessionUid = QStringLiteral("test-system");
     QString m_sessionLabel = QStringLiteral("Test Site");
+    qint64 m_session = 0;
     int m_seq = 0;
     /* Fixed, ascending stamps: nothing here should depend on the wall clock. */
     qint64 m_clock = 1'700'000'000;
@@ -1223,6 +1581,10 @@ class Setup : public QObject {
     Q_OBJECT
 
   public:
+    /* QUICK_TEST_MAIN_WITH_SETUP builds this object before the application and every engine, which
+     * is when the collector policy has to be in place. */
+    Setup() { dsd_qt::applyQmlGcPolicy(); }
+
     ~Setup() override { dsd_state_ext_free_all(m_talkgroup_state.get()); }
 
     Q_INVOKABLE bool
@@ -1578,6 +1940,25 @@ class Setup : public QObject {
         m_engine->rootContext()->setContextProperty(QStringLiteral("decoderHost"), m_host_readings);
     }
 
+    /**
+     * @brief Claim or deny the screen policy (#574) on every host a case can use.
+     *
+     * The map and both lifecycle hosts all answer, so it holds with or without
+     * useLifecycleHost(). Production reads it as a CONSTANT, so set it before
+     * loading the screen under test.
+     */
+    Q_INVOKABLE void
+    setScreenPolicySupported(bool supported) {
+        m_import_host->screenPolicy = supported;
+        m_initializing_host->screenPolicy = supported;
+        m_host[QStringLiteral("screenPolicySupported")] = supported;
+        m_host_readings->insert(QStringLiteral("screenPolicySupported"), supported);
+        QQmlContext* ctx = m_engine->rootContext();
+        if (ctx->contextProperty(QStringLiteral("decoderHost")).value<QObject*>() == m_host_readings) {
+            ctx->setContextProperty(QStringLiteral("decoderHost"), m_host_readings);
+        }
+    }
+
     /** @brief Publish a live/idle host so cases can exercise session-only actions. */
     Q_INVOKABLE void
     setHostRunning(bool running) {
@@ -1648,10 +2029,33 @@ class Setup : public QObject {
         return (m_commands != nullptr) ? m_commands->nextChannelCalls() : -1;
     }
 
+    /** @brief The row on air the "this channel" editors capture, and the session edits they send (issue #518). */
+    Q_INVOKABLE void
+    setScanRowContext(const QVariantMap& context) {
+        if (m_commands != nullptr) {
+            m_commands->setScanRowContext(context);
+        }
+    }
+
+    Q_INVOKABLE int
+    scanRowEditCalls() const {
+        return (m_commands != nullptr) ? m_commands->scanRowEditCalls() : -1;
+    }
+
+    Q_INVOKABLE QVariantMap
+    lastScanRowEdit() const {
+        return (m_commands != nullptr) ? m_commands->lastScanRowEdit() : QVariantMap();
+    }
+
     /** @brief What the radio panel last asked the engine for. */
     Q_INVOKABLE int
     gainCalls() const {
         return (m_commands != nullptr) ? m_commands->gainCalls() : -1;
+    }
+
+    Q_INVOKABLE int
+    airspyCalls() const {
+        return (m_commands != nullptr) ? m_commands->airspyCalls() : -1;
     }
 
     Q_INVOKABLE int
@@ -1667,6 +2071,29 @@ class Setup : public QObject {
     Q_INVOKABLE int
     squelchCalls() const {
         return (m_commands != nullptr) ? m_commands->squelchCalls() : -1;
+    }
+
+    /** @brief The last auto squelch margin the Radio sheet asked for, and how many times it asked. */
+    Q_INVOKABLE int
+    lastSquelchMarginDb() const {
+        return (m_commands != nullptr) ? m_commands->lastSquelchMarginDb() : -1;
+    }
+
+    Q_INVOKABLE int
+    squelchAutoCalls() const {
+        return (m_commands != nullptr) ? m_commands->squelchAutoCalls() : -1;
+    }
+
+    /** @brief How many times the Radio sheet asked for the noise squelch (its margin is lastSquelchMarginDb()). */
+    Q_INVOKABLE int
+    squelchNoiseCalls() const {
+        return (m_commands != nullptr) ? m_commands->squelchNoiseCalls() : -1;
+    }
+
+    /** @brief How many times the Radio sheet asked for the configured level back from Auto. */
+    Q_INVOKABLE int
+    restoreSquelchCalls() const {
+        return (m_commands != nullptr) ? m_commands->restoreSquelchCalls() : -1;
     }
 
     /** @brief The last NFM channel width the Radio sheet asked for (issue #525), and how many times it asked. */
@@ -1693,6 +2120,33 @@ class Setup : public QObject {
     Q_INVOKABLE int
     lastPpm() const {
         return (m_commands != nullptr) ? m_commands->lastPpm() : 9999;
+    }
+
+    /** @brief The last AM channel width the Radio sheet asked for (issue #524), and how many times it asked. */
+    Q_INVOKABLE int
+    lastAmBandwidthHz() const {
+        return (m_commands != nullptr) ? m_commands->lastAmBandwidthHz() : -1;
+    }
+
+    Q_INVOKABLE int
+    amBandwidthCalls() const {
+        return (m_commands != nullptr) ? m_commands->amBandwidthCalls() : -1;
+    }
+
+    /** @brief The last tone-filter edit the editor sent (#527), and how many it sent. */
+    Q_INVOKABLE int
+    lastToneFilterMode() const {
+        return (m_commands != nullptr) ? m_commands->lastToneFilterMode() : -1;
+    }
+
+    Q_INVOKABLE QString
+    lastToneFilterList() const {
+        return (m_commands != nullptr) ? m_commands->lastToneFilterList() : QString();
+    }
+
+    Q_INVOKABLE int
+    toneFilterCalls() const {
+        return (m_commands != nullptr) ? m_commands->toneFilterCalls() : -1;
     }
 
     Q_INVOKABLE QFont
@@ -1809,7 +2263,10 @@ class Setup : public QObject {
         prefs[QStringLiteral("onboardingDone")] = true;
         prefs[QStringLiteral("backgroundListening")] = false;
         prefs[QStringLiteral("notificationExplained")] = true;
-        prefs[QStringLiteral("keepScreenAwake")] = false;
+        /* Issue #574: AppPrefs' defaults, System default and 30 s. */
+        prefs[QStringLiteral("screenMode")] = 0;
+        prefs[QStringLiteral("screenDelaySec")] = 30;
+        prefs[QStringLiteral("screenDelayChoices")] = QVariantList({10, 30, 60, 120, 300});
         prefs[QStringLiteral("skipEncrypted")] = false;
         prefs[QStringLiteral("persistTgLockouts")] = true;
         /* The radio defaults the settings screen and the explore setup edit.
@@ -1881,10 +2338,15 @@ class Setup : public QObject {
         metrics[QStringLiteral("siteConfirmed")] = false;
 
         metrics[QStringLiteral("uiMessage")] = QString();
+        // The decode clock's wall-clock now that recent-call ages read: the fixture's decoder is
+        // idle, so it is simply the wall clock the screens used to read.
+        metrics[QStringLiteral("decodeNowMs")] = QDateTime::currentMSecsSinceEpoch();
         metrics[QStringLiteral("audioMuted")] = false;
         metrics[QStringLiteral("heldTg")] = 0;
         metrics[QStringLiteral("carrierLock")] = false;
         metrics[QStringLiteral("radioInput")] = true;
+        // Whether the input in force is an I/Q replay (issue #575): live input at rest, so tuning stays offered.
+        metrics[QStringLiteral("replayInput")] = false;
         metrics[QStringLiteral("streamActive")] = false;
         metrics[QStringLiteral("snrValid")] = false;
         metrics[QStringLiteral("snrDb")] = 0.0;
@@ -1965,14 +2427,35 @@ class Setup : public QObject {
         metrics[QStringLiteral("scanVisitLive")] = false;
         metrics[QStringLiteral("scanVisitRemainingDs")] = 0;
         // The received sub-audible tone (#522): no analog FM monitor at rest, so the row is
-        // down. The configured policy is its own reading and says "off" until #527.
+        // down. The configured policy is its own reading and says "off" with no policy set.
         metrics[QStringLiteral("rxToneVisible")] = false;
         metrics[QStringLiteral("rxToneStatus")] = 0;
         metrics[QStringLiteral("rxToneText")] = QString();
         metrics[QStringLiteral("rxToneKind")] = 0;
         metrics[QStringLiteral("rxToneTenthsHz")] = 0;
+        metrics[QStringLiteral("rxToneDcsCode")] = 0;
+        metrics[QStringLiteral("rxToneDcsInverted")] = false;
+        metrics[QStringLiteral("rxToneDcsAliasCode")] = 0;
+        metrics[QStringLiteral("rxToneDcsAliasInverted")] = false;
         metrics[QStringLiteral("rxToneCarrier")] = false;
         metrics[QStringLiteral("rxToneConfiguredText")] = QStringLiteral("off");
+        // The Tone filter row (#527): hidden with no policy in force, and no verdict.
+        metrics[QStringLiteral("toneFilterVisible")] = false;
+        metrics[QStringLiteral("toneFilterGate")] = 0;
+        metrics[QStringLiteral("toneFilterStatusText")] = QString();
+        // Its live editor: unreachable with no detection running, opening on no policy, and no scan row shadowing it.
+        metrics[QStringLiteral("toneFilterEditable")] = false;
+        metrics[QStringLiteral("toneFilterRowOverride")] = false;
+        metrics[QStringLiteral("toneFilterConfiguredMode")] = 0;
+        metrics[QStringLiteral("toneFilterConfiguredList")] = QString();
+        // No scan row on air for the "this channel" editors (#518).
+        metrics[QStringLiteral("scanRowActive")] = false;
+        metrics[QStringLiteral("scanRowLabel")] = QString();
+        metrics[QStringLiteral("scanRowKey")] = QString();
+        metrics[QStringLiteral("scanRowEditable")] = 0;
+        metrics[QStringLiteral("scanRowEdited")] = 0;
+        metrics[QStringLiteral("scanRowListed")] = 0;
+        metrics[QStringLiteral("scanRowSynced")] = true;
         // Whether an automatic controller owns the tuner, which one, and where it
         // points. The two named owners word a message; tunerControlled is the gate.
         metrics[QStringLiteral("tunerControlled")] = false;
@@ -1990,6 +2473,8 @@ class Setup : public QObject {
         metrics[QStringLiteral("decodeMode")] = 1;
         metrics[QStringLiteral("modulation")] = 0;
         metrics[QStringLiteral("tunerGainDb")] = 30;
+        metrics[QStringLiteral("configuredTunerGainDb")] = 30;
+        metrics[QStringLiteral("tunerGainRowOverride")] = false;
         metrics[QStringLiteral("squelchDb")] = -120.0;
         metrics[QStringLiteral("squelchOff")] = false;
         // #521: a scan row's own squelch. 0 is off in these two, as in rtl_sql.
@@ -1999,6 +2484,20 @@ class Setup : public QObject {
         metrics[QStringLiteral("effectiveSquelchOff")] = false;
         metrics[QStringLiteral("squelchRowOverride")] = false;
         metrics[QStringLiteral("squelchReadout")] = QStringLiteral("-120.0 dB");
+        // The dynamic squelches: whether each setting is AUTO or NOISE, its margin (kept under a level; 0 here, which
+        // the sheet reads as the default), whether the default may be NOISE, and the status of the one in force (""
+        // under a level).
+        metrics[QStringLiteral("configuredSquelchAuto")] = false;
+        metrics[QStringLiteral("configuredSquelchNoise")] = false;
+        metrics[QStringLiteral("effectiveSquelchNoise")] = false;
+        metrics[QStringLiteral("squelchNoiseOffered")] = true;
+        metrics[QStringLiteral("configuredSquelchMarginDb")] = 0;
+        metrics[QStringLiteral("effectiveSquelchAuto")] = false;
+        metrics[QStringLiteral("effectiveSquelchMarginDb")] = 0;
+        metrics[QStringLiteral("squelchAutoStatus")] = QString();
+        metrics[QStringLiteral("configuredSquelchLevelOff")] = false;
+        // #628: whether the session runs on audio input, where the monitor's Squelch row edits the squelch.
+        metrics[QStringLiteral("squelchAudioInput")] = false;
         // #525: the analog channel width in force (0 outside the analog preset and on PCM input),
         // whether the DSP rate bounds it, the configured width the control edits (0 = default),
         // the widest width the running stream's DSP rate filters (0 = not known), and the
@@ -2006,11 +2505,31 @@ class Setup : public QObject {
         metrics[QStringLiteral("analogBandwidthHz")] = 0;
         metrics[QStringLiteral("analogBandwidthDspLimited")] = false;
         metrics[QStringLiteral("analogBandwidthConfiguredHz")] = 0;
+        metrics[QStringLiteral("analogBandwidthSettingHz")] = 0;
+        // #524: the configured NFM and AM widths whichever preset runs (0 = default), for the
+        // width of the analog kind the configured preset does not run.
+        metrics[QStringLiteral("nfmBandwidthConfiguredHz")] = 0;
+        metrics[QStringLiteral("amBandwidthConfiguredHz")] = 0;
+        // #524: whether the engine offers each kind's width for editing (dsd_app_analog_width_offered()).
+        metrics[QStringLiteral("nfmBandwidthOffered")] = false;
+        metrics[QStringLiteral("amBandwidthOffered")] = false;
         metrics[QStringLiteral("analogBandwidthMaxHz")] = 0;
         metrics[QStringLiteral("analogBandwidthReading")] = QString();
         // #526: an nfm scan row on air (its width is in force on any session), and whether it sets its own.
         metrics[QStringLiteral("analogBandwidthRowActive")] = false;
         metrics[QStringLiteral("analogBandwidthRowOverride")] = false;
+        // #524: whether the width the analogBandwidth* keys describe is AM's (the preset's kind, or a row's on air).
+        metrics[QStringLiteral("analogBandwidthAm")] = false;
+        // #621: audio input with a rigctl peer that demodulates it, where the width is the passband the peer is asked
+        // for, and what an unset width of each kind stands for ("-B 12.5 kHz" or "peer's own" for NFM on a peer
+        // session; "default", 16 kHz NFM and 6 kHz AM elsewhere).
+        metrics[QStringLiteral("peerPassband")] = false;
+        // #621: whether the reading's kind runs now on a peer session (not while a typed digital row keeps it at -B).
+        metrics[QStringLiteral("passbandInForce")] = false;
+        metrics[QStringLiteral("nfmBandwidthUnsetText")] = QStringLiteral("default");
+        metrics[QStringLiteral("amBandwidthUnsetText")] = QStringLiteral("default");
+        metrics[QStringLiteral("nfmBandwidthUnsetHz")] = 16000;
+        metrics[QStringLiteral("amBandwidthUnsetHz")] = 6000;
         metrics[QStringLiteral("ppm")] = 0;
         // TETRA network identity and the current control/traffic allocations.
         // Hidden at rest until the decoder has accepted network information.
@@ -2050,9 +2569,9 @@ class Setup : public QObject {
         /* Why the last session stopped, empty while nothing has failed. */
         host[QStringLiteral("failureText")] = QString();
         /* The Android-only capabilities the settings screen hides rows on: a
-         * desktop host brokers no USB device and cannot hold the screen awake,
+         * desktop host brokers no USB device and applies no screen policy,
          * which is the arrangement this offscreen run matches. */
-        host[QStringLiteral("keepScreenAwakeSupported")] = false;
+        host[QStringLiteral("screenPolicySupported")] = false;
         host[QStringLiteral("localDeviceBrokered")] = false;
         host[QStringLiteral("localDeviceSource")] = QStringLiteral("usb");
         host[QStringLiteral("localDeviceSerial")] = QString();
