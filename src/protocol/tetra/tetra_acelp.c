@@ -219,6 +219,65 @@ static void tetra_acelp_process_impl(const uint8_t *type2_bits, int type2_len,
                                      int block_idx, int half,
                                      dsd_opts *opts, dsd_state *state);
 
+/* Two ACELP frames are 60 ms. The traffic slot returns every 4*255/18000 s,
+ * 453.333 samples at 8 kHz. 453, 453, 454 averages to that, so the playback
+ * ring does not fill up and start discarding audio. */
+static int
+tetra_slot_paced_samples(void) {
+    static int phase = 0;
+    const int n = (phase == 2) ? 454 : 453;
+    phase = (phase + 1) % 3;
+    return n;
+}
+
+/* dsd_audio_write() counts frames, then multiplies by the stream channel count.
+ * AUTO opens a stereo stream. A mono buffer passed as that many frames is read
+ * as interleaved left/right, so each burst plays at twice the speed and the
+ * unread half of the read walks off the buffer. */
+static void
+tetra_write_device_pcm(dsd_opts* opts, const int16_t* mono, int n) {
+    if (!opts || !opts->audio_out_stream || !mono || n <= 0) {
+        return;
+    }
+    if (opts->pulse_digi_out_channels == 2) {
+        int16_t stereo[1280];
+        if (n > 640) {
+            n = 640;
+        }
+        for (int i = 0; i < n; i++) {
+            stereo[i * 2] = mono[i];
+            stereo[i * 2 + 1] = mono[i];
+        }
+        dsd_audio_write(opts->audio_out_stream, stereo, (size_t)n);
+        return;
+    }
+    dsd_audio_write(opts->audio_out_stream, mono, (size_t)n);
+}
+
+static void
+tetra_resample_i16(const int16_t* in, int in_n, int16_t* out, int out_n) {
+    if (!in || !out || in_n < 2 || out_n < 2) {
+        return;
+    }
+    const int den = out_n - 1;
+    for (int i = 0; i < out_n; i++) {
+        const int pos = i * (in_n - 1);
+        const int i0 = pos / den;
+        int i1 = i0 + 1;
+        if (i1 >= in_n) {
+            i1 = in_n - 1;
+        }
+        const int frac = pos % den;
+        int sample = in[i0] + (in[i1] - in[i0]) * frac / den;
+        if (sample > 32767) {
+            sample = 32767;
+        } else if (sample < -32768) {
+            sample = -32768;
+        }
+        out[i] = (int16_t)sample;
+    }
+}
+
 void tetra_acelp_process_tch(const uint8_t *type2_bits, int type2_len,
                               int block_idx,
                               dsd_opts *opts, dsd_state *state)
@@ -249,24 +308,45 @@ static void tetra_acelp_process_impl(const uint8_t *type2_bits, int type2_len,
     }
 
     if (!tetra_acelp_channel_gate_passes(opts)) {
-        if (!warned_control_channel) {
-            fprintf(stderr, "[TETRA] waiting for a traffic-channel grant; control-channel bursts are not speech\n");
-            warned_control_channel = 1;
+        /* A main-carrier traffic slot is this downlink, not a retune. The
+         * grant flag can lag the first speech bursts; dropping them until
+         * it catches up is a hole at the start of every such call. */
+        const int same_carrier_voice = state && state->trunk_cc_freq > 0 && state->tetra_vc_freq_hz == state->trunk_cc_freq;
+        if (!same_carrier_voice) {
+            if (!warned_control_channel) {
+                fprintf(stderr,
+                        "[TETRA] waiting for a traffic-channel grant; control-channel bursts are not speech\n");
+                warned_control_channel = 1;
+            }
+            return;
         }
-        return;
     }
 
-    /* Phase 12 floor-grant gate. */
+    /* A later allocation for another call rewrites the slot bitmap while
+     * this timeslot is still talking. Keep that timeslot for a short hang
+     * so the sentence is not cut off. An explicit release (bitmap 0) stops
+     * at once. */
+    static int talk_tn = 0;
+    static double talk_until = 0.0;
+    const double now_gate = dsd_realtime_mono_s();
     if (!tetra_acelp_slot_gate_passes(block_idx ? block_idx : 1, state)) {
-        if (!warned_gate) {
-            fprintf(stderr,
-                "[TETRA] audio suppressed by slot gate: grant_valid=%u vc_slot=%u block=%d\n",
-                state ? (unsigned)state->tetra_tx_granted_valid : 0u,
-                state ? (unsigned)state->tetra_vc_slot : 0u,
-                block_idx ? block_idx : 1);
-            warned_gate = 1;
+        const int released = state && state->tetra_vc_assignment_valid && (state->tetra_vc_timeslot_bitmap & 0x0F) == 0;
+        const int still_talking = !released && state && state->tetra_tdma_valid && state->tetra_tn == talk_tn
+                                   && talk_tn != 0 && now_gate < talk_until;
+        if (!still_talking) {
+            if (!warned_gate) {
+                fprintf(stderr,
+                        "[TETRA] audio suppressed by slot gate: grant_valid=%u vc_slot=%u block=%d\n",
+                        state ? (unsigned)state->tetra_tx_granted_valid : 0u,
+                        state ? (unsigned)state->tetra_vc_slot : 0u,
+                        block_idx ? block_idx : 1);
+                warned_gate = 1;
+            }
+            return;
         }
-        return;
+    } else if (state && state->tetra_tdma_valid && state->tetra_tn >= 1 && state->tetra_tn <= 4) {
+        talk_tn = state->tetra_tn;
+        talk_until = now_gate + 2.0;
     }
 
     const int need_bits = half ? TETRA_TCH_FRAME_BITS : 2 * TETRA_TCH_FRAME_BITS;
@@ -329,16 +409,19 @@ static void tetra_acelp_process_impl(const uint8_t *type2_bits, int type2_len,
     if (opts->audio_out_type == 0 && opts->audio_out_stream &&
         opts->slot1_on == 1 && opts->pulse_digi_rate_out == 8000) {
         const double now = dsd_realtime_mono_s();
-        if (last_live_audio_stream != opts->audio_out_stream ||
-            last_live_audio_time <= 0.0 || now - last_live_audio_time > 0.25) {
+        if (last_live_audio_stream != opts->audio_out_stream || last_live_audio_time <= 0.0
+            || now - last_live_audio_time > 1.0) {
             const int16_t prefill[640] = {0}; /* 80 ms at 8 kHz */
-            dsd_audio_write(opts->audio_out_stream, prefill, 640);
+            tetra_write_device_pcm(opts, prefill, 640);
         }
         last_live_audio_stream = opts->audio_out_stream;
         last_live_audio_time = now;
     }
 
-    for (int f = 0; f < (half ? 1 : 2); f++) {
+    int16_t live[2 * TETRA_TCH_FRAME_SAMPLES];
+    int live_samples = 0;
+    const int frame_count = half ? 1 : 2;
+    for (int f = 0; f < frame_count; f++) {
         const uint8_t *frame = codec + f * TETRA_TCH_FRAME_BITS;
 
         int16_t pcm[TETRA_TCH_FRAME_SAMPLES];
@@ -363,8 +446,11 @@ static void tetra_acelp_process_impl(const uint8_t *type2_bits, int type2_len,
 
         /* —— Step 3: audio routing (same pattern as M17 / Codec2) —— */
         if (opts->slot1_on == 1) {
-            if (opts->audio_out_type == 0 && opts->audio_out_stream)
-                dsd_audio_write(opts->audio_out_stream, pcm, (size_t)nsamples);
+            if (opts->audio_out_type == 0 && opts->audio_out_stream
+                && live_samples + nsamples <= (int)(sizeof live / sizeof live[0])) {
+                memcpy(live + live_samples, pcm, (size_t)nsamples * sizeof(int16_t));
+                live_samples += nsamples;
+            }
             if (opts->audio_out_type == 8)
                 dsd_udp_audio_hook_blast(opts, state,
                                          (size_t)nsamples * sizeof(int16_t), pcm);
@@ -384,5 +470,14 @@ static void tetra_acelp_process_impl(const uint8_t *type2_bits, int type2_len,
             }
             sf_write_short(opts->wav_out_f, ss, nsamples * 2);
         }
+    }
+
+    if (live_samples == 2 * TETRA_TCH_FRAME_SAMPLES && opts->pulse_digi_rate_out == 8000) {
+        int16_t paced[454];
+        const int out_n = tetra_slot_paced_samples();
+        tetra_resample_i16(live, live_samples, paced, out_n);
+        tetra_write_device_pcm(opts, paced, out_n);
+    } else if (live_samples > 0) {
+        tetra_write_device_pcm(opts, live, live_samples);
     }
 }

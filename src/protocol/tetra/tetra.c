@@ -297,10 +297,10 @@ static void tetra_decode_tch_fs(const uint16_t *soft_b1, const uint16_t *soft_b2
     int mismatches = -1;
     int dec_len = tetra_speech_channel_decode_q(deint, decoded, (int)sizeof(decoded), &mismatches);
 
-    /* DMO: the speech code has no CRC, but with the right DM colour code a
-     * burst re-encodes to within a few bits of what was received, while a
-     * wrong-seed or noise burst disagrees in ~40 of 330 bits. Drop those
-     * instead of feeding noise to the vocoder. TMO keeps its old behaviour. */
+    /* The speech code has no CRC. DMO and uplink keep the re-encode check:
+     * a wrong scrambler disagrees in ~40 of 330 bits. TMO downlink at a few
+     * dB SNR lands in the same range on bursts that are still intelligible,
+     * so dropping them there cuts the call out. */
     if ((state->tetra_dmo || state->tetra_uplink) && mismatches > TETRA_DMO_TCH_MAX_MISMATCH) {
         state->tetra_decode_errors++;
         if (opts->errorbars)

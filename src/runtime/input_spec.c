@@ -19,9 +19,38 @@
 #include "dsd-neo/core/opts_fwd.h"
 #include "dsd-neo/core/safe_api.h"
 
-static int
-is_valid_rtl_bw_khz(int bw) {
-    return (bw == 4 || bw == 6 || bw == 8 || bw == 12 || bw == 16 || bw == 24 || bw == 48 || bw == 72);
+/* Analog channel widths use 4..48. The rest are integer samples per TETRA symbol at 18 ksym/s:
+ * 36=2, 54=3, 72=4, 90=5, 108=6, 144=8. */
+static const int k_rtl_dsp_bw_khz[] = {4, 6, 8, 12, 16, 24, 36, 48, 54, 72, 90, 108, 144};
+
+int
+dsd_rtl_dsp_bw_khz_is_valid(int bw) {
+    for (size_t i = 0; i < sizeof k_rtl_dsp_bw_khz / sizeof k_rtl_dsp_bw_khz[0]; i++) {
+        if (k_rtl_dsp_bw_khz[i] == bw) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int
+dsd_rtl_dsp_bw_khz_nearest(int bw) {
+    int best = k_rtl_dsp_bw_khz[0];
+    int best_dist = bw - best;
+    if (best_dist < 0) {
+        best_dist = -best_dist;
+    }
+    for (size_t i = 1; i < sizeof k_rtl_dsp_bw_khz / sizeof k_rtl_dsp_bw_khz[0]; i++) {
+        int dist = bw - k_rtl_dsp_bw_khz[i];
+        if (dist < 0) {
+            dist = -dist;
+        }
+        if (dist < best_dist) {
+            best_dist = dist;
+            best = k_rtl_dsp_bw_khz[i];
+        }
+    }
+    return best;
 }
 
 static int
@@ -192,7 +221,7 @@ parse_soapy_optional_front(char* tok[SOFTY_TOK_MAX], size_t n, size_t* cur, int*
         return -1;
     }
     if (rc > 0) {
-        *bw = is_valid_rtl_bw_khz(iv) ? iv : 48;
+        *bw = dsd_rtl_dsp_bw_khz_is_valid(iv) ? iv : 48;
     }
 
     return 0;
@@ -401,7 +430,7 @@ dsd_rtl_spec_bw_khz_or_default(const char* token) {
     if (!token || rtl_spec_parse_int(token, &bw) != 0) {
         return 48;
     }
-    if (is_valid_rtl_bw_khz(bw)) {
+    if (dsd_rtl_dsp_bw_khz_is_valid(bw)) {
         return bw;
     }
     return 48;

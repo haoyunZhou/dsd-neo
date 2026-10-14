@@ -17,6 +17,7 @@
 #include <dsd-neo/runtime/analog_tones.h>
 #include <dsd-neo/runtime/config.h>
 #include <dsd-neo/runtime/config_schema.h>
+#include <dsd-neo/runtime/input_spec.h>
 #include <dsd-neo/runtime/path_policy.h>
 #include <errno.h>
 #include <stdint.h>
@@ -438,7 +439,7 @@ validate_composed_scan_max_visit_ms(const dsdneoUserConfig* cfg, const char* sec
 static int
 validate_configured_rtl_bw_khz(int bw) {
     /* What applying the config leaves in force: an unset or unsupported value is the 48 kHz default. */
-    return dsd_analog_rtl_dsp_bw_is_selectable(bw) ? bw : 48;
+    return dsd_rtl_dsp_bw_khz_is_valid(bw) ? bw : 48;
 }
 
 /* Whether startup builds an RTL-SDR or rtl_tcp input with rtl_bw_khz (it takes rtl_freq, and a host for rtl_tcp). */

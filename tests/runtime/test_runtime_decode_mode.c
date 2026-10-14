@@ -23,7 +23,7 @@ static int
 expect_auto_enables_every_decoder(const char* label, const dsd_opts* opts) {
     if (!(opts->frame_dstar == 1 && opts->frame_x2tdma == 1 && opts->frame_p25p1 == 1 && opts->frame_p25p2 == 1
           && opts->frame_nxdn48 == 1 && opts->frame_nxdn96 == 1 && opts->frame_dmr == 1 && opts->frame_dpmr == 1
-          && opts->frame_provoice == 1 && opts->frame_ysf == 1 && opts->frame_m17 == 1)) {
+          && opts->frame_provoice == 1 && opts->frame_ysf == 1 && opts->frame_m17 == 1 && opts->frame_tetra == 1)) {
         DSD_FPRINTF(stderr, "%s AUTO should enable all digital frame flags\n", label);
         return 1;
     }
@@ -522,6 +522,7 @@ test_symbol_timing_and_inference(void) {
     opts.frame_provoice = 1;
     opts.frame_ysf = 1;
     opts.frame_m17 = 1;
+    opts.frame_tetra = 1;
     if (dsd_infer_decode_mode_preset(&opts) != DSDCFG_MODE_AUTO
         || dsd_infer_decode_mode_preset_exact(&opts) != DSDCFG_MODE_AUTO) {
         DSD_FPRINTF(stderr, "all-decoder mask should infer AUTO exactly\n");

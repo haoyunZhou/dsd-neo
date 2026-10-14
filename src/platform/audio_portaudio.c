@@ -269,15 +269,22 @@ portaudio_wait_for_work_locked(dsd_audio_stream* stream, int* synthesize_underru
         return;
     }
     *synthesize_underrun = 0;
-    while (!stream->stop && !stream->drain_requested && stream->ring_samples_count == 0) {
-        if (stream->conceal_inited && stream->conceal_has_good) {
-            int ret = dsd_cond_timedwait(&stream->cv, &stream->mu, DSD_PORTAUDIO_OUTPUT_CHUNK_MS);
-            if (ret != 0 && !stream->stop && !stream->drain_requested && stream->ring_samples_count == 0) {
-                *synthesize_underrun = 1;
-                break;
-            }
-        } else {
+    /* A short remainder is not a cue to invent the rest of the chunk. Codecs hand
+     * audio over in bursts, and padding whatever is already queued puts a gap in
+     * every burst. Wait one chunk for the rest; only an empty ring that stays
+     * empty is an underrun. */
+    while (!stream->stop && !stream->drain_requested && stream->ring_samples_count < stream->chunk_samples) {
+        if (stream->ring_samples_count == 0 && !(stream->conceal_inited && stream->conceal_has_good)) {
             (void)dsd_cond_wait(&stream->cv, &stream->mu);
+            continue;
+        }
+        const int ret = dsd_cond_timedwait(&stream->cv, &stream->mu, DSD_PORTAUDIO_OUTPUT_CHUNK_MS);
+        if (ret != 0 && !stream->stop && !stream->drain_requested
+            && stream->ring_samples_count < stream->chunk_samples) {
+            if (stream->ring_samples_count == 0) {
+                *synthesize_underrun = 1;
+            }
+            break;
         }
     }
 }

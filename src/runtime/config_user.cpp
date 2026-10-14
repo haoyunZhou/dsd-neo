@@ -30,6 +30,7 @@
 #include <dsd-neo/runtime/config_schema.h>
 #include <dsd-neo/runtime/decode_mode.h>
 #include <dsd-neo/runtime/freq_parse.h>
+#include <dsd-neo/runtime/input_spec.h>
 #include <dsd-neo/runtime/log.h>
 #include <dsd-neo/runtime/path_policy.h>
 #include <dsd-neo/runtime/rdio_export.h>
@@ -401,7 +402,7 @@ apply_shared_radio_tuning_from_config(const dsdneoUserConfig* cfg, dsd_opts* opt
     int sql = cfg->rtl_sql;
     int vol = cfg->rtl_volume ? cfg->rtl_volume : opts->rtl_volume_multiplier;
 
-    if (!dsd_analog_rtl_dsp_bw_is_selectable(bw)) {
+    if (!dsd_rtl_dsp_bw_khz_is_valid(bw)) {
         bw = 48;
     }
 

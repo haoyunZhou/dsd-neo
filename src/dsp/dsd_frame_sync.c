@@ -79,7 +79,45 @@ frame_sync_opts_has_4800_four_level_mode(const dsd_opts* opts) {
         return 0;
     }
     return (opts->frame_p25p1 == 1 || opts->frame_dmr == 1 || opts->frame_nxdn96 == 1 || opts->frame_ysf == 1
-            || opts->frame_m17 == 1 || opts->frame_tetra == 1);
+            || opts->frame_m17 == 1);
+}
+
+/* TETRA shares the SPS hunt only when another digital decoder is also on. Alone, it keeps the
+ * dedicated 18 ksym/s clock and must not rotate away from it. */
+static int
+frame_sync_other_digital_enabled(const dsd_opts* opts) {
+    return opts->frame_dstar == 1 || opts->frame_x2tdma == 1 || opts->frame_p25p1 == 1 || opts->frame_p25p2 == 1
+           || opts->frame_nxdn48 == 1 || opts->frame_nxdn96 == 1 || opts->frame_dmr == 1 || opts->frame_dpmr == 1
+           || opts->frame_provoice == 1 || opts->frame_ysf == 1 || opts->frame_m17 == 1;
+}
+
+static int
+frame_sync_tetra_owns_timing(const dsd_opts* opts) {
+    return opts && opts->frame_tetra == 1 && !frame_sync_other_digital_enabled(opts);
+}
+
+static int
+frame_sync_tetra_profile_active(const dsd_opts* opts, const dsd_state* state) {
+    if (!opts || opts->frame_tetra != 1) {
+        return 0;
+    }
+    if (frame_sync_tetra_owns_timing(opts)) {
+        return 1;
+    }
+    return state && state->sps_hunt_idx == DSD_FRAME_SYNC_SPS_PROFILE_18000_4;
+}
+
+static int
+frame_sync_dsp_bw_is_tetra_rate(int khz) {
+    switch (khz) {
+        case 36:
+        case 54:
+        case 72:
+        case 90:
+        case 108:
+        case 144: return 1;
+        default: return 0;
+    }
 }
 
 static int frame_sync_current_demod_rate(const dsd_opts* opts, const dsd_state* state);
@@ -1020,7 +1058,7 @@ static int
 frame_sync_try_tetra(frame_sync_match_ctx* ctx) {
     const dsd_opts* opts = ctx->opts;
     dsd_state* state = ctx->state;
-    if (opts->frame_tetra != 1) {
+    if (!frame_sync_tetra_profile_active(opts, state)) {
         return DSD_SYNC_NONE;
     }
 
@@ -2118,7 +2156,7 @@ frame_sync_apply_cli_mod_lock(const dsd_opts* opts, dsd_state* state) {
 
 static int
 frame_sync_select_t_max(const dsd_opts* opts, const dsd_state* state) {
-    if (opts->frame_tetra == 1) {
+    if (frame_sync_tetra_profile_active(opts, state)) {
         return 19;
     }
     switch (state->sps_hunt_idx) {
@@ -2378,7 +2416,7 @@ frame_sync_apply_mod_switch(const dsd_opts* opts, dsd_state* state, int do_switc
 
 void
 frame_sync_maybe_auto_switch_modulation(const dsd_opts* opts, dsd_state* state, int t_max, int* lastt) {
-    if (opts->frame_tetra == 1) {
+    if (frame_sync_tetra_profile_active(opts, state)) {
         state->rf_mod = 1;
         return;
     }
@@ -2475,7 +2513,7 @@ frame_sync_debug_symbol_stats(float symbol) {
 
 static int
 frame_sync_cqpsk_4level_enabled(const dsd_opts* opts, const dsd_state* state) {
-    if (opts->frame_tetra == 1 && state->rf_mod == 1) {
+    if (frame_sync_tetra_profile_active(opts, state) && state->rf_mod == 1) {
         return 1;
     }
 #ifdef USE_RADIO
@@ -3247,6 +3285,8 @@ frame_sync_sps_profile_has_candidate(const dsd_opts* opts, int profile_index) {
         case DSD_FRAME_SYNC_SPS_PROFILE_9600_2: return opts->frame_provoice == 1;
         case DSD_FRAME_SYNC_SPS_PROFILE_6000_4: return opts->frame_p25p2 == 1 || opts->frame_x2tdma == 1;
         case DSD_FRAME_SYNC_SPS_PROFILE_4800_2: return opts->frame_dstar == 1;
+        case DSD_FRAME_SYNC_SPS_PROFILE_18000_4:
+            return opts->frame_tetra == 1 && frame_sync_other_digital_enabled(opts);
         default: return 0;
     }
 }
@@ -3350,8 +3390,9 @@ frame_sync_apply_sps_profile_timing(const dsd_opts* opts, dsd_state* state, cons
 static int
 frame_sync_sps_profile_normalized_modulation(const dsd_opts* opts, const dsd_state* state,
                                              const frame_sync_sps_profile* profile, int profile_index) {
-    const int requested = (profile_index == DSD_FRAME_SYNC_SPS_PROFILE_4800_4 && opts->frame_p25p1 == 1
-                           && state->p25_p1_validated_rf_mod == 1)
+    const int requested = (profile_index == DSD_FRAME_SYNC_SPS_PROFILE_18000_4
+                           || (profile_index == DSD_FRAME_SYNC_SPS_PROFILE_4800_4 && opts->frame_p25p1 == 1
+                               && state->p25_p1_validated_rf_mod == 1))
                               ? 1
                               : 0;
     return dsd_frame_sync_profile_modulation(profile->levels, requested);
@@ -3475,11 +3516,19 @@ frame_sync_ensure_enabled_sps_profile(const dsd_opts* opts, dsd_state* state) {
     if (!opts || !state) {
         return;
     }
-    if (opts->frame_tetra == 1) {
+    if (frame_sync_tetra_owns_timing(opts)) {
         const int demod_rate = frame_sync_current_demod_rate(opts, state);
         state->samplesPerSymbol = dsd_opts_compute_sps_rate(opts, 18000, demod_rate);
         state->symbolCenter = dsd_opts_symbol_center(state->samplesPerSymbol);
         state->rf_mod = 1;
+        return;
+    }
+    /* A TETRA-rate DSP bandwidth (integer samples at 18 ksym/s) starts on that clock.
+     * symbolcnt stays 0 only until the first sync pass, so a later visit to 4800 is left alone. */
+    if (opts->frame_tetra == 1 && frame_sync_other_digital_enabled(opts) && state->symbolcnt == 0
+        && frame_sync_dsp_bw_is_tetra_rate(opts->rtl_dsp_bw_khz)
+        && state->sps_hunt_idx != DSD_FRAME_SYNC_SPS_PROFILE_18000_4) {
+        frame_sync_apply_sps_hunt_profile(opts, state, DSD_FRAME_SYNC_SPS_PROFILE_18000_4, 0);
         return;
     }
 
@@ -3707,7 +3756,7 @@ frame_sync_maybe_probe_p25p1_cqpsk(const dsd_opts* opts, dsd_state* state, int p
 
 int
 frame_sync_no_sync_sps_hunt(const dsd_opts* opts, dsd_state* state) {
-    if (opts->frame_tetra == 1) {
+    if (frame_sync_tetra_owns_timing(opts)) {
         const int demod_rate = frame_sync_current_demod_rate(opts, state);
         state->samplesPerSymbol = dsd_opts_compute_sps_rate(opts, 18000, demod_rate);
         state->symbolCenter = dsd_opts_symbol_center(state->samplesPerSymbol);

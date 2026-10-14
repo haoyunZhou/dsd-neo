@@ -20,6 +20,7 @@
 #include <dsd-neo/core/state_fwd.h>
 #include <dsd-neo/platform/posix_compat.h>
 #include <dsd-neo/runtime/config.h>
+#include <dsd-neo/runtime/input_spec.h>
 #include <dsd-neo/runtime/squelch.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -1060,19 +1061,10 @@ cb_rtl_bw(void* u, int ok, int bw) {
     }
     if (ok) {
         int adjusted = 0;
-        const int allowed[] = {4, 6, 8, 12, 16, 24, 48};
-        int best = allowed[0];
-        int64_t best_dist = llabs((int64_t)bw - (int64_t)allowed[0]);
-        for (size_t i = 1; i < (sizeof allowed / sizeof allowed[0]); i++) {
-            int64_t d = llabs((int64_t)bw - (int64_t)allowed[i]);
-            if (d < best_dist) {
-                best_dist = d;
-                best = allowed[i];
-            }
-        }
+        const int best = dsd_rtl_dsp_bw_khz_nearest(bw);
         if (best != bw) {
             adjusted = 1;
-            ui_statusf("RTL BW adjusted to %d kHz (allowed: 4,6,8,12,16,24,48)", best);
+            ui_statusf("RTL BW adjusted to %d kHz (allowed: 4,6,8,12,16,24,36,48,54,72,90,108,144)", best);
         }
         bw = best;
         int32_t v = bw;

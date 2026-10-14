@@ -39,6 +39,7 @@
 #include <dsd-neo/runtime/config.h>
 #include <dsd-neo/runtime/decode_clock.h>
 #include <dsd-neo/runtime/input_failure.h>
+#include <dsd-neo/runtime/input_spec.h>
 #include <dsd-neo/runtime/log.h>
 #include <dsd-neo/runtime/scan_mode.h>
 #include <dsd-neo/runtime/scan_options.h>
@@ -2004,7 +2005,7 @@ svc_rtl_set_bandwidth_locked(dsd_opts* opts, dsd_state* state, int khz, char* wh
     if (!opts || !state) {
         return -1;
     }
-    if (!dsd_analog_rtl_dsp_bw_is_selectable(khz)) {
+    if (!dsd_rtl_dsp_bw_khz_is_valid(khz)) {
         khz = 48;
     }
     if (!svc_rtl_bandwidth_fits_analog_width(opts, state, khz, why, why_size)) {

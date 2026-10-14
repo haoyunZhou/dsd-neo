@@ -183,6 +183,7 @@ decode_mode_apply_auto(dsdDecodePresetProfile p, dsd_opts* o, dsd_state* s) {
     o->frame_provoice = 1;
     o->frame_ysf = 1;
     o->frame_m17 = 1;
+    o->frame_tetra = 1;
     if (p == DSD_DECODE_PRESET_PROFILE_CLI) {
         /* Cleared together, like every sibling preset does. Applied mid-session
          * (the Qt radio panel's decode chips), a preset that leaves the previous
@@ -758,7 +759,7 @@ dsd_infer_decode_mode_preset_exact(const dsd_opts* opts) {
     } map[] = {
         {DSD_MODE_BIT_DSTAR | DSD_MODE_BIT_X2TDMA | DSD_MODE_BIT_P25P1 | DSD_MODE_BIT_P25P2 | DSD_MODE_BIT_NXDN48
              | DSD_MODE_BIT_NXDN96 | DSD_MODE_BIT_DMR | DSD_MODE_BIT_DPMR | DSD_MODE_BIT_PROVOICE | DSD_MODE_BIT_YSF
-             | DSD_MODE_BIT_M17,
+             | DSD_MODE_BIT_M17 | DSD_MODE_BIT_TETRA,
          DSDCFG_MODE_AUTO},
         {DSD_MODE_BIT_P25P1 | DSD_MODE_BIT_P25P2 | DSD_MODE_BIT_DMR, DSDCFG_MODE_TDMA},
         {DSD_MODE_BIT_DMR, DSDCFG_MODE_DMR},
