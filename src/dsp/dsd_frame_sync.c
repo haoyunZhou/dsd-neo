@@ -112,10 +112,7 @@ frame_sync_dsp_bw_is_tetra_rate(int khz) {
     switch (khz) {
         case 36:
         case 54:
-        case 72:
-        case 90:
-        case 108:
-        case 144: return 1;
+        case 72: return 1;
         default: return 0;
     }
 }

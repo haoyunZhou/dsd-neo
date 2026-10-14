@@ -1645,7 +1645,7 @@ cache file. Direct frequency changes are disabled during `--trunk-scan`, whose t
 
 ## RTL‑SDR details (`-i rtl` / `-i rtltcp`)
 
-- Fields: `dev` (device index), `freq` (Hz/MHz), `gain` (0–49), `ppm`, `bw` (kHz: 4, 6, 8, 12, 16, 24, 36, 48, 54, 72, 90, 108, 144), `sql` (negative = threshold in dB, `0` = off, positive = linear mean power, `auto[+N]` = the [auto squelch](#auto-squelch---squelch-auto), `noise[+N]` = the [noise squelch](#noise-squelch---squelch-noise)), `vol` (monitor gain, 0–3; typical 1–3), optional `bias[=on|off]`. TETRA wants an integer number of samples per symbol at 18 ksym/s: 36, 54, 72, 90, 108 or 144 kHz. `bias` alone (or `b`) turns the bias tee on; a value
+- Fields: `dev` (device index), `freq` (Hz/MHz), `gain` (0–49), `ppm`, `bw` (kHz: 4, 6, 8, 12, 16, 24, 36, 48, 54, 72), `sql` (negative = threshold in dB, `0` = off, positive = linear mean power, `auto[+N]` = the [auto squelch](#auto-squelch---squelch-auto), `noise[+N]` = the [noise squelch](#noise-squelch---squelch-noise)), `vol` (monitor gain, 0–3; typical 1–3), optional `bias[=on|off]`. TETRA wants an integer number of samples per symbol at 18 ksym/s: 36, 54 or 72 kHz. `bias` alone (or `b`) turns the bias tee on; a value
   is one whole word: `on`/`off`, `1`/`0`, `true`/`false` or `yes`/`no` (any case). A value or trailing option it cannot
   read is ignored with a warning and leaves the bias tee as it was; the startup `RTL #N:` line ends in `BIAS=on` when
   it is on.

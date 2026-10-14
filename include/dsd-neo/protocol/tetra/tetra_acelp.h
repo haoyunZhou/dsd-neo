@@ -93,6 +93,11 @@ void tetra_acelp_process_tch_half(const uint8_t *type2_bits, int type2_len,
  */
 void tetra_vocoder_close(void);
 
+/* The next TCH/FS burst is concealment, not a new set of codec parameters.
+ * A noise burst decoded as speech overwrites the decoder memory, and every
+ * later frame of that call comes out wrong. */
+void tetra_acelp_set_frame_bfi(int bfi);
+
 #ifdef __cplusplus
 }
 #endif

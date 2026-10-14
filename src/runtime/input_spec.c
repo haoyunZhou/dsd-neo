@@ -21,7 +21,7 @@
 
 /* Analog channel widths use 4..48. The rest are integer samples per TETRA symbol at 18 ksym/s:
  * 36=2, 54=3, 72=4, 90=5, 108=6, 144=8. */
-static const int k_rtl_dsp_bw_khz[] = {4, 6, 8, 12, 16, 24, 36, 48, 54, 72, 90, 108, 144};
+static const int k_rtl_dsp_bw_khz[] = {4, 6, 8, 12, 16, 24, 36, 48, 54, 72};
 
 int
 dsd_rtl_dsp_bw_khz_is_valid(int bw) {

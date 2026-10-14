@@ -26,7 +26,7 @@ tetra_acelp_builtin_reset(void)
 }
 
 TETRA_ACELP_EXPORT int
-tetra_acelp_builtin_decode(const uint8_t *bits, int nbits, int16_t *pcm, int nsamples)
+tetra_acelp_builtin_decode(const uint8_t *bits, int nbits, int16_t *pcm, int nsamples, int bfi)
 {
     Word16 serial[TETRA_ACELP_BITS + 1];
     Word16 parameters[24];
@@ -42,7 +42,7 @@ tetra_acelp_builtin_decode(const uint8_t *bits, int nbits, int16_t *pcm, int nsa
         s_decoder_ready = 1;
     }
 
-    serial[0] = 0; /* corrected bits; the pipe protocol has no bad-frame flag */
+    serial[0] = (Word16)(bfi ? 1 : 0); /* ETSI bad-frame indicator */
     for (i = 0; i < TETRA_ACELP_BITS; i++) {
         if (bits[i] > 1)
             return 0;

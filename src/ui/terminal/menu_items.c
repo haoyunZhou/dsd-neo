@@ -182,7 +182,7 @@ static const NcMenuItem RTL_MENU_ITEMS[] = {
      .on_select = rtl_set_ppm},
     {.id = "rtl.bw",
      .label_fn = lbl_rtl_bw,
-     .help = "DSP bandwidth (the demodulator's sample rate) in kHz: 4, 6, 8, 12, 16, 24, 36, 48, 54, 72, 90, 108 or 144.",
+     .help = "DSP bandwidth (the demodulator's sample rate) in kHz: 4, 6, 8, 12, 16, 24, 36, 48, 54 or 72.",
      .on_select = rtl_set_bw},
     /* 'v' is here as well as on Input > Input volume: the key drives whichever of the
        two multipliers matches the live input type, and on RTL that is this row. */

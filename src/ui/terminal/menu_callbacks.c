@@ -1064,7 +1064,7 @@ cb_rtl_bw(void* u, int ok, int bw) {
         const int best = dsd_rtl_dsp_bw_khz_nearest(bw);
         if (best != bw) {
             adjusted = 1;
-            ui_statusf("RTL BW adjusted to %d kHz (allowed: 4,6,8,12,16,24,36,48,54,72,90,108,144)", best);
+            ui_statusf("RTL BW adjusted to %d kHz (allowed: 4,6,8,12,16,24,36,48,54,72)", best);
         }
         bw = best;
         int32_t v = bw;

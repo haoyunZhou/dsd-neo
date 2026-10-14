@@ -297,10 +297,11 @@ static void tetra_decode_tch_fs(const uint16_t *soft_b1, const uint16_t *soft_b2
     int mismatches = -1;
     int dec_len = tetra_speech_channel_decode_q(deint, decoded, (int)sizeof(decoded), &mismatches);
 
-    /* The speech code has no CRC. DMO and uplink keep the re-encode check:
-     * a wrong scrambler disagrees in ~40 of 330 bits. TMO downlink at a few
-     * dB SNR lands in the same range on bursts that are still intelligible,
-     * so dropping them there cuts the call out. */
+    /* The speech code has no CRC. DMO and uplink drop a burst that does not
+     * re-encode: a wrong scrambler disagrees in ~40 of 330 bits. TMO keeps
+     * the burst, but a count that high is concealment. Decoding it as a good
+     * frame overwrites the ACELP memory and the rest of the call comes out
+     * wrong. */
     if ((state->tetra_dmo || state->tetra_uplink) && mismatches > TETRA_DMO_TCH_MAX_MISMATCH) {
         state->tetra_decode_errors++;
         if (opts->errorbars)
@@ -339,6 +340,8 @@ static void tetra_decode_tch_fs(const uint16_t *soft_b1, const uint16_t *soft_b2
             }
         }
         tetra_air_decrypt_voice(state, decoded, dec_len, 0);
+        tetra_acelp_set_frame_bfi(!(state->tetra_dmo || state->tetra_uplink) &&
+                                  mismatches > TETRA_DMO_TCH_MAX_MISMATCH);
         tetra_acelp_process_tch(decoded, dec_len, 0, opts, state);
     }
 
@@ -654,6 +657,55 @@ static void tetra_uplink_process_nub(dsd_opts* opts, dsd_state* state)
     watchdog_event_current(opts, state, 0);
 }
 
+/* Training sequences of successive downlink slots are 255 symbols apart.
+ * A missed burst used to advance the timeslot by one anyway, so after the
+ * first few slots the speech gate was listening to the wrong one. */
+static int tetra_slot_anchor_valid;
+static uint32_t tetra_slot_anchor_symbolcnt;
+
+static void
+tetra_tdma_advance_steps(dsd_state* state, int steps)
+{
+    if (!state || steps <= 0 || !state->tetra_tdma_valid || state->tetra_tn < 1 || state->tetra_tn > 4) {
+        return;
+    }
+    const int idx = (state->tetra_tn - 1) + steps;
+    state->tetra_tn = (uint8_t)((idx % 4) + 1);
+    const int fn = (int)state->tetra_fn + idx / 4;
+    state->tetra_fn = (uint8_t)(fn % 18);
+    state->tetra_mn = (uint8_t)((state->tetra_mn + fn / 18) % 60);
+}
+
+static void
+tetra_tdma_anchor_at(const dsd_state* state, uint32_t symbolcnt)
+{
+    tetra_slot_anchor_valid = state && state->tetra_tdma_valid ? 1 : 0;
+    tetra_slot_anchor_symbolcnt = symbolcnt;
+}
+
+static void
+tetra_tdma_catch_up(dsd_state* state)
+{
+    if (!state) {
+        return;
+    }
+    const uint32_t now = state->symbolcnt;
+    if (!(state->tetra_tdma_valid && tetra_slot_anchor_valid)) {
+        tetra_tdma_advance_ndb(state);
+    } else {
+        const uint32_t delta = now - tetra_slot_anchor_symbolcnt;
+        /* Under half a slot: this lock is not the next timeslot. */
+        if (delta >= 180u && delta <= 144000u) {
+            const uint32_t steps32 = (delta + 127u) / 255u;
+            tetra_tdma_advance_steps(state, steps32 > 100000u ? 100000 : (int)steps32);
+        } else if (delta > 144000u) {
+            state->tetra_tdma_valid = 0;
+        }
+    }
+    tetra_slot_anchor_valid = state->tetra_tdma_valid ? 1 : 0;
+    tetra_slot_anchor_symbolcnt = now;
+}
+
 void processTetraFrame(dsd_opts* opts, dsd_state* state)
 {
     soft_symbol_frame_begin(state);
@@ -671,7 +723,7 @@ void processTetraFrame(dsd_opts* opts, dsd_state* state)
         tetra_dmo_process_ndb(opts, state);
         return;
     }
-    tetra_tdma_advance_ndb(state);
+    tetra_tdma_catch_up(state);
 
     /* AACH half 2 sits between the training sequence and Block 2. */
     skipDibit(opts, state, 8);
@@ -941,6 +993,7 @@ static int tetra_sb_crc_ok(const uint8_t *decoded, int dec_len)
 
 void processTetraSBFrame(dsd_opts *opts, dsd_state *state)
 {
+    const uint32_t burst_symbolcnt = state->symbolcnt;
     soft_symbol_frame_begin(state);
 
     if (!state->tetra_sb1_valid) {
@@ -1022,7 +1075,8 @@ void processTetraSBFrame(dsd_opts *opts, dsd_state *state)
                 s.system_code, s.comm_type, s.ab_usage, s.slot, s.frame, s.enc_state);
     } else if (crc_ok) {
         state->tetra_dmo = 0;
-        tetra_bsch_parse(decoded, TETRA_SB_TYPE1_BITS, opts, state);
+        if (tetra_bsch_parse(decoded, TETRA_SB_TYPE1_BITS, opts, state))
+            tetra_tdma_anchor_at(state, burst_symbolcnt);
     }
 
     /* ------------------------------------------------------------------

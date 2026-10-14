@@ -73,7 +73,7 @@ static int s_voc_builtin = 0;
 
 #if DSD_HAVE_TETRA_ACELP_BUILTIN
 extern void tetra_acelp_builtin_reset(void);
-extern int tetra_acelp_builtin_decode(const uint8_t *bits, int nbits, int16_t *pcm, int nsamples);
+extern int tetra_acelp_builtin_decode(const uint8_t *bits, int nbits, int16_t *pcm, int nsamples, int bfi);
 #endif
 
 /* Convert decoded TYPE2 bits (at least 274 bits) into two consecutive codec frames.
@@ -138,6 +138,13 @@ static int voc_ensure_open(void) {
 #else
     return 0;
 #endif
+}
+
+static int s_frame_bfi;
+
+void tetra_acelp_set_frame_bfi(int bfi)
+{
+    s_frame_bfi = bfi ? 1 : 0;
 }
 
 void tetra_vocoder_close(void) {
@@ -302,6 +309,8 @@ static void tetra_acelp_process_impl(const uint8_t *type2_bits, int type2_len,
     static double last_live_audio_time = 0.0;
     static dsd_audio_stream *last_live_audio_stream = NULL;
 
+    const int frame_bfi = s_frame_bfi;
+    s_frame_bfi = 0;
     if (!type2_bits || !opts) {
         fprintf(stderr, "[TETRA] cannot process TCH without bits and decoder options\n");
         return;
@@ -322,31 +331,17 @@ static void tetra_acelp_process_impl(const uint8_t *type2_bits, int type2_len,
         }
     }
 
-    /* A later allocation for another call rewrites the slot bitmap while
-     * this timeslot is still talking. Keep that timeslot for a short hang
-     * so the sentence is not cut off. An explicit release (bitmap 0) stops
-     * at once. */
-    static int talk_tn = 0;
-    static double talk_until = 0.0;
-    const double now_gate = dsd_realtime_mono_s();
+    /* Phase 12 floor-grant gate. */
     if (!tetra_acelp_slot_gate_passes(block_idx ? block_idx : 1, state)) {
-        const int released = state && state->tetra_vc_assignment_valid && (state->tetra_vc_timeslot_bitmap & 0x0F) == 0;
-        const int still_talking = !released && state && state->tetra_tdma_valid && state->tetra_tn == talk_tn
-                                   && talk_tn != 0 && now_gate < talk_until;
-        if (!still_talking) {
-            if (!warned_gate) {
-                fprintf(stderr,
-                        "[TETRA] audio suppressed by slot gate: grant_valid=%u vc_slot=%u block=%d\n",
-                        state ? (unsigned)state->tetra_tx_granted_valid : 0u,
-                        state ? (unsigned)state->tetra_vc_slot : 0u,
-                        block_idx ? block_idx : 1);
-                warned_gate = 1;
-            }
-            return;
+        if (!warned_gate) {
+            fprintf(stderr,
+                    "[TETRA] audio suppressed by slot gate: grant_valid=%u vc_slot=%u block=%d\n",
+                    state ? (unsigned)state->tetra_tx_granted_valid : 0u,
+                    state ? (unsigned)state->tetra_vc_slot : 0u,
+                    block_idx ? block_idx : 1);
+            warned_gate = 1;
         }
-    } else if (state && state->tetra_tdma_valid && state->tetra_tn >= 1 && state->tetra_tn <= 4) {
-        talk_tn = state->tetra_tn;
-        talk_until = now_gate + 2.0;
+        return;
     }
 
     const int need_bits = half ? TETRA_TCH_FRAME_BITS : 2 * TETRA_TCH_FRAME_BITS;
@@ -360,6 +355,22 @@ static void tetra_acelp_process_impl(const uint8_t *type2_bits, int type2_len,
     /* Reception activity is independent of codec availability. Do not let
      * generic no-carrier handling use a stale pre-call activity timestamp. */
     dsd_mark_vc_sync(state);
+
+    /* One decoder memory is one speaker. A different timeslot, or a gap
+     * long enough to be another call, must not continue the previous
+     * filter. */
+    if (state && state->tetra_tdma_valid && state->tetra_tn >= 1 && state->tetra_tn <= 4) {
+        static int voc_tn = 0;
+        static double voc_time = 0.0;
+        const double now = dsd_realtime_mono_s();
+        if (voc_tn != state->tetra_tn || (voc_time > 0.0 && now - voc_time > 0.4)) {
+#if DSD_HAVE_TETRA_ACELP_BUILTIN
+            tetra_acelp_builtin_reset();
+#endif
+        }
+        voc_tn = state->tetra_tn;
+        voc_time = now;
+    }
 
     /* —— Step 1: class reorder → 2 codec frames —— */
     uint8_t codec[2 * TETRA_TCH_FRAME_BITS];  /* 274 bytes */
@@ -429,7 +440,7 @@ static void tetra_acelp_process_impl(const uint8_t *type2_bits, int type2_len,
         int nsamples = 0;
 #if DSD_HAVE_TETRA_ACELP_BUILTIN
         nsamples = tetra_acelp_builtin_decode(frame, TETRA_TCH_FRAME_BITS,
-                                              pcm, TETRA_TCH_FRAME_SAMPLES);
+                                              pcm, TETRA_TCH_FRAME_SAMPLES, frame_bfi);
 #endif
         if (nsamples != TETRA_TCH_FRAME_SAMPLES) {
             if (state) {

@@ -25,7 +25,7 @@ static const dsdcfg_schema_entry_t s_schema[] = {
     {"input", "rtl_freq", "RTL-SDR frequency (supports K/M/G suffix)", "851.375M", NULL, DSDCFG_TYPE_FREQ, 0, 0},
     {"input", "rtl_gain", "RTL-SDR gain in dB (0 for AGC)", "0", NULL, DSDCFG_TYPE_INT, 0, 49},
     {"input", "rtl_ppm", "RTL-SDR frequency correction in PPM", "0", NULL, DSDCFG_TYPE_INT, -1000, 1000},
-    {"input", "rtl_bw_khz", "RTL-SDR DSP bandwidth in kHz", "48", NULL, DSDCFG_TYPE_INT, 4, 144},
+    {"input", "rtl_bw_khz", "RTL-SDR DSP bandwidth in kHz", "48", NULL, DSDCFG_TYPE_INT, 4, 72},
     {"input", "rtl_sql", "Squelch level in dB (0 to disable); radio and audio inputs", "0", NULL, DSDCFG_TYPE_INT, -120,
      0},
     {"input", "rtl_sql_mode",

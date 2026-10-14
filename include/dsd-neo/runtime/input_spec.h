@@ -63,7 +63,7 @@ int dsd_rtl_input_spec_apply(dsd_opts* opts);
 /**
  * @brief Return 1 when @p bw kHz is a DSP baseband the RTL path will run.
  *
- * 4, 6, 8, 12, 16, 24 and 48 kHz are the analog set. 36, 54, 72, 90, 108 and 144 kHz are the
+ * 4, 6, 8, 12, 16, 24 and 48 kHz are the analog set. 36, 54 and 72 kHz are the
  * integer samples-per-symbol rates for TETRA at 18 ksym/s.
  */
 int dsd_rtl_dsp_bw_khz_is_valid(int bw);

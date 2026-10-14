@@ -154,7 +154,7 @@ interactive_configure_rtl_input(dsd_opts* opts, int* src) {
     int dev = prompt_int("RTL device index", 0, 0, 255);
     int gain = prompt_int("RTL gain (dB)", 22, 0, 60);
     int ppm = prompt_int("PPM error", 0, -200, 200);
-    int bw = prompt_int("DSP bandwidth (kHz: 4,6,8,12,16,24,36,48,54,72,90,108,144)", 48, 4, 144);
+    int bw = prompt_int("DSP bandwidth (kHz: 4,6,8,12,16,24,36,48,54,72)", 48, 4, 72);
     int sql = prompt_int("Squelch (0=off; negative dB ok via CLI later)", 0, -1000, 100000);
     int vol = prompt_int("Monitor gain multiplier (1..3)", 1, 1, 3);
     DSD_SNPRINTF(opts->audio_in_dev, sizeof opts->audio_in_dev, "rtl:%d:%s:%d:%d:%d:%d:%d", dev, freq, gain, ppm, bw,
@@ -180,7 +180,7 @@ interactive_configure_rtltcp_input(dsd_opts* opts) {
     }
     int gain = prompt_int("RTL gain (dB)", 22, 0, 60);
     int ppm = prompt_int("PPM error", 0, -200, 200);
-    int bw = prompt_int("DSP bandwidth (kHz: 4,6,8,12,16,24,36,48,54,72,90,108,144)", 48, 4, 144);
+    int bw = prompt_int("DSP bandwidth (kHz: 4,6,8,12,16,24,36,48,54,72)", 48, 4, 72);
     int sql = prompt_int("Squelch (0=off)", 0, -1000, 100000);
     int vol = prompt_int("Monitor gain multiplier (1..3)", 1, 1, 3);
     DSD_SNPRINTF(opts->audio_in_dev, sizeof opts->audio_in_dev, "rtltcp:%s:%d:%s:%d:%d:%d:%d:%d", host, port, freq,
