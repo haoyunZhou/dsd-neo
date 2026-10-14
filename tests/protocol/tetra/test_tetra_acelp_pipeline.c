@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-/* External-vocoder IPC and PCM routing integration test. */
+/* In-process ACELP decode and PCM routing integration test. */
 #include <dsd-neo/protocol/tetra/tetra_acelp.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/state.h>

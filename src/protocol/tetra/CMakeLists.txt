@@ -27,8 +27,8 @@ target_include_directories(dsd-neo_proto_tetra
 target_link_libraries(dsd-neo_proto_tetra PUBLIC dsd-neo_core dsd-neo_crypto)
 
 # Local ETSI EN 300 395-2 C-CODE is optional and is never fetched by the build.
-# When it is present, speech is decoded in-process. TETRA_VOCODER_CMD remains
-# an explicit override for tests and alternate codecs.
+# When it is present, speech is decoded in-process. There is no external
+# vocoder process.
 set(_DSD_TETRA_C_CODE_DEFAULT "")
 if(EXISTS "${PROJECT_SOURCE_DIR}/third_party/tetra_acelp/reference/C-CODE/SOURCE.H")
     set(_DSD_TETRA_C_CODE_DEFAULT
@@ -38,7 +38,7 @@ endif()
 set(ETSI_TETRA_C_CODE
     "${_DSD_TETRA_C_CODE_DEFAULT}"
     CACHE PATH
-    "Local ETSI EN 300 395-2 C-CODE directory. Empty leaves speech on TETRA_VOCODER_CMD."
+    "Local ETSI EN 300 395-2 C-CODE directory. Empty leaves TETRA speech silent."
 )
 if(EXISTS "${ETSI_TETRA_C_CODE}/SOURCE.H")
     set(_DSD_TETRA_ACELP_SOURCES
@@ -74,7 +74,7 @@ if(EXISTS "${ETSI_TETRA_C_CODE}/SOURCE.H")
     target_link_libraries(dsd-neo_proto_tetra PUBLIC dsd-neo_tetra_acelp)
     message(STATUS "TETRA ACELP: in-process decoder from ${ETSI_TETRA_C_CODE}")
 else()
-    message(STATUS "TETRA ACELP: no local C-CODE; speech uses TETRA_VOCODER_CMD")
+    message(STATUS "TETRA ACELP: no local C-CODE; speech stays silent")
 endif()
 
 function(dsd_neo_copy_tetra_acelp_runtime target)

@@ -137,6 +137,57 @@ static void tetra_prepare_block(const uint8_t *dibuf, const float *soft_in,
  * SCH-HD path: depuncture a single 216-bit block with rate 2/3,
  * Viterbi decode, and dispatch to MAC parser.
  * ------------------------------------------------------------------------- */
+/* Re-encode a decoded SCH/HD type-2 block and count disagreements against the
+ * received deinterleaved channel bits (216 punctured symbols). Returns -1
+ * when the puncturer cannot be applied. */
+static int tetra_hd_reencode_mismatches(const uint8_t *type2, const uint16_t *deint)
+{
+    uint8_t mother[144 * 4];
+    uint8_t punct[TETRA_NDB_BLOCK_BITS];
+    int state = 0;
+
+    for (int pos = 0; pos < 144; pos++) {
+        const int bit = type2[pos] & 1;
+        const int d1 = (state >> 0) & 1;
+        const int d2 = (state >> 1) & 1;
+        const int d3 = (state >> 2) & 1;
+        const int d4 = (state >> 3) & 1;
+        mother[pos * 4 + 0] = (uint8_t)(bit ^ d1 ^ d4);
+        mother[pos * 4 + 1] = (uint8_t)(bit ^ d2 ^ d3 ^ d4);
+        mother[pos * 4 + 2] = (uint8_t)(bit ^ d1 ^ d2 ^ d4);
+        mother[pos * 4 + 3] = (uint8_t)(bit ^ d1 ^ d3 ^ d4);
+        state = ((state << 1) & 0xEu) | bit;
+    }
+    if (tetra_rcpc_puncture_by_id(TETRA_RCPC_PUNCT_2_3, mother, 144 * 4,
+                                  punct, TETRA_NDB_BLOCK_BITS) != TETRA_NDB_BLOCK_BITS)
+        return -1;
+
+    int bad = 0;
+    for (int i = 0; i < TETRA_NDB_BLOCK_BITS; i++) {
+        if (punct[i] == 0xff)
+            continue;
+        if ((deint[i] > 0x7fffu) != punct[i])
+            bad++;
+    }
+    return bad;
+}
+
+/* A rotated Costas phase discards the soft amplitude and leaves only 0/0xffff
+ * decisions. CRC-16 still accepts the 4 dB NTS2 blocks, which re-encode with
+ * 10..15 of these 216 bits wrong. A clean rotated burst re-encodes exactly,
+ * so those stay. Soft-decision blocks are not judged here: at 6 dB a valid
+ * block already disagrees in up to the mid-20s. */
+#define TETRA_HD_HARD_MAX_MISMATCH 8
+
+static int tetra_costs_are_hard(const uint16_t *costs, int count)
+{
+    for (int i = 0; i < count; i++) {
+        if (costs[i] != 0u && costs[i] != 0xffffu)
+            return 0;
+    }
+    return 1;
+}
+
 /* Shared SCH/HD (and STCH) FEC: one descrambled 216-bit block -> 124 type-1
  * bits. Returns 1 when the CRC-16 passes; `decoded` needs 256 bytes. */
 static int tetra_hd_decode_bits(const uint16_t *soft, uint8_t *decoded)
@@ -159,8 +210,16 @@ static int tetra_hd_decode_bits(const uint16_t *soft, uint8_t *decoded)
     int dec_len = tetra_viterbi_decode_soft(depunc, depunc_len, decoded, 256);
     free(depunc);
 
-    return dec_len >= type2_len
-           && tetra_crc16_ccitt_bits(decoded, type1_len + 16) == 0x1D0Fu;
+    const int crc_ok = dec_len >= type2_len
+                       && tetra_crc16_ccitt_bits(decoded, type1_len + 16) == 0x1D0Fu;
+    if (!crc_ok)
+        return 0;
+    if (tetra_costs_are_hard(deint_soft, TETRA_NDB_BLOCK_BITS)) {
+        const int bad = tetra_hd_reencode_mismatches(decoded, deint_soft);
+        if (bad < 0 || bad > TETRA_HD_HARD_MAX_MISMATCH)
+            return 0;
+    }
+    return 1;
 }
 
 static int tetra_decode_schd(const uint16_t *soft, int cc, int block_idx,

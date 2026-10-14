@@ -528,7 +528,8 @@ demod_apply_channel_lpf_defaults(struct demod_state* demod, const dsd_opts* opts
     }
     demod->channel_lpf_enable = channel_lpf ? 1 : 0;
     demod->channel_lpf_profile = profile;
-    if (demod->output_kind == DSD_DEMOD_OUTPUT_SYMBOL_CQPSK) {
+    /* P25 CQPSK/LSM uses the 12.5 kHz profile. TETRA is also CQPSK, at 18 ksps in a 25 kHz channel, and stays WIDE. */
+    if (demod->output_kind == DSD_DEMOD_OUTPUT_SYMBOL_CQPSK && demod->symbol_rate_hz != 18000) {
         demod->channel_lpf_profile = DSD_CH_LPF_PROFILE_P25_CQPSK;
     }
     demod->analog_family = 0;
@@ -1486,8 +1487,8 @@ rtl_demod_open_channel_profile(int landing_cqpsk, int requested_cqpsk, int chann
         return channel_profile;
     }
     if (landing_cqpsk > 0) {
-        /* demod_apply_channel_lpf_defaults(): CQPSK output always runs the P25 CQPSK filter. */
-        return DSD_CH_LPF_PROFILE_P25_CQPSK;
+        /* demod_apply_channel_lpf_defaults(): P25 CQPSK output runs the P25 CQPSK filter. TETRA's 18 ksps stays WIDE. */
+        return symbol_rate_hz == 18000 ? DSD_CH_LPF_PROFILE_WIDE : DSD_CH_LPF_PROFILE_P25_CQPSK;
     }
     if (channel_profile == DSD_CH_LPF_PROFILE_P25_CQPSK && symbol_rate_hz == 4800) {
         /* A P25 Phase 1 open on the FSK discriminator filters with the C4FM profile. */

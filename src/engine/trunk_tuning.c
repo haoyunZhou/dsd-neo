@@ -83,7 +83,9 @@ dsd_engine_select_p25_sps_profile(dsd_state* state, int is_tdma) {
  * p25_cc_freq is not the answer: NXDN and EDACS trunking anchor that same field, so the
  * frequency being set proves only that some protocol has a control channel. Everything derived
  * from a P25 control channel -- the 4800/6000 symbol rate, the C4FM/QPSK choice, the P25 SPS
- * hunt profile -- is wrong for those protocols, which run GFSK at their own rates.
+ * hunt profile -- is wrong for those protocols, which run GFSK at their own rates. TETRA is
+ * the same kind of miss: a voice grant passes the live samples-per-symbol count, and treating
+ * that as a P25 retune replaces the 18 kHz pi/4-DQPSK chain with a 4800 symbol C4FM profile.
  */
 static int
 dsd_engine_cc_is_p25(const dsd_state* state) {
@@ -101,7 +103,8 @@ dsd_engine_cc_is_p25(const dsd_state* state) {
     }
     if (DSD_SYNC_IS_DMR(state->synctype) || DSD_SYNC_IS_DMR(state->lastsynctype) || DSD_SYNC_IS_NXDN(state->synctype)
         || DSD_SYNC_IS_NXDN(state->lastsynctype) || DSD_SYNC_IS_EDACS(state->synctype)
-        || DSD_SYNC_IS_EDACS(state->lastsynctype)) {
+        || DSD_SYNC_IS_EDACS(state->lastsynctype) || DSD_SYNC_IS_TETRA(state->synctype)
+        || DSD_SYNC_IS_TETRA(state->lastsynctype)) {
         return 0;
     }
     return 1;

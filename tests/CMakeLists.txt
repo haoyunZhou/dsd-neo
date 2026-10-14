@@ -11127,9 +11127,8 @@ unset(_dsd_tetra_test)
 unset(_dsd_tetra_test_name)
 unset(_dsd_tetra_test_sources)
 
-# Exercise the actual persistent vocoder subprocess and WAV routing with the
-# deterministic silence stub. Keep the protocol suite usable when Python is
-# intentionally absent from a minimal target environment.
+# Field-capture and IQ fixture checks need Python. The protocol suite still
+# configures when a minimal environment has no interpreter.
 find_package(Python3 COMPONENTS Interpreter QUIET)
 if(Python3_Interpreter_FOUND)
     add_test(
@@ -11156,7 +11155,7 @@ if(Python3_Interpreter_FOUND)
         PROPERTIES LABELS "tetra;iq-fixture" TIMEOUT 120
     )
 endif()
-if(Python3_Interpreter_FOUND)
+if(TARGET dsd-neo_tetra_acelp)
     add_executable(
         dsd-neo_test_tetra_acelp_pipeline
         protocol/tetra/test_tetra_acelp_pipeline.c
@@ -11176,59 +11175,7 @@ if(Python3_Interpreter_FOUND)
     )
     set_tests_properties(
         TETRA_ACELP_PIPELINE
-        PROPERTIES
-            LABELS "protocol;tetra;audio"
-            ENVIRONMENT
-                "TETRA_VOCODER_CMD=${Python3_EXECUTABLE} \"${PROJECT_SOURCE_DIR}/tools/tetra/vocoder_stub.py\""
-    )
-
-    add_executable(
-        dsd-neo_test_tetra_acelp_short_output
-        protocol/tetra/test_tetra_acelp_short_output.c
-    )
-    target_include_directories(
-        dsd-neo_test_tetra_acelp_short_output
-        PRIVATE ${PROJECT_SOURCE_DIR}/include
-    )
-    target_link_libraries(
-        dsd-neo_test_tetra_acelp_short_output
-        PRIVATE dsd-neo_proto_tetra dsd-neo_fec
-    )
-    dsd_neo_copy_tetra_acelp_runtime(dsd-neo_test_tetra_acelp_short_output)
-    add_test(
-        NAME TETRA_ACELP_SHORT_OUTPUT
-        COMMAND dsd-neo_test_tetra_acelp_short_output
-    )
-    set_tests_properties(
-        TETRA_ACELP_SHORT_OUTPUT
-        PROPERTIES
-            LABELS "protocol;tetra;audio"
-            ENVIRONMENT
-                "TETRA_VOCODER_CMD=${Python3_EXECUTABLE} \"${PROJECT_SOURCE_DIR}/tools/tetra/vocoder_stub.py\" --short-output"
-    )
-
-    add_test(
-        NAME TETRA_ACELP_TIMEOUT
-        COMMAND dsd-neo_test_tetra_acelp_short_output
-    )
-    set_tests_properties(
-        TETRA_ACELP_TIMEOUT
-        PROPERTIES
-            LABELS "protocol;tetra;audio"
-            TIMEOUT 8
-            ENVIRONMENT
-                "TETRA_VOCODER_CMD=${Python3_EXECUTABLE} \"${PROJECT_SOURCE_DIR}/tools/tetra/vocoder_stub.py\" --hang"
-    )
-
-    add_test(
-        NAME TETRA_ACELP_MISSING_COMMAND
-        COMMAND dsd-neo_test_tetra_acelp_short_output
-    )
-    set_tests_properties(
-        TETRA_ACELP_MISSING_COMMAND
-        PROPERTIES
-            LABELS "protocol;tetra;audio"
-            ENVIRONMENT "TETRA_VOCODER_CMD=;TETRA_ACELP_DISABLE_BUILTIN=1"
+        PROPERTIES LABELS "protocol;tetra;audio"
     )
 endif()
 

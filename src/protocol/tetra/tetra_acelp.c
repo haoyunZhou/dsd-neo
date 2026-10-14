@@ -1,10 +1,4 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-#ifndef _WIN32
-#  ifndef _POSIX_C_SOURCE
-#    define _POSIX_C_SOURCE 200809L
-#  endif
-#endif
-
 #include <dsd-neo/protocol/tetra/tetra_acelp.h>
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/state.h>
@@ -17,22 +11,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
-#ifdef _WIN32
-#  ifndef WIN32_LEAN_AND_MEAN
-#    define WIN32_LEAN_AND_MEAN
-#  endif
-#  include <windows.h>
-#else
-#  include <errno.h>
-#  include <poll.h>
-#  include <signal.h>
-#  include <time.h>
-#  include <unistd.h>
-#  include <sys/types.h>
-#  include <sys/wait.h>
-#  include <pthread.h>
-#endif
-
 /* EN 300 395-2 V1.3.1 Table 4 bit-position tables for TCH/FS — from osmo-tetra tch_reordering.c */
 
 /* 51 Class-0 (unprotected) bit positions, 1-indexed */
@@ -87,16 +65,6 @@ enum {
 /* TETRA TCH/FS speech frame parameters (ETSI EN 300 395-2) */
 #define TETRA_TCH_FRAME_BITS     137  /* encoded bits in one ACELP codec frame       */
 #define TETRA_TCH_FRAME_SAMPLES  240  /* decoded PCM16 samples (30 ms @ 8 kHz)        */
-#define TETRA_VOCODER_READ_TIMEOUT_MS 2000
-
-typedef enum {
-    TETRA_VOC_STATUS_UNKNOWN = 0,
-    TETRA_VOC_STATUS_OPEN,
-    TETRA_VOC_STATUS_MISSING_CMD,
-    TETRA_VOC_STATUS_OPEN_FAILED
-} tetra_voc_status_t;
-
-static int s_voc_last_timeout = 0;
 static int s_voc_builtin = 0;
 
 #ifndef DSD_HAVE_TETRA_ACELP_BUILTIN
@@ -107,22 +75,6 @@ static int s_voc_builtin = 0;
 extern void tetra_acelp_builtin_reset(void);
 extern int tetra_acelp_builtin_decode(const uint8_t *bits, int nbits, int16_t *pcm, int nsamples);
 #endif
-
-/* TETRA_VOCODER_CMD forces the external process. Otherwise a decoder that was
- * linked from a local ETSI C-CODE tree runs in this process. */
-static int voc_builtin_selected(void) {
-#if !DSD_HAVE_TETRA_ACELP_BUILTIN
-    return 0;
-#else
-    const char *off = getenv("TETRA_ACELP_DISABLE_BUILTIN");
-    const char *cmd = getenv("TETRA_VOCODER_CMD");
-    if (off && off[0] && strcmp(off, "0") != 0)
-        return 0;
-    if (cmd && cmd[0])
-        return 0;
-    return 1;
-#endif
-}
 
 /* Convert decoded TYPE2 bits (at least 274 bits) into two consecutive codec frames.
  * Each frame occupies TETRA_TCH_FRAME_BITS (137) bytes in the output buffer.
@@ -175,379 +127,26 @@ static void tetra_acelp_reorder_half(const uint8_t* in, uint8_t* out) {
         out[class2_positions[bit] - 1] = cur[bit];
 }
 
-/* =========================================================================
- * Persistent external vocoder subprocess
- *
- * The TETRA ACELP speech codec is proprietary (ETSI ETS 300 395-2) and has
- * no freely-available open-source implementation.  dsd-neo supports an
- * external command-line vocoder via the TETRA_VOCODER_CMD environment
- * variable.  The subprocess must implement this synchronous protocol:
- *
- *   → stdin  : TETRA_TCH_FRAME_BITS raw bytes (one byte per coded bit, 0/1)
- *   ← stdout : TETRA_TCH_FRAME_SAMPLES × sizeof(int16_t) bytes of PCM16LE
- *              (8 kHz, mono, little-endian)
- *   repeat indefinitely until stdin is closed.
- *
- * Do not vendor ETSI ACELP sources into this repository. The top-level
- * build does not compile a speech codec. tools/tetra/acelp_adapter is a
- * separate CMake project that the developer points at a local C-CODE tree.
- * tools/tetra/vocoder_stub.py is the silence stub used by tests.
- * Linux and macOS launch TETRA_VOCODER_CMD with sh -c. Windows uses
- * cmd.exe /C. The byte protocol above is the same on both.
- * ========================================================================= */
-
-#ifdef _WIN32
-/* ---- Windows implementation ---- */
-static struct {
-    HANDLE h_write;   /* parent writes bits  → child stdin  */
-    HANDLE h_read;    /* parent reads  PCM   ← child stdout */
-    HANDLE h_proc;
-    HANDLE h_thread;
-    HANDLE h_job;
-    int    open;
-} s_voc;
-
-static tetra_voc_status_t s_voc_status = TETRA_VOC_STATUS_UNKNOWN;
-
-static int
-build_windows_shell_command(const char *cmd, char *out, size_t out_sz) {
-    const char *comspec;
-
-    if (!cmd || !cmd[0] || !out || out_sz < 16)
-        return 0;
-
-    comspec = getenv("ComSpec");
-    if (!comspec || !comspec[0])
-        comspec = "C:\\Windows\\System32\\cmd.exe";
-
-    /*
-     * Run through cmd.exe so TETRA_VOCODER_CMD can be a normal Windows
-     * command line: .exe with args, .cmd/.bat wrappers, or interpreter-based
-     * commands such as "py -3 path\\to\\vocoder.py".
-     */
-    return snprintf(out, out_sz, "\"%s\" /D /S /C \"%s\"", comspec, cmd) < (int)out_sz;
-}
-
-static int voc_open(const char *cmd) {
-    SECURITY_ATTRIBUTES sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.nLength = sizeof(sa);
-    sa.bInheritHandle = TRUE;
-
-    HANDLE pipe_stdin_r,  pipe_stdin_w;
-    HANDLE pipe_stdout_r, pipe_stdout_w;
-    if (!CreatePipe(&pipe_stdin_r,  &pipe_stdin_w,  &sa, 0)) return 0;
-    if (!CreatePipe(&pipe_stdout_r, &pipe_stdout_w, &sa, 0)) {
-        CloseHandle(pipe_stdin_r); CloseHandle(pipe_stdin_w);
-        return 0;
-    }
-    /* make the parent-side handles non-inheritable */
-    SetHandleInformation(pipe_stdin_w,  HANDLE_FLAG_INHERIT, 0);
-    SetHandleInformation(pipe_stdout_r, HANDLE_FLAG_INHERIT, 0);
-
-    STARTUPINFOA si;
-    ZeroMemory(&si, sizeof(si));
-    si.cb = sizeof(si);
-    si.hStdInput  = pipe_stdin_r;
-    si.hStdOutput = pipe_stdout_w;
-    si.hStdError  = GetStdHandle(STD_ERROR_HANDLE);
-    si.dwFlags    = STARTF_USESTDHANDLES;
-
-    PROCESS_INFORMATION pi;
-    ZeroMemory(&pi, sizeof(pi));
-    char cmd_buf[2048];
-    DWORD last_error;
-    HANDLE job = NULL;
-
-    if (!build_windows_shell_command(cmd, cmd_buf, sizeof(cmd_buf))) {
-        fprintf(stderr, "[TETRA] vocoder command too long or invalid\n");
-        CloseHandle(pipe_stdin_r);  CloseHandle(pipe_stdin_w);
-        CloseHandle(pipe_stdout_r); CloseHandle(pipe_stdout_w);
-        return 0;
-    }
-
-    job = CreateJobObjectA(NULL, NULL);
-    if (job) {
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits;
-        ZeroMemory(&limits, sizeof(limits));
-        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation,
-                                     &limits, sizeof(limits))) {
-            CloseHandle(job);
-            job = NULL;
-        }
-    }
-
-    if (!job || !CreateProcessA(NULL, cmd_buf, NULL, NULL, TRUE, CREATE_SUSPENDED,
-                                NULL, NULL, &si, &pi)) {
-        last_error = GetLastError();
-        fprintf(stderr, "[TETRA] failed to start vocoder command '%s' (CreateProcess=%lu)\n",
-                cmd, (unsigned long)last_error);
-        if (job) CloseHandle(job);
-        CloseHandle(pipe_stdin_r);  CloseHandle(pipe_stdin_w);
-        CloseHandle(pipe_stdout_r); CloseHandle(pipe_stdout_w);
-        return 0;
-    }
-    if (!AssignProcessToJobObject(job, pi.hProcess)) {
-        last_error = GetLastError();
-        fprintf(stderr, "[TETRA] failed to contain vocoder process tree (Win32=%lu)\n",
-                (unsigned long)last_error);
-        TerminateProcess(pi.hProcess, 1);
-        WaitForSingleObject(pi.hProcess, 2000);
-        CloseHandle(pi.hProcess);
-        CloseHandle(pi.hThread);
-        CloseHandle(job);
-        CloseHandle(pipe_stdin_r);  CloseHandle(pipe_stdin_w);
-        CloseHandle(pipe_stdout_r); CloseHandle(pipe_stdout_w);
-        return 0;
-    }
-    ResumeThread(pi.hThread);
-    /* close child-side handles in parent */
-    CloseHandle(pipe_stdin_r);
-    CloseHandle(pipe_stdout_w);
-
-    s_voc.h_write  = pipe_stdin_w;
-    s_voc.h_read   = pipe_stdout_r;
-    s_voc.h_proc   = pi.hProcess;
-    s_voc.h_thread = pi.hThread;
-    s_voc.h_job    = job;
-    s_voc.open     = 1;
-    s_voc_status   = TETRA_VOC_STATUS_OPEN;
-    fprintf(stderr, "[TETRA] vocoder subprocess started\n");
-    return 1;
-}
-
-static int voc_send_recv(const uint8_t *bits, int nbits, int16_t *pcm, int nsamples) {
-    DWORD nwritten, nread;
-    s_voc_last_timeout = 0;
-    if (!WriteFile(s_voc.h_write, bits, (DWORD)nbits, &nwritten, NULL)
-            || (int)nwritten != nbits)
-        return 0;
-    int pcm_bytes = nsamples * (int)sizeof(int16_t);
-    DWORD got = 0;
-    uint8_t *p = (uint8_t *)pcm;
-    ULONGLONG deadline = GetTickCount64() + TETRA_VOCODER_READ_TIMEOUT_MS;
-    while ((int)got < pcm_bytes) {
-        DWORD available = 0;
-        if (!PeekNamedPipe(s_voc.h_read, NULL, 0, NULL, &available, NULL))
-            break;
-        if (available == 0) {
-            if (WaitForSingleObject(s_voc.h_proc, 0) == WAIT_OBJECT_0)
-                break;
-            if (GetTickCount64() >= deadline) {
-                s_voc_last_timeout = 1;
-                break;
-            }
-            Sleep(5);
-            continue;
-        }
-        if (!ReadFile(s_voc.h_read, p + got, (DWORD)(pcm_bytes - (int)got), &nread, NULL)
-                || nread == 0)
-            break;
-        got += nread;
-    }
-    return (int)(got / sizeof(int16_t));
-}
-
-void tetra_vocoder_close(void) {
-    if (s_voc_builtin) {
-#if DSD_HAVE_TETRA_ACELP_BUILTIN
-        tetra_acelp_builtin_reset();
-#endif
-        s_voc_builtin = 0;
-        s_voc_status = TETRA_VOC_STATUS_UNKNOWN;
-        return;
-    }
-    if (!s_voc.open) return;
-    CloseHandle(s_voc.h_write);
-    CloseHandle(s_voc.h_read);
-    if (WaitForSingleObject(s_voc.h_proc, 200) == WAIT_TIMEOUT) {
-        TerminateJobObject(s_voc.h_job, 1);
-        WaitForSingleObject(s_voc.h_proc, 2000);
-    }
-    CloseHandle(s_voc.h_proc);
-    CloseHandle(s_voc.h_thread);
-    CloseHandle(s_voc.h_job);
-    memset(&s_voc, 0, sizeof(s_voc));
-}
-
-#else
-/* ---- POSIX implementation ---- */
-static struct {
-    int    fd_write;   /* parent writes bits  → child stdin  */
-    int    fd_read;    /* parent reads  PCM   ← child stdout */
-    pid_t  pid;
-    int    open;
-} s_voc;
-
-static tetra_voc_status_t s_voc_status = TETRA_VOC_STATUS_UNKNOWN;
-
-/* A closed child stdin must be a recoverable codec error, not a SIGPIPE that
- * terminates the decoder. Block SIGPIPE only in this thread and consume the
- * signal generated by this write before restoring the caller's mask. */
-static int
-voc_write_all(int fd, const uint8_t *data, size_t len)
-{
-    sigset_t block, oldmask, pending;
-    int had_pending = 0;
-    size_t total = 0;
-
-    sigemptyset(&block);
-    sigaddset(&block, SIGPIPE);
-    if (pthread_sigmask(SIG_BLOCK, &block, &oldmask) != 0)
-        return 0;
-    if (sigpending(&pending) == 0)
-        had_pending = sigismember(&pending, SIGPIPE);
-
-    while (total < len) {
-        ssize_t written = write(fd, data + total, len - total);
-        if (written > 0) {
-            total += (size_t)written;
-            continue;
-        }
-        if (written < 0 && errno == EINTR)
-            continue;
-        break;
-    }
-
-    if (total != len && !had_pending && sigpending(&pending) == 0
-            && sigismember(&pending, SIGPIPE)) {
-        int consumed_signal;
-        (void)sigwait(&block, &consumed_signal);
-    }
-    (void)pthread_sigmask(SIG_SETMASK, &oldmask, NULL);
-    return total == len;
-}
-
-static int voc_open(const char *cmd) {
-    int to_child[2], from_child[2];
-    if (pipe(to_child) != 0) return 0;
-    if (pipe(from_child) != 0) {
-        close(to_child[0]); close(to_child[1]);
-        return 0;
-    }
-    pid_t pid = fork();
-    if (pid < 0) {
-        close(to_child[0]); close(to_child[1]);
-        close(from_child[0]); close(from_child[1]);
-        return 0;
-    }
-    if (pid == 0) {
-        /* child */
-        /* Give the shell and any codec it starts a private process group so
-         * timeout recovery can terminate the whole command tree. */
-        if (setpgid(0, 0) != 0)
-            _exit(127);
-        dup2(to_child[0],   STDIN_FILENO);
-        dup2(from_child[1], STDOUT_FILENO);
-        close(to_child[0]); close(to_child[1]);
-        close(from_child[0]); close(from_child[1]);
-        execlp("sh", "sh", "-c", cmd, (char *)NULL);
-        _exit(127);
-    }
-    /* parent */
-    close(to_child[0]);
-    close(from_child[1]);
-    s_voc.fd_write = to_child[1];
-    s_voc.fd_read  = from_child[0];
-    s_voc.pid      = pid;
-    s_voc.open     = 1;
-    s_voc_status   = TETRA_VOC_STATUS_OPEN;
-    fprintf(stderr, "[TETRA] vocoder subprocess started\n");
-    return 1;
-}
-
-static int64_t
-voc_monotonic_ms(void)
-{
-    struct timespec ts;
-    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
-        return 0;
-    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-}
-
-static int voc_send_recv(const uint8_t *bits, int nbits, int16_t *pcm, int nsamples) {
-    s_voc_last_timeout = 0;
-    if (!voc_write_all(s_voc.fd_write, bits, (size_t)nbits)) return 0;
-    int pcm_bytes = nsamples * (int)sizeof(int16_t);
-    int total = 0;
-    uint8_t *p = (uint8_t *)pcm;
-    int64_t deadline = voc_monotonic_ms() + TETRA_VOCODER_READ_TIMEOUT_MS;
-    while (total < pcm_bytes) {
-        struct pollfd ready = {s_voc.fd_read, POLLIN, 0};
-        int poll_rc;
-        int64_t remaining = deadline - voc_monotonic_ms();
-        if (remaining <= 0) {
-            s_voc_last_timeout = 1;
-            break;
-        }
-        do {
-            poll_rc = poll(&ready, 1, (int)remaining);
-        } while (poll_rc < 0 && errno == EINTR);
-        if (poll_rc == 0)
-            s_voc_last_timeout = 1;
-        if (poll_rc <= 0 || (ready.revents & (POLLERR | POLLNVAL)))
-            break;
-        ssize_t r = read(s_voc.fd_read, p + total, (size_t)(pcm_bytes - total));
-        if (r < 0 && errno == EINTR) continue;
-        if (r <= 0) break;
-        total += (int)r;
-    }
-    return total / (int)sizeof(int16_t);
-}
-
-void tetra_vocoder_close(void) {
-    if (s_voc_builtin) {
-#if DSD_HAVE_TETRA_ACELP_BUILTIN
-        tetra_acelp_builtin_reset();
-#endif
-        s_voc_builtin = 0;
-        s_voc_status = TETRA_VOC_STATUS_UNKNOWN;
-        return;
-    }
-    if (!s_voc.open) return;
-    close(s_voc.fd_write);
-    close(s_voc.fd_read);
-    int status = 0;
-    int exited = 0;
-    for (int i = 0; i < 20; i++) {
-        pid_t rc = waitpid(s_voc.pid, &status, WNOHANG);
-        if (rc == s_voc.pid || (rc < 0 && errno == ECHILD)) {
-            exited = 1;
-            break;
-        }
-        struct timespec pause = {0, 10000000L}; /* 10 ms, at most 200 ms */
-        nanosleep(&pause, NULL);
-    }
-    /* The shell may have exited while a codec descendant still holds our
-     * pipe open. Close the private process group as well as reaping the child. */
-    kill(-s_voc.pid, SIGTERM);
-    if (!exited) {
-        while (waitpid(s_voc.pid, &status, 0) < 0 && errno == EINTR) {}
-    }
-    memset(&s_voc, 0, sizeof(s_voc));
-}
-#endif /* _WIN32 / POSIX */
-
-/* Ensure the vocoder subprocess is running.  Returns 1 if open. */
+/* Speech uses only the ETSI ACELP decoder linked into this process. */
 static int voc_ensure_open(void) {
-    if (s_voc_builtin || s_voc.open) return 1;
-    if (voc_builtin_selected()) {
-        s_voc_builtin = 1;
-        s_voc_status = TETRA_VOC_STATUS_OPEN;
-        fprintf(stderr, "[TETRA] ACELP decoder linked in-process\n");
+    if (s_voc_builtin)
         return 1;
-    }
-    const char *cmd = getenv("TETRA_VOCODER_CMD");
-    if (!cmd || !cmd[0]) {
-        s_voc_status = TETRA_VOC_STATUS_MISSING_CMD;
-        return 0;
-    }
-    if (!voc_open(cmd)) {
-        s_voc_status = TETRA_VOC_STATUS_OPEN_FAILED;
-        return 0;
-    }
+#if DSD_HAVE_TETRA_ACELP_BUILTIN
+    s_voc_builtin = 1;
+    fprintf(stderr, "[TETRA] ACELP decoder linked in-process\n");
     return 1;
+#else
+    return 0;
+#endif
+}
+
+void tetra_vocoder_close(void) {
+    if (!s_voc_builtin)
+        return;
+#if DSD_HAVE_TETRA_ACELP_BUILTIN
+    tetra_acelp_builtin_reset();
+#endif
+    s_voc_builtin = 0;
 }
 
 static const char *
@@ -604,7 +203,7 @@ void tetra_acelp_decode(const uint8_t* bits, int len) {
  * from both NDB blocks:
  *
  *   type-2 bits → class reorder → 2 × ACELP codec frames
- *               → external vocoder subprocess (TETRA_VOCODER_CMD)
+ *               → in-process ETSI ACELP decoder
  *               → PCM16 routing (PA / UDP / raw FD / WAV)
  *
  * The reorder produces two 137-bit ACELP frames from all 274
@@ -638,7 +237,6 @@ static void tetra_acelp_process_impl(const uint8_t *type2_bits, int type2_len,
                                      dsd_opts *opts, dsd_state *state)
 {
     static int warned_gate = 0;
-    static int warned_missing_cmd = 0;
     static int warned_open_failed = 0;
     static int warned_no_sink = 0;
     static int warned_control_channel = 0;
@@ -693,26 +291,15 @@ static void tetra_acelp_process_impl(const uint8_t *type2_bits, int type2_len,
 
     /* —— Step 2: vocoder + audio routing for each frame —— */
     if (!voc_ensure_open()) {
-        if (s_voc_status == TETRA_VOC_STATUS_MISSING_CMD) {
-            if (state) state->tetra_vocoder_status = TETRA_VOCODER_STATUS_COMMAND_MISSING;
-            if (!warned_missing_cmd) {
-                fprintf(stderr,
-                    "[TETRA] audio disabled: TETRA_VOCODER_CMD is not set. "
-                    "Example: TETRA_VOCODER_CMD=\"python tools/tetra/vocoder_stub.py --tone\"\n");
-                warned_missing_cmd = 1;
-            }
-        } else if (s_voc_status == TETRA_VOC_STATUS_OPEN_FAILED) {
-            if (state) {
-                state->tetra_vocoder_status = TETRA_VOCODER_STATUS_START_FAILED;
-                state->tetra_vocoder_errors++;
-            }
-            if (!warned_open_failed) {
-                const char *cmd = getenv("TETRA_VOCODER_CMD");
-                fprintf(stderr,
-                    "[TETRA] audio disabled: failed to start vocoder command: %s\n",
-                    (cmd && cmd[0]) ? cmd : "(unset)");
-                warned_open_failed = 1;
-            }
+        if (state) {
+            state->tetra_vocoder_status = TETRA_VOCODER_STATUS_START_FAILED;
+            state->tetra_vocoder_errors++;
+        }
+        if (!warned_open_failed) {
+            fprintf(stderr,
+                "[TETRA] audio disabled: the in-process ACELP decoder is not linked. "
+                "Configure ETSI_TETRA_C_CODE and rebuild.\n");
+            warned_open_failed = 1;
         }
         return;
     }
@@ -756,24 +343,14 @@ static void tetra_acelp_process_impl(const uint8_t *type2_bits, int type2_len,
 
         int16_t pcm[TETRA_TCH_FRAME_SAMPLES];
         memset(pcm, 0, sizeof(pcm));
-        int nsamples;
-        if (s_voc_builtin) {
+        int nsamples = 0;
 #if DSD_HAVE_TETRA_ACELP_BUILTIN
-            s_voc_last_timeout = 0;
-            nsamples = tetra_acelp_builtin_decode(frame, TETRA_TCH_FRAME_BITS,
-                                                  pcm, TETRA_TCH_FRAME_SAMPLES);
-#else
-            nsamples = 0;
+        nsamples = tetra_acelp_builtin_decode(frame, TETRA_TCH_FRAME_BITS,
+                                              pcm, TETRA_TCH_FRAME_SAMPLES);
 #endif
-        } else {
-            nsamples = voc_send_recv(frame, TETRA_TCH_FRAME_BITS,
-                                     pcm, TETRA_TCH_FRAME_SAMPLES);
-        }
         if (nsamples != TETRA_TCH_FRAME_SAMPLES) {
             if (state) {
-                state->tetra_vocoder_status = s_voc_last_timeout
-                                                ? TETRA_VOCODER_STATUS_TIMEOUT
-                                                : TETRA_VOCODER_STATUS_SHORT_OUTPUT;
+                state->tetra_vocoder_status = TETRA_VOCODER_STATUS_SHORT_OUTPUT;
                 state->tetra_vocoder_errors++;
             }
             fprintf(stderr,

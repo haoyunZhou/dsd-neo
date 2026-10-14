@@ -137,6 +137,11 @@ interactive_choose_input_source(void) {
    channel to it (interactive_am_refused()). */
 static int
 interactive_dsp_bw_khz(int bw) {
+    /* 72 kHz is the TETRA rate (18 ksym/s at 4 samples/symbol). It is not an analog-channel
+     * bandwidth, so the analog selectable list does not name it. */
+    if (bw == 72) {
+        return 72;
+    }
     return dsd_analog_rtl_dsp_bw_is_selectable(bw) ? bw : DSD_ANALOG_RTL_DSP_BW_MAX_KHZ;
 }
 
@@ -153,7 +158,7 @@ interactive_configure_rtl_input(dsd_opts* opts, int* src) {
     int dev = prompt_int("RTL device index", 0, 0, 255);
     int gain = prompt_int("RTL gain (dB)", 22, 0, 60);
     int ppm = prompt_int("PPM error", 0, -200, 200);
-    int bw = prompt_int("DSP bandwidth (kHz: 4,6,8,12,16,24,48)", 48, 4, 48);
+    int bw = prompt_int("DSP bandwidth (kHz: 4,6,8,12,16,24,48,72)", 48, 4, 72);
     int sql = prompt_int("Squelch (0=off; negative dB ok via CLI later)", 0, -1000, 100000);
     int vol = prompt_int("Monitor gain multiplier (1..3)", 1, 1, 3);
     DSD_SNPRINTF(opts->audio_in_dev, sizeof opts->audio_in_dev, "rtl:%d:%s:%d:%d:%d:%d:%d", dev, freq, gain, ppm, bw,
@@ -179,7 +184,7 @@ interactive_configure_rtltcp_input(dsd_opts* opts) {
     }
     int gain = prompt_int("RTL gain (dB)", 22, 0, 60);
     int ppm = prompt_int("PPM error", 0, -200, 200);
-    int bw = prompt_int("DSP bandwidth (kHz: 4,6,8,12,16,24,48)", 48, 4, 48);
+    int bw = prompt_int("DSP bandwidth (kHz: 4,6,8,12,16,24,48,72)", 48, 4, 72);
     int sql = prompt_int("Squelch (0=off)", 0, -1000, 100000);
     int vol = prompt_int("Monitor gain multiplier (1..3)", 1, 1, 3);
     DSD_SNPRINTF(opts->audio_in_dev, sizeof opts->audio_in_dev, "rtltcp:%s:%d:%s:%d:%d:%d:%d:%d", host, port, freq,
