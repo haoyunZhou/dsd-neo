@@ -114,6 +114,8 @@ Item {
     property alias nameText: nameField.text
 
     readonly property bool radioSource: sourceType === "usb" || sourceType === "airspy" || sourceType === "rtltcp"
+    // A file source replaying a symbol capture, which carries TETRA's symbols as a radio's I/Q does.
+    readonly property bool symbolSource: sourceType === "file" && Util.isSymbolCapture(fileText)
 
     // Per-source conventions, not one shared guess: 1234 is rtl_tcp's port, but
     // GQRX/SDR++ audio streams (docs/network-audio.md) use 7355 and a TCP audio
@@ -205,8 +207,10 @@ Item {
      * decode and whether to follow calls are real questions about the system just
      * found, and answering them for the user would produce a card that does not
      * work. @a sys supplies the source; it is the explore session's own map.
+     * A Signal search @a detection (SignalSearchModel::systemForHit()) also
+     * supplies the decoder, gain, bandwidth and receiver settings it captured.
      */
-    function openForFound(sys, freqMhz) {
+    function openForFound(sys, freqMhz, detection) {
         resetImport();
         retainedKeySourceUid = "";
         decryptionProfileUid = "";
@@ -241,6 +245,23 @@ Item {
         srcCsvPath = "";
         csvNotice = "";
         csvNoticeIsProblem = false;
+        if (detection) {
+            decodeFlag = detection.decodeFlag || "";
+            trunking = false;
+            trunkingAnswered = true;
+            // A whole-dB override (0 is the tuner's AGC); -1 for an Airspy,
+            // whose gains are in its own settings, leaves the field unset.
+            gainField.text = detection.gainDb >= 0 ? String(detection.gainDb) : "";
+            bwField.text = String(detection.bandwidthKhz > 0 ? detection.bandwidthKhz : 48);
+            // The receiver the detection was made with, not the app defaults
+            // reset above: an Airspy's own settings, or an RTL's PPM and its
+            // explicit bias tee. A field the source does not use stays unset.
+            airspySettings = detection.airspy || ({});
+            ppmField.text = detection.ppm !== undefined ? String(detection.ppm) : "";
+            biasTee = detection.biasTee !== undefined ? detection.biasTee : -1;
+            extraField.text = detection.extraArgs || "";
+            csvNotice = detection.searchUnresolved ? qsTr("Digital identification is unresolved. NFM monitoring does not confirm an analog transmission.") : "";
+        }
         initialDraft = draftFingerprint();
     }
 
@@ -307,12 +328,25 @@ Item {
     }
 
     /**
-     * A source change away from the radio drops a chip only a radio can run
-     * (AM, issue #524) back to Auto, rather than saving a system the engine
-     * would refuse to start. Its chip is greyed out for the new source.
+     * Whether the source can run a decode flag: AM needs a radio (issue #524),
+     * TETRA a radio or a symbol capture file; network and other file audio
+     * arrives already demodulated.
+     */
+    function decodeFlagRunsHere(flag) {
+        if (radioSource)
+            return true;
+        if (Util.decodeFlagNeedsRadio(flag))
+            return false;
+        return !Util.decodeFlagNeedsIqOrSymbols(flag) || symbolSource;
+    }
+
+    /**
+     * A source change away from the radio drops a chip the new source cannot
+     * run back to Auto, rather than saving a system the engine would refuse to
+     * start. Its chip is greyed out for the new source.
      */
     function dropRadioOnlyDecodeFlag() {
-        if (!radioSource && Util.decodeFlagNeedsRadio(decodeFlag))
+        if (!decodeFlagRunsHere(decodeFlag))
             pickDecodeFlag("");
     }
 
@@ -379,11 +413,12 @@ Item {
             return true;
         }
         // A system edited or imported onto a non-radio source may still carry
-        // AM, which only a radio can run: not until another chip is picked.
-        // Nor on a radio whose bandwidth cannot filter the AM channel.
+        // AM, which only a radio can run, or TETRA, which a radio or a symbol
+        // capture can: not until another chip is picked. Nor on a radio whose
+        // bandwidth cannot filter the AM channel.
         if (step === 1)
             return hangtimeValid() && encryptionValid && (!radioSource || sessionArgs.freqValid(freqText))
-                && (radioSource || !Util.decodeFlagNeedsRadio(decodeFlag)) && amBandwidthError().length === 0;
+                && decodeFlagRunsHere(decodeFlag) && amBandwidthError().length === 0;
         return hangtimeValid() && encryptionValid && nameText.trim().length > 0;
     }
 
@@ -942,21 +977,22 @@ Item {
 
                             objectName: "wizardDecode_" + modelData.label
                             text: modelData.label
-                            // AM needs the radio's I/Q (issue #524): network and file audio arrives demodulated.
-                            enabled: modelData.iqOnly !== true || wizard.radioSource
+                            // AM needs the radio's I/Q (issue #524), TETRA the radio's I/Q or a symbol capture:
+                            // network and other file audio arrives demodulated.
+                            enabled: wizard.decodeFlagRunsHere(modelData.flag)
                             selected: wizard.decodeFlag === modelData.flag
                             onClicked: wizard.pickDecodeFlag(modelData.flag)
                         }
                     }
                 }
 
-                // Why the AM chip is greyed out on a network or file source,
-                // rather than leaving a dead control (issue #524).
+                // Why the AM and TETRA chips are greyed out on a network or file
+                // source, rather than leaving a dead control (issue #524).
                 Text {
                     objectName: "wizardDecodeIqNote"
                     visible: !wizard.radioSource
                     width: parent.width
-                    text: qsTr("AM needs a radio source: network and file audio arrives already demodulated.")
+                    text: qsTr("AM needs a radio source, and TETRA one or a symbol capture (.bin): network and file audio arrives already demodulated.")
                     font.family: Theme.sans
                     font.pixelSize: Theme.fontSize(12)
                     color: Theme.textSecondary

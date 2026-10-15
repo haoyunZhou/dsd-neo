@@ -7,6 +7,7 @@
 #include <dsd-neo/core/parse.h>
 #include <dsd-neo/core/power.h>
 #include <dsd-neo/platform/posix_compat.h>
+#include <dsd-neo/runtime/analog_channel.h>
 #include <dsd-neo/runtime/freq_parse.h>
 #include <dsd-neo/runtime/input_spec.h>
 #include <dsd-neo/runtime/log.h>
@@ -18,40 +19,6 @@
 #include <string.h>
 #include "dsd-neo/core/opts_fwd.h"
 #include "dsd-neo/core/safe_api.h"
-
-/* Analog channel widths use 4..48. The rest are integer samples per TETRA symbol at 18 ksym/s:
- * 36=2, 54=3, 72=4, 90=5, 108=6, 144=8. */
-static const int k_rtl_dsp_bw_khz[] = {4, 6, 8, 12, 16, 24, 36, 48, 54, 72};
-
-int
-dsd_rtl_dsp_bw_khz_is_valid(int bw) {
-    for (size_t i = 0; i < sizeof k_rtl_dsp_bw_khz / sizeof k_rtl_dsp_bw_khz[0]; i++) {
-        if (k_rtl_dsp_bw_khz[i] == bw) {
-            return 1;
-        }
-    }
-    return 0;
-}
-
-int
-dsd_rtl_dsp_bw_khz_nearest(int bw) {
-    int best = k_rtl_dsp_bw_khz[0];
-    int best_dist = bw - best;
-    if (best_dist < 0) {
-        best_dist = -best_dist;
-    }
-    for (size_t i = 1; i < sizeof k_rtl_dsp_bw_khz / sizeof k_rtl_dsp_bw_khz[0]; i++) {
-        int dist = bw - k_rtl_dsp_bw_khz[i];
-        if (dist < 0) {
-            dist = -dist;
-        }
-        if (dist < best_dist) {
-            best_dist = dist;
-            best = k_rtl_dsp_bw_khz[i];
-        }
-    }
-    return best;
-}
 
 static int
 looks_like_soapy_kv_args(const char* tok) {
@@ -221,7 +188,7 @@ parse_soapy_optional_front(char* tok[SOFTY_TOK_MAX], size_t n, size_t* cur, int*
         return -1;
     }
     if (rc > 0) {
-        *bw = dsd_rtl_dsp_bw_khz_is_valid(iv) ? iv : 48;
+        *bw = dsd_analog_rtl_dsp_bw_or_default(iv);
     }
 
     return 0;
@@ -428,12 +395,9 @@ int
 dsd_rtl_spec_bw_khz_or_default(const char* token) {
     int bw = 0;
     if (!token || rtl_spec_parse_int(token, &bw) != 0) {
-        return 48;
+        return DSD_ANALOG_RTL_DSP_BW_DEFAULT_KHZ;
     }
-    if (dsd_rtl_dsp_bw_khz_is_valid(bw)) {
-        return bw;
-    }
-    return 48;
+    return dsd_analog_rtl_dsp_bw_or_default(bw);
 }
 
 /* A trailing token: `bias` or `b` alone (or with an empty value) turns the bias tee on, and `bias=<value>` /

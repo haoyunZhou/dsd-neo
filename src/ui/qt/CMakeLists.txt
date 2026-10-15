@@ -42,6 +42,8 @@ target_sources(
         scan_list_targets.cpp
         scan_list_starter.cpp
         spectrum_model.cpp
+        signal_search_model.cpp
+        known_frequency_index.cpp
         spectrum_view_item.cpp
         session_args.cpp
         talkgroup_filter_model.cpp
@@ -128,6 +130,8 @@ qt_add_resources(
         qml/SegmentedControl.qml
         qml/SettingsScreen.qml
         qml/SpectrumScreen.qml
+        qml/SignalSearchScreen.qml
+        qml/SignalSearchRangeEditor.qml
         qml/SquelchSheet.qml
         qml/TalkgroupSaveFlow.qml
         qml/TalkgroupEditSheet.qml
@@ -181,6 +185,14 @@ qt_add_resources(
     FILES
         "${DSD_PFFFT_LICENSE_DIR}/pffft-LICENSE.txt"
         "${DSD_PFFFT_LICENSE_DIR}/pffft-NOTICES.txt"
+)
+
+qt_add_resources(
+    dsd-neo_ui_qt
+    "dsd_neo_tetra_crypto_notices"
+    PREFIX "/dsdneo/notices"
+    BASE "${DSD_TETRA_CRYPTO_LICENSE_DIR}"
+    FILES "${DSD_TETRA_CRYPTO_LICENSE_DIR}/tetra_crypto-LICENSE.txt"
 )
 
 # Qt's unprefixed `signals`/`slots`/`emit` macros collide with project C headers

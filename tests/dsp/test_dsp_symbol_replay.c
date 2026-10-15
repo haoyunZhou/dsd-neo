@@ -508,6 +508,42 @@ test_float_symbol_replay_scales_values(void) {
     opts.symbolfile = NULL;
 }
 
+/* A TETRA session reads a float symbol file's symbols as they are: the file holds the symbols an I/Q input's CQPSK
+ * demodulator recovered (outer levels +-3, inner +-1), and TETRA's frame-sync slicer cuts them at the fixed thresholds
+ * 0 and +-2 of that domain, as it cuts the RTL front end's symbols and a soft capture's. Scaled by 10000 like the other
+ * modes' symbols, both inner levels sliced as outer ones and no training sequence matched. */
+static void
+test_float_symbol_replay_keeps_tetra_symbols(void) {
+    static dsd_opts opts;
+    static dsd_state state;
+    init_symbol_replay_fixture(&opts, &state);
+    opts.audio_in_type = AUDIO_IN_SYMBOL_FLT;
+    opts.frame_tetra = 1;
+    state.rf_mod = 1;
+    opts.symbolfile = tmpfile();
+    assert(opts.symbolfile != NULL);
+    const float levels[] = {1.0f, 3.0f, -1.0f, -3.0f, 0.75f};
+    assert(fwrite(levels, sizeof(levels[0]), sizeof(levels) / sizeof(levels[0]), opts.symbolfile)
+           == sizeof(levels) / sizeof(levels[0]));
+    rewind(opts.symbolfile);
+    g_cleanup_calls = 0;
+    exitflag = 0;
+
+    for (size_t i = 0; i < sizeof(levels) / sizeof(levels[0]); i++) {
+        float symbol = getSymbol(&opts, &state, 0);
+        if (fabsf(symbol - levels[i]) > 0.0001f) {
+            DSD_FPRINTF(stderr, "FAIL: TETRA float symbol %zu read as %f, stored %f\n", i, (double)symbol,
+                        (double)levels[i]);
+            assert(0);
+        }
+    }
+    assert(state.symbolcnt == 5);
+    assert(g_cleanup_calls == 0);
+
+    fclose(opts.symbolfile);
+    opts.symbolfile = NULL;
+}
+
 static void
 test_float_symbol_replay_eof_sets_exitflag(void) {
     static dsd_opts opts;
@@ -3061,6 +3097,7 @@ test_carrier_stamp_at_an_unusable_tap_rate(void) {
     feed_tone_blocks(&opts, &state, 2);
     assert(state.analog_rx.tone_state == DSD_ANALOG_TONE_STATE_UNAVAILABLE && state.analog_rx.carrier_open == 1);
     assert(dsd_analog_rx_carrier_open_now(&opts, &state) == 1);
+    assert(dsd_analog_rx_carrier_observed_now(&opts, &state) == 1);
     assert(state.last_cc_sync_time != 0 && state.last_cc_sync_time_m > 0.0);
     assert(state.last_vc_sync_time != 0 && state.last_vc_sync_time_m > 0.0);
 
@@ -3068,10 +3105,19 @@ test_carrier_stamp_at_an_unusable_tap_rate(void) {
        sees the retune is dropped (at this rate a read is a whole block), and the next one opens the new channel's. */
     dsd_trunk_tuning_generation_advance();
     assert(dsd_analog_rx_carrier_open_now(&opts, &state) == 0);
+    /* Nor has the tap judged the new channel: a closed carrier there is no verdict yet (Signal search waits on this). */
+    assert(dsd_analog_rx_carrier_observed_now(&opts, &state) == 0);
     feed_tone_blocks(&opts, &state, 1);
     assert(dsd_analog_rx_carrier_open_now(&opts, &state) == 0);
+    assert(dsd_analog_rx_carrier_observed_now(&opts, &state) == 0);
     feed_tone_blocks(&opts, &state, 1);
     assert(dsd_analog_rx_carrier_open_now(&opts, &state) == 1);
+    assert(dsd_analog_rx_carrier_observed_now(&opts, &state) == 1);
+    /* A reset sets the samples in hand aside: nothing is judged until the next read. */
+    dsd_analog_rx_reset(&state);
+    assert(dsd_analog_rx_carrier_observed_now(&opts, &state) == 0);
+    feed_tone_blocks(&opts, &state, 1);
+    assert(dsd_analog_rx_carrier_observed_now(&opts, &state) == 1);
 
     /* The squelch closes over the -23.8 dBFS block: the carrier holds through the 200 ms hangover (76800 samples, 80
        blocks), then nothing stamps. */
@@ -3080,6 +3126,8 @@ test_carrier_stamp_at_an_unusable_tap_rate(void) {
     assert(state.analog_rx.carrier_open == 1 && dsd_analog_rx_carrier_open_now(&opts, &state) == 1);
     feed_tone_blocks(&opts, &state, 1);
     assert(state.analog_rx.carrier_open == 0 && dsd_analog_rx_carrier_open_now(&opts, &state) == 0);
+    /* A judged, closed channel: a verdict, which a quiet timer may count from. */
+    assert(dsd_analog_rx_carrier_observed_now(&opts, &state) == 1);
     assert(state.analog_rx.tone_state == DSD_ANALOG_TONE_STATE_UNAVAILABLE);
     clear_carrier_stamps(&state);
     feed_tone_blocks(&opts, &state, 2);
@@ -5133,6 +5181,7 @@ main(void) {
     test_unsupported_soft_headers_are_rejected();
     test_soft_header_without_record_cleans_up_at_eof();
     test_float_symbol_replay_scales_values();
+    test_float_symbol_replay_keeps_tetra_symbols();
     test_float_symbol_replay_eof_sets_exitflag();
     test_soft_symbol_replay_bounds_stored_symbols();
     test_float_symbol_replay_bounds_stored_symbols();

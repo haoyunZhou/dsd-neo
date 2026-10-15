@@ -542,10 +542,10 @@ if(DSD_ENABLE_FAST_MATH)
             $<$<COMPILE_LANGUAGE:CXX>:-fno-math-errno>
         )
     elseif(MSVC)
-        add_compile_options(
-            $<$<COMPILE_LANGUAGE:C>:/fp:fast>
-            $<$<COMPILE_LANGUAGE:CXX>:/fp:fast>
-        )
+        # Wait for the per-source and per-target IEEE exceptions before
+        # choosing /fp:fast; conflicting /fp modes produce MSVC D9025.
+        include(MsvcFastMath)
+        cmake_language(DEFER CALL dsd_msvc_fast_math "${PROJECT_SOURCE_DIR}")
     endif()
 endif()
 
@@ -1336,6 +1336,7 @@ add_custom_target(
 )
 
 include(cmake/Pffft.cmake)
+include(cmake/TetraCrypto.cmake)
 
 # Install license/notice files with binaries
 install(
@@ -1351,6 +1352,10 @@ install(
     FILES
         "${DSD_PFFFT_LICENSE_DIR}/pffft-LICENSE.txt"
         "${DSD_PFFFT_LICENSE_DIR}/pffft-NOTICES.txt"
+    DESTINATION ${CMAKE_INSTALL_DOCDIR}/licenses
+)
+install(
+    FILES "${DSD_TETRA_CRYPTO_LICENSE_DIR}/tetra_crypto-LICENSE.txt"
     DESTINATION ${CMAKE_INSTALL_DOCDIR}/licenses
 )
 if(DSD_HAS_AIRSPY)

@@ -1,115 +1,52 @@
-TETRA speech codec
+# TETRA tools
 
-dsd-neo stops at a 137-bit speech frame. When CMake is given a local ETSI
-`C-CODE` directory (`ETSI_TETRA_C_CODE`, or
-`third_party/tetra_acelp/reference/C-CODE` after `prepare.ps1`), that decoder
-is linked into the process and no vocoder command is required. The sources are
-not fetched or redistributed by this repository.
+## Speech codec
 
-`TETRA_VOCODER_CMD` still forces the older pipe protocol. Use it for the test
-stub or for a separately built adapter. Downloading the standard from ETSI
-does not make those sources redistributable here.
+dsd-neo decodes a TETRA traffic channel down to 137-bit speech frames, checks each burst's CRC and plays the PCM a
+speech codec library makes of them. The ETSI EN 300 395-2 codec is not in this repository and the dsd-neo build does
+not compile one: downloading the standard from ETSI does not make its sources redistributable here. A user who has a
+codec names its shared library with `--tetra-codec <file>`; without one TETRA decodes as usual and plays no speech.
 
-- Automated tests point `TETRA_VOCODER_CMD` at `vocoder_stub.py` below. The stub
-  returns silence and checks the pipe, not speech quality.
-- For real speech, point the top-level build at the same `C-CODE` directory
-  with `-DETSI_TETRA_C_CODE`. dsd-neo then decodes in-process. A local
-  preparation helper is in `third_party/tetra_acelp/`. The separate
-  `acelp_adapter/` executable remains available when a pipe is required;
-  its build instructions are in `acelp_adapter/README.md`.
-- Do not commit the ETSI archive, the `C-CODE` tree, or the adapter binary.
-  A local checkout dropped under `tools/tetra/etsi/` or
-  `acelp_adapter/C-CODE/` is gitignored.
-- Linux and macOS launch the command with `sh -c`. Windows launches it with
-  `cmd.exe /C`. Both sides use the same pipe: 137 bytes in (one byte per bit,
-  value 0 or 1), 480 bytes out (240 PCM16LE samples at 8 kHz). Write diagnostics
-  to stderr.
+The library exports four C functions, described in `include/dsd-neo/protocol/tetra/tetra_codec_abi.h`:
+
+| Function | Does |
+| --- | --- |
+| `uint32_t dsd_tetra_codec_abi_version(void)` | Returns the interface version, 1 |
+| `void* dsd_tetra_codec_create(void)` | Makes a decoder in its reset state, or returns NULL |
+| `int dsd_tetra_codec_decode(void* codec, const uint8_t* bits, int bad_frame, int16_t* pcm)` | Decodes one speech frame: 137 bytes, each 0 or 1, to 240 samples at 8 kHz; returns 0 on success |
+| `void dsd_tetra_codec_destroy(void* codec)` | Frees a decoder |
+
+dsd-neo loads the library once, on its decoder thread, the first time TETRA speech needs decoding, and refuses one
+that reports another interface version or lacks a function, with one error naming the reason. A frame whose CRC failed
+reaches the codec with `bad_frame` set, for the codec to conceal. The library is opened by the path given, relative to
+the working directory when it is not absolute, never from the system's library search path.
+
+- `acelp_adapter/` builds such a library from a local copy of the ETSI reference decoder on Linux, macOS and
+  Windows: configure it as its own CMake project with `-DETSI_TETRA_C_CODE` pointing at the `C-CODE` directory, then
+  pass the library it builds to `--tetra-codec`. See `acelp_adapter/README.md`. Do not commit the ETSI archive, its
+  `C-CODE` tree or a library built from it; `tools/tetra/etsi/` and `tools/tetra/acelp_adapter/C-CODE/` are ignored by
+  git for local copies.
+- The tests use a codec of their own (`tests/protocol/tetra/tetra_test_codec.c`) that makes no speech, only samples
+  that say which frame they came from; it says nothing about speech quality.
+
+```sh
+dsd-neo -fT --tetra-codec /path/to/libtetra-codec.so -i rtl:0:392.5M:0:0:72
+```
 
 ## Crypto libraries
 
-Air-interface and end-to-end crypto are vcpkg overlay ports, the same way
-`mbe-neo` and `codec2` are. Do not clone them into this directory. A leftover
-checkout under `tools/tetra/TETRA_crypto/` or `tools/tetra/TETRA_etee/` is
-gitignored and is not used.
+TETRA air-interface decryption uses the TEA1, TEA2 and TEA3 keystream
+generators from MidnightBlueLabs/TETRA_crypto (Apache-2.0). Like PFFFT, the
+build downloads the archive pinned in `tools/ci-dependency-pins.env`, checks its
+SHA-256 and compiles `tea1.c`, `tea2.c` and `tea3.c` into the internal
+`dsd-neo_tetra_crypto` target on every platform, so no package has to be
+installed first. `src/crypto/tetra_tea.c` is the only file that includes them
+and packs the frame-number IV itself. Offline builds, updates and AUR packaging
+are described in `docs/dependencies.md` ("Pinned TETRA_crypto source").
 
-| Port | Upstream | Role |
-| --- | --- | --- |
-| `vcpkg-ports/tetracrypto` | MidnightBlueLabs/TETRA_crypto | TEA1, TEA2, TEA3, HURDLE, TAA1 |
-| `vcpkg-ports/tetraetee` | MidnightBlueLabs/TETRA_etee | End-to-end E-functions; links OpenSSL |
+## Real-air fixtures
 
-Both upstream repositories are Apache-2.0. Windows and Android presets install
-the ports from `vcpkg.json`. Linux and macOS builds that do not use vcpkg
-install the same CMake projects with `tools/install_tetra_crypto_deps.sh`.
-Commits and archive hashes are pinned in `tools/ci-dependency-pins.env`.
-The `tetracrypto` port force-includes a small endian compatibility header so
-those sources stay unchanged on MSVC. The `tetraetee` port replaces the unused
-GNU `min()` macro and the variable-length arrays with fixed buffers before
-compiling, because MSVC rejects both. Linux and macOS builds keep the upstream
-sources.
-
-Vocoder stub and testing
-
-Quick test for `TETRA_VOCODER_CMD` integration
-
-- Make the stub executable (Linux/macOS):
-
-```bash
-chmod +x tools/tetra/vocoder_stub.py
-```
-
-- Example: run dsd-neo with the stub as the vocoder (POSIX shells):
-
-```bash
-export TETRA_VOCODER_CMD="$PWD/tools/tetra/vocoder_stub.py"
-./build/<your_dsd_binary> [args]
-```
-
-- On Windows (PowerShell), set environment variable then run your dsd binary:
-
-```powershell
-$tetraPython = (Get-Command python).Source
-$tetraStub = Join-Path $PWD 'tools\tetra\vocoder_stub.py'
-$env:TETRA_VOCODER_CMD = '"{0}" "{1}"' -f $tetraPython, $tetraStub
-# run your binary from the same session
-```
-
-Notes:
-- The stub writes raw 16-bit little-endian PCM silence frames to stdout.
-- Replace `TETRA_VOCODER_CMD` with the path to a real command-line vocoder when available.
-- The command stays running across frames. For each frame it reads exactly
-  137 bytes from stdin (one byte per bit, each 0 or 1), writes exactly 480 bytes
-  (240 samples, 30 ms) of signed PCM16LE at 8 kHz mono, and flushes stdout. Two
-  such exchanges make one decoded TCH/FS block pair.
-- Send diagnostics to stderr; extra stdout bytes corrupt PCM framing.
-- The decoder bounds PCM reads with a two-second deadline. Missing commands,
-  short output and timeout are covered by the `TETRA_ACELP_*` CTest cases.
-- The stub produces silence and does not establish ACELP speech correctness.
-  Real voice acceptance requires a real codec and an independently checked
-  audio reference. See [the six-stage checklist](../../docs/tetra-implementation-status.md).
-
-## Field-capture acceptance
-
-`verify_field_capture.py` checks a retuned IQ evidence bundle before it is used
-to close the hardware trunk-tracking gate. A structural check validates the v2
-event timeline, exact data size, sample alignment, zero capture/input drops,
-and a captured CC-to-VC-to-CC sequence:
-
-```bash
-python tools/tetra/verify_field_capture.py capture.iq.json \
-  --cc-hz 390000000 --vc-hz 391000000
-```
-
-The acceptance form additionally requires a provenance document based on
-`FIELD_CAPTURE_PROVENANCE.template.md` and a log from
-realtime replay. The log must contain, in order, a BSCH decode, channel
-allocation, TCH/FS decode, and a later BSCH decode after the return. It writes a
-machine-readable report containing hashes for all evidence files:
-
-```bash
-dsd-neo --iq-replay capture.iq.json --iq-replay-rate realtime -fT \
-  --frontend terminal >capture.log 2>&1
-python tools/tetra/verify_field_capture.py capture.iq.json \
-  --cc-hz 390000000 --vc-hz 391000000 \
-  --decode-log capture.log --provenance PROVENANCE.md --acceptance \
-  --report ACCEPTANCE.json
-```
+`prepare_real_air_fixture.py` reproduces the derived TETRA real-air fixtures
+in `tests/fixtures/iq` from the preserved upstream captures and checks every
+input and output hash; `tests/fixtures/iq/tetra_scbs_real_air.PROVENANCE.md`
+records the sources.

@@ -29,6 +29,7 @@
 #include <dsd-neo/core/dmr_key_map.h>
 #include <dsd-neo/core/enc_lockout.h>
 #include <dsd-neo/core/key_set.h>
+#include <dsd-neo/core/tetra_publication.h>
 
 #include <dsd-neo/protocol/p25/p25_cc_candidates.h>
 #include <dsd-neo/protocol/p25/p25_status_symbol.h>
@@ -38,26 +39,65 @@
  * truncated to 63 characters plus the terminator. */
 #define DSD_CHANNEL_LABEL_SIZE 64
 
-/* Recent decoded TETRA messages for the terminal UI. The decoder owns writes;
- * the UI reads the published state snapshot, never the live decoder state. */
-#define DSD_TETRA_MESSAGE_CAPACITY 16
-#define DSD_TETRA_MESSAGE_TEXT_SIZE 144
-typedef enum {
-    DSD_TETRA_MESSAGE_CALL = 1,
-    DSD_TETRA_MESSAGE_CONTROL = 2,
-    DSD_TETRA_MESSAGE_SDS = 3,
-} dsd_tetra_message_category;
-
+/* The TETRA burst capture the frame sync hands to the TETRA decoder (dsd_state::tetra_sync). */
 typedef struct {
-    uint8_t category;
-    char text[DSD_TETRA_MESSAGE_TEXT_SIZE];
-} dsd_tetra_message;
+    /* ─────────────────────────────────────────────────────────────────────────
+     * TETRA NDB Block 1 capture
+     *
+     * The NDB sync scan window consumes Block 1 before processTetraFrame() is
+     * called.  At TETRA sync detection the 108 hard dibits of Block 1 are saved
+     * here from the scan buffer so the frame processor can decode both blocks.
+     *
+     * b1_valid:   1 when b1_dibuf holds a fresh capture, cleared
+     *                   after processTetraFrame() consumes it.
+     * polarity:   0 = normal (+TETRA), 1 = inverted (-TETRA).
+     *                     Written by the frame sync from a synchronisation
+     *                     burst, and by the decoder from a control uplink
+     *                     burst whose SCH/HU passed its CRC.
+     * nts2:        1 = this NDB matched training sequence 2.
+     * cb:          1 = the frame sync locked a control uplink burst. Every
+     *                     TETRA lock sets it; it stays for the burst's
+     *                     publication (control uplink mode).
+     * ───────────────────────────────────────────────────────────────────────── */
+    uint8_t b1_dibuf[108];
+    float b1_soft[108];
+    uint8_t b1_valid;
+    uint8_t b1_soft_valid;
+    uint8_t polarity;
+    uint8_t nts2;
+    /* How many 90° slicer steps to undo before FEC. 0 keeps the historical
+     * mapping; 1..3 correct a Costas phase that still correlates the training
+     * word but not against the unrotated pattern. */
+    uint8_t phase_rot;
+    uint8_t cb;
+
+    /* sb1_dibuf: 60 hard dibits of the BSCH block captured from the
+     * synchronisation burst (SB) scan window at SSB detection.
+     * sb1_valid: 1 when sb1_dibuf holds a fresh capture. */
+    uint8_t sb1_dibuf[60];
+    float sb1_soft[60];
+    uint8_t sb1_valid;
+    uint8_t sb1_soft_valid;
+    /* Set by the decoder: 1 when block 1 sits directly against the training sequence (direct mode and the
+     * uplink normal burst have no AACH), so the frame sync captures it from the right symbols. */
+    uint8_t block1_follows_training;
+
+    /* The first b2_lead_count dibits of block 2 (0 or 2), hard and soft, which the frame sync read past the training
+     * sequence before it locked: on the uplink, normal training sequence 1 is also the middle of the control burst's
+     * extended training sequence, so an uplink normal burst is told from a control burst only two symbols after its
+     * training. The decoder takes them before it reads on; b2_lead_soft_valid is 0 when no soft values came with
+     * them. Every TETRA lock sets the count. */
+    uint8_t b2_lead_dibits[2];
+    float b2_lead_soft[2];
+    uint8_t b2_lead_count;
+    uint8_t b2_lead_soft_valid;
+} dsd_tetra_sync_capture;
 
 /* The highest frequency, in Hz, a trunking channel is stored or tuned at, the same on every platform: the largest value
  * a 32-bit long holds (long is 32-bit on Windows, and trunk frequencies are stored as long), which also fits the
  * uint32_t tuner path. No trunking band comes near it. A channel-map row, an over-the-air channel computation or a
  * cached control channel past it is refused rather than stored or tuned. */
-#define DSD_TRUNK_FREQ_MAX_HZ  2147483647L
+#define DSD_TRUNK_FREQ_MAX_HZ 2147483647L
 
 enum DSD_ATTR_PACKED {
     DSD_P25_MAC_FRAGMENT_MAX_OCTETS = 256,
@@ -751,6 +791,9 @@ struct dsd_state {
     // Multi-key array
     unsigned long long int rkey_array[0x1FFFF];
     unsigned char rkey_array_loaded[0x1FFFF];
+    // TETRA air-interface keys, one per network (--tetra-key). Kept here, outside every ui_snapshot.c copy range,
+    // for the same reason as rkey_array.
+    dsd_tetra_air_key tetra_air_keys[DSD_TETRA_AIR_KEY_SLOTS];
     // DMR talkgroup -> key ID override map (--dmr-tg-key-csv): a mapped talkgroup
     // selects its key id in place of the OTA-signaled one at key-activation time.
     // payload_keyid* stay the OTA truth; the map only steers the keyring lookup.
@@ -1648,7 +1691,10 @@ struct dsd_state {
 
     /* Input switches on the decoder thread (issue #634).
        input_interrupted: a frame-sync hunt read gave way to a queued command once its input had been silent for a
-       stream pause; getFrameSync() returns at once and the engine loop applies the command.
+       stream pause; getFrameSync() returns at once and the engine loop applies the command. A Signal search also sets
+       it inside a frame, when it leaves the frame or a live read gives up on a stalled input: getSymbol() then stands
+       erasures in for every symbol until the engine loop consumes it, and the frame decoders drop the frame
+       (dsd_state_frame_read_lost()).
        input_boundary: the stream the decoder read was replaced (a switch, a rollback that restarted it, a loss, a
        fallback); the engine ends the reception (noCarrier() and an explicit end of every call) before it decodes the
        new stream.
@@ -1658,7 +1704,8 @@ struct dsd_state {
     int input_boundary;
     /* The carrier boundary's count (issue #575): dsd_engine_carrier_boundary() bumps it whenever the receiver leaves a
        carrier. A decoder that buffers several bursts or frames before it decodes them notes it when collection starts,
-       and drops what it buffered, as on a sync loss, when it moved meanwhile: those bursts belong to the carrier left. */
+       and drops what it buffered, as on a sync loss, when it moved meanwhile: those bursts belong to the carrier left.
+       It drops them as well when an input interruption cut them (dsd_state_frame_read_lost()). */
     uint32_t carrier_seq;
     /* The frame processFrame() is dispatching (issue #661): its synctype, which a decoder borrowing another protocol's
        vocoder (YSF, scrambled dPMR) leaves alone while it changes synctype, and carrier_seq when dispatch began.
@@ -2019,6 +2066,9 @@ struct dsd_state {
        the readout shows the tracker during a call and what it is for between calls. Written on the decoder thread;
        rides the vertex_ks_count..ui_msg range. */
     uint8_t squelch_edacs_call;
+    /* What the TETRA decoder shows every frontend (dsd_tetra_publication), copied from its private state extension at
+       the end of each burst. Rides the vertex_ks_count..ui_msg range. */
+    dsd_tetra_publication tetra_pub;
 
     // Transient UI message (shown briefly in ncurses printer)
     char ui_msg[128];
@@ -2026,6 +2076,10 @@ struct dsd_state {
     // Extension slots for module-owned per-state allocations (see core/state_ext.h).
     void* state_ext[DSD_STATE_EXT_MAX];
     dsd_state_ext_cleanup_fn state_ext_cleanup[DSD_STATE_EXT_MAX];
+    /* The TETRA burst the frame sync captured at a training sequence (dsd_tetra_sync_capture): written by the
+     * frame sync and read by the TETRA decoder for the same burst. Decoder-thread private; never published.
+     * The rest of the TETRA decoder state lives in its state extension (src/protocol/tetra/tetra_state.h). */
+    dsd_tetra_sync_capture tetra_sync;
 
     /* ─────────────────────────────────────────────────────────────────────────
      * TETRA NDB Block 1 capture
@@ -2991,6 +3045,16 @@ struct dsd_state {
 // cppcheck-suppress-end uninitMemberVarNoCtor
 
 // NOLINTEND(clang-analyzer-optin.performance.Padding)
+
+/* Whether a frame decoder that noted @p carrier_seq when it began reading must drop what it read, as on a sync loss:
+   the carrier boundary moved the carrier count meanwhile (issue #575), or an input interruption cut the frame
+   (input_interrupted: a Signal search left it, or a live read gave up on a stalled input), after which getSymbol()
+   stood erasures in for every symbol. Either way part of the frame is not the transmission's, so nothing of it may
+   decode, play or publish. */
+static inline int
+dsd_state_frame_read_lost(const dsd_state* state, uint32_t carrier_seq) {
+    return state->carrier_seq != carrier_seq || state->input_interrupted != 0;
+}
 
 static inline int
 dsd_state_trunk_chan_valid(uint32_t channel) {

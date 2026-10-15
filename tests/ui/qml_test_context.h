@@ -1849,6 +1849,15 @@ class Setup : public QObject {
         }
     }
 
+    /** Publish the `signalSearch` model Main.qml reads, so a case can load Main over a search the decoder already
+     * owns, as a recreated Activity does. Null withdraws it: the name then reads as undefined again, which is how
+     * Main and every other case see a fixture without the model. */
+    Q_INVOKABLE void
+    setSignalSearchModel(QObject* model) {
+        m_engine->rootContext()->setContextProperty(QStringLiteral("signalSearch"),
+                                                    model != nullptr ? QVariant::fromValue(model) : QVariant());
+    }
+
     // Qt.platform.os is read-only. Load the production shell with only that
     // platform reading substituted so desktop tests exercise the Android gate.
     // Reject source drift instead of silently changing unrelated platform checks.
@@ -2352,6 +2361,8 @@ class Setup : public QObject {
         metrics[QStringLiteral("snrDb")] = 0.0;
         metrics[QStringLiteral("cfoHz")] = 0.0;
         metrics[QStringLiteral("airspy")] = QVariantMap();
+        // The receiver the session runs on, as the Qt start path names it; none at rest.
+        metrics[QStringLiteral("radioSource")] = QVariantMap();
         metrics[QStringLiteral("tunerGainText")] = QStringLiteral("auto");
         // WP-F3 decode quality: validity is independent of radioInput.
         metrics[QStringLiteral("qualityValid")] = false;
@@ -2531,17 +2542,18 @@ class Setup : public QObject {
         metrics[QStringLiteral("nfmBandwidthUnsetHz")] = 16000;
         metrics[QStringLiteral("amBandwidthUnsetHz")] = 6000;
         metrics[QStringLiteral("ppm")] = 0;
-        // TETRA network identity and the current control/traffic allocations.
-        // Hidden at rest until the decoder has accepted network information.
-        metrics[QStringLiteral("tetraNetworkKnown")] = false;
+        // The TETRA rows (app_control/tetra_view.h): hidden at rest, until the TETRA preset has decoded a block.
+        metrics[QStringLiteral("tetraVisible")] = false;
+        metrics[QStringLiteral("tetraModeText")] = QString();
+        metrics[QStringLiteral("tetraEncrypted")] = false;
         metrics[QStringLiteral("tetraNetworkText")] = QString();
-        metrics[QStringLiteral("tetraTrunkStateText")] = QString();
-        metrics[QStringLiteral("tetraControlChannelText")] = QString();
-        metrics[QStringLiteral("tetraTrafficChannelText")] = QString();
-        metrics[QStringLiteral("tetraMmStatusKnown")] = false;
+        metrics[QStringLiteral("tetraTrunkText")] = QString();
+        metrics[QStringLiteral("tetraOnTraffic")] = false;
+        metrics[QStringLiteral("tetraControlText")] = QString();
+        metrics[QStringLiteral("tetraTrafficText")] = QString();
         metrics[QStringLiteral("tetraMmStatusText")] = QString();
-        metrics[QStringLiteral("tetraVocoderStatusKnown")] = false;
-        metrics[QStringLiteral("tetraVocoderStatusText")] = QString();
+        metrics[QStringLiteral("tetraCodecText")] = QString();
+        metrics[QStringLiteral("tetraCodecFault")] = false;
         m_metrics = metrics;
         m_engine = engine;
         m_metric_readings = new ReadingMap(engine);

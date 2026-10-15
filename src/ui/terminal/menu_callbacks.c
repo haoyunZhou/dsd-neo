@@ -19,6 +19,7 @@
 #include <dsd-neo/core/state.h>
 #include <dsd-neo/core/state_fwd.h>
 #include <dsd-neo/platform/posix_compat.h>
+#include <dsd-neo/runtime/analog_channel.h>
 #include <dsd-neo/runtime/config.h>
 #include <dsd-neo/runtime/input_spec.h>
 #include <dsd-neo/runtime/squelch.h>
@@ -1061,10 +1062,13 @@ cb_rtl_bw(void* u, int ok, int bw) {
     }
     if (ok) {
         int adjusted = 0;
-        const int best = dsd_rtl_dsp_bw_khz_nearest(bw);
+        /* Snapped to the nearest selectable bandwidth, the narrower of two as near. */
+        const int best = dsd_analog_rtl_dsp_bw_nearest(bw, DSD_ANALOG_RTL_DSP_BW_MAX_KHZ);
         if (best != bw) {
+            char allowed[64];
+            (void)dsd_analog_rtl_dsp_bw_list(DSD_ANALOG_RTL_DSP_BW_MAX_KHZ, allowed, sizeof allowed);
             adjusted = 1;
-            ui_statusf("RTL BW adjusted to %d kHz (allowed: 4,6,8,12,16,24,36,48,54,72)", best);
+            ui_statusf("RTL BW adjusted to %d kHz (allowed: %s)", best, allowed);
         }
         bw = best;
         int32_t v = bw;

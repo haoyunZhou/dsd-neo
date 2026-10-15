@@ -802,7 +802,8 @@ validate_replay_semantics(const dsd_iq_replay_config* cfg, char* err_buf, size_t
 
 /* The sample format and capture stage pairs a replay can convert to the demodulator's float input, as the replay
  * reader's converters do (replay_convert_block_to_f32() in rtl_device.cpp): cu8 at either capture stage, cf32 only
- * as the driver delivered it, before the input ring, and little-endian cs16 at post_mute_pre_widen. */
+ * as the driver delivered it, before the input ring, and little-endian cs16 only at the cu8 stage, where it stands in
+ * for a widened cu8 capture. */
 static int
 validate_replay_convertible(const dsd_iq_replay_config* cfg, char* err_buf, size_t err_buf_size) {
     if (cfg->format == DSD_IQ_FORMAT_CU8) {

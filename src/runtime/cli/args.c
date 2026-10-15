@@ -47,6 +47,7 @@
 #include <dsd-neo/runtime/rdio_export.h>
 #include <dsd-neo/runtime/scan_mode.h>
 #include <dsd-neo/runtime/squelch.h>
+#include <dsd-neo/runtime/tetra_rate.h>
 #include <errno.h>
 #include <inttypes.h>
 #include <stdio.h>
@@ -763,6 +764,36 @@ cli_check_am_input(dsd_opts* opts, dsd_state* state, int cli_chose_am, int* out_
     return 0;
 }
 
+/* TETRA decodes from an I/Q radio input or a symbol capture only (dsd_decode_mode_runs_on_input_spec()): discriminator
+ * audio has lost the phase steps of its pi/4-DQPSK. -fT on a PCM input is an error, as -fM is. [mode] decode = tetra
+ * from a loaded config keeps the mode, which has no Analog sibling to fall back to as AM has, and says that nothing will
+ * decode on this input. */
+static int
+cli_check_tetra_input(const dsd_opts* opts, int cli_chose_tetra, int* out_exit_rc) {
+    if (dsd_infer_decode_mode_preset_exact(opts) != DSDCFG_MODE_TETRA
+        || dsd_decode_mode_runs_on_input_spec(DSDCFG_MODE_TETRA, opts)) {
+        return 0;
+    }
+    if (cli_chose_tetra) {
+        LOG_ERROR("-fT: %s\n", DSD_DECODE_MODE_TETRA_NEEDS_IQ_TEXT);
+        cli_set_exit_rc(out_exit_rc, 1);
+        return -1;
+    }
+    LOG_WARN("WARNING: [mode] decode = tetra: %s. Nothing decodes on this input.\n",
+             DSD_DECODE_MODE_TETRA_NEEDS_IQ_TEXT);
+    return 0;
+}
+
+/* The presets an input cannot carry (cli_check_am_input(), cli_check_tetra_input()), with @p cli_mode the preset a -f
+   selector chose, DSDCFG_MODE_UNSET for none. */
+static int
+cli_check_preset_input(dsd_opts* opts, dsd_state* state, dsdneoUserDecodeMode cli_mode, int* out_exit_rc) {
+    if (cli_check_am_input(opts, state, cli_mode == DSDCFG_MODE_AM, out_exit_rc) != 0) {
+        return -1;
+    }
+    return cli_check_tetra_input(opts, cli_mode == DSDCFG_MODE_TETRA, out_exit_rc);
+}
+
 static int
 cli_set_iqreplay_audio_dev(dsd_opts* opts, const char* path) {
     if (!opts || !path) {
@@ -864,6 +895,60 @@ cli_parse_airspy_option(int argc, char** argv, int i, dsd_opts* opts) {
         opts->airspy_config_error = 0;
     }
     return eq ? 1 : 2;
+}
+
+/* --tetra-codec <file>: the TETRA speech codec library, loaded when the first TETRA speech frame needs it, so a
+   missing or unsuitable library is reported then. The path keeps the user's ~ expansion and nothing else. */
+static int
+cli_set_tetra_codec(const char* spec, dsd_opts* opts) {
+    if (!spec || spec[0] == '\0') {
+        return -1;
+    }
+    char expanded[sizeof opts->tetra_codec_path];
+    if (dsd_path_expand_user(spec, expanded, sizeof expanded) != 0 || expanded[0] == '\0') {
+        return -1;
+    }
+    DSD_SNPRINTF(opts->tetra_codec_path, sizeof opts->tetra_codec_path, "%s", expanded);
+    return 0;
+}
+
+/* --tetra-net mcc,mnc,colour: the TETRA network identity scrambling starts from until a BSCH supplies one (an uplink
+   or a late-joined session never sees the BSCH). MCC is 10 bits, MNC 14 bits and the colour code 6 bits (EN 300 392-2
+   clause 8.2.5.2); the colour takes decimal or 0x hexadecimal. */
+static int
+cli_parse_tetra_net(const char* spec, dsd_opts* opts) {
+    char buf[48];
+    uint16_t mcc = 0;
+    uint16_t mnc = 0;
+    uint8_t colour = 0;
+    const size_t len = strlen(spec);
+    if (len >= sizeof(buf)) {
+        return -1;
+    }
+    DSD_MEMCPY(buf, spec, len + 1U);
+    char* const mnc_text = strchr(buf, ',');
+    char* const colour_text = mnc_text ? strchr(mnc_text + 1, ',') : NULL;
+    if (!colour_text) {
+        return -1;
+    }
+    *mnc_text = '\0';
+    *colour_text = '\0';
+    const char* colour_digits = colour_text + 1;
+    int colour_base = 10;
+    if (colour_digits[0] == '0' && (colour_digits[1] == 'x' || colour_digits[1] == 'X')) {
+        colour_digits += 2;
+        colour_base = 16;
+    }
+    if (dsd_parse_uint16_strict(buf, 10, 0x3FFU, &mcc) != 0
+        || dsd_parse_uint16_strict(mnc_text + 1, 10, 0x3FFFU, &mnc) != 0
+        || dsd_parse_uint8_strict(colour_digits, colour_base, 0x3FU, &colour) != 0) {
+        return -1;
+    }
+    opts->tetra_net_mcc = mcc;
+    opts->tetra_net_mnc = mnc;
+    opts->tetra_net_colour = colour;
+    opts->tetra_net_preset = 1;
+    return 0;
 }
 
 #define DSD_PARSE_ARGS_PRESCAN_BLOCK()                                                                                 \
@@ -1124,76 +1209,62 @@ cli_parse_airspy_option(int argc, char** argv, int i, dsd_opts* opts) {
             continue;                                                                                                  \
         }                                                                                                              \
         if (strcmp(argv[i], "--tetra-uplink") == 0) {                                                                  \
-            state->tetra_uplink = 1;                                                                                   \
-            LOG_INFO("NOTICE: TETRA uplink bursts enabled\n");                                                         \
+            opts->tetra_uplink = 1;                                                                                    \
             continue;                                                                                                  \
         }                                                                                                              \
         if (strcmp(argv[i], "--tetra-net") == 0 || strncmp(argv[i], "--tetra-net=", 12) == 0) {                        \
-            const char* net = (argv[i][11] == '=') ? argv[i] + 12 : NULL;                                             \
-            unsigned mcc = 0;                                                                                          \
-            unsigned mnc = 0;                                                                                          \
-            int colour = 0;                                                                                            \
+            const char* net = argv[i][11] == '=' ? argv[i] + 12 : NULL;                                                \
             if (net == NULL) {                                                                                         \
                 if (i + 1 >= argc) {                                                                                   \
-                    LOG_ERROR("--tetra-net requires mcc,mnc,colour\n");                                                \
+                    LOG_ERROR("--tetra-net requires mcc,mnc,colour (for example 262,1001,0x19)\n");                    \
                     cli_set_exit_rc(out_exit_rc, 1);                                                                   \
                     return DSD_PARSE_ERROR;                                                                            \
                 }                                                                                                      \
                 net = DSD_PARSE_ARGS_NEXT_ARG();                                                                       \
             }                                                                                                          \
-            if (!state->tetra_net_known) {                                                                             \
-                if (sscanf(net, "%u,%u,%i", &mcc, &mnc, &colour) != 3) {                                               \
-                    LOG_ERROR("--tetra-net requires mcc,mnc,colour (for example 86,28,0x19)\n");                       \
+            if (cli_parse_tetra_net(net, opts) != 0) {                                                                 \
+                LOG_ERROR("--tetra-net requires mcc,mnc,colour: MCC 0-1023, MNC 0-16383, colour 0-63 (decimal or "     \
+                          "0x hex)\n");                                                                                \
+                cli_set_exit_rc(out_exit_rc, 1);                                                                       \
+                return DSD_PARSE_ERROR;                                                                                \
+            }                                                                                                          \
+            continue;                                                                                                  \
+        }                                                                                                              \
+        if (strcmp(argv[i], "--tetra-codec") == 0 || strncmp(argv[i], "--tetra-codec=", 14) == 0) {                    \
+            const char* codec = argv[i][13] == '=' ? argv[i] + 14 : NULL;                                              \
+            if (codec == NULL) {                                                                                       \
+                if (i + 1 >= argc) {                                                                                   \
+                    LOG_ERROR("--tetra-codec requires the path of a TETRA speech codec library\n");                    \
                     cli_set_exit_rc(out_exit_rc, 1);                                                                   \
                     return DSD_PARSE_ERROR;                                                                            \
                 }                                                                                                      \
-                state->tetra_mcc = (uint16_t)(mcc & 0x3FFu);                                                           \
-                state->tetra_mnc = (uint16_t)(mnc & 0x3FFFu);                                                          \
-                state->tetra_colour = (uint8_t)(colour & 0x3Fu);                                                       \
-                state->tetra_lfsr_seed =                                                                               \
-                    tetra_compute_scramb_seed(state->tetra_mcc, state->tetra_mnc, state->tetra_colour);                \
-                state->tetra_net_known = 1;                                                                            \
-                LOG_INFO("NOTICE: TETRA network MCC=%u MNC=%u colour=%u\n", mcc & 0x3FFu, mnc & 0x3FFFu,               \
-                         (unsigned)(colour & 0x3F));                                                                   \
+                codec = DSD_PARSE_ARGS_NEXT_ARG();                                                                     \
+            }                                                                                                          \
+            if (cli_set_tetra_codec(codec, opts) != 0) {                                                               \
+                LOG_ERROR("--tetra-codec requires the path of a TETRA speech codec library (at most %zu bytes)\n",     \
+                          sizeof opts->tetra_codec_path - 1U);                                                         \
+                cli_set_exit_rc(out_exit_rc, 1);                                                                       \
+                return DSD_PARSE_ERROR;                                                                                \
             }                                                                                                          \
             continue;                                                                                                  \
         }                                                                                                              \
         if (strcmp(argv[i], "--tetra-key") == 0 || strncmp(argv[i], "--tetra-key=", 12) == 0) {                        \
-            const char* spec = (argv[i][11] == '=') ? argv[i] + 12 : NULL;                                            \
-            unsigned key_mcc = 0;                                                                                      \
-            unsigned key_mnc = 0;                                                                                      \
-            char hex[21];                                                                                              \
-            uint8_t key[10];                                                                                           \
-            int hex_ok = 1;                                                                                            \
+            const char* spec = argv[i][11] == '=' ? argv[i] + 12 : NULL;                                               \
             if (spec == NULL) {                                                                                        \
                 if (i + 1 >= argc) {                                                                                   \
-                    LOG_ERROR("--tetra-key requires mcc,mnc,20 hex digits\n");                                         \
+                    LOG_ERROR("--tetra-key requires mcc,mnc and 20 hex digits\n");                                     \
                     cli_set_exit_rc(out_exit_rc, 1);                                                                   \
                     return DSD_PARSE_ERROR;                                                                            \
                 }                                                                                                      \
                 spec = DSD_PARSE_ARGS_NEXT_ARG();                                                                      \
             }                                                                                                          \
-            hex[0] = '\0';                                                                                             \
-            if (sscanf(spec, "%u,%u,%20s", &key_mcc, &key_mnc, hex) != 3 || strlen(hex) != 20) {                       \
-                LOG_ERROR("--tetra-key requires mcc,mnc,20 hex digits\n");                                             \
+            if (dsd_key_apply_direct(state, DSD_KEY_TYPE_TETRA_AIR, spec, DSD_KEY_APPLY_OVERLAY)                       \
+                != DSD_KEY_DIRECT_OK) {                                                                                \
+                LOG_ERROR("--tetra-key requires mcc,mnc and 20 hex digits (MCC 0-1023, MNC 0-16383; keys for at most " \
+                          "four networks)\n");                                                                         \
                 cli_set_exit_rc(out_exit_rc, 1);                                                                       \
                 return DSD_PARSE_ERROR;                                                                                \
             }                                                                                                          \
-            for (int hi = 0; hi < 10; hi++) {                                                                          \
-                unsigned byte = 0;                                                                                     \
-                if (sscanf(hex + (hi * 2), "%2x", &byte) != 1) {                                                       \
-                    hex_ok = 0;                                                                                        \
-                    break;                                                                                             \
-                }                                                                                                      \
-                key[hi] = (uint8_t)byte;                                                                               \
-            }                                                                                                          \
-            if (!hex_ok) {                                                                                             \
-                LOG_ERROR("--tetra-key requires mcc,mnc,20 hex digits\n");                                             \
-                cli_set_exit_rc(out_exit_rc, 1);                                                                       \
-                return DSD_PARSE_ERROR;                                                                                \
-            }                                                                                                          \
-            tetra_air_key_set(state, (uint16_t)(key_mcc & 0x3FFu), (uint16_t)(key_mnc & 0x3FFFu), key);                \
-            LOG_INFO("NOTICE: TETRA air key loaded for MCC=%u MNC=%u\n", key_mcc & 0x3FFu, key_mnc & 0x3FFFu);         \
             continue;                                                                                                  \
         }                                                                                                              \
         if (strcmp(argv[i], "--iq-info") == 0) {                                                                       \
@@ -2933,6 +3004,9 @@ cli_report_short_opt_error(int c, int argc, char** argv) {
                 opts->monitor_input_audio = 0;                                                                         \
                 /* ... and the AM detector -fM chose: the M17 encoder shares the analog front end. */                  \
                 opts->analog_demod = DSD_ANALOG_DEMOD_FM;                                                              \
+                /* ... and TETRA, as every preset but TETRA leaves it: left on, `-fT -fp` runs TETRA beside ProVoice,  \
+                   a decoder set no preset describes, and the RTL demodulator is timed for neither. */                 \
+                dsd_decode_mode_leave_tetra(opts, state);                                                              \
             }                                                                                                          \
             const char decode_preset = optarg[0] == 'r' ? 's' : optarg[0];                                             \
             dsdneoUserDecodeMode core_mode = DSDCFG_MODE_UNSET;                                                        \
@@ -2966,6 +3040,13 @@ cli_report_short_opt_error(int c, int argc, char** argv) {
                     case 'm': LOG_INFO("NOTICE: Decoding only dPMR frames.\n"); break;                                 \
                     case 'z':                                                                                          \
                         LOG_INFO("NOTICE: Decoding only M17 frames (polarity auto-detected from preamble).\n");        \
+                        break;                                                                                         \
+                    case 'T':                                                                                          \
+                        /* As -fe takes 24 kHz: TETRA runs only at a multiple of 18 kHz. A bandwidth field in      \
+                           the -i spec, applied when the input opens, still names another. */                          \
+                        opts->rtl_dsp_bw_khz = DSD_TETRA_DSP_BW_KHZ;                                                   \
+                        LOG_INFO("NOTICE: Decoding only TETRA frames at a %d kHz DSP bandwidth.\n",                    \
+                                 DSD_TETRA_DSP_BW_KHZ);                                                                \
                         break;                                                                                         \
                     default: break;                                                                                    \
                 }                                                                                                      \
@@ -3498,7 +3579,7 @@ dsd_parse_short_opts(int argc, char** argv, dsd_opts* opts, dsd_state* state, in
     if (cli_decode_timing_seen && dsd_opts_source_uses_effective_input_rate(opts)) {
         int timing_rate_hz = dsd_opts_effective_input_rate(opts);
         if (cli_decode_timing_source == CLI_TIMING_SOURCE_PRESET && timing_rate_hz != 48000) {
-            dsd_apply_decode_mode_symbol_timing(cli_decode_timing_mode, timing_rate_hz, state);
+            (void)dsd_apply_decode_mode_symbol_timing(cli_decode_timing_mode, timing_rate_hz, state);
         } else if (cli_decode_timing_source == CLI_TIMING_SOURCE_MANUAL && cli_manual_timing_sps > 0) {
             state->samplesPerSymbol = cli_manual_timing_sps;
             state->symbolCenter = cli_manual_timing_center;
@@ -3508,7 +3589,8 @@ dsd_parse_short_opts(int argc, char** argv, dsd_opts* opts, dsd_state* state, in
             }
         }
     }
-    if (cli_check_am_input(opts, state, cli_decode_timing_seen && cli_decode_timing_mode == DSDCFG_MODE_AM, out_exit_rc)
+    if (cli_check_preset_input(opts, state, cli_decode_timing_seen ? cli_decode_timing_mode : DSDCFG_MODE_UNSET,
+                               out_exit_rc)
         != 0) {
         return DSD_PARSE_ERROR;
     }

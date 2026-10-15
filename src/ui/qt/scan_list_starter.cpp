@@ -16,10 +16,11 @@
 #include <QTemporaryFile>
 #include <QVariant>
 #include <QVariantList>
+#include <Qt>
+#include <QtGlobal>
 #include <dsd-neo/app_control/trunk_scan_validate.h>
 #include <dsd-neo/core/csv_validate.h>
 #include <dsd-neo/runtime/analog_channel.h>
-#include <initializer_list>
 #include <stdint.h>
 #include <utility>
 #include "app_prefs.h"
@@ -127,7 +128,7 @@ analogRateWarning(const QVariantMap& list, const SessionArgPrefs& prefs, const Q
     }
     const int listKhz = list.value("bandwidthKhz", -1).toInt();
     const int khz = listKhz > 0 ? listKhz : prefs.bandwidthKhz;
-    const int rateHz = (dsd_analog_rtl_dsp_bw_is_selectable(khz) ? khz : DSD_ANALOG_RTL_DSP_BW_MAX_KHZ) * 1000;
+    const int rateHz = dsd_analog_rtl_dsp_bw_or_default(khz) * 1000;
     const int nfmHz = configuredAnalogWidthHz(prefs.extraArgs, DSD_ANALOG_DEMOD_FM);
     const int amHz = configuredAnalogWidthHz(prefs.extraArgs, DSD_ANALOG_DEMOD_AM);
     int skipped = 0;
@@ -275,7 +276,7 @@ ScanListStarter::resolveSystems(const QVariantMap& list, QString* error) const {
                 }
                 const auto configuration = m_profiles->configuration(profile, &profileError);
                 if (!profileError.isEmpty()) {
-                    *error = profileError;
+                    *error = std::move(profileError);
                     return {};
                 }
                 for (auto i = configuration.cbegin(); i != configuration.cend(); ++i) {
@@ -311,7 +312,7 @@ ScanListStarter::resolveEntryProfiles(QVariantMap& prepared, QString* error) con
             const auto configuration =
                 m_profiles->configuration(entry.value("decryptionProfileUid").toString(), &profileError);
             if (!profileError.isEmpty()) {
-                *error = profileError;
+                *error = std::move(profileError);
                 return false;
             }
             entry.insert("decryptionConfiguration", configuration);

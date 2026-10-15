@@ -371,6 +371,40 @@ DPMR_SYNTH_FRAME_REPEATS = 30
 DPMR_SYNTH_NOISE_SIGMA = 0.02
 DPMR_DIBIT_TO_LEVEL = {1: 3.0, 0: 1.0, 2: -1.0, 3: -3.0}
 
+# Deterministic TETRA Synchronisation Bursts carrying one valid BSCH. The
+# physical channel runs at 18 ksym/s pi/4-DQPSK; the selected identity is
+# deliberately conspicuous in decoder output so the CTest assertion proves
+# that FEC and BSCH parsing ran, rather than accepting sync alone.
+TETRA_SYNTH_NAME = "tetra_bsch_synth"
+TETRA_INVERTED_NAME = "tetra_bsch_inverted"
+TETRA_BAD_CRC_NAME = "tetra_bsch_bad_crc"
+TETRA_IMPAIRED_NAME = "tetra_bsch_cfo_awgn"
+TETRA_THRESHOLD_PASS_NAME = "tetra_bsch_cfo_awgn_snr6"
+TETRA_MULTIPATH_NAME = "tetra_bsch_two_ray"
+TETRA_CLOCK_FAST_NAME = "tetra_bsch_clock_100ppm"
+TETRA_CLOCK_SLOW_NAME = "tetra_bsch_clock_minus_100ppm"
+TETRA_BAD_CRC_IMPAIRED_NAME = "tetra_bsch_bad_crc_cfo_awgn"
+# The same bursts at the 72 kHz RTL DSP bandwidth (4 samples per symbol), the rate an RTL-SDR runs TETRA at; fewer
+# repeats, since the replay only has to show that the 72 kHz chain decodes.
+TETRA_72K_NAME = "tetra_bsch_synth_72k"
+TETRA_72K_BURST_REPEATS = 25
+TETRA_SYMBOL_RATE = 18000
+TETRA_BURST_REPEATS = 100
+TETRA_IMPAIRED_SEED = 0x54455452
+TETRA_IMPAIRED_CFO_HZ = 300.0
+TETRA_IMPAIRED_SNR_DB = 14.0
+TETRA_THRESHOLD_PASS_SNR_DB = 6.0
+TETRA_TWO_RAY_DELAY_SAMPLES = 1
+TETRA_TWO_RAY_AMPLITUDE = 0.45
+TETRA_TWO_RAY_CFO_HZ = 3.0
+TETRA_TWO_RAY_PHASE_RAD = 2.2
+TETRA_CLOCK_ERROR_PPM = 100.0
+TETRA_SSB_SYNC = "3001213032213001213"
+TETRA_NTS_SYNC = "31003221310"
+TETRA_NTS2_SYNC = "13221003132"
+TETRA_PHASE_STEP = {0: math.pi / 4.0, 1: 3.0 * math.pi / 4.0,
+                    2: -math.pi / 4.0, 3: -3.0 * math.pi / 4.0}
+
 # Synthetic analog NFM carrying a CTCSS tone, for received-tone detection (issue #522).
 #
 # Each is an FM signal built through remodulate(): voice-band audio (noise band-limited to
@@ -485,6 +519,8 @@ METADATA_TEMPLATE = """{{
 # sidecar every fixture without events has.
 SIDECAR_DEFAULTS = {
     "version": 1,
+    "sample_rate_hz": SAMPLE_RATE_HZ,
+    "rtl_dsp_bw_khz": DSP_BW_KHZ,
     "center_frequency_hz": 851375000,
     "capture_center_frequency_hz": 851375000,
     "contains_retunes": False,
@@ -833,7 +869,7 @@ def check_replay_events(fields, data_bytes):
     """Refuse a sidecar the replay reader would reject, with the reader's own rules.
 
     The rules are validate_replay_events_metadata() and the event parser in
-    src/io/iq/iq_replay.c, for a cu8 capture of this script's sample rate.
+    src/io/iq/iq_replay.c, for a cu8 capture at the sidecar's sample rate.
     """
     events = fields["events"]
     if events and fields["version"] != 2:
@@ -863,7 +899,7 @@ def check_replay_events(fields, data_bytes):
             raise ValueError(f"event {index}: unsupported kind {kind!r}")
         if not event["center_frequency_hz"] or not event["capture_center_frequency_hz"]:
             raise ValueError(f"event {index}: {kind} needs non-zero centre frequencies")
-        if event["sample_rate_hz"] != SAMPLE_RATE_HZ:
+        if event["sample_rate_hz"] != fields["sample_rate_hz"]:
             raise ValueError(f"event {index}: replay does not support a sample-rate change")
         if kind == "RETUNE":
             if retune_needs_reset:
@@ -928,11 +964,11 @@ def write_capture(out_dir, name, payload, data_file=None, sample_rate=None, dsp_
         written = 0
     metadata = METADATA_TEMPLATE.format(
         version=fields["version"],
-        sample_rate=rate,
+        sample_rate=fields["sample_rate_hz"],
         center_frequency_hz=fields["center_frequency_hz"],
         capture_center_frequency_hz=fields["capture_center_frequency_hz"],
-        bw_khz=bw_khz,
-        demod_rate=rate,
+        bw_khz=fields["rtl_dsp_bw_khz"],
+        demod_rate=fields["sample_rate_hz"],
         contains_retunes="true" if fields["contains_retunes"] else "false",
         capture_retune_count=fields["capture_retune_count"],
         capture_started_utc=fields["capture_started_utc"],
@@ -945,10 +981,14 @@ def write_capture(out_dir, name, payload, data_file=None, sample_rate=None, dsp_
     return written
 
 
-def write_fixture(out_dir, name, samples, normalize=True, sample_rate=None, dsp_bw_khz=None):
+def write_fixture(out_dir, name, samples, normalize=True, sample_rate=SAMPLE_RATE_HZ, dsp_bw_khz=DSP_BW_KHZ):
     return write_capture(
-        out_dir, name, to_cu8(samples, normalize=normalize).tobytes(),
-        sample_rate=sample_rate, dsp_bw_khz=dsp_bw_khz)
+        out_dir,
+        name,
+        to_cu8(samples, normalize=normalize).tobytes(),
+        sample_rate_hz=sample_rate,
+        rtl_dsp_bw_khz=dsp_bw_khz,
+    )
 
 
 def load_cu8_fixture(path):
@@ -1307,28 +1347,47 @@ def tetra_sysinfo_dibits():
 
 
 def tetra_channel_allocation_dibits():
-    """SCH-HD carrying a basic pi/4-DQPSK MAC-RESOURCE allocation."""
+    """SCH-HD carrying a pi/4-DQPSK MAC-RESOURCE (EN 300 392-2 table 21.55) to a group SSI
+    with a basic channel allocation (table 21.87), then a Null PDU and fill bits (clause 23.4.2)."""
     info = [0] * 124
     pack_field(info, 0, 0, 2)       # MAC-RESOURCE
     pack_field(info, 1, 2, 1)       # fill bits present
     pack_field(info, 0, 3, 1)       # grant on current channel
     pack_field(info, 0, 4, 2)       # clear header/TM-SDU
     pack_field(info, 0, 6, 1)       # random access undefined
-    pack_field(info, 2, 7, 6)       # header-only/null PDU
-    pack_field(info, 0, 13, 3)      # null address
-    pack_field(info, 0, 16, 1)      # no power control
-    pack_field(info, 0, 17, 1)      # no slot grant
-    pack_field(info, 1, 18, 1)      # channel allocation present
-    pack_field(info, 0, 19, 2)      # replace current channel
-    pack_field(info, 4, 21, 4)      # assigned timeslot bitmap
-    pack_field(info, 1, 25, 2)      # downlink only
-    pack_field(info, 0, 27, 1)      # no CLCH permission
-    pack_field(info, 0, 28, 1)      # no cell change
-    pack_field(info, 400, 29, 12)   # assigned carrier
-    pack_field(info, 0, 41, 1)      # inherit SYSINFO band/offset
-    pack_field(info, 1, 42, 2)      # one monitoring pattern
+    pack_field(info, 9, 7, 6)       # PDU length 9 octets: 68 bits and 4 fill bits
+    pack_field(info, 1, 13, 3)      # SSI address
+    pack_field(info, 1234, 16, 24)  # group SSI
+    pack_field(info, 0, 40, 1)      # no power control
+    pack_field(info, 0, 41, 1)      # no slot grant
+    pack_field(info, 1, 42, 1)      # channel allocation present
+    pack_field(info, 0, 43, 2)      # replace current channel
+    pack_field(info, 4, 45, 4)      # assigned timeslot bitmap
+    pack_field(info, 1, 49, 2)      # downlink only
+    pack_field(info, 0, 51, 1)      # no CLCH permission
+    pack_field(info, 0, 52, 1)      # no cell change
+    pack_field(info, 400, 53, 12)   # assigned carrier
+    pack_field(info, 0, 65, 1)      # inherit SYSINFO band/offset
+    pack_field(info, 1, 66, 2)      # one monitoring pattern
+    pack_field(info, 1, 68, 1)      # fill bits 1000
+    pack_field(info, 2, 79, 6)      # Null PDU at bit 72: 2 octets, address type 000
+    pack_field(info, 1, 88, 1)      # fill bits after the Null PDU
     seed = (((17 | (4242 << 6) | (460 << 20)) << 2) | 3) & 0xFFFFFFFF
     return tetra_control_block_dibits(info, 101, seed, 216)
+
+
+def tetra_speech_crc(bits, degree, low):
+    """EN 300 395-2 equations 43 to 45: F(X) = X^degree I(X) mod G(X) with I(X) = C(1) + C(2) X + ..., and
+    low the terms of G(X) below X^degree. Element i is f(i), sent as parity bit b(i + 1)."""
+    top = 1 << (degree - 1)
+    mask = (1 << degree) - 1
+    reg = 0
+    for bit in reversed(bits):
+        feedback = bool(reg & top) != bool(bit & 1)
+        reg = (reg << 1) & mask
+        if feedback:
+            reg ^= low
+    return [(reg >> i) & 1 for i in range(degree)]
 
 
 def tetra_tch_fs_dibits():
@@ -1363,9 +1422,11 @@ def tetra_tch_fs_dibits():
           (1, 1, 1, 1, 1, 1, 1, 1),
           (1, 0, 0, 0, 1, 0, 0, 0))
     class1 = encode_segment(speech[102:214], a1)
-    # The deterministic fixture does not use BFI yet; zero CRC bits still
-    # exercise the exact protected length and the four terminating bits.
-    class2 = encode_segment(speech[214:] + [0] * 8 + [0] * 4, a2)
+    # Clause 5.5.1: seven CRC bits over class 2 from G(X) = 1 + X^3 + X^7, then
+    # b8, the sum of the class-2 and CRC bits, then four tail bits.
+    crc = tetra_speech_crc(speech[214:], 7, 0x09)
+    parity = sum(speech[214:] + crc) & 1
+    class2 = encode_segment(speech[214:] + crc + [parity] + [0] * 4, a2)
     deinterleaved = speech[:102] + class1 + class2
     assert len(deinterleaved) == 432 and state == 0
 
@@ -1374,17 +1435,17 @@ def tetra_tch_fs_dibits():
         for line in range(24):
             interleaved[column * 24 + line] = deinterleaved[line * 18 + column]
 
+    # The 432 type-4 bits are one block, scrambled as one sequence across both
+    # halves of the burst (EN 300 392-2 clause 8.2.5).
     seed = (((17 | (4242 << 6) | (460 << 20)) << 2) | 3) & 0xFFFFFFFF
-    blocks = []
-    for block in (interleaved[:216], interleaved[216:]):
-        scrambled = tetra_scramble(block, seed)
-        blocks.append([(scrambled[i] << 1) | scrambled[i + 1]
-                       for i in range(0, 216, 2)])
-    return blocks[0], blocks[1]
+    scrambled = tetra_scramble(interleaved, seed)
+    dibits = [(scrambled[i] << 1) | scrambled[i + 1] for i in range(0, 432, 2)]
+    return dibits[:108], dibits[108:]
 
 
-def modulate_tetra(dibits):
-    sample_rate = 54000  # exactly three complex samples per TETRA symbol
+def modulate_tetra(dibits, sample_rate=54000):
+    # A whole number of complex samples per TETRA symbol: three at 54 kHz, four at 72 kHz.
+    assert sample_rate % TETRA_SYMBOL_RATE == 0
     sps = sample_rate // TETRA_SYMBOL_RATE
     # Give carrier/timing recovery a non-repeating acquisition preamble before
     # the first asserted burst.
@@ -1431,7 +1492,8 @@ def tetra_sample_clock_error(samples, ppm):
             + 1j * np.interp(source_positions, source_axis, samples.imag))
 
 
-def build_tetra_synth(out_dir):
+def tetra_synth_bursts():
+    """One synchronisation burst, one SCH/HD burst and one TCH/FS burst, as dibits."""
     bsch = tetra_bsch_dibits()
     sysinfo = tetra_sysinfo_dibits()
     allocation = tetra_channel_allocation_dibits()
@@ -1447,7 +1509,19 @@ def build_tetra_synth(out_dir):
     # SCH/HD half-slots; NTS1 joins its blocks into one TCH/FS codeword.
     ndb = sysinfo + ([0] * 7) + nts2 + ([0] * 8) + allocation
     voice_ndb = tch_b1 + ([0] * 7) + nts1 + ([0] * 8) + tch_b2
-    samples = modulate_tetra((sb + ndb + voice_ndb) * TETRA_BURST_REPEATS)
+    return sb + ndb + voice_ndb
+
+
+def build_tetra_synth_72k(out_dir):
+    samples = modulate_tetra(tetra_synth_bursts() * TETRA_72K_BURST_REPEATS, sample_rate=72000)
+    written = write_fixture(out_dir, TETRA_72K_NAME, samples, sample_rate=72000, dsp_bw_khz=72)
+    print(f"{TETRA_72K_NAME:28s} synth   {written // 1024:6d} KiB")
+    return written
+
+
+def build_tetra_synth(out_dir):
+    sync = [int(char) for char in TETRA_SSB_SYNC]
+    samples = modulate_tetra(tetra_synth_bursts() * TETRA_BURST_REPEATS)
     written = write_fixture(out_dir, TETRA_SYNTH_NAME, samples, sample_rate=54000, dsp_bw_khz=54)
     print(f"{TETRA_SYNTH_NAME:28s} synth   {written // 1024:6d} KiB")
     # Complex conjugation reverses every differential phase step. For TETRA's
@@ -1465,11 +1539,6 @@ def build_tetra_synth(out_dir):
         out_dir, TETRA_THRESHOLD_PASS_NAME, threshold_pass,
         sample_rate=54000, dsp_bw_khz=54)
     print(f"{TETRA_THRESHOLD_PASS_NAME:28s} synth   {threshold_pass_written // 1024:6d} KiB")
-    threshold_reject = impair_tetra(samples, snr_db=TETRA_THRESHOLD_REJECT_SNR_DB)
-    threshold_reject_written = write_fixture(
-        out_dir, TETRA_THRESHOLD_REJECT_NAME, threshold_reject,
-        sample_rate=54000, dsp_bw_khz=54)
-    print(f"{TETRA_THRESHOLD_REJECT_NAME:28s} synth   {threshold_reject_written // 1024:6d} KiB")
     two_ray = simulcast_two_ray(samples, TETRA_TWO_RAY_DELAY_SAMPLES,
                                 TETRA_TWO_RAY_AMPLITUDE, TETRA_TWO_RAY_CFO_HZ,
                                 TETRA_TWO_RAY_PHASE_RAD)
@@ -1498,8 +1567,9 @@ def build_tetra_synth(out_dir):
                                          dsp_bw_khz=54)
     print(f"{TETRA_BAD_CRC_IMPAIRED_NAME:28s} synth   {bad_impaired_written // 1024:6d} KiB")
     return (written + inverted_written + impaired_written + threshold_pass_written
-            + threshold_reject_written + two_ray_written + clock_fast_written
-            + clock_slow_written + bad_written + bad_impaired_written)
+            + two_ray_written + clock_fast_written
+            + clock_slow_written + bad_written + bad_impaired_written
+            + build_tetra_synth_72k(out_dir))
 
 def build_attenuated(out_dir):
     """Write the level-shifted replays of committed fixtures (issue #521)."""
@@ -1765,6 +1835,18 @@ def derived_fixture_names():
             TETRA_BAD_CRC_IMPAIRED_NAME,
         ]
         + [entry[0] for entry in SQUELCH_BURST]
+        + [
+            TETRA_SYNTH_NAME,
+            TETRA_INVERTED_NAME,
+            TETRA_BAD_CRC_NAME,
+            TETRA_IMPAIRED_NAME,
+            TETRA_THRESHOLD_PASS_NAME,
+            TETRA_MULTIPATH_NAME,
+            TETRA_CLOCK_FAST_NAME,
+            TETRA_CLOCK_SLOW_NAME,
+            TETRA_BAD_CRC_IMPAIRED_NAME,
+            TETRA_72K_NAME,
+        ]
     )
 
 
@@ -1812,6 +1894,7 @@ def main():
         total += build_derived_retune(args.out)
         total += build_derived_gap(args.out)
         total += build_dpmr_synth(args.out)
+        total += build_tetra_synth(args.out)
         total += build_nfm_synth(args.out)
         total += build_am_synth(args.out)
         total += build_tetra_synth(args.out)

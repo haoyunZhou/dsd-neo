@@ -3100,19 +3100,44 @@ start_replay_stream_quietly(const char* metadata_path, int loop, std::unique_ptr
     return 0;
 }
 
-/* Issue #572: replay converts cu8, little-endian cs16 at post_mute_pre_widen, and cf32 captured as the driver
- * delivered it. A cf32 capture stamped with the cu8 stage (which the capture writer accepts) is refused at the start,
- * as an unreadable sidecar is, and leaves nothing behind. Such a capture used to start, and the reader then dropped
- * every chunk it could not convert: the replay ended with nothing delivered and no failure. */
+/* Issue #572: replay converts cu8, cf32 captured as the driver delivered it, before the input ring, and cs16 stamped
+ * with the cu8 stage, and nothing else. A cs16 capture stamped with the cf32 stage, or a cf32 capture stamped with the
+ * cu8 stage (which the capture writer accepts), is refused at the start, as an unreadable sidecar is, and leaves
+ * nothing behind. Such a capture used to start, and the reader then dropped every chunk it could not convert: the
+ * replay ended with nothing delivered and no failure. */
 static int
 test_replay_refuses_a_capture_it_cannot_convert(void) {
     int rc = 0;
-    const char* label = "cf32 at the cu8 stage";
-    char metadata_path[DSD_TEST_PATH_MAX];
-    const int made = make_replay_fixture(metadata_path, sizeof(metadata_path), DSD_IQ_FORMAT_CF32, "post_mute_pre_widen",
-                                          0, 2U * kReplayChunkBytes);
-    if (made != 0) {
-        return 1;
+    for (int cf32 = 0; cf32 <= 1; cf32++) {
+        const char* label = cf32 ? "cf32 at the cu8 stage" : "cs16 at the cf32 stage";
+        char metadata_path[DSD_TEST_PATH_MAX];
+        const int made = cf32 ? make_replay_fixture(metadata_path, sizeof(metadata_path), DSD_IQ_FORMAT_CF32,
+                                                    "post_mute_pre_widen", 0, 2U * kReplayChunkBytes)
+                              : make_hand_written_replay_fixture(metadata_path, sizeof(metadata_path), "cs16", "little",
+                                                                 "post_driver_cf32_pre_ring", 3U * kReplayChunkBytes);
+        if (made != 0) {
+            return 1;
+        }
+        dsd_input_failure_clear();
+        std::unique_ptr<dsd_opts> opts;
+        RtlSdrContext* ctx = NULL;
+        char what[160];
+        const int refused = start_replay_stream_quietly(metadata_path, 0, &opts, &ctx) != 0;
+        if (!refused) {
+            uint64_t delivered = 0U;
+            int rescued = 0;
+            rc |= read_replay_to_end(ctx, 5000U, label, &delivered, &rescued);
+            finish_replay(ctx, rescued);
+            dsd_input_failure failure;
+            dsd_input_failure_get(&failure);
+            DSD_FPRINTF(stderr, "  %s: the replay started, delivered %llu samples, input failure kind %d\n", label,
+                        (unsigned long long)delivered, (int)failure.kind);
+        }
+        DSD_SNPRINTF(what, sizeof(what), "%s: the replay start is refused", label);
+        rc |= expect_true(what, refused);
+        DSD_SNPRINTF(what, sizeof(what), "%s: no stream resources left", label);
+        rc |= expect_true(what, rtl_stream_test_has_resources() == 0);
+        dsd_input_failure_clear();
     }
     dsd_input_failure_clear();
     std::unique_ptr<dsd_opts> opts;
@@ -3133,6 +3158,37 @@ test_replay_refuses_a_capture_it_cannot_convert(void) {
     rc |= expect_true(what, refused);
     DSD_SNPRINTF(what, sizeof(what), "%s: no stream resources left", label);
     rc |= expect_true(what, rtl_stream_test_has_resources() == 0);
+    dsd_input_failure_clear();
+    return rc;
+}
+
+/* cs16 stamped with the cu8 stage (the TETRA real-air captures) replays: it starts, delivers samples and reports no
+ * input failure. */
+static int
+test_replay_converts_cs16_at_the_cu8_stage(void) {
+    char metadata_path[DSD_TEST_PATH_MAX];
+    if (make_hand_written_replay_fixture(metadata_path, sizeof(metadata_path), "cs16", "little", "post_mute_pre_widen",
+                                         3U * kReplayChunkBytes)
+        != 0) {
+        return 1;
+    }
+    int rc = 0;
+    dsd_input_failure_clear();
+    std::unique_ptr<dsd_opts> opts;
+    RtlSdrContext* ctx = NULL;
+    const int started = start_replay_stream_quietly(metadata_path, 0, &opts, &ctx) == 0;
+    rc |= expect_true("cs16 at the cu8 stage: the replay starts", started);
+    if (started) {
+        uint64_t delivered = 0U;
+        int rescued = 0;
+        rc |= read_replay_to_end(ctx, 5000U, "cs16 at the cu8 stage", &delivered, &rescued);
+        finish_replay(ctx, rescued);
+        dsd_input_failure failure;
+        dsd_input_failure_get(&failure);
+        rc |= expect_true("cs16 at the cu8 stage: samples delivered", delivered > 0U);
+        rc |= expect_true("cs16 at the cu8 stage: no input failure", failure.kind == DSD_INPUT_FAILURE_NONE);
+    }
+    rc |= expect_true("cs16 at the cu8 stage: no stream resources left", rtl_stream_test_has_resources() == 0);
     dsd_input_failure_clear();
     return rc;
 }
@@ -3474,6 +3530,7 @@ main(void) {
     rc |= test_soapy_cf32_read_enters_bounded();
     rc |= test_replay_read_failure_mid_chunk_delivers_what_was_read();
     rc |= test_replay_refuses_a_capture_it_cannot_convert();
+    rc |= test_replay_converts_cs16_at_the_cu8_stage();
     rc |= test_replay_refuses_a_centre_past_the_tuner_limit();
     rc |= test_replay_conversion_failure_ends_with_the_failure();
     rc |= test_loop_pass_that_submits_nothing_ends();

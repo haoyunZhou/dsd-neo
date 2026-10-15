@@ -83,9 +83,9 @@ dsd_engine_select_p25_sps_profile(dsd_state* state, int is_tdma) {
  * p25_cc_freq is not the answer: NXDN and EDACS trunking anchor that same field, so the
  * frequency being set proves only that some protocol has a control channel. Everything derived
  * from a P25 control channel -- the 4800/6000 symbol rate, the C4FM/QPSK choice, the P25 SPS
- * hunt profile -- is wrong for those protocols, which run GFSK at their own rates. TETRA is
- * the same kind of miss: a voice grant passes the live samples-per-symbol count, and treating
- * that as a P25 retune replaces the 18 kHz pi/4-DQPSK chain with a 4800 symbol C4FM profile.
+ * hunt profile -- is wrong for those protocols, which run GFSK at their own rates, and for TETRA,
+ * which runs pi/4-DQPSK at 18000 sym/s. TETRA is decided by its sync before the modulation is
+ * looked at: its rf_mod is the QPSK family's, which on its own would read as P25 CQPSK.
  */
 static int
 dsd_engine_cc_is_p25(const dsd_state* state) {
@@ -96,6 +96,9 @@ dsd_engine_cc_is_p25(const dsd_state* state) {
     // history: a target that has not synced yet reads as P25 by synctype alone, because
     // DSD_SYNC_P25P1_POS is 0.
     if (dsd_engine_trunk_scan_target_count(state) > 0) {
+        return 0;
+    }
+    if (DSD_SYNC_IS_TETRA(state->synctype) || DSD_SYNC_IS_TETRA(state->lastsynctype)) {
         return 0;
     }
     if (state->rf_mod == 2) {

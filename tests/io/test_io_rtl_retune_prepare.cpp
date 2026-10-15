@@ -1541,6 +1541,36 @@ test_familyless_retune_supersede_count(void) {
     return failed;
 }
 
+static int
+expect_waited(const char* label, uint64_t waited_ms, uint64_t min_ms, uint64_t max_ms) {
+    if (waited_ms < min_ms || waited_ms >= max_ms) {
+        DSD_FPRINTF(stderr, "FAIL: %s waited %llu ms, want [%llu, %llu)\n", label, (unsigned long long)waited_ms,
+                    (unsigned long long)min_ms, (unsigned long long)max_ms);
+        return 1;
+    }
+    return 0;
+}
+
+/* A Signal search visit bounds the decoder's radio read: an output that delivers nothing for 100 ms fails the read,
+ * which the symbol readers take as an interruption, so a stalled input (an RTL-TCP stall, say) cannot hold the decoder
+ * past the visit's deadlines and commands. The orchestrator reads with no decoder state, so the bound follows the
+ * search's ownership of the tuner. Outside a search the read waits for the producer as it always has. */
+static int
+test_search_live_read_bound(void) {
+    int got = 0;
+    uint64_t waited_ms = 0U;
+    int failed =
+        expect_int_eq("search read hook", rtl_stream_test_search_live_read_bound(7U, 3000, &got, &waited_ms), 0);
+    failed |= expect_int_eq("a search's read gives up on a silent producer", got, -1);
+    failed |= expect_waited("a search's read", waited_ms, 100U, 2000U);
+
+    failed |= expect_int_eq("read hook outside a search",
+                            rtl_stream_test_search_live_read_bound(0U, 300, &got, &waited_ms), 0);
+    failed |= expect_int_eq("outside a search the read waits for the producer", got, 1);
+    failed |= expect_waited("a read outside a search", waited_ms, 250U, 60000U);
+    return failed;
+}
+
 int
 main(void) {
     dsd_neo_log_set_tap(capture_error_log, NULL);
@@ -2313,9 +2343,8 @@ main(void) {
     const int16_t cs16_samples[] = {8192, -16384, 32767, -32768};
     uint8_t cs16_raw[sizeof(cs16_samples)] = {};
     DSD_MEMCPY(cs16_raw, cs16_samples, sizeof(cs16_samples));
-    rc = call_replay_convert_block(DSD_IQ_FORMAT_CS16, "post_mute_pre_widen", 0, 0, cs16_raw,
-                                   sizeof(cs16_raw), 8U, 0, 0, 0U, converted,
-                                   sizeof(converted) / sizeof(converted[0]), &convert_phase,
+    rc = call_replay_convert_block(DSD_IQ_FORMAT_CS16, "post_mute_pre_widen", 0, 0, cs16_raw, sizeof(cs16_raw), 8U, 0,
+                                   0, 0U, converted, sizeof(converted) / sizeof(converted[0]), &convert_phase,
                                    &convert_have_carry, &convert_carry_byte);
     failed |= expect_int_eq("replay CS16 conversion count", rc, 4);
     failed |= expect_double_near("replay CS16 I0", converted[0], 0.25, 1e-6);
@@ -2324,15 +2353,13 @@ main(void) {
     failed |= expect_double_near("replay CS16 Q1", converted[3], -1.0, 1e-6);
     failed |= expect_int_eq("replay CS16 preserves phase", convert_phase, 0);
 
-    rc = call_replay_convert_block(DSD_IQ_FORMAT_CS16, "post_mute_pre_widen", 0, 0, cs16_raw,
-                                   sizeof(cs16_raw) - 1U, 8U, 0, 0, 0U, converted,
-                                   sizeof(converted) / sizeof(converted[0]), &convert_phase,
+    rc = call_replay_convert_block(DSD_IQ_FORMAT_CS16, "post_mute_pre_widen", 0, 0, cs16_raw, sizeof(cs16_raw) - 1U, 8U,
+                                   0, 0, 0U, converted, sizeof(converted) / sizeof(converted[0]), &convert_phase,
                                    &convert_have_carry, &convert_carry_byte);
     failed |= expect_int_eq("replay CS16 rejects partial complex sample", rc, -1);
 
-    rc = call_replay_convert_block(DSD_IQ_FORMAT_CS16, "post_driver_cf32_pre_ring", 0, 0, cs16_raw,
-                                   sizeof(cs16_raw), 8U, 0, 0, 0U, converted,
-                                   sizeof(converted) / sizeof(converted[0]), &convert_phase,
+    rc = call_replay_convert_block(DSD_IQ_FORMAT_CS16, "post_driver_cf32_pre_ring", 0, 0, cs16_raw, sizeof(cs16_raw),
+                                   8U, 0, 0, 0U, converted, sizeof(converted) / sizeof(converted[0]), &convert_phase,
                                    &convert_have_carry, &convert_carry_byte);
     failed |= expect_int_eq("replay CS16 rejects wrong capture stage", rc, -1);
 
@@ -2499,6 +2526,7 @@ main(void) {
     failed |= test_external_backend_landing_filter_state();
     failed |= test_family_landing_after_pending();
     failed |= test_live_republish_lands_where_it_was_timed();
+    failed |= test_search_live_read_bound();
 
     return failed ? 1 : 0;
 }

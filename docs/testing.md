@@ -5,6 +5,12 @@ to reduce regression and security risk.
 
 ## Test Suites
 
+Signal search's detector, tuning lifecycle, provenance, native journal and Qt tests
+are described in [Signal search verification](signal-search.md#verification-and-measured-limits).
+Its manual hardware benchmark is deliberately outside CTest: automatic tests never
+claim an attached SDR. Report acquisition, measurement/identification, UI and transport
+latency separately; desktop synthetic tests do not establish Android screen-off performance.
+
 The CTest suite includes focused tests for:
 
 - runtime configuration, CLI parsing, rings, hooks, shutdown, and telemetry
@@ -269,6 +275,26 @@ retains its noise, fading and ISI while reversing all differential phase steps;
 requires at least 15. `tools/tetra/prepare_real_air_fixture.py` verifies the raw
 SCBS, resampled, marginal, and inverted hashes; the adjacent provenance file
 records the source commits, transforms, and parameters.
+
+The synthetic TETRA fixtures (`tetra_bsch_*`, `build_tetra_synth()` in `tools/build_iq_fixtures.py`) repeat one
+sequence 100 times at 54 kHz: a synchronisation burst with a CRC-valid BSCH (MCC 460, MNC 4242, colour code 17), a
+normal downlink burst whose two SCH/HD half slots carry SYSINFO and a MAC-RESOURCE channel allocation, and a full-slot
+TCH/S burst whose class-2 CRC passes. `DECODE_IQ_TETRA_BSCH`, `_SYSINFO`, `_CHANNEL_ALLOCATION` and `_TCH_FS` assert
+each on the clean replay; the `_INVERTED` (complex conjugate: every dibit XOR 2 and the negative sync words),
+`_CFO_AWGN` (300 Hz offset at 14 dB SNR), `_TWO_RAY` (a second path one sample later at -6.9 dB),
+`_CLOCK_100PPM` and `_CLOCK_MINUS_100PPM` (sample-clock error) variants repeat all four, and `_SNR6` (the same offset
+and noise at 6 dB) the three signalling cases. The TCH/FS cases require the speech CRC on at least 90 of the 100
+bursts, and on the clean and inverted replays every burst with no re-encode mismatch. `tetra_bsch_synth_72k` carries
+25 of the same sequences at the 72 kHz DSP bandwidth `-fT` runs an RTL-SDR at (4 samples per symbol):
+`DECODE_IQ_TETRA_BSCH_72K` requires 24 BSCH decodes and no rate warning, and `DECODE_IQ_TETRA_TCH_FS_72K` 24 TCH/FS
+bursts with the CRC passing and none failing. `DECODE_IQ_TETRA_BAD_CRC_REJECT`
+and `DECODE_IQ_TETRA_BAD_CRC_CFO_AWGN_REJECT` replay a BSCH with one protected bit flipped: the burst must sync and
+no network identity may be published. `DECODE_IQ_TETRA_FLOAT_SYMBOL_REPLAY` (`tests/iq_float_symbol_replay_check.cmake`)
+captures the clean replay's symbols (`-c`), writes them as a float symbol file (`dsd-neo_test_symbol_capture_to_float`)
+and replays that with `-i symbols.raw`: it must decode as many BSCHs as the I/Q replay, at least 90 of the 100 (all of
+them here), which a float symbol file scaled into the PCM sample domain loses (TETRA's frame-sync slicer has fixed
+thresholds in the symbol domain). These are deterministic
+regression boundaries, not receiver-sensitivity claims.
 
 `provoice` is the sigidwiki ProVoice clip, one 3.5 s transmission (issue #588). Unlike the other audio sources it was
 recorded from a receiver's de-emphasized audio rather than from its discriminator: its 9600 baud clock line is there,
@@ -1235,244 +1261,11 @@ per start with the onset anywhere in a word; `<dsd-neo/dsp/analog_rx.h>` sets it
 
 Known gaps and caveats:
 
-- **TETRA** has focused CTest coverage for FEC/interleaving, MAC, MLE/MM/CMCE,
-  SDS, channel information, TCH slot gating, and trunking state helpers (run
-  with `ctest --preset dev-debug -L tetra --output-on-failure`). A deterministic
-  trunking result matrix correlates asynchronous VC and CC-return requests,
-  blocks an overlapping transition, commits successful completion, and rolls
-  failed completion back to the prior channel state while retiring its frame
-  gate. It also verifies that a failed VC reassignment or CC return preserves
-  the previous VC identity, generic frequency caches, activity timestamps, and
-  shared tuned flag, and that disabling trunking finishes in `IDLE`. The engine
-  polls correlated TETRA completion before its frame-dispatch gate and while
-  unsynchronized, so a failed request can roll back even when no TETRA frame is
-  allowed to reach the protocol tick.
-  A deterministic Synchronisation Burst fixture crosses the full 18 ksym/s
-  pi/4-DQPSK chain. Its transmitter applies convolutional coding, RCPC
-  puncturing, block interleaving, and then scrambling; the receiver reverses
-  that order by descrambling before deinterleaving. This ordering matches the
-  air-interface chain and is pinned by fixture reproducibility plus the IQ
-  decode assertions. `TETRA_AIR_CHAIN_VECTOR` additionally decodes fixed
-  120-bit BSCH and 216-bit SYSINFO type-5 literals through descrambling,
-  deinterleaving, depuncturing, Viterbi, CRC, and field assertions,
-  independently of fixture regeneration. The SYSINFO case uses the network
-  scrambling seed recovered from BSCH and verifies the K216/a101 SCH-HD path;
-  the BSCH case also proves that the former deinterleave-before-descramble order
-  fails CRC. The fixture continues
-  through a CRC-valid BSCH, NDB SCH-HD blocks, a standards-shaped MAC-RESOURCE
-  Channel Allocation IE, and a known TCH/FS codeword. It verifies network
-  identity, SYSINFO, assigned-carrier parsing, and recovery of all 292 TCH/FS
-  type-2 bits. The sequence advances the BSCH timestamp across its NDB bursts
-  and verifies that the allocated TN2 bitmap admits the TCH/FS burst; focused
-  slot-gate cases cover all four TN/bitmap mappings and released allocations.
-  Frame synchronization preserves the analog soft symbols preceding the NTS
-  and SSB markers, so BSCH and NDB block 1 enter Viterbi decoding with the same
-  soft-decision quality as the live second block. Symbol replay retains a
-  hard-decision fallback when no analog history is available. A
-  complex-conjugated fixture verifies the negative-polarity NTS/SSB patterns
-  and normalizes the dibit MSB in captured/live blocks, control bits, and soft
-  metrics before protected BSCH, SCH-HD, and TCH/FS decoding.
-  A paired bad-CRC burst verifies rejection. The same accept and
-  reject paths are replayed with deterministic 300 Hz carrier offset and 14 dB
-  complex-AWGN SNR, covering carrier/timing recovery under a repeatable channel
-  impairment. Two additional fixtures retain that 300 Hz offset and fixed noise
-  realization to bracket protected-control decoding: at 6 dB SNR the BSCH,
-  SYSINFO, and Channel Allocation assertions must all succeed, while at 4 dB
-  synchronization may occur but none of those CRC-protected messages may be
-  published. This is a deterministic synthetic regression boundary, not a
-  calibrated receiver-sensitivity claim. A deterministic two-ray variant adds a second path delayed by one
-  54 kHz sample (18.5 us), attenuated to 0.45 (-6.9 dB), offset by 3 Hz, and
-  shifted by 2.2 radians. Its BSCH, SYSINFO, Channel Allocation, and TCH/FS
-  replay cases cover frequency-selective fading and intersymbol interference.
-  Two separate fixtures resample the waveform with +100 ppm and -100 ppm clock
-  mismatches while retaining the nominal 54 kHz replay rate. The same four
-  assertions then verify continuous symbol-timing tracking as the sampling
-  phase drifts in either direction.
-  `TETRA_IQ_FIXTURE_REPRODUCIBILITY` regenerates all ten deterministic TETRA
-  waveforms and their replay metadata in a temporary directory, then requires
-  byte-for-byte identity with the checked-in fixtures. This makes a generator
-  change or a missing derived fixture fail CTest before decode expectations can
-  silently continue against stale data.
-  The CMCE/SDS unit cases also require declared optional information elements
-  and SDS payloads to be complete before any call, floor-control, or short-data
-  state is published. MM identity, authentication, location-update, and status
-  fields follow the same atomic rule, including preservation of the last
-  valid state when a replacement PDU is truncated. MAC fragment tests require
-  an explicit RESOURCE start, a consistent colour code, and an in-bounds final
-  payload before the reassembled TM-SDU passes through basic-link LLC and
-  reaches MLE. The FCS-bearing fragmentation case validates the Annex C
-  32-bit FCS and proves a corrupted replacement cannot publish a call or tune.
-  `TETRA_MLE_CMCE` also covers SDS-TL ACK, REPORT, and TRANSFER references,
-  conditional forward-address lengths, short reports carried by D-STATUS, and
-  concatenated SDS both with and without SDS-TL. Concatenation cases exercise
-  out-of-order delivery, extended references, duplicate suppression, conflicting
-  duplicate rejection, invalid sequence values, and publish only after every
-  part has arrived.
-  It also decodes a frozen 88-bit CMCE/MLE vector containing the published
-  `tetra-multiframe-sds` example's 64-bit PID-130 SDS-TRANSFER field, and
-  independently checks message reference 32 and Latin-1 text `Ahoj` without
-  using the local bit-field constructor.
-  `TETRA_SDS_REFERENCE_MAC` starts from a separate published 272-bit MAC PDU
-  from `smarek/kaitai-tetra-sds`. It verifies the MAC length boundary,
-  BL-UDATA LLC removal, MLE/CMCE dispatch, message reference 32, and the same
-  `Ahoj` text without a locally constructed protocol envelope. The source
-  publishes no reproducible off-air capture provenance, so this is an
-  interoperability regression rather than the remaining field-capture gate.
-  The table 14.15 D-SETUP vector covers notification, temporary address, calling
-  SSI, and calling-party extension in their standardized type-2 order. A later
-  setup without those elements must clear their validity and the previous
-  calling identity instead of leaking stale call metadata.
-  The implemented CMCE downlink family requires the Annex E O-bit, including
-  setup/release, call-response, status, information, restoration, facility,
-  short-data, function-not-supported, and floor-control PDUs. When it is set,
-  tests require every table-defined P-bit/value and a complete terminating
-  M/type-3/4 chain before publishing state. The SDS case also exercises one
-  unknown, bounded Type 3 element and rejects an incomplete replacement.
-  D-FACILITY vectors follow the official Annex E.2 and E.3 layouts for two
-  independently length-delimited SS-PDUs and the 12-bit "SS not supported"
-  acknowledgement. They require the outer O-bit and publish no partial
-  facility state when a later SS-PDU is truncated.
-  The official Annex E.8 D-CONNECT vector adds the complete 93-bit CMCE body
-  with a 42-bit SS-AL INVOKE1 ACK Facility Type 3 element. It verifies the
-  standardized identifier and length envelope, the terminal M-bit, and atomic
-  rejection when either the Facility value or terminal bit is truncated.
-  Tables 14.18 and 14.19 vectors likewise cover the transmitting-party type,
-  SSI, and extension carried by D-TX-GRANTED and D-TX-INTERRUPT. Missing
-  optionals clear old floor identity, while a truncated conditional extension
-  preserves the last complete event. Release and control-channel return clear
-  all associated floor identities.
-  Text cases cover Latin-1 to UTF-8 and UTF-16BE surrogate pairs, with malformed
-  input preserving the previous message. GSM packed 7-bit text includes the
-  default alphabet and escape table, with a cross-octet euro-symbol test.
-  Other legacy code pages remain unsupported. The published decoder trace adds
-  an independent SDS application result, but its upstream example says real
-  data was removed and does not provide a raw capture with reproducible
-  provenance, so the full off-air interoperability gate remains open.
-  `TETRA_FIELD_CAPTURE_VERIFIER` tests the stage-5 evidence checker with a
-  complete CC-to-VC-to-CC bundle and rejection cases for missing return,
-  capture drops, and out-of-order decode milestones. The checker itself still
-  requires a real v2 capture, provenance document, and realtime replay log
-  before it reports an external bundle as accepted.
-  `TETRA_ACELP_PIPELINE` additionally launches the persistent Python vocoder
-  stub, exchanges both
-  137-bit codec frames, and verifies that 480 PCM samples reach a WAV sink.
-  `TETRA_ACELP_SHORT_OUTPUT` makes the subprocess return only 80 of the required
-  240 samples and verifies that the decoder resets it without routing a partial
-  frame. `TETRA_ACELP_TIMEOUT` holds the subprocess output open without returning
-  PCM and verifies that the decoder leaves the blocking read within two seconds;
-  Windows additionally terminates the complete shell/codec process tree. All
-  three cases run through the Windows and POSIX subprocess implementations.
-  `TETRA_ACELP_REFERENCE` decodes the GPL-3.0 telive “Hello Tetra” hardware-test
-  sample through the speech 24x18 deinterleaver and class-specific RCPC path.
-  It compares all 8,220 bits in the resulting 60 ACELP frames with output from
-  the ETSI reference decoder. The adjacent 8 kHz mono PCM16 WAV contains the
-  independently decoded 14,400-sample reference; source commits, package
-  hashes, licenses, and artifact hashes are recorded in its `PROVENANCE.md`.
-  `TETRA_REAL_AIR_BIT_TRACE` anchors BSCH and SYSINFO parsing to a public
-  [Osmocom real-air decode trace](https://lists.osmocom.org/hyperkitty/list/tetra@lists.osmocom.org/thread/6DN55M2TG23RWBDOLGJYJPNQB337C4H6/).
-  It verifies MCC 293, MNC 7, colour code 3, the frame timestamp, service detail
-  `0x0D77`, and the standards-based 393.7125 MHz downlink carrier calculation.
-  `TETRA_AIR_CHAIN_VECTOR` also checks the scrambler against a direct ETSI
-  recurrence and CRC-decodes a captured non-zero-colour BNCH block. The
-  redistributable raw SCBS IQ pair and marginal control-channel capture then
-  exercise CS16 replay, modulation, synchronization, BSCH FEC/CRC and identity
-  parsing end to end. A hardware retune capture remains outstanding.
-  `TETRA_MM_DISPATCH` includes frozen hexadecimal PDUs for EN 300 392-7 tables
-  A.4, A.26, A.30a, and A.31. They bypass the test-side bit-field constructor
-  and independently pin the D-AUTHENTICATION, D-CK CHANGE, D-OTAR, and
-  D-DISABLE field offsets.
-  MM dispatch and mandatory-field vectors use the 4-bit downlink PDU type map
-  from ETSI EN 300 392-2 V3.8.1, Table 16.75. The focused vectors cover
-  location-update accept, command, reject and proceeding, group identity and
-  acknowledgement, D-MM-STATUS, and function-not-supported; conditional cipher
-  parameters must be complete before state is published. D-LOCATION UPDATE
-  COMMAND also decodes its optional Address Extension MCC/MNC and validates the
-  terminating Annex E type-3/4 chain before publishing the command.
-  D-LOCATION UPDATE ACCEPT applies the same rule to its SSI, Address Extension,
-  Subscriber Class, Energy Saving, and SCCH Type 2 elements.
-  Official Annex E.10 and E.11 vectors cover the minimal LU Accept and the
-  159-bit form containing Subscriber Class plus consecutive New Registered Area
-  and Group Identity Location Accept Type 4 elements. The E.11 case requires
-  both nested and outer M-bit termination before replacing the previous state.
-  The official Annex E.9 Group Identity Downlink vector retains both attachment
-  and detachment entries. Additional table 16.54 cases cover GTSI, visitor GSSI,
-  and combined GTSI/visitor-GSSI conditional address layouts. The terminal
-  status summary exposes the accepted group-entry count.
-  Official Annex E.16-E.18 MLE vectors cover D-NWRK-BROADCAST with no optional
-  data, an explicit zero-neighbour indication, and two CA neighbours. All
-  mandatory fields for up to seven neighbours are retained; every neighbour's
-  ten optional P-bits and declared values must be complete before the network
-  broadcast snapshot is replaced.
-  Official Annex E.19-E.24 MLE vectors cover D-NEW-CELL and D-PREPARE-FAIL
-  both with and without their MM SDUs, plus D-RESTORE-ACK carrying the required
-  CMCE D-CALL-RESTORE and D-RESTORE-FAIL. The mandatory outer O-bit is consumed
-  before the SDU, malformed nested restore data cannot publish an ACK, and the
-  table 18.10 D-CHANNEL RESPONSE fields are retained only for a conforming
-  message with its reserved optionals absent.
-  Table 18.4 D-NWRK-BROADCAST EXTENSION coverage retains serving-cell and CA
-  neighbour channel classes plus regular and extended-carrier irregular
-  channel details. Its six ordered Type 2 presence bits, repeated-entry
-  counts, conditional ten-bit carrier extension, and forbidden reserved
-  fields must all validate before the previous extension snapshot is replaced.
-  Extended-PDU type 1 coverage decodes table 18.5 D-NWRK-BROADCAST REMOVE,
-  retaining complete CA and DA whole-cell or selective class/channel removal
-  records plus the serving-cell removal lists. Truncated nested records and
-  any asserted reserved Type 2 field preserve the previous valid snapshot.
-  Extended-PDU type 0 coverage decodes the complete table 18.3
-  D-NWRK-BROADCAST-DA layout: serving DA identity/reselection/load/time, local
-  CA cell, DA neighbours and their standardized optionals, channel classes,
-  and irregular channels. Conditional carrier extensions, all nested counts,
-  and forbidden inner and outer reserved fields validate before the previous
-  DA snapshot is replaced.
-  EN 300 392-7 tables A.31/A.32 D-DISABLE and D-ENABLE coverage requires the
-  complete conditional 60-bit TEI, subscription identity, optional 160-bit
-  authentication challenge, and terminating proprietary-element chain before
-  changing enabled state. Legacy tests and display text that treated SDS
-  length forms as separate CMCE PDU types have been removed.
-  Legacy fields and dead tests derived from a conflicting five-bit MM PDU
-  table have also been removed; downlink MM dispatch and fixtures now use the
-  four-bit table 16.75 exclusively.
-  EN 300 392-7 table A.26 D-CK CHANGE coverage validates SCK lists and DMO
-  subsets, GCK lists, combined CCK/GCK activation, every time representation,
-  reserved key types, and atomic rejection of incomplete demands.
-  Tables A.1-A.4 D-AUTHENTICATION coverage retains complete 80-bit random
-  challenges and seeds for demand/response, conditional mutual-authentication
-  responses, result/reject fields, and bounded proprietary Type 3 tails.
-  Table A.9 D-OTAR CCK Provide coverage retains the complete 120-bit sealed
-  current and conditional future CCK values. It validates all-location, list,
-  mask/selector and ordered-range location-area forms, rejects forbidden future
-  key combinations and truncated fields atomically, and uses the four-bit OTAR
-  subtype mapping from table A.85.
-  Tables A.12 and A.15 cover GCK Provide/Reject, including individual/group
-  session selection, complete repeated 152-bit sealed-key descriptors,
-  GCKN/GSSI rejection references, group-association consistency, retry timing,
-  and optional address extension. Tables A.16 and A.19 cover SCK Provide/Reject, including individual/group
-  session selection, complete repeated 143-bit sealed-key descriptors, per-key
-  rejection reasons, KSG reserved values, retry timing, and optional address
-  extension. Tables A.20 and A.23 retain complete GSKO seed, version, sealed key,
-  GSSI and reject fields. Reserved bits, reserved reject reasons, and incomplete
-  O/P/M tails preserve the previous complete OTAR snapshot.
-  Table A.24 covers SCK/GCK key association and disassociation, including GSSI
-  lists and ranges, optional foreign-network addressing, reserved selection and
-  grouping values, invalid response controls, and atomic malformed-PDU rejection.
-  Table A.27f covers individual SCK, KAG member, SCK subset, all-SCK,
-  individual GCK, all-GCK and GSKO deletion demands, including repeated key
-  identifiers, subset bounds, optional addressing and invalid extension rejection.
-  Table A.27h covers individual/subset/all SCK, individual/all GCK and GSKO
-  key-status demands with validated subset bounds and optional addressing.
-  Table A.27d covers DMO SCK subset and repeated individual-key activation,
-  all four time forms, mandatory DMO-network MNI, and atomic truncation handling.
-  Table A.30 covers NEWCELL DCK-forwarding results and complete conditional CCK
-  information using the same validated table A.42/A.43 decoder as CCK Provide.
-  Table A.30a covers CMG GTSI provision with optional foreign-network address.
-  D-LOCATION UPDATE REJECT validates its O/P/M structure and publishes the
-  optional Address Extension only after the full MCC/MNC and tail are present.
-  Location-update proceeding, group identity, and group acknowledgement also
-  require their O-bit and a complete Type 3/4 chain when optional data follows.
-  A separate validity flag prevents the default zero Status Downlink value from
-  appearing as received data; valid status is shown with its Table 16.92 label
-  in the terminal channel summary.
-- **ProVoice** and **X2-TDMA** have no usable public sample and are untested here.
+- **TETRA** replays are synthetic apart from two off-air control-channel captures, so no replay covers a real
+  traffic channel, direct mode or a retune to follow a call; following runs against stand-in tuning hooks in
+  `TETRA_TRUNK_SM`, `ENGINE_TETRA_TRUNK` and `TETRA_CALLS` ([TETRA protocol tests](#tetra-protocol-tests)). Speech
+  plays only through a codec library the user builds, so CI drives the speech path with a test codec, and
+  `TETRA_ACELP_REFERENCE` pins the recovered speech bits rather than audio. The uplink is not decoded.
 - **X2-TDMA** has no usable public sample and is untested here.
 - **dPMR** decodes only what its CCH CRC-7 verifies (issue #407), so the `dpmr` off-air capture publishes nothing:
   it carries no recoverable CCH, which is why the CRC was thought to be broken. `DECODE_IQ_DPMR_MARGINAL` pins that
@@ -1507,6 +1300,32 @@ Known gaps and caveats:
   registered `-fA` case fails on that warning (`NOT_EXPECTED`); `tools/replay_ab.sh` leaves such repeats out (its
   `off_path` column). An AM case on this excerpt (`-fM`) carries the same guard.
 
+
+### TETRA protocol tests
+
+`ctest --preset dev-debug -L tetra --output-on-failure` runs them. Signalling blocks are built field by field from the
+ETSI tables (`tests/protocol/tetra/tetra_test_pdu.h`), so a test states the PDU it sends rather than a hex string,
+except where a published vector is the point. Tests that need time run on the decode clock's TEST source.
+
+| Case | What it pins |
+| --- | --- |
+| `TETRA_BITS` | The bounded bit reader: MSB-first reads, a read past the end fails and keeps failing, type-2 presence bits and type-3/4 element chains (EN 300 392-2 clauses 14.7, 18.4). |
+| `TETRA_AIR_CHAIN_VECTOR`, `TETRA_REAL_AIR_BIT_TRACE` | Fixed BSCH and SYSINFO type-5 vectors through descrambling, deinterleaving, depuncturing, Viterbi and CRC, kept out of the fixture generator so a generator and decoder cannot agree on a wrong order (deinterleaving before descrambling fails the CRC); a CRC-decoded off-air BNCH; BSCH and SYSINFO parsing against a [published Osmocom real-air decode](https://lists.osmocom.org/hyperkitty/list/tetra@lists.osmocom.org/thread/6DN55M2TG23RWBDOLGJYJPNQB337C4H6/) (MCC 293, MNC 7, colour code 3, 393.7125 MHz). |
+| `TETRA_RCPC_MAP`, `TETRA_DEPUNCTURE_REGRESSION`, `TETRA_SCH_HU` | Every RCPC puncturing scheme against its clause (EN 300 392-2 8.2.3.1, EN 300 395-2 5.4.3.2), a round trip through the production coding chain, and the SCH/HU coding loop. |
+| `TETRA_SPEECH_CHANNEL`, `TETRA_SPEECH_REORDER`, `TETRA_ACELP_REFERENCE` | The speech channel decoder against an encoder written from EN 300 395-2 clause 5, CRC and parity bit included (a wrong parity bit fails it; random blocks are almost never speech); type-1 bits to speech frames (tables 4 to 6); telive's GPL-3.0 "Hello Tetra" sample decoded to the 8,220 bits the ETSI reference decoder produces, with every class-2 CRC passing (`tests/fixtures/tetra/acelp/PROVENANCE.md`). |
+| `TETRA_BURST_VERDICT` | Whole bursts through the dispatch handler: PROFILE_PROVEN for a burst that decoded a CRC-passed block and UNPRODUCTIVE otherwise, the synchronisation burst's BNCH decoded with the scrambling its BSCH just set, a failed signalling CRC dropping the timeslot's partial TM-SDU, and the MAC given the network's colour code. |
+| `TETRA_TDMA_CLOCK` | The BSCH sets TN, FN and MN as sent (1-based); normal bursts advance the clock by the slots counted since, wrapping FN 18 to 1 and MN 60 to 1 and counting hyperframes, so the EN 300 392-7 initial value is never 0. |
+| `TETRA_MAC_STATE`, `TETRA_MAC_PDUS`, `TETRA_MAC_FRAGMENTS` | The downlink MAC and basic-link LLC of EN 300 392-2 clauses 21 and 23: PDUs bounded by their length indication, several PDUs per block, fill bits, the Null PDU, encrypted TM-SDUs left unparsed, the LLC FCS against the CRC-32/BZIP2 check value and an annex C long division, MAC-D-BLCK, ACCESS-DEFINE and SYSINFO through their decoders; TM-SDU reconstruction per timeslot with its guards and the N.203 limit. |
+| `TETRA_MLE_CMCE`, `TETRA_MLE_PDUS`, `TETRA_CMCE_PDUS`, `TETRA_SDS_PDUS`, `TETRA_D_TX_GRANTED_CHAN` | MLE routing and the CMCE, SDS, SNDCP and MLE protocol decoders against their tables (clauses 14, 18, 28, 29): a PDU that does not fit, or ends without its O-bit or terminating M-bit, acts on nothing; SDS text with unpaired surrogates and C1 controls made safe; concatenated SDS reassembled per session and timed out on the decode clock. |
+| `TETRA_SDS_REFERENCE_MAC` | A published 272-bit MAC PDU from smarek/kaitai-tetra-sds (Apache-2.0) through the MAC, LLC, MLE and CMCE into the event history as a data notice: message reference 32, text `Ahoj`. |
+| `TETRA_MM_DISPATCH` | MM PDUs (EN 300 392-2 clause 16, EN 300 392-7 annex A) through `tetra_mm_decode()`, with frozen hexadecimal PDUs for tables A.4, A.26, A.30a and A.31, and the carrier-number-to-frequency calculation. |
+| `TETRA_DMO` | Direct mode (EN 300 396-2 to -5): each DM PDU read with its own layout, the DM colour code, and the security class of the current call; SCH/S and SCH/H vectors from a real 851.0125 MHz call. |
+| `TETRA_AIR`, `TETRA_CRYPTO` | The EN 300 392-7 initial value, the encryption cipher key TB5 derives for the carrier being received (Midnight Blue's published TB5 vectors), the key stream segments of full- and half-slot speech (table 6.4) and the published TEA1, TEA2 and TEA3 vectors. |
+| `TETRA_CALLS` | Call records by call identifier, channel allocations attached to the call they came with or to the addressed party's, the followed call chosen by talkgroup policy and the encryption lockout, and the followed, heard and direct mode calls published as canonical calls from their signalling and speech. |
+| `TETRA_TRUNK_SM`, `ENGINE_TETRA_TRUNK` | The trunking state machine per session: CRC evidence before a grant is followed, tunes the backend completes at once, completes later or fails, the grant timeout and the hangtime after speech, releases by call identifier; the engine's tick, the carrier boundary that drops a followed call without tuning, and the no-carrier pass that forgets the carrier's evidence. |
+| `TETRA_VOICE_GATE` | The followed call's timeslots on its settled carrier once its signalling proved it there; one heard timeslot at a time when not trunking, held only by speech that plays (muted speech shows its call and gives way); direct mode always; the call each burst belongs to and its encryption class. |
+| `TETRA_VOICE_PIPELINE`, `TETRA_VOICE_CODEC`, `PLATFORM_DYNLIB` | The speech path against a test codec library (`tests/protocol/tetra/tetra_test_codec.c`) built as a shared library and loaded through `--tetra-codec` as a user's would be, its samples saying which decode made them: speech starts at a CRC-passed burst, bad frames after it are concealed until a run of four ends it, a stolen half slot's frame is concealed ahead of its speech frame, 240-sample frames leave the output whole 160-sample blocks with the rest carried, a carrier-boundary reset drops the carry and restarts the codec, air-encrypted speech is decrypted at the right key stream bits once it is back in speech frame order, speech starts over at another call or another talker, and the channel, timeslot, encryption, talkgroup and record gates hold back what they should. The libraries dsd-neo cannot use (none named, no file, another interface version, a missing function, no decoder, failing decodes) give one log line each and no audio; `PLATFORM_DYNLIB` runs the loader underneath over the same libraries. |
+| `TETRA_PUBLICATION`, `APP_CONTROL_TETRA_VIEW`, `TETRA_FMT_HELPERS` | What the decoder publishes for the frontends (nothing before a block decoded, the timeslot bitmap TN1 first, no key, cleared with the state), the rows every frontend shows from it, and the encryption-mode and MM status names. |
 
 ### MBE capture checks (issue #661)
 
@@ -1805,7 +1624,10 @@ forcing the legacy filter on at the 8 kHz RTL rate, misses 1.1% of 6 dB carriers
 model does not cover spurs or adjacent channels: a steady tone inside the channel is a carrier to the coherence test,
 and with these thresholds a birdie from -12 dB (widest plans) to -3.6 dB (narrowest) against the noise reads as one.
 `python3 tools/squelch_model.py` reproduces the report (`build/squelch_model/report.md`) in about 25 minutes on 8
-workers; `--quick` takes about a minute.
+workers; `--quick` takes about a minute. The 72 kHz RTL DSP bandwidth, selectable since TETRA needs it, came after that
+run, and the model now plans it too (an SDDC at 2 MS/s then runs 125 kHz): `--quick` counts 448 combinations, 270 that
+run and 210 carrier plans, and the scheme the squelch uses (`norm/40ms/cdb` in the report) passes all 210, as it passes
+all 196 of a `--quick` run without 72 kHz.
 
 #### Auto squelch on EDACS analog voice and the M17 encoder (design gate)
 
@@ -1883,7 +1705,7 @@ channel rate: EDACS converts what it reads to 48 kHz (issue #633). For the encod
 | Case | What it pins |
 | --- | --- |
 | `M17_STATE_DISPATCH` output-format case | Both payloads (two 160-sample codec frames at 3200, one 320-sample frame at 1600) play as two 160-frame blocks in each format: s16 or f32, mono or stereo, on UDP and, through the `dsd_audio_write` wrap (GNU and Clang off Apple), on a local stream. The wrap copies frames x channels samples as a backend reads them, so under ASan a short buffer is a report; on a two-channel stream both channels carry the decoded frame at full level. Every f32 sample equals the chained s16 sample / 32768, and the device receives those same s16 samples under `-y`. `-g 3` triples the samples `-g 1` passes through in both formats. The existing UDP, mute and stamp cases now count 1600's two blocks and stage into initialised output buffers. |
-| `CORE_AUDIO2_HELPERS` decoded-PCM case | `dsd_audio_play_decoded_pcm16()` against gates stubbed to mute: a forced talkgroup mute, a blocked record policy and a stale NXDN cipher with no key never mute a settled frame in any format, channel count or sink; a stale X2 slot cannot select slot 2 for M17; a 330-sample buffer runs the slot 0 chain and short staging exactly twice; the slot 1 switch and the mute still apply; the static WAV records what slot 1 plays in both formats and the per-call WAV every frame; a state with no output history plays nothing; the public mixers keep the policy verdict. |
+| `CORE_AUDIO2_HELPERS` decoded-PCM case | `dsd_audio_play_decoded_pcm16()` against gates stubbed to mute: a forced talkgroup mute, a blocked record policy and a stale NXDN cipher with no key never mute a settled frame in any format, channel count or sink; a stale X2 slot cannot select slot 2 for M17; a 330-sample buffer runs the slot 0 chain and short staging exactly twice; the slot 1 switch and the mute still apply; the static WAV records what slot 1 plays in both formats and the per-call WAV every frame; a state with no output history plays nothing; the public mixers keep the policy verdict; `dsd_audio_play_decoded_pcm16_record()` with record 0 still plays but writes neither WAV. |
 | `RUNTIME_CLI_PARSE` encoder-rate cases | `-fZ` opens the digital output at 8 kHz mono; `-fB` and `-fP` keep 48 kHz. Explicit `-8` survives every supported manual selector in either argument order, including after an analog preset. |
 | `M17_STATE_DISPATCH` IP bounds cases | Every truncated stream/control prefix uses an exact-sized allocation and leaves state untouched; a valid MPKT shorter than a stream frame reads only its own header. A sender-shaped 52-byte text-metadata packet retains its final nonzero application byte, with only the two CRC bytes excluded from the payload. ASan checks those bounds. |
 | `DECODE_IQ_M17_VOICE_OUTPUT` (Codec2 builds) | The M17 fixture on stdout: `-fz` whole s16 frames, `-fz -y` twice its bytes, `-fa` twice, `-fa -y` four times; `-g 1` and `-g 50` differ. |

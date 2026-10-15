@@ -5,6 +5,8 @@
 
 #include <dsd-neo/core/opts.h>
 #include <dsd-neo/core/state.h>
+#include <dsd-neo/core/state_ext.h>
+#include <dsd-neo/core/tetra_publication.h>
 #include <dsd-neo/dsp/frame_sync.h>
 #include <dsd-neo/runtime/analog_channel.h>
 #include <dsd-neo/runtime/decode_clock.h>
@@ -48,11 +50,8 @@ dsd_decode_mode_profile_for(dsdneoUserDecodeMode mode) {
 
     switch (mode) {
         case DSDCFG_MODE_TETRA:
-            /* TETRA owns a dedicated 18 ksym/s timing path rather than taking
-               part in the multi-protocol SPS hunt. COUNT is therefore the
-               intentional no-hunt-profile sentinel. */
             profile.symbol_rate_hz = 18000;
-            profile.sps_profile_index = DSD_FRAME_SYNC_SPS_PROFILE_COUNT;
+            profile.sps_profile_index = DSD_FRAME_SYNC_SPS_PROFILE_18000_4;
             break;
         case DSDCFG_MODE_P25P2:
             profile.symbol_rate_hz = 6000;
@@ -112,6 +111,10 @@ dsd_rtl_channel_profile_for(const dsd_opts* opts, int symbol_rate_hz, int levels
     return DSD_RTL_STREAM_CHANNEL_PROFILE_P25_C4FM;
 }
 
+/* The decode presets (k_decode_mode_presets, below the functions they apply). */
+typedef struct decode_mode_preset decode_mode_preset;
+static const decode_mode_preset* decode_mode_preset_find(dsdneoUserDecodeMode mode);
+
 /**
  * @brief The symbol timing a preset starts a mode off on, at 48 kHz.
  *
@@ -142,10 +145,10 @@ decode_mode_base_symbol_timing(dsdneoUserDecodeMode mode, int* out_sps, int* out
     }
 }
 
-void
+int
 dsd_apply_decode_mode_symbol_timing(dsdneoUserDecodeMode mode, int effective_input_rate_hz, dsd_state* state) {
-    if (!state) {
-        return;
+    if (!state || !decode_mode_preset_find(mode)) {
+        return -1;
     }
 
     int base_sps = 10;
@@ -155,10 +158,11 @@ dsd_apply_decode_mode_symbol_timing(dsdneoUserDecodeMode mode, int effective_inp
     state->symbolCenter = base_center;
 
     if (effective_input_rate_hz <= 0 || effective_input_rate_hz == 48000) {
-        return;
+        return 0;
     }
 
     dsd_state_rescale_symbol_timing(state, 48000, effective_input_rate_hz);
+    return 0;
 }
 
 static void
@@ -630,56 +634,84 @@ decode_mode_apply_am(dsd_opts* o, dsd_state* s) {
     DSD_SNPRINTF(o->output_name, sizeof o->output_name, "%s", "AM Monitor");
 }
 
-static int
-decode_mode_apply_profiled(dsdneoUserDecodeMode mode, dsdDecodePresetProfile profile, dsd_opts* opts,
-                           dsd_state* state) {
-    switch (mode) {
-        case DSDCFG_MODE_AUTO: decode_mode_apply_auto(profile, opts, state); return 0;
-        case DSDCFG_MODE_NXDN48: decode_mode_apply_nxdn48(profile, opts, state); return 0;
-        case DSDCFG_MODE_NXDN96: decode_mode_apply_nxdn96(profile, opts, state); return 0;
-        case DSDCFG_MODE_X2TDMA: decode_mode_apply_x2tdma(profile, opts, state); return 0;
-        case DSDCFG_MODE_YSF: decode_mode_apply_ysf(profile, opts, state); return 0;
-        default: return -1;
+/* Every decode preset. The profiled ones (AUTO, NXDN48, NXDN96, X2-TDMA, YSF) read the caller's profile, the rest
+   apply the same way from every entry point. One table, so a mode is refused before anything changes
+   (dsd_apply_decode_mode_preset()) by the same lookup that applies it. */
+struct decode_mode_preset {
+    dsdneoUserDecodeMode mode;
+    void (*apply)(dsd_opts* o, dsd_state* s);
+    void (*apply_profiled)(dsdDecodePresetProfile p, dsd_opts* o, dsd_state* s);
+};
+
+static const decode_mode_preset k_decode_mode_presets[] = {
+    {DSDCFG_MODE_AUTO, NULL, decode_mode_apply_auto},
+    {DSDCFG_MODE_NXDN48, NULL, decode_mode_apply_nxdn48},
+    {DSDCFG_MODE_NXDN96, NULL, decode_mode_apply_nxdn96},
+    {DSDCFG_MODE_X2TDMA, NULL, decode_mode_apply_x2tdma},
+    {DSDCFG_MODE_YSF, NULL, decode_mode_apply_ysf},
+    {DSDCFG_MODE_P25P1, decode_mode_apply_p25p1, NULL},
+    {DSDCFG_MODE_P25P2, decode_mode_apply_p25p2, NULL},
+    {DSDCFG_MODE_DMR, decode_mode_apply_dmr, NULL},
+    {DSDCFG_MODE_DMR_MONO, decode_mode_apply_dmr_mono, NULL},
+    {DSDCFG_MODE_DSTAR, decode_mode_apply_dstar, NULL},
+    {DSDCFG_MODE_EDACS_PV, decode_mode_apply_edacs_pv, NULL},
+    {DSDCFG_MODE_DPMR, decode_mode_apply_dpmr, NULL},
+    {DSDCFG_MODE_M17, decode_mode_apply_m17, NULL},
+    {DSDCFG_MODE_TDMA, decode_mode_apply_tdma, NULL},
+    {DSDCFG_MODE_TETRA, decode_mode_apply_tetra, NULL},
+    {DSDCFG_MODE_ANALOG, decode_mode_apply_analog, NULL},
+    {DSDCFG_MODE_AM, decode_mode_apply_am, NULL},
+};
+
+/* The preset that applies @p mode, or NULL for a mode no preset implements (DSDCFG_MODE_UNSET among them). */
+static const decode_mode_preset*
+decode_mode_preset_find(dsdneoUserDecodeMode mode) {
+    for (size_t i = 0; i < sizeof k_decode_mode_presets / sizeof k_decode_mode_presets[0]; i++) {
+        if (k_decode_mode_presets[i].mode == mode) {
+            return &k_decode_mode_presets[i];
+        }
     }
+    return NULL;
 }
 
-static int
-decode_mode_dispatch(dsdneoUserDecodeMode mode, dsdDecodePresetProfile profile, dsd_opts* opts, dsd_state* state) {
-    if (decode_mode_apply_profiled(mode, profile, opts, state) == 0) {
-        return 0;
+void
+dsd_decode_mode_leave_tetra(dsd_opts* opts, dsd_state* state) {
+    if (!opts || !state) {
+        return;
     }
+    opts->frame_tetra = 0;
+    (void)dsd_state_ext_set(state, DSD_STATE_EXT_PROTO_TETRA, NULL, NULL);
+    DSD_MEMSET(&state->tetra_sync, 0, sizeof(state->tetra_sync));
+    dsd_tetra_publication_reset(&state->tetra_pub);
+}
 
-    switch (mode) {
-        case DSDCFG_MODE_P25P1: decode_mode_apply_p25p1(opts, state); return 0;
-        case DSDCFG_MODE_P25P2: decode_mode_apply_p25p2(opts, state); return 0;
-        case DSDCFG_MODE_DMR: decode_mode_apply_dmr(opts, state); return 0;
-        case DSDCFG_MODE_DMR_MONO: decode_mode_apply_dmr_mono(opts, state); return 0;
-        case DSDCFG_MODE_DSTAR: decode_mode_apply_dstar(opts, state); return 0;
-        case DSDCFG_MODE_EDACS_PV: decode_mode_apply_edacs_pv(opts, state); return 0;
-        case DSDCFG_MODE_DPMR: decode_mode_apply_dpmr(opts, state); return 0;
-        case DSDCFG_MODE_M17: decode_mode_apply_m17(opts, state); return 0;
-        case DSDCFG_MODE_TDMA: decode_mode_apply_tdma(opts, state); return 0;
-        case DSDCFG_MODE_TETRA: decode_mode_apply_tetra(opts, state); return 0;
-        case DSDCFG_MODE_ANALOG: decode_mode_apply_analog(opts, state); return 0;
-        case DSDCFG_MODE_AM: decode_mode_apply_am(opts, state); return 0;
-        default: return -1;
+void
+dsd_decode_mode_commit_tetra(dsd_opts* opts, dsd_state* state) {
+    if (opts && state && opts->frame_tetra == 0) {
+        dsd_decode_mode_leave_tetra(opts, state);
     }
 }
 
 int
-dsd_apply_decode_mode_preset(dsdneoUserDecodeMode mode, dsdDecodePresetProfile profile, dsd_opts* opts,
+dsd_stage_decode_mode_preset(dsdneoUserDecodeMode mode, dsdDecodePresetProfile profile, dsd_opts* opts,
                              dsd_state* state) {
-    if (!opts || !state) {
+    /* A mode no preset implements (DSDCFG_MODE_UNSET: a config's [mode] without a decode key) is refused before
+       anything changes, the TETRA decoder flag included, so the session keeps the decoders it runs. */
+    const decode_mode_preset* preset = decode_mode_preset_find(mode);
+    if (!opts || !state || !preset) {
         return -1;
     }
 
-    /* Every preset other than TETRA must leave the TETRA decoder disabled. */
+    /* Every preset but TETRA's runs no TETRA decoder. What the TETRA decoder holds is the commit's to drop
+       (dsd_decode_mode_commit_tetra()): settings staged and then put back bring the session back whole. */
     if (mode != DSDCFG_MODE_TETRA) {
         opts->frame_tetra = 0;
     }
 
-    if (decode_mode_dispatch(mode, profile, opts, state) != 0) {
-        return -1;
+    if (preset->apply_profiled) {
+        preset->apply_profiled(profile, opts, state);
+    } else if (preset->apply) {
+        preset->apply(opts, state);
     }
 
     /* Analog monitor is a mode like any other, so leaving it is part of choosing a
@@ -688,8 +720,8 @@ dsd_apply_decode_mode_preset(dsdneoUserDecodeMode mode, dsdDecodePresetProfile p
        order-dependent, and every decode chip in the Qt radio panel renders
        unselected because the engine reports a mode none of them carry. The CLI used
        to clear it at its own `-f` case; it belongs to the presets, which is where
-       every caller gets it. Applied after the dispatch so an unsupported mode
-       changes nothing at all.
+       every caller gets it. An unsupported mode was refused above, so it changes
+       nothing at all.
 
        monitor_input_audio only follows analog_only out. Unlike analog_only --
        which nothing but this preset and `-fA` ever set -- it is also the `-8`
@@ -707,6 +739,16 @@ dsd_apply_decode_mode_preset(dsdneoUserDecodeMode mode, dsdDecodePresetProfile p
         /* The analog kind belongs to the analog presets; a digital session never carries one it did not choose. */
         opts->analog_demod = DSD_ANALOG_DEMOD_FM;
     }
+    return 0;
+}
+
+int
+dsd_apply_decode_mode_preset(dsdneoUserDecodeMode mode, dsdDecodePresetProfile profile, dsd_opts* opts,
+                             dsd_state* state) {
+    if (dsd_stage_decode_mode_preset(mode, profile, opts, state) != 0) {
+        return -1;
+    }
+    dsd_decode_mode_commit_tetra(opts, state);
     return 0;
 }
 
@@ -843,9 +885,41 @@ dsd_decode_mode_input_spec_is_iq(const dsd_opts* opts) {
                : 0;
 }
 
+const char*
+dsd_decode_mode_needs_iq_text(dsdneoUserDecodeMode mode) {
+    switch (mode) {
+        case DSDCFG_MODE_AM: return DSD_DECODE_MODE_AM_NEEDS_IQ_TEXT;
+        case DSDCFG_MODE_TETRA: return DSD_DECODE_MODE_TETRA_NEEDS_IQ_TEXT;
+        default: return NULL;
+    }
+}
+
 int
 dsd_decode_mode_runs_on_input(dsdneoUserDecodeMode mode, const dsd_opts* opts) {
-    return (mode != DSDCFG_MODE_AM || dsd_decode_mode_input_is_iq(opts)) ? 1 : 0;
+    if (mode == DSDCFG_MODE_AM) {
+        return dsd_decode_mode_input_is_iq(opts);
+    }
+    if (mode == DSDCFG_MODE_TETRA) {
+        return (dsd_decode_mode_input_is_iq(opts)
+                || (opts && (opts->audio_in_type == AUDIO_IN_SYMBOL_BIN || opts->audio_in_type == AUDIO_IN_SYMBOL_FLT)))
+                   ? 1
+                   : 0;
+    }
+    return 1;
+}
+
+int
+dsd_decode_mode_runs_on_input_spec(dsdneoUserDecodeMode mode, const dsd_opts* opts) {
+    if (mode == DSDCFG_MODE_AM) {
+        return dsd_decode_mode_input_spec_is_iq(opts);
+    }
+    if (mode == DSDCFG_MODE_TETRA) {
+        return (dsd_decode_mode_input_spec_is_iq(opts)
+                || (opts && dsd_opts_audio_in_dev_is_symbol_capture(opts->audio_in_dev)))
+                   ? 1
+                   : 0;
+    }
+    return 1;
 }
 
 /* How long the toast stays: a start sets it before any frontend is up to show it. */
