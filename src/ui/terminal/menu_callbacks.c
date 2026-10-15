@@ -21,7 +21,6 @@
 #include <dsd-neo/platform/posix_compat.h>
 #include <dsd-neo/runtime/analog_channel.h>
 #include <dsd-neo/runtime/config.h>
-#include <dsd-neo/runtime/input_spec.h>
 #include <dsd-neo/runtime/squelch.h>
 #include <stdint.h>
 #include <stdlib.h>

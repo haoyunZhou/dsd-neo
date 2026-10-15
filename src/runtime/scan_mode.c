@@ -1330,11 +1330,6 @@ dsd_scan_mode_effective_profile(const dsd_opts* opts, const dsd_state* state) {
             case DSD_FRAME_SYNC_SPS_PROFILE_9600_2: return dsd_decode_mode_profile_for(DSDCFG_MODE_EDACS_PV);
             case DSD_FRAME_SYNC_SPS_PROFILE_6000_4: return dsd_decode_mode_profile_for(DSDCFG_MODE_P25P2);
             case DSD_FRAME_SYNC_SPS_PROFILE_4800_2: return dsd_decode_mode_profile_for(DSDCFG_MODE_DSTAR);
-            case DSD_FRAME_SYNC_SPS_PROFILE_18000_4: {
-                dsd_decode_mode_profile profile = dsd_decode_mode_profile_for(DSDCFG_MODE_TETRA);
-                profile.sps_profile_index = DSD_FRAME_SYNC_SPS_PROFILE_18000_4;
-                return profile;
-            }
             default: break;
         }
     }

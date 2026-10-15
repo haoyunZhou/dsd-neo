@@ -4355,7 +4355,6 @@ fake_scan_control(dsd_opts* opts, dsd_state* state, int op) {
  * --trunk-scan they are handed to the coordinator through the control hook; with neither
  * scanner running they are accepted and declined with a status message.
  */
-#ifdef DSD_NEO_TEST_IO_CONTROL_WRAP
 static int
 test_scan_hold_avoid_commands(void) {
     int rc = 0;
@@ -4572,7 +4571,6 @@ test_scan_hold_avoid_commands(void) {
     reset_cc_tune_stub(DSD_TRUNK_TUNE_RESULT_OK);
     return rc;
 }
-#endif
 
 /*
  * Issue #575: the return to the control channel and the channel cycle (the next LCN, P25 candidate or -Y row) are
@@ -7005,9 +7003,6 @@ test_temporary_lockout_commands(uint8_t slot) {
 
     // Export uses the same canonical writer even when its source snapshot has avoids.
     union {
-        long double floating_alignment;
-        void* pointer_alignment;
-        uint64_t integer_alignment;
         unsigned char bytes[1200];
         dsd_app_tg_export_payload alignment; /* MSVC's C <stddef.h> has no max_align_t. */
     } storage = {{0}};
@@ -7167,8 +7162,8 @@ test_skip_commands(uint8_t slot) {
     rc |= expect_int("export seed skip", dsd_tg_policy_call_skip_arm(&state, 123, 1, 0, dsd_decode_now_mono_s()), 0);
 
     union {
-        dsd_app_tg_export_payload alignment; /* MSVC's C <stddef.h> has no max_align_t. */
         unsigned char bytes[1200];
+        dsd_app_tg_export_payload alignment; /* MSVC's C <stddef.h> has no max_align_t. */
     } storage = {{0}};
 
     dsd_app_tg_export_payload* export = (dsd_app_tg_export_payload*)storage.bytes;

@@ -70,8 +70,8 @@ int frame_sync_trunk_scan_p25p1_trial(const dsd_opts* opts, const dsd_state* sta
  * of dsd_frame_sync_sps_hunt_dwell_passes() x DSD_FRAME_SYNC_NO_SYNC_PASS_SYMBOLS. That is what
  * the span has to cover to do its job at all, and it is tight rather than padded: from the proof,
  * the hunt spends at most one dwell finishing on 2400/4 -- the proof restarted that counter -- one
- * each traversing 9600/2, 6000/4, 4800/2 and 18000/4, and the guard must still be standing through
- * the whole of the first 4800/4 dwell, where the claimants are. Builds without some of those
+ * each traversing 9600/2, 6000/4 and 4800/2, and the guard must still be standing through the
+ * whole of the first 4800/4 dwell, where the claimants are. Builds without some of those
  * candidates simply arrive sooner.
  *
  * The other bound is what it costs a signal that is really there: a transmission that has genuinely
@@ -81,7 +81,7 @@ int frame_sync_trunk_scan_p25p1_trial(const dsd_opts* opts, const dsd_state* sta
  * over-reaching, and the profile hold that PROFILE_PROVEN itself buys stays the primary defence
  * (see dsd_frame_sync_suppress_4800_4_for_2400_4_transmission()).
  */
-#define DSD_FRAME_SYNC_PROVEN_2400_4_HOLD_SYMBOLS   32400U
+#define DSD_FRAME_SYNC_PROVEN_2400_4_HOLD_SYMBOLS   27000U
 
 /** @brief One entry of the SPS hunt's rate/level table, indexed by dsd_state::sps_hunt_idx. */
 typedef struct {

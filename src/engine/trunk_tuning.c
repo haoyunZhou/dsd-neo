@@ -106,8 +106,7 @@ dsd_engine_cc_is_p25(const dsd_state* state) {
     }
     if (DSD_SYNC_IS_DMR(state->synctype) || DSD_SYNC_IS_DMR(state->lastsynctype) || DSD_SYNC_IS_NXDN(state->synctype)
         || DSD_SYNC_IS_NXDN(state->lastsynctype) || DSD_SYNC_IS_EDACS(state->synctype)
-        || DSD_SYNC_IS_EDACS(state->lastsynctype) || DSD_SYNC_IS_TETRA(state->synctype)
-        || DSD_SYNC_IS_TETRA(state->lastsynctype)) {
+        || DSD_SYNC_IS_EDACS(state->lastsynctype)) {
         return 0;
     }
     return 1;

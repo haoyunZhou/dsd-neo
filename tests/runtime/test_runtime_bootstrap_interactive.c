@@ -572,7 +572,7 @@ test_file_input_applies_clamped_low_sample_rate(void) {
     const char* input = "4\n"
                         "capture.raw\n"
                         "1\n"
-                        "15\n"
+                        "14\n"
                         "n\n"
                         "n\n"
                         "n\n";
@@ -632,7 +632,7 @@ test_rtl_input_formats_clamped_radio_options(void) {
                         "3\n"
                         "-1001\n"
                         "9\n"
-                        "15\n"
+                        "14\n"
                         "n\n"
                         "n\n"
                         "n\n";
@@ -678,7 +678,7 @@ test_rtl_empty_frequency_falls_back_to_pulse_devices(void) {
     static dsd_state state;
     const char* input = "2\n"
                         "\n"
-                        "15\n"
+                        "14\n"
                         "n\n";
 
     reset_harness();

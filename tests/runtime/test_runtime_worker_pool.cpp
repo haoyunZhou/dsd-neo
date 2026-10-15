@@ -15,8 +15,6 @@
 #include <dsd-neo/runtime/worker_pool.h>
 #include <thread>
 
-#include "test_support.h"
-
 struct demod_state;
 
 struct CounterArg {

@@ -21,9 +21,6 @@ target_sources(
         tetra_tea.c
 )
 
-find_package(tetracrypto CONFIG REQUIRED)
-find_package(tetraetee CONFIG REQUIRED)
-
 target_include_directories(
     dsd-neo_crypto
     PUBLIC ${PROJECT_SOURCE_DIR}/include

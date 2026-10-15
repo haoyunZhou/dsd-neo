@@ -55,12 +55,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#if defined(_WIN32)
-#include <direct.h>
-#include <io.h>
-#else
-#include <unistd.h>
-#endif
 #include "analog_tone_policy.h"
 #include "test_support.h"
 #include "trunk_scan_internal.h"

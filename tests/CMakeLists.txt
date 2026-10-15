@@ -2072,9 +2072,9 @@ add_executable(
 )
 target_include_directories(
     dsd-neo_test_runtime_worker_pool
-    PRIVATE ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/tests/test_support
+    PRIVATE ${PROJECT_SOURCE_DIR}/include
 )
-target_link_libraries(dsd-neo_test_runtime_worker_pool PRIVATE dsd-neo_runtime dsd-neo_test_support)
+target_link_libraries(dsd-neo_test_runtime_worker_pool PRIVATE dsd-neo_runtime)
 add_test(NAME RUNTIME_WORKER_POOL COMMAND dsd-neo_test_runtime_worker_pool)
 
 add_executable(
@@ -2273,7 +2273,6 @@ if(DSD_ENABLE_TERMINAL_UI)
         PRIVATE
             DSD_NEO_THREADING_NO_INLINE_CREATE
             DSD_NEO_TEST_HOOKS
-            $<$<C_COMPILER_ID:MSVC>:CURSES_LIBRARY>
             NCURSES_REENTRANT=0
     )
     target_include_directories(
@@ -2627,11 +2626,7 @@ if(DSD_ENABLE_TERMINAL_UI)
     )
     target_compile_definitions(
         dsd-neo_test_ui_panels_header_footer
-        PRIVATE
-            NCURSES_NOMACROS
-            attron=dsd_test_attron
-            attroff=dsd_test_attroff
-            printw=dsd_test_printw
+        PRIVATE NCURSES_NOMACROS
     )
     target_include_directories(
         dsd-neo_test_ui_panels_header_footer
@@ -2990,27 +2985,6 @@ if(DSD_ENABLE_TERMINAL_UI)
             ${CURSES_LIBRARIES}
             ${DSD_NEO_TEST_MATH_LIB}
     )
-    # The printer is compiled into this executable and formats a TETRA mode line.
-    # Link the protocol archive directly: that target also exposes the core
-    # library, whose symbols this test stubs. Crypto is linked as a target so
-    # its TEA import libraries stay on the link line.
-    target_link_options(
-        dsd-neo_test_ui_ncurses_printer_helpers
-        PRIVATE "$<TARGET_LINKER_FILE:dsd-neo_proto_tetra>"
-    )
-    set_property(
-        TARGET dsd-neo_test_ui_ncurses_printer_helpers
-        APPEND
-        PROPERTY LINK_DEPENDS "$<TARGET_LINKER_FILE:dsd-neo_proto_tetra>"
-    )
-    target_link_libraries(
-        dsd-neo_test_ui_ncurses_printer_helpers
-        PRIVATE dsd-neo_crypto
-    )
-    add_dependencies(
-        dsd-neo_test_ui_ncurses_printer_helpers
-        dsd-neo_proto_tetra
-    )
     if(MSVC)
         target_compile_definitions(
             dsd-neo_test_ui_ncurses_printer_helpers
@@ -3222,7 +3196,7 @@ if(DSD_ENABLE_TERMINAL_UI)
     )
     target_compile_definitions(
         dsd-neo_test_ui_prims_status_gamma
-        PRIVATE NCURSES_REENTRANT=0 $<$<C_COMPILER_ID:MSVC>:CURSES_LIBRARY>
+        PRIVATE NCURSES_REENTRANT=0
     )
     target_include_directories(
         dsd-neo_test_ui_prims_status_gamma
@@ -3233,7 +3207,7 @@ if(DSD_ENABLE_TERMINAL_UI)
     )
     target_link_libraries(
         dsd-neo_test_ui_prims_status_gamma
-        PRIVATE ${CURSES_LIBRARIES} ${DSD_NEO_TEST_MATH_LIB}
+        PRIVATE ${DSD_NEO_TEST_MATH_LIB}
     )
     if(MSVC)
         target_compile_definitions(
@@ -5446,13 +5420,7 @@ add_test(
 add_executable(dsd-neo_test_core_audio_gain core/test_core_audio_gain.c)
 target_include_directories(
     dsd-neo_test_core_audio_gain
-    PRIVATE
-        ${PROJECT_SOURCE_DIR}/include
-        ${PROJECT_SOURCE_DIR}/tests/test_support
-)
-target_link_libraries(
-    dsd-neo_test_core_audio_gain
-    PRIVATE dsd-neo_core dsd-neo_test_support
+    PRIVATE ${PROJECT_SOURCE_DIR}/include
 )
 target_link_libraries(
     dsd-neo_test_core_audio_gain
@@ -5565,7 +5533,7 @@ target_include_directories(
 )
 target_compile_definitions(
     dsd-neo_test_core_audio2_helpers
-    PRIVATE DSD_AUDIO2_INTERNAL= MBE_API=
+    PRIVATE DSD_AUDIO2_INTERNAL=
 )
 target_link_libraries(
     dsd-neo_test_core_audio2_helpers
@@ -11918,7 +11886,7 @@ target_include_directories(
 )
 target_link_libraries(
     dsd-neo_test_io_rigctl_control
-    PRIVATE ${DSD_NEO_TEST_MATH_LIB} ${DSD_PLATFORM_LIBS}
+    PRIVATE ${DSD_NEO_TEST_MATH_LIB}
 )
 # The test stubs the dsd_socket_* layer instead of linking dsd-neo_platform, so
 # the byte-order calls (htons) need Winsock directly on Windows.
@@ -11995,7 +11963,7 @@ target_compile_definitions(
 )
 target_include_directories(
     dsd-neo_test_io_rtl_perf
-    PRIVATE ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src/io/radio ${PROJECT_SOURCE_DIR}/tests/test_support
+    PRIVATE ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src/io/radio
 )
 target_link_libraries(
     dsd-neo_test_io_rtl_perf
@@ -17011,24 +16979,4 @@ if(WIN32 AND CURSES_INCLUDE_DIRS)
     unset(_dsd_neo_test_type)
     unset(_dsd_neo_test_includes)
     unset(_dsd_neo_curses_dir)
-endif()
-
-# Several focused tests provide local stubs for symbols that are also pulled in
-# transitively by MSVC static libraries. Permit those deliberate overrides.
-if(MSVC)
-    foreach(
-        _dsd_override_test
-        dsd-neo_test_nxdn_enc_class
-        dsd-neo_test_p25_p2_2v_first_frame_gate
-        dsd-neo_test_p25_p2_release_partial_audio
-        dsd-neo_test_p25_p2_reliability
-        dsd-neo_test_ui_prims_status_gamma
-    )
-        target_link_options(
-            ${_dsd_override_test}
-            PRIVATE /FORCE:MULTIPLE /INCREMENTAL:NO /IGNORE:4006 /IGNORE:4075 /IGNORE:4088
-        )
-        set_property(TARGET ${_dsd_override_test} PROPERTY DSD_NEO_ALLOW_LINK_WARNINGS ON)
-        set_property(TARGET ${_dsd_override_test} PROPERTY LINK_WARNING_AS_ERROR OFF)
-    endforeach()
 endif()

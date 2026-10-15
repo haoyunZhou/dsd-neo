@@ -318,12 +318,6 @@ test_sps_hunt_skips_disabled_protocol_rates(void) {
     assert(frame_sync_sps_hunt_next_index(&opts, &state) == 3);
 
     reset(&opts, &state);
-    opts.frame_dmr = 1;
-    opts.frame_tetra = 1;
-    state.sps_hunt_idx = 4;
-    assert(frame_sync_sps_hunt_next_index(&opts, &state) == 5);
-
-    reset(&opts, &state);
     state.sps_hunt_idx = 2;
     assert(frame_sync_sps_hunt_next_index(&opts, &state) == 2);
 
@@ -2719,13 +2713,6 @@ test_rtl_sps_profiles_apply_and_lock_on_sync(void) {
         .apply_demod_profile = fake_apply_demod_profile,
     };
     dsd_rtl_stream_metrics_hooks_set(&hooks);
-    reset_fake_profile_capture();
-
-    state.sps_hunt_idx = 0;
-    frame_sync_apply_sps_hunt_profile(&opts, &state, DSD_FRAME_SYNC_SPS_PROFILE_18000_4, 0);
-    assert(g_profile_rate == 18000);
-    assert(g_profile_levels == 4);
-    assert(g_profile_channel == DSD_RTL_STREAM_CHANNEL_PROFILE_WIDE);
     reset_fake_profile_capture();
 
     for (int profile_index = 0; profile_index < 5; profile_index++) {

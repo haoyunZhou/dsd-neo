@@ -168,7 +168,6 @@ git clone https://github.com/arancormonk/mbelib-neo
 cmake -S mbelib-neo -B mbelib-neo/build -DCMAKE_BUILD_TYPE=Release
 cmake --build mbelib-neo/build -j
 cmake --install mbelib-neo/build --prefix "$HOME/.local"
-bash tools/install_tetra_crypto_deps.sh "$HOME/.local"
 
 # Linux: user-prefix installs need this when running installed binaries.
 export LD_LIBRARY_PATH="$HOME/.local/lib:$HOME/.local/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"

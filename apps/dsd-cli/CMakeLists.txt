@@ -37,7 +37,6 @@ if(CODEC2_FOUND)
 endif()
 
 target_link_libraries(dsd-neo PRIVATE dsd-neo_warnings)
-dsd_neo_copy_tetra_acelp_runtime(dsd-neo)
 
 if(BUILD_TESTING)
     add_test(

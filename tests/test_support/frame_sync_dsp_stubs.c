@@ -109,8 +109,3 @@ void
 dsd_analog_audio_note_reception(const dsd_state* state) {
     (void)state;
 }
-
-void
-tetra_uplink_configure(dsd_state* state) {
-    (void)state;
-}

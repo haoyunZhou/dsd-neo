@@ -17,7 +17,6 @@
 #include <dsd-neo/runtime/analog_tones.h>
 #include <dsd-neo/runtime/config.h>
 #include <dsd-neo/runtime/config_schema.h>
-#include <dsd-neo/runtime/input_spec.h>
 #include <dsd-neo/runtime/path_policy.h>
 #include <errno.h>
 #include <stdint.h>

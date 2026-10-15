@@ -294,13 +294,6 @@ run_stale_vc_with_cc_case(const generic_return_case* test_case) {
                       p25_p2_voice_aliases_cleared(state));
     rc |= expect_true(test_case->name, "stale-vc-with-cc", "canonical call ended", canonical_call_ended(state));
     rc |= expect_true(test_case->name, "stale-vc-with-cc", "recent activity cleared", recent_activity_cleared(state));
-    if (DSD_SYNC_IS_TETRA(test_case->synctype)) {
-        rc |= expect_true(test_case->name, "stale-vc-with-cc", "TETRA traffic state cleared",
-                          !state->tetra_call_active && !state->tetra_tx_granted_valid && !state->tetra_tx_wait
-                              && !state->tetra_vc_assignment_valid && state->tetra_vc_freq_hz == 0);
-        rc |= expect_true(test_case->name, "stale-vc-with-cc", "TETRA SM reconciled to CC",
-                          tetra_sm_get_state() == TETRA_SM_ON_CC);
-    }
 
     free_test_runtime(opts, state);
     return rc;
@@ -328,13 +321,6 @@ run_stale_vc_without_cc_case(const generic_return_case* test_case) {
                           && state->p2_wacn == 0 && state->p2_sysid == 0);
     rc |= expect_true(test_case->name, "stale-vc-without-cc", "p25 slot and audio aliases cleared",
                       p25_p2_voice_aliases_cleared(state));
-    if (DSD_SYNC_IS_TETRA(test_case->synctype)) {
-        rc |= expect_true(test_case->name, "stale-vc-without-cc", "unreturnable TETRA traffic cleared",
-                          !state->tetra_call_active && !state->tetra_vc_assignment_valid
-                              && state->tetra_vc_freq_hz == 0);
-        rc |= expect_true(test_case->name, "stale-vc-without-cc", "TETRA SM returned to IDLE",
-                          tetra_sm_get_state() == TETRA_SM_IDLE);
-    }
 
     free_test_runtime(opts, state);
     return rc;
@@ -499,8 +485,6 @@ main(void) {
         {"x2tdma-voice-neg", DSD_SYNC_X2TDMA_VOICE_NEG},
         {"x2tdma-voice-pos", DSD_SYNC_X2TDMA_VOICE_POS},
         {"x2tdma-data-neg", DSD_SYNC_X2TDMA_DATA_NEG},
-        {"tetra-ndb-pos", DSD_SYNC_TETRA_NDB_POS},
-        {"tetra-sb-neg", DSD_SYNC_TETRA_SB_NEG},
     };
     static const generic_return_case tetra_cases[] = {
         {"tetra-ndb-pos", DSD_SYNC_TETRA_NDB_POS},

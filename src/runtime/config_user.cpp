@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: GPL-3.0-or-later
 /*
  * Copyright (C) 2025 by arancormonk <180709949+arancormonk@users.noreply.github.com>
  */
@@ -30,7 +30,6 @@
 #include <dsd-neo/runtime/config_schema.h>
 #include <dsd-neo/runtime/decode_mode.h>
 #include <dsd-neo/runtime/freq_parse.h>
-#include <dsd-neo/runtime/input_spec.h>
 #include <dsd-neo/runtime/log.h>
 #include <dsd-neo/runtime/path_policy.h>
 #include <dsd-neo/runtime/rdio_export.h>
@@ -1589,10 +1588,6 @@ apply_demod_mode(dsd_opts* opts, dsd_state* state, int mod_c4fm, int mod_qpsk, i
 static void
 apply_demod_config(const dsdneoUserConfig* cfg, dsd_opts* opts, dsd_state* state) {
     if (!cfg || !opts || !state || !cfg->has_demod) {
-        return;
-    }
-    if (cfg->has_mode && cfg->decode_mode == DSDCFG_MODE_DPMR) {
-        apply_demod_mode(opts, state, 1, 0, 0, 0, 0);
         return;
     }
     switch (cfg->demod_path) {

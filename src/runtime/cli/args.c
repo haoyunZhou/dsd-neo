@@ -28,8 +28,6 @@
 #include <dsd-neo/io/iq_replay.h>
 #include <dsd-neo/io/iq_types.h>
 #include <dsd-neo/platform/audio.h>
-#include <dsd-neo/protocol/tetra/tetra_fec.h>
-#include <dsd-neo/protocol/tetra/tetra_air.h>
 #include <dsd-neo/platform/file_compat.h>
 #include <dsd-neo/platform/platform.h>
 #include <dsd-neo/platform/posix_compat.h>

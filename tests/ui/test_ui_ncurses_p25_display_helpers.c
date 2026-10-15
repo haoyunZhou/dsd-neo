@@ -90,9 +90,6 @@ append_raw_capture(const char* text, int len) {
 static void
 assert_capture_contains(const char* needle) {
     assert(needle != NULL);
-    if (strstr(g_printw_capture, needle) == NULL) {
-        fprintf(stderr, "missing capture text: %s\ncaptured: %s\n", needle, g_printw_capture);
-    }
     assert(strstr(g_printw_capture, needle) != NULL);
 }
 

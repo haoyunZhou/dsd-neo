@@ -38,7 +38,6 @@
 #include <dsd-neo/dsp/analog_audio.h>
 #include <dsd-neo/protocol/dpmr/dpmr.h>
 #include <dsd-neo/protocol/edacs/edacs_afs.h>
-#include <dsd-neo/protocol/tetra/tetra_dmo.h>
 #include <dsd-neo/protocol/m17/m17_parse.h>
 #include <dsd-neo/protocol/p25/p25_callsign.h>
 #include <dsd-neo/protocol/p25/p25_crypto.h>
