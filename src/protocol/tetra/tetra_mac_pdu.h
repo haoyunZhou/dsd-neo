@@ -122,7 +122,6 @@ typedef enum {
  * @return The usage. Frame 18's PDU (table 21.83) gives none: frame 18 carries signalling only.
  */
 tetra_dl_usage tetra_access_assign_dl_usage(uint16_t pdu, uint8_t* usage_marker);
-
 #ifdef __cplusplus
 }
 #endif

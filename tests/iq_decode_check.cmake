@@ -8,8 +8,7 @@
 #
 # Expected -D inputs: DSD_BIN, MODE, FIXTURE, EXPECTED; optional NOT_EXPECTED,
 # MIN_MATCHES (minimum number of non-overlapping EXPECTED matches) and
-# EVENT_EXPECTED with WORK_DIR (a regex the run's event history must match).
-foreach(_var DSD_BIN MODE FIXTURE EXPECTED)
+# EVENT_EXPECTED with WORK_DIR (a regex the run's event history must match).foreach(_var DSD_BIN MODE FIXTURE EXPECTED)
     if(NOT DEFINED ${_var})
         message(FATAL_ERROR "iq_decode_check: missing -D${_var}")
     endif()
@@ -70,8 +69,7 @@ if(DEFINED MIN_MATCHES AND NOT "${MIN_MATCHES}" STREQUAL "")
             "iq_decode_check: MIN_MATCHES must be a positive integer"
         )
     endif()
-    dsd_test_count_regex_matches(_expected_match_count "${EXPECTED}" "${_all}")
-    if(_expected_match_count LESS MIN_MATCHES)
+    dsd_test_count_regex_matches(_expected_match_count "${EXPECTED}" "${_all}")    if(_expected_match_count LESS MIN_MATCHES)
         message(
             FATAL_ERROR
             "iq_decode_check: payload /${EXPECTED}/ matched ${_expected_match_count} times, expected at least ${MIN_MATCHES}\n${_all}"

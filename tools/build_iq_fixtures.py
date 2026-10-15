@@ -942,15 +942,13 @@ def write_capture(out_dir, name, payload, data_file=None, **sidecar):
 def write_fixture(
     out_dir, name, samples, normalize=True, sample_rate=SAMPLE_RATE_HZ, dsp_bw_khz=DSP_BW_KHZ, **sidecar
 ):
-    """Quantize samples to cu8 and write them with their sidecar; keywords are write_capture()'s sidecar fields."""
-    return write_capture(
+    """Quantize samples to cu8 and write them with their sidecar; keywords are write_capture()'s sidecar fields."""    return write_capture(
         out_dir,
         name,
         to_cu8(samples, normalize=normalize).tobytes(),
         sample_rate_hz=sample_rate,
         rtl_dsp_bw_khz=dsp_bw_khz,
-        **sidecar,
-    )
+        **sidecar,    )
 
 
 def load_cu8_fixture(path):
@@ -1840,8 +1838,7 @@ def derived_fixture_names():
             TETRA_BAD_CRC_IMPAIRED_NAME,
             TETRA_72K_NAME,
         ]
-        + [entry[0] for entry in DERIVED_TETRA_GAP]
-    )
+        + [entry[0] for entry in DERIVED_TETRA_GAP]    )
 
 
 def check_only_names(only):
@@ -1894,8 +1891,7 @@ def main():
         total += build_derived_gap(args.out)
         total += build_dpmr_synth(args.out)
         total += build_tetra_synth(args.out)
-        total += build_tetra_gap(args.out)
-        total += build_nfm_synth(args.out)
+        total += build_tetra_gap(args.out)        total += build_nfm_synth(args.out)
         total += build_am_synth(args.out)
         total += build_analog_synth(args.out)
         total += build_squelch_burst(args.out)

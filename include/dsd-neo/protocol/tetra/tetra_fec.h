@@ -109,7 +109,6 @@ uint32_t tetra_rm3014_encode(uint16_t info);
  *  returns the number of bits corrected, 0 to 3; otherwise, or with a bit above bit 29 set, returns -1 and leaves
  *  @p info alone. */
 int tetra_rm3014_decode(uint32_t received, uint16_t* info);
-
 #ifdef __cplusplus
 }
 #endif

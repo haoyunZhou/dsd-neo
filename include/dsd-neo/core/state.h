@@ -67,8 +67,7 @@ typedef struct {
      * training sequence (EN 300 392-2 table 9.7), captured with block 1.
      * aach1_valid: 1 when aach1_dibuf holds them; 0 for a burst with no AACH (uplink, direct mode). */
     uint8_t aach1_dibuf[7];
-    uint8_t aach1_valid;
-    uint8_t polarity;
+    uint8_t aach1_valid;    uint8_t polarity;
     uint8_t nts2;
     /* How many 90° slicer steps to undo before FEC. 0 keeps the historical
      * mapping; 1..3 correct a Costas phase that still correlates the training

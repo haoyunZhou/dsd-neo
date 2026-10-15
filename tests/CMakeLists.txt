@@ -11114,8 +11114,7 @@ add_test(NAME EDACS_GRANT_POLICY COMMAND dsd-neo_test_edacs_grant_policy)
 # dropped from the CTest name).
 set(_dsd_tetra_test_sources
     acelp_reference
-    tetra_aach
-    tetra_bits
+    tetra_aach    tetra_bits
     air_chain_vector
     d_tx_granted_chan
     depuncture_regression
@@ -13588,8 +13587,7 @@ if(DSD_HAS_RADIO)
         "${_dsd_tetra_aach_not_traffic}"
         8
     )
-    unset(_dsd_tetra_aach_not_traffic)
-    # Complex-conjugated IQ reverses every differential phase step. Require
+    unset(_dsd_tetra_aach_not_traffic)    # Complex-conjugated IQ reverses every differential phase step. Require
     # protected payloads after negative-polarity synchronization and dibit-MSB
     # normalization in both the BSCH and NDB paths.
     dsd_neo_add_iq_decode_test(

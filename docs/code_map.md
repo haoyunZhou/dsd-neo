@@ -4446,8 +4446,7 @@ Private per-protocol modules worth knowing about:
 
 The frame sync (`frame_sync_try_tetra()` in `src/dsp/dsd_frame_sync.c`) locks a TETRA burst at the end of its training
 sequence and captures block 1 from its history into `dsd_state::tetra_sync`, on the TMO downlink with AACH half 1, the
-7 dibits right before the training sequence (`aach1_dibuf`; the decoder reads half 2 after it). On the uplink (`--tetra-uplink`) normal
-training sequence 1 is also dibits 2..12 of the control burst's extended training sequence (EN 300 392-2 clause
+7 dibits right before the training sequence (`aach1_dibuf`; the decoder reads half 2 after it). On the uplink (`--tetra-uplink`) normaltraining sequence 1 is also dibits 2..12 of the control burst's extended training sequence (EN 300 392-2 clause
 9.4.4.3.3), so there the control burst is tried first and a normal burst's training is matched two symbols back, once
 those two symbols showed it ends no control burst; they are block 2's first two dibits, which the decoder takes before
 it reads on (`b2_lead_count`, `tetra_read_block2()` in `tetra.c`). Off the uplink the normal burst locks at its training
@@ -4475,8 +4474,7 @@ Each downlink signalling PDU family has a pure decoder that reads one PDU into a
 1 only when the whole PDU, optional elements included, was there and well formed; it keeps nothing and acts on nothing.
 All are module-private: `tetra_mac_resource_decode()` and `tetra_mac_broadcast_decode()` (the MAC-RESOURCE header with
 its address, SYSINFO with its D-MLE-SYSINFO, ACCESS-DEFINE; `src/protocol/tetra/tetra_mac_pdu.h`, with
-`tetra_access_assign_dl_usage()`, the downlink usage an AACH's ACCESS-ASSIGN gives its slot), `tetra_mle_decode()`
-(the MLE protocol PDUs, the D-CALL RESTORE of a D-RESTORE-ACK included), `tetra_sds_decode()` (D-STATUS and D-SDS-DATA:
+`tetra_access_assign_dl_usage()`, the downlink usage an AACH's ACCESS-ASSIGN gives its slot), `tetra_mle_decode()`(the MLE protocol PDUs, the D-CALL RESTORE of a D-RESTORE-ACK included), `tetra_sds_decode()` (D-STATUS and D-SDS-DATA:
 the SDS-TL header, the text, a concatenation part's control fields but not its reassembly) and `tetra_sndcp_decode()`
 (the SN-PDU header; all three in `tetra_mle_pdu.h`), and `tetra_mm_decode()` (the MM PDUs of EN 300 392-2 clause 16 and
 EN 300 392-7 annex A; `tetra_mm_pdu.h`). The dispatchers (`tetra_mac_parse_schd()`, `tetra_mle_dispatch()`,
@@ -4799,8 +4797,7 @@ single "current call".
   sends SCH/F blocks of nearly all zero bits, which pass the speech CRC once noise breaks theirs (all zero bits are a
   codeword of every linear code). The AACH is the shortened (30,14) Reed-Muller code (`tetra_rm3014_decode()`, up to 3
   bits corrected, scrambled with the colour code); one that cannot be read says nothing, and the block is tried as
-  speech as before. The `-Z` NDB line shows the PDU read, header/field 1/field 2 (`AACH 3/51/51`), or `AACH ?`. Trunking on, only the followed call's timeslots play, once its tune settled and its signalling proved it on
-  the carrier, while its record does not place it elsewhere (an allocation no call PDU took, which never tunes, or a
+  speech as before. The `-Z` NDB line shows the PDU read, header/field 1/field 2 (`AACH 3/51/51`), or `AACH ?`. Trunking on, only the followed call's timeslots play, once its tune settled and its signalling proved it on  the carrier, while its record does not place it elsewhere (an allocation no call PDU took, which never tunes, or a
   reallocation whose tune failed moves it off the channel the receiver stays on, which the SwMI may give any call next;
   `voice_record_on()`) and no other call was allocated its channel (Channel exclusivity above: the state machine let
   go of it then), and only as the TDMA clock places the burst: a retune stops the clock until the carrier's next BSCH, and
@@ -4947,7 +4944,6 @@ whose AACH says control or unallocated, the uplink signalling that proves its ca
 grant), `TETRA_AACH` (the Reed-Muller code and table 21.82 against AACH words received off air),
 `DECODE_IQ_TETRA_REAL_AIR_CALL_AACH`, `DECODE_IQ_TETRA_REAL_AIR_GAP_AACH_GATE`, `TETRA_AIR`, `TETRA_CRYPTO` (TB5),
 `TETRA_MLE_CMCE`, `CORE_ACCESS_CODE`.
-
 #### State and its boundaries
 
 What each part of the TETRA decoder state belongs to, what sets it, and what forgets it. A boundary the engine sees (a

@@ -67,8 +67,7 @@ enum {
     BSCH_DIBITS = 60,
     SB_BB_DIBITS = 15,
     BLOCK_DIBITS = 108,
-    AACH1_DIBITS = 7,
-    NDB_AACH2_DIBITS = 8,
+    AACH1_DIBITS = 7,    NDB_AACH2_DIBITS = 8,
 };
 
 static const char k_bsch_type5[] = "1011100110110010011101011001001111111010111101101001000011110011"
@@ -247,14 +246,12 @@ ndb_burst(session* s, int nts2, const uint8_t* aach, const uint8_t* block1, cons
         DSD_MEMCPY(tail, aach + AACH1_DIBITS, NDB_AACH2_DIBITS);
         DSD_MEMCPY(s->state->tetra_sync.aach1_dibuf, aach, AACH1_DIBITS);
     }
-    s->state->tetra_sync.aach1_valid = aach != NULL;
-    DSD_MEMCPY(tail + NDB_AACH2_DIBITS, block2, BLOCK_DIBITS);
+    s->state->tetra_sync.aach1_valid = aach != NULL;    DSD_MEMCPY(tail + NDB_AACH2_DIBITS, block2, BLOCK_DIBITS);
     feed(s, tail, (int)sizeof tail);
     DSD_MEMCPY(s->state->tetra_sync.b1_dibuf, block1, BLOCK_DIBITS);
     s->state->tetra_sync.b1_valid = 1;
     s->state->tetra_sync.b1_soft_valid = 0;
-    s->state->tetra_sync.nts2 = (uint8_t)(nts2 != 0);
-    s->state->tetra_sync.cb = 0;
+    s->state->tetra_sync.nts2 = (uint8_t)(nts2 != 0);    s->state->tetra_sync.cb = 0;
     s->state->lastsynctype = DSD_SYNC_TETRA_NDB_POS;
     s->state->synctype = DSD_SYNC_TETRA_NDB_POS;
     return dsd_dispatch_handle_tetra(s->opts, s->state);
@@ -295,8 +292,7 @@ encode_aach(uint16_t pdu, uint32_t error, uint32_t seed, uint8_t* dibits) {
     scrambled_zeros(seed, 30, pn);
     for (int i = 0; i < AACH1_DIBITS + NDB_AACH2_DIBITS; i++) {
         dibits[i] = (uint8_t)(((word >> (28 - (2 * i))) & 3U) ^ pn[i]);
-    }
-}
+    }}
 
 /* Noise: a synchronisation burst whose BSCH fails its CRC proves nothing, and with no network known its block 2 cannot
  * be descrambled. */
@@ -897,7 +893,6 @@ test_aach_tells_traffic_from_signalling(void) {
     }
     session_close(&s);
 }
-
 /* A channel allocation in the first half of a normal burst moves the receiver: the second half was sent on the carrier
  * left, so it is not decoded, and nothing in it counts for the traffic carrier. */
 static void
@@ -1087,7 +1082,6 @@ main(void) {
     test_retune_leaves_the_rest_of_the_burst();
     test_burst_entry_settles();
     test_frame_18_tries_no_speech();
-    test_aach_tells_traffic_from_signalling();
-    DSD_FPRINTF(stdout, "TETRA_BURST_VERDICT: OK\n");
+    test_aach_tells_traffic_from_signalling();    DSD_FPRINTF(stdout, "TETRA_BURST_VERDICT: OK\n");
     return 0;
 }
